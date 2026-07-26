@@ -11,7 +11,7 @@
 //!
 //! Schema:
 //! ```text
-//! snapshots(repo_id TEXT PK, data BLOB, generation INTEGER)
+//! snapshots(repo_id TEXT PK, data BLOB, generation INTEGER, snapshot_generation INTEGER)
 //! overlays(repo_id TEXT, session_id TEXT, data BLOB, PK(repo_id, session_id))
 //! ```
 
@@ -110,7 +110,7 @@ impl SqliteBackend {
                  repo_id    TEXT    PRIMARY KEY,
                  data       BLOB    NOT NULL,
                  generation INTEGER NOT NULL DEFAULT 0,
-                 snapshot_generation INTEGER
+                 snapshot_generation INTEGER NOT NULL
              );
 
              CREATE TABLE IF NOT EXISTS overlays (
@@ -129,63 +129,55 @@ impl SqliteBackend {
         )
         .map_err(|e| KinDbError::StorageError(format!("failed to initialize SQL schema: {e}")))?;
 
-        let has_snapshot_generation = {
-            let mut statement = conn
-                .prepare("PRAGMA table_info(snapshots)")
-                .map_err(|error| {
-                    KinDbError::StorageError(format!(
-                        "failed to inspect SQLite snapshots schema: {error}"
-                    ))
-                })?;
-            let columns = statement
-                .query_map([], |row| row.get::<_, String>(1))
-                .map_err(|error| {
-                    KinDbError::StorageError(format!(
-                        "failed to read SQLite snapshots schema: {error}"
-                    ))
-                })?;
-            let mut found = false;
-            for column in columns {
-                if column.map_err(|error| {
-                    KinDbError::StorageError(format!(
-                        "failed to decode SQLite snapshots schema: {error}"
-                    ))
-                })? == "snapshot_generation"
-                {
-                    found = true;
-                }
-            }
-            found
-        };
-        if !has_snapshot_generation {
-            conn.execute(
-                "ALTER TABLE snapshots ADD COLUMN snapshot_generation INTEGER",
-                [],
-            )
+        let mut statement = conn
+            .prepare("PRAGMA table_info(snapshots)")
             .map_err(|error| {
                 KinDbError::StorageError(format!(
-                    "failed to add SQLite snapshot-generation authority: {error}"
+                    "failed to inspect SQLite snapshots schema: {error}"
                 ))
             })?;
+        let columns = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            })
+            .map_err(|error| {
+                KinDbError::StorageError(format!("failed to read SQLite snapshots schema: {error}"))
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| {
+                KinDbError::StorageError(format!(
+                    "failed to decode SQLite snapshots schema: {error}"
+                ))
+            })?;
+        let exact_current_schema = [
+            ("repo_id", "TEXT", 0, None, 1),
+            ("data", "BLOB", 1, None, 0),
+            ("generation", "INTEGER", 1, Some("0"), 0),
+            ("snapshot_generation", "INTEGER", 1, None, 0),
+        ];
+        let matches_current = columns.len() == exact_current_schema.len()
+            && columns.iter().zip(exact_current_schema).all(
+                |((name, sql_type, not_null, default, primary_key), expected)| {
+                    (
+                        name.as_str(),
+                        sql_type.as_str(),
+                        *not_null,
+                        default.as_deref(),
+                        *primary_key,
+                    ) == expected
+                },
+            );
+        if !matches_current {
+            return Err(KinDbError::StorageError(
+                "SQLite snapshots table is not the exact current authority schema".to_string(),
+            ));
         }
-
-        // A legacy row is safely self-contained only when it has no journal.
-        // Rows with legacy deltas keep NULL and fail closed on recovery because
-        // their snapshot base cannot be proven from the old schema.
-        conn.execute(
-            "UPDATE snapshots AS snapshots_row
-             SET snapshot_generation = generation
-             WHERE snapshot_generation IS NULL
-               AND NOT EXISTS (
-                   SELECT 1 FROM deltas WHERE deltas.repo_id = snapshots_row.repo_id
-               )",
-            [],
-        )
-        .map_err(|error| {
-            KinDbError::StorageError(format!(
-                "failed to migrate safe SQLite snapshot authorities: {error}"
-            ))
-        })?;
 
         Ok(())
     }
@@ -217,7 +209,7 @@ impl SqliteBackend {
                 |row| {
                     Ok((
                         row.get::<_, Vec<u8>>(0)?,
-                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, i64>(1)?,
                         row.get::<_, i64>(2)?,
                     ))
                 },
@@ -231,11 +223,6 @@ impl SqliteBackend {
         let Some((snapshot_bytes, snapshot_generation, head_generation)) = row else {
             return Ok(None);
         };
-        let snapshot_generation = snapshot_generation.ok_or_else(|| {
-            KinDbError::StorageError(format!(
-                "SQLite repo {repo_id} has legacy deltas but no provable snapshot-base generation"
-            ))
-        })?;
         let snapshot_generation =
             Self::decode_generation(snapshot_generation, "snapshot authority")?;
         let head_generation = Self::decode_generation(head_generation, "head authority")?;
@@ -346,7 +333,7 @@ impl StorageBackend for SqliteBackend {
                 KinDbError::StorageError(format!("SQLite begin transaction failed: {e}"))
             })?;
 
-        let current_gen: Option<(i64, Option<i64>)> = tx
+        let current_gen: Option<(i64, i64)> = tx
             .query_row(
                 "SELECT generation, snapshot_generation FROM snapshots WHERE repo_id = ?1",
                 params![repo_id],
@@ -363,11 +350,6 @@ impl StorageBackend for SqliteBackend {
         let stored_gen = match current_gen {
             Some((generation, snapshot_generation)) => {
                 let generation = Self::decode_generation(generation, "head authority")?;
-                let snapshot_generation = snapshot_generation.ok_or_else(|| {
-                    KinDbError::StorageError(format!(
-                        "SQLite repo {repo_id} has no provable snapshot-base generation"
-                    ))
-                })?;
                 let snapshot_generation =
                     Self::decode_generation(snapshot_generation, "snapshot authority")?;
                 if snapshot_generation > generation {
@@ -416,112 +398,6 @@ impl StorageBackend for SqliteBackend {
         Ok(new_gen)
     }
 
-    fn rebuild_legacy_journal(
-        &self,
-        repo_id: &str,
-        data: &[u8],
-        expected_gen: Generation,
-    ) -> Result<Generation, KinDbError> {
-        let _snapshot = crate::storage::format::GraphSnapshot::from_bytes(data)?;
-        let expected_sql_generation =
-            Self::encode_generation(expected_gen, "legacy rebuild expected")?;
-        let mut conn = self.conn.lock();
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|error| {
-                KinDbError::StorageError(format!(
-                    "SQLite begin legacy rebuild transaction failed: {error}"
-                ))
-            })?;
-
-        let current: Option<(i64, Option<i64>)> = tx
-            .query_row(
-                "SELECT generation, snapshot_generation FROM snapshots WHERE repo_id = ?1",
-                params![repo_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()
-            .map_err(|error| {
-                KinDbError::StorageError(format!(
-                    "SQLite read legacy rebuild authority failed for repo {repo_id}: {error}"
-                ))
-            })?;
-        let Some((current_generation, _snapshot_generation)) = current else {
-            return Err(KinDbError::StorageError(format!(
-                "SQLite repo {repo_id} has no base snapshot to rebuild"
-            )));
-        };
-        let current_generation =
-            Self::decode_generation(current_generation, "legacy rebuild head")?;
-        if current_generation != expected_gen {
-            return Err(KinDbError::StorageError(format!(
-                "SQLite legacy rebuild generation mismatch for repo {repo_id}: expected {expected_gen}, found {current_generation}; quiesce old writers and reconcile again"
-            )));
-        }
-
-        // Capture exact rows inside the same IMMEDIATE transaction that will
-        // promote the rebuilt snapshot. SQLite's write lock makes the capture,
-        // authority update, and exact-row deletion one serializable commit.
-        let captured = Self::load_deltas_from_connection(&tx, repo_id, GENERATION_INIT)?;
-        if captured.is_empty() {
-            return Err(KinDbError::StorageError(format!(
-                "SQLite repo {repo_id} has no legacy journal to rebuild"
-            )));
-        }
-        let journal_head = captured
-            .iter()
-            .map(|(_, generation)| *generation)
-            .max()
-            .unwrap_or(expected_gen);
-        let new_gen = checked_next_generation(
-            expected_gen.max(journal_head),
-            "SQLite legacy journal rebuild",
-        )?;
-        let new_sql_generation = Self::encode_generation(new_gen, "legacy rebuild result")?;
-        let rows = tx
-            .execute(
-                "UPDATE snapshots
-                 SET data = ?1, generation = ?2, snapshot_generation = ?2
-                 WHERE repo_id = ?3 AND generation = ?4",
-                params![data, new_sql_generation, repo_id, expected_sql_generation],
-            )
-            .map_err(|error| {
-                KinDbError::StorageError(format!(
-                    "SQLite legacy rebuild authority update failed for repo {repo_id}: {error}"
-                ))
-            })?;
-        if rows != 1 {
-            return Err(KinDbError::StorageError(format!(
-                "SQLite legacy rebuild CAS lost for repo {repo_id} at generation {expected_gen}"
-            )));
-        }
-        for (delta, generation) in captured {
-            let sql_generation = Self::encode_generation(generation, "legacy rebuild delta")?;
-            let deleted = tx
-                .execute(
-                    "DELETE FROM deltas
-                     WHERE repo_id = ?1 AND generation = ?2 AND data = ?3",
-                    params![repo_id, sql_generation, delta],
-                )
-                .map_err(|error| {
-                    KinDbError::StorageError(format!(
-                        "SQLite exact legacy delta cleanup failed for repo {repo_id}: {error}"
-                    ))
-                })?;
-            if deleted != 1 {
-                return Err(KinDbError::StorageError(format!(
-                    "SQLite legacy journal changed while rebuilding repo {repo_id}; transaction was rolled back"
-                )));
-            }
-        }
-        tx.commit().map_err(|error| {
-            KinDbError::StorageError(format!(
-                "SQLite legacy rebuild commit failed for repo {repo_id}: {error}"
-            ))
-        })?;
-        Ok(new_gen)
-    }
-
     fn save_delta(
         &self,
         repo_id: &str,
@@ -544,7 +420,7 @@ impl StorageBackend for SqliteBackend {
             })?;
 
         // Read current generation for CAS
-        let current_gen: Option<(i64, Option<i64>)> = tx
+        let current_gen: Option<(i64, i64)> = tx
             .query_row(
                 "SELECT generation, snapshot_generation FROM snapshots WHERE repo_id = ?1",
                 params![repo_id],
@@ -562,11 +438,6 @@ impl StorageBackend for SqliteBackend {
                 "SQLite repo {repo_id} has no base snapshot for delta persistence"
             )));
         };
-        let snapshot_generation = snapshot_generation.ok_or_else(|| {
-            KinDbError::StorageError(format!(
-                "SQLite repo {repo_id} has no provable snapshot-base generation"
-            ))
-        })?;
         let snapshot_generation =
             Self::decode_generation(snapshot_generation, "snapshot authority")?;
         let stored_gen = Self::decode_generation(current_gen, "head authority")?;
@@ -751,6 +622,39 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_backend_rejects_noncurrent_snapshot_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.sqlite");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE snapshots (
+                 repo_id TEXT PRIMARY KEY,
+                 data BLOB NOT NULL,
+                 generation INTEGER NOT NULL DEFAULT 0,
+                 snapshot_generation INTEGER
+             );",
+        )
+        .unwrap();
+        drop(conn);
+
+        let error = match SqliteBackend::new(&path) {
+            Ok(_) => panic!("nullable snapshot authority schema must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("not the exact current authority schema"));
+    }
+
+    #[test]
+    fn sqlite_backend_reopens_current_snapshot_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("current.sqlite");
+        drop(SqliteBackend::new(&path).unwrap());
+        SqliteBackend::new(&path).unwrap();
+    }
+
+    #[test]
     fn sqlite_backend_roundtrip_snapshot() {
         let backend = test_backend();
 
@@ -900,9 +804,10 @@ mod tests {
         let expected = Generation::try_from(i64::MAX).unwrap();
         let replacement = {
             let mut snapshot = GraphSnapshot::empty();
-            snapshot
-                .file_hashes
-                .insert("replacement.rs".to_string(), [8; 32]);
+            snapshot.admit_artifact_for_test(
+                "replacement.rs".to_string(),
+                crate::types::regular_tree_entry(8),
+            );
             snapshot.to_bytes().unwrap()
         };
         let error = backend
@@ -915,7 +820,7 @@ mod tests {
         assert_eq!(
             GraphSnapshot::from_bytes(&authority.snapshot_bytes)
                 .unwrap()
-                .file_hashes
+                .resolved_tree
                 .len(),
             0
         );
@@ -1046,92 +951,12 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_legacy_schema_migrates_only_rows_without_unbound_journals() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let db_path = dir.path().join("legacy.db");
-        let bytes = GraphSnapshot::empty().to_bytes().unwrap();
-        {
-            let connection = Connection::open(&db_path).unwrap();
-            connection
-                .execute_batch(
-                    "CREATE TABLE snapshots (
-                         repo_id TEXT PRIMARY KEY,
-                         data BLOB NOT NULL,
-                         generation INTEGER NOT NULL DEFAULT 0
-                     );
-                     CREATE TABLE deltas (
-                         repo_id TEXT NOT NULL,
-                         generation INTEGER NOT NULL,
-                         data BLOB NOT NULL,
-                         PRIMARY KEY (repo_id, generation)
-                     );",
-                )
-                .unwrap();
-            connection
-                .execute(
-                    "INSERT INTO snapshots (repo_id, data, generation) VALUES (?1, ?2, 7)",
-                    params!["clean", &bytes],
-                )
-                .unwrap();
-            connection
-                .execute(
-                    "INSERT INTO snapshots (repo_id, data, generation) VALUES (?1, ?2, 8)",
-                    params!["unbound", &bytes],
-                )
-                .unwrap();
-            connection
-                .execute(
-                    "INSERT INTO deltas (repo_id, generation, data) VALUES (?1, 8, ?2)",
-                    params![
-                        "unbound",
-                        crate::storage::delta::GraphSnapshotDelta::empty(7)
-                            .to_bytes()
-                            .unwrap()
-                    ],
-                )
-                .unwrap();
-        }
-
-        let backend = SqliteBackend::new(&db_path).unwrap();
-        let clean = backend
-            .load_snapshot_authority("clean")
-            .unwrap()
-            .expect("journal-free legacy row migrates");
-        assert_eq!(clean.snapshot_generation, 7);
-        assert_eq!(clean.head_generation, 7);
-
-        let error = backend
-            .load_snapshot_authority("unbound")
-            .expect_err("legacy journal row must retain unknown base and fail closed");
-        assert!(error.to_string().contains("no provable snapshot-base"));
-
-        let stale_error = backend
-            .rebuild_legacy_journal("unbound", &bytes, 7)
-            .expect_err("stale quiesce cursor must fail before the migration transaction");
-        assert!(stale_error.to_string().contains("expected 7, found 8"));
-        let mut reconciled = GraphSnapshot::empty();
-        reconciled
-            .file_hashes
-            .insert("reconciled.rs".to_string(), [9; 32]);
-        let generation = backend
-            .rebuild_legacy_journal("unbound", &reconciled.to_bytes().unwrap(), 8)
-            .unwrap();
-        assert_eq!(generation, 9);
-        assert!(backend.load_deltas_since("unbound", 0).unwrap().is_empty());
-        let recovered = crate::storage::backend::load_recovered_snapshot(&backend, "unbound")
-            .unwrap()
-            .unwrap();
-        assert_eq!(recovered.generation, generation);
-        assert_eq!(recovered.snapshot.file_hashes, reconciled.file_hashes);
-    }
-
-    #[test]
     fn sqlite_backend_recovery_replays_deltas_after_connection_reopen() {
         let dir = tempfile::TempDir::new().unwrap();
         let db_path = dir.path().join("restart.db");
         let repo_id = "restart-repo";
         let mut base = GraphSnapshot::empty();
-        base.file_hashes.insert("base.rs".to_string(), [1; 32]);
+        base.admit_artifact_for_test("base.rs".to_string(), crate::types::regular_tree_entry(1));
 
         {
             let backend = SqliteBackend::new(&db_path).unwrap();
@@ -1140,18 +965,20 @@ mod tests {
                 .unwrap();
 
             let mut after_first = base.clone();
-            after_first
-                .file_hashes
-                .insert("first.rs".to_string(), [2; 32]);
+            after_first.admit_artifact_for_test(
+                "first.rs".to_string(),
+                crate::types::regular_tree_entry(2),
+            );
             let first = crate::storage::delta::compute_graph_delta(&base, &after_first, gen1);
             let gen2 = backend
                 .save_delta(repo_id, &first.to_bytes().unwrap(), gen1)
                 .unwrap();
 
             let mut after_second = after_first.clone();
-            after_second
-                .file_hashes
-                .insert("second.rs".to_string(), [3; 32]);
+            after_second.admit_artifact_for_test(
+                "second.rs".to_string(),
+                crate::types::regular_tree_entry(3),
+            );
             let second =
                 crate::storage::delta::compute_graph_delta(&after_first, &after_second, gen2);
             backend
@@ -1163,18 +990,20 @@ mod tests {
         let (base_bytes, base_generation) = reopened.load_snapshot(repo_id).unwrap().unwrap();
         assert_eq!(base_generation, 1, "tuple generation describes base bytes");
         assert_eq!(
-            GraphSnapshot::from_bytes(&base_bytes).unwrap().file_hashes,
-            base.file_hashes
+            GraphSnapshot::from_bytes(&base_bytes)
+                .unwrap()
+                .resolved_tree,
+            base.resolved_tree
         );
         let recovered = crate::storage::backend::load_recovered_snapshot(&reopened, repo_id)
             .unwrap()
             .expect("snapshot exists");
         assert_eq!(recovered.generation, 3);
         assert_eq!(recovered.deltas_applied, 2);
-        assert_eq!(recovered.snapshot.file_hashes.len(), 3);
-        assert!(recovered.snapshot.file_hashes.contains_key("base.rs"));
-        assert!(recovered.snapshot.file_hashes.contains_key("first.rs"));
-        assert!(recovered.snapshot.file_hashes.contains_key("second.rs"));
+        assert_eq!(recovered.snapshot.resolved_tree.len(), 3);
+        assert!(recovered.snapshot.has_artifact_path_for_test("base.rs"));
+        assert!(recovered.snapshot.has_artifact_path_for_test("first.rs"));
+        assert!(recovered.snapshot.has_artifact_path_for_test("second.rs"));
     }
 
     #[test]
@@ -1192,9 +1021,10 @@ mod tests {
             .save_snapshot(repo_id, &base.to_bytes().unwrap(), GENERATION_INIT)
             .unwrap();
         let mut promoted = base.clone();
-        promoted
-            .file_hashes
-            .insert("promoted.rs".to_string(), [4; 32]);
+        promoted.admit_artifact_for_test(
+            "promoted.rs".to_string(),
+            crate::types::regular_tree_entry(4),
+        );
         let first = crate::storage::delta::compute_graph_delta(&base, &promoted, gen1);
         let gen2 = cleaner
             .save_delta(repo_id, &first.to_bytes().unwrap(), gen1)
@@ -1217,9 +1047,10 @@ mod tests {
         checked_rx.recv().unwrap();
 
         let mut with_concurrent = promoted.clone();
-        with_concurrent
-            .file_hashes
-            .insert("concurrent.rs".to_string(), [5; 32]);
+        with_concurrent.admit_artifact_for_test(
+            "concurrent.rs".to_string(),
+            crate::types::regular_tree_entry(5),
+        );
         let concurrent =
             crate::storage::delta::compute_graph_delta(&promoted, &with_concurrent, gen3);
         let (writer_started_tx, writer_started_rx) = mpsc::channel();
@@ -1251,6 +1082,10 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(recovered.generation, gen4);
-        assert!(recovered.snapshot.file_hashes.contains_key("concurrent.rs"));
+        assert!(recovered
+            .snapshot
+            .resolved_tree
+            .artifact_id_at_path(&crate::types::RepoPath::from_utf8("concurrent.rs").unwrap())
+            .is_some());
     }
 }

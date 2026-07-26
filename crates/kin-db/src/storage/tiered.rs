@@ -11,7 +11,7 @@ use crate::engine::InMemoryGraph;
 use crate::error::KinDbError;
 use crate::storage::format::GraphSnapshot;
 use crate::storage::mmap;
-use crate::store::{ChangeStore, EntityStore};
+use crate::store::EntityStore;
 use crate::types::*;
 
 #[cfg(test)]
@@ -154,7 +154,6 @@ pub struct TieredGraph {
 struct ManagedHotScope {
     entity_ids: HashSet<EntityId>,
     relation_ids: HashSet<RelationId>,
-    branch_names: HashSet<BranchName>,
 }
 
 impl ManagedHotScope {
@@ -167,7 +166,6 @@ impl ManagedHotScope {
     fn record_snapshot(&mut self, snapshot: &GraphSnapshot) {
         self.entity_ids.extend(snapshot.entities.keys().copied());
         self.relation_ids.extend(snapshot.relations.keys().copied());
-        self.branch_names.extend(snapshot.branches.keys().cloned());
     }
 }
 
@@ -216,7 +214,7 @@ impl TieredGraph {
         if estimated_in_memory <= hot_budget {
             // Fits in memory — full load
             let snapshot = load_snapshot_from_disk(&path)?;
-            let graph = hydrate_graph(snapshot);
+            let graph = hydrate_graph(snapshot)?;
             Ok(Self {
                 hot: Arc::new(graph),
                 _cold_mmap: RwLock::new(None),
@@ -421,7 +419,7 @@ impl TieredGraph {
                 .read()
                 .clone()
                 .unwrap_or_else(|| ManagedHotScope::from_snapshot(&hot_snapshot));
-            merge_hot_into_cold(cold, hot_snapshot.clone(), &scope)
+            merge_hot_into_cold(cold, hot_snapshot.clone(), &scope)?
         } else {
             hot_snapshot.clone()
         };
@@ -473,7 +471,7 @@ fn name_match_rank(name: &str, pattern: &str) -> u8 {
 }
 
 /// Hydrate a full InMemoryGraph from a snapshot.
-fn hydrate_graph(snapshot: GraphSnapshot) -> InMemoryGraph {
+fn hydrate_graph(snapshot: GraphSnapshot) -> Result<InMemoryGraph, KinDbError> {
     InMemoryGraph::from_snapshot(snapshot)
 }
 
@@ -514,10 +512,6 @@ fn hydrate_graph_partial(
         }
     }
 
-    for branch in snapshot.branches.values() {
-        graph.create_branch(branch)?;
-    }
-
     Ok(graph)
 }
 
@@ -525,7 +519,7 @@ fn merge_hot_into_cold(
     mut cold: GraphSnapshot,
     hot: GraphSnapshot,
     scope: &ManagedHotScope,
-) -> GraphSnapshot {
+) -> Result<GraphSnapshot, KinDbError> {
     cold.version = GraphSnapshot::CURRENT_VERSION;
     let hot_entity_ids: HashSet<_> = hot.entities.keys().copied().collect();
     let deleted_managed_entities: HashSet<_> = scope
@@ -549,9 +543,6 @@ fn merge_hot_into_cold(
                 .map(|entity_id| !deleted_managed_entities.contains(&entity_id))
                 .unwrap_or(true)
     });
-    cold.branches
-        .retain(|branch_name, _| !scope.branch_names.contains(branch_name));
-
     cold.entities.extend(hot.entities);
     cold.relations
         .extend(hot.relations.into_iter().filter(|(_, relation)| {
@@ -568,7 +559,6 @@ fn merge_hot_into_cold(
         }));
     cold.changes.extend(hot.changes);
     cold.change_children.extend(hot.change_children);
-    cold.branches.extend(hot.branches);
     cold.work_items.extend(hot.work_items);
     cold.annotations.extend(hot.annotations);
 
@@ -585,47 +575,6 @@ fn merge_hot_into_cold(
     cold.assertions.extend(hot.assertions);
     cold.verification_runs.extend(hot.verification_runs);
 
-    // Merge tuple-Vec fields by deduplicating
-    if !hot.test_covers_entity.is_empty() {
-        let existing: HashSet<_> = cold.test_covers_entity.iter().cloned().collect();
-        cold.test_covers_entity.extend(
-            hot.test_covers_entity
-                .into_iter()
-                .filter(|t| !existing.contains(t)),
-        );
-    }
-    if !hot.test_covers_contract.is_empty() {
-        let existing: HashSet<_> = cold.test_covers_contract.iter().cloned().collect();
-        cold.test_covers_contract.extend(
-            hot.test_covers_contract
-                .into_iter()
-                .filter(|t| !existing.contains(t)),
-        );
-    }
-    if !hot.test_verifies_work.is_empty() {
-        let existing: HashSet<_> = cold.test_verifies_work.iter().cloned().collect();
-        cold.test_verifies_work.extend(
-            hot.test_verifies_work
-                .into_iter()
-                .filter(|t| !existing.contains(t)),
-        );
-    }
-    if !hot.run_proves_entity.is_empty() {
-        let existing: HashSet<_> = cold.run_proves_entity.iter().cloned().collect();
-        cold.run_proves_entity.extend(
-            hot.run_proves_entity
-                .into_iter()
-                .filter(|t| !existing.contains(t)),
-        );
-    }
-    if !hot.run_proves_work.is_empty() {
-        let existing: HashSet<_> = cold.run_proves_work.iter().cloned().collect();
-        cold.run_proves_work.extend(
-            hot.run_proves_work
-                .into_iter()
-                .filter(|t| !existing.contains(t)),
-        );
-    }
     if !hot.mock_hints.is_empty() {
         let existing: HashSet<_> = cold.mock_hints.iter().map(|m| m.hint_id).collect();
         cold.mock_hints.extend(
@@ -693,7 +642,18 @@ fn merge_hot_into_cold(
         cold.opaque_artifacts.extend(hot.opaque_artifacts);
     }
 
-    cold.file_hashes.extend(hot.file_hashes);
+    let mut artifacts: Vec<_> = cold.resolved_tree.into_artifacts().collect();
+    for incoming in hot.resolved_tree.into_artifacts() {
+        artifacts.retain(|artifact| {
+            artifact.artifact_id != incoming.artifact_id && artifact.path != incoming.path
+        });
+        artifacts.push(incoming);
+    }
+    cold.resolved_tree = ResolvedTree::from_artifacts(artifacts).map_err(|error| {
+        KinDbError::StorageError(format!(
+            "tiered repository-tree merge violates identity/path authority: {error}"
+        ))
+    })?;
     cold.sessions.extend(hot.sessions);
     cold.intents.extend(hot.intents);
 
@@ -706,7 +666,7 @@ fn merge_hot_into_cold(
         );
     }
     rebuild_relation_indexes(&mut cold);
-    cold
+    Ok(cold)
 }
 
 fn rebuild_relation_indexes(snapshot: &mut GraphSnapshot) {
@@ -847,9 +807,10 @@ impl std::fmt::Display for TieredGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
     use tempfile::TempDir;
 
+    #[cfg(feature = "vector")]
     use crate::storage::{build_entity_hash_map, compute_graph_root_hash, verify_subgraph};
     #[cfg(feature = "vector")]
     use crate::vector::VectorIndex;
@@ -881,6 +842,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "vector")]
     fn test_entity_with_language(name: &str, path: &str, language: LanguageId) -> Entity {
         Entity {
             file_origin: Some(FilePathId::new(path)),
@@ -909,13 +871,6 @@ mod tests {
         TieredConfig {
             max_hot_bytes: Some(file_size.saturating_mul(4).saturating_sub(1).max(1)),
             bytes_per_entity: 1,
-        }
-    }
-
-    fn test_branch(name: &str) -> Branch {
-        Branch {
-            name: BranchName::new(name),
-            head: SemanticChangeId::from_hash(Hash256::from_bytes([1; 32])),
         }
     }
 
@@ -1411,35 +1366,6 @@ mod tests {
                 .len(),
             expected
         );
-    }
-
-    #[test]
-    fn mmap_backed_save_persists_branch_deletion() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("graph.kndb");
-
-        let main = test_branch("main");
-        let feature = test_branch("feature/demo");
-        let mut snap = GraphSnapshot::empty();
-        snap.branches = [
-            (main.name.clone(), main.clone()),
-            (feature.name.clone(), feature.clone()),
-        ]
-        .into_iter()
-        .collect();
-        mmap::atomic_write(&path, &snap).unwrap();
-
-        let config = force_mmap_config_with_full_hot(&path);
-        let tiered = TieredGraph::open(&path, config.clone()).unwrap();
-        assert_eq!(tiered.strategy(), LoadStrategy::MmapBacked);
-
-        tiered.hot.delete_branch(&feature.name).unwrap();
-        tiered.save().unwrap();
-
-        assert!(tiered.hot.get_branch(&feature.name).unwrap().is_none());
-        let reopened = TieredGraph::open(&path, config).unwrap();
-        assert!(reopened.hot.get_branch(&feature.name).unwrap().is_none());
-        assert!(reopened.hot.get_branch(&main.name).unwrap().is_some());
     }
 
     #[test]

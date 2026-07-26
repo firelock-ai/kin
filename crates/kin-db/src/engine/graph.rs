@@ -15,9 +15,12 @@ use crate::error::KinDbError;
 use crate::search::{
     opaque_artifact_fields, shallow_file_fields, structured_artifact_fields, TextIndex,
 };
+use crate::storage::change_validation::validate_semantic_change;
 use crate::storage::format::LocateGraphSnapshot;
 use crate::storage::merkle::{
-    compute_graph_root_hash, compute_root_hash_generic, GraphHashSource, MerkleCache,
+    compute_graph_root_hash, compute_live_retrieval_authority_hash,
+    compute_locate_retrieval_authority_hash, compute_retrieval_authority_hash,
+    compute_root_hash_generic, GraphHashSource, MerkleCache,
 };
 use crate::storage::{CollectionDelta, Generation, GraphSnapshot, GraphSnapshotDelta, VecDelta};
 use crate::store::{
@@ -241,7 +244,7 @@ const TEXT_INDEX_IMPORT_SOURCE_WEIGHT: f32 = 1.4;
 const TEXT_INDEX_NEIGHBOR_NAME_WEIGHT: f32 = 1.0;
 #[cfg(all(feature = "embeddings", feature = "vector"))]
 const MAX_EMBED_CONTEXT_VALUES_PER_LABEL: usize = 3;
-const PHASE9_RELATION_NAMESPACE: uuid::Uuid =
+const VERIFICATION_RELATION_NAMESPACE: uuid::Uuid =
     uuid::Uuid::from_u128(0x6a5a6d56593e4f4fb6f6f2e1de3d4f99);
 
 fn coverage_percent(indexed: usize, total: usize) -> f64 {
@@ -289,7 +292,7 @@ fn semantic_change_payload(change: &SemanticChange) -> Result<SemanticChangePayl
     let mut exact_float_bits = Vec::new();
     for delta in &change.entity_deltas {
         match delta {
-            EntityDelta::Added(entity) => record_entity_float_bits(
+            EntityDelta::Added { new: entity } => record_entity_float_bits(
                 change.id,
                 entity,
                 "entity fingerprint stability score",
@@ -309,17 +312,46 @@ fn semantic_change_payload(change: &SemanticChange) -> Result<SemanticChangePayl
                     &mut exact_float_bits,
                 )?;
             }
-            EntityDelta::Removed(_) => {}
+            EntityDelta::Removed { old } => record_entity_float_bits(
+                change.id,
+                old,
+                "removed entity fingerprint stability score",
+                &mut exact_float_bits,
+            )?,
         }
     }
     for delta in &change.relation_deltas {
-        if let RelationDelta::Added(relation) = delta {
-            record_change_float(
-                change.id,
-                "relation confidence",
-                relation.confidence,
-                &mut exact_float_bits,
-            )?;
+        match delta {
+            RelationDelta::Added { new } => {
+                record_change_float(
+                    change.id,
+                    "relation confidence",
+                    new.confidence,
+                    &mut exact_float_bits,
+                )?;
+            }
+            RelationDelta::Modified { old, new } => {
+                record_change_float(
+                    change.id,
+                    "old relation confidence",
+                    old.confidence,
+                    &mut exact_float_bits,
+                )?;
+                record_change_float(
+                    change.id,
+                    "new relation confidence",
+                    new.confidence,
+                    &mut exact_float_bits,
+                )?;
+            }
+            RelationDelta::Removed { old } => {
+                record_change_float(
+                    change.id,
+                    "removed relation confidence",
+                    old.confidence,
+                    &mut exact_float_bits,
+                )?;
+            }
         }
     }
     Ok(SemanticChangePayload {
@@ -328,33 +360,18 @@ fn semantic_change_payload(change: &SemanticChange) -> Result<SemanticChangePayl
     })
 }
 
-fn build_artifact_indexes_from_paths<I>(
-    paths: I,
-) -> (
-    HashMap<FilePathId, ArtifactId>,
-    HashMap<ArtifactId, FilePathId>,
-)
-where
-    I: IntoIterator<Item = FilePathId>,
-{
-    let mut artifact_index = HashMap::new();
-    let mut artifact_reverse = HashMap::new();
-    for path in paths {
-        let id = ArtifactId::seed_from_file_id(&path);
-        artifact_index.entry(path.clone()).or_insert(id);
-        artifact_reverse.entry(id).or_insert(path);
-    }
-    (artifact_index, artifact_reverse)
+fn repo_path_for_file_path(path: &FilePathId) -> Result<RepoPath, KinDbError> {
+    RepoPath::from_utf8(&path.0).map_err(|error| {
+        KinDbError::StorageError(format!("invalid repository path {}: {error}", path.0))
+    })
 }
 
-fn reverse_artifact_index(
-    artifact_index: &HashMap<FilePathId, ArtifactId>,
-) -> HashMap<ArtifactId, FilePathId> {
-    let mut artifact_reverse = HashMap::new();
-    for (path, id) in artifact_index {
-        artifact_reverse.entry(*id).or_insert_with(|| path.clone());
-    }
-    artifact_reverse
+fn file_path_for_repo_path(path: &RepoPath) -> Option<FilePathId> {
+    path.as_utf8().map(FilePathId::new)
+}
+
+fn tree_state_error(error: TreeStateError) -> KinDbError {
+    KinDbError::StorageError(format!("repository tree transition rejected: {error}"))
 }
 
 fn topologically_order_changes<I>(changes: I) -> Vec<SemanticChange>
@@ -393,6 +410,55 @@ where
         }
     }
     ordered
+}
+
+fn find_artifact_revision(
+    changes: impl IntoIterator<Item = (SemanticChangeId, SemanticChange)>,
+    target: ArtifactRevisionId,
+) -> Option<ArtifactRevision> {
+    let mut active_by_change =
+        HashMap::<SemanticChangeId, HashMap<ArtifactId, ArtifactRevisionId>>::new();
+    for change in topologically_order_changes(changes) {
+        let mut active = change
+            .parents
+            .first()
+            .and_then(|parent| active_by_change.get(parent))
+            .cloned()
+            .unwrap_or_default();
+        for delta in &change.tree_deltas {
+            let artifact_id = delta.artifact_id();
+            let Some(located) = delta.new_state() else {
+                active.remove(&artifact_id);
+                continue;
+            };
+            let mut predecessors = Vec::new();
+            for parent in &change.parents {
+                let Some(predecessor) = active_by_change
+                    .get(parent)
+                    .and_then(|parent_active| parent_active.get(&artifact_id))
+                    .copied()
+                else {
+                    continue;
+                };
+                if !predecessors.contains(&predecessor) {
+                    predecessors.push(predecessor);
+                }
+            }
+            let revision = ArtifactRevision::new(
+                artifact_id,
+                located.path.clone(),
+                located.entry,
+                change.id,
+                predecessors,
+            );
+            active.insert(artifact_id, revision.revision_id);
+            if revision.revision_id == target {
+                return Some(revision);
+            }
+        }
+        active_by_change.insert(change.id, active);
+    }
+    None
 }
 
 fn entity_matches_revision(left: &Entity, right: &Entity) -> bool {
@@ -448,7 +514,7 @@ fn append_entity_revisions(ent: &mut EntityData, change: &SemanticChange) -> Vec
     let mut superseded = Vec::new();
     for delta in &change.entity_deltas {
         match delta {
-            EntityDelta::Added(entity) => {
+            EntityDelta::Added { new: entity } => {
                 if entity_unchanged_since_last_revision(ent, entity) {
                     continue;
                 }
@@ -473,7 +539,7 @@ fn append_entity_revisions(ent: &mut EntityData, change: &SemanticChange) -> Vec
                     previous_revision,
                 ));
             }
-            EntityDelta::Removed(_) => {}
+            EntityDelta::Removed { .. } => {}
         }
     }
     superseded
@@ -757,7 +823,7 @@ pub(crate) fn build_relation_indexes_with_reuse(
 fn verification_relation_id(kind: RelationKind, src: GraphNodeId, dst: GraphNodeId) -> RelationId {
     let payload = format!("{kind:?}|{src}|{dst}");
     RelationId(uuid::Uuid::new_v5(
-        &PHASE9_RELATION_NAMESPACE,
+        &VERIFICATION_RELATION_NAMESPACE,
         payload.as_bytes(),
     ))
 }
@@ -773,55 +839,6 @@ fn verification_relation(kind: RelationKind, src: GraphNodeId, dst: GraphNodeId)
         created_in: None,
         import_source: None,
         evidence: Vec::new(),
-    }
-}
-
-fn migrate_legacy_verification_relations(snapshot: &mut GraphSnapshot) {
-    let mut seen: HashSet<(RelationKind, GraphNodeId, GraphNodeId)> = snapshot
-        .relations
-        .values()
-        .map(|relation| (relation.kind, relation.src, relation.dst))
-        .collect();
-
-    for (test_id, entity_id) in snapshot.test_covers_entity.drain(..) {
-        let src = GraphNodeId::Test(test_id);
-        let dst = GraphNodeId::Entity(entity_id);
-        if seen.insert((RelationKind::Covers, src, dst)) {
-            let relation = verification_relation(RelationKind::Covers, src, dst);
-            snapshot.relations.insert(relation.id, relation);
-        }
-    }
-    for (test_id, contract_id) in snapshot.test_covers_contract.drain(..) {
-        let src = GraphNodeId::Test(test_id);
-        let dst = GraphNodeId::Contract(contract_id);
-        if seen.insert((RelationKind::Covers, src, dst)) {
-            let relation = verification_relation(RelationKind::Covers, src, dst);
-            snapshot.relations.insert(relation.id, relation);
-        }
-    }
-    for (test_id, work_id) in snapshot.test_verifies_work.drain(..) {
-        let src = GraphNodeId::Test(test_id);
-        let dst = GraphNodeId::Work(work_id);
-        if seen.insert((RelationKind::Covers, src, dst)) {
-            let relation = verification_relation(RelationKind::Covers, src, dst);
-            snapshot.relations.insert(relation.id, relation);
-        }
-    }
-    for (run_id, entity_id) in snapshot.run_proves_entity.drain(..) {
-        let src = GraphNodeId::VerificationRun(run_id);
-        let dst = GraphNodeId::Entity(entity_id);
-        if seen.insert((RelationKind::DerivedFrom, src, dst)) {
-            let relation = verification_relation(RelationKind::DerivedFrom, src, dst);
-            snapshot.relations.insert(relation.id, relation);
-        }
-    }
-    for (run_id, work_id) in snapshot.run_proves_work.drain(..) {
-        let src = GraphNodeId::VerificationRun(run_id);
-        let dst = GraphNodeId::Work(work_id);
-        if seen.insert((RelationKind::DerivedFrom, src, dst)) {
-            let relation = verification_relation(RelationKind::DerivedFrom, src, dst);
-            snapshot.relations.insert(relation.id, relation);
-        }
     }
 }
 
@@ -892,8 +909,8 @@ struct EntityData {
     node_incoming: HashMap<GraphNodeId, Vec<RelationId>>,
     /// Secondary indexes for fast lookup.
     indexes: IndexSet,
-    /// Incremental indexing: file path → SHA-256 content hash.
-    file_hashes: HashMap<String, [u8; 32]>,
+    /// Exact graph-owned repository tree and artifact identity authority.
+    resolved_tree: ResolvedTree,
     /// Shallow file tracking (C2 tier).
     shallow_files: HashMap<FilePathId, ShallowTrackedFile>,
     /// Persisted file layouts for projection.
@@ -902,10 +919,6 @@ struct EntityData {
     structured_artifacts: HashMap<FilePathId, StructuredArtifact>,
     /// Opaque artifact tracking (C0 tier).
     opaque_artifacts: HashMap<FilePathId, OpaqueArtifact>,
-    /// Forward: FilePathId → ArtifactId (O(1) lookup)
-    artifact_index: HashMap<FilePathId, ArtifactId>,
-    /// Reverse: ArtifactId → FilePathId (O(1) reverse lookup)
-    artifact_reverse: HashMap<ArtifactId, FilePathId>,
 }
 
 impl GraphHashSource for EntityData {
@@ -929,13 +942,12 @@ impl GraphHashSource for EntityData {
     }
 }
 
-/// Semantic change DAG + branches.
+/// Semantic change DAG. Named refs are repository authority, not graph state.
 #[derive(Clone)]
 struct ChangeData {
     changes: HashMap<SemanticChangeId, SemanticChange>,
     /// Parent → children in the change DAG.
     change_children: HashMap<SemanticChangeId, Vec<SemanticChangeId>>,
-    branches: HashMap<BranchName, Branch>,
 }
 
 /// Work items, annotations, links.
@@ -1615,7 +1627,7 @@ impl PreparedEmbedBatch {
 pub struct InMemoryGraph {
     /// Core entity/relation graph.
     entities: RwLock<EntityData>,
-    /// Semantic change DAG + branches.
+    /// Semantic change DAG. Repository refs live in the shared authority cell.
     changes: RwLock<ChangeData>,
     /// Work items, annotations, links.
     work: RwLock<WorkData>,
@@ -1692,7 +1704,37 @@ pub struct InMemoryGraph {
     /// triggered their own flushes).
     #[cfg(test)]
     merkle_flush_count: std::sync::atomic::AtomicUsize,
+    /// One-shot fault injection for the post-authority transaction cleanup
+    /// boundary. Keeps the retry-safety invariant adversarially testable.
+    #[cfg(test)]
+    fail_next_transaction_derived_cleanup: AtomicBool,
+    #[cfg(test)]
+    fail_next_text_rebuild: AtomicBool,
 }
+
+#[cfg(test)]
+thread_local! {
+    static CREATE_CHANGE_AFTER_REVISION_HOOK:
+        std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn set_create_change_after_revision_hook(hook: impl FnOnce() + 'static) {
+    CREATE_CHANGE_AFTER_REVISION_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+fn run_create_change_after_revision_hook() {
+    CREATE_CHANGE_AFTER_REVISION_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
+#[cfg(not(test))]
+fn run_create_change_after_revision_hook() {}
 
 impl InMemoryGraph {
     /// Create a new empty in-memory graph (RAM-only text index).
@@ -1730,18 +1772,15 @@ impl InMemoryGraph {
                 node_outgoing: HashMap::new(),
                 node_incoming: HashMap::new(),
                 indexes: IndexSet::new(),
-                file_hashes: HashMap::new(),
+                resolved_tree: ResolvedTree::default(),
                 shallow_files: HashMap::new(),
                 file_layouts: HashMap::new(),
                 structured_artifacts: HashMap::new(),
                 opaque_artifacts: HashMap::new(),
-                artifact_index: HashMap::new(),
-                artifact_reverse: HashMap::new(),
             }),
             changes: RwLock::new(ChangeData {
                 changes: HashMap::new(),
                 change_children: HashMap::new(),
-                branches: HashMap::new(),
             }),
             work: RwLock::new(WorkData {
                 work_items: HashMap::new(),
@@ -1798,14 +1837,17 @@ impl InMemoryGraph {
             embed_stage_timings: crate::embed::EmbedStageTimings::default(),
             #[cfg(test)]
             merkle_flush_count: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            fail_next_transaction_derived_cleanup: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_text_rebuild: AtomicBool::new(false),
         };
 
         graph
     }
 
     /// Restore a graph from a snapshot (RAM-only text index).
-    pub fn from_snapshot(mut snapshot: GraphSnapshot) -> Self {
-        migrate_legacy_verification_relations(&mut snapshot);
+    pub fn from_snapshot(snapshot: GraphSnapshot) -> Result<Self, KinDbError> {
         let expected_root_hash = compute_graph_root_hash(&snapshot);
         Self::from_snapshot_inner(snapshot, None, expected_root_hash, false, false)
     }
@@ -1813,10 +1855,9 @@ impl InMemoryGraph {
     /// Restore a graph from a snapshot (RAM-only text index) with a precomputed
     /// graph root hash.
     pub fn from_snapshot_with_root_hash(
-        mut snapshot: GraphSnapshot,
+        snapshot: GraphSnapshot,
         expected_root_hash: [u8; 32],
-    ) -> Self {
-        migrate_legacy_verification_relations(&mut snapshot);
+    ) -> Result<Self, KinDbError> {
         Self::from_snapshot_inner(snapshot, None, expected_root_hash, false, false)
     }
 
@@ -1825,20 +1866,18 @@ impl InMemoryGraph {
     /// This is intended for graph-only workflows such as warm-cache diffing
     /// where entity/file truth is needed but lexical retrieval is not.
     pub fn from_snapshot_without_text_index_with_root_hash(
-        mut snapshot: GraphSnapshot,
+        snapshot: GraphSnapshot,
         expected_root_hash: [u8; 32],
-    ) -> Self {
-        migrate_legacy_verification_relations(&mut snapshot);
+    ) -> Result<Self, KinDbError> {
         Self::from_snapshot_inner(snapshot, None, expected_root_hash, false, true)
     }
 
     /// Restore a graph from a snapshot with a persistent text index at the
     /// given directory path.
     pub fn from_snapshot_with_text_index(
-        mut snapshot: GraphSnapshot,
+        snapshot: GraphSnapshot,
         text_index_path: PathBuf,
-    ) -> Self {
-        migrate_legacy_verification_relations(&mut snapshot);
+    ) -> Result<Self, KinDbError> {
         let expected_root_hash = compute_graph_root_hash(&snapshot);
         Self::from_snapshot_inner(
             snapshot,
@@ -1852,10 +1891,9 @@ impl InMemoryGraph {
     /// Restore a graph from a snapshot with a persistent text index loaded in
     /// read-only mode.
     pub fn from_snapshot_with_text_index_read_only(
-        mut snapshot: GraphSnapshot,
+        snapshot: GraphSnapshot,
         text_index_path: PathBuf,
-    ) -> Self {
-        migrate_legacy_verification_relations(&mut snapshot);
+    ) -> Result<Self, KinDbError> {
         let expected_root_hash = compute_graph_root_hash(&snapshot);
         Self::from_snapshot_inner(
             snapshot,
@@ -1869,11 +1907,10 @@ impl InMemoryGraph {
     /// Restore a graph from a snapshot with a persistent text index and a
     /// precomputed graph root hash.
     pub fn from_snapshot_with_text_index_and_root_hash(
-        mut snapshot: GraphSnapshot,
+        snapshot: GraphSnapshot,
         text_index_path: PathBuf,
         expected_root_hash: [u8; 32],
-    ) -> Self {
-        migrate_legacy_verification_relations(&mut snapshot);
+    ) -> Result<Self, KinDbError> {
         Self::from_snapshot_inner(
             snapshot,
             Some(text_index_path),
@@ -1886,11 +1923,10 @@ impl InMemoryGraph {
     /// Restore a graph from a snapshot with a persistent text index loaded in
     /// read-only mode and a precomputed graph root hash.
     pub fn from_snapshot_with_text_index_and_root_hash_read_only(
-        mut snapshot: GraphSnapshot,
+        snapshot: GraphSnapshot,
         text_index_path: PathBuf,
         expected_root_hash: [u8; 32],
-    ) -> Self {
-        migrate_legacy_verification_relations(&mut snapshot);
+    ) -> Result<Self, KinDbError> {
         Self::from_snapshot_inner(
             snapshot,
             Some(text_index_path),
@@ -1909,17 +1945,19 @@ impl InMemoryGraph {
         snapshot: LocateGraphSnapshot,
         text_index_path: Option<PathBuf>,
         expected_root_hash: [u8; 32],
-    ) -> Self {
+    ) -> Result<Self, KinDbError> {
         Self::from_locate_snapshot_inner(snapshot, text_index_path, expected_root_hash, true)
     }
 
     fn from_snapshot_inner(
         snapshot: GraphSnapshot,
         text_index_path: Option<PathBuf>,
-        expected_root_hash: [u8; 32],
+        _expected_root_hash: [u8; 32],
         read_only: bool,
         skip_text_index: bool,
-    ) -> Self {
+    ) -> Result<Self, KinDbError> {
+        snapshot.validate_storage_admission()?;
+        let retrieval_authority_hash = compute_retrieval_authority_hash(&snapshot);
         let GraphSnapshot {
             version: _,
             entities,
@@ -1928,7 +1966,6 @@ impl InMemoryGraph {
             incoming: persisted_incoming,
             changes,
             change_children,
-            branches,
             work_items,
             annotations,
             work_links,
@@ -1940,11 +1977,6 @@ impl InMemoryGraph {
             test_cases,
             assertions,
             verification_runs,
-            test_covers_entity: _,
-            test_covers_contract: _,
-            test_verifies_work: _,
-            run_proves_entity: _,
-            run_proves_work: _,
             mock_hints,
             contracts,
             actors,
@@ -1955,26 +1987,27 @@ impl InMemoryGraph {
             file_layouts,
             structured_artifacts,
             opaque_artifacts,
-            file_hashes,
+            resolved_tree,
             sessions,
             intents,
             downstream_warnings,
             entity_revisions,
-            entity_tombstones: _,
-            relation_tombstones: _,
-            change_order: _,
-            artifact_index,
+            // Repository authority is owned by the immutable publication
+            // manager, never by this in-place mutable graph.
+            repository_authority: _,
         } = snapshot;
-        let entity_revisions: HashMap<EntityId, Vec<EntityRevision>> =
-            if entity_revisions.is_empty() && !changes.is_empty() {
-                kin_model::graph::derive_entity_revisions_from_changes(topologically_order_changes(
-                    changes.iter().map(|(id, change)| (*id, change.clone())),
-                ))
-                .into_iter()
-                .collect()
-            } else {
-                entity_revisions.into_iter().collect()
-            };
+        let entity_revisions: HashMap<EntityId, Vec<EntityRevision>> = if entity_revisions
+            .is_empty()
+            && !changes.is_empty()
+        {
+            kin_model::graph::derive_entity_revisions_from_changes(topologically_order_changes(
+                changes.iter().map(|(id, change)| (*id, change.clone())),
+            ))?
+            .into_iter()
+            .collect()
+        } else {
+            entity_revisions.into_iter().collect()
+        };
         let _span = tracing::info_span!(
             "kindb.graph.from_snapshot",
             entities = entities.len(),
@@ -2037,7 +2070,7 @@ impl InMemoryGraph {
         let text_index_current = text_index
             .as_ref()
             .and_then(TextIndex::graph_root_hash)
-            .map(|hash| hash == expected_root_hash)
+            .map(|hash| hash == retrieval_authority_hash)
             .unwrap_or(false);
         let text_index_entity_coverage_current = if text_index_current {
             text_index
@@ -2110,22 +2143,6 @@ impl InMemoryGraph {
             .into_iter()
             .map(|artifact| (artifact.file_id.clone(), artifact))
             .collect();
-        let persisted_artifact_index: HashMap<FilePathId, ArtifactId> =
-            artifact_index.into_iter().collect();
-        let (artifact_index, artifact_reverse) = if persisted_artifact_index.is_empty() {
-            build_artifact_indexes_from_paths(
-                shallow_files
-                    .keys()
-                    .chain(file_layouts.keys())
-                    .chain(structured_artifacts.keys())
-                    .chain(opaque_artifacts.keys())
-                    .cloned(),
-            )
-        } else {
-            let artifact_reverse = reverse_artifact_index(&persisted_artifact_index);
-            (persisted_artifact_index, artifact_reverse)
-        };
-
         let entity_data = EntityData {
             entities: entities.into_iter().collect(),
             entity_revisions,
@@ -2135,13 +2152,11 @@ impl InMemoryGraph {
             node_outgoing,
             node_incoming,
             indexes,
-            file_hashes: file_hashes.into_iter().collect(),
+            resolved_tree,
             shallow_files,
             file_layouts,
             structured_artifacts,
             opaque_artifacts,
-            artifact_index,
-            artifact_reverse,
         };
         let merkle = MerkleCache::from_source(&entity_data);
 
@@ -2150,7 +2165,6 @@ impl InMemoryGraph {
             changes: RwLock::new(ChangeData {
                 changes: changes.into_iter().collect(),
                 change_children: change_children.into_iter().collect(),
-                branches: branches.into_iter().collect(),
             }),
             work: RwLock::new(WorkData {
                 work_items: work_items.into_iter().collect(),
@@ -2210,13 +2224,17 @@ impl InMemoryGraph {
             embed_stage_timings: crate::embed::EmbedStageTimings::default(),
             #[cfg(test)]
             merkle_flush_count: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            fail_next_transaction_derived_cleanup: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_text_rebuild: AtomicBool::new(false),
         };
 
         if !skip_text_index && (!text_index_current || !text_index_entity_coverage_current) {
-            graph.rebuild_text_index_with_root_hash(expected_root_hash);
+            graph.try_rebuild_text_index_from_graph(&graph, retrieval_authority_hash)?;
         }
 
-        graph
+        Ok(graph)
     }
 
     fn from_locate_snapshot_inner(
@@ -2224,17 +2242,21 @@ impl InMemoryGraph {
         text_index_path: Option<PathBuf>,
         expected_root_hash: [u8; 32],
         read_only: bool,
-    ) -> Self {
+    ) -> Result<Self, KinDbError> {
+        snapshot.validate_storage_admission()?;
+        let retrieval_authority_hash =
+            compute_locate_retrieval_authority_hash(&snapshot, expected_root_hash);
         let LocateGraphSnapshot {
             version: _,
             entities,
             relations,
             changes,
+            entity_revisions,
             shallow_files,
             file_layouts,
             structured_artifacts,
             opaque_artifacts,
-            artifact_index,
+            resolved_tree,
         } = snapshot;
         let _span = tracing::info_span!(
             "kindb.graph.from_locate_snapshot",
@@ -2277,7 +2299,7 @@ impl InMemoryGraph {
         let text_index_current = text_index
             .as_ref()
             .and_then(TextIndex::graph_root_hash)
-            .map(|hash| hash == expected_root_hash)
+            .map(|hash| hash == retrieval_authority_hash)
             .unwrap_or(false);
 
         let entity_vec: Vec<&Entity> = entities.values().collect();
@@ -2336,44 +2358,30 @@ impl InMemoryGraph {
             .into_iter()
             .map(|artifact| (artifact.file_id.clone(), artifact))
             .collect();
-        let persisted_artifact_index: HashMap<FilePathId, ArtifactId> =
-            artifact_index.into_iter().collect();
-        let (artifact_index, artifact_reverse) = if persisted_artifact_index.is_empty() {
-            build_artifact_indexes_from_paths(
-                shallow_files
-                    .keys()
-                    .chain(file_layouts.keys())
-                    .chain(structured_artifacts.keys())
-                    .chain(opaque_artifacts.keys())
-                    .cloned(),
-            )
-        } else {
-            let artifact_reverse = reverse_artifact_index(&persisted_artifact_index);
-            (persisted_artifact_index, artifact_reverse)
-        };
-
         let entity_data = EntityData {
             entities,
-            entity_revisions: kin_model::graph::derive_entity_revisions_from_changes(
-                topologically_order_changes(
-                    changes.iter().map(|(id, change)| (*id, change.clone())),
-                ),
-            )
-            .into_iter()
-            .collect(),
+            entity_revisions: if entity_revisions.is_empty() && !changes.is_empty() {
+                kin_model::graph::derive_entity_revisions_from_changes(
+                    topologically_order_changes(
+                        changes.iter().map(|(id, change)| (*id, change.clone())),
+                    ),
+                )?
+                .into_iter()
+                .collect()
+            } else {
+                entity_revisions
+            },
             relations,
             outgoing,
             incoming,
             node_outgoing,
             node_incoming,
             indexes,
-            file_hashes: HashMap::new(),
+            resolved_tree,
             shallow_files,
             file_layouts,
             structured_artifacts,
             opaque_artifacts,
-            artifact_index,
-            artifact_reverse,
         };
         let merkle = MerkleCache::from_source(&entity_data);
 
@@ -2382,7 +2390,6 @@ impl InMemoryGraph {
             changes: RwLock::new(ChangeData {
                 changes,
                 change_children: HashMap::new(),
-                branches: HashMap::new(),
             }),
             work: RwLock::new(WorkData {
                 work_items: HashMap::new(),
@@ -2439,19 +2446,17 @@ impl InMemoryGraph {
             embed_stage_timings: crate::embed::EmbedStageTimings::default(),
             #[cfg(test)]
             merkle_flush_count: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            fail_next_transaction_derived_cleanup: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_text_rebuild: AtomicBool::new(false),
         };
 
         if !text_index_current {
-            graph.rebuild_text_index_with_root_hash(expected_root_hash);
+            graph.try_rebuild_text_index_from_graph(&graph, retrieval_authority_hash)?;
         }
 
-        graph
-    }
-
-    fn rebuild_text_index_with_root_hash(&self, root_hash: [u8; 32]) {
-        if let Err(error) = self.try_rebuild_text_index_from_graph(self, root_hash) {
-            tracing::warn!(error = %error, "failed to rebuild text index");
-        }
+        Ok(graph)
     }
 
     fn try_rebuild_text_index_from_graph(
@@ -2462,12 +2467,14 @@ impl InMemoryGraph {
         let _span = tracing::info_span!("kindb.graph.rebuild_text_index_with_root_hash").entered();
         let docs = {
             let ent = source.entities.read();
-            Self::collect_text_index_docs(&ent)
+            Self::collect_text_index_docs(&ent)?
         };
         self.try_rebuild_text_index_from_docs(docs, root_hash)
     }
 
-    fn collect_text_index_docs(ent: &EntityData) -> Vec<(RetrievalKey, Vec<(String, f32)>)> {
+    fn collect_text_index_docs(
+        ent: &EntityData,
+    ) -> Result<Vec<(RetrievalKey, Vec<(String, f32)>)>, KinDbError> {
         let _span = tracing::info_span!(
             "kindb.graph.rebuild_text_index.collect",
             entities = ent.entities.len(),
@@ -2485,8 +2492,8 @@ impl InMemoryGraph {
             };
             (RetrievalKey::Entity(entity.id), fields)
         });
-        let artifact_docs = collect_artifact_text_index_docs(ent);
-        entity_docs.chain(artifact_docs).collect()
+        let artifact_docs = collect_artifact_text_index_docs(ent)?;
+        Ok(entity_docs.chain(artifact_docs).collect())
     }
 
     fn try_rebuild_text_index_from_docs(
@@ -2495,8 +2502,17 @@ impl InMemoryGraph {
         root_hash: [u8; 32],
     ) -> Result<(), KinDbError> {
         let Some(ref ti) = self.text_index else {
+            self.text_dirty.store(false, Ordering::Release);
+            self.text_full_rebuild_required
+                .store(false, Ordering::Release);
             return Ok(());
         };
+        #[cfg(test)]
+        if self.fail_next_text_rebuild.swap(false, Ordering::AcqRel) {
+            return Err(KinDbError::StorageError(
+                "injected full text-index rebuild failure".to_string(),
+            ));
+        }
 
         {
             let _span = tracing::info_span!(
@@ -2655,10 +2671,11 @@ impl InMemoryGraph {
         &self,
         epoch: PersistenceEpoch,
         expected_root_hash: [u8; 32],
-        persist_additional: impl FnOnce() -> Result<T, KinDbError>,
+        expected_retrieval_authority_hash: [u8; 32],
+        persist_additional: impl FnOnce([u8; 32]) -> Result<T, KinDbError>,
     ) -> Result<bool, KinDbError> {
         let ent = self.entities.read();
-        let _chg = self.changes.read();
+        let chg = self.changes.read();
         let _wrk = self.work.read();
         let _rev = self.reviews.read();
         let _ver = self.verification.read();
@@ -2667,16 +2684,29 @@ impl InMemoryGraph {
         let pending = self.pending_delta.lock();
         self.flush_merkle(&ent);
         let current_root_hash = self.merkle.read().root_hash();
+        let current_retrieval_authority_hash = compute_live_retrieval_authority_hash(
+            current_root_hash,
+            &ent.entities,
+            &ent.relations,
+            &chg.changes,
+            &ent.entity_revisions,
+            &ent.resolved_tree,
+            &ent.shallow_files,
+            &ent.file_layouts,
+            &ent.structured_artifacts,
+            &ent.opaque_artifacts,
+        );
         let exact = current_root_hash == expected_root_hash
+            && current_retrieval_authority_hash == expected_retrieval_authority_hash
             && pending.in_flight_persistence.contains(&epoch.0)
             && pending.delta.is_empty()
             && !self.full_snapshot_required.load(Ordering::Acquire);
         if !exact {
             return Ok(false);
         }
-        let docs = Self::collect_text_index_docs(&ent);
-        self.try_rebuild_text_index_from_docs(docs, expected_root_hash)?;
-        persist_additional()?;
+        let docs = Self::collect_text_index_docs(&ent)?;
+        self.try_rebuild_text_index_from_docs(docs, expected_retrieval_authority_hash)?;
+        persist_additional(expected_retrieval_authority_hash)?;
         Ok(true)
     }
 
@@ -2732,39 +2762,6 @@ impl InMemoryGraph {
         delta_map_remove(&mut pending.delta.entity_revisions, entity_id);
     }
 
-    fn record_entity_revisions_delta_upsert(
-        &self,
-        entity_id: EntityId,
-        revisions: Vec<EntityRevision>,
-    ) {
-        let mut pending = self.pending_delta.lock();
-        delta_map_upsert(&mut pending.delta.entity_revisions, entity_id, revisions);
-    }
-
-    fn record_change_delta_upsert(&self, change: SemanticChange) {
-        let mut pending = self.pending_delta.lock();
-        delta_map_upsert(&mut pending.delta.changes, change.id, change);
-    }
-
-    fn record_change_children_delta_upsert(
-        &self,
-        change_id: SemanticChangeId,
-        children: Vec<SemanticChangeId>,
-    ) {
-        let mut pending = self.pending_delta.lock();
-        delta_map_upsert(&mut pending.delta.change_children, change_id, children);
-    }
-
-    fn record_branch_delta_upsert(&self, branch: Branch) {
-        let mut pending = self.pending_delta.lock();
-        delta_map_upsert(&mut pending.delta.branches, branch.name.clone(), branch);
-    }
-
-    fn record_branch_delta_remove(&self, name: BranchName) {
-        let mut pending = self.pending_delta.lock();
-        delta_map_remove(&mut pending.delta.branches, name);
-    }
-
     fn record_relation_delta_upsert(&self, ent: &EntityData, relation: Relation) {
         let mut pending = self.pending_delta.lock();
         delta_map_upsert(&mut pending.delta.relations, relation.id, relation.clone());
@@ -2775,26 +2772,6 @@ impl InMemoryGraph {
         let mut pending = self.pending_delta.lock();
         delta_map_remove(&mut pending.delta.relations, relation.id);
         record_relation_edge_delta(&mut pending, ent, relation);
-    }
-
-    fn record_file_hash_delta_upsert(&self, path: String, hash: [u8; 32]) {
-        let mut pending = self.pending_delta.lock();
-        delta_map_upsert(&mut pending.delta.file_hashes, path, hash);
-    }
-
-    fn record_file_hash_delta_remove(&self, path: String) {
-        let mut pending = self.pending_delta.lock();
-        delta_map_remove(&mut pending.delta.file_hashes, path);
-    }
-
-    fn record_artifact_index_delta_upsert(&self, path: FilePathId, artifact_id: ArtifactId) {
-        let mut pending = self.pending_delta.lock();
-        delta_map_upsert(&mut pending.delta.artifact_index, path, artifact_id);
-    }
-
-    fn record_artifact_index_delta_remove(&self, path: FilePathId) {
-        let mut pending = self.pending_delta.lock();
-        delta_map_remove(&mut pending.delta.artifact_index, path);
     }
 
     fn record_shallow_file_delta_upsert(
@@ -2908,11 +2885,57 @@ impl InMemoryGraph {
 
         let batch: Vec<(&Entity, &[(String, f32)])> =
             docs.iter().map(|(e, f)| (e, f.as_slice())).collect();
-        let _ = ti.upsert_with_extra_fields_batch(batch);
+        if let Err(error) = ti.upsert_with_extra_fields_batch(batch) {
+            self.quarantine_text_index_after_authority_commit(
+                "refreshing affected entity documents",
+                &error,
+            );
+            return;
+        }
 
         if !entity_ids.is_empty() {
             self.text_dirty.store(true, Ordering::Release);
         }
+    }
+
+    fn quarantine_text_index_after_authority_commit(
+        &self,
+        operation: &'static str,
+        error: &KinDbError,
+    ) {
+        self.text_full_rebuild_required
+            .store(true, Ordering::Release);
+        self.text_dirty.store(true, Ordering::Release);
+        tracing::error!(
+            operation,
+            error = %error,
+            "derived text index failed after graph authority committed; quarantined for full rebuild"
+        );
+    }
+
+    #[cfg(feature = "vector")]
+    fn quarantine_vector_index_after_authority_commit(
+        &self,
+        operation: &'static str,
+        error: &KinDbError,
+    ) {
+        tracing::error!(
+            operation,
+            error = %error,
+            "derived vector index failed after graph authority committed; reset and queued for full rebuild"
+        );
+        self.reset_vector_index();
+        self.queue_all_for_embedding();
+        self.queue_all_artifacts_for_embedding();
+        self.mark_vector_full_reconcile();
+    }
+
+    #[cfg(not(feature = "vector"))]
+    fn quarantine_vector_index_after_authority_commit(
+        &self,
+        _operation: &'static str,
+        _error: &KinDbError,
+    ) {
     }
 
     fn upsert_retrievable_text_index(
@@ -3033,7 +3056,7 @@ impl InMemoryGraph {
         &self,
         precomputed_hash: Option<crate::storage::merkle::MerkleHash>,
     ) -> Result<(Vec<u8>, crate::storage::merkle::MerkleHash), KinDbError> {
-        let (bytes, graph_root_hash, _) =
+        let (bytes, graph_root_hash, _, _) =
             self.serialize_snapshot_borrowed_inner(precomputed_hash, false)?;
         Ok((bytes, graph_root_hash))
     }
@@ -3052,11 +3075,36 @@ impl InMemoryGraph {
         ),
         KinDbError,
     > {
-        let (bytes, graph_root_hash, epoch) =
+        let (bytes, graph_root_hash, _, epoch) =
             self.serialize_snapshot_borrowed_inner(precomputed_hash, true)?;
         Ok((
             bytes,
             graph_root_hash,
+            epoch.expect("persistence serialization always allocates an epoch"),
+        ))
+    }
+
+    /// Capture one full-snapshot persistence batch together with both the
+    /// entity/relation Merkle root and the exact authority digest used to bind
+    /// retrieval sidecars.
+    pub fn begin_snapshot_persistence_with_retrieval_hash(
+        &self,
+        precomputed_hash: Option<crate::storage::merkle::MerkleHash>,
+    ) -> Result<
+        (
+            Vec<u8>,
+            crate::storage::merkle::MerkleHash,
+            crate::storage::merkle::MerkleHash,
+            PersistenceEpoch,
+        ),
+        KinDbError,
+    > {
+        let (bytes, graph_root_hash, retrieval_authority_hash, epoch) =
+            self.serialize_snapshot_borrowed_inner(precomputed_hash, true)?;
+        Ok((
+            bytes,
+            graph_root_hash,
+            retrieval_authority_hash,
             epoch.expect("persistence serialization always allocates an epoch"),
         ))
     }
@@ -3068,6 +3116,7 @@ impl InMemoryGraph {
     ) -> Result<
         (
             Vec<u8>,
+            crate::storage::merkle::MerkleHash,
             crate::storage::merkle::MerkleHash,
             Option<PersistenceEpoch>,
         ),
@@ -3089,6 +3138,7 @@ impl InMemoryGraph {
         let ver = self.verification.read();
         let prv = self.provenance.read();
         let ses = self.sessions.read();
+        validate_entity_enrichment_admission(&ent)?;
         let t_lock = t0.elapsed();
 
         let t1 = std::time::Instant::now();
@@ -3102,6 +3152,18 @@ impl InMemoryGraph {
                 .unwrap_or(current)
         };
         let t_hash = t1.elapsed();
+        let retrieval_authority_hash = compute_live_retrieval_authority_hash(
+            graph_root_hash,
+            &ent.entities,
+            &ent.relations,
+            &chg.changes,
+            &ent.entity_revisions,
+            &ent.resolved_tree,
+            &ent.shallow_files,
+            &ent.file_layouts,
+            &ent.structured_artifacts,
+            &ent.opaque_artifacts,
+        );
 
         let t2 = std::time::Instant::now();
         let bytes = {
@@ -3112,14 +3174,13 @@ impl InMemoryGraph {
                 relations: &ent.relations,
                 outgoing: &ent.outgoing,
                 incoming: &ent.incoming,
-                file_hashes: &ent.file_hashes,
+                resolved_tree: &ent.resolved_tree,
                 shallow_files: &ent.shallow_files,
                 file_layouts: &ent.file_layouts,
                 structured_artifacts: &ent.structured_artifacts,
                 opaque_artifacts: &ent.opaque_artifacts,
                 changes: &chg.changes,
                 change_children: &chg.change_children,
-                branches: &chg.branches,
                 work_items: &wrk.work_items,
                 annotations: &wrk.annotations,
                 work_links: &wrk.work_links,
@@ -3164,48 +3225,68 @@ impl InMemoryGraph {
             "kindb.save_timer"
         );
 
-        Ok((bytes, graph_root_hash, persistence_epoch))
+        Ok((
+            bytes,
+            graph_root_hash,
+            retrieval_authority_hash,
+            persistence_epoch,
+        ))
     }
 
-    /// O(1) lookup: file path → graph-assigned ArtifactId
-    pub fn artifact_id_for_path(&self, path: &FilePathId) -> Option<ArtifactId> {
-        self.entities.read().artifact_index.get(path).copied()
+    /// Return the exact authority digest that persisted lexical/vector
+    /// sidecars must match before they can answer queries.
+    #[cfg(any(feature = "vector", test))]
+    pub(crate) fn retrieval_authority_hash(&self) -> [u8; 32] {
+        let ent = self.entities.read();
+        let chg = self.changes.read();
+        self.flush_merkle(&ent);
+        let graph_root_hash = self.merkle.read().root_hash();
+        compute_live_retrieval_authority_hash(
+            graph_root_hash,
+            &ent.entities,
+            &ent.relations,
+            &chg.changes,
+            &ent.entity_revisions,
+            &ent.resolved_tree,
+            &ent.shallow_files,
+            &ent.file_layouts,
+            &ent.structured_artifacts,
+            &ent.opaque_artifacts,
+        )
     }
 
-    /// O(1) reverse lookup: ArtifactId → file path
-    pub fn path_for_artifact_id(&self, id: &ArtifactId) -> Option<FilePathId> {
-        self.entities.read().artifact_reverse.get(id).cloned()
+    /// Return a snapshot of the exact graph-owned repository tree.
+    pub fn resolved_tree(&self) -> ResolvedTree {
+        self.entities.read().resolved_tree.clone()
     }
 
-    /// Idempotent: returns existing ID if tracked, else assigns new one.
-    /// For migration, uses from_path() deterministic derivation so existing
-    /// graph edges remain valid.
-    pub fn ensure_artifact_id(&self, path: &FilePathId) -> ArtifactId {
-        let mut ent = self.entities.write();
-        if let Some(id) = ent.artifact_index.get(path) {
-            *id
-        } else {
-            let new_id = ArtifactId::seed_from_path(&path.0);
-            ent.artifact_index.insert(path.clone(), new_id);
-            ent.artifact_reverse.insert(new_id, path.clone());
-            self.record_artifact_index_delta_upsert(path.clone(), new_id);
-            new_id
-        }
+    /// Resolve a byte-exact repository path to its admitted artifact identity.
+    pub fn artifact_id_at_path(&self, path: &RepoPath) -> Option<ArtifactId> {
+        self.entities.read().resolved_tree.artifact_id_at_path(path)
     }
 
-    /// Move artifact identity across paths (file rename).
-    pub fn rename_artifact(
-        &self,
-        old_path: &FilePathId,
-        new_path: &FilePathId,
-    ) -> Option<ArtifactId> {
-        let mut ent = self.entities.write();
-        let id = ent.artifact_index.remove(old_path)?;
-        ent.artifact_index.insert(new_path.clone(), id);
-        ent.artifact_reverse.insert(id, new_path.clone());
-        self.record_artifact_index_delta_remove(old_path.clone());
-        self.record_artifact_index_delta_upsert(new_path.clone(), id);
-        Some(id)
+    /// Resolve an admitted artifact identity to its exact tree record.
+    pub fn resolved_artifact(&self, id: &ArtifactId) -> Option<ResolvedArtifact> {
+        self.entities.read().resolved_tree.get(id).cloned()
+    }
+
+    /// Resolve an admitted artifact identity to its byte-exact path.
+    pub fn repo_path_for_artifact_id(&self, id: &ArtifactId) -> Option<RepoPath> {
+        self.entities
+            .read()
+            .resolved_tree
+            .get(id)
+            .map(|artifact| artifact.path.clone())
+    }
+
+    fn require_artifact_id(&self, path: &FilePathId) -> Result<ArtifactId, KinDbError> {
+        let repo_path = repo_path_for_file_path(path)?;
+        self.artifact_id_at_path(&repo_path).ok_or_else(|| {
+            KinDbError::StorageError(format!(
+                "semantic enrichment requires an admitted repository artifact at {}",
+                path.0
+            ))
+        })
     }
 
     /// Return all entity→entity edges in a single lock acquisition.
@@ -3242,14 +3323,13 @@ impl InMemoryGraph {
             relations: ent.relations.into_iter().collect(),
             outgoing: ent.outgoing.into_iter().collect(),
             incoming: ent.incoming.into_iter().collect(),
-            file_hashes: ent.file_hashes.into_iter().collect(),
+            resolved_tree: ent.resolved_tree,
             shallow_files: ent.shallow_files.into_values().collect(),
             file_layouts: ent.file_layouts.into_values().collect(),
             structured_artifacts: ent.structured_artifacts.into_values().collect(),
             opaque_artifacts: ent.opaque_artifacts.into_values().collect(),
             changes: chg.changes.into_iter().collect(),
             change_children: chg.change_children.into_iter().collect(),
-            branches: chg.branches.into_iter().collect(),
             work_items: wrk.work_items.into_iter().collect(),
             annotations: wrk.annotations.into_iter().collect(),
             work_links: wrk.work_links,
@@ -3261,11 +3341,6 @@ impl InMemoryGraph {
             test_cases: ver.test_cases.into_iter().collect(),
             assertions: ver.assertions.into_iter().collect(),
             verification_runs: ver.verification_runs.into_iter().collect(),
-            test_covers_entity: Vec::new(),
-            test_covers_contract: Vec::new(),
-            test_verifies_work: Vec::new(),
-            run_proves_entity: Vec::new(),
-            run_proves_work: Vec::new(),
             mock_hints: ver.mock_hints,
             contracts: ver.contracts.into_iter().collect(),
             actors: prv.actors.into_iter().collect(),
@@ -3275,10 +3350,7 @@ impl InMemoryGraph {
             sessions: ses.sessions.into_iter().collect(),
             intents: ses.intents.into_iter().collect(),
             downstream_warnings: ses.downstream_warnings,
-            entity_tombstones: std::collections::HashMap::new(),
-            relation_tombstones: std::collections::HashMap::new(),
-            change_order: std::collections::HashMap::new(),
-            artifact_index: ent.artifact_index.into_iter().collect(),
+            repository_authority: None,
         }
     }
 
@@ -3429,7 +3501,7 @@ impl InMemoryGraph {
             file_layout_count: ent.file_layouts.len(),
             structured_artifact_count: ent.structured_artifacts.len(),
             opaque_artifact_count: ent.opaque_artifacts.len(),
-            file_hash_count: ent.file_hashes.len(),
+            working_tree_entry_count: ent.resolved_tree.len(),
             text_indexed_entity_count,
             text_index_coverage_percent: coverage_percent(
                 text_indexed_entity_count,
@@ -3457,18 +3529,17 @@ impl InMemoryGraph {
         // If a full rebuild was requested (e.g., after bulk relation insert),
         // do it now before committing. This regenerates all relation-derived
         // text fields in one pass instead of per-entity updates.
-        if self
-            .text_full_rebuild_required
-            .swap(false, Ordering::AcqRel)
-        {
+        if self.text_full_rebuild_required.load(Ordering::Acquire) {
             // Use a zero root hash — persist_text_index_with_root_hash sets the
             // real one. This just ensures the text content is rebuilt.
-            self.rebuild_text_index_with_root_hash([0u8; 32]);
-            return Ok(());
+            return self.try_rebuild_text_index_from_graph(self, [0u8; 32]);
         }
         if self.text_dirty.swap(false, Ordering::AcqRel) {
             if let Some(ref ti) = self.text_index {
-                ti.commit()?;
+                if let Err(error) = ti.commit() {
+                    self.text_dirty.store(true, Ordering::Release);
+                    return Err(error);
+                }
             }
         }
         Ok(())
@@ -3481,12 +3552,8 @@ impl InMemoryGraph {
         // If relation-derived fields are stale, do a full rebuild first.
         // This is set by upsert_relations_batch to amortize the cost of
         // 20K+ individual Tantivy upserts into one full rebuild at persist time.
-        if self
-            .text_full_rebuild_required
-            .swap(false, Ordering::AcqRel)
-        {
-            self.rebuild_text_index_with_root_hash(graph_root_hash);
-            return Ok(());
+        if self.text_full_rebuild_required.load(Ordering::Acquire) {
+            return self.try_rebuild_text_index_from_graph(self, graph_root_hash);
         }
 
         if let Some(ref ti) = self.text_index {
@@ -3520,16 +3587,25 @@ impl InMemoryGraph {
             limit = limit
         )
         .entered();
-        match self.text_index {
-            Some(ref ti) => ti.fuzzy_search(query, limit),
-            None => Ok(Vec::new()),
+        let Some(ref text_index) = self.text_index else {
+            return Ok(Vec::new());
+        };
+        if self.text_full_rebuild_required.load(Ordering::Acquire) {
+            return Err(KinDbError::StorageError(
+                "derived text index is quarantined pending a full graph-authority rebuild"
+                    .to_string(),
+            ));
         }
+        text_index.fuzzy_search(query, limit)
     }
 
     /// Document frequency of `term` in the text index (its rarest token's
     /// posting count), for IDF-style term-discrimination weighting by callers.
     /// Returns 0 when there is no text index or the term is unindexed.
     pub fn text_doc_frequency(&self, term: &str) -> usize {
+        if self.text_full_rebuild_required.load(Ordering::Acquire) {
+            return 0;
+        }
         match self.text_index {
             Some(ref ti) => ti.doc_frequency(term),
             None => 0,
@@ -3539,6 +3615,9 @@ impl InMemoryGraph {
     /// Number of documents currently visible to text search (the N for IDF).
     /// Returns 0 when there is no text index.
     pub fn text_document_count(&self) -> usize {
+        if self.text_full_rebuild_required.load(Ordering::Acquire) {
+            return 0;
+        }
         match self.text_index {
             Some(ref ti) => ti.live_document_count(),
             None => 0,
@@ -3560,52 +3639,42 @@ impl InMemoryGraph {
                 .find(|rev| rev.revision_id == *rev_id)
                 .map(|rev| ResolvedRetrievalItem::Entity(rev.entity.clone())),
             RetrievalKey::Artifact(artifact_id) => {
-                let file_path = ent.artifact_reverse.get(artifact_id)?;
+                let file_path = file_path_for_repo_path(&ent.resolved_tree.get(artifact_id)?.path)?;
                 ent.shallow_files
-                    .get(file_path)
+                    .get(&file_path)
                     .cloned()
                     .map(ResolvedRetrievalItem::ShallowFile)
                     .or_else(|| {
                         ent.structured_artifacts
-                            .get(file_path)
+                            .get(&file_path)
                             .cloned()
                             .map(ResolvedRetrievalItem::StructuredArtifact)
                     })
                     .or_else(|| {
                         ent.opaque_artifacts
-                            .get(file_path)
+                            .get(&file_path)
                             .cloned()
                             .map(ResolvedRetrievalItem::OpaqueArtifact)
                     })
             }
             RetrievalKey::ArtifactRevision(rev_id) => {
                 let chg = self.changes.read();
-                for change in chg.changes.values() {
-                    for delta in &change.artifact_deltas {
-                        if let Some(hash) = delta.new_hash {
-                            let derived_id = ArtifactRevisionId::for_artifact_change(
-                                &delta.file_id,
-                                &change.id,
-                                &hash,
-                            );
-                            if derived_id == *rev_id {
-                                return Some(ResolvedRetrievalItem::ShallowFile(
-                                    ShallowTrackedFile {
-                                        file_id: delta.file_id.clone(),
-                                        language_hint: String::new(),
-                                        declaration_count: 0,
-                                        import_count: 0,
-                                        syntax_hash: hash,
-                                        signature_hash: None,
-                                        declaration_names: vec![],
-                                        import_paths: vec![],
-                                    },
-                                ));
-                            }
-                        }
-                    }
-                }
-                None
+                let revision = find_artifact_revision(
+                    chg.changes.iter().map(|(id, change)| (*id, change.clone())),
+                    *rev_id,
+                )?;
+                let file_id = file_path_for_repo_path(&revision.path)?;
+                let syntax_hash = revision.entry.blob_identity()?;
+                Some(ResolvedRetrievalItem::ShallowFile(ShallowTrackedFile {
+                    file_id,
+                    language_hint: String::new(),
+                    declaration_count: 0,
+                    import_count: 0,
+                    syntax_hash,
+                    signature_hash: None,
+                    declaration_names: vec![],
+                    import_paths: vec![],
+                }))
             }
         }
     }
@@ -3800,13 +3869,13 @@ impl InMemoryGraph {
         Ok(0)
     }
 
-    /// Load a persisted HNSW vector index from disk.
+    /// Load persisted HNSW bytes for internal index construction.
     ///
     /// Dimensions are read from the file — no embedder needed. This means
     /// semantic search works even when `embeddings` feature is off, as long
     /// as a pre-built index exists on disk.
-    #[cfg(feature = "vector")]
-    pub fn load_vector_index(&self, path: &std::path::Path) -> Result<usize, KinDbError> {
+    #[cfg(all(test, feature = "vector"))]
+    pub(crate) fn load_vector_index(&self, path: &std::path::Path) -> Result<usize, KinDbError> {
         let _span = tracing::info_span!(
             "kindb.load_vector_index",
             path = %path.display()
@@ -3825,12 +3894,11 @@ impl InMemoryGraph {
         Ok(count)
     }
 
-    /// Load a persisted index, rejecting it ONLY if it positively declares a
-    /// model/graph identity incompatible with `expected` (a legacy unstamped
-    /// index is grandfathered and still loads).
+    /// Load a persisted index only when its model and graph descriptor proves
+    /// compatibility with `expected`.
     ///
-    /// Unlike [`InMemoryGraph::load_vector_index`], an incompatible or unreadable
-    /// index is NOT installed and does NOT error — it returns
+    /// An incompatible or unreadable index is NOT installed and does NOT error;
+    /// it returns
     /// [`VectorIndexLoad::Incompatible`] so the caller can archive + rebuild
     /// instead of crash-looping or serving silently-wrong neighbors. The in-memory
     /// index is left untouched on incompatibility.
@@ -3841,7 +3909,7 @@ impl InMemoryGraph {
         expected: &crate::vector::IndexDescriptor,
     ) -> crate::vector::VectorIndexLoad {
         use crate::vector::{IndexLoadOutcome, VectorIndexLoad};
-        match VectorIndex::load_compatible_grandfathered(path, expected) {
+        match VectorIndex::load_compatible(path, expected) {
             IndexLoadOutcome::Loaded(index) => {
                 let count = index.len();
                 *self.vector_index.lock() = Some(Arc::new(index));
@@ -3894,6 +3962,15 @@ impl InMemoryGraph {
         if let Some(ref index) = *self.vector_index.lock() {
             index.set_descriptor(descriptor);
         }
+    }
+
+    /// Return the loaded vector index's persisted compatibility descriptor.
+    #[cfg(feature = "vector")]
+    pub fn vector_index_descriptor(&self) -> Option<crate::vector::IndexDescriptor> {
+        self.vector_index
+            .lock()
+            .as_ref()
+            .map(|index| index.descriptor())
     }
 
     #[cfg(feature = "embeddings")]
@@ -4408,9 +4485,8 @@ impl InMemoryGraph {
     /// Drop the in-memory vector index so the next embedding pass rebuilds it
     /// from scratch at the CURRENT embedder dimension.
     ///
-    /// This is the migration path for a repo whose persisted index was built at
-    /// a different embedding dimension (e.g. an older 384-dim model) than the
-    /// model now in use (768-dim). A normal embed pass reuses the loaded index
+    /// This is the rebuild path when a persisted index was produced at a
+    /// different embedding dimension than the configured model. A normal embed pass reuses the loaded index
     /// and upserts fail with a dimension mismatch; clearing the in-memory index
     /// lets `queue_missing_for_embedding` re-queue every entity/artifact (the
     /// emptied index reports nothing as indexed) and `get_vector_index` lazily
@@ -5432,21 +5508,11 @@ impl InMemoryGraph {
 
     /// Delete a shallow tracked file by file path.
     pub fn delete_shallow_file(&self, file_id: &FilePathId) -> Result<(), KinDbError> {
-        let artifact_id = self.artifact_id_for_path(file_id).unwrap_or_else(|| {
-            let id = ArtifactId::seed_from_file_id(file_id);
-            id
-        });
+        let artifact_id = self.require_artifact_id(file_id)?;
 
         let mut ent = self.entities.write();
         let old = ent.shallow_files.remove(file_id);
         self.record_shallow_file_delta_remove(old, file_id.clone());
-        if !ent.structured_artifacts.contains_key(file_id)
-            && !ent.opaque_artifacts.contains_key(file_id)
-        {
-            ent.artifact_index.remove(file_id);
-            ent.artifact_reverse.remove(&artifact_id);
-            self.record_artifact_index_delta_remove(file_id.clone());
-        }
         drop(ent);
 
         let key = RetrievalKey::Artifact(artifact_id);
@@ -5542,20 +5608,6 @@ impl InMemoryGraph {
     // Incremental indexing helpers
     // -------------------------------------------------------------------
 
-    /// Record the content hash for a file.
-    pub fn set_file_hash(&self, path: &str, hash: [u8; 32]) {
-        self.entities
-            .write()
-            .file_hashes
-            .insert(path.to_string(), hash);
-        self.record_file_hash_delta_upsert(path.to_string(), hash);
-    }
-
-    /// Get the recorded hash for a file.
-    pub fn get_file_hash(&self, path: &str) -> Option<[u8; 32]> {
-        self.entities.read().file_hashes.get(path).copied()
-    }
-
     /// Remove all entities and their outgoing relations for entities in a given file.
     ///
     /// Incoming relations from OTHER files pointing to removed entities are kept
@@ -5569,8 +5621,6 @@ impl InMemoryGraph {
         let entity_ids: Vec<EntityId> = ent.indexes.by_file(path).to_vec();
 
         if entity_ids.is_empty() {
-            ent.file_hashes.remove(path);
-            self.record_file_hash_delta_remove(path.to_string());
             return Vec::new();
         }
 
@@ -5631,24 +5681,87 @@ impl InMemoryGraph {
             }
         }
 
-        // Also remove the file hash entry.
-        ent.file_hashes.remove(path);
-        self.record_file_hash_delta_remove(path.to_string());
         self.refresh_merkle_for_entities(&ent, merkle_seeds);
 
         entity_ids
     }
 
-    /// Get all file paths that have recorded content hashes.
-    pub fn indexed_file_paths(&self) -> Vec<String> {
-        self.entities.read().file_hashes.keys().cloned().collect()
+    /// Get all byte-exact paths present in the graph-owned repository tree.
+    pub fn repository_paths(&self) -> Vec<RepoPath> {
+        self.entities
+            .read()
+            .resolved_tree
+            .artifacts_by_path()
+            .map(|artifact| artifact.path.clone())
+            .collect()
+    }
+
+    /// Admit or update one UTF-8 artifact through the real tree transaction
+    /// path. Test-only ingestion helper; production callers supply identities
+    /// and deltas at the import/reconcile boundary.
+    #[cfg(test)]
+    pub(crate) fn admit_artifact_for_test(&self, path: &str, entry: TreeEntry) -> ArtifactId {
+        let path = RepoPath::from_utf8(path).expect("valid test repository path");
+        let existing = self.resolved_tree().artifact_at_path(&path).cloned();
+        let artifact_id = existing
+            .as_ref()
+            .map(|artifact| artifact.artifact_id)
+            .unwrap_or_else(ArtifactId::new);
+        if existing
+            .as_ref()
+            .is_some_and(|artifact| artifact.entry == entry)
+        {
+            return artifact_id;
+        }
+        let tree_delta = match existing {
+            Some(artifact) => TreeDelta::Updated {
+                artifact_id,
+                old: artifact.located_entry(),
+                new: LocatedEntry::new(path, entry),
+            },
+            None => TreeDelta::Added {
+                artifact_id,
+                new: LocatedEntry::new(path, entry),
+            },
+        };
+        self.apply_transaction_delta(&TransactionDelta {
+            entity_deltas: Vec::new(),
+            relation_deltas: Vec::new(),
+            tree_deltas: vec![tree_delta],
+            admission_policy_delta: None,
+        })
+        .expect("test artifact admission");
+        artifact_id
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tree_entry_for_test(&self, path: &str) -> Option<TreeEntry> {
+        let path = RepoPath::from_utf8(path).ok()?;
+        self.resolved_tree()
+            .artifact_at_path(&path)
+            .map(|artifact| artifact.entry)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn remove_admitted_artifact_for_test(&self, path: &str) -> Option<TreeEntry> {
+        let path = RepoPath::from_utf8(path).ok()?;
+        let artifact = self.resolved_tree().artifact_at_path(&path).cloned()?;
+        self.apply_transaction_delta(&TransactionDelta {
+            entity_deltas: Vec::new(),
+            relation_deltas: Vec::new(),
+            tree_deltas: vec![TreeDelta::Removed {
+                artifact_id: artifact.artifact_id,
+                old: artifact.located_entry(),
+            }],
+            admission_policy_delta: None,
+        })
+        .expect("test artifact removal");
+        Some(artifact.entry)
     }
 
     /// Get file paths that have at least one entity (function, class, etc.).
-    /// Unlike `indexed_file_paths` which returns every tracked file (including
-    /// build artifacts, configs, etc.), this returns only files the parser
-    /// extracted semantic entities from — the graph-native authority on what
-    /// constitutes source code.
+    /// Unlike [`Self::repository_paths`], which returns every admitted artifact,
+    /// this returns only files the parser extracted semantic entities from.
     pub fn entity_bearing_file_paths(&self) -> Vec<String> {
         self.entities.read().indexes.file.keys().cloned().collect()
     }
@@ -5668,7 +5781,6 @@ impl std::fmt::Debug for InMemoryGraph {
             .field("entities", &ent.entities.len())
             .field("relations", &ent.relations.len())
             .field("changes", &chg.changes.len())
-            .field("branches", &chg.branches.len())
             .finish()
     }
 }
@@ -5703,38 +5815,90 @@ fn remove_relations_for_entity(ent: &mut EntityData, entity_id: &EntityId) -> Ve
     removed
 }
 
-fn collect_artifact_text_index_docs<'a>(
-    ent: &'a EntityData,
-) -> impl Iterator<Item = (RetrievalKey, Vec<(String, f32)>)> + 'a {
-    ent.shallow_files
-        .values()
-        .map(|file| {
-            let id = ent
-                .artifact_index
-                .get(&file.file_id)
-                .copied()
-                .unwrap_or_else(|| ArtifactId::seed_from_file_id(&file.file_id));
-            (RetrievalKey::Artifact(id), shallow_file_fields(file))
-        })
-        .chain(ent.structured_artifacts.values().map(|artifact| {
-            let id = ent
-                .artifact_index
-                .get(&artifact.file_id)
-                .copied()
-                .unwrap_or_else(|| ArtifactId::seed_from_file_id(&artifact.file_id));
-            (
-                RetrievalKey::Artifact(id),
-                structured_artifact_fields(artifact),
-            )
-        }))
-        .chain(ent.opaque_artifacts.values().map(|artifact| {
-            let id = ent
-                .artifact_index
-                .get(&artifact.file_id)
-                .copied()
-                .unwrap_or_else(|| ArtifactId::seed_from_file_id(&artifact.file_id));
-            (RetrievalKey::Artifact(id), opaque_artifact_fields(artifact))
-        }))
+fn graph_node_is_admitted(
+    node: GraphNodeId,
+    entity_ids: &HashSet<EntityId>,
+    artifact_ids: &HashSet<ArtifactId>,
+    work: &WorkData,
+    verification: &VerificationData,
+) -> bool {
+    match node {
+        GraphNodeId::Entity(id) => entity_ids.contains(&id),
+        GraphNodeId::Artifact(id) => artifact_ids.contains(&id),
+        GraphNodeId::Test(id) => verification.test_cases.contains_key(&id),
+        GraphNodeId::Contract(id) => verification.contracts.contains_key(&id),
+        GraphNodeId::Work(id) => work.work_items.contains_key(&id),
+        GraphNodeId::VerificationRun(id) => verification.verification_runs.contains_key(&id),
+    }
+}
+
+fn admitted_artifact_id(ent: &EntityData, file_id: &FilePathId) -> Result<ArtifactId, KinDbError> {
+    let path = repo_path_for_file_path(file_id)?;
+    ent.resolved_tree.artifact_id_at_path(&path).ok_or_else(|| {
+        KinDbError::StorageError(format!(
+            "semantic enrichment exists without admitted repository identity at {}",
+            file_id.0
+        ))
+    })
+}
+
+fn validate_entity_enrichment_admission(ent: &EntityData) -> Result<(), KinDbError> {
+    for file_id in ent
+        .shallow_files
+        .keys()
+        .chain(ent.file_layouts.keys())
+        .chain(ent.structured_artifacts.keys())
+        .chain(ent.opaque_artifacts.keys())
+    {
+        admitted_artifact_id(ent, file_id)?;
+    }
+    Ok(())
+}
+
+fn tree_delta_invalidates_path_facets(delta: &TreeDelta) -> bool {
+    match (delta.old_state(), delta.new_state()) {
+        (Some(_), None) => true,
+        (Some(old), Some(new)) if old.path != new.path => true,
+        (
+            Some(LocatedEntry {
+                entry: TreeEntry::Blob { hash: old, .. },
+                ..
+            }),
+            Some(LocatedEntry {
+                entry: TreeEntry::Blob { hash: new, .. },
+                ..
+            }),
+        ) => old != new,
+        (Some(old), Some(new)) => old.entry != new.entry,
+        (None, _) => false,
+    }
+}
+
+fn collect_artifact_text_index_docs(
+    ent: &EntityData,
+) -> Result<Vec<(RetrievalKey, Vec<(String, f32)>)>, KinDbError> {
+    let mut docs = Vec::with_capacity(
+        ent.shallow_files.len() + ent.structured_artifacts.len() + ent.opaque_artifacts.len(),
+    );
+    for file in ent.shallow_files.values() {
+        docs.push((
+            RetrievalKey::Artifact(admitted_artifact_id(ent, &file.file_id)?),
+            shallow_file_fields(file),
+        ));
+    }
+    for artifact in ent.structured_artifacts.values() {
+        docs.push((
+            RetrievalKey::Artifact(admitted_artifact_id(ent, &artifact.file_id)?),
+            structured_artifact_fields(artifact),
+        ));
+    }
+    for artifact in ent.opaque_artifacts.values() {
+        docs.push((
+            RetrievalKey::Artifact(admitted_artifact_id(ent, &artifact.file_id)?),
+            opaque_artifact_fields(artifact),
+        ));
+    }
+    Ok(docs)
 }
 
 #[cfg(feature = "vector")]
@@ -5743,21 +5907,18 @@ fn collect_artifact_ids(ent: &EntityData) -> Vec<ArtifactId> {
         ent.shallow_files.len() + ent.structured_artifacts.len() + ent.opaque_artifacts.len(),
     );
 
-    for file_id in ent.shallow_files.keys() {
-        if let Some(id) = ent.artifact_index.get(file_id) {
-            ids.push(*id);
-        }
-    }
-    for file_id in ent.structured_artifacts.keys() {
-        if let Some(id) = ent.artifact_index.get(file_id) {
-            ids.push(*id);
-        }
-    }
-    for file_id in ent.opaque_artifacts.keys() {
-        if let Some(id) = ent.artifact_index.get(file_id) {
-            ids.push(*id);
-        }
-    }
+    ids.extend(ent.shallow_files.keys().map(|file_id| {
+        admitted_artifact_id(ent, file_id)
+            .expect("validated shallow enrichment must have repository identity")
+    }));
+    ids.extend(ent.structured_artifacts.keys().map(|file_id| {
+        admitted_artifact_id(ent, file_id)
+            .expect("validated structured enrichment must have repository identity")
+    }));
+    ids.extend(ent.opaque_artifacts.keys().map(|file_id| {
+        admitted_artifact_id(ent, file_id)
+            .expect("validated opaque enrichment must have repository identity")
+    }));
 
     ids
 }
@@ -5767,23 +5928,23 @@ fn artifact_embedding_doc(
     ent: &EntityData,
     artifact_id: &ArtifactId,
 ) -> Option<(RetrievalKey, String)> {
-    let file_path = ent.artifact_reverse.get(artifact_id)?;
+    let file_path = file_path_for_repo_path(&ent.resolved_tree.get(artifact_id)?.path)?;
 
-    if let Some(file) = ent.shallow_files.get(file_path) {
+    if let Some(file) = ent.shallow_files.get(&file_path) {
         return Some((
             RetrievalKey::Artifact(*artifact_id),
             crate::embed::format_shallow_text(file),
         ));
     }
 
-    if let Some(artifact) = ent.structured_artifacts.get(file_path) {
+    if let Some(artifact) = ent.structured_artifacts.get(&file_path) {
         return Some((
             RetrievalKey::Artifact(*artifact_id),
             crate::embed::format_artifact_text(artifact),
         ));
     }
 
-    if let Some(artifact) = ent.opaque_artifacts.get(file_path) {
+    if let Some(artifact) = ent.opaque_artifacts.get(&file_path) {
         return Some((
             RetrievalKey::Artifact(*artifact_id),
             crate::embed::format_opaque_text(artifact),
@@ -6016,11 +6177,8 @@ fn relation_embedding_label(kind: RelationKind, outgoing: bool) -> &'static str 
 impl EntityStore for InMemoryGraph {
     type Error = KinDbError;
 
-    // Graph-assigned artifact identity: generic `GraphStore` consumers resolve a
-    // path to its graph-owned `ArtifactId` through this override (delegates to the
-    // inherent O(1) artifact-index lookup) rather than re-deriving from the path.
-    fn artifact_id_for_path(&self, path: &FilePathId) -> Option<ArtifactId> {
-        InMemoryGraph::artifact_id_for_path(self, path)
+    fn artifact_id_at_path(&self, path: &RepoPath) -> Option<ArtifactId> {
+        InMemoryGraph::artifact_id_at_path(self, path)
     }
 
     // -----------------------------------------------------------------------
@@ -6522,7 +6680,7 @@ impl EntityStore for InMemoryGraph {
     }
 
     fn upsert_shallow_file(&self, shallow: &ShallowTrackedFile) -> Result<(), KinDbError> {
-        let artifact_id = self.ensure_artifact_id(&shallow.file_id);
+        let artifact_id = self.require_artifact_id(&shallow.file_id)?;
         let old = self
             .entities
             .write()
@@ -6554,7 +6712,7 @@ impl EntityStore for InMemoryGraph {
     }
 
     fn upsert_structured_artifact(&self, artifact: &StructuredArtifact) -> Result<(), KinDbError> {
-        let artifact_id = self.ensure_artifact_id(&artifact.file_id);
+        let artifact_id = self.require_artifact_id(&artifact.file_id)?;
         let old = self
             .entities
             .write()
@@ -6591,20 +6749,11 @@ impl EntityStore for InMemoryGraph {
     }
 
     fn delete_structured_artifact(&self, file_id: &FilePathId) -> Result<(), KinDbError> {
-        let artifact_id = self.artifact_id_for_path(file_id).unwrap_or_else(|| {
-            let id = ArtifactId::seed_from_file_id(file_id);
-            id
-        });
+        let artifact_id = self.require_artifact_id(file_id)?;
 
         let mut ent = self.entities.write();
         let old = ent.structured_artifacts.remove(file_id);
         self.record_structured_artifact_delta_remove(old, file_id.clone());
-        // Only remove the index if there are no other artifact types using this path
-        if !ent.shallow_files.contains_key(file_id) && !ent.opaque_artifacts.contains_key(file_id) {
-            ent.artifact_index.remove(file_id);
-            ent.artifact_reverse.remove(&artifact_id);
-            self.record_artifact_index_delta_remove(file_id.clone());
-        }
         drop(ent);
 
         let key = RetrievalKey::Artifact(artifact_id);
@@ -6618,7 +6767,7 @@ impl EntityStore for InMemoryGraph {
     }
 
     fn upsert_opaque_artifact(&self, artifact: &OpaqueArtifact) -> Result<(), KinDbError> {
-        let artifact_id = self.ensure_artifact_id(&artifact.file_id);
+        let artifact_id = self.require_artifact_id(&artifact.file_id)?;
         let old = self
             .entities
             .write()
@@ -6650,22 +6799,11 @@ impl EntityStore for InMemoryGraph {
     }
 
     fn delete_opaque_artifact(&self, file_id: &FilePathId) -> Result<(), KinDbError> {
-        let artifact_id = self.artifact_id_for_path(file_id).unwrap_or_else(|| {
-            let id = ArtifactId::seed_from_file_id(file_id);
-            id
-        });
+        let artifact_id = self.require_artifact_id(file_id)?;
 
         let mut ent = self.entities.write();
         let old = ent.opaque_artifacts.remove(file_id);
         self.record_opaque_artifact_delta_remove(old, file_id.clone());
-        // Only remove the index if there are no other artifact types using this path
-        if !ent.shallow_files.contains_key(file_id)
-            && !ent.structured_artifacts.contains_key(file_id)
-        {
-            ent.artifact_index.remove(file_id);
-            ent.artifact_reverse.remove(&artifact_id);
-            self.record_artifact_index_delta_remove(file_id.clone());
-        }
         drop(ent);
 
         let key = RetrievalKey::Artifact(artifact_id);
@@ -6679,7 +6817,7 @@ impl EntityStore for InMemoryGraph {
     }
 
     fn upsert_file_layout(&self, layout: &FileLayout) -> Result<(), KinDbError> {
-        self.ensure_artifact_id(&layout.file_id);
+        self.require_artifact_id(&layout.file_id)?;
         let old = self
             .entities
             .write()
@@ -6703,49 +6841,283 @@ impl EntityStore for InMemoryGraph {
             .collect())
     }
 
-    fn get_file_hash(&self, file_id: &FilePathId) -> Result<Option<Hash256>, KinDbError> {
+    fn get_tree_entry(&self, file_id: &FilePathId) -> Result<Option<TreeEntry>, KinDbError> {
+        let path = repo_path_for_file_path(file_id)?;
         Ok(self
             .entities
             .read()
-            .file_hashes
-            .get(&file_id.0)
-            .copied()
-            .map(Hash256::from_bytes))
+            .resolved_tree
+            .artifact_at_path(&path)
+            .map(|artifact| artifact.entry))
     }
 
     fn delete_file_layout(&self, file_id: &FilePathId) -> Result<(), KinDbError> {
-        let artifact_id = self.artifact_id_for_path(file_id).unwrap_or_else(|| {
-            let id = ArtifactId::seed_from_file_id(file_id);
-            id
-        });
+        self.require_artifact_id(file_id)?;
 
         let mut ent = self.entities.write();
         let old = ent.file_layouts.remove(file_id);
         self.record_file_layout_delta_remove(old, file_id.clone());
-        if !ent.shallow_files.contains_key(file_id)
-            && !ent.structured_artifacts.contains_key(file_id)
-            && !ent.opaque_artifacts.contains_key(file_id)
-        {
-            ent.artifact_index.remove(file_id);
-            ent.artifact_reverse.remove(&artifact_id);
-            self.record_artifact_index_delta_remove(file_id.clone());
-        }
         Ok(())
     }
 
     fn apply_transaction_delta(&self, delta: &TransactionDelta) -> Result<(), KinDbError> {
+        kin_model::validate_transaction_delta(delta)?;
+        if delta.admission_policy_delta.is_some() {
+            return Err(KinDbError::StorageError(
+                "admission policy is repository authority; commit it through \
+                 commit_repository_transaction instead of mutating an InMemoryGraph"
+                    .to_string(),
+            ));
+        }
         let mut affected = HashSet::new();
-        let mut deleted_entities = Vec::new();
+        let mut deleted_entities = HashSet::new();
         let mut merkle_seeds = HashSet::new();
+        let mut retired_artifact_indexes = HashSet::new();
 
         {
             let mut ent = self.entities.write();
 
-            // 1. Process entity deltas
+            // Validate the complete identity-bearing tree transition against
+            // one parent state before mutating any graph domain. ResolvedTree
+            // removes every old location before inserting any new location, so
+            // swaps, cycles, and remove-then-reuse are one atomic transaction.
+            let staged_tree = ent
+                .resolved_tree
+                .apply(&delta.tree_deltas)
+                .map_err(tree_state_error)?;
+
+            // Validate every explicit old/new entity transition against one
+            // pre-transaction state before changing authority. A tree change
+            // never infers entity or relation deletion: those transitions must
+            // be present in the self-inverting semantic delta.
+            let mut prospective_entities = ent.entities.clone();
+            let mut entities_requiring_tree_validation = HashSet::new();
+            for entity_delta in &delta.entity_deltas {
+                match entity_delta {
+                    EntityDelta::Added { new: entity } => {
+                        if prospective_entities.contains_key(&entity.id) {
+                            return Err(KinDbError::StorageError(format!(
+                                "transaction adds existing entity {}",
+                                entity.id
+                            )));
+                        }
+                        prospective_entities.insert(entity.id, entity.clone());
+                        entities_requiring_tree_validation.insert(entity.id);
+                    }
+                    EntityDelta::Modified { old, new } => {
+                        if old.id != new.id {
+                            return Err(KinDbError::StorageError(format!(
+                                "transaction entity modification changes identity from {} to {}",
+                                old.id, new.id
+                            )));
+                        }
+                        if prospective_entities.get(&old.id) != Some(old) {
+                            return Err(KinDbError::StorageError(format!(
+                                "transaction has stale old payload for entity {}",
+                                old.id
+                            )));
+                        }
+                        prospective_entities.insert(new.id, new.clone());
+                        entities_requiring_tree_validation.insert(new.id);
+                    }
+                    EntityDelta::Removed { old } => {
+                        if prospective_entities.get(&old.id) != Some(old) {
+                            return Err(KinDbError::StorageError(format!(
+                                "transaction has stale old payload for removed entity {}",
+                                old.id
+                            )));
+                        }
+                        prospective_entities.remove(&old.id);
+                    }
+                }
+            }
+            let invalidated_paths: HashSet<_> = delta
+                .tree_deltas
+                .iter()
+                .filter_map(TreeDelta::old_state)
+                .filter_map(|old| file_path_for_repo_path(&old.path))
+                .collect();
+            entities_requiring_tree_validation.extend(prospective_entities.values().filter_map(
+                |entity| {
+                    entity
+                        .file_origin
+                        .as_ref()
+                        .is_some_and(|path| invalidated_paths.contains(path))
+                        .then_some(entity.id)
+                },
+            ));
+            for entity_id in entities_requiring_tree_validation {
+                let Some(entity) = prospective_entities.get(&entity_id) else {
+                    continue;
+                };
+                let Some(file_id) = entity.file_origin.as_ref() else {
+                    continue;
+                };
+                let path = repo_path_for_file_path(file_id)?;
+                if staged_tree.artifact_id_at_path(&path).is_none() {
+                    return Err(KinDbError::StorageError(format!(
+                        "transaction leaves entity {} on repository path {} absent from the staged tree; carry its exact entity removal or relocation in the same delta",
+                        entity.id, file_id.0
+                    )));
+                }
+            }
+            let prospective_entity_ids: HashSet<EntityId> =
+                prospective_entities.keys().copied().collect();
+
+            let staged_artifact_ids: HashSet<ArtifactId> = staged_tree
+                .artifacts()
+                .map(|artifact| artifact.artifact_id)
+                .collect();
+            let mut prospective_relations = ent.relations.clone();
+            for relation_delta in &delta.relation_deltas {
+                match relation_delta {
+                    RelationDelta::Added { new } => {
+                        if prospective_relations.contains_key(&new.id) {
+                            return Err(KinDbError::StorageError(format!(
+                                "transaction adds existing relation {}",
+                                new.id
+                            )));
+                        }
+                        prospective_relations.insert(new.id, new.clone());
+                    }
+                    RelationDelta::Modified { old, new } => {
+                        if old.id != new.id {
+                            return Err(KinDbError::StorageError(format!(
+                                "transaction relation modification changes identity from {} to {}",
+                                old.id, new.id
+                            )));
+                        }
+                        if prospective_relations.get(&old.id) != Some(old) {
+                            return Err(KinDbError::StorageError(format!(
+                                "transaction has stale old payload for relation {}",
+                                old.id
+                            )));
+                        }
+                        prospective_relations.insert(new.id, new.clone());
+                    }
+                    RelationDelta::Removed { old } => {
+                        if prospective_relations.get(&old.id) != Some(old) {
+                            return Err(KinDbError::StorageError(format!(
+                                "transaction has stale old payload for removed relation {}",
+                                old.id
+                            )));
+                        }
+                        prospective_relations.remove(&old.id);
+                    }
+                }
+            }
+            let work = self.work.read();
+            let verification = self.verification.read();
+            for relation in prospective_relations.values() {
+                for (side, node) in [("source", relation.src), ("destination", relation.dst)] {
+                    if !graph_node_is_admitted(
+                        node,
+                        &prospective_entity_ids,
+                        &staged_artifact_ids,
+                        &work,
+                        &verification,
+                    ) {
+                        return Err(KinDbError::StorageError(format!(
+                            "transaction relation {} has unadmitted {side} endpoint {node}",
+                            relation.id
+                        )));
+                    }
+                }
+            }
+            drop(verification);
+            drop(work);
+
+            // Keep the whole graph transaction in one persistence batch. The
+            // normal record_* helpers take this lock per mutation; doing that
+            // here would let a persistence detach split tree, facet, entity,
+            // and relation effects across different durable deltas.
+            let mut pending = self.pending_delta.lock();
+
+            // 1. Retire path-keyed enrichment through the identity-bearing old
+            // tree state before publishing the new tree. A later path lookup
+            // cannot authenticate a cleanup after a removal or move, while the
+            // validated TreeDelta still proves the exact ArtifactId, location,
+            // and materialization being replaced. Keeping this under the same
+            // entity lock makes the tree and its derived facets one atomic
+            // graph-truth transition.
+            for tree_delta in &delta.tree_deltas {
+                if !tree_delta_invalidates_path_facets(tree_delta) {
+                    continue;
+                }
+                let Some(old_state) = tree_delta.old_state() else {
+                    continue;
+                };
+                let Some(file_id) = file_path_for_repo_path(&old_state.path) else {
+                    continue;
+                };
+                let artifact_id = tree_delta.artifact_id();
+                retired_artifact_indexes.insert(artifact_id);
+
+                if let Some(old) = ent.file_layouts.remove(&file_id) {
+                    delta_vec_remove_by_key(
+                        &mut pending.delta.file_layouts,
+                        Some(old),
+                        file_id.clone(),
+                        |layout| layout.file_id.clone(),
+                    );
+                }
+                if let Some(old) = ent.shallow_files.remove(&file_id) {
+                    delta_vec_remove_by_key(
+                        &mut pending.delta.shallow_files,
+                        Some(old),
+                        file_id.clone(),
+                        |file| file.file_id.clone(),
+                    );
+                    retired_artifact_indexes.insert(artifact_id);
+                }
+                if let Some(old) = ent.structured_artifacts.remove(&file_id) {
+                    delta_vec_remove_by_key(
+                        &mut pending.delta.structured_artifacts,
+                        Some(old),
+                        file_id.clone(),
+                        |artifact| artifact.file_id.clone(),
+                    );
+                    retired_artifact_indexes.insert(artifact_id);
+                }
+                if let Some(old) = ent.opaque_artifacts.remove(&file_id) {
+                    delta_vec_remove_by_key(
+                        &mut pending.delta.opaque_artifacts,
+                        Some(old),
+                        file_id,
+                        |artifact| artifact.file_id.clone(),
+                    );
+                    retired_artifact_indexes.insert(artifact_id);
+                }
+            }
+
+            // 2. Publish exact repository-tree truth and its persistence delta.
+            for tree_delta in &delta.tree_deltas {
+                let artifact_id = tree_delta.artifact_id();
+                if let Some(new) = tree_delta.new_state() {
+                    delta_map_upsert(&mut pending.delta.resolved_tree, artifact_id, new.clone());
+                } else {
+                    delta_map_remove(&mut pending.delta.resolved_tree, artifact_id);
+                }
+            }
+            ent.resolved_tree = staged_tree;
+
+            // 3. Process entity deltas.
             for ent_delta in &delta.entity_deltas {
                 match ent_delta {
-                    EntityDelta::Added(entity) | EntityDelta::Modified { new: entity, .. } => {
-                        if let Some(old) = ent.entities.remove(&entity.id) {
+                    EntityDelta::Added { new: entity } => {
+                        ent.indexes.insert(
+                            entity.id,
+                            &entity.name,
+                            entity.file_origin.as_ref(),
+                            entity.kind,
+                        );
+                        ent.entities.insert(entity.id, entity.clone());
+                        delta_map_upsert(&mut pending.delta.entities, entity.id, entity.clone());
+                        affected.insert(entity.id);
+                        merkle_seeds.insert(entity.id);
+                    }
+                    EntityDelta::Modified { old, new: entity } => {
+                        if ent.entities.remove(&entity.id).is_some() {
                             let name_changed = old.name != entity.name;
                             let file_changed = old.file_origin != entity.file_origin;
                             let kind_changed = old.kind != entity.kind;
@@ -6764,99 +7136,135 @@ impl EntityStore for InMemoryGraph {
                                     entity.kind,
                                 );
                             }
-                        } else {
-                            ent.indexes.insert(
-                                entity.id,
-                                &entity.name,
-                                entity.file_origin.as_ref(),
-                                entity.kind,
-                            );
                         }
 
                         ent.entities.insert(entity.id, entity.clone());
-                        self.record_entity_delta_upsert(entity.clone());
+                        delta_map_upsert(&mut pending.delta.entities, entity.id, entity.clone());
                         affected.insert(entity.id);
                         merkle_seeds.insert(entity.id);
                     }
-                    EntityDelta::Removed(id) => {
-                        deleted_entities.push(*id);
-                        merkle_seeds.insert(*id);
-                        if let Some(entity) = ent.entities.remove(id) {
-                            ent.indexes.remove(
-                                &entity.id,
-                                &entity.name,
-                                entity.file_origin.as_ref(),
-                                entity.kind,
-                            );
-                            if let Some(ref ti) = self.text_index {
-                                let _ = ti.remove(id);
-                                self.text_dirty.store(true, Ordering::Release);
-                            }
-
-                            if let Some(outgoing) = ent.outgoing.get(id) {
-                                for rel_id in outgoing {
-                                    if let Some(rel) = ent.relations.get(rel_id) {
-                                        if let Some(neighbor) =
-                                            entity_neighbor_for_relation(rel, id)
-                                        {
-                                            affected.insert(neighbor);
-                                            merkle_seeds.insert(neighbor);
-                                        }
-                                    }
-                                }
-                            }
-                            if let Some(incoming) = ent.incoming.get(id) {
-                                for rel_id in incoming {
-                                    if let Some(rel) = ent.relations.get(rel_id) {
-                                        if let Some(neighbor) =
-                                            entity_neighbor_for_relation(rel, id)
-                                        {
-                                            affected.insert(neighbor);
-                                            merkle_seeds.insert(neighbor);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        let removed_relations = remove_relations_for_entity(&mut ent, id);
-                        self.record_entity_delta_remove(*id);
-                        for relation in &removed_relations {
-                            self.record_relation_delta_remove(&ent, relation);
-                        }
+                    EntityDelta::Removed { old } => {
+                        ent.entities.remove(&old.id);
+                        ent.indexes
+                            .remove(&old.id, &old.name, old.file_origin.as_ref(), old.kind);
+                        delta_map_remove(&mut pending.delta.entities, old.id);
+                        affected.insert(old.id);
+                        merkle_seeds.insert(old.id);
+                        deleted_entities.insert(old.id);
                     }
                 }
             }
 
-            // 2. Process relation deltas
+            // 4. Process relation deltas.
             for rel_delta in &delta.relation_deltas {
                 match rel_delta {
-                    RelationDelta::Added(relation) => {
-                        if let Some(old) = ent.relations.remove(&relation.id) {
-                            affected.extend(entity_ids_for_relation(&old));
-                            merkle_seeds.extend(entity_ids_for_relation(&old));
-                            remove_relation_indexes(&mut ent, &old);
-                            self.record_relation_delta_remove(&ent, &old);
-                        }
+                    RelationDelta::Added { new: relation } => {
                         insert_relation_indexes(&mut ent, relation);
                         ent.relations.insert(relation.id, relation.clone());
-                        self.record_relation_delta_upsert(&ent, relation.clone());
+                        delta_map_upsert(
+                            &mut pending.delta.relations,
+                            relation.id,
+                            relation.clone(),
+                        );
+                        record_relation_edge_delta(&mut pending, &ent, relation);
                         affected.extend(entity_ids_for_relation(relation));
                         merkle_seeds.extend(entity_ids_for_relation(relation));
                     }
-                    RelationDelta::Removed(id) => {
-                        if let Some(rel) = ent.relations.remove(id) {
-                            affected.extend(entity_ids_for_relation(&rel));
-                            merkle_seeds.extend(entity_ids_for_relation(&rel));
-                            remove_relation_indexes(&mut ent, &rel);
-                            self.record_relation_delta_remove(&ent, &rel);
-                        }
+                    RelationDelta::Modified { old, new } => {
+                        ent.relations.remove(&old.id);
+                        affected.extend(entity_ids_for_relation(old));
+                        merkle_seeds.extend(entity_ids_for_relation(old));
+                        remove_relation_indexes(&mut ent, old);
+                        insert_relation_indexes(&mut ent, new);
+                        ent.relations.insert(new.id, new.clone());
+                        delta_map_upsert(&mut pending.delta.relations, new.id, new.clone());
+                        record_relation_edge_delta(&mut pending, &ent, old);
+                        record_relation_edge_delta(&mut pending, &ent, new);
+                        affected.extend(entity_ids_for_relation(new));
+                        merkle_seeds.extend(entity_ids_for_relation(new));
+                    }
+                    RelationDelta::Removed { old } => {
+                        ent.relations.remove(&old.id);
+                        affected.extend(entity_ids_for_relation(old));
+                        merkle_seeds.extend(entity_ids_for_relation(old));
+                        remove_relation_indexes(&mut ent, old);
+                        delta_map_remove(&mut pending.delta.relations, old.id);
+                        record_relation_edge_delta(&mut pending, &ent, old);
                     }
                 }
             }
+            deleted_entities.retain(|entity_id| !ent.entities.contains_key(entity_id));
             self.refresh_merkle_for_entities(&ent, merkle_seeds.iter().copied());
         }
 
-        // 3. Clean up deleted entities from the embedding queue / vector index
+        // Authority is now committed. Every operation below touches only
+        // derived retrieval state and must never turn this successful
+        // transaction into an `Err` that a caller might retry against the new
+        // tree. A failed cache mutation quarantines that cache for a rebuild.
+        #[cfg(test)]
+        let injected_derived_failure = self
+            .fail_next_transaction_derived_cleanup
+            .swap(false, Ordering::AcqRel);
+        #[cfg(not(test))]
+        let injected_derived_failure = false;
+        let mut vector_quarantine_error = injected_derived_failure.then(|| {
+            KinDbError::StorageError("injected post-authority vector cleanup failure".to_string())
+        });
+        if injected_derived_failure {
+            let error = KinDbError::StorageError(
+                "injected post-authority text cleanup failure".to_string(),
+            );
+            self.quarantine_text_index_after_authority_commit(
+                "fault-injected transaction cleanup",
+                &error,
+            );
+        }
+
+        let mut deleted_entities: Vec<EntityId> = deleted_entities.into_iter().collect();
+        deleted_entities.sort_unstable();
+        if !injected_derived_failure && !deleted_entities.is_empty() {
+            if let Some(ref text_index) = self.text_index {
+                if let Err(error) = text_index.remove_batch(&deleted_entities) {
+                    self.quarantine_text_index_after_authority_commit(
+                        "retiring invalidated entities",
+                        &error,
+                    );
+                } else {
+                    self.text_dirty.store(true, Ordering::Release);
+                }
+            }
+        }
+
+        // 5. Retire derived retrieval state for exact-tree artifacts. Sort for
+        // deterministic vector free-list reuse.
+        let mut retired_artifact_indexes: Vec<ArtifactId> =
+            retired_artifact_indexes.into_iter().collect();
+        retired_artifact_indexes.sort_unstable();
+        for artifact_id in &retired_artifact_indexes {
+            let key = RetrievalKey::Artifact(*artifact_id);
+            if !injected_derived_failure {
+                if let Err(error) = self.remove_retrievable_text_index(&key) {
+                    self.quarantine_text_index_after_authority_commit(
+                        "retiring an invalidated artifact",
+                        &error,
+                    );
+                }
+            }
+            if vector_quarantine_error.is_none() {
+                if let Err(error) = self.remove_retrievable_vector(&key) {
+                    vector_quarantine_error = Some(error);
+                }
+            }
+        }
+        #[cfg(feature = "vector")]
+        {
+            let mut queue = self.artifact_embedding_queue.lock();
+            for artifact_id in &retired_artifact_indexes {
+                queue.remove(artifact_id);
+            }
+        }
+
+        // 6. Clean up deleted entities from the embedding queue / vector index
         #[cfg(feature = "vector")]
         {
             let mut eq = self.embedding_queue.lock();
@@ -6864,16 +7272,34 @@ impl EntityStore for InMemoryGraph {
             for id in &deleted_entities {
                 eq.remove(&RetrievalKey::Entity(*id));
                 if let Some(ref vi) = *vi_lock {
-                    let _ = vi.remove(id);
+                    if vector_quarantine_error.is_none() {
+                        if let Err(error) = vi.remove(id) {
+                            vector_quarantine_error = Some(error);
+                        }
+                    }
                 }
             }
         }
 
-        // 4. Invalidate / refresh text index & embeddings for affected entities
-        let affected_list: Vec<EntityId> = affected.into_iter().collect();
+        // 7. Invalidate / refresh text index & embeddings for affected entities
+        let mut affected_list: Vec<EntityId> = affected
+            .into_iter()
+            .filter(|entity_id| !deleted_entities.contains(entity_id))
+            .collect();
+        affected_list.sort_unstable();
         if !affected_list.is_empty() {
             self.refresh_text_index_for_entities(&affected_list);
-            self.invalidate_entities_for_embedding(&affected_list)?;
+            if vector_quarantine_error.is_none() {
+                if let Err(error) = self.invalidate_entities_for_embedding(&affected_list) {
+                    vector_quarantine_error = Some(error);
+                }
+            }
+        }
+        if let Some(error) = vector_quarantine_error {
+            self.quarantine_vector_index_after_authority_commit(
+                "retiring exact-tree/entity retrieval state",
+                &error,
+            );
         }
 
         Ok(())
@@ -7093,9 +7519,9 @@ impl ChangeStore for InMemoryGraph {
             .values()
             .filter(|change| {
                 change.entity_deltas.iter().any(|delta| match delta {
-                    EntityDelta::Added(e) => e.id == *id,
+                    EntityDelta::Added { new } => new.id == *id,
                     EntityDelta::Modified { old, new } => old.id == *id || new.id == *id,
-                    EntityDelta::Removed(eid) => eid == id,
+                    EntityDelta::Removed { old } => old.id == *id,
                 })
             })
             .cloned()
@@ -7158,6 +7584,7 @@ impl ChangeStore for InMemoryGraph {
 
     fn create_change(&self, change: &SemanticChange) -> Result<(), KinDbError> {
         let payload = semantic_change_payload(change)?;
+        validate_semantic_change(change)?;
         let mut ent = self.entities.write();
         let mut chg = self.changes.write();
         if let Some(existing) = chg.changes.get(&change.id) {
@@ -7167,17 +7594,21 @@ impl ChangeStore for InMemoryGraph {
             return Err(KinDbError::DuplicateChange(change.id.to_string()));
         }
 
+        // Revisions, child edges, and the change payload are one durable
+        // mutation. Keep the pending-delta lock for the entire authority
+        // transition so a concurrent persistence detach cannot split them
+        // across generations.
+        let mut pending = self.pending_delta.lock();
         let superseded_revisions = append_entity_revisions(&mut ent, change);
-        #[cfg(feature = "vector")]
-        self.note_superseded_vectors(&superseded_revisions);
-        #[cfg(not(feature = "vector"))]
-        let _ = superseded_revisions;
+        run_create_change_after_revision_hook();
         let revision_updates: Vec<(EntityId, Vec<EntityRevision>)> = change
             .entity_deltas
             .iter()
             .map(|delta| match delta {
-                EntityDelta::Added(entity) | EntityDelta::Modified { new: entity, .. } => entity.id,
-                EntityDelta::Removed(id) => *id,
+                EntityDelta::Added { new: entity } | EntityDelta::Modified { new: entity, .. } => {
+                    entity.id
+                }
+                EntityDelta::Removed { old } => old.id,
             })
             .filter_map(|entity_id| {
                 ent.entity_revisions
@@ -7187,17 +7618,27 @@ impl ChangeStore for InMemoryGraph {
             })
             .collect();
         for (entity_id, revisions) in revision_updates {
-            self.record_entity_revisions_delta_upsert(entity_id, revisions);
+            delta_map_upsert(&mut pending.delta.entity_revisions, entity_id, revisions);
         }
         // Register in parent → children index
         for parent in &change.parents {
             let children = chg.change_children.entry(*parent).or_default();
             children.push(change.id);
-            self.record_change_children_delta_upsert(*parent, children.clone());
+            delta_map_upsert(
+                &mut pending.delta.change_children,
+                *parent,
+                children.clone(),
+            );
         }
 
         chg.changes.insert(change.id, change.clone());
-        self.record_change_delta_upsert(change.clone());
+        delta_map_upsert(&mut pending.delta.changes, change.id, change.clone());
+        drop(pending);
+
+        #[cfg(feature = "vector")]
+        self.note_superseded_vectors(&superseded_revisions);
+        #[cfg(not(feature = "vector"))]
+        let _ = superseded_revisions;
         Ok(())
     }
 
@@ -7230,53 +7671,6 @@ impl ChangeStore for InMemoryGraph {
         // Reverse so oldest-first
         result.reverse();
         Ok(result)
-    }
-
-    // -----------------------------------------------------------------------
-    // Branch operations — changes lock only
-    // -----------------------------------------------------------------------
-
-    fn get_branch(&self, name: &BranchName) -> Result<Option<Branch>, KinDbError> {
-        Ok(self.changes.read().branches.get(name).cloned())
-    }
-
-    fn create_branch(&self, branch: &Branch) -> Result<(), KinDbError> {
-        let mut chg = self.changes.write();
-        if chg.branches.contains_key(&branch.name) {
-            return Err(KinDbError::DuplicateEntity(format!(
-                "branch '{}' already exists",
-                branch.name
-            )));
-        }
-        chg.branches.insert(branch.name.clone(), branch.clone());
-        self.record_branch_delta_upsert(branch.clone());
-        Ok(())
-    }
-
-    fn update_branch_head(
-        &self,
-        name: &BranchName,
-        new_head: &SemanticChangeId,
-    ) -> Result<(), KinDbError> {
-        let mut chg = self.changes.write();
-        match chg.branches.get_mut(name) {
-            Some(branch) => {
-                branch.head = *new_head;
-                self.record_branch_delta_upsert(branch.clone());
-                Ok(())
-            }
-            None => Err(KinDbError::NotFound(format!("branch '{}'", name))),
-        }
-    }
-
-    fn delete_branch(&self, name: &BranchName) -> Result<(), KinDbError> {
-        self.changes.write().branches.remove(name);
-        self.record_branch_delta_remove(name.clone());
-        Ok(())
-    }
-
-    fn list_branches(&self) -> Result<Vec<Branch>, KinDbError> {
-        Ok(self.changes.read().branches.values().cloned().collect())
     }
 }
 
@@ -7374,6 +7768,16 @@ impl InMemoryGraph {
             return Ok(());
         }
 
+        // Validate the complete immutable identity and exact payload of every
+        // item before acquiring any graph lock. A spoofed later item therefore
+        // cannot expose a partial batch or append a pending persistence delta.
+        let mut validated = Vec::with_capacity(changes.len());
+        for change in changes {
+            let payload = semantic_change_payload(&change)?;
+            validate_semantic_change(&change)?;
+            validated.push((change, payload));
+        }
+
         // Domain lock order is part of InMemoryGraph's deadlock contract:
         // entities -> changes. Holding both makes a batch appear as one ordered
         // import to readers instead of exposing a partially registered DAG.
@@ -7385,10 +7789,9 @@ impl InMemoryGraph {
         // bit-exact payloads are idempotent; a differing payload under the
         // same content identity is corruption and rejects the whole batch
         // atomically.
-        let mut unique_changes = Vec::with_capacity(changes.len());
+        let mut unique_changes = Vec::with_capacity(validated.len());
         let mut batch_payloads = HashMap::new();
-        for change in changes {
-            let payload = semantic_change_payload(&change)?;
+        for (change, payload) in validated {
             if let Some(existing) = chg.changes.get(&change.id) {
                 if semantic_change_payload(existing)? == payload {
                     continue;
@@ -7420,8 +7823,10 @@ impl InMemoryGraph {
         for change in unique_changes {
             superseded_revisions.extend(append_entity_revisions(&mut ent, &change));
             for entity_id in change.entity_deltas.iter().map(|delta| match delta {
-                EntityDelta::Added(entity) | EntityDelta::Modified { new: entity, .. } => entity.id,
-                EntityDelta::Removed(id) => *id,
+                EntityDelta::Added { new: entity } | EntityDelta::Modified { new: entity, .. } => {
+                    entity.id
+                }
+                EntityDelta::Removed { old } => old.id,
             }) {
                 // Sequential create_change records the first delta slot only
                 // once a revision chain exists. A removal before an add has no
@@ -9060,6 +9465,847 @@ mod tests {
         }
     }
 
+    fn seal_change(mut change: SemanticChange) -> SemanticChange {
+        change.id =
+            kin_model::compute_semantic_change_id(&change).expect("valid semantic change fixture");
+        change
+    }
+
+    fn admit_change(graph: &InMemoryGraph, change: SemanticChange) -> SemanticChangeId {
+        let change = seal_change(change);
+        let id = change.id;
+        graph.create_change(&change).expect("valid change fixture");
+        id
+    }
+
+    fn assert_no_change_admission(graph: &InMemoryGraph) {
+        let snapshot = graph.to_snapshot();
+        assert!(snapshot.changes.is_empty());
+        assert!(snapshot.entity_revisions.is_empty());
+        assert!(snapshot.change_children.is_empty());
+        assert!(snapshot.resolved_tree.is_empty());
+        assert!(!graph.has_pending_delta());
+    }
+
+    fn test_repo_path(path: &str) -> RepoPath {
+        RepoPath::from_utf8(path).unwrap()
+    }
+
+    fn test_located(path: &str, entry: TreeEntry) -> LocatedEntry {
+        LocatedEntry::new(test_repo_path(path), entry)
+    }
+
+    fn admit_enrichment(
+        graph: &InMemoryGraph,
+        file_id: &FilePathId,
+        content_hash: Hash256,
+    ) -> ArtifactId {
+        graph.admit_artifact_for_test(&file_id.0, TreeEntry::blob(content_hash, false))
+    }
+
+    #[test]
+    fn transaction_applies_exact_non_language_tree_transitions() {
+        let graph = InMemoryGraph::new();
+        let file_id = FilePathId::new("compose.yaml");
+        let artifact_id = ArtifactId::new();
+        let regular = TreeEntry::blob(Hash256::from_bytes([0x11; 32]), false);
+        let executable = TreeEntry::blob(Hash256::from_bytes([0x11; 32]), true);
+        let symlink = TreeEntry::symlink(Hash256::from_bytes([0x22; 32]));
+
+        graph
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: Vec::new(),
+                relation_deltas: Vec::new(),
+                tree_deltas: vec![TreeDelta::Added {
+                    artifact_id,
+                    new: test_located(&file_id.0, regular),
+                }],
+                admission_policy_delta: None,
+            })
+            .unwrap();
+        assert_eq!(graph.get_tree_entry(&file_id).unwrap(), Some(regular));
+
+        graph
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: Vec::new(),
+                relation_deltas: Vec::new(),
+                tree_deltas: vec![TreeDelta::Updated {
+                    artifact_id,
+                    old: test_located(&file_id.0, regular),
+                    new: test_located(&file_id.0, executable),
+                }],
+                admission_policy_delta: None,
+            })
+            .unwrap();
+        assert_eq!(graph.get_tree_entry(&file_id).unwrap(), Some(executable));
+
+        graph
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: Vec::new(),
+                relation_deltas: Vec::new(),
+                tree_deltas: vec![TreeDelta::Updated {
+                    artifact_id,
+                    old: test_located(&file_id.0, executable),
+                    new: test_located(&file_id.0, symlink),
+                }],
+                admission_policy_delta: None,
+            })
+            .unwrap();
+        assert_eq!(graph.get_tree_entry(&file_id).unwrap(), Some(symlink));
+    }
+
+    #[test]
+    fn tree_mode_only_update_preserves_content_derived_facets() {
+        let graph = InMemoryGraph::new();
+        let file_id = FilePathId::new("Makefile");
+        let hash = Hash256::from_bytes([0x10; 32]);
+        let regular = TreeEntry::blob(hash, false);
+        let executable = TreeEntry::blob(hash, true);
+        let artifact_id = graph.admit_artifact_for_test(&file_id.0, regular);
+        let artifact = StructuredArtifact {
+            file_id: file_id.clone(),
+            kind: ArtifactKind::Makefile,
+            content_hash: hash,
+            text_preview: Some("build:".into()),
+        };
+        let entity = test_entity("make_target", &file_id.0);
+        graph.upsert_entity(&entity).unwrap();
+        graph.upsert_structured_artifact(&artifact).unwrap();
+        graph.clear_pending_delta();
+
+        graph
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: Vec::new(),
+                relation_deltas: Vec::new(),
+                tree_deltas: vec![TreeDelta::Updated {
+                    artifact_id,
+                    old: test_located(&file_id.0, regular),
+                    new: test_located(&file_id.0, executable),
+                }],
+                admission_policy_delta: None,
+            })
+            .unwrap();
+
+        assert_eq!(graph.get_tree_entry(&file_id).unwrap(), Some(executable));
+        assert_eq!(
+            graph
+                .get_structured_artifact(&file_id)
+                .unwrap()
+                .expect("content-identical facet must remain")
+                .content_hash,
+            hash
+        );
+        assert!(
+            graph.get_entity(&entity.id).unwrap().is_some(),
+            "mode-only transitions must preserve entities derived from identical bytes"
+        );
+        let pending = graph
+            .pending_delta_snapshot(0)
+            .expect("mode transition must be persisted");
+        assert!(pending.structured_artifacts.is_empty());
+    }
+
+    #[test]
+    fn explicit_content_change_removals_preserve_semantic_revision_history() {
+        let graph = InMemoryGraph::new();
+        let changed_file = FilePathId::new("src/changed.rs");
+        let neighbor_file = FilePathId::new("src/neighbor.rs");
+        let old_entry = TreeEntry::blob(Hash256::from_bytes([0x12; 32]), false);
+        let new_entry = TreeEntry::blob(Hash256::from_bytes([0x13; 32]), false);
+        let artifact_id = graph.admit_artifact_for_test(&changed_file.0, old_entry);
+        graph.admit_artifact_for_test(
+            &neighbor_file.0,
+            TreeEntry::blob(Hash256::from_bytes([0x14; 32]), false),
+        );
+
+        let retired = test_entity("retired", &changed_file.0);
+        let neighbor = test_entity("neighbor", &neighbor_file.0);
+        graph.upsert_entity(&retired).unwrap();
+        graph.upsert_entity(&neighbor).unwrap();
+        let relation = test_relation(retired.id, neighbor.id, RelationKind::Calls);
+        graph.upsert_relation(&relation).unwrap();
+        admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+                parents: Vec::new(),
+                timestamp: Timestamp::now(),
+                author: AuthorId::new("tester"),
+                message: "record retired revision".into(),
+                entity_deltas: vec![EntityDelta::Added {
+                    new: retired.clone(),
+                }],
+                relation_deltas: Vec::new(),
+                tree_deltas: Vec::new(),
+                projected_files: vec![changed_file.clone()],
+                spec_link: None,
+                evidence: Vec::new(),
+                risk_summary: None,
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
+            },
+        );
+        assert!(graph
+            .to_snapshot()
+            .entity_revisions
+            .contains_key(&retired.id));
+        graph.clear_pending_delta();
+
+        graph
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: vec![EntityDelta::Removed {
+                    old: retired.clone(),
+                }],
+                relation_deltas: vec![RelationDelta::Removed {
+                    old: relation.clone(),
+                }],
+                tree_deltas: vec![TreeDelta::Updated {
+                    artifact_id,
+                    old: test_located(&changed_file.0, old_entry),
+                    new: test_located(&changed_file.0, new_entry),
+                }],
+                admission_policy_delta: None,
+            })
+            .unwrap();
+
+        assert!(graph.get_entity(&retired.id).unwrap().is_none());
+        assert!(graph.get_entity(&neighbor.id).unwrap().is_some());
+        assert_eq!(graph.relation_count(), 0);
+        let snapshot = graph.to_snapshot();
+        assert!(
+            snapshot.entity_revisions.contains_key(&retired.id),
+            "removing live state must not erase immutable semantic revision history"
+        );
+        assert!(!snapshot.relations.contains_key(&relation.id));
+        assert_eq!(
+            graph.artifact_id_at_path(&test_repo_path(&changed_file.0)),
+            Some(artifact_id),
+            "the new exact artifact remains valid without semantic enrichment"
+        );
+
+        let pending = graph
+            .pending_delta_snapshot(0)
+            .expect("retirement and tree replacement must share one delta");
+        assert!(pending.entities.removed.contains(&retired.id));
+        assert!(!pending.entity_revisions.removed.contains(&retired.id));
+        assert!(pending.relations.removed.contains(&relation.id));
+        assert_eq!(pending.resolved_tree.modified.len(), 1);
+    }
+
+    #[test]
+    fn content_change_retires_derived_but_preserves_manual_artifact_relations() {
+        let graph = InMemoryGraph::new();
+        let file_id = FilePathId::new("Dockerfile");
+        let entity_file_id = FilePathId::new("src/main.rs");
+        let old_entry = TreeEntry::blob(Hash256::from_bytes([0x31; 32]), false);
+        let new_entry = TreeEntry::blob(Hash256::from_bytes([0x32; 32]), false);
+        let artifact_id = graph.admit_artifact_for_test(&file_id.0, old_entry);
+        graph.admit_artifact_for_test(
+            &entity_file_id.0,
+            TreeEntry::blob(Hash256::from_bytes([0x33; 32]), false),
+        );
+        let entity = test_entity("build_image", &entity_file_id.0);
+        graph.upsert_entity(&entity).unwrap();
+        let derived_relation = Relation {
+            id: RelationId::new(),
+            kind: RelationKind::DependsOn,
+            src: GraphNodeId::Entity(entity.id),
+            dst: GraphNodeId::Artifact(artifact_id),
+            confidence: 1.0,
+            origin: RelationOrigin::Inferred,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
+        };
+        let manual_relation = Relation {
+            id: RelationId::new(),
+            kind: RelationKind::OwnedByFile,
+            src: GraphNodeId::Entity(entity.id),
+            dst: GraphNodeId::Artifact(artifact_id),
+            confidence: 1.0,
+            origin: RelationOrigin::Manual,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
+        };
+        graph.upsert_relation(&derived_relation).unwrap();
+        graph.upsert_relation(&manual_relation).unwrap();
+        graph.clear_pending_delta();
+
+        graph
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: Vec::new(),
+                relation_deltas: vec![RelationDelta::Removed {
+                    old: derived_relation.clone(),
+                }],
+                tree_deltas: vec![TreeDelta::Updated {
+                    artifact_id,
+                    old: test_located(&file_id.0, old_entry),
+                    new: test_located(&file_id.0, new_entry),
+                }],
+                admission_policy_delta: None,
+            })
+            .unwrap();
+
+        assert!(
+            graph.get_entity(&entity.id).unwrap().is_some(),
+            "an entity in a different unchanged file remains admitted"
+        );
+        assert_eq!(graph.relation_count(), 1);
+        let snapshot = graph.to_snapshot();
+        assert!(!snapshot.relations.contains_key(&derived_relation.id));
+        assert!(snapshot.relations.contains_key(&manual_relation.id));
+        let pending = graph
+            .pending_delta_snapshot(0)
+            .expect("artifact-edge retirement must share the exact-tree delta");
+        assert!(pending.relations.removed.contains(&derived_relation.id));
+        assert!(!pending.relations.removed.contains(&manual_relation.id));
+        assert_eq!(pending.resolved_tree.modified.len(), 1);
+    }
+
+    #[test]
+    fn pure_artifact_move_preserves_identity_relations() {
+        let graph = InMemoryGraph::new();
+        let old_path = "config/compose.yaml";
+        let new_path = "deploy/compose.yaml";
+        let entry = TreeEntry::blob(Hash256::from_bytes([0x34; 32]), false);
+        let artifact_id = graph.admit_artifact_for_test(old_path, entry);
+        graph.admit_artifact_for_test(
+            "src/main.rs",
+            TreeEntry::blob(Hash256::from_bytes([0x35; 32]), false),
+        );
+        let entity = test_entity("deploy", "src/main.rs");
+        graph.upsert_entity(&entity).unwrap();
+        let relations: Vec<Relation> = [RelationOrigin::Manual, RelationOrigin::Parsed]
+            .into_iter()
+            .map(|origin| Relation {
+                id: RelationId::new(),
+                kind: RelationKind::DependsOn,
+                src: GraphNodeId::Entity(entity.id),
+                dst: GraphNodeId::Artifact(artifact_id),
+                confidence: 1.0,
+                origin,
+                created_in: None,
+                import_source: None,
+                evidence: Vec::new(),
+            })
+            .collect();
+        graph.upsert_relations_batch(&relations).unwrap();
+        graph.clear_pending_delta();
+
+        graph
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: Vec::new(),
+                relation_deltas: Vec::new(),
+                tree_deltas: vec![TreeDelta::Updated {
+                    artifact_id,
+                    old: test_located(old_path, entry),
+                    new: test_located(new_path, entry),
+                }],
+                admission_policy_delta: None,
+            })
+            .unwrap();
+
+        let snapshot = graph.to_snapshot();
+        assert!(
+            relations
+                .iter()
+                .all(|relation| snapshot.relations.contains_key(&relation.id)),
+            "a pure location change cannot erase relations to stable artifact identity"
+        );
+        let pending = graph
+            .pending_delta_snapshot(0)
+            .expect("the move itself must be persisted");
+        assert!(pending.relations.is_empty());
+    }
+
+    #[test]
+    fn artifact_deletion_retires_all_incident_relation_origins() {
+        let graph = InMemoryGraph::new();
+        let artifact_path = "Dockerfile";
+        let entry = TreeEntry::blob(Hash256::from_bytes([0x36; 32]), false);
+        let artifact_id = graph.admit_artifact_for_test(artifact_path, entry);
+        graph.admit_artifact_for_test(
+            "src/main.rs",
+            TreeEntry::blob(Hash256::from_bytes([0x37; 32]), false),
+        );
+        let entity = test_entity("image", "src/main.rs");
+        graph.upsert_entity(&entity).unwrap();
+        let relations: Vec<Relation> = [
+            RelationOrigin::Parsed,
+            RelationOrigin::Inferred,
+            RelationOrigin::Manual,
+            RelationOrigin::Lsp,
+        ]
+        .into_iter()
+        .map(|origin| Relation {
+            id: RelationId::new(),
+            kind: RelationKind::DependsOn,
+            src: GraphNodeId::Entity(entity.id),
+            dst: GraphNodeId::Artifact(artifact_id),
+            confidence: 1.0,
+            origin,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
+        })
+        .collect();
+        graph.upsert_relations_batch(&relations).unwrap();
+        graph.clear_pending_delta();
+
+        graph
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: Vec::new(),
+                relation_deltas: relations
+                    .iter()
+                    .cloned()
+                    .map(|old| RelationDelta::Removed { old })
+                    .collect(),
+                tree_deltas: vec![TreeDelta::Removed {
+                    artifact_id,
+                    old: test_located(artifact_path, entry),
+                }],
+                admission_policy_delta: None,
+            })
+            .unwrap();
+
+        assert_eq!(graph.relation_count(), 0);
+        let pending = graph
+            .pending_delta_snapshot(0)
+            .expect("artifact and incident-edge retirement must be atomic");
+        assert!(relations
+            .iter()
+            .all(|relation| pending.relations.removed.contains(&relation.id)));
+    }
+
+    #[test]
+    fn transaction_rejects_entity_placement_absent_from_staged_tree() {
+        let graph = InMemoryGraph::new();
+        let entity = test_entity("orphan", "src/missing.rs");
+
+        let error = graph
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: vec![EntityDelta::Added {
+                    new: entity.clone(),
+                }],
+                relation_deltas: Vec::new(),
+                tree_deltas: Vec::new(),
+                admission_policy_delta: None,
+            })
+            .unwrap_err();
+
+        assert!(error.to_string().contains("absent from the staged tree"));
+        assert!(graph.get_entity(&entity.id).unwrap().is_none());
+        assert!(graph.resolved_tree().is_empty());
+        assert!(!graph.has_pending_delta());
+    }
+
+    #[test]
+    fn tree_removal_requires_exact_entity_retirement_in_the_same_delta() {
+        let graph = InMemoryGraph::new();
+        let path = "src/owned.rs";
+        let entry = TreeEntry::blob(Hash256::from_bytes([0x14; 32]), false);
+        let artifact_id = graph.admit_artifact_for_test(path, entry);
+        let entity = test_entity("owned", path);
+        graph.upsert_entity(&entity).unwrap();
+        graph.clear_pending_delta();
+
+        let error = graph
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: Vec::new(),
+                relation_deltas: Vec::new(),
+                tree_deltas: vec![TreeDelta::Removed {
+                    artifact_id,
+                    old: test_located(path, entry),
+                }],
+                admission_policy_delta: None,
+            })
+            .expect_err("a tree transition cannot silently orphan semantic authority");
+
+        assert!(error
+            .to_string()
+            .contains("carry its exact entity removal or relocation"));
+        assert_eq!(
+            graph
+                .artifact_id_at_path(&test_repo_path(path))
+                .expect("tree authority must remain"),
+            artifact_id
+        );
+        assert_eq!(graph.get_entity(&entity.id).unwrap(), Some(entity));
+        assert!(!graph.has_pending_delta());
+    }
+
+    #[test]
+    fn transaction_rejects_unadmitted_relation_endpoint_before_any_mutation() {
+        let graph = InMemoryGraph::new();
+        let entity = test_entity("would_land", "src/new.rs");
+        let artifact_id = ArtifactId::new();
+        let entry = TreeEntry::blob(Hash256::from_bytes([0x15; 32]), false);
+        let relation = test_relation(entity.id, EntityId::new(), RelationKind::Calls);
+
+        let error = graph
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: vec![EntityDelta::Added {
+                    new: entity.clone(),
+                }],
+                relation_deltas: vec![RelationDelta::Added { new: relation }],
+                tree_deltas: vec![TreeDelta::Added {
+                    artifact_id,
+                    new: test_located("src/new.rs", entry),
+                }],
+                admission_policy_delta: None,
+            })
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("unadmitted destination endpoint"));
+        assert!(graph.get_entity(&entity.id).unwrap().is_none());
+        assert!(graph.resolved_tree().is_empty());
+        assert!(!graph.has_pending_delta());
+    }
+
+    #[test]
+    fn post_authority_cache_failure_quarantines_without_retryable_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = InMemoryGraph::with_text_index(dir.path().join("text-index"));
+        let file_id = FilePathId::new("src/fault.rs");
+        let old_entry = TreeEntry::blob(Hash256::from_bytes([0x16; 32]), false);
+        let new_entry = TreeEntry::blob(Hash256::from_bytes([0x17; 32]), false);
+        let artifact_id = graph.admit_artifact_for_test(&file_id.0, old_entry);
+        let entity = test_entity("faulted", &file_id.0);
+        graph.upsert_entity(&entity).unwrap();
+        graph.flush_text_index().unwrap();
+        assert!(!graph.text_search("faulted", 10).unwrap().is_empty());
+        graph.clear_pending_delta();
+        graph
+            .fail_next_transaction_derived_cleanup
+            .store(true, Ordering::Release);
+
+        graph
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: vec![EntityDelta::Removed {
+                    old: entity.clone(),
+                }],
+                relation_deltas: Vec::new(),
+                tree_deltas: vec![TreeDelta::Updated {
+                    artifact_id,
+                    old: test_located(&file_id.0, old_entry),
+                    new: test_located(&file_id.0, new_entry),
+                }],
+                admission_policy_delta: None,
+            })
+            .expect("derived cache failure cannot reverse committed authority");
+
+        assert!(graph.get_entity(&entity.id).unwrap().is_none());
+        assert_eq!(graph.get_tree_entry(&file_id).unwrap(), Some(new_entry));
+        assert!(graph.text_full_rebuild_required.load(Ordering::Acquire));
+        assert!(
+            graph
+                .text_search("faulted", 10)
+                .unwrap_err()
+                .to_string()
+                .contains("quarantined"),
+            "a quarantined derived index must never answer from stale documents"
+        );
+        assert_eq!(graph.text_doc_frequency("faulted"), 0);
+        assert_eq!(graph.text_document_count(), 0);
+        graph.fail_next_text_rebuild.store(true, Ordering::Release);
+        assert!(
+            graph.flush_text_index().is_err(),
+            "the deterministic rebuild failure must reach the caller"
+        );
+        assert!(
+            graph.text_full_rebuild_required.load(Ordering::Acquire),
+            "a failed rebuild cannot clear quarantine"
+        );
+        assert!(graph.text_search("faulted", 10).is_err());
+        graph.flush_text_index().unwrap();
+        assert!(!graph.text_full_rebuild_required.load(Ordering::Acquire));
+        assert!(graph.text_search("faulted", 10).unwrap().is_empty());
+        #[cfg(feature = "vector")]
+        {
+            assert!(graph.vector_index.lock().is_none());
+            assert_eq!(
+                graph.pending_artifact_embeddings(),
+                0,
+                "an exact artifact without enrichment has no vector document to rebuild"
+            );
+        }
+    }
+
+    #[test]
+    fn tree_transaction_retires_old_path_facets_by_captured_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = InMemoryGraph::with_text_index(dir.path().join("text-index"));
+        let old_file_id = FilePathId::new("config/old.toml");
+        let new_file_id = FilePathId::new("config/current.toml");
+        let old_entry = TreeEntry::blob(Hash256::from_bytes([0x21; 32]), false);
+        let new_entry = TreeEntry::blob(Hash256::from_bytes([0x22; 32]), false);
+        let artifact_id = graph.admit_artifact_for_test(&old_file_id.0, old_entry);
+        let shallow = ShallowTrackedFile {
+            file_id: old_file_id.clone(),
+            language_hint: "unsupported".into(),
+            declaration_count: 1,
+            import_count: 0,
+            syntax_hash: Hash256::from_bytes([0x23; 32]),
+            signature_hash: None,
+            declaration_names: vec!["obsolete_shallow_marker".into()],
+            import_paths: Vec::new(),
+        };
+        let layout = FileLayout {
+            file_id: old_file_id.clone(),
+            parse_completeness: ParseCompleteness::Full,
+            imports: ImportSection {
+                byte_range: 0..0,
+                items: Vec::new(),
+            },
+            regions: Vec::new(),
+        };
+        let structured = StructuredArtifact {
+            file_id: old_file_id.clone(),
+            kind: ArtifactKind::CiConfig,
+            content_hash: Hash256::from_bytes([0x24; 32]),
+            text_preview: Some("obsolete structured marker".into()),
+        };
+        let opaque = OpaqueArtifact {
+            file_id: old_file_id.clone(),
+            content_hash: Hash256::from_bytes([0x25; 32]),
+            mime_type: Some("application/octet-stream".into()),
+            text_preview: Some("obsolete opaque marker".into()),
+        };
+
+        graph.upsert_shallow_file(&shallow).unwrap();
+        graph.upsert_file_layout(&layout).unwrap();
+        graph.upsert_structured_artifact(&structured).unwrap();
+        graph.upsert_opaque_artifact(&opaque).unwrap();
+        graph.flush_text_index().unwrap();
+        graph.clear_pending_delta();
+
+        graph
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: Vec::new(),
+                relation_deltas: Vec::new(),
+                tree_deltas: vec![TreeDelta::Updated {
+                    artifact_id,
+                    old: test_located(&old_file_id.0, old_entry),
+                    new: test_located(&new_file_id.0, new_entry),
+                }],
+                admission_policy_delta: None,
+            })
+            .unwrap();
+
+        assert!(graph.get_shallow_file(&old_file_id).unwrap().is_none());
+        assert!(graph.get_file_layout(&old_file_id).unwrap().is_none());
+        assert!(graph
+            .get_structured_artifact(&old_file_id)
+            .unwrap()
+            .is_none());
+        assert!(graph.get_opaque_artifact(&old_file_id).unwrap().is_none());
+        assert_eq!(
+            graph.artifact_id_at_path(&test_repo_path(&new_file_id.0)),
+            Some(artifact_id)
+        );
+        assert!(graph
+            .artifact_id_at_path(&test_repo_path(&old_file_id.0))
+            .is_none());
+
+        let pending = graph
+            .pending_delta_snapshot(0)
+            .expect("tree and facet removals must be persisted together");
+        assert_eq!(pending.shallow_files.removed.len(), 1);
+        assert_eq!(pending.shallow_files.removed[0].file_id, old_file_id);
+        assert_eq!(pending.file_layouts.removed.len(), 1);
+        assert_eq!(pending.file_layouts.removed[0].file_id, old_file_id);
+        assert_eq!(pending.structured_artifacts.removed.len(), 1);
+        assert_eq!(pending.structured_artifacts.removed[0].file_id, old_file_id);
+        assert_eq!(pending.opaque_artifacts.removed.len(), 1);
+        assert_eq!(pending.opaque_artifacts.removed[0].file_id, old_file_id);
+        assert_eq!(
+            pending.resolved_tree.modified,
+            vec![(artifact_id, test_located(&new_file_id.0, new_entry))]
+        );
+
+        graph.flush_text_index().unwrap();
+        let artifact_key = RetrievalKey::Artifact(artifact_id);
+        assert!(!graph
+            .text_search("obsolete opaque marker", 10)
+            .unwrap()
+            .iter()
+            .any(|(key, _)| *key == artifact_key));
+        #[cfg(feature = "vector")]
+        assert!(!graph.artifact_embedding_queue.lock().contains(&artifact_id));
+    }
+
+    #[test]
+    fn tree_removal_retires_facets_without_post_removal_path_lookup() {
+        let graph = InMemoryGraph::new();
+        let file_id = FilePathId::new("compose.yaml");
+        let entry = TreeEntry::blob(Hash256::from_bytes([0x31; 32]), false);
+        let artifact_id = graph.admit_artifact_for_test(&file_id.0, entry);
+        let artifact = StructuredArtifact {
+            file_id: file_id.clone(),
+            kind: ArtifactKind::ComposeFile,
+            content_hash: Hash256::from_bytes([0x32; 32]),
+            text_preview: Some("services:".into()),
+        };
+        graph.upsert_structured_artifact(&artifact).unwrap();
+        graph.clear_pending_delta();
+
+        graph
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: Vec::new(),
+                relation_deltas: Vec::new(),
+                tree_deltas: vec![TreeDelta::Removed {
+                    artifact_id,
+                    old: test_located(&file_id.0, entry),
+                }],
+                admission_policy_delta: None,
+            })
+            .unwrap();
+
+        assert!(graph
+            .artifact_id_at_path(&test_repo_path(&file_id.0))
+            .is_none());
+        assert!(graph.get_structured_artifact(&file_id).unwrap().is_none());
+        let pending = graph
+            .pending_delta_snapshot(0)
+            .expect("tree and facet removal must share one persistence delta");
+        assert_eq!(pending.resolved_tree.removed, vec![artifact_id]);
+        assert_eq!(pending.structured_artifacts.removed.len(), 1);
+        assert_eq!(pending.structured_artifacts.removed[0].file_id, file_id);
+    }
+
+    #[test]
+    fn stale_tree_transition_rejects_all_graph_mutations_atomically() {
+        let graph = InMemoryGraph::new();
+        let file_id = FilePathId::new("Dockerfile");
+        let current = TreeEntry::blob(Hash256::from_bytes([0x31; 32]), false);
+        let stale = TreeEntry::blob(Hash256::from_bytes([0x32; 32]), false);
+        let replacement = TreeEntry::blob(Hash256::from_bytes([0x33; 32]), true);
+        let artifact_id = graph.admit_artifact_for_test(&file_id.0, current);
+        let entity = test_entity("must_not_land", "src/lib.rs");
+
+        let error = graph
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: vec![EntityDelta::Added {
+                    new: entity.clone(),
+                }],
+                relation_deltas: Vec::new(),
+                tree_deltas: vec![TreeDelta::Updated {
+                    artifact_id,
+                    old: test_located(&file_id.0, stale),
+                    new: test_located(&file_id.0, replacement),
+                }],
+                admission_policy_delta: None,
+            })
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("repository tree transition rejected"));
+        assert_eq!(graph.get_tree_entry(&file_id).unwrap(), Some(current));
+        assert!(graph.get_entity(&entity.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn stale_tree_transition_preserves_every_old_path_facet_atomically() {
+        let graph = InMemoryGraph::new();
+        let file_id = FilePathId::new("config/settings.yaml");
+        let current = TreeEntry::blob(Hash256::from_bytes([0x41; 32]), false);
+        let stale = TreeEntry::blob(Hash256::from_bytes([0x42; 32]), false);
+        let replacement = TreeEntry::blob(Hash256::from_bytes([0x43; 32]), false);
+        let artifact_id = graph.admit_artifact_for_test(&file_id.0, current);
+        let shallow = ShallowTrackedFile {
+            file_id: file_id.clone(),
+            language_hint: "yaml".into(),
+            declaration_count: 0,
+            import_count: 0,
+            syntax_hash: Hash256::from_bytes([0x44; 32]),
+            signature_hash: None,
+            declaration_names: Vec::new(),
+            import_paths: Vec::new(),
+        };
+        let layout = FileLayout {
+            file_id: file_id.clone(),
+            parse_completeness: ParseCompleteness::Full,
+            imports: ImportSection {
+                byte_range: 0..0,
+                items: Vec::new(),
+            },
+            regions: Vec::new(),
+        };
+        let structured = StructuredArtifact {
+            file_id: file_id.clone(),
+            kind: ArtifactKind::CiConfig,
+            content_hash: Hash256::from_bytes([0x45; 32]),
+            text_preview: Some("structured".into()),
+        };
+        let opaque = OpaqueArtifact {
+            file_id: file_id.clone(),
+            content_hash: Hash256::from_bytes([0x46; 32]),
+            mime_type: None,
+            text_preview: Some("opaque".into()),
+        };
+        graph.upsert_shallow_file(&shallow).unwrap();
+        graph.upsert_file_layout(&layout).unwrap();
+        graph.upsert_structured_artifact(&structured).unwrap();
+        graph.upsert_opaque_artifact(&opaque).unwrap();
+        graph.clear_pending_delta();
+
+        let error = graph
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: Vec::new(),
+                relation_deltas: Vec::new(),
+                tree_deltas: vec![TreeDelta::Updated {
+                    artifact_id,
+                    old: test_located(&file_id.0, stale),
+                    new: test_located(&file_id.0, replacement),
+                }],
+                admission_policy_delta: None,
+            })
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("repository tree transition rejected"));
+        assert_eq!(graph.get_tree_entry(&file_id).unwrap(), Some(current));
+        assert_eq!(
+            graph
+                .get_shallow_file(&file_id)
+                .unwrap()
+                .expect("shallow facet must remain")
+                .syntax_hash,
+            shallow.syntax_hash
+        );
+        assert_eq!(
+            graph
+                .get_file_layout(&file_id)
+                .unwrap()
+                .expect("layout facet must remain")
+                .parse_completeness
+                .bucket(),
+            layout.parse_completeness.bucket()
+        );
+        assert_eq!(
+            graph
+                .get_structured_artifact(&file_id)
+                .unwrap()
+                .expect("structured facet must remain")
+                .content_hash,
+            structured.content_hash
+        );
+        assert_eq!(
+            graph
+                .get_opaque_artifact(&file_id)
+                .unwrap()
+                .expect("opaque facet must remain")
+                .content_hash,
+            opaque.content_hash
+        );
+        assert!(!graph.has_pending_delta());
+    }
+
     fn test_relation(src: EntityId, dst: EntityId, kind: RelationKind) -> Relation {
         Relation {
             id: RelationId::new(),
@@ -9305,7 +10551,7 @@ mod tests {
         snapshot.outgoing.insert(e1.id, vec![rid]);
         snapshot.incoming.insert(e2.id, vec![rid]);
 
-        let graph = InMemoryGraph::from_snapshot(snapshot);
+        let graph = InMemoryGraph::from_snapshot(snapshot).unwrap();
         assert_eq!(graph.relation_count(), 1);
         // Reads the (reused) entity-level `outgoing` adjacency.
         let outgoing = graph.get_relations(&e1.id, &[]).unwrap();
@@ -9711,16 +10957,25 @@ mod tests {
         };
         let artifact_file_id = artifact.file_id.clone();
         snapshot.structured_artifacts.push(artifact);
+        let artifact_id = ArtifactId::new();
+        snapshot.resolved_tree = ResolvedTree::from_artifacts([ResolvedArtifact::new(
+            artifact_id,
+            test_repo_path(&artifact_file_id.0),
+            TreeEntry::blob(Hash256::from_bytes([9; 32]), false),
+        )])
+        .unwrap();
 
         let graph =
-            InMemoryGraph::from_snapshot_with_text_index(snapshot, dir.path().join("text-index"));
+            InMemoryGraph::from_snapshot_with_text_index(snapshot, dir.path().join("text-index"))
+                .unwrap();
 
-        // Identity is graph-assigned: read the id the graph minted on restore.
-        let artifact_key = RetrievalKey::Artifact(
-            graph
-                .artifact_id_for_path(&artifact_file_id)
-                .expect("restored artifact must have a graph-assigned id"),
+        // Current snapshots carry graph-assigned artifact identity explicitly;
+        // restore consumes it without deriving identity from the path.
+        assert_eq!(
+            graph.artifact_id_at_path(&test_repo_path(&artifact_file_id.0)),
+            Some(artifact_id)
         );
+        let artifact_key = RetrievalKey::Artifact(artifact_id);
 
         let hits = graph.text_search("extension registry", 10).unwrap();
         assert!(
@@ -9746,14 +11001,15 @@ mod tests {
             content_hash: Hash256::from_bytes([9; 32]),
             text_preview: Some("build install".into()),
         };
+        admit_enrichment(&graph, &artifact.file_id, artifact.content_hash);
         graph.upsert_structured_artifact(&artifact).unwrap();
         graph.flush_text_index().unwrap();
 
-        // Identity is graph-assigned by the upsert: read it back from the index.
+        // Read back the identity assigned by explicit tree admission.
         let artifact_key = RetrievalKey::Artifact(
             graph
-                .artifact_id_for_path(&artifact.file_id)
-                .expect("upserted artifact must have a graph-assigned id"),
+                .artifact_id_at_path(&test_repo_path(&artifact.file_id.0))
+                .expect("admitted artifact must have a graph-owned id"),
         );
 
         let hits = graph.text_search("build install", 10).unwrap();
@@ -9783,14 +11039,15 @@ mod tests {
             content_hash: Hash256::from_bytes([7; 32]),
             text_preview: Some("build clean".into()),
         };
+        admit_enrichment(&graph, &artifact.file_id, artifact.content_hash);
         graph.upsert_structured_artifact(&artifact).unwrap();
         graph.flush_text_index().unwrap();
 
-        // Identity is graph-assigned by the upsert: capture it before deletion.
+        // Capture the explicitly admitted identity before enrichment deletion.
         let artifact_key = RetrievalKey::Artifact(
             graph
-                .artifact_id_for_path(&artifact.file_id)
-                .expect("upserted artifact must have a graph-assigned id"),
+                .artifact_id_at_path(&test_repo_path(&artifact.file_id.0))
+                .expect("admitted artifact must have a graph-owned id"),
         );
         assert!(graph
             .text_search("build clean", 10)
@@ -9983,73 +11240,45 @@ mod tests {
     }
 
     #[test]
-    fn branch_operations() {
-        let graph = InMemoryGraph::new();
-        let change_id = SemanticChangeId::from_hash(Hash256::from_bytes([1; 32]));
-        let branch = Branch {
-            name: BranchName::new("main"),
-            head: change_id,
-        };
-
-        graph.create_branch(&branch).unwrap();
-        let fetched = graph.get_branch(&BranchName::new("main")).unwrap().unwrap();
-        assert_eq!(fetched.name.0, "main");
-
-        let new_head = SemanticChangeId::from_hash(Hash256::from_bytes([2; 32]));
-        graph
-            .update_branch_head(&BranchName::new("main"), &new_head)
-            .unwrap();
-        let updated = graph.get_branch(&BranchName::new("main")).unwrap().unwrap();
-        assert_eq!(updated.head, new_head);
-
-        let branches = graph.list_branches().unwrap();
-        assert_eq!(branches.len(), 1);
-
-        graph.delete_branch(&BranchName::new("main")).unwrap();
-        assert!(graph
-            .get_branch(&BranchName::new("main"))
-            .unwrap()
-            .is_none());
-    }
-
-    #[test]
     fn change_dag_operations() {
         let graph = InMemoryGraph::new();
 
-        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([1; 32]));
-        let genesis = SemanticChange {
-            id: genesis_id,
+        let genesis = seal_change(SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([1; 32])),
             parents: vec![],
             timestamp: Timestamp::now(),
             author: AuthorId::new("test"),
             message: "genesis".to_string(),
             entity_deltas: vec![],
             relation_deltas: vec![],
-            artifact_deltas: vec![],
+            tree_deltas: vec![],
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],
             risk_summary: None,
-            authored_on: None,
-        };
+            origin: kin_model::ChangeOrigin::Native,
+            admission_policy_delta: None,
+        });
+        let genesis_id = genesis.id;
         graph.create_change(&genesis).unwrap();
 
-        let child_id = SemanticChangeId::from_hash(Hash256::from_bytes([2; 32]));
-        let child = SemanticChange {
-            id: child_id,
+        let child = seal_change(SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([2; 32])),
             parents: vec![genesis_id],
             timestamp: Timestamp::now(),
             author: AuthorId::new("test"),
             message: "child".to_string(),
             entity_deltas: vec![],
             relation_deltas: vec![],
-            artifact_deltas: vec![],
+            tree_deltas: vec![],
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],
             risk_summary: None,
-            authored_on: None,
-        };
+            origin: kin_model::ChangeOrigin::Native,
+            admission_policy_delta: None,
+        });
+        let child_id = child.id;
         graph.create_change(&child).unwrap();
 
         let fetched = graph.get_change(&child_id).unwrap().unwrap();
@@ -10064,7 +11293,7 @@ mod tests {
     fn create_change_is_idempotent_only_for_identical_payload() {
         let graph = InMemoryGraph::new();
         let parent = SemanticChangeId::from_hash(Hash256::from_bytes([0x31; 32]));
-        let change = SemanticChange {
+        let change = seal_change(SemanticChange {
             id: SemanticChangeId::from_hash(Hash256::from_bytes([0x32; 32])),
             parents: vec![parent],
             timestamp: Timestamp::now(),
@@ -10072,13 +11301,14 @@ mod tests {
             message: "immutable payload".to_string(),
             entity_deltas: vec![],
             relation_deltas: vec![],
-            artifact_deltas: vec![],
+            tree_deltas: vec![],
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],
             risk_summary: None,
-            authored_on: None,
-        };
+            origin: kin_model::ChangeOrigin::Native,
+            admission_policy_delta: None,
+        });
 
         graph.create_change(&change).unwrap();
         graph
@@ -10096,7 +11326,7 @@ mod tests {
         let error = graph
             .create_change(&conflicting)
             .expect_err("same id with different payload must be rejected");
-        assert!(matches!(error, KinDbError::DuplicateChange(_)));
+        assert!(matches!(error, KinDbError::Model(_)));
         assert_eq!(
             graph.get_change(&change.id).unwrap().unwrap().message,
             "immutable payload"
@@ -10112,35 +11342,36 @@ mod tests {
         let graph = InMemoryGraph::new();
         let mut entity = test_entity("float_identity", "src/lib.rs");
         entity.fingerprint.stability_score = 0.0;
-        let change = SemanticChange {
+        let change = seal_change(SemanticChange {
             id: SemanticChangeId::from_hash(Hash256::from_bytes([0x3d; 32])),
             parents: vec![],
             timestamp: Timestamp::now(),
             author: AuthorId::new("agent"),
             message: "exact float payload".to_string(),
-            entity_deltas: vec![EntityDelta::Added(entity)],
+            entity_deltas: vec![EntityDelta::Added { new: entity }],
             relation_deltas: vec![],
-            artifact_deltas: vec![],
+            tree_deltas: vec![],
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],
             risk_summary: None,
-            authored_on: None,
-        };
+            origin: kin_model::ChangeOrigin::Native,
+            admission_policy_delta: None,
+        });
         graph.create_change(&change).unwrap();
 
         let mut conflicting = change.clone();
-        let EntityDelta::Added(entity) = &mut conflicting.entity_deltas[0] else {
+        let EntityDelta::Added { new: entity } = &mut conflicting.entity_deltas[0] else {
             unreachable!("fixture contains one added entity")
         };
         entity.fingerprint.stability_score = -0.0;
         let error = graph
             .create_change(&conflicting)
             .expect_err("different IEEE-754 payload bits must not be idempotent");
-        assert!(matches!(error, KinDbError::DuplicateChange(_)));
+        assert!(matches!(error, KinDbError::Model(_)));
 
         let stored = graph.get_change(&change.id).unwrap().unwrap();
-        let EntityDelta::Added(entity) = &stored.entity_deltas[0] else {
+        let EntityDelta::Added { new: entity } = &stored.entity_deltas[0] else {
             unreachable!("stored fixture contains one added entity")
         };
         assert_eq!(
@@ -10160,14 +11391,15 @@ mod tests {
             timestamp: Timestamp::now(),
             author: AuthorId::new("agent"),
             message: "invalid float payload".to_string(),
-            entity_deltas: vec![EntityDelta::Added(entity)],
+            entity_deltas: vec![EntityDelta::Added { new: entity }],
             relation_deltas: vec![],
-            artifact_deltas: vec![],
+            tree_deltas: vec![],
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],
             risk_summary: None,
-            authored_on: None,
+            origin: kin_model::ChangeOrigin::Native,
+            admission_policy_delta: None,
         };
 
         let error = graph
@@ -10179,36 +11411,272 @@ mod tests {
     }
 
     #[test]
-    fn create_changes_rejects_conflicting_batch_before_any_mutation() {
+    fn create_change_rejects_spoofed_id_before_any_mutation() {
         let graph = InMemoryGraph::new();
-        let entity = test_entity("must_not_land", "src/lib.rs");
-        let id = SemanticChangeId::from_hash(Hash256::from_bytes([0x41; 32]));
-        let first = SemanticChange {
-            id,
+        let spoofed = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0x40; 32])),
             parents: vec![],
             timestamp: Timestamp::now(),
             author: AuthorId::new("agent"),
-            message: "first".to_string(),
-            entity_deltas: vec![EntityDelta::Added(entity)],
+            message: "spoofed".to_string(),
+            entity_deltas: vec![EntityDelta::Added {
+                new: test_entity("must_not_land", "src/lib.rs"),
+            }],
             relation_deltas: vec![],
-            artifact_deltas: vec![],
+            tree_deltas: vec![],
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],
             risk_summary: None,
-            authored_on: None,
+            origin: kin_model::ChangeOrigin::Native,
+            admission_policy_delta: None,
         };
-        let mut conflicting = first.clone();
-        conflicting.message = "conflict".to_string();
 
         let error = graph
-            .create_changes(vec![first, conflicting])
-            .expect_err("conflicting duplicate must reject the whole batch");
-        assert!(matches!(error, KinDbError::DuplicateChange(_)));
+            .create_change(&spoofed)
+            .expect_err("spoofed identity must fail closed");
+        assert!(error.to_string().contains("recomputes to"));
+        assert_no_change_admission(&graph);
+    }
+
+    #[test]
+    fn public_snapshot_hydration_rejects_spoofed_change_identity() {
+        let spoofed = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0xee; 32])),
+            parents: Vec::new(),
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("attacker"),
+            message: "spoofed hydration".into(),
+            entity_deltas: Vec::new(),
+            relation_deltas: Vec::new(),
+            tree_deltas: Vec::new(),
+            projected_files: Vec::new(),
+            spec_link: None,
+            evidence: Vec::new(),
+            risk_summary: None,
+            origin: kin_model::ChangeOrigin::Native,
+            admission_policy_delta: None,
+        };
+        let mut snapshot = GraphSnapshot::empty();
+        snapshot.changes.insert(spoofed.id, spoofed);
+
+        let error = InMemoryGraph::from_snapshot(snapshot)
+            .expect_err("public hydration must validate immutable change identity");
+        assert!(error.to_string().contains("semantic change"));
+    }
+
+    #[test]
+    fn borrowed_snapshot_save_rejects_spoofed_change_identity() {
+        let graph = InMemoryGraph::new();
+        let spoofed = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0xed; 32])),
+            parents: Vec::new(),
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("attacker"),
+            message: "spoofed borrowed save".into(),
+            entity_deltas: Vec::new(),
+            relation_deltas: Vec::new(),
+            tree_deltas: Vec::new(),
+            projected_files: Vec::new(),
+            spec_link: None,
+            evidence: Vec::new(),
+            risk_summary: None,
+            origin: kin_model::ChangeOrigin::Native,
+            admission_policy_delta: None,
+        };
+        graph.changes.write().changes.insert(spoofed.id, spoofed);
+
+        let error = graph
+            .serialize_snapshot_borrowed()
+            .expect_err("borrowed persistence must validate immutable change identity");
+        assert!(error.to_string().contains("semantic change"));
+    }
+
+    #[test]
+    fn create_change_cannot_be_detached_between_revision_children_and_change() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let graph = std::sync::Arc::new(InMemoryGraph::new());
+        let parent = seal_change(SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+            parents: Vec::new(),
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("tester"),
+            message: "parent".into(),
+            entity_deltas: Vec::new(),
+            relation_deltas: Vec::new(),
+            tree_deltas: Vec::new(),
+            projected_files: Vec::new(),
+            spec_link: None,
+            evidence: Vec::new(),
+            risk_summary: None,
+            origin: kin_model::ChangeOrigin::Native,
+            admission_policy_delta: None,
+        });
+        graph.create_change(&parent).unwrap();
+        graph.clear_pending_delta();
+
+        let entity = test_entity("atomic_change", "src/atomic.rs");
+        let child = seal_change(SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+            parents: vec![parent.id],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("tester"),
+            message: "child".into(),
+            entity_deltas: vec![EntityDelta::Added {
+                new: entity.clone(),
+            }],
+            relation_deltas: Vec::new(),
+            tree_deltas: Vec::new(),
+            projected_files: vec![entity.file_origin.clone().unwrap()],
+            spec_link: None,
+            evidence: Vec::new(),
+            risk_summary: None,
+            origin: kin_model::ChangeOrigin::Native,
+            admission_policy_delta: None,
+        });
+
+        let (at_revision_tx, at_revision_rx) = mpsc::channel();
+        let (continue_tx, continue_rx) = mpsc::channel();
+        let creator_graph = graph.clone();
+        let creator_change = child.clone();
+        let creator = std::thread::spawn(move || {
+            set_create_change_after_revision_hook(move || {
+                at_revision_tx.send(()).unwrap();
+                continue_rx.recv().unwrap();
+            });
+            creator_graph.create_change(&creator_change)
+        });
+
+        at_revision_rx.recv().unwrap();
+        assert!(
+            graph.pending_delta.try_lock().is_none(),
+            "the pending-delta fence must already be held when revisions mutate"
+        );
+
+        let (detach_started_tx, detach_started_rx) = mpsc::channel();
+        let (detached_tx, detached_rx) = mpsc::channel();
+        let detach_graph = graph.clone();
+        let detacher = std::thread::spawn(move || {
+            detach_started_tx.send(()).unwrap();
+            detached_tx
+                .send(detach_graph.begin_delta_persistence(0))
+                .unwrap();
+        });
+        detach_started_rx.recv().unwrap();
+        assert!(
+            detached_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "persistence detach must wait for the complete change batch"
+        );
+
+        continue_tx.send(()).unwrap();
+        creator.join().unwrap().unwrap();
+        let (delta, epoch) = detached_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .expect("the complete change batch must detach");
+        detacher.join().unwrap();
+
+        let has_change = delta
+            .changes
+            .added
+            .iter()
+            .chain(delta.changes.modified.iter())
+            .any(|(id, value)| *id == child.id && value.id == child.id);
+        let has_revisions = delta
+            .entity_revisions
+            .added
+            .iter()
+            .chain(delta.entity_revisions.modified.iter())
+            .any(|(id, revisions)| *id == entity.id && !revisions.is_empty());
+        let has_child_edge = delta
+            .change_children
+            .added
+            .iter()
+            .chain(delta.change_children.modified.iter())
+            .any(|(id, children)| *id == parent.id && children.contains(&child.id));
+        assert!(has_change && has_revisions && has_child_edge);
+        assert!(graph.complete_persistence(epoch));
+    }
+
+    #[test]
+    fn create_change_rejects_identical_spoofed_reinsertion() {
+        let graph = InMemoryGraph::new();
+        let spoofed = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0x40; 32])),
+            parents: vec![],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("agent"),
+            message: "same invalid retry".to_string(),
+            entity_deltas: vec![],
+            relation_deltas: vec![],
+            tree_deltas: vec![],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            origin: kin_model::ChangeOrigin::Native,
+            admission_policy_delta: None,
+        };
+
+        for _ in 0..2 {
+            let error = graph
+                .create_change(&spoofed)
+                .expect_err("an identical spoofed retry is never idempotent");
+            assert!(error.to_string().contains("recomputes to"));
+        }
+        assert_no_change_admission(&graph);
+    }
+
+    #[test]
+    fn create_changes_rejects_later_spoof_before_any_mutation() {
+        let graph = InMemoryGraph::new();
+        let entity = test_entity("must_not_land", "src/lib.rs");
+        let first = seal_change(SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0x41; 32])),
+            parents: vec![],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("agent"),
+            message: "first".to_string(),
+            entity_deltas: vec![EntityDelta::Added { new: entity }],
+            relation_deltas: vec![],
+            tree_deltas: vec![],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            origin: kin_model::ChangeOrigin::Native,
+            admission_policy_delta: None,
+        });
+        let mut spoofed = seal_change(SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0x42; 32])),
+            parents: vec![first.id],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("agent"),
+            message: "later spoof".to_string(),
+            entity_deltas: vec![],
+            relation_deltas: vec![],
+            tree_deltas: vec![],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            origin: kin_model::ChangeOrigin::Native,
+            admission_policy_delta: None,
+        });
+        spoofed.id = SemanticChangeId::from_hash(Hash256::from_bytes([0xff; 32]));
+        let error = graph
+            .create_changes(vec![first, spoofed])
+            .expect_err("a spoofed later item must reject the whole batch");
+        assert!(error.to_string().contains("recomputes to"));
         let snapshot = graph.to_snapshot();
         assert!(snapshot.changes.is_empty());
         assert!(snapshot.entity_revisions.is_empty());
         assert!(snapshot.change_children.is_empty());
+        assert!(snapshot.resolved_tree.is_empty());
         assert!(!graph.has_pending_delta());
     }
 
@@ -10217,23 +11685,24 @@ mod tests {
         let graph = InMemoryGraph::new();
         let mut entity = test_entity("batch_float_identity", "src/lib.rs");
         entity.fingerprint.stability_score = 0.0;
-        let first = SemanticChange {
+        let first = seal_change(SemanticChange {
             id: SemanticChangeId::from_hash(Hash256::from_bytes([0x42; 32])),
             parents: vec![],
             timestamp: Timestamp::now(),
             author: AuthorId::new("agent"),
             message: "batch exact float payload".to_string(),
-            entity_deltas: vec![EntityDelta::Added(entity)],
+            entity_deltas: vec![EntityDelta::Added { new: entity }],
             relation_deltas: vec![],
-            artifact_deltas: vec![],
+            tree_deltas: vec![],
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],
             risk_summary: None,
-            authored_on: None,
-        };
+            origin: kin_model::ChangeOrigin::Native,
+            admission_policy_delta: None,
+        });
         let mut conflicting = first.clone();
-        let EntityDelta::Added(entity) = &mut conflicting.entity_deltas[0] else {
+        let EntityDelta::Added { new: entity } = &mut conflicting.entity_deltas[0] else {
             unreachable!("fixture contains one added entity")
         };
         entity.fingerprint.stability_score = -0.0;
@@ -10241,7 +11710,7 @@ mod tests {
         let error = graph
             .create_changes(vec![first, conflicting])
             .expect_err("bit-distinct floats under one ID must reject the whole batch");
-        assert!(matches!(error, KinDbError::DuplicateChange(_)));
+        assert!(matches!(error, KinDbError::Model(_)));
         let snapshot = graph.to_snapshot();
         assert!(snapshot.changes.is_empty());
         assert!(snapshot.entity_revisions.is_empty());
@@ -10251,21 +11720,24 @@ mod tests {
     #[test]
     fn create_changes_non_finite_payload_rejects_prior_valid_entries_atomically() {
         let graph = InMemoryGraph::new();
-        let valid = SemanticChange {
+        let valid = seal_change(SemanticChange {
             id: SemanticChangeId::from_hash(Hash256::from_bytes([0x43; 32])),
             parents: vec![],
             timestamp: Timestamp::now(),
             author: AuthorId::new("agent"),
             message: "valid first entry".to_string(),
-            entity_deltas: vec![EntityDelta::Added(test_entity("valid", "src/valid.rs"))],
+            entity_deltas: vec![EntityDelta::Added {
+                new: test_entity("valid", "src/valid.rs"),
+            }],
             relation_deltas: vec![],
-            artifact_deltas: vec![],
+            tree_deltas: vec![],
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],
             risk_summary: None,
-            authored_on: None,
-        };
+            origin: kin_model::ChangeOrigin::Native,
+            admission_policy_delta: None,
+        });
         let source = test_entity("source", "src/source.rs");
         let target = test_entity("target", "src/target.rs");
         let mut relation = test_relation(source.id, target.id, RelationKind::Calls);
@@ -10277,13 +11749,14 @@ mod tests {
             author: AuthorId::new("agent"),
             message: "invalid later entry".to_string(),
             entity_deltas: vec![],
-            relation_deltas: vec![RelationDelta::Added(relation)],
-            artifact_deltas: vec![],
+            relation_deltas: vec![RelationDelta::Added { new: relation }],
+            tree_deltas: vec![],
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],
             risk_summary: None,
-            authored_on: None,
+            origin: kin_model::ChangeOrigin::Native,
+            admission_policy_delta: None,
         };
 
         let error = graph
@@ -10306,60 +11779,64 @@ mod tests {
         modified.signature = "fn target(value: usize)".to_string();
         modified.fingerprint.signature_hash = Hash256::from_bytes([0x44; 32]);
 
-        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x11; 32]));
-        let first_child_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x22; 32]));
-        let second_child_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x33; 32]));
         let timestamp = Timestamp::now();
-        let changes = vec![
-            SemanticChange {
-                id: genesis_id,
-                parents: vec![],
-                timestamp: timestamp.clone(),
-                author: AuthorId::new("test"),
-                message: "genesis".to_string(),
-                entity_deltas: vec![EntityDelta::Added(original.clone())],
-                relation_deltas: vec![],
-                artifact_deltas: vec![],
-                projected_files: vec![],
-                spec_link: None,
-                evidence: vec![],
-                risk_summary: None,
-                authored_on: None,
-            },
-            SemanticChange {
-                id: first_child_id,
-                parents: vec![genesis_id],
-                timestamp: timestamp.clone(),
-                author: AuthorId::new("test"),
-                message: "modify target".to_string(),
-                entity_deltas: vec![EntityDelta::Modified {
-                    old: original.clone(),
-                    new: modified,
-                }],
-                relation_deltas: vec![],
-                artifact_deltas: vec![],
-                projected_files: vec![],
-                spec_link: None,
-                evidence: vec![],
-                risk_summary: None,
-                authored_on: None,
-            },
-            SemanticChange {
-                id: second_child_id,
-                parents: vec![genesis_id],
-                timestamp,
-                author: AuthorId::new("test"),
-                message: "sibling".to_string(),
-                entity_deltas: vec![],
-                relation_deltas: vec![],
-                artifact_deltas: vec![],
-                projected_files: vec![],
-                spec_link: None,
-                evidence: vec![],
-                risk_summary: None,
-                authored_on: None,
-            },
-        ];
+        let genesis = seal_change(SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0x11; 32])),
+            parents: vec![],
+            timestamp: timestamp.clone(),
+            author: AuthorId::new("test"),
+            message: "genesis".to_string(),
+            entity_deltas: vec![EntityDelta::Added {
+                new: original.clone(),
+            }],
+            relation_deltas: vec![],
+            tree_deltas: vec![],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            origin: kin_model::ChangeOrigin::Native,
+            admission_policy_delta: None,
+        });
+        let genesis_id = genesis.id;
+        let first_child = seal_change(SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0x22; 32])),
+            parents: vec![genesis_id],
+            timestamp: timestamp.clone(),
+            author: AuthorId::new("test"),
+            message: "modify target".to_string(),
+            entity_deltas: vec![EntityDelta::Modified {
+                old: original.clone(),
+                new: modified,
+            }],
+            relation_deltas: vec![],
+            tree_deltas: vec![],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            origin: kin_model::ChangeOrigin::Native,
+            admission_policy_delta: None,
+        });
+        let first_child_id = first_child.id;
+        let second_child = seal_change(SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0x33; 32])),
+            parents: vec![genesis_id],
+            timestamp,
+            author: AuthorId::new("test"),
+            message: "sibling".to_string(),
+            entity_deltas: vec![],
+            relation_deltas: vec![],
+            tree_deltas: vec![],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            origin: kin_model::ChangeOrigin::Native,
+            admission_policy_delta: None,
+        });
+        let second_child_id = second_child.id;
+        let changes = vec![genesis, first_child, second_child];
 
         for change in &changes {
             sequential.create_change(change).unwrap();
@@ -10487,8 +11964,8 @@ mod tests {
         let removed_then_added = test_entity("late", "src/late.rs");
         let other = test_entity("other", "src/other.rs");
         let timestamp = Timestamp::now();
-        let make_change =
-            |id_byte: u8, message: &str, entity_deltas: Vec<EntityDelta>| SemanticChange {
+        let make_change = |id_byte: u8, message: &str, entity_deltas: Vec<EntityDelta>| {
+            seal_change(SemanticChange {
                 id: SemanticChangeId::from_hash(Hash256::from_bytes([id_byte; 32])),
                 parents: vec![],
                 timestamp: timestamp.clone(),
@@ -10496,28 +11973,34 @@ mod tests {
                 message: message.to_string(),
                 entity_deltas,
                 relation_deltas: vec![],
-                artifact_deltas: vec![],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
-            };
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
+            })
+        };
         let changes = vec![
             make_change(
                 0x41,
                 "remove before history is available",
-                vec![EntityDelta::Removed(removed_then_added.id)],
+                vec![EntityDelta::Removed {
+                    old: removed_then_added.clone(),
+                }],
             ),
             make_change(
                 0x42,
                 "add another entity first",
-                vec![EntityDelta::Added(other)],
+                vec![EntityDelta::Added { new: other }],
             ),
             make_change(
                 0x43,
                 "add the previously removed entity",
-                vec![EntityDelta::Added(removed_then_added)],
+                vec![EntityDelta::Added {
+                    new: removed_then_added,
+                }],
             ),
         ];
 
@@ -10629,53 +12112,57 @@ mod tests {
     fn resolve_entity_at_replays_entity_deltas_for_target_head() {
         let graph = InMemoryGraph::new();
 
-        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x11; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: genesis_id,
+        let genesis_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x11; 32])),
                 parents: vec![],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
                 message: "genesis".to_string(),
                 entity_deltas: vec![],
                 relation_deltas: vec![],
-                artifact_deltas: vec![],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
-            })
-            .unwrap();
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
+            },
+        );
 
         let entity_v1 = test_entity("foo", "src/lib.rs");
-        let add_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x22; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: add_id,
+        let add_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x22; 32])),
                 parents: vec![genesis_id],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
                 message: "add foo".to_string(),
-                entity_deltas: vec![EntityDelta::Added(entity_v1.clone())],
+                entity_deltas: vec![EntityDelta::Added {
+                    new: entity_v1.clone(),
+                }],
                 relation_deltas: vec![],
-                artifact_deltas: vec![],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
-            })
-            .unwrap();
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
+            },
+        );
 
         let mut entity_v2 = entity_v1.clone();
         entity_v2.signature = "fn foo(value: i32)".to_string();
         entity_v2.fingerprint.signature_hash = Hash256::from_bytes([0x33; 32]);
 
-        let modify_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x33; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: modify_id,
+        let modify_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x33; 32])),
                 parents: vec![add_id],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
@@ -10685,14 +12172,15 @@ mod tests {
                     new: entity_v2.clone(),
                 }],
                 relation_deltas: vec![],
-                artifact_deltas: vec![],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
-            })
-            .unwrap();
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
+            },
+        );
 
         let at_add = graph
             .resolve_entity_at(&entity_v1.id, &add_id)
@@ -10711,53 +12199,57 @@ mod tests {
     fn get_entity_revisions_at_tracks_revision_lineage_for_target_head() {
         let graph = InMemoryGraph::new();
 
-        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x34; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: genesis_id,
+        let genesis_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x34; 32])),
                 parents: vec![],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
                 message: "genesis".to_string(),
                 entity_deltas: vec![],
                 relation_deltas: vec![],
-                artifact_deltas: vec![],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
-            })
-            .unwrap();
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
+            },
+        );
 
         let entity_v1 = test_entity("foo", "src/lib.rs");
-        let add_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x35; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: add_id,
+        let add_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x35; 32])),
                 parents: vec![genesis_id],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
                 message: "add foo".to_string(),
-                entity_deltas: vec![EntityDelta::Added(entity_v1.clone())],
+                entity_deltas: vec![EntityDelta::Added {
+                    new: entity_v1.clone(),
+                }],
                 relation_deltas: vec![],
-                artifact_deltas: vec![],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
-            })
-            .unwrap();
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
+            },
+        );
 
         let mut entity_v2 = entity_v1.clone();
         entity_v2.signature = "fn foo(value: i32)".to_string();
         entity_v2.fingerprint.signature_hash = Hash256::from_bytes([0x36; 32]);
 
-        let modify_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x37; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: modify_id,
+        let modify_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x37; 32])),
                 parents: vec![add_id],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
@@ -10767,14 +12259,15 @@ mod tests {
                     new: entity_v2.clone(),
                 }],
                 relation_deltas: vec![],
-                artifact_deltas: vec![],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
-            })
-            .unwrap();
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
+            },
+        );
 
         let revisions = graph
             .get_entity_revisions_at(&entity_v1.id, &modify_id)
@@ -10794,52 +12287,56 @@ mod tests {
     fn create_change_persists_entity_revision_lineage_in_snapshots() {
         let graph = InMemoryGraph::new();
 
-        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x71; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: genesis_id,
+        let genesis_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x71; 32])),
                 parents: vec![],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
                 message: "genesis".to_string(),
                 entity_deltas: vec![],
                 relation_deltas: vec![],
-                artifact_deltas: vec![],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
-            })
-            .unwrap();
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
+            },
+        );
 
         let entity_v1 = test_entity("foo", "src/lib.rs");
-        let add_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x72; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: add_id,
+        let add_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x72; 32])),
                 parents: vec![genesis_id],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
                 message: "add foo".to_string(),
-                entity_deltas: vec![EntityDelta::Added(entity_v1.clone())],
+                entity_deltas: vec![EntityDelta::Added {
+                    new: entity_v1.clone(),
+                }],
                 relation_deltas: vec![],
-                artifact_deltas: vec![],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
-            })
-            .unwrap();
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
+            },
+        );
 
         let mut entity_v2 = entity_v1.clone();
         entity_v2.signature = "fn foo(value: i32)".to_string();
         entity_v2.fingerprint.signature_hash = Hash256::from_bytes([0x73; 32]);
-        let modify_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x74; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: modify_id,
+        let modify_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x74; 32])),
                 parents: vec![add_id],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
@@ -10849,14 +12346,15 @@ mod tests {
                     new: entity_v2,
                 }],
                 relation_deltas: vec![],
-                artifact_deltas: vec![],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
-            })
-            .unwrap();
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
+            },
+        );
 
         let snapshot = graph.to_snapshot();
         let revisions = snapshot
@@ -10876,52 +12374,56 @@ mod tests {
     fn from_snapshot_backfills_entity_revisions_from_change_history() {
         let graph = InMemoryGraph::new();
 
-        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x75; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: genesis_id,
+        let genesis_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x75; 32])),
                 parents: vec![],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
                 message: "genesis".to_string(),
                 entity_deltas: vec![],
                 relation_deltas: vec![],
-                artifact_deltas: vec![],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
-            })
-            .unwrap();
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
+            },
+        );
 
         let entity_v1 = test_entity("foo", "src/lib.rs");
-        let add_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x76; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: add_id,
+        let add_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x76; 32])),
                 parents: vec![genesis_id],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
                 message: "add foo".to_string(),
-                entity_deltas: vec![EntityDelta::Added(entity_v1.clone())],
+                entity_deltas: vec![EntityDelta::Added {
+                    new: entity_v1.clone(),
+                }],
                 relation_deltas: vec![],
-                artifact_deltas: vec![],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
-            })
-            .unwrap();
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
+            },
+        );
 
         let mut entity_v2 = entity_v1.clone();
         entity_v2.signature = "fn foo(value: i32)".to_string();
         entity_v2.fingerprint.signature_hash = Hash256::from_bytes([0x77; 32]);
-        let modify_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x78; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: modify_id,
+        let modify_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x78; 32])),
                 parents: vec![add_id],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
@@ -10931,19 +12433,20 @@ mod tests {
                     new: entity_v2,
                 }],
                 relation_deltas: vec![],
-                artifact_deltas: vec![],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
-            })
-            .unwrap();
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
+            },
+        );
 
         let mut snapshot = graph.to_snapshot();
         snapshot.entity_revisions.clear();
 
-        let reloaded = InMemoryGraph::from_snapshot(snapshot);
+        let reloaded = InMemoryGraph::from_snapshot(snapshot).unwrap();
         let repaired = reloaded.to_snapshot();
         let revisions = repaired
             .entity_revisions
@@ -10962,69 +12465,76 @@ mod tests {
     fn get_relation_revisions_at_replays_relation_lifecycle() {
         let graph = InMemoryGraph::new();
 
-        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x38; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: genesis_id,
+        let genesis_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x38; 32])),
                 parents: vec![],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
                 message: "genesis".to_string(),
                 entity_deltas: vec![],
                 relation_deltas: vec![],
-                artifact_deltas: vec![],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
-            })
-            .unwrap();
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
+            },
+        );
 
         let caller = test_entity("caller", "src/lib.rs");
         let callee = test_entity("callee", "src/lib.rs");
         let rel = test_relation(caller.id, callee.id, RelationKind::Calls);
 
-        let add_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x39; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: add_id,
+        let add_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x39; 32])),
                 parents: vec![genesis_id],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
                 message: "add graph".to_string(),
                 entity_deltas: vec![
-                    EntityDelta::Added(caller.clone()),
-                    EntityDelta::Added(callee.clone()),
+                    EntityDelta::Added {
+                        new: caller.clone(),
+                    },
+                    EntityDelta::Added {
+                        new: callee.clone(),
+                    },
                 ],
-                relation_deltas: vec![RelationDelta::Added(rel.clone())],
-                artifact_deltas: vec![],
+                relation_deltas: vec![RelationDelta::Added { new: rel.clone() }],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
-            })
-            .unwrap();
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
+            },
+        );
 
-        let remove_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x3a; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: remove_id,
+        let remove_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x3a; 32])),
                 parents: vec![add_id],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
                 message: "remove relation".to_string(),
                 entity_deltas: vec![],
-                relation_deltas: vec![RelationDelta::Removed(rel.id)],
-                artifact_deltas: vec![],
+                relation_deltas: vec![RelationDelta::Removed { old: rel.clone() }],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
-            })
-            .unwrap();
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
+            },
+        );
 
         let revisions = graph
             .get_relation_revisions_at(&rel.id, &remove_id)
@@ -11039,69 +12549,78 @@ mod tests {
     fn resolve_graph_at_replays_entities_and_relations() {
         let graph = InMemoryGraph::new();
 
-        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x41; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: genesis_id,
+        let genesis_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x41; 32])),
                 parents: vec![],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
                 message: "genesis".to_string(),
                 entity_deltas: vec![],
                 relation_deltas: vec![],
-                artifact_deltas: vec![],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
-            })
-            .unwrap();
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
+            },
+        );
 
         let caller = test_entity("caller", "src/lib.rs");
         let callee = test_entity("callee", "src/lib.rs");
         let rel = test_relation(caller.id, callee.id, RelationKind::Calls);
 
-        let add_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x42; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: add_id,
+        let add_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x42; 32])),
                 parents: vec![genesis_id],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
                 message: "add graph".to_string(),
                 entity_deltas: vec![
-                    EntityDelta::Added(caller.clone()),
-                    EntityDelta::Added(callee.clone()),
+                    EntityDelta::Added {
+                        new: caller.clone(),
+                    },
+                    EntityDelta::Added {
+                        new: callee.clone(),
+                    },
                 ],
-                relation_deltas: vec![RelationDelta::Added(rel.clone())],
-                artifact_deltas: vec![],
+                relation_deltas: vec![RelationDelta::Added { new: rel.clone() }],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
-            })
-            .unwrap();
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
+            },
+        );
 
-        let remove_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x43; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: remove_id,
+        let remove_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x43; 32])),
                 parents: vec![add_id],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
                 message: "remove callee".to_string(),
-                entity_deltas: vec![EntityDelta::Removed(callee.id)],
-                relation_deltas: vec![],
-                artifact_deltas: vec![],
+                entity_deltas: vec![EntityDelta::Removed {
+                    old: callee.clone(),
+                }],
+                relation_deltas: vec![RelationDelta::Removed { old: rel.clone() }],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
-            })
-            .unwrap();
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
+            },
+        );
 
         let added_state = graph.resolve_graph_at(&add_id).unwrap();
         assert_eq!(added_state.entities.len(), 2);
@@ -11112,112 +12631,120 @@ mod tests {
         assert!(!removed_state.entities.contains_key(&callee.id));
         assert!(
             removed_state.relations.is_empty(),
-            "dangling relations should be pruned when an entity is removed"
+            "entity and relation removal are both explicit in exact history"
         );
     }
 
     #[test]
-    fn resolve_graph_at_replays_file_tree_into_resolved_state() {
+    fn resolve_graph_at_replays_tree_into_resolved_state() {
         let graph = InMemoryGraph::new();
 
-        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x44; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: genesis_id,
+        let genesis_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x44; 32])),
                 parents: vec![],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
                 message: "genesis".to_string(),
                 entity_deltas: vec![],
                 relation_deltas: vec![],
-                artifact_deltas: vec![],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
-            })
-            .unwrap();
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
+            },
+        );
 
         let file_id = FilePathId::new("docs/config.json");
+        let artifact_id = ArtifactId::new();
         let content_hash = Hash256::from_bytes([0x45; 32]);
-        let add_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x46; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: add_id,
+        let add_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x46; 32])),
                 parents: vec![genesis_id],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
                 message: "add artifact".to_string(),
                 entity_deltas: vec![],
                 relation_deltas: vec![],
-                artifact_deltas: vec![ArtifactDelta {
-                    file_id: file_id.clone(),
-                    kind: ArtifactDeltaKind::Added,
-                    old_hash: None,
-                    new_hash: Some(content_hash),
+                tree_deltas: vec![TreeDelta::Added {
+                    artifact_id,
+                    new: test_located(&file_id.0, TreeEntry::blob(content_hash, false)),
                 }],
                 projected_files: vec![file_id.clone()],
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
-            })
-            .unwrap();
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
+            },
+        );
 
         let state = graph.resolve_graph_at(&add_id).unwrap();
-        assert_eq!(state.file_tree.get(&file_id), Some(&content_hash));
+        assert_eq!(
+            state.tree.get(&artifact_id).map(|artifact| artifact.entry),
+            Some(TreeEntry::blob(content_hash, false))
+        );
     }
 
     #[test]
     fn get_entity_history_at_filters_to_reachable_changes() {
         let graph = InMemoryGraph::new();
 
-        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x51; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: genesis_id,
+        let genesis_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x51; 32])),
                 parents: vec![],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
                 message: "genesis".to_string(),
                 entity_deltas: vec![],
                 relation_deltas: vec![],
-                artifact_deltas: vec![],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
-            })
-            .unwrap();
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
+            },
+        );
 
         let entity = test_entity("foo", "src/lib.rs");
-        let add_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x52; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: add_id,
+        let add_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x52; 32])),
                 parents: vec![genesis_id],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
                 message: "add foo".to_string(),
-                entity_deltas: vec![EntityDelta::Added(entity.clone())],
+                entity_deltas: vec![EntityDelta::Added {
+                    new: entity.clone(),
+                }],
                 relation_deltas: vec![],
-                artifact_deltas: vec![],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
-            })
-            .unwrap();
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
+            },
+        );
 
         let mut main_entity = entity.clone();
         main_entity.signature = "fn foo_main()".to_string();
-        let main_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x53; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: main_id,
+        let main_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x53; 32])),
                 parents: vec![add_id],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
@@ -11227,21 +12754,22 @@ mod tests {
                     new: main_entity,
                 }],
                 relation_deltas: vec![],
-                artifact_deltas: vec![],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
-            })
-            .unwrap();
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
+            },
+        );
 
         let mut feature_entity = entity.clone();
         feature_entity.signature = "fn foo_feature()".to_string();
-        let feature_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x54; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: feature_id,
+        let _feature_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x54; 32])),
                 parents: vec![add_id],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
@@ -11251,14 +12779,15 @@ mod tests {
                     new: feature_entity,
                 }],
                 relation_deltas: vec![],
-                artifact_deltas: vec![],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
-            })
-            .unwrap();
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
+            },
+        );
 
         let history = graph.get_entity_history_at(&entity.id, &main_id).unwrap();
         let messages: Vec<_> = history.into_iter().map(|change| change.message).collect();
@@ -11272,53 +12801,57 @@ mod tests {
     fn get_entity_revisions_at_tracks_supersession_and_removal() {
         let graph = InMemoryGraph::new();
 
-        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x55; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: genesis_id,
+        let genesis_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x55; 32])),
                 parents: vec![],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
                 message: "genesis".to_string(),
                 entity_deltas: vec![],
                 relation_deltas: vec![],
-                artifact_deltas: vec![],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
-            })
-            .unwrap();
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
+            },
+        );
 
         let entity_v1 = test_entity("foo", "src/lib.rs");
-        let add_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x56; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: add_id,
+        let add_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x56; 32])),
                 parents: vec![genesis_id],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
                 message: "add foo".to_string(),
-                entity_deltas: vec![EntityDelta::Added(entity_v1.clone())],
+                entity_deltas: vec![EntityDelta::Added {
+                    new: entity_v1.clone(),
+                }],
                 relation_deltas: vec![],
-                artifact_deltas: vec![],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
-            })
-            .unwrap();
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
+            },
+        );
 
         let mut entity_v2 = entity_v1.clone();
         entity_v2.signature = "fn foo(value: i32)".to_string();
         entity_v2.fingerprint.signature_hash = Hash256::from_bytes([0x57; 32]);
 
-        let modify_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x58; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: modify_id,
+        let modify_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x58; 32])),
                 parents: vec![add_id],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
@@ -11328,33 +12861,37 @@ mod tests {
                     new: entity_v2.clone(),
                 }],
                 relation_deltas: vec![],
-                artifact_deltas: vec![],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
-            })
-            .unwrap();
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
+            },
+        );
 
-        let remove_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x59; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: remove_id,
+        let remove_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x59; 32])),
                 parents: vec![modify_id],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
                 message: "remove foo".to_string(),
-                entity_deltas: vec![EntityDelta::Removed(entity_v1.id)],
+                entity_deltas: vec![EntityDelta::Removed {
+                    old: entity_v2.clone(),
+                }],
                 relation_deltas: vec![],
-                artifact_deltas: vec![],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
-            })
-            .unwrap();
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
+            },
+        );
 
         let revisions = graph
             .get_entity_revisions_at(&entity_v1.id, &remove_id)
@@ -11378,68 +12915,75 @@ mod tests {
     fn get_relation_revisions_at_tracks_add_remove_cycles() {
         let graph = InMemoryGraph::new();
 
-        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x5a; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: genesis_id,
+        let genesis_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x5a; 32])),
                 parents: vec![],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
                 message: "genesis".to_string(),
                 entity_deltas: vec![],
                 relation_deltas: vec![],
-                artifact_deltas: vec![],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
-            })
-            .unwrap();
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
+            },
+        );
 
         let caller = test_entity("caller", "src/lib.rs");
         let callee = test_entity("callee", "src/lib.rs");
         let rel = test_relation(caller.id, callee.id, RelationKind::Calls);
-        let add_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x5b; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: add_id,
+        let add_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x5b; 32])),
                 parents: vec![genesis_id],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
                 message: "add relation".to_string(),
                 entity_deltas: vec![
-                    EntityDelta::Added(caller.clone()),
-                    EntityDelta::Added(callee.clone()),
+                    EntityDelta::Added {
+                        new: caller.clone(),
+                    },
+                    EntityDelta::Added {
+                        new: callee.clone(),
+                    },
                 ],
-                relation_deltas: vec![RelationDelta::Added(rel.clone())],
-                artifact_deltas: vec![],
+                relation_deltas: vec![RelationDelta::Added { new: rel.clone() }],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
-            })
-            .unwrap();
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
+            },
+        );
 
-        let remove_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x5c; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: remove_id,
+        let remove_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x5c; 32])),
                 parents: vec![add_id],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
                 message: "remove relation".to_string(),
                 entity_deltas: vec![],
-                relation_deltas: vec![RelationDelta::Removed(rel.id)],
-                artifact_deltas: vec![],
+                relation_deltas: vec![RelationDelta::Removed { old: rel.clone() }],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
-            })
-            .unwrap();
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
+            },
+        );
 
         let revisions = graph
             .get_relation_revisions_at(&rel.id, &remove_id)
@@ -11457,281 +13001,285 @@ mod tests {
     fn get_artifact_revisions_at_tracks_current_and_removed_content() {
         let graph = InMemoryGraph::new();
 
-        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x66; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: genesis_id,
+        let genesis_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x66; 32])),
                 parents: vec![],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
                 message: "genesis".to_string(),
                 entity_deltas: vec![],
                 relation_deltas: vec![],
-                artifact_deltas: vec![],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
-            })
-            .unwrap();
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
+            },
+        );
 
         let file_id = FilePathId::new("docs/config.json");
+        let artifact_id = ArtifactId::new();
         let v1 = Hash256::from_bytes([0x67; 32]);
-        let add_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x68; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: add_id,
+        let add_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x68; 32])),
                 parents: vec![genesis_id],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
                 message: "add artifact".to_string(),
                 entity_deltas: vec![],
                 relation_deltas: vec![],
-                artifact_deltas: vec![ArtifactDelta {
-                    file_id: file_id.clone(),
-                    kind: ArtifactDeltaKind::Added,
-                    old_hash: None,
-                    new_hash: Some(v1),
+                tree_deltas: vec![TreeDelta::Added {
+                    artifact_id,
+                    new: test_located(&file_id.0, TreeEntry::blob(v1, false)),
                 }],
                 projected_files: vec![file_id.clone()],
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
-            })
-            .unwrap();
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
+            },
+        );
 
         let v2 = Hash256::from_bytes([0x69; 32]);
-        let modify_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x6a; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: modify_id,
+        let modify_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x6a; 32])),
                 parents: vec![add_id],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
                 message: "modify artifact".to_string(),
                 entity_deltas: vec![],
                 relation_deltas: vec![],
-                artifact_deltas: vec![ArtifactDelta {
-                    file_id: file_id.clone(),
-                    kind: ArtifactDeltaKind::Modified,
-                    old_hash: Some(v1),
-                    new_hash: Some(v2),
+                tree_deltas: vec![TreeDelta::Updated {
+                    artifact_id,
+                    old: test_located(&file_id.0, TreeEntry::blob(v1, false)),
+                    new: test_located(&file_id.0, TreeEntry::blob(v2, false)),
                 }],
                 projected_files: vec![file_id.clone()],
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
-            })
-            .unwrap();
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
+            },
+        );
 
-        let remove_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x6b; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: remove_id,
+        let remove_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x6b; 32])),
                 parents: vec![modify_id],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
                 message: "remove artifact".to_string(),
                 entity_deltas: vec![],
                 relation_deltas: vec![],
-                artifact_deltas: vec![ArtifactDelta {
-                    file_id: file_id.clone(),
-                    kind: ArtifactDeltaKind::Removed,
-                    old_hash: Some(v2),
-                    new_hash: None,
+                tree_deltas: vec![TreeDelta::Removed {
+                    artifact_id,
+                    old: test_located(&file_id.0, TreeEntry::blob(v2, false)),
                 }],
                 projected_files: vec![file_id.clone()],
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
-            })
-            .unwrap();
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
+            },
+        );
 
         let revisions = graph
-            .get_artifact_revisions_at(&file_id, &remove_id)
+            .get_artifact_revisions_at(&artifact_id, &remove_id)
             .unwrap();
         assert_eq!(revisions.len(), 2);
-        assert_eq!(revisions[0].content_hash, v1);
-        assert_eq!(revisions[0].ended_by, Some(modify_id));
-        assert_eq!(revisions[1].content_hash, v2);
-        assert_eq!(revisions[1].ended_by, Some(remove_id));
+        assert_eq!(revisions[0].entry, TreeEntry::blob(v1, false));
+        assert_eq!(revisions[1].entry, TreeEntry::blob(v2, false));
         assert!(graph
-            .resolve_artifact_revision_at(&file_id, &remove_id)
+            .resolve_artifact_revision_at(&artifact_id, &remove_id)
             .unwrap()
             .is_none());
     }
 
     #[test]
-    fn resolve_file_tree_at_replays_artifact_deltas_for_target_head() {
+    fn resolve_tree_at_replays_tree_deltas_for_target_head() {
         let graph = InMemoryGraph::new();
 
-        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x61; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: genesis_id,
+        let genesis_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x61; 32])),
                 parents: vec![],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
                 message: "genesis".to_string(),
                 entity_deltas: vec![],
                 relation_deltas: vec![],
-                artifact_deltas: vec![],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
-            })
-            .unwrap();
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
+            },
+        );
 
         let file_id = FilePathId::new("docs/config.json");
+        let artifact_id = ArtifactId::new();
         let v1 = Hash256::from_bytes([0x62; 32]);
-        let add_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x63; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: add_id,
+        let add_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x63; 32])),
                 parents: vec![genesis_id],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
                 message: "add artifact".to_string(),
                 entity_deltas: vec![],
                 relation_deltas: vec![],
-                artifact_deltas: vec![ArtifactDelta {
-                    file_id: file_id.clone(),
-                    kind: ArtifactDeltaKind::Added,
-                    old_hash: None,
-                    new_hash: Some(v1),
+                tree_deltas: vec![TreeDelta::Added {
+                    artifact_id,
+                    new: test_located(&file_id.0, TreeEntry::blob(v1, false)),
                 }],
                 projected_files: vec![file_id.clone()],
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
-            })
-            .unwrap();
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
+            },
+        );
 
         let v2 = Hash256::from_bytes([0x64; 32]);
-        let modify_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x65; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: modify_id,
+        let modify_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x65; 32])),
                 parents: vec![add_id],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
                 message: "modify artifact".to_string(),
                 entity_deltas: vec![],
                 relation_deltas: vec![],
-                artifact_deltas: vec![ArtifactDelta {
-                    file_id: file_id.clone(),
-                    kind: ArtifactDeltaKind::Modified,
-                    old_hash: Some(v1),
-                    new_hash: Some(v2),
+                tree_deltas: vec![TreeDelta::Updated {
+                    artifact_id,
+                    old: test_located(&file_id.0, TreeEntry::blob(v1, false)),
+                    new: test_located(&file_id.0, TreeEntry::blob(v2, false)),
                 }],
                 projected_files: vec![file_id.clone()],
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
-            })
-            .unwrap();
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
+            },
+        );
 
-        let at_add = graph.resolve_file_tree_at(&add_id).unwrap();
-        assert_eq!(at_add.get(&file_id), Some(&v1));
+        let at_add = graph.resolve_tree_at(&add_id).unwrap();
+        assert_eq!(
+            at_add.get(&artifact_id).map(|artifact| artifact.entry),
+            Some(TreeEntry::blob(v1, false))
+        );
 
-        let at_modify = graph.resolve_file_tree_at(&modify_id).unwrap();
-        assert_eq!(at_modify.get(&file_id), Some(&v2));
+        let at_modify = graph.resolve_tree_at(&modify_id).unwrap();
+        assert_eq!(
+            at_modify.get(&artifact_id).map(|artifact| artifact.entry),
+            Some(TreeEntry::blob(v2, false))
+        );
     }
 
     #[test]
     fn get_artifact_revisions_at_replays_file_history() {
         let graph = InMemoryGraph::new();
 
-        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x66; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: genesis_id,
+        let genesis_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x66; 32])),
                 parents: vec![],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
                 message: "genesis".to_string(),
                 entity_deltas: vec![],
                 relation_deltas: vec![],
-                artifact_deltas: vec![],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
-            })
-            .unwrap();
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
+            },
+        );
 
         let file_id = FilePathId::new("docs/config.json");
+        let artifact_id = ArtifactId::new();
         let v1 = Hash256::from_bytes([0x67; 32]);
-        let add_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x68; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: add_id,
+        let add_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x68; 32])),
                 parents: vec![genesis_id],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
                 message: "add artifact".to_string(),
                 entity_deltas: vec![],
                 relation_deltas: vec![],
-                artifact_deltas: vec![ArtifactDelta {
-                    file_id: file_id.clone(),
-                    kind: ArtifactDeltaKind::Added,
-                    old_hash: None,
-                    new_hash: Some(v1),
+                tree_deltas: vec![TreeDelta::Added {
+                    artifact_id,
+                    new: test_located(&file_id.0, TreeEntry::blob(v1, false)),
                 }],
                 projected_files: vec![file_id.clone()],
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
-            })
-            .unwrap();
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
+            },
+        );
 
         let v2 = Hash256::from_bytes([0x69; 32]);
-        let modify_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x6a; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: modify_id,
+        let modify_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x6a; 32])),
                 parents: vec![add_id],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
                 message: "modify artifact".to_string(),
                 entity_deltas: vec![],
                 relation_deltas: vec![],
-                artifact_deltas: vec![ArtifactDelta {
-                    file_id: file_id.clone(),
-                    kind: ArtifactDeltaKind::Modified,
-                    old_hash: Some(v1),
-                    new_hash: Some(v2),
+                tree_deltas: vec![TreeDelta::Updated {
+                    artifact_id,
+                    old: test_located(&file_id.0, TreeEntry::blob(v1, false)),
+                    new: test_located(&file_id.0, TreeEntry::blob(v2, false)),
                 }],
                 projected_files: vec![file_id.clone()],
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
-            })
-            .unwrap();
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
+            },
+        );
 
         let revisions = graph
-            .get_artifact_revisions_at(&file_id, &modify_id)
+            .get_artifact_revisions_at(&artifact_id, &modify_id)
             .unwrap();
         assert_eq!(revisions.len(), 2);
-        assert_eq!(revisions[0].content_hash, v1);
-        assert_eq!(revisions[0].ended_by, Some(modify_id));
-        assert_eq!(revisions[1].content_hash, v2);
+        assert_eq!(revisions[0].entry, TreeEntry::blob(v1, false));
+        assert_eq!(revisions[1].entry, TreeEntry::blob(v2, false));
         assert_eq!(
-            revisions[1].previous_revision,
-            Some(revisions[0].revision_id)
+            revisions[1].predecessor_revisions,
+            vec![revisions[0].revision_id]
         );
-        assert_eq!(revisions[1].ended_by, None);
     }
 
     #[test]
@@ -12017,6 +13565,7 @@ mod tests {
             import_paths: vec!["zstd.h".into()],
         };
 
+        admit_enrichment(&graph, &sf.file_id, sf.syntax_hash);
         graph.upsert_shallow_file(&sf).unwrap();
         let files = graph.list_shallow_files().unwrap();
         assert_eq!(files.len(), 1);
@@ -12056,6 +13605,8 @@ mod tests {
             text_preview: Some("<svg".into()),
         };
 
+        admit_enrichment(&graph, &structured.file_id, structured.content_hash);
+        admit_enrichment(&graph, &opaque.file_id, opaque.content_hash);
         graph.upsert_structured_artifact(&structured).unwrap();
         graph.upsert_opaque_artifact(&opaque).unwrap();
 
@@ -12116,14 +13667,22 @@ mod tests {
             text_preview: Some("<svg".into()),
         };
 
+        admit_enrichment(&graph, &shallow.file_id, shallow.syntax_hash);
+        admit_enrichment(&graph, &structured.file_id, structured.content_hash);
+        admit_enrichment(&graph, &opaque.file_id, opaque.content_hash);
         graph.upsert_shallow_file(&shallow).unwrap();
         graph.upsert_structured_artifact(&structured).unwrap();
         graph.upsert_opaque_artifact(&opaque).unwrap();
 
-        // Identity is graph-assigned by the upserts above: read it back.
-        let shallow_id = graph.artifact_id_for_path(&shallow.file_id).unwrap();
-        let structured_id = graph.artifact_id_for_path(&structured.file_id).unwrap();
-        let opaque_id = graph.artifact_id_for_path(&opaque.file_id).unwrap();
+        let shallow_id = graph
+            .artifact_id_at_path(&test_repo_path(&shallow.file_id.0))
+            .unwrap();
+        let structured_id = graph
+            .artifact_id_at_path(&test_repo_path(&structured.file_id.0))
+            .unwrap();
+        let opaque_id = graph
+            .artifact_id_at_path(&test_repo_path(&opaque.file_id.0))
+            .unwrap();
 
         {
             let queue = graph.artifact_embedding_queue.lock();
@@ -12157,20 +13716,77 @@ mod tests {
             regions: vec![SourceRegion::Trivia { byte_range: 0..12 }],
         };
 
+        admit_enrichment(&graph, &file_id, Hash256::from_bytes([0x15; 32]));
         graph.upsert_file_layout(&layout).unwrap();
         let fetched = graph.get_file_layout(&file_id).unwrap().unwrap();
         assert_eq!(fetched.parse_completeness, layout.parse_completeness);
         assert_eq!(graph.list_file_layouts().unwrap().len(), 1);
-        assert!(
-            graph.artifact_id_for_path(&file_id).is_some(),
-            "source file layouts must register graph artifact IDs for artifact relations"
-        );
+        assert!(graph
+            .artifact_id_at_path(&test_repo_path(&file_id.0))
+            .is_some());
 
         graph.delete_file_layout(&file_id).unwrap();
         assert!(graph.get_file_layout(&file_id).unwrap().is_none());
         assert!(
-            graph.artifact_id_for_path(&file_id).is_none(),
-            "deleting the last file-surface owner should remove the artifact index entry"
+            graph
+                .artifact_id_at_path(&test_repo_path(&file_id.0))
+                .is_some(),
+            "deleting enrichment must not erase repository identity"
+        );
+    }
+
+    #[test]
+    fn artifact_identity_only_enters_through_tree_admission() {
+        let path = FilePathId::new("src/lib.rs");
+        let graph = InMemoryGraph::new();
+        assert!(graph
+            .artifact_id_at_path(&test_repo_path(&path.0))
+            .is_none());
+
+        let assigned = graph.admit_artifact_for_test(
+            &path.0,
+            TreeEntry::blob(Hash256::from_bytes([0; 32]), false),
+        );
+
+        assert_eq!(
+            graph.artifact_id_at_path(&test_repo_path(&path.0)),
+            Some(assigned)
+        );
+    }
+
+    #[test]
+    fn independent_graphs_assign_distinct_identities_to_the_same_path_history() {
+        let original_path = FilePathId::new("src/original.rs");
+        let renamed_path = FilePathId::new("src/current.rs");
+        let left = InMemoryGraph::new();
+        let right = InMemoryGraph::new();
+        let entry = TreeEntry::blob(Hash256::from_bytes([1; 32]), false);
+
+        let left_id = left.admit_artifact_for_test(&original_path.0, entry);
+        let right_id = right.admit_artifact_for_test(&original_path.0, entry);
+        assert_ne!(left_id, right_id);
+
+        for (graph, artifact_id) in [(&left, left_id), (&right, right_id)] {
+            graph
+                .apply_transaction_delta(&TransactionDelta {
+                    entity_deltas: Vec::new(),
+                    relation_deltas: Vec::new(),
+                    tree_deltas: vec![TreeDelta::Updated {
+                        artifact_id,
+                        old: test_located(&original_path.0, entry),
+                        new: test_located(&renamed_path.0, entry),
+                    }],
+                    admission_policy_delta: None,
+                })
+                .unwrap();
+        }
+        assert_eq!(
+            left.artifact_id_at_path(&test_repo_path(&renamed_path.0)),
+            Some(left_id)
+        );
+        assert_eq!(
+            right.artifact_id_at_path(&test_repo_path(&renamed_path.0)),
+            Some(right_id)
         );
     }
 
@@ -12397,7 +14013,7 @@ mod tests {
     #[cfg(feature = "vector")]
     #[test]
     fn reset_vector_index_requeues_every_entity_for_rebuild() {
-        // Simulates the stale-dimension migration: a repo arrives with a loaded
+        // Simulates a stale-dimension rebuild: a repo arrives with a loaded
         // index that already covers every entity, so a normal pass would queue
         // nothing. Resetting must drop the index and let a full re-queue happen
         // so the rebuild produces a fresh index at the live embedder dimension.
@@ -12448,24 +14064,28 @@ mod tests {
         change_byte: u8,
         entities: &[Entity],
     ) -> SemanticChange {
-        let change = SemanticChange {
+        let change = seal_change(SemanticChange {
             id: SemanticChangeId::from_hash(Hash256::from_bytes([change_byte; 32])),
             parents: vec![],
-            timestamp: Timestamp::now(),
+            timestamp: Timestamp(
+                chrono::DateTime::from_timestamp(1_700_000_000 + i64::from(change_byte), 0)
+                    .expect("test timestamp is representable"),
+            ),
             author: AuthorId::new("test"),
             message: "init".to_string(),
             entity_deltas: entities
                 .iter()
-                .map(|e| EntityDelta::Added(e.clone()))
+                .map(|e| EntityDelta::Added { new: e.clone() })
                 .collect(),
             relation_deltas: vec![],
-            artifact_deltas: vec![],
+            tree_deltas: vec![],
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],
             risk_summary: None,
-            authored_on: None,
-        };
+            origin: kin_model::ChangeOrigin::Native,
+            admission_policy_delta: None,
+        });
         graph.create_change(&change).unwrap();
         graph.batch_upsert_entities(entities).unwrap();
         change
@@ -12837,16 +14457,21 @@ mod tests {
             mime_type: Some("image/svg+xml".into()),
             text_preview: Some("<svg".into()),
         };
+        admit_enrichment(&graph, &structured.file_id, structured.content_hash);
+        admit_enrichment(&graph, &opaque.file_id, opaque.content_hash);
         graph.upsert_structured_artifact(&structured).unwrap();
         graph.upsert_opaque_artifact(&opaque).unwrap();
 
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("vectors.usearch");
         let index = crate::VectorIndex::new(2).unwrap();
-        // Identity is graph-assigned by the upsert above: read it back so the
-        // pre-seeded vector index entry matches what the graph will look for.
-        let structured_key =
-            RetrievalKey::Artifact(graph.artifact_id_for_path(&structured.file_id).unwrap());
+        // Use the explicitly admitted identity so the pre-seeded vector entry
+        // matches the graph-owned repository tree.
+        let structured_key = RetrievalKey::Artifact(
+            graph
+                .artifact_id_at_path(&test_repo_path(&structured.file_id.0))
+                .unwrap(),
+        );
         index
             .upsert_retrievable(structured_key, &[1.0, 0.0])
             .unwrap();
@@ -12856,7 +14481,9 @@ mod tests {
         graph.artifact_embedding_queue.lock().clear();
         graph.queue_missing_artifacts_for_embedding();
 
-        let opaque_id = graph.artifact_id_for_path(&opaque.file_id).unwrap();
+        let opaque_id = graph
+            .artifact_id_at_path(&test_repo_path(&opaque.file_id.0))
+            .unwrap();
         let queue = graph.artifact_embedding_queue.lock();
         assert_eq!(queue.len(), 1);
         assert!(queue.contains(&opaque_id));
@@ -13095,6 +14722,7 @@ mod tests {
             content_hash: Hash256::from_bytes([0x45; 32]),
             text_preview: Some("build".into()),
         };
+        admit_enrichment(&graph, &artifact.file_id, artifact.content_hash);
         graph.upsert_structured_artifact(&artifact).unwrap();
 
         let dir = tempfile::TempDir::new().unwrap();
@@ -13128,7 +14756,10 @@ mod tests {
         // Source files can have graph-native artifact identities for relations
         // and projection, but only shallow/structured/opaque artifact records
         // have document text that the artifact embedder can vectorize.
-        graph.ensure_artifact_id(&FilePathId::new("src/lib.rs"));
+        graph.admit_artifact_for_test(
+            "src/lib.rs",
+            TreeEntry::blob(Hash256::from_bytes([0x46; 32]), false),
+        );
 
         let status = graph.embedding_status();
         assert_eq!(status.total, 1);
@@ -13193,6 +14824,7 @@ mod tests {
             declaration_names: vec!["README".into()],
             import_paths: vec![],
         };
+        admit_enrichment(&graph, &shallow.file_id, shallow.syntax_hash);
         graph.upsert_shallow_file(&shallow).unwrap();
 
         let layout = FileLayout {
@@ -13204,6 +14836,7 @@ mod tests {
             },
             regions: vec![SourceRegion::Trivia { byte_range: 0..8 }],
         };
+        admit_enrichment(&graph, &layout.file_id, Hash256::from_bytes([1; 32]));
         graph.upsert_file_layout(&layout).unwrap();
 
         let structured = StructuredArtifact {
@@ -13212,6 +14845,7 @@ mod tests {
             content_hash: Hash256::from_bytes([2; 32]),
             text_preview: Some("build test".into()),
         };
+        admit_enrichment(&graph, &structured.file_id, structured.content_hash);
         graph.upsert_structured_artifact(&structured).unwrap();
 
         let opaque = OpaqueArtifact {
@@ -13220,10 +14854,10 @@ mod tests {
             mime_type: Some("image/svg+xml".into()),
             text_preview: Some("<svg".into()),
         };
+        admit_enrichment(&graph, &opaque.file_id, opaque.content_hash);
         graph.upsert_opaque_artifact(&opaque).unwrap();
 
-        // Set a file hash
-        graph.set_file_hash("src/a.rs", [1u8; 32]);
+        // The source path was already admitted before its layout enrichment.
         graph.flush_text_index().unwrap();
 
         #[cfg(feature = "vector")]
@@ -13248,7 +14882,7 @@ mod tests {
         assert_eq!(stats.shallow_file_count, 1);
         assert_eq!(stats.structured_artifact_count, 1);
         assert_eq!(stats.opaque_artifact_count, 1);
-        assert_eq!(stats.file_hash_count, 1);
+        assert_eq!(stats.working_tree_entry_count, 4);
         assert_eq!(stats.text_indexed_entity_count, 3);
         assert!((stats.text_index_coverage_percent - 100.0).abs() < f64::EPSILON);
         #[cfg(feature = "vector")]
@@ -13277,48 +14911,50 @@ mod tests {
     fn resolve_graph_at_handles_deep_linear_history_iteratively() {
         let graph = InMemoryGraph::new();
 
-        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x5b; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: genesis_id,
+        let genesis_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x5b; 32])),
                 parents: vec![],
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
                 message: "genesis".to_string(),
                 entity_deltas: vec![],
                 relation_deltas: vec![],
-                artifact_deltas: vec![],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
-                authored_on: None,
-            })
-            .unwrap();
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
+            },
+        );
 
         let mut previous = genesis_id;
         let mut head = genesis_id;
         for idx in 0..3_000u16 {
             let mut bytes = [0u8; 32];
             bytes[..2].copy_from_slice(&(idx + 1).to_be_bytes());
-            let id = SemanticChangeId::from_hash(Hash256::from_bytes(bytes));
-            graph
-                .create_change(&SemanticChange {
-                    id,
+            let id = admit_change(
+                &graph,
+                SemanticChange {
+                    id: SemanticChangeId::from_hash(Hash256::from_bytes(bytes)),
                     parents: vec![previous],
                     timestamp: Timestamp::now(),
                     author: AuthorId::new("test"),
                     message: format!("change {idx}"),
                     entity_deltas: vec![],
                     relation_deltas: vec![],
-                    artifact_deltas: vec![],
+                    tree_deltas: vec![],
                     projected_files: vec![],
                     spec_link: None,
                     evidence: vec![],
                     risk_summary: None,
-                    authored_on: None,
-                })
-                .unwrap();
+                    origin: kin_model::ChangeOrigin::Native,
+                    admission_policy_delta: None,
+                },
+            );
             previous = id;
             head = id;
         }
@@ -13326,7 +14962,7 @@ mod tests {
         let state = graph.resolve_graph_at(&head).unwrap();
         assert!(state.entities.is_empty());
         assert!(state.relations.is_empty());
-        assert!(state.file_tree.is_empty());
+        assert!(state.tree.is_empty());
     }
 
     fn test_entity_with_id(id_seed: u128, name: &str) -> Entity {
@@ -14980,7 +16616,7 @@ mod tests {
         let fwd: Vec<usize> = (0..rels.len()).collect();
         let g = determinism_build(&ents, &rels, &fwd);
         let before = g.compute_root_hash();
-        let reopened = InMemoryGraph::from_snapshot(g.to_snapshot());
+        let reopened = InMemoryGraph::from_snapshot(g.to_snapshot()).unwrap();
         assert_eq!(
             before,
             reopened.compute_root_hash(),

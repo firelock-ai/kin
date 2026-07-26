@@ -1,5 +1,5 @@
-//! Regression: the kvec sidecar's `graph_root_hash` must be the
-//! continuously-maintained current graph root.
+//! Regression: the kvec sidecar's historical `graph_root_hash` field must bind
+//! the exact retrieval authority, including repository-tree and artifact state.
 //!
 //! Included as a child module of `storage::snapshot` (rather than an external
 //! `tests/` integration test) because reading the module-private sidecar helpers
@@ -8,7 +8,6 @@
 #![cfg(feature = "vector")]
 
 use super::*;
-use crate::storage::merkle::compute_graph_root_hash;
 use crate::store::EntityStore;
 use crate::types::*;
 use crate::VectorIndex;
@@ -41,7 +40,7 @@ fn stamp_test_entity(name: &str) -> Entity {
     }
 }
 
-/// The kvec sidecar is stamped with the continuously-maintained graph root.
+/// The kvec sidecar is stamped with the exact retrieval authority.
 #[test]
 fn kvec_stamp_uses_continuously_maintained_root() {
     let dir = TempDir::new().unwrap();
@@ -61,12 +60,7 @@ fn kvec_stamp_uses_continuously_maintained_root() {
 
     mgr.save().unwrap();
 
-    let canonical = compute_graph_root_hash(&graph.to_snapshot());
-    assert_eq!(
-        graph.snapshot_root_hash_hint(),
-        Some(canonical),
-        "maintained root must stay current before vector stamp"
-    );
+    let canonical = graph.retrieval_authority_hash();
 
     SnapshotManager::save_vector_index_for_graph(&snapshot_path, graph.as_ref(), None).unwrap();
 
@@ -77,7 +71,7 @@ fn kvec_stamp_uses_continuously_maintained_root() {
     assert_eq!(
         metadata.graph_root_hash,
         hex::encode(canonical),
-        "sidecar must stamp the maintained current root"
+        "sidecar must stamp the exact retrieval authority"
     );
 }
 

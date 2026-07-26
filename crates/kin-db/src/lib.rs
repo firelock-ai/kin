@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
+pub mod admission;
 pub mod embed;
 pub mod engine;
 pub mod error;
@@ -22,6 +23,7 @@ pub use storage::format::{CompactionStats, GraphSnapshot};
 #[cfg(feature = "gcs")]
 pub use storage::GcsBackend;
 pub use storage::ReadIndex;
+pub use storage::SnapshotManager;
 #[cfg(feature = "vector")]
 pub use storage::VECTOR_INDEX_METADATA_VERSION;
 pub use storage::{
@@ -35,17 +37,22 @@ pub use storage::{
 };
 pub use storage::{
     load_recovered_snapshot, Generation, LocalFileBackend, PersistedDelta, RecoveredSnapshot,
-    SnapshotAuthority, SnapshotRecoveryState, StorageBackend, GENERATION_INIT,
-    MAX_SOURCE_BLOB_BYTES,
+    SnapshotAuthority, SnapshotCursor, SnapshotRecoveryState, SnapshotSaveOutcome, StorageBackend,
+    GENERATION_INIT, MAX_SOURCE_BLOB_BYTES,
+};
+pub use storage::{
+    AuthorityCommitDecision, AuthorityPublication, AuthorityReadLease, DurableAuthorityPersistence,
+    PersistOutcome, VersionedAuthorityState,
+};
+pub use storage::{
+    ChangeAdmissionPolicy, LocalRepositoryAuthorityFreeze, PersistedRepositoryAuthority,
+    RepositoryAuthorityManager, RepositoryAuthorityState,
 };
 pub use storage::{LoadStrategy, SystemMemInfo, TieredConfig, TieredGraph};
-pub use storage::{
-    LocalAuthorityRecoveryDeltaEvidence, LocalAuthorityRecoveryEvidence, SnapshotManager,
-};
 pub use store::{
     ChangeStore, EntityStore, GraphStore, ProvenanceStore, SessionStore, VerificationStore,
     WorkStore,
 };
 pub use types::*;
 #[cfg(feature = "vector")]
-pub use vector::VectorIndex;
+pub use vector::{IndexDescriptor, VectorIndex, VectorIndexLoad};

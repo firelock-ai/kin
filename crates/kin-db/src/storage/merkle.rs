@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::error::KinDbError;
-use crate::storage::format::GraphSnapshot;
+use crate::storage::format::{GraphSnapshot, LocateGraphSnapshot};
 use crate::types::*;
 
 /// Trait abstracting read-only access to the entity/relation graph for Merkle
@@ -642,6 +642,199 @@ pub fn compute_graph_root_hash(snapshot: &GraphSnapshot) -> MerkleHash {
     compute_root_hash_generic(snapshot, None)
 }
 
+/// Versioned authority for every graph domain that can change locate, lexical,
+/// or vector retrieval results.
+///
+/// The legacy graph root intentionally covers only entity/relation topology.
+/// It is therefore not a safe sidecar identity for exact repository-tree or
+/// artifact enrichment changes. This digest binds those domains as well while
+/// remaining substantially cheaper than cloning and hashing a full snapshot.
+pub const RETRIEVAL_AUTHORITY_HASH_VERSION: u32 = 1;
+
+const RETRIEVAL_AUTHORITY_DOMAIN: &[u8] = b"kin-retrieval-authority-v1:";
+
+/// Compute the retrieval-sidecar authority for an owned snapshot.
+pub fn compute_retrieval_authority_hash(snapshot: &GraphSnapshot) -> MerkleHash {
+    let mut hasher = Sha256::new();
+    hasher.update(RETRIEVAL_AUTHORITY_DOMAIN);
+    hasher.update(RETRIEVAL_AUTHORITY_HASH_VERSION.to_le_bytes());
+    hasher.update(compute_graph_root_hash(snapshot));
+
+    hash_map_domain(&mut hasher, "retrieval_entities", &snapshot.entities);
+    hash_map_domain(&mut hasher, "retrieval_relations", &snapshot.relations);
+    hash_map_domain(&mut hasher, "retrieval_changes", &snapshot.changes);
+    hash_map_domain(
+        &mut hasher,
+        "retrieval_entity_revisions",
+        &snapshot.entity_revisions,
+    );
+
+    let shallow: Vec<_> = snapshot
+        .shallow_files
+        .iter()
+        .map(|value| (&value.file_id, value))
+        .collect();
+    hash_domain_elements(&mut hasher, "retrieval_shallow_files", &shallow);
+    let layouts: Vec<_> = snapshot
+        .file_layouts
+        .iter()
+        .map(|value| (&value.file_id, value))
+        .collect();
+    hash_domain_elements(&mut hasher, "retrieval_file_layouts", &layouts);
+    let structured: Vec<_> = snapshot
+        .structured_artifacts
+        .iter()
+        .map(|value| (&value.file_id, value))
+        .collect();
+    hash_domain_elements(&mut hasher, "retrieval_structured_artifacts", &structured);
+    let opaque: Vec<_> = snapshot
+        .opaque_artifacts
+        .iter()
+        .map(|value| (&value.file_id, value))
+        .collect();
+    hash_domain_elements(&mut hasher, "retrieval_opaque_artifacts", &opaque);
+
+    let resolved: Vec<_> = snapshot.resolved_tree.artifacts().collect();
+    hash_domain_elements(&mut hasher, "retrieval_resolved_tree", &resolved);
+    finalize_sha256(hasher)
+}
+
+/// Compute the retrieval authority for the locate-only projection without
+/// materialising a second owned `GraphSnapshot`.
+pub(crate) fn compute_locate_retrieval_authority_hash(
+    snapshot: &LocateGraphSnapshot,
+    graph_root_hash: MerkleHash,
+) -> MerkleHash {
+    let mut hasher = Sha256::new();
+    hasher.update(RETRIEVAL_AUTHORITY_DOMAIN);
+    hasher.update(RETRIEVAL_AUTHORITY_HASH_VERSION.to_le_bytes());
+    hasher.update(graph_root_hash);
+
+    hash_domain_elements(
+        &mut hasher,
+        "retrieval_entities",
+        &snapshot.entities.iter().collect::<Vec<_>>(),
+    );
+    hash_domain_elements(
+        &mut hasher,
+        "retrieval_relations",
+        &snapshot.relations.iter().collect::<Vec<_>>(),
+    );
+    hash_domain_elements(
+        &mut hasher,
+        "retrieval_changes",
+        &snapshot.changes.iter().collect::<Vec<_>>(),
+    );
+    hash_domain_elements(
+        &mut hasher,
+        "retrieval_entity_revisions",
+        &snapshot.entity_revisions.iter().collect::<Vec<_>>(),
+    );
+
+    let shallow: Vec<_> = snapshot
+        .shallow_files
+        .iter()
+        .map(|value| (&value.file_id, value))
+        .collect();
+    hash_domain_elements(&mut hasher, "retrieval_shallow_files", &shallow);
+    let layouts: Vec<_> = snapshot
+        .file_layouts
+        .iter()
+        .map(|value| (&value.file_id, value))
+        .collect();
+    hash_domain_elements(&mut hasher, "retrieval_file_layouts", &layouts);
+    let structured: Vec<_> = snapshot
+        .structured_artifacts
+        .iter()
+        .map(|value| (&value.file_id, value))
+        .collect();
+    hash_domain_elements(&mut hasher, "retrieval_structured_artifacts", &structured);
+    let opaque: Vec<_> = snapshot
+        .opaque_artifacts
+        .iter()
+        .map(|value| (&value.file_id, value))
+        .collect();
+    hash_domain_elements(&mut hasher, "retrieval_opaque_artifacts", &opaque);
+
+    let resolved: Vec<_> = snapshot.resolved_tree.artifacts().collect();
+    hash_domain_elements(&mut hasher, "retrieval_resolved_tree", &resolved);
+    finalize_sha256(hasher)
+}
+
+/// Compute the same retrieval authority directly over live hashbrown stores.
+///
+/// This is the zero-clone persistence path used while graph read guards are
+/// held. Keep it byte-equivalent to [`compute_retrieval_authority_hash`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compute_live_retrieval_authority_hash(
+    graph_root_hash: MerkleHash,
+    entities: &hashbrown::HashMap<EntityId, Entity>,
+    relations: &hashbrown::HashMap<RelationId, Relation>,
+    changes: &hashbrown::HashMap<SemanticChangeId, SemanticChange>,
+    entity_revisions: &hashbrown::HashMap<EntityId, Vec<EntityRevision>>,
+    resolved_tree: &ResolvedTree,
+    shallow_files: &hashbrown::HashMap<FilePathId, ShallowTrackedFile>,
+    file_layouts: &hashbrown::HashMap<FilePathId, FileLayout>,
+    structured_artifacts: &hashbrown::HashMap<FilePathId, StructuredArtifact>,
+    opaque_artifacts: &hashbrown::HashMap<FilePathId, OpaqueArtifact>,
+) -> MerkleHash {
+    let mut hasher = Sha256::new();
+    hasher.update(RETRIEVAL_AUTHORITY_DOMAIN);
+    hasher.update(RETRIEVAL_AUTHORITY_HASH_VERSION.to_le_bytes());
+    hasher.update(graph_root_hash);
+
+    hash_domain_elements(
+        &mut hasher,
+        "retrieval_entities",
+        &entities.iter().collect::<Vec<_>>(),
+    );
+    hash_domain_elements(
+        &mut hasher,
+        "retrieval_relations",
+        &relations.iter().collect::<Vec<_>>(),
+    );
+    hash_domain_elements(
+        &mut hasher,
+        "retrieval_changes",
+        &changes.iter().collect::<Vec<_>>(),
+    );
+    hash_domain_elements(
+        &mut hasher,
+        "retrieval_entity_revisions",
+        &entity_revisions.iter().collect::<Vec<_>>(),
+    );
+    hash_domain_elements(
+        &mut hasher,
+        "retrieval_shallow_files",
+        &shallow_files.iter().collect::<Vec<_>>(),
+    );
+    hash_domain_elements(
+        &mut hasher,
+        "retrieval_file_layouts",
+        &file_layouts.iter().collect::<Vec<_>>(),
+    );
+    hash_domain_elements(
+        &mut hasher,
+        "retrieval_structured_artifacts",
+        &structured_artifacts.iter().collect::<Vec<_>>(),
+    );
+    hash_domain_elements(
+        &mut hasher,
+        "retrieval_opaque_artifacts",
+        &opaque_artifacts.iter().collect::<Vec<_>>(),
+    );
+    let resolved: Vec<_> = resolved_tree.artifacts().collect();
+    hash_domain_elements(&mut hasher, "retrieval_resolved_tree", &resolved);
+    finalize_sha256(hasher)
+}
+
+fn finalize_sha256(hasher: Sha256) -> MerkleHash {
+    let result = hasher.finalize();
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(&result);
+    hash
+}
+
 /// Like [`compute_graph_root_hash`] but accepts an optional [`MerkleCache`].
 ///
 /// When a `MerkleCache` is provided, per-entity content hashes are reused
@@ -704,11 +897,11 @@ pub fn compute_root_hash_generic(
 /// that persist a truth hash should persist [`RepoTruthHash`] instead of a bare
 /// digest so a format upgrade is distinguishable from an actual change in repo
 /// truth.
-pub const REPO_TRUTH_HASH_VERSION: u32 = 2;
+pub const REPO_TRUTH_HASH_VERSION: u32 = 4;
 
 /// Domain separator for the repo-truth digest. Carries the encoding version so
 /// a v1 digest can never be mistaken for a v2 digest of the same snapshot.
-const REPO_TRUTH_DOMAIN: &[u8] = b"kin-repo-truth-v2:";
+const REPO_TRUTH_DOMAIN: &[u8] = b"kin-repo-truth-v4:";
 
 /// A repo-truth digest tagged with the encoding version that produced it.
 ///
@@ -757,7 +950,7 @@ impl RepoTruthHash {
 /// with unchanged semantics — this hash folds that root in and then adds the
 /// canonical *content* of every other snapshot domain: the change DAG (ids,
 /// parents, message, author, timestamp, and all entity/relation/artifact
-/// deltas), branches, work, reviews, tests, contracts, verification,
+/// deltas), work, reviews, tests, contracts, verification,
 /// provenance, sessions, intents, files, and artifacts.
 ///
 /// Use this for bootstrap acceptance, optimistic concurrency, and cache
@@ -778,8 +971,7 @@ impl RepoTruthHash {
 /// including them would produce spurious mismatches on an unchanged repo:
 /// - `outgoing` / `incoming`: adjacency indexes over `relations`;
 /// - `change_children`: inverse index over `changes[].parents`;
-/// - `change_order`: topological ordinals derived from the change DAG;
-/// - `entity_revisions`: re-derived from `changes` whenever it is absent.
+/// - `entity_revisions`: re-derived from `changes` whenever it is empty.
 pub fn compute_repo_truth_hash(snapshot: &GraphSnapshot) -> MerkleHash {
     // Exhaustive destructuring is the coverage guard: adding a domain to
     // `GraphSnapshot` breaks this build until the new field is either hashed or
@@ -796,7 +988,6 @@ pub fn compute_repo_truth_hash(snapshot: &GraphSnapshot) -> MerkleHash {
         changes,
         // Inverse index over `changes[].parents`.
         change_children: _,
-        branches,
         work_items,
         annotations,
         work_links,
@@ -808,11 +999,6 @@ pub fn compute_repo_truth_hash(snapshot: &GraphSnapshot) -> MerkleHash {
         test_cases,
         assertions,
         verification_runs,
-        test_covers_entity,
-        test_covers_contract,
-        test_verifies_work,
-        run_proves_entity,
-        run_proves_work,
         mock_hints,
         contracts,
         actors,
@@ -823,18 +1009,14 @@ pub fn compute_repo_truth_hash(snapshot: &GraphSnapshot) -> MerkleHash {
         file_layouts,
         structured_artifacts,
         opaque_artifacts,
-        file_hashes,
+        resolved_tree,
         sessions,
         intents,
         downstream_warnings,
-        // Re-derived from `changes` whenever it is absent, so a load can
+        // Re-derived from `changes` whenever it is empty, so a load can
         // legitimately populate it on an otherwise unchanged repo.
         entity_revisions: _,
-        entity_tombstones,
-        relation_tombstones,
-        // Topological ordinals derived from the change DAG.
-        change_order: _,
-        artifact_index,
+        repository_authority,
     } = snapshot;
 
     let mut hasher = Sha256::new();
@@ -852,8 +1034,6 @@ pub fn compute_repo_truth_hash(snapshot: &GraphSnapshot) -> MerkleHash {
     hash_map_domain(&mut hasher, "relations", relations);
 
     hash_map_domain(&mut hasher, "changes", changes);
-    hash_map_domain(&mut hasher, "branches", branches);
-
     hash_map_domain(&mut hasher, "work_items", work_items);
     hash_map_domain(&mut hasher, "annotations", annotations);
     hash_vec_domain(&mut hasher, "work_links", work_links);
@@ -867,11 +1047,6 @@ pub fn compute_repo_truth_hash(snapshot: &GraphSnapshot) -> MerkleHash {
     hash_map_domain(&mut hasher, "test_cases", test_cases);
     hash_map_domain(&mut hasher, "assertions", assertions);
     hash_map_domain(&mut hasher, "verification_runs", verification_runs);
-    hash_vec_domain(&mut hasher, "test_covers_entity", test_covers_entity);
-    hash_vec_domain(&mut hasher, "test_covers_contract", test_covers_contract);
-    hash_vec_domain(&mut hasher, "test_verifies_work", test_verifies_work);
-    hash_vec_domain(&mut hasher, "run_proves_entity", run_proves_entity);
-    hash_vec_domain(&mut hasher, "run_proves_work", run_proves_work);
     hash_vec_domain(&mut hasher, "mock_hints", mock_hints);
     hash_map_domain(&mut hasher, "contracts", contracts);
 
@@ -884,15 +1059,21 @@ pub fn compute_repo_truth_hash(snapshot: &GraphSnapshot) -> MerkleHash {
     hash_vec_domain(&mut hasher, "file_layouts", file_layouts);
     hash_vec_domain(&mut hasher, "artifacts_structured", structured_artifacts);
     hash_vec_domain(&mut hasher, "artifacts_opaque", opaque_artifacts);
-    hash_map_domain(&mut hasher, "file_hashes", file_hashes);
-    hash_map_domain(&mut hasher, "artifact_index", artifact_index);
+    let resolved_artifacts: Vec<_> = resolved_tree.artifacts().cloned().collect();
+    hash_vec_domain(&mut hasher, "resolved_tree", &resolved_artifacts);
 
     hash_map_domain(&mut hasher, "sessions", sessions);
     hash_map_domain(&mut hasher, "intents", intents);
     hash_vec_domain(&mut hasher, "downstream_warnings", downstream_warnings);
-
-    hash_map_domain(&mut hasher, "entity_tombstones", entity_tombstones);
-    hash_map_domain(&mut hasher, "relation_tombstones", relation_tombstones);
+    if let Some(repository_authority) = repository_authority {
+        hash_domain_elements(
+            &mut hasher,
+            "repository_authority",
+            std::slice::from_ref(repository_authority),
+        );
+    } else {
+        hash_domain_count(&mut hasher, "repository_authority", 0);
+    }
 
     let result = hasher.finalize();
     let mut hash = [0u8; 32];
@@ -1900,7 +2081,7 @@ mod tests {
     }
 
     fn test_change(id_byte: u8, message: &str, entity_deltas: Vec<EntityDelta>) -> SemanticChange {
-        SemanticChange {
+        let mut change = SemanticChange {
             id: SemanticChangeId::from_hash(Hash256::from_bytes([id_byte; 32])),
             parents: Vec::new(),
             timestamp: fixed_timestamp(1_700_000_000),
@@ -1908,13 +2089,22 @@ mod tests {
             message: message.to_string(),
             entity_deltas,
             relation_deltas: Vec::new(),
-            artifact_deltas: Vec::new(),
+            tree_deltas: Vec::new(),
             projected_files: Vec::new(),
             spec_link: None,
             evidence: Vec::new(),
             risk_summary: None,
-            authored_on: None,
-        }
+            origin: kin_model::ChangeOrigin::Native,
+            admission_policy_delta: None,
+        };
+        change.id =
+            kin_model::compute_semantic_change_id(&change).expect("valid semantic change fixture");
+        change
+    }
+
+    fn reseal_change(change: &mut SemanticChange) {
+        change.id =
+            kin_model::compute_semantic_change_id(change).expect("valid semantic change fixture");
     }
 
     fn snapshot_with_changes(changes: Vec<SemanticChange>) -> GraphSnapshot {
@@ -1926,9 +2116,9 @@ mod tests {
     }
 
     /// The regression this primitive was blind to: identical head snapshot,
-    /// identical change ids, identical change count — but the history disagrees
-    /// about what the change actually did. A cardinality-only digest cannot see
-    /// it; a content digest must.
+    /// Identical change count, but the history disagrees about what the change
+    /// actually did. Full-payload change identity and the repo-truth digest must
+    /// both change.
     #[test]
     fn repo_truth_hash_detects_rewritten_entity_delta() {
         let original = test_entity("resolver_target");
@@ -1938,18 +2128,23 @@ mod tests {
         let before = snapshot_with_changes(vec![test_change(
             0x11,
             "add resolver target",
-            vec![EntityDelta::Added(original)],
+            vec![EntityDelta::Added { new: original }],
         )]);
         let after = snapshot_with_changes(vec![test_change(
             0x11,
             "add resolver target",
-            vec![EntityDelta::Added(rewritten)],
+            vec![EntityDelta::Added { new: rewritten }],
         )]);
 
         assert_eq!(
             before.changes.len(),
             after.changes.len(),
             "the two histories must have equal cardinality for this test to mean anything"
+        );
+        assert_ne!(
+            before.changes.keys().next(),
+            after.changes.keys().next(),
+            "rewritten payloads must mint different semantic change ids"
         );
         assert_eq!(
             compute_graph_root_hash(&before),
@@ -1969,6 +2164,8 @@ mod tests {
         let mut after_change = before_change.clone();
         before_change.parents = vec![SemanticChangeId::from_hash(Hash256::from_bytes([0xA0; 32]))];
         after_change.parents = vec![SemanticChangeId::from_hash(Hash256::from_bytes([0xB0; 32]))];
+        reseal_change(&mut before_change);
+        reseal_change(&mut after_change);
 
         assert_ne!(
             compute_repo_truth_hash(&snapshot_with_changes(vec![before_change])),
@@ -1997,9 +2194,27 @@ mod tests {
     #[test]
     fn repo_truth_hash_is_independent_of_change_insertion_order() {
         let changes = vec![
-            test_change(0x41, "first", vec![EntityDelta::Added(test_entity("a"))]),
-            test_change(0x42, "second", vec![EntityDelta::Added(test_entity("b"))]),
-            test_change(0x43, "third", vec![EntityDelta::Added(test_entity("c"))]),
+            test_change(
+                0x41,
+                "first",
+                vec![EntityDelta::Added {
+                    new: test_entity("a"),
+                }],
+            ),
+            test_change(
+                0x42,
+                "second",
+                vec![EntityDelta::Added {
+                    new: test_entity("b"),
+                }],
+            ),
+            test_change(
+                0x43,
+                "third",
+                vec![EntityDelta::Added {
+                    new: test_entity("c"),
+                }],
+            ),
         ];
         let mut reversed = changes.clone();
         reversed.reverse();
@@ -2043,8 +2258,8 @@ mod tests {
             vec![relation.clone()],
         );
         for change in [
-            test_change(0x61, "one", vec![EntityDelta::Added(entity_a)]),
-            test_change(0x62, "two", vec![EntityDelta::Added(entity_b)]),
+            test_change(0x61, "one", vec![EntityDelta::Added { new: entity_a }]),
+            test_change(0x62, "two", vec![EntityDelta::Added { new: entity_b }]),
         ] {
             snapshot.changes.insert(change.id, change);
         }
@@ -2084,12 +2299,12 @@ mod tests {
             compute_repo_truth_hash(&snapshot_with_changes(vec![test_change(
                 0x71,
                 "meta",
-                vec![EntityDelta::Added(forward)]
+                vec![EntityDelta::Added { new: forward }]
             )])),
             compute_repo_truth_hash(&snapshot_with_changes(vec![test_change(
                 0x71,
                 "meta",
-                vec![EntityDelta::Added(reverse)]
+                vec![EntityDelta::Added { new: reverse }]
             )])),
             "metadata key insertion order must not affect the repo truth hash"
         );
@@ -2142,6 +2357,199 @@ mod tests {
         assert_eq!(round_tripped, tagged);
     }
 
+    #[test]
+    fn repo_truth_hash_covers_tree_mode_and_symlink_kind() {
+        let hash = Hash256::from_bytes([0x5a; 32]);
+        let mut regular = GraphSnapshot::empty();
+        regular.admit_artifact_for_test("tool".to_string(), TreeEntry::blob(hash, false));
+        let regular_root = compute_repo_truth_hash(&regular);
+
+        let mut executable = regular.clone();
+        executable.admit_artifact_for_test("tool".to_string(), TreeEntry::blob(hash, true));
+        let executable_root = compute_repo_truth_hash(&executable);
+
+        let mut symlink = regular.clone();
+        symlink.admit_artifact_for_test("tool".to_string(), TreeEntry::symlink(hash));
+        let symlink_root = compute_repo_truth_hash(&symlink);
+
+        assert_ne!(regular_root, executable_root);
+        assert_ne!(regular_root, symlink_root);
+        assert_ne!(executable_root, symlink_root);
+    }
+
+    #[test]
+    fn repo_truth_hash_covers_artifact_identity_path_and_gitlink_target() {
+        let artifact_id = ArtifactId::new();
+        let other_id = ArtifactId::new();
+        let path = RepoPath::from_utf8("vendor/dependency").unwrap();
+        let moved_path = RepoPath::from_utf8("third_party/dependency").unwrap();
+        let target = GitObjectId::sha1([1; 20]);
+        let other_target = GitObjectId::sha1([2; 20]);
+
+        let snapshot = |id, path: RepoPath, target| {
+            let mut snapshot = GraphSnapshot::empty();
+            snapshot.resolved_tree = ResolvedTree::from_artifacts([ResolvedArtifact::new(
+                id,
+                path,
+                TreeEntry::gitlink(target),
+            )])
+            .unwrap();
+            snapshot
+        };
+        let baseline = compute_repo_truth_hash(&snapshot(artifact_id, path.clone(), target));
+        let identity_changed = compute_repo_truth_hash(&snapshot(other_id, path.clone(), target));
+        let path_changed = compute_repo_truth_hash(&snapshot(artifact_id, moved_path, target));
+        let target_changed = compute_repo_truth_hash(&snapshot(artifact_id, path, other_target));
+
+        assert_ne!(baseline, identity_changed);
+        assert_ne!(baseline, path_changed);
+        assert_ne!(baseline, target_changed);
+    }
+
+    #[test]
+    fn repo_truth_hash_is_independent_of_resolved_tree_insertion_order() {
+        let left = ResolvedArtifact::new(
+            ArtifactId::new(),
+            RepoPath::from_utf8("a").unwrap(),
+            crate::types::regular_tree_entry(1),
+        );
+        let right = ResolvedArtifact::new(
+            ArtifactId::new(),
+            RepoPath::from_utf8("b").unwrap(),
+            crate::types::regular_tree_entry(2),
+        );
+        let mut first = GraphSnapshot::empty();
+        first.resolved_tree = ResolvedTree::from_artifacts([left.clone(), right.clone()]).unwrap();
+        let mut second = GraphSnapshot::empty();
+        second.resolved_tree = ResolvedTree::from_artifacts([right, left]).unwrap();
+
+        assert_eq!(
+            compute_repo_truth_hash(&first),
+            compute_repo_truth_hash(&second)
+        );
+    }
+
+    #[test]
+    fn retrieval_authority_changes_when_exact_tree_or_artifact_facets_change() {
+        let empty = GraphSnapshot::empty();
+        let mut tree_only = GraphSnapshot::empty();
+        let artifact_id = ArtifactId::new();
+        tree_only.resolved_tree = ResolvedTree::from_artifacts([ResolvedArtifact::new(
+            artifact_id,
+            RepoPath::from_utf8("compose.yaml").unwrap(),
+            crate::types::regular_tree_entry(1),
+        )])
+        .unwrap();
+
+        assert_eq!(
+            compute_graph_root_hash(&empty),
+            compute_graph_root_hash(&tree_only),
+            "the entity/relation root deliberately does not cover exact tree truth"
+        );
+        assert_ne!(
+            compute_retrieval_authority_hash(&empty),
+            compute_retrieval_authority_hash(&tree_only),
+            "retrieval sidecars must be invalidated by exact tree changes"
+        );
+
+        let mut with_facet = tree_only.clone();
+        with_facet.structured_artifacts.push(StructuredArtifact {
+            file_id: FilePathId::new("compose.yaml"),
+            kind: ArtifactKind::ComposeFile,
+            content_hash: Hash256::from_bytes([2; 32]),
+            text_preview: Some("services:".into()),
+        });
+        assert_ne!(
+            compute_retrieval_authority_hash(&tree_only),
+            compute_retrieval_authority_hash(&with_facet),
+            "artifact retrieval documents must participate in sidecar authority"
+        );
+    }
+
+    #[test]
+    fn owned_locate_and_live_retrieval_authorities_are_byte_equivalent() {
+        let mut snapshot = GraphSnapshot::empty();
+        let artifact_id = ArtifactId::new();
+        snapshot.resolved_tree = ResolvedTree::from_artifacts([ResolvedArtifact::new(
+            artifact_id,
+            RepoPath::from_utf8("Dockerfile").unwrap(),
+            crate::types::regular_tree_entry(3),
+        )])
+        .unwrap();
+        snapshot.opaque_artifacts.push(OpaqueArtifact {
+            file_id: FilePathId::new("Dockerfile"),
+            content_hash: Hash256::from_bytes([3; 32]),
+            mime_type: Some("text/plain".into()),
+            text_preview: Some("FROM scratch".into()),
+        });
+        let entity = test_entity("container_entry");
+        snapshot.entities.insert(entity.id, entity);
+
+        let graph_root_hash = compute_graph_root_hash(&snapshot);
+        let owned = compute_retrieval_authority_hash(&snapshot);
+        let locate = LocateGraphSnapshot::from(snapshot.clone());
+        assert_eq!(
+            owned,
+            compute_locate_retrieval_authority_hash(&locate, graph_root_hash)
+        );
+
+        let entities = snapshot
+            .entities
+            .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect();
+        let relations = snapshot
+            .relations
+            .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect();
+        let changes = snapshot
+            .changes
+            .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect();
+        let revisions = snapshot
+            .entity_revisions
+            .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect();
+        let shallow = snapshot
+            .shallow_files
+            .iter()
+            .map(|value| (value.file_id.clone(), value.clone()))
+            .collect();
+        let layouts = snapshot
+            .file_layouts
+            .iter()
+            .map(|value| (value.file_id.clone(), value.clone()))
+            .collect();
+        let structured = snapshot
+            .structured_artifacts
+            .iter()
+            .map(|value| (value.file_id.clone(), value.clone()))
+            .collect();
+        let opaque = snapshot
+            .opaque_artifacts
+            .iter()
+            .map(|value| (value.file_id.clone(), value.clone()))
+            .collect();
+        assert_eq!(
+            owned,
+            compute_live_retrieval_authority_hash(
+                graph_root_hash,
+                &entities,
+                &relations,
+                &changes,
+                &revisions,
+                &snapshot.resolved_tree,
+                &shallow,
+                &layouts,
+                &structured,
+                &opaque,
+            )
+        );
+    }
+
     fn map_elements_encode<K, V>(map: &HashMap<K, V>) -> bool
     where
         K: serde::Serialize,
@@ -2160,6 +2568,11 @@ mod tests {
         items.iter().all(|item| serde_json::to_value(item).is_ok())
     }
 
+    fn resolved_tree_elements_encode(tree: &ResolvedTree) -> bool {
+        tree.artifacts()
+            .all(|artifact| serde_json::to_value(artifact).is_ok())
+    }
+
     /// Guards the `JSON_TAG_UNENCODABLE` branch in [`canonical_element_hash`]:
     /// if a domain element ever stops projecting to JSON, its content silently
     /// degrades to an error-string digest instead of being covered. Fail here
@@ -2169,6 +2582,9 @@ mod tests {
     fn repo_truth_elements_project_to_canonical_json() {
         let entity = test_entity("encodable");
         let other = test_entity("encodable_other");
+        let modified_old = test_entity("encodable_modified_old");
+        let mut modified_new = modified_old.clone();
+        modified_new.name = "encodable_modified_new".to_string();
         let relation = test_relation(entity.id, other.id, RelationKind::Calls);
         let mut snapshot =
             build_snapshot(vec![entity.clone(), other.clone()], vec![relation.clone()]);
@@ -2176,31 +2592,26 @@ mod tests {
             0x91,
             "encodable change",
             vec![
-                EntityDelta::Added(entity.clone()),
-                EntityDelta::Modified {
-                    old: entity.clone(),
-                    new: other.clone(),
+                EntityDelta::Added {
+                    new: entity.clone(),
                 },
-                EntityDelta::Removed(other.id),
+                EntityDelta::Modified {
+                    old: modified_old,
+                    new: modified_new,
+                },
+                EntityDelta::Removed { old: other.clone() },
             ],
         );
         snapshot.changes.insert(change.id, change);
-        snapshot.branches.insert(
-            BranchName("main".to_string()),
-            Branch {
-                name: BranchName("main".to_string()),
-                head: SemanticChangeId::from_hash(Hash256::from_bytes([0x91; 32])),
-            },
+        snapshot.admit_artifact_for_test(
+            "src/main.rs".to_string(),
+            crate::types::regular_tree_entry(7),
         );
-        snapshot
-            .file_hashes
-            .insert("src/main.rs".to_string(), [7u8; 32]);
 
         for (domain, encodes) in [
             ("entities", map_elements_encode(&snapshot.entities)),
             ("relations", map_elements_encode(&snapshot.relations)),
             ("changes", map_elements_encode(&snapshot.changes)),
-            ("branches", map_elements_encode(&snapshot.branches)),
             ("work_items", map_elements_encode(&snapshot.work_items)),
             ("annotations", map_elements_encode(&snapshot.annotations)),
             ("work_links", vec_elements_encode(&snapshot.work_links)),
@@ -2224,26 +2635,6 @@ mod tests {
                 "verification_runs",
                 map_elements_encode(&snapshot.verification_runs),
             ),
-            (
-                "test_covers_entity",
-                vec_elements_encode(&snapshot.test_covers_entity),
-            ),
-            (
-                "test_covers_contract",
-                vec_elements_encode(&snapshot.test_covers_contract),
-            ),
-            (
-                "test_verifies_work",
-                vec_elements_encode(&snapshot.test_verifies_work),
-            ),
-            (
-                "run_proves_entity",
-                vec_elements_encode(&snapshot.run_proves_entity),
-            ),
-            (
-                "run_proves_work",
-                vec_elements_encode(&snapshot.run_proves_work),
-            ),
             ("mock_hints", vec_elements_encode(&snapshot.mock_hints)),
             ("contracts", map_elements_encode(&snapshot.contracts)),
             ("actors", map_elements_encode(&snapshot.actors)),
@@ -2263,24 +2654,15 @@ mod tests {
                 "artifacts_opaque",
                 vec_elements_encode(&snapshot.opaque_artifacts),
             ),
-            ("file_hashes", map_elements_encode(&snapshot.file_hashes)),
             (
-                "artifact_index",
-                map_elements_encode(&snapshot.artifact_index),
+                "resolved_tree",
+                resolved_tree_elements_encode(&snapshot.resolved_tree),
             ),
             ("sessions", map_elements_encode(&snapshot.sessions)),
             ("intents", map_elements_encode(&snapshot.intents)),
             (
                 "downstream_warnings",
                 vec_elements_encode(&snapshot.downstream_warnings),
-            ),
-            (
-                "entity_tombstones",
-                map_elements_encode(&snapshot.entity_tombstones),
-            ),
-            (
-                "relation_tombstones",
-                map_elements_encode(&snapshot.relation_tombstones),
             ),
         ] {
             assert!(

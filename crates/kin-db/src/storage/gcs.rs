@@ -28,8 +28,9 @@ use sha2::{Digest, Sha256};
 use crate::error::KinDbError;
 use crate::storage::backend::{
     validate_source_blob_read_size, validate_source_blob_repo_id, validate_source_blob_size,
-    verify_source_blob_digest, Generation, SnapshotAuthority, SnapshotRecoveryState,
-    StorageBackend, GENERATION_INIT, MAX_SOURCE_BLOB_BYTES,
+    verify_source_blob_digest, Generation, SnapshotAuthority, SnapshotCursor,
+    SnapshotRecoveryState, SnapshotSaveOutcome, StorageBackend, GENERATION_INIT,
+    MAX_SOURCE_BLOB_BYTES,
 };
 
 const GCS_FULL_AUTHORITY_MAGIC: [u8; 8] = *b"KNGCSF02";
@@ -130,12 +131,6 @@ impl GcsBackend {
         })
     }
 
-    fn snapshot_meta(&self, path: &ObjectPath) -> Result<ObjectMeta, KinDbError> {
-        self.block_on(self.store.head(path)).map_err(|error| {
-            KinDbError::StorageError(format!("GCS head failed for {path}: {error}"))
-        })
-    }
-
     fn encode_full_snapshot_authority(snapshot_bytes: &[u8]) -> Result<Vec<u8>, KinDbError> {
         let payload_len = u64::try_from(snapshot_bytes.len()).map_err(|_| {
             KinDbError::StorageError("GCS snapshot payload length exceeds u64".to_string())
@@ -148,9 +143,11 @@ impl GcsBackend {
         Ok(encoded)
     }
 
-    fn decode_full_snapshot_authority(bytes: &[u8]) -> Result<(Vec<u8>, bool), KinDbError> {
+    fn decode_full_snapshot_authority(bytes: &[u8]) -> Result<Vec<u8>, KinDbError> {
         if !bytes.starts_with(&GCS_FULL_AUTHORITY_MAGIC) {
-            return Ok((bytes.to_vec(), false));
+            return Err(KinDbError::StorageError(
+                "GCS snapshot object is not a current full-authority envelope".to_string(),
+            ));
         }
         if bytes.len() < GCS_FULL_AUTHORITY_HEADER_LEN {
             return Err(KinDbError::StorageError(
@@ -184,13 +181,10 @@ impl GcsBackend {
                 "GCS full-snapshot authority digest mismatch".to_string(),
             ));
         }
-        Ok((payload.to_vec(), true))
+        Ok(payload.to_vec())
     }
 
-    fn load_snapshot_object(
-        &self,
-        repo_id: &str,
-    ) -> Result<Option<(SnapshotAuthority, bool)>, KinDbError> {
+    fn load_snapshot_object(&self, repo_id: &str) -> Result<Option<SnapshotAuthority>, KinDbError> {
         let path = self.snapshot_path(repo_id);
         let get_result = match self.block_on(self.store.get(&path)) {
             Ok(result) => result,
@@ -208,15 +202,12 @@ impl GcsBackend {
         let bytes = self.block_on(get_result.bytes()).map_err(|error| {
             KinDbError::StorageError(format!("GCS read bytes failed for {path}: {error}"))
         })?;
-        let (snapshot_bytes, has_full_authority) = Self::decode_full_snapshot_authority(&bytes)?;
-        Ok(Some((
-            SnapshotAuthority {
-                snapshot_bytes,
-                snapshot_generation: generation,
-                head_generation: generation,
-            },
-            has_full_authority,
-        )))
+        let snapshot_bytes = Self::decode_full_snapshot_authority(&bytes)?;
+        Ok(Some(SnapshotAuthority {
+            snapshot_bytes,
+            snapshot_generation: generation,
+            head_generation: generation,
+        }))
     }
 
     fn list_delta_objects(
@@ -267,22 +258,6 @@ impl GcsBackend {
         Ok(deltas)
     }
 
-    fn delta_object_identity(
-        deltas: &[(Generation, ObjectMeta)],
-    ) -> Vec<(Generation, String, Option<String>, Option<String>)> {
-        deltas
-            .iter()
-            .map(|(generation, meta)| {
-                (
-                    *generation,
-                    meta.location.to_string(),
-                    meta.version.clone(),
-                    meta.e_tag.clone(),
-                )
-            })
-            .collect()
-    }
-
     fn put_full_snapshot_cas(
         &self,
         repo_id: &str,
@@ -291,44 +266,128 @@ impl GcsBackend {
     ) -> Result<Generation, KinDbError> {
         let path = self.snapshot_path(repo_id);
         let payload = PutPayload::from(Self::encode_full_snapshot_authority(data)?);
-        let opts = if expected_gen == GENERATION_INIT {
-            PutOptions {
-                mode: PutMode::Create,
-                ..PutOptions::default()
-            }
-        } else {
-            let meta = self.snapshot_meta(&path)?;
-            let current_generation =
-                Self::numeric_version(meta.version.as_deref(), &format!("snapshot {path}"))?;
-            if current_generation != expected_gen {
+        let current_meta = match self.block_on(self.store.head(&path)) {
+            Ok(meta) => Some(meta),
+            Err(object_store::Error::NotFound { .. }) => None,
+            Err(error) => {
                 return Err(KinDbError::StorageError(format!(
-                    "GCS snapshot generation mismatch for {path}: expected {expected_gen}, found {current_generation}"
+                    "GCS head failed for {path} before save: {error}"
                 )));
             }
-            PutOptions {
-                mode: PutMode::Update(UpdateVersion {
-                    e_tag: meta.e_tag,
-                    version: meta.version,
-                }),
+        };
+        let opts = match current_meta {
+            None if expected_gen == GENERATION_INIT => PutOptions {
+                mode: PutMode::Create,
                 ..PutOptions::default()
+            },
+            None => {
+                return Err(KinDbError::StorageError(format!(
+                    "GCS snapshot {path} is missing at expected cursor {expected_gen}"
+                )));
+            }
+            Some(meta) => {
+                let current_generation =
+                    Self::numeric_version(meta.version.as_deref(), &format!("snapshot {path}"))?;
+                if current_generation != expected_gen {
+                    return match self.confirm_exact_snapshot_retry(repo_id, data, expected_gen)? {
+                        Some(installed_generation) => Ok(installed_generation),
+                        None => Err(KinDbError::StorageError(format!(
+                            "GCS snapshot generation mismatch for {path}: expected {expected_gen}, found {current_generation}"
+                        ))),
+                    };
+                }
+                PutOptions {
+                    mode: PutMode::Update(UpdateVersion {
+                        e_tag: meta.e_tag,
+                        version: meta.version,
+                    }),
+                    ..PutOptions::default()
+                }
             }
         };
 
-        let result = self
-            .block_on(self.store.put_opts(&path, payload, opts))
-            .map_err(|error| {
-                KinDbError::StorageError(format!("GCS save failed for {path}: {error}"))
-            })?;
+        let result = match self.block_on(self.store.put_opts(&path, payload, opts)) {
+            Ok(result) => result,
+            Err(error)
+                if matches!(
+                    &error,
+                    object_store::Error::AlreadyExists { .. }
+                        | object_store::Error::Precondition { .. }
+                        | object_store::Error::NotModified { .. }
+                ) =>
+            {
+                return match self.confirm_exact_snapshot_retry(repo_id, data, expected_gen) {
+                    Ok(Some(installed_generation)) => Ok(installed_generation),
+                    Ok(None) => Err(KinDbError::StorageError(format!(
+                        "GCS conditional save failed for {path}: {error}"
+                    ))),
+                    Err(verification_error) => Err(KinDbError::StorageError(format!(
+                        "GCS conditional save failed for {path}: {error}; installed authority verification failed: {verification_error}"
+                    ))),
+                };
+            }
+            Err(
+                error @ (object_store::Error::NotFound { .. }
+                | object_store::Error::InvalidPath { .. }
+                | object_store::Error::NotSupported { .. }
+                | object_store::Error::NotImplemented { .. }
+                | object_store::Error::PermissionDenied { .. }
+                | object_store::Error::Unauthenticated { .. }
+                | object_store::Error::UnknownConfigurationKey { .. }),
+            ) => {
+                return Err(KinDbError::StorageError(format!(
+                    "GCS save was rejected before installation for {path}: {error}"
+                )));
+            }
+            Err(error) => {
+                return Err(KinDbError::SnapshotPersistenceIndeterminate(format!(
+                    "GCS save outcome is unknown for {path}: {error}"
+                )));
+            }
+        };
         let generation = Self::numeric_version(
             result.version.as_deref(),
             &format!("save result for {path}"),
-        )?;
+        )
+        .map_err(|error| {
+            KinDbError::SnapshotPersistenceIndeterminate(format!(
+                "GCS acknowledged save for {path}, but its installed cursor is unknown: {error}"
+            ))
+        })?;
         if generation <= expected_gen {
-            return Err(KinDbError::StorageError(format!(
+            return Err(KinDbError::SnapshotPersistenceIndeterminate(format!(
                 "GCS save result for {path} did not advance generation: expected above {expected_gen}, found {generation}"
             )));
         }
         Ok(generation)
+    }
+
+    /// Confirm a retry only when the store exposes the exact serialized
+    /// candidate at a cursor different from the caller's prior CAS cursor.
+    fn confirm_exact_snapshot_retry(
+        &self,
+        repo_id: &str,
+        data: &[u8],
+        expected_gen: Generation,
+    ) -> Result<Option<Generation>, KinDbError> {
+        let Some(authority) = self.load_snapshot_object(repo_id)? else {
+            if expected_gen == GENERATION_INIT {
+                return Ok(None);
+            }
+            return Err(KinDbError::StorageError(format!(
+                "GCS snapshot for repo {repo_id} is missing at expected cursor {expected_gen}"
+            )));
+        };
+        let current_generation = authority.head_generation;
+        if current_generation == expected_gen {
+            return Ok(None);
+        }
+        if authority.snapshot_bytes == data {
+            return Ok(Some(current_generation));
+        }
+        Err(KinDbError::StorageError(format!(
+            "GCS snapshot generation mismatch for repo {repo_id}: expected {expected_gen}, found {current_generation} with different authority bytes"
+        )))
     }
 }
 
@@ -466,29 +525,40 @@ impl StorageBackend for GcsBackend {
         Ok(Some(data))
     }
 
+    fn source_blob_len(&self, repo_id: &str, digest: [u8; 32]) -> Result<Option<u64>, KinDbError> {
+        validate_source_blob_repo_id(repo_id)?;
+        let path = self.source_blob_path(repo_id, digest)?;
+        match self.block_on(self.store.head(&path)) {
+            Ok(metadata) => {
+                validate_source_blob_size(metadata.size, path.as_ref())?;
+                Ok(Some(metadata.size))
+            }
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(error) => Err(KinDbError::StorageError(format!(
+                "GCS source blob metadata load failed for {path}: {error}"
+            ))),
+        }
+    }
+
     fn load_snapshot_authority(
         &self,
         repo_id: &str,
     ) -> Result<Option<SnapshotAuthority>, KinDbError> {
-        Ok(self
-            .load_snapshot_object(repo_id)?
-            .map(|(authority, _)| authority))
+        self.load_snapshot_object(repo_id)
     }
 
     fn load_recovery_state(&self, repo_id: &str) -> Result<SnapshotRecoveryState, KinDbError> {
         // GCS incremental writes are disabled until snapshot+journal authority
-        // has one conditional commit point. Any visible journal is therefore
-        // unbound legacy state or a post-migration write from an old binary.
-        // Silently deleting or ignoring it would acknowledge graph state that
-        // is absent from the full-snapshot authority.
+        // has one conditional commit point. Any visible journal is unbound
+        // state and must fail closed.
         let deltas = self.list_delta_objects(repo_id)?;
         if !deltas.is_empty() {
             return Err(KinDbError::StorageError(format!(
-                "GCS repo {repo_id} has {} unbound or mixed-version delta objects; drain legacy writers and reconcile them before retrying",
+                "GCS repo {repo_id} has {} unbound delta objects outside current authority",
                 deltas.len()
             )));
         }
-        let Some((authority, _has_full_authority)) = self.load_snapshot_object(repo_id)? else {
+        let Some(authority) = self.load_snapshot_object(repo_id)? else {
             return Ok((None, Vec::new()));
         };
         Ok((Some(authority), Vec::new()))
@@ -504,7 +574,7 @@ impl StorageBackend for GcsBackend {
         let deltas = self.list_delta_objects(repo_id)?;
         if !deltas.is_empty() {
             return Err(KinDbError::StorageError(format!(
-                "refusing GCS full-snapshot commit for repo {repo_id}: {} legacy or mixed-version delta objects remain",
+                "refusing GCS full-snapshot commit for repo {repo_id}: {} unbound delta objects remain",
                 deltas.len()
             )));
         }
@@ -513,76 +583,25 @@ impl StorageBackend for GcsBackend {
         // this point authority has committed and callers must receive its new
         // generation so their CAS cursor cannot remain on the pre-commit value.
         // `load_recovery_state` and `clear_deltas` both list journals and fail
-        // closed if a legacy writer raced this commit; Kin's retryable
-        // post-commit finalizer exercises that fence immediately.
+        // closed if an unbound write raced this commit.
         Ok(generation)
     }
 
-    fn rebuild_legacy_journal(
+    fn save_snapshot_classified(
         &self,
         repo_id: &str,
         data: &[u8],
-        expected_gen: Generation,
-    ) -> Result<Generation, KinDbError> {
-        let _snapshot = crate::storage::format::GraphSnapshot::from_bytes(data)?;
-        let captured = self.list_delta_objects(repo_id)?;
-        if captured.is_empty() {
-            return Err(KinDbError::StorageError(format!(
-                "GCS repo {repo_id} has no legacy journal to rebuild"
-            )));
-        }
-        let captured_identity = Self::delta_object_identity(&captured);
-
-        // GCS legacy filenames were wall-clock values, not a provable chain.
-        // Never infer graph truth from them. The caller supplies reconciled
-        // full bytes; versions are used only to prove the artifact set stayed
-        // unchanged before the conditional snapshot promotion.
-        let rechecked = self.list_delta_objects(repo_id)?;
-        if Self::delta_object_identity(&rechecked) != captured_identity {
-            return Err(KinDbError::StorageError(format!(
-                "GCS legacy journal changed while rebuilding repo {repo_id}; authority was not committed"
-            )));
-        }
-        let generation = self.put_full_snapshot_cas(repo_id, data, expected_gen)?;
-
-        // Authority is durable. Cleanup is deliberately best effort so an
-        // object-store outage cannot strand the caller on the old CAS cursor.
-        // Each object is re-headed and removed only if its version/ETag still
-        // matches the pre-commit capture. Any residual object keeps normal
-        // recovery fail-closed and can be reconciled by retrying this method.
-        for (_, captured_meta) in &captured {
-            let current = match self.block_on(self.store.head(&captured_meta.location)) {
-                Ok(meta) => meta,
-                Err(object_store::Error::NotFound { .. }) => continue,
-                Err(error) => {
-                    tracing::warn!(repo_id, path = %captured_meta.location, error = %error, generation, "GCS rebuild committed; deferred legacy delta verification");
-                    continue;
-                }
-            };
-            if current.version != captured_meta.version || current.e_tag != captured_meta.e_tag {
-                tracing::warn!(repo_id, path = %captured_meta.location, generation, "GCS rebuild preserved a legacy delta that changed after capture");
-                continue;
+        expected_cursor: SnapshotCursor,
+    ) -> SnapshotSaveOutcome {
+        match self.save_snapshot(repo_id, data, expected_cursor.backend_generation()) {
+            Ok(generation) => SnapshotSaveOutcome::Committed {
+                cursor: SnapshotCursor::from_backend_generation(generation),
+            },
+            Err(error @ KinDbError::SnapshotPersistenceIndeterminate(_)) => {
+                SnapshotSaveOutcome::Indeterminate(error)
             }
-            if let Err(error) = self.block_on(self.store.delete(&captured_meta.location)) {
-                tracing::warn!(repo_id, path = %captured_meta.location, error = %error, generation, "GCS rebuild committed; deferred captured-delta cleanup");
-            }
+            Err(error) => SnapshotSaveOutcome::NotCommitted(error),
         }
-        match self.list_delta_objects(repo_id) {
-            Ok(remaining) if !remaining.is_empty() => tracing::warn!(
-                repo_id,
-                generation,
-                remaining = remaining.len(),
-                "GCS rebuild committed with residual journal artifacts; recovery remains fail-closed"
-            ),
-            Err(error) => tracing::warn!(
-                repo_id,
-                generation,
-                error = %error,
-                "GCS rebuild committed; could not verify journal drain"
-            ),
-            Ok(_) => {}
-        }
-        Ok(generation)
     }
 
     fn save_delta(
@@ -602,29 +621,20 @@ impl StorageBackend for GcsBackend {
         since_gen: Generation,
     ) -> Result<Vec<(Vec<u8>, Generation)>, KinDbError> {
         let deltas = self.list_delta_objects(repo_id)?;
-        let mut result = Vec::with_capacity(deltas.len());
-        for (generation, meta) in deltas {
-            if generation <= since_gen {
-                continue;
-            }
-            let path = meta.location;
-            let get_result = self.block_on(self.store.get(&path)).map_err(|e| {
-                KinDbError::StorageError(format!("GCS delta read failed for {path}: {e}"))
-            })?;
-            let bytes = self.block_on(get_result.bytes()).map_err(|e| {
-                KinDbError::StorageError(format!("GCS delta bytes failed for {path}: {e}"))
-            })?;
-            result.push((bytes.to_vec(), generation));
+        if deltas.is_empty() {
+            return Ok(Vec::new());
         }
-
-        Ok(result)
+        Err(KinDbError::StorageError(format!(
+            "GCS repo {repo_id} has {} unbound delta objects while reading after generation {since_gen}",
+            deltas.len()
+        )))
     }
 
     fn clear_deltas(&self, repo_id: &str) -> Result<(), KinDbError> {
         let deltas = self.list_delta_objects(repo_id)?;
         if !deltas.is_empty() {
             return Err(KinDbError::StorageError(format!(
-                "refusing to delete {} unbound GCS delta objects for repo {repo_id}; reconcile mixed-version writes explicitly",
+                "refusing to delete {} unbound GCS delta objects for repo {repo_id}",
                 deltas.len()
             )));
         }
@@ -719,9 +729,17 @@ impl GcsBackend {
 mod tests {
     use super::*;
     use crate::storage::format::GraphSnapshot;
+    use crate::storage::RepositoryAuthorityManager;
     use async_trait::async_trait;
     use futures_util::stream::BoxStream;
     use futures_util::StreamExt;
+    use kin_model::{
+        compute_resolved_tree_hash, AdmissionCase, AuthorId, DefaultRefExpectation,
+        DefaultRefMutation, EffectiveAdmissionPolicyStamp, FrozenLocalOverlay,
+        FrozenLocalOverlayDelta, OperationId, RefName, RepositoryId, RepositoryTransaction,
+        ResolvedTree, SharedAdmissionPolicy, WorkspaceExpectation, WorkspaceHead, WorkspaceId,
+        WorkspaceMutation, REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+    };
     use object_store::memory::InMemory;
     use object_store::{
         CopyOptions, GetResult, ListResult, MultipartUpload, PutMultipartOptions, PutResult,
@@ -743,9 +761,9 @@ mod tests {
     struct VersionedMemoryStore {
         inner: InMemory,
         state: Arc<tokio::sync::Mutex<VersionState>>,
-        fail_next_delete: Arc<AtomicBool>,
         report_next_get_as_oversized: Arc<AtomicBool>,
         body_get_count: Arc<AtomicUsize>,
+        fail_next_put_after_commit: Arc<AtomicBool>,
     }
 
     impl VersionedMemoryStore {
@@ -756,14 +774,10 @@ mod tests {
                     next_generation: 100,
                     versions: HashMap::new(),
                 })),
-                fail_next_delete: Arc::new(AtomicBool::new(false)),
                 report_next_get_as_oversized: Arc::new(AtomicBool::new(false)),
                 body_get_count: Arc::new(AtomicUsize::new(0)),
+                fail_next_put_after_commit: Arc::new(AtomicBool::new(false)),
             }
-        }
-
-        fn fail_next_delete(&self) {
-            self.fail_next_delete.store(true, Ordering::SeqCst);
         }
 
         fn report_next_get_as_oversized(&self) {
@@ -773,6 +787,11 @@ mod tests {
 
         fn body_get_count(&self) -> usize {
             self.body_get_count.load(Ordering::SeqCst)
+        }
+
+        fn fail_next_put_after_commit(&self) {
+            self.fail_next_put_after_commit
+                .store(true, Ordering::SeqCst);
         }
 
         fn precondition_error(path: &ObjectPath, message: String) -> object_store::Error {
@@ -831,6 +850,17 @@ mod tests {
             state.next_generation += 1;
             state.versions.insert(location.to_string(), generation);
             result.version = Some(generation.to_string());
+            if self
+                .fail_next_put_after_commit
+                .swap(false, Ordering::SeqCst)
+            {
+                return Err(object_store::Error::Generic {
+                    store: "VersionedMemoryStore",
+                    source: Box::new(std::io::Error::other(
+                        "injected acknowledgement loss after object install",
+                    )),
+                });
+            }
             Ok(result)
         }
 
@@ -867,19 +897,6 @@ mod tests {
             &self,
             locations: BoxStream<'static, ObjectStoreResult<ObjectPath>>,
         ) -> BoxStream<'static, ObjectStoreResult<ObjectPath>> {
-            if self.fail_next_delete.swap(false, Ordering::SeqCst) {
-                return locations
-                    .then(|location| async move {
-                        let location = location?;
-                        Err(object_store::Error::Generic {
-                            store: "VersionedMemoryStore",
-                            source: Box::new(std::io::Error::other(format!(
-                                "injected delete failure for {location}"
-                            ))),
-                        })
-                    })
-                    .boxed();
-            }
             let state = Arc::clone(&self.state);
             self.inner
                 .delete_stream(locations)
@@ -949,6 +966,61 @@ mod tests {
         Sha256::digest(data).into()
     }
 
+    fn unborn_authority_transaction(
+        manager: &RepositoryAuthorityManager<GcsBackend>,
+        repository_id: &RepositoryId,
+        workspace_id: WorkspaceId,
+        publish_default_ref: bool,
+    ) -> RepositoryTransaction {
+        let default_ref = RefName::branch(b"main").unwrap();
+        let head = WorkspaceHead::Symbolic {
+            target: default_ref.clone(),
+        };
+        let tree_hash = compute_resolved_tree_hash(&ResolvedTree::default()).unwrap();
+        let shared = SharedAdmissionPolicy::empty(0);
+        let overlay =
+            FrozenLocalOverlay::new(workspace_id, 0, AdmissionCase::Sensitive, Vec::new()).unwrap();
+        let policy = EffectiveAdmissionPolicyStamp {
+            shared: shared.stamp(),
+            local: overlay.stamp(),
+        };
+        let workspace_mutation = WorkspaceMutation {
+            workspace_id,
+            expected: WorkspaceExpectation::MustNotExist,
+            new_generation: 0,
+            new_head: head.clone(),
+            new_base_target: None,
+            new_base_tree_hash: None,
+            tree_deltas: Vec::new(),
+            new_tree_hash: tree_hash,
+            new_shared_admission_policy: shared,
+            new_admission_policy: policy,
+        };
+        let lease = manager.read_authority();
+        let transaction = RepositoryTransaction {
+            schema_version: REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+            operation_id: OperationId::new(),
+            repository_id: repository_id.clone(),
+            expected_generation: lease.roots().generation,
+            expected_roots: lease.roots().clone(),
+            actor: AuthorId::new("gcs-authority-test"),
+            reason: "publish an exact unborn GCS workspace".to_string(),
+            external_objects: Vec::new(),
+            git_authority_delta: None,
+            changes: Vec::new(),
+            aliases: Vec::new(),
+            ref_mutations: Vec::new(),
+            default_ref_mutation: publish_default_ref.then_some(DefaultRefMutation {
+                expected: DefaultRefExpectation::MustBeUnset,
+                new_default: Some(default_ref),
+            }),
+            workspace_mutation: Some(workspace_mutation),
+            local_overlay_delta: Some(FrozenLocalOverlayDelta::initialize(overlay)),
+        };
+        drop(lease);
+        transaction
+    }
+
     #[test]
     fn gcs_source_blob_roundtrips_retries_and_reports_missing() {
         let store = Arc::new(VersionedMemoryStore::new());
@@ -968,8 +1040,16 @@ mod tests {
             reopened.load_source_blob("repo-a", digest).unwrap(),
             Some(data.to_vec())
         );
+        assert_eq!(
+            reopened.source_blob_len("repo-a", digest).unwrap(),
+            Some(data.len() as u64)
+        );
         assert!(reopened
             .load_source_blob("repo-b", digest)
+            .unwrap()
+            .is_none());
+        assert!(reopened
+            .source_blob_len("repo-b", digest)
             .unwrap()
             .is_none());
     }
@@ -1118,14 +1198,12 @@ mod tests {
     fn gcs_full_snapshot_authority_envelope_roundtrips_and_detects_corruption() {
         let bytes = GraphSnapshot::empty().to_bytes().unwrap();
         let encoded = GcsBackend::encode_full_snapshot_authority(&bytes).unwrap();
-        let (decoded, authoritative) =
-            GcsBackend::decode_full_snapshot_authority(&encoded).unwrap();
-        assert!(authoritative);
+        let decoded = GcsBackend::decode_full_snapshot_authority(&encoded).unwrap();
         assert_eq!(decoded, bytes);
 
-        let (legacy, authoritative) = GcsBackend::decode_full_snapshot_authority(&bytes).unwrap();
-        assert!(!authoritative);
-        assert_eq!(legacy, bytes);
+        let error = GcsBackend::decode_full_snapshot_authority(&bytes)
+            .expect_err("raw snapshot bytes are not current GCS authority");
+        assert!(error.to_string().contains("not a current"));
 
         let mut corrupt = encoded;
         *corrupt.last_mut().unwrap() ^= 0xff;
@@ -1135,7 +1213,7 @@ mod tests {
     }
 
     #[test]
-    fn gcs_backend_disables_uncommitted_legacy_delta_authority() {
+    fn gcs_backend_rejects_unbound_delta_objects() {
         let backend = test_backend();
         let repo_id = "restart-repo";
         assert!(!backend.supports_incremental_deltas());
@@ -1149,20 +1227,24 @@ mod tests {
             .to_string()
             .contains("no single conditional snapshot+journal authority"));
 
-        let legacy_path = ObjectPath::from(format!("test/{repo_id}/deltas/{:020}.kndd", 43_u64));
+        let unbound_path = ObjectPath::from(format!("test/{repo_id}/deltas/{:020}.kndd", 43_u64));
         backend
-            .block_on(backend.store.put(&legacy_path, PutPayload::from(delta)))
+            .block_on(backend.store.put(&unbound_path, PutPayload::from(delta)))
             .unwrap();
-        assert_eq!(backend.load_deltas_since(repo_id, 0).unwrap().len(), 1);
+        backend
+            .load_deltas_since(repo_id, 0)
+            .expect_err("unbound GCS deltas must not be exposed as replay authority");
         let recovery_error = backend
             .load_recovery_state(repo_id)
-            .expect_err("unbound legacy GCS journals must fail closed");
-        assert!(recovery_error.to_string().contains("mixed-version delta"));
+            .expect_err("unbound GCS journals must fail closed");
+        assert!(recovery_error.to_string().contains("unbound delta"));
         let cleanup_error = backend
             .clear_deltas(repo_id)
             .expect_err("automatic cleanup must not erase unbound journal state");
         assert!(cleanup_error.to_string().contains("refusing to delete"));
-        assert_eq!(backend.load_deltas_since(repo_id, 0).unwrap().len(), 1);
+        backend
+            .load_deltas_since(repo_id, 0)
+            .expect_err("unbound journal state must remain fail-closed");
     }
 
     #[test]
@@ -1173,7 +1255,7 @@ mod tests {
         let repo_id = "restart-repo";
 
         let mut base = GraphSnapshot::empty();
-        base.file_hashes.insert("base.rs".to_string(), [1; 32]);
+        base.admit_artifact_for_test("base.rs".to_string(), crate::types::regular_tree_entry(1));
         let gen1 = backend
             .save_snapshot(repo_id, &base.to_bytes().unwrap(), GENERATION_INIT)
             .unwrap();
@@ -1181,9 +1263,10 @@ mod tests {
         assert_eq!(stale_gen, gen1);
 
         let mut current = base.clone();
-        current
-            .file_hashes
-            .insert("current.rs".to_string(), [2; 32]);
+        current.admit_artifact_for_test(
+            "current.rs".to_string(),
+            crate::types::regular_tree_entry(2),
+        );
         let gen2 = backend
             .save_snapshot(repo_id, &current.to_bytes().unwrap(), gen1)
             .unwrap();
@@ -1197,12 +1280,13 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(recovered.generation, gen2);
-        assert_eq!(recovered.snapshot.file_hashes, current.file_hashes);
+        assert_eq!(recovered.snapshot.resolved_tree, current.resolved_tree);
 
         let mut after_reopen = recovered.snapshot;
-        after_reopen
-            .file_hashes
-            .insert("after-reopen.rs".to_string(), [3; 32]);
+        after_reopen.admit_artifact_for_test(
+            "after-reopen.rs".to_string(),
+            crate::types::regular_tree_entry(3),
+        );
         let gen3 = reopened
             .save_snapshot(repo_id, &after_reopen.to_bytes().unwrap(), gen2)
             .unwrap();
@@ -1213,16 +1297,189 @@ mod tests {
                 .unwrap();
         assert_eq!(final_recovery.generation, gen3);
         assert_eq!(
-            final_recovery.snapshot.file_hashes,
-            after_reopen.file_hashes
+            final_recovery.snapshot.resolved_tree,
+            after_reopen.resolved_tree
         );
     }
 
     #[test]
-    fn gcs_versioned_fixture_fails_closed_on_post_authority_legacy_journal() {
+    fn repository_authority_separates_logical_generation_from_gcs_version() {
+        let store = Arc::new(VersionedMemoryStore::new());
+        let repository_id = RepositoryId::new("gcs-authority-repo").unwrap();
+        let backend = Arc::new(GcsBackend::from_store(
+            Box::new(Arc::clone(&store)),
+            "fixture",
+        ));
+        let stale_backend = Arc::new(GcsBackend::from_store(
+            Box::new(Arc::clone(&store)),
+            "fixture",
+        ));
+        let manager =
+            RepositoryAuthorityManager::open(repository_id.clone(), Arc::clone(&backend)).unwrap();
+        let stale = RepositoryAuthorityManager::open(repository_id.clone(), stale_backend).unwrap();
+        let stale_transaction =
+            unborn_authority_transaction(&stale, &repository_id, WorkspaceId::new(), false);
+
+        let first =
+            unborn_authority_transaction(&manager, &repository_id, WorkspaceId::new(), true);
+        let receipt = manager.commit_repository_transaction(first).unwrap();
+        assert_eq!(receipt.generation, 1);
+        assert_eq!(
+            backend
+                .load_snapshot(repository_id.as_str())
+                .unwrap()
+                .unwrap()
+                .1,
+            100,
+            "provider-assigned version is deliberately not Kin generation 1"
+        );
+
+        stale
+            .commit_repository_transaction(stale_transaction)
+            .expect_err("a manager holding the pre-create GCS cursor must lose CAS");
+        assert_eq!(stale.read_authority().roots().generation, 0);
+
+        let reopened_backend = Arc::new(GcsBackend::from_store(
+            Box::new(Arc::clone(&store)),
+            "fixture",
+        ));
+        let reopened =
+            RepositoryAuthorityManager::open(repository_id.clone(), Arc::clone(&reopened_backend))
+                .unwrap();
+        assert_eq!(reopened.read_authority().roots().generation, 1);
+
+        let second =
+            unborn_authority_transaction(&reopened, &repository_id, WorkspaceId::new(), false);
+        let receipt = reopened.commit_repository_transaction(second).unwrap();
+        assert_eq!(receipt.generation, 2);
+        assert_eq!(
+            reopened_backend
+                .load_snapshot(repository_id.as_str())
+                .unwrap()
+                .unwrap()
+                .1,
+            101
+        );
+
+        let final_backend = Arc::new(GcsBackend::from_store(Box::new(store), "fixture"));
+        let final_manager = RepositoryAuthorityManager::open(repository_id, final_backend).unwrap();
+        assert_eq!(final_manager.read_authority().roots().generation, 2);
+    }
+
+    #[test]
+    fn repository_authority_recovers_gcs_post_install_error_live_and_after_reopen() {
+        let store = Arc::new(VersionedMemoryStore::new());
+        let repository_id = RepositoryId::new("gcs-indeterminate-authority").unwrap();
+        let backend = Arc::new(GcsBackend::from_store(
+            Box::new(Arc::clone(&store)),
+            "fixture",
+        ));
+        let manager =
+            RepositoryAuthorityManager::open(repository_id.clone(), Arc::clone(&backend)).unwrap();
+        let transaction =
+            unborn_authority_transaction(&manager, &repository_id, WorkspaceId::new(), true);
+
+        store.fail_next_put_after_commit();
+        let error = manager
+            .commit_repository_transaction(transaction.clone())
+            .expect_err("installed object with a lost acknowledgement is indeterminate");
+        assert!(matches!(
+            error,
+            KinDbError::SnapshotPersistenceIndeterminate(_)
+        ));
+        assert_eq!(manager.read_authority().roots().generation, 0);
+
+        let installed = backend
+            .load_snapshot_authority(repository_id.as_str())
+            .unwrap()
+            .expect("the provider installed the exact candidate");
+        assert_eq!(installed.head_generation, 100);
+        let installed_bytes = installed.snapshot_bytes;
+
+        let reopened_backend = Arc::new(GcsBackend::from_store(
+            Box::new(Arc::clone(&store)),
+            "fixture",
+        ));
+        let reopened =
+            RepositoryAuthorityManager::open(repository_id.clone(), reopened_backend).unwrap();
+        assert_eq!(reopened.read_authority().roots().generation, 1);
+        let reopened_receipt = reopened
+            .commit_repository_transaction(transaction.clone())
+            .expect("reopen must recognize the installed operation as idempotent");
+
+        let live_receipt = manager
+            .commit_repository_transaction(transaction)
+            .expect("live manager must publish its retained exact candidate before prepare");
+        assert_eq!(live_receipt, reopened_receipt);
+        assert_eq!(manager.read_authority().roots().generation, 1);
+        let final_authority = backend
+            .load_snapshot_authority(repository_id.as_str())
+            .unwrap()
+            .unwrap();
+        assert_eq!(final_authority.head_generation, 100);
+        assert_eq!(
+            final_authority.snapshot_bytes, installed_bytes,
+            "reconciliation must not emit a timestamp-rebuilt successor"
+        );
+    }
+
+    #[test]
+    fn gcs_exact_content_retry_confirms_installed_candidate_without_rewrite() {
         let store = Arc::new(VersionedMemoryStore::new());
         let backend = GcsBackend::from_store(Box::new(Arc::clone(&store)), "fixture");
-        let repo_id = "mixed-version";
+        let repo_id = "gcs-exact-retry";
+        let bytes = GraphSnapshot::empty().to_bytes().unwrap();
+
+        store.fail_next_put_after_commit();
+        let error = backend
+            .save_snapshot(repo_id, &bytes, GENERATION_INIT)
+            .expect_err("provider acknowledgement loss must be surfaced");
+        assert!(matches!(
+            error,
+            KinDbError::SnapshotPersistenceIndeterminate(_)
+        ));
+
+        let cursor = backend
+            .save_snapshot(repo_id, &bytes, GENERATION_INIT)
+            .expect("exact retry must confirm the installed candidate");
+        assert_eq!(cursor, 100);
+        assert_eq!(
+            backend.load_snapshot(repo_id).unwrap().unwrap().1,
+            100,
+            "confirmation must not create provider version 101"
+        );
+    }
+
+    #[test]
+    fn gcs_normal_snapshot_cas_does_not_download_the_existing_body() {
+        let store = Arc::new(VersionedMemoryStore::new());
+        let backend = GcsBackend::from_store(Box::new(Arc::clone(&store)), "fixture");
+        let repo_id = "gcs-metadata-cas";
+        let base = GraphSnapshot::empty().to_bytes().unwrap();
+        let cursor = backend
+            .save_snapshot(repo_id, &base, GENERATION_INIT)
+            .unwrap();
+
+        let mut successor = GraphSnapshot::empty();
+        successor.admit_artifact_for_test(
+            "compose.yaml".to_string(),
+            crate::types::regular_tree_entry(1),
+        );
+        backend
+            .save_snapshot(repo_id, &successor.to_bytes().unwrap(), cursor)
+            .unwrap();
+        assert_eq!(
+            store.body_get_count(),
+            0,
+            "normal CAS should use HEAD; only retry reconciliation needs exact bytes"
+        );
+    }
+
+    #[test]
+    fn gcs_versioned_fixture_fails_closed_on_post_authority_unbound_journal() {
+        let store = Arc::new(VersionedMemoryStore::new());
+        let backend = GcsBackend::from_store(Box::new(Arc::clone(&store)), "fixture");
+        let repo_id = "unbound-journal";
         let bytes = GraphSnapshot::empty().to_bytes().unwrap();
         let generation = backend
             .save_snapshot(repo_id, &bytes, GENERATION_INIT)
@@ -1239,94 +1496,14 @@ mod tests {
             .unwrap();
 
         let recovery_error = crate::storage::backend::load_recovered_snapshot(&backend, repo_id)
-            .expect_err("post-authority legacy journal must fail closed");
-        assert!(recovery_error.to_string().contains("mixed-version delta"));
+            .expect_err("post-authority unbound journal must fail closed");
+        assert!(recovery_error.to_string().contains("unbound delta"));
         backend
             .clear_deltas(repo_id)
-            .expect_err("mixed-version journal must be preserved for reconciliation");
-        assert_eq!(
-            backend
-                .load_deltas_since(repo_id, generation)
-                .unwrap()
-                .len(),
-            1
-        );
-    }
-
-    #[test]
-    fn gcs_explicit_rebuild_uses_caller_truth_and_preserves_committed_cursor() {
-        let store = Arc::new(VersionedMemoryStore::new());
-        let backend = GcsBackend::from_store(Box::new(Arc::clone(&store)), "fixture");
-        let repo_id = "legacy-rebuild";
-        let mut legacy_base = GraphSnapshot::empty();
-        legacy_base
-            .file_hashes
-            .insert("legacy-base.rs".to_string(), [1; 32]);
-        let snapshot_path = backend.snapshot_path(repo_id);
-        let legacy_put = backend
-            .block_on(store.put(
-                &snapshot_path,
-                PutPayload::from(legacy_base.to_bytes().unwrap()),
-            ))
-            .unwrap();
-        let legacy_generation =
-            GcsBackend::numeric_version(legacy_put.version.as_deref(), "legacy test snapshot")
-                .unwrap();
-        let timestamp_generation = 1_700_000_000_000_000_000_u64;
-        let delta_path = ObjectPath::from(format!(
-            "fixture/{repo_id}/deltas/{timestamp_generation:020}.kndd"
-        ));
+            .expect_err("unbound journal must not be silently deleted");
         backend
-            .block_on(
-                store.put(
-                    &delta_path,
-                    PutPayload::from(
-                        crate::storage::delta::GraphSnapshotDelta::empty(legacy_generation)
-                            .to_bytes()
-                            .unwrap(),
-                    ),
-                ),
-            )
-            .unwrap();
-
-        let stale = backend
-            .rebuild_legacy_journal(
-                repo_id,
-                &legacy_base.to_bytes().unwrap(),
-                legacy_generation - 1,
-            )
-            .expect_err("snapshot CAS must reject a stale quiesce cursor");
-        assert!(stale.to_string().contains("generation mismatch"));
-
-        // GCS timestamp filenames are not replay authority. The reconciled
-        // graph below is deliberately caller-supplied and becomes the exact
-        // full snapshot committed by the migration.
-        let mut reconciled = legacy_base.clone();
-        reconciled
-            .file_hashes
-            .insert("reconciled.rs".to_string(), [2; 32]);
-        store.fail_next_delete();
-        let committed = backend
-            .rebuild_legacy_journal(repo_id, &reconciled.to_bytes().unwrap(), legacy_generation)
-            .expect("conditional authority commit must return despite cleanup failure");
-        assert!(committed > legacy_generation);
-        let (committed_bytes, tuple_generation) = backend.load_snapshot(repo_id).unwrap().unwrap();
-        assert_eq!(tuple_generation, committed);
-        assert_eq!(committed_bytes, reconciled.to_bytes().unwrap());
-        let recovery_error = crate::storage::backend::load_recovered_snapshot(&backend, repo_id)
-            .expect_err("residual journal must keep normal recovery fail-closed");
-        assert!(recovery_error.to_string().contains("mixed-version delta"));
-
-        let retried = backend
-            .rebuild_legacy_journal(repo_id, &reconciled.to_bytes().unwrap(), committed)
-            .unwrap();
-        assert!(retried > committed);
-        assert!(backend.load_deltas_since(repo_id, 0).unwrap().is_empty());
-        let recovered = crate::storage::backend::load_recovered_snapshot(&backend, repo_id)
-            .unwrap()
-            .unwrap();
-        assert_eq!(recovered.generation, retried);
-        assert_eq!(recovered.snapshot.file_hashes, reconciled.file_hashes);
+            .load_deltas_since(repo_id, generation)
+            .expect_err("unbound journal must not become replay authority");
     }
 
     #[test]
@@ -1395,7 +1572,7 @@ mod tests {
         let repo = "cas-test-repo";
 
         let mut base = GraphSnapshot::empty();
-        base.file_hashes.insert("base.rs".to_string(), [1; 32]);
+        base.admit_artifact_for_test("base.rs".to_string(), crate::types::regular_tree_entry(1));
         let bytes = base.to_bytes().unwrap();
         let gen1 = backend
             .save_snapshot(repo, &bytes, GENERATION_INIT)
@@ -1404,9 +1581,10 @@ mod tests {
         assert_eq!(stale_gen, gen1);
 
         let mut current = base.clone();
-        current
-            .file_hashes
-            .insert("current.rs".to_string(), [2; 32]);
+        current.admit_artifact_for_test(
+            "current.rs".to_string(),
+            crate::types::regular_tree_entry(2),
+        );
         let gen2 = backend
             .save_snapshot(repo, &current.to_bytes().unwrap(), gen1)
             .expect("second save (conditional Update) must succeed against real GCS");
@@ -1419,7 +1597,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(recovered.generation, gen2);
-        assert_eq!(recovered.snapshot.file_hashes, current.file_hashes);
+        assert_eq!(recovered.snapshot.resolved_tree, current.resolved_tree);
 
         eprintln!(
             "gens: create={gen1} update={gen2} recovered={}",

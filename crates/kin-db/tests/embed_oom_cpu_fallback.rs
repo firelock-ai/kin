@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
+#![cfg(feature = "embeddings")]
+
 //! Runtime proof of the kin-db embedding dispatcher's CPU-degrade-on-OOM path.
 //!
 //! Background: the Metal embedding arms in `embed/mod.rs` match

@@ -37,7 +37,9 @@ fuzz_target!(|data: &[u8]| {
     // Capture entity ids before from_snapshot consumes the snapshot.
     let entity_ids: Vec<_> = snapshot.entities.keys().cloned().collect();
 
-    let graph = InMemoryGraph::from_snapshot(snapshot);
+    let Ok(graph) = InMemoryGraph::from_snapshot(snapshot) else {
+        return;
+    };
 
     // Walk the entity-extraction read surfaces for every ingested entity.
     // These traverse the adjacency indexes built during ingestion and must

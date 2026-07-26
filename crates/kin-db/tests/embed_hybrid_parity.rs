@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
+#![cfg(feature = "embeddings")]
+
 //! Runtime proof that the throughput-profile hybrid split is value- and
 //! order-preserving.
 //!

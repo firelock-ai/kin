@@ -21,6 +21,15 @@ pub enum KinDbError {
     #[error("storage error: {0}")]
     StorageError(String),
 
+    /// A snapshot write may have installed its exact candidate, but the
+    /// backend could not prove the commit outcome to the caller.
+    ///
+    /// Callers must retain and reconcile that same candidate. Rebuilding a
+    /// successor can change timestamps or other serialized identity and can
+    /// therefore neither confirm nor safely supersede the uncertain write.
+    #[error("snapshot persistence outcome is indeterminate: {0}")]
+    SnapshotPersistenceIndeterminate(String),
+
     #[error(
         "immutable source blob is {actual_bytes} bytes, above the caller-supplied {max_bytes}-byte read limit"
     )]
@@ -52,16 +61,14 @@ pub enum KinDbError {
 }
 
 impl KinDbError {
-    /// Error for a snapshot whose format version predates the oldest schema
-    /// this binary can load. Names the version gap and a remediation command
-    /// so the caller can report it instead of failing opaquely.
+    /// Error for a snapshot whose format predates exact universal-tree truth.
     pub fn snapshot_schema_too_old(found: u32, min: u32, max: u32) -> Self {
         KinDbError::IncompatibleSnapshotVersion {
             found,
             min,
             max,
             direction: "is older than",
-            remediation: "this graph was written by an older Kin; rebuild it with `kin migrate` or `kin embed --rebuild`",
+            remediation: "reinitialize this pre-release repository with the current Kin; exact file modes cannot be recovered from this snapshot",
         }
     }
 
