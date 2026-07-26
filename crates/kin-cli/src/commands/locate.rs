@@ -4,7 +4,7 @@
 use anyhow::{Context, Result};
 use kin_model::{
     ChangeStore, EntityFilter, EntityKind, EntityRole, EntityStore, GraphNodeId, RelationKind,
-    SemanticChangeId,
+    RepoPath, SemanticChangeId,
 };
 use rustc_hash::FxHasher;
 use serde::{Deserialize, Serialize};
@@ -1451,10 +1451,9 @@ pub fn run_with_graph_capture(
 }
 
 fn locate_workspace_root() -> Option<std::path::PathBuf> {
-    let cwd = std::env::current_dir().ok()?;
-    kin_core::KinLayout::discover(&cwd)
-        .map(|layout| kin_core::source_dir(&layout))
-        .or(Some(cwd))
+    // Runtime locate answers from graph-owned retrieval state. A working-tree
+    // root would let ranking helpers infer evidence from raw files.
+    None
 }
 
 pub fn run_with_graph_capture_in_workspace(
@@ -3438,7 +3437,7 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
         );
     }
     let file_provenance = if explain {
-        collect_result_provenance(graph, &results, &projection_provenance)
+        collect_result_provenance(graph, &results, &projection_provenance)?
     } else {
         HashMap::new()
     };
@@ -3554,19 +3553,19 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
     // Project bounded inline snippets from graph-owned content (no extra IO on
     // the working tree). No-op unless requested; the early budget-exhausted
     // return above carries no symbols, so it needs no snippets.
-    attach_snippets(&mut result, graph, &snippet_opts);
+    attach_snippets(&mut result, graph, &snippet_opts)?;
     // Re-project the ranked symbols into the graph-native PRIMARY surface: a
     // single globally-ranked entity list (file demoted to provenance). Reuses the
     // snippet projection's bounds; the daemon caches the full ranking and windows
     // one page. No-op unless the agent/JSON surface requested snippets.
-    build_entity_view(&mut result, graph, &snippet_opts);
+    build_entity_view(&mut result, graph, &snippet_opts)?;
     Ok(result)
 }
 
 pub fn run_with_graph_capture_at_ref(
     layout: &kin_core::KinLayout,
-    graph: &kin_db::InMemoryGraph,
-    blob_store: &kin_blobs::BlobStore,
+    vector_source: &kin_db::InMemoryGraph,
+    _blob_store: &kin_blobs::BlobStore,
     head: &SemanticChangeId,
     reference: &str,
     text: &str,
@@ -3575,27 +3574,43 @@ pub fn run_with_graph_capture_at_ref(
     max_files_explicit: bool,
     snippet_opts: SnippetOptions,
 ) -> Result<LocateResult> {
-    let changes = kin_core::collect_changes_at_ref(graph, head)
+    let authority = crate::commands::repository_authority::ActiveRepositoryAuthority::open(layout)?;
+    run_with_repository_authority_capture_at_ref(
+        authority.manager(),
+        vector_source,
+        head,
+        reference,
+        text,
+        explain,
+        max_files,
+        max_files_explicit,
+        snippet_opts,
+    )
+}
+
+fn run_with_repository_authority_capture_at_ref<B>(
+    authority: &kin_db::RepositoryAuthorityManager<B>,
+    vector_source: &kin_db::InMemoryGraph,
+    head: &SemanticChangeId,
+    reference: &str,
+    text: &str,
+    explain: bool,
+    max_files: usize,
+    max_files_explicit: bool,
+    snippet_opts: SnippetOptions,
+) -> Result<LocateResult>
+where
+    B: kin_db::StorageBackend + ?Sized + 'static,
+{
+    let history = {
+        let lease = authority.read_authority();
+        kin_db::InMemoryGraph::from_snapshot(lease.snapshot().clone())
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?
+    };
+    let changes = kin_core::collect_changes_at_ref(&history, head)
         .map_err(|err| anyhow::anyhow!(err.to_string()))?;
-    let historical = if let Some(git_oid) = reference.strip_prefix("git:") {
-        kin_core::build_graph_at_git_ref_with_repo(
-            graph,
-            blob_store,
-            head,
-            layout.working_dir(),
-            git_oid,
-            None,
-        )
-    } else {
-        kin_core::build_graph_at_ref_with_repo(
-            graph,
-            blob_store,
-            head,
-            Some(layout.working_dir()),
-            None,
-        )
-    }
-    .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+    let historical = kin_core::build_graph_at_ref(authority, head)
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?;
     let _ = crate::commands::cochange::refresh_from_changes(&historical, &changes);
     let extra_priority_files =
         discover_historical_test_artifact_priority_files(&historical, reference, text);
@@ -3607,7 +3622,7 @@ pub fn run_with_graph_capture_at_ref(
         max_files,
         max_files_explicit,
         extra_priority_files,
-        Some(graph),
+        Some(vector_source),
         snippet_opts,
     )
 }
@@ -3940,9 +3955,7 @@ fn priority_relation_retention_paths(
         if is_amalgamated_or_generated_path(seed_path) || is_vendored_path(seed_path) {
             continue;
         }
-        let Some(seed_artifact_id) =
-            graph.artifact_id_for_path(&kin_model::FilePathId::new(seed_path.as_str()))
-        else {
+        let Some(seed_artifact_id) = graph_artifact_id_at_utf8_path(graph, seed_path) else {
             continue;
         };
         let seed_node = GraphNodeId::Artifact(seed_artifact_id);
@@ -4233,8 +4246,8 @@ fn graph_named_test_artifact_paths(graph: &kin_db::InMemoryGraph) -> Vec<String>
 /// the "named test artifacts that contain triple-quoted strings" signal is read
 /// from those graph surfaces rather than by shelling out to `git grep`/`git
 /// show` over raw working-tree contents. `graph` is the ref-scoped graph
-/// (`build_graph_at_git_ref_with_repo` output); a file with no graph-owned body
-/// is dropped honestly instead of being re-read from disk.
+/// (`build_graph_at_ref` output); a file with no graph-owned body is dropped
+/// honestly instead of being re-read from disk or Git.
 pub fn discover_historical_test_artifact_priority_files(
     graph: &kin_db::InMemoryGraph,
     reference: &str,
@@ -7927,9 +7940,7 @@ fn extract_multihop_signals(
             if (!test_query && is_test_path(seed_path)) || is_vendored_path(seed_path) {
                 continue;
             }
-            let Some(start_artifact_id) =
-                graph.artifact_id_for_path(&kin_model::FilePathId::new(seed_path.as_str()))
-            else {
+            let Some(start_artifact_id) = graph_artifact_id_at_utf8_path(graph, seed_path) else {
                 continue;
             };
             let start = GraphNodeId::Artifact(start_artifact_id);
@@ -9838,35 +9849,75 @@ fn collect_result_provenance(
     graph: &kin_db::InMemoryGraph,
     results: &[(String, f32)],
     projection_provenance: &HashMap<String, LocateFileProvenance>,
-) -> HashMap<String, LocateFileProvenance> {
+) -> Result<HashMap<String, LocateFileProvenance>> {
     results
         .iter()
-        .map(|(path, _)| {
-            let provenance =
-                projection_provenance
-                    .get(path)
-                    .cloned()
-                    .unwrap_or_else(|| LocateFileProvenance {
-                        objects: vec![artifact_graph_object(
-                            graph_artifact_id_for_path(graph, path),
-                            path,
-                        )],
-                        edges: Vec::new(),
-                    });
-            (path.clone(), provenance)
+        .map(|(path, _)| -> Result<_> {
+            let provenance = match projection_provenance.get(path).cloned() {
+                Some(provenance) => provenance,
+                None => LocateFileProvenance {
+                    objects: vec![artifact_graph_object(
+                        require_graph_artifact_id(graph, path)?,
+                        path,
+                    )],
+                    edges: Vec::new(),
+                },
+            };
+            Ok((path.clone(), provenance))
         })
         .collect()
 }
 
-/// Resolve the graph-assigned `ArtifactId` for `path` from the graph's
-/// artifact index, falling back to the deterministic path derivation only when
-/// the path is not yet indexed. Mirrors the canonical kin-db lookup
-/// (`artifact_index.get(..).unwrap_or_else(|| ArtifactId::seed_from_file_id(..))`).
-fn graph_artifact_id_for_path(graph: &kin_db::InMemoryGraph, path: &str) -> kin_model::ArtifactId {
-    let file_id = kin_model::FilePathId::new(path);
-    graph
-        .artifact_id_for_path(&file_id)
-        .unwrap_or_else(|| kin_model::ArtifactId::seed_from_path(path))
+fn graph_artifact_id_at_utf8_path(
+    graph: &kin_db::InMemoryGraph,
+    path: &str,
+) -> Option<kin_model::ArtifactId> {
+    let repo_path = match RepoPath::from_utf8(path) {
+        Ok(path) => path,
+        Err(error) => {
+            tracing::warn!(
+                target: "kin.locate.graph_gap",
+                path,
+                %error,
+                "locate path is not a valid exact repository path"
+            );
+            return None;
+        }
+    };
+    let artifact_id = graph.artifact_id_at_path(&repo_path);
+    if artifact_id.is_none() {
+        tracing::warn!(
+            target: "kin.locate.graph_gap",
+            path,
+            "locate result has no admitted artifact identity"
+        );
+    }
+    artifact_id
+}
+
+fn graph_utf8_path_for_artifact_id(
+    graph: &kin_db::InMemoryGraph,
+    artifact_id: &kin_model::ArtifactId,
+) -> Option<String> {
+    let path = graph.repo_path_for_artifact_id(artifact_id)?;
+    let Some(path_utf8) = path.as_utf8() else {
+        tracing::warn!(
+            target: "kin.locate.graph_gap",
+            ?artifact_id,
+            path = %path,
+            "semantic locate cannot present this byte-exact artifact path on its UTF-8 path surface"
+        );
+        return None;
+    };
+    Some(path_utf8.to_owned())
+}
+
+fn require_graph_artifact_id(
+    graph: &kin_db::InMemoryGraph,
+    path: &str,
+) -> Result<kin_model::ArtifactId> {
+    graph_artifact_id_at_utf8_path(graph, path)
+        .with_context(|| format!("graph gap: no admitted artifact identity for {path}"))
 }
 
 fn artifact_graph_object(artifact_id: kin_model::ArtifactId, path: &str) -> LocateGraphObject {
@@ -10205,8 +10256,7 @@ fn resolve_entities_to_files(
             let artifact_hops = locate_env_usize("KIN_LOCATE_RESOLVE_ARTIFACT_HOPS", 2);
             let artifact_frontier = locate_env_usize("KIN_LOCATE_RESOLVE_ARTIFACT_FRONTIER", 32);
             let artifact_hop_decay = locate_env_f32("KIN_LOCATE_RESOLVE_ARTIFACT_HOP_DECAY", 0.55);
-            let start_artifact_id =
-                graph.artifact_id_for_path(&kin_model::FilePathId::new(fo.0.as_str()));
+            let start_artifact_id = graph_artifact_id_at_utf8_path(graph, &fo.0);
             if let Some(start_artifact_id) = start_artifact_id {
                 let start_artifact = GraphNodeId::Artifact(start_artifact_id);
                 let mut visited_artifacts = HashSet::from([start_artifact]);
@@ -10895,14 +10945,12 @@ fn relation_adjacent_artifact_path(
     };
 
     if let GraphNodeId::Artifact(artifact_id) = other {
-        if let Some(path) = graph.path_for_artifact_id(&artifact_id) {
-            return Some((path.0, GraphNodeId::Artifact(artifact_id)));
-        }
+        return graph_utf8_path_for_artifact_id(graph, &artifact_id)
+            .map(|path| (path, GraphNodeId::Artifact(artifact_id)));
     }
 
     relation_projected_artifact_path(rel, from_node).and_then(|path| {
-        graph
-            .artifact_id_for_path(&kin_model::FilePathId::new(path.as_str()))
+        graph_artifact_id_at_utf8_path(graph, &path)
             .map(|artifact_id| (path, GraphNodeId::Artifact(artifact_id)))
     })
 }
@@ -13668,7 +13716,7 @@ fn graph_projection_backed_generated_paths(
 }
 
 fn path_has_derived_from_artifact_relation(graph: &kin_db::InMemoryGraph, path: &str) -> bool {
-    let Some(artifact_id) = graph.artifact_id_for_path(&kin_model::FilePathId::new(path)) else {
+    let Some(artifact_id) = graph_artifact_id_at_utf8_path(graph, path) else {
         return false;
     };
     let node = GraphNodeId::Artifact(artifact_id);
@@ -13719,8 +13767,7 @@ fn projection_contributor_retention_paths_with_limits(
         if *score < seed_floor {
             continue;
         }
-        let Some(artifact_id) = graph.artifact_id_for_path(&kin_model::FilePathId::new(path))
-        else {
+        let Some(artifact_id) = graph_artifact_id_at_utf8_path(graph, path) else {
             continue;
         };
         let node = GraphNodeId::Artifact(artifact_id);
@@ -13736,10 +13783,7 @@ fn projection_contributor_retention_paths_with_limits(
                 continue;
             }
             let contributor_path = match relation.dst {
-                GraphNodeId::Artifact(dst_id) => graph
-                    .path_for_artifact_id(&dst_id)
-                    .map(|path| path.0)
-                    .or_else(|| relation_projection_resolved_path(&relation)),
+                GraphNodeId::Artifact(dst_id) => graph_utf8_path_for_artifact_id(graph, &dst_id),
                 _ => None,
             };
             let Some(contributor_path) = contributor_path else {
@@ -13791,13 +13835,6 @@ fn relation_has_projection_marker_evidence(relation: &kin_model::Relation) -> bo
             || evidence.token.as_deref() == Some("#include")
                 && evidence.resolved_path.as_deref().is_some()
     })
-}
-
-fn relation_projection_resolved_path(relation: &kin_model::Relation) -> Option<String> {
-    relation
-        .evidence
-        .iter()
-        .find_map(|evidence| evidence.resolved_path.clone())
 }
 
 fn priority_backing_applies_for_path(
@@ -15120,7 +15157,9 @@ fn collect_explain_for_file(
 /// shared [`kin_mcp::handlers::common::read_entity_source_excerpt_detailed`]
 /// projection (content-addressed, hash-verified — the same bytes
 /// `get_entity_source` and `semantic_locate` serve), so there is no working-tree
-/// read: a graph/blob miss simply leaves the symbol as coordinates-only.
+/// read. A graph/tree/blob authority gap fails the locate request loudly rather
+/// than returning a coordinates-only result that could be mistaken for a
+/// complete graph answer.
 ///
 /// Additive: symbol set, ordering, and scores are untouched (the ContextBench
 /// scorer derives its predicted symbol set from `symbols[].name`, which is
@@ -15130,9 +15169,9 @@ pub fn attach_snippets(
     result: &mut LocateResult,
     graph: &kin_db::InMemoryGraph,
     opts: &SnippetOptions,
-) {
+) -> Result<()> {
     if !opts.enabled {
-        return;
+        return Ok(());
     }
     for file in result.files.iter_mut() {
         if file.symbols.is_empty() {
@@ -15142,9 +15181,7 @@ pub fn attach_snippets(
             file_path: Some(kin_model::FilePathId::new(&file.path)),
             ..Default::default()
         };
-        let Ok(entities) = graph.query_entities(&filter) else {
-            continue;
-        };
+        let entities = graph.query_entities(&filter)?;
         if entities.is_empty() {
             continue;
         }
@@ -15160,17 +15197,18 @@ pub fn attach_snippets(
             let Some(entity) = match_symbol_entity(&entities, sym) else {
                 continue;
             };
-            if let Some(snippet) = kin_mcp::handlers::common::read_entity_source_excerpt_detailed(
+            if let Some(source) = kin_mcp::handlers::common::read_entity_source_excerpt_detailed(
                 graph,
                 entity,
                 opts.max_lines,
                 opts.max_chars,
-            ) {
-                sym.snippet = Some(snippet);
+            )? {
+                sym.snippet = Some(source.body);
                 filled += 1;
             }
         }
     }
+    Ok(())
 }
 
 /// Resolve a located symbol to its graph entity by name, disambiguating by start
@@ -15197,31 +15235,35 @@ fn match_symbol_entity<'a>(
 /// the entity spans more source lines than the cap surfaced. Same
 /// content-addressed, hash-verified projection
 /// ([`kin_mcp::handlers::common::read_entity_source_excerpt_detailed`]) every
-/// agent surface uses — never a working-tree read; a graph/blob miss yields
-/// `None` (coordinates only).
+/// agent surface uses — never a working-tree read. `None` means the entity has
+/// no source coordinates; graph/tree/blob gaps are errors.
 fn bounded_entity_body_with_note(
     graph: &kin_db::InMemoryGraph,
     entity: &kin_model::Entity,
     max_lines: usize,
     max_chars: usize,
-) -> Option<String> {
-    let body = kin_mcp::handlers::common::read_entity_source_excerpt_detailed(
+) -> Result<Option<String>> {
+    let Some(source) = kin_mcp::handlers::common::read_entity_source_excerpt_detailed(
         graph, entity, max_lines, max_chars,
-    )?;
+    )?
+    else {
+        return Ok(None);
+    };
+    let body = source.body;
     if let Some(span) = entity.span.as_ref() {
         let total_lines =
             (span.end_line.saturating_sub(span.start_line) as usize).saturating_add(1);
         let shown = body.lines().count();
         if total_lines > shown {
             let remaining = total_lines - shown;
-            return Some(format!(
+            return Ok(Some(format!(
                 "{body}\n… (+{remaining} more line{} — get_entity_source {} for the full body)",
                 if remaining == 1 { "" } else { "s" },
                 entity.id
-            ));
+            )));
         }
     }
-    Some(body)
+    Ok(Some(body))
 }
 
 /// Re-project the file-attributed ranked symbols already built into `result`
@@ -15242,9 +15284,9 @@ pub fn build_entity_view(
     result: &mut LocateResult,
     graph: &kin_db::InMemoryGraph,
     opts: &SnippetOptions,
-) {
+) -> Result<()> {
     if !opts.enabled {
-        return;
+        return Ok(());
     }
     // (file_rank, LocateEntity) so global ranking can tie-break on file order.
     let mut ranked: Vec<(usize, LocateEntity)> = Vec::new();
@@ -15257,9 +15299,7 @@ pub fn build_entity_view(
             file_path: Some(kin_model::FilePathId::new(&file.path)),
             ..Default::default()
         };
-        let Ok(entities) = graph.query_entities(&filter) else {
-            continue;
-        };
+        let entities = graph.query_entities(&filter)?;
         if entities.is_empty() {
             continue;
         }
@@ -15274,7 +15314,7 @@ pub fn build_entity_view(
             // Bodies belong to definitions; references/re-exports stay
             // coordinates-only (the symbol already reused its snippet, if any).
             let body = if sym.definition {
-                bounded_entity_body_with_note(graph, entity, opts.max_lines, opts.max_chars)
+                bounded_entity_body_with_note(graph, entity, opts.max_lines, opts.max_chars)?
                     .or_else(|| sym.snippet.clone())
             } else {
                 None
@@ -15323,6 +15363,7 @@ pub fn build_entity_view(
 
     result.entities = ranked.into_iter().map(|(_, entity)| entity).collect();
     result.total_ranked = result.entities.len();
+    Ok(())
 }
 
 /// Stable, opaque key for a locate ranking, scoped to the query, the ref/scope it
@@ -15730,18 +15771,257 @@ fn output_text(result: &LocateResult) {
 }
 
 #[cfg(test)]
-// Test fixtures build synthetic artifact relations by path; graph-assigned
-// IDs are path-derived for these in-test graphs, so the deprecated path
-// constructor is the correct fixture tool here.
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    use kin_db::{LocalFileBackend, RepositoryAuthorityManager};
     use kin_model::ArtifactId;
     use kin_model::{
-        ArtifactDelta, ArtifactDeltaKind, AuthorId, ChangeStore, Entity, EntityDelta, EntityId,
-        EntityMetadata, EntityStore, FilePathId, FingerprintAlgorithm, Hash256, LanguageId,
-        OpaqueArtifact, Relation, RelationEvidence, RelationId, RelationKind, RelationOrigin,
-        SemanticChange, SemanticChangeId, SemanticFingerprint, SourceSpan, Timestamp, Visibility,
+        AdmissionCase, AdmissionPolicyDelta, AuthorId, ChangeOrigin, ChangeStore,
+        DefaultRefExpectation, DefaultRefMutation, EffectiveAdmissionPolicyStamp, Entity,
+        EntityDelta, EntityId, EntityMetadata, EntityStore, FilePathId, FingerprintAlgorithm,
+        FrozenLocalOverlay, FrozenLocalOverlayDelta, Hash256, LanguageId, LocatedEntry,
+        OpaqueArtifact, OperationId, RefExpectation, RefMutation, RefName, RefTarget,
+        RefUpdatePolicy, Relation, RelationDelta, RelationEvidence, RelationId, RelationKind,
+        RelationOrigin, RepoPath, RepositoryId, RepositoryTransaction, ResolvedTree,
+        SemanticChange, SemanticChangeId, SemanticFingerprint, SharedAdmissionPolicy, SourceSpan,
+        Timestamp, TransactionDelta, TreeDelta, TreeEntry, Visibility, WorkspaceExpectation,
+        WorkspaceHead, WorkspaceId, WorkspaceMutation, REPOSITORY_TRANSACTION_SCHEMA_VERSION,
     };
+
+    fn located(path: &str, hash: Hash256) -> LocatedEntry {
+        LocatedEntry::new(
+            RepoPath::from_utf8(path).expect("valid test repository path"),
+            TreeEntry::blob(hash, false),
+        )
+    }
+
+    fn native_change(
+        parents: Vec<SemanticChangeId>,
+        message: &str,
+        entity_deltas: Vec<EntityDelta>,
+        tree_deltas: Vec<TreeDelta>,
+    ) -> SemanticChange {
+        let admission_policy_delta = parents
+            .is_empty()
+            .then(|| AdmissionPolicyDelta::initialize(SharedAdmissionPolicy::empty(0)));
+        let mut change = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+            origin: ChangeOrigin::Native,
+            parents,
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("locate-test"),
+            message: message.to_string(),
+            entity_deltas,
+            relation_deltas: Vec::new(),
+            tree_deltas,
+            admission_policy_delta,
+            projected_files: Vec::new(),
+            spec_link: None,
+            evidence: Vec::new(),
+            risk_summary: None,
+        };
+        change.id = kin_core::compute_semantic_change_id(&change).unwrap();
+        change
+    }
+
+    fn persist_test_history(
+        root: &std::path::Path,
+        repository_name: &str,
+        changes: Vec<SemanticChange>,
+        bodies: &[(Hash256, &[u8])],
+    ) -> RepositoryAuthorityManager<LocalFileBackend> {
+        let repository_id = RepositoryId::new(repository_name).unwrap();
+        let manager = RepositoryAuthorityManager::open(
+            repository_id.clone(),
+            Arc::new(LocalFileBackend::new(root.join("kindb"))),
+        )
+        .unwrap();
+        for (digest, body) in bodies {
+            manager.save_source_blob(*digest, body).unwrap();
+        }
+        let shared_policy = SharedAdmissionPolicy::empty(0);
+        let workspace_id = WorkspaceId::from_uuid(uuid::Uuid::new_v4());
+        let overlay =
+            FrozenLocalOverlay::new(workspace_id, 0, AdmissionCase::Sensitive, Vec::new()).unwrap();
+        let admission_policy = EffectiveAdmissionPolicyStamp {
+            shared: shared_policy.stamp(),
+            local: overlay.stamp(),
+        };
+        let main = RefName::branch(b"main").unwrap();
+        let mut tree = ResolvedTree::default();
+        let mut previous_target = None;
+        let mut previous_tree_hash = None;
+        for (index, change) in changes.into_iter().enumerate() {
+            let prior_target = previous_target.clone();
+            let prior_tree_hash = previous_tree_hash;
+            tree = tree.apply(&change.tree_deltas).unwrap();
+            let tree_hash = kin_model::compute_resolved_tree_hash(&tree).unwrap();
+            let target = RefTarget::change(change.id);
+            let lease = manager.read_authority();
+            let transaction = RepositoryTransaction {
+                schema_version: REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+                operation_id: OperationId::new(),
+                repository_id: repository_id.clone(),
+                expected_generation: lease.roots().generation,
+                expected_roots: lease.roots().clone(),
+                actor: AuthorId::new("locate-test"),
+                reason: format!("persist exact locate history fixture: {}", change.message),
+                external_objects: Vec::new(),
+                git_authority_delta: None,
+                changes: vec![change.clone()],
+                aliases: Vec::new(),
+                ref_mutations: vec![RefMutation {
+                    name: main.clone(),
+                    expected: prior_target
+                        .clone()
+                        .map_or(RefExpectation::MustNotExist, |target| {
+                            RefExpectation::MustEqual { target }
+                        }),
+                    new_target: Some(target.clone()),
+                    policy: RefUpdatePolicy::FastForwardOnly,
+                }],
+                default_ref_mutation: (index == 0).then(|| DefaultRefMutation {
+                    expected: DefaultRefExpectation::MustBeUnset,
+                    new_default: Some(main.clone()),
+                }),
+                workspace_mutation: Some(WorkspaceMutation {
+                    workspace_id,
+                    expected: if index == 0 {
+                        WorkspaceExpectation::MustNotExist
+                    } else {
+                        WorkspaceExpectation::MustEqual {
+                            generation: u64::try_from(index - 1).unwrap(),
+                            head: WorkspaceHead::Symbolic {
+                                target: main.clone(),
+                            },
+                            base_target: prior_target,
+                            base_tree_hash: prior_tree_hash,
+                            tree_hash: prior_tree_hash.unwrap(),
+                            admission_policy: admission_policy.clone(),
+                        }
+                    },
+                    new_generation: u64::try_from(index).unwrap(),
+                    new_head: WorkspaceHead::Symbolic {
+                        target: main.clone(),
+                    },
+                    new_base_target: Some(target.clone()),
+                    new_base_tree_hash: Some(tree_hash),
+                    tree_deltas: change.tree_deltas,
+                    new_tree_hash: tree_hash,
+                    new_shared_admission_policy: shared_policy.clone(),
+                    new_admission_policy: admission_policy.clone(),
+                }),
+                local_overlay_delta: (index == 0)
+                    .then(|| FrozenLocalOverlayDelta::initialize(overlay.clone())),
+            };
+            drop(lease);
+            manager.commit_repository_transaction(transaction).unwrap();
+            previous_target = Some(target);
+            previous_tree_hash = Some(tree_hash);
+        }
+        manager
+    }
+
+    trait TestArtifactAdmission {
+        fn put_opaque(&self, artifact: &OpaqueArtifact) -> kin_db::Result<()>;
+    }
+
+    impl TestArtifactAdmission for kin_db::InMemoryGraph {
+        fn put_opaque(&self, artifact: &OpaqueArtifact) -> kin_db::Result<()> {
+            let path = RepoPath::from_utf8(artifact.file_id.0.clone())
+                .expect("valid test repository path");
+            let new = kin_model::LocatedEntry::new(
+                path.clone(),
+                TreeEntry::blob(artifact.content_hash, false),
+            );
+            let tree_delta = match self.resolved_tree().artifact_at_path(&path).cloned() {
+                Some(existing) if existing.entry == new.entry => None,
+                Some(existing) => Some(TreeDelta::Updated {
+                    artifact_id: existing.artifact_id,
+                    old: existing.located_entry(),
+                    new,
+                }),
+                None => Some(TreeDelta::Added {
+                    artifact_id: ArtifactId::new(),
+                    new,
+                }),
+            };
+            if let Some(tree_delta) = tree_delta {
+                self.apply_transaction_delta(&TransactionDelta {
+                    entity_deltas: Vec::new(),
+                    relation_deltas: Vec::new(),
+                    tree_deltas: vec![tree_delta],
+                    admission_policy_delta: None,
+                })?;
+            }
+            EntityStore::upsert_opaque_artifact(self, artifact)
+        }
+    }
+
+    fn test_artifact_id(graph: &kin_db::InMemoryGraph, path: &str) -> ArtifactId {
+        let path = RepoPath::from_utf8(path).expect("valid test repository path");
+        graph
+            .artifact_id_at_path(&path)
+            .expect("test artifact must be explicitly admitted")
+    }
+
+    fn admit_test_source(graph: &kin_db::InMemoryGraph, path: &str, body: &str) {
+        graph
+            .put_opaque(&OpaqueArtifact {
+                file_id: FilePathId::new(path),
+                content_hash: kin_blobs::digest(body.as_bytes()),
+                mime_type: Some("text/plain".to_string()),
+                text_preview: Some(body.to_string()),
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn result_provenance_fails_loud_when_tree_identity_is_missing() {
+        let graph = kin_db::InMemoryGraph::new();
+        let error = match collect_result_provenance(
+            &graph,
+            &[("README.md".to_string(), 1.0)],
+            &HashMap::new(),
+        ) {
+            Err(error) => error,
+            Ok(_) => {
+                panic!("locate provenance must not fabricate a path-derived artifact identity")
+            }
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("graph gap: no admitted artifact identity for README.md"),
+            "unexpected graph-gap error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn result_provenance_uses_explicitly_admitted_identity() {
+        let graph = kin_db::InMemoryGraph::new();
+        graph
+            .put_opaque(&OpaqueArtifact {
+                file_id: FilePathId::new("README.md"),
+                content_hash: Hash256::from_bytes([0x81; 32]),
+                mime_type: Some("text/markdown".to_string()),
+                text_preview: Some("# Kin".to_string()),
+            })
+            .unwrap();
+        let artifact_id = test_artifact_id(&graph, "README.md");
+
+        let provenance =
+            collect_result_provenance(&graph, &[("README.md".to_string(), 1.0)], &HashMap::new())
+                .unwrap();
+
+        assert_eq!(
+            provenance["README.md"].objects[0].id,
+            GraphNodeId::Artifact(artifact_id).to_string()
+        );
+    }
 
     fn hit(score: f32) -> Vec<FileHit> {
         vec![FileHit {
@@ -16179,7 +16459,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        build_entity_view(&mut result, &graph, &SnippetOptions::default());
+        build_entity_view(&mut result, &graph, &SnippetOptions::default()).unwrap();
         assert!(
             result.entities.is_empty(),
             "disabled snippet opts must leave the entity surface untouched"
@@ -16226,7 +16506,7 @@ mod tests {
     fn graph_derived_candidate_text_serves_graph_body_and_ignores_disk() {
         let graph = kin_db::InMemoryGraph::new();
         graph
-            .upsert_opaque_artifact(&OpaqueArtifact {
+            .put_opaque(&OpaqueArtifact {
                 file_id: FilePathId::new("src/foo.rs"),
                 content_hash: Hash256::from_bytes([7; 32]),
                 mime_type: Some("text/x-rust".into()),
@@ -16256,7 +16536,7 @@ mod tests {
         // presence alone — an absent workspace root must not disable it.
         let scoped_graph = kin_db::InMemoryGraph::new();
         scoped_graph
-            .upsert_opaque_artifact(&OpaqueArtifact {
+            .put_opaque(&OpaqueArtifact {
                 file_id: FilePathId::new("src/scoped.rs"),
                 content_hash: Hash256::from_bytes([13; 32]),
                 mime_type: Some("text/x-rust".into()),
@@ -16288,7 +16568,7 @@ mod tests {
         // body. Both are graph gaps: they must yield no text and never be
         // patched from a raw workspace disk read.
         graph
-            .upsert_opaque_artifact(&OpaqueArtifact {
+            .put_opaque(&OpaqueArtifact {
                 file_id: FilePathId::new("src/none.rs"),
                 content_hash: Hash256::from_bytes([9; 32]),
                 mime_type: Some("text/x-rust".into()),
@@ -16296,7 +16576,7 @@ mod tests {
             })
             .unwrap();
         graph
-            .upsert_opaque_artifact(&OpaqueArtifact {
+            .put_opaque(&OpaqueArtifact {
                 file_id: FilePathId::new("src/empty.rs"),
                 content_hash: Hash256::from_bytes([11; 32]),
                 mime_type: Some("text/x-rust".into()),
@@ -16322,7 +16602,7 @@ mod tests {
     fn graph_source_text_returns_typed_gap_on_graph_miss_without_reading_disk() {
         let graph = kin_db::InMemoryGraph::new();
         graph
-            .upsert_opaque_artifact(&OpaqueArtifact {
+            .put_opaque(&OpaqueArtifact {
                 file_id: FilePathId::new("src/present.rs"),
                 content_hash: Hash256::from_bytes([3; 32]),
                 mime_type: Some("text/x-rust".into()),
@@ -16347,7 +16627,7 @@ mod tests {
         );
 
         graph
-            .upsert_opaque_artifact(&OpaqueArtifact {
+            .put_opaque(&OpaqueArtifact {
                 file_id: FilePathId::new("src/blank.rs"),
                 content_hash: Hash256::from_bytes([4; 32]),
                 mime_type: Some("text/x-rust".into()),
@@ -16383,7 +16663,7 @@ mod tests {
             graph.upsert_entity(entity).unwrap();
         }
         graph
-            .upsert_opaque_artifact(&OpaqueArtifact {
+            .put_opaque(&OpaqueArtifact {
                 file_id: FilePathId::new("src/config.rs"),
                 content_hash: Hash256::from_bytes([21; 32]),
                 mime_type: Some("text/x-rust".into()),
@@ -16393,7 +16673,7 @@ mod tests {
             })
             .unwrap();
         graph
-            .upsert_opaque_artifact(&OpaqueArtifact {
+            .put_opaque(&OpaqueArtifact {
                 file_id: FilePathId::new("src/settings.rs"),
                 content_hash: Hash256::from_bytes([22; 32]),
                 mime_type: Some("text/x-rust".into()),
@@ -16625,7 +16905,7 @@ mod tests {
 
     fn seed_opaque_body(graph: &kin_db::InMemoryGraph, path: &str, seed: u8, body: &str) {
         graph
-            .upsert_opaque_artifact(&OpaqueArtifact {
+            .put_opaque(&OpaqueArtifact {
                 file_id: FilePathId::new(path),
                 content_hash: Hash256::from_bytes([seed; 32]),
                 mime_type: Some("text/x-source".into()),
@@ -16784,8 +17064,25 @@ mod tests {
                     .unwrap();
             }
         }
+        for (idx, artifact) in graph.resolved_tree().artifacts().enumerate() {
+            let x = 1.0f32 / ((entities.len() + idx + 1) as f32);
+            index
+                .upsert_retrievable(
+                    kin_model::RetrievalKey::Artifact(artifact.artifact_id),
+                    &[x, 1.0 - x],
+                )
+                .unwrap();
+        }
+        let descriptor = kin_db::IndexDescriptor {
+            model_id: Some("locate-test@v1".to_string()),
+            graph_root: Some(hex::encode(graph.compute_root_hash())),
+        };
+        index.set_descriptor(descriptor.clone());
         index.save(&path).unwrap();
-        graph.load_vector_index(&path).unwrap();
+        assert!(matches!(
+            graph.load_vector_index_compatible(&path, &descriptor),
+            kin_db::VectorIndexLoad::Loaded(_)
+        ));
         let status = graph.embedding_status();
         assert_eq!(
             status.indexed, status.total,
@@ -16823,6 +17120,7 @@ mod tests {
         let graph = kin_db::InMemoryGraph::new();
         let entity = test_entity("handler", "src/lib.py", 1, 5);
         graph.upsert_entity(&entity).unwrap();
+        admit_test_source(&graph, "src/lib.py", "def handler():\n    pass\n");
 
         std::env::set_var("KIN_REQUIRE_COMPLETE_EMBEDDINGS", "1");
         std::env::remove_var("KIN_BYPASS_EMBEDDING_COVERAGE_CHECK");
@@ -16846,6 +17144,7 @@ mod tests {
         let graph = kin_db::InMemoryGraph::new();
         let entity = test_entity("handler", "src/lib.py", 1, 5);
         graph.upsert_entity(&entity).unwrap();
+        admit_test_source(&graph, "src/lib.py", "def handler():\n    pass\n");
 
         std::env::set_var("KIN_REQUIRE_COMPLETE_EMBEDDINGS", "1");
         std::env::remove_var("KIN_BYPASS_EMBEDDING_COVERAGE_CHECK");
@@ -16877,6 +17176,7 @@ mod tests {
         let graph = kin_db::InMemoryGraph::new();
         let entity = test_entity("handler", "src/lib.py", 1, 5);
         graph.upsert_entity(&entity).unwrap();
+        admit_test_source(&graph, "src/lib.py", "def handler():\n    pass\n");
 
         std::env::remove_var("KIN_REQUIRE_COMPLETE_EMBEDDINGS");
         std::env::remove_var("KIN_BYPASS_EMBEDDING_COVERAGE_CHECK");
@@ -16887,7 +17187,10 @@ mod tests {
             .semantic_coverage
             .expect("semantic_coverage must be reported");
         assert_eq!(coverage.indexed, 0, "no embeddings indexed in this graph");
-        assert_eq!(coverage.total, 1, "one embeddable entity");
+        assert_eq!(
+            coverage.total, 2,
+            "one entity and its admitted artifact require embeddings"
+        );
         assert!(!coverage.complete, "coverage must be marked incomplete");
         assert!(
             coverage.note.is_some(),
@@ -18679,7 +18982,7 @@ mod tests {
         .enumerate()
         {
             graph
-                .upsert_opaque_artifact(&OpaqueArtifact {
+                .put_opaque(&OpaqueArtifact {
                     file_id: FilePathId::new(path),
                     content_hash: Hash256::from_bytes([idx as u8; 32]),
                     mime_type: Some("text/x-c++hdr".into()),
@@ -18687,19 +18990,13 @@ mod tests {
                 })
                 .unwrap();
         }
-        let iter_artifact = graph
-            .artifact_id_for_path(&FilePathId::new(
-                "include/nlohmann/detail/iterators/iter_impl.hpp",
-            ))
-            .unwrap();
-        let internal_artifact = graph
-            .artifact_id_for_path(&FilePathId::new(
-                "include/nlohmann/detail/iterators/internal_iterator.hpp",
-            ))
-            .unwrap();
-        let macro_artifact = graph
-            .artifact_id_for_path(&FilePathId::new("include/nlohmann/detail/macro_scope.hpp"))
-            .unwrap();
+        let iter_artifact =
+            test_artifact_id(&graph, "include/nlohmann/detail/iterators/iter_impl.hpp");
+        let internal_artifact = test_artifact_id(
+            &graph,
+            "include/nlohmann/detail/iterators/internal_iterator.hpp",
+        );
+        let macro_artifact = test_artifact_id(&graph, "include/nlohmann/detail/macro_scope.hpp");
         for (target_artifact, target_path) in [
             (
                 internal_artifact,
@@ -18771,7 +19068,7 @@ mod tests {
         let generated = FilePathId::new("single_include/nlohmann/json.hpp");
         let source = FilePathId::new("include/nlohmann/detail/exceptions.hpp");
         graph
-            .upsert_opaque_artifact(&OpaqueArtifact {
+            .put_opaque(&OpaqueArtifact {
                 file_id: generated.clone(),
                 content_hash: Hash256::from_bytes([91; 32]),
                 mime_type: Some("text/x-c++hdr".into()),
@@ -18779,7 +19076,7 @@ mod tests {
             })
             .unwrap();
         graph
-            .upsert_opaque_artifact(&OpaqueArtifact {
+            .put_opaque(&OpaqueArtifact {
                 file_id: source.clone(),
                 content_hash: Hash256::from_bytes([92; 32]),
                 mime_type: Some("text/x-c++hdr".into()),
@@ -18787,8 +19084,8 @@ mod tests {
             })
             .unwrap();
 
-        let generated_id = graph.artifact_id_for_path(&generated).unwrap();
-        let source_id = graph.artifact_id_for_path(&source).unwrap();
+        let generated_id = test_artifact_id(&graph, &generated.0);
+        let source_id = test_artifact_id(&graph, &source.0);
         graph
             .upsert_relation(&Relation {
                 id: RelationId::new(),
@@ -18828,7 +19125,7 @@ mod tests {
         let unrelated = FilePathId::new("develop/detail/input/lexer.hpp");
         for (idx, file_id) in [&generated, &source, &unrelated].iter().enumerate() {
             graph
-                .upsert_opaque_artifact(&OpaqueArtifact {
+                .put_opaque(&OpaqueArtifact {
                     file_id: (*file_id).clone(),
                     content_hash: Hash256::from_bytes([idx as u8 + 11; 32]),
                     mime_type: Some("text/x-c++hdr".into()),
@@ -18837,9 +19134,9 @@ mod tests {
                 .unwrap();
         }
 
-        let generated_id = graph.artifact_id_for_path(&generated).unwrap();
-        let source_id = graph.artifact_id_for_path(&source).unwrap();
-        let unrelated_id = graph.artifact_id_for_path(&unrelated).unwrap();
+        let generated_id = test_artifact_id(&graph, &generated.0);
+        let source_id = test_artifact_id(&graph, &source.0);
+        let unrelated_id = test_artifact_id(&graph, &unrelated.0);
         graph
             .upsert_relation(&Relation {
                 id: RelationId::new(),
@@ -19579,7 +19876,7 @@ mod tests {
         let graph = kin_db::InMemoryGraph::new();
 
         graph
-            .upsert_opaque_artifact(&OpaqueArtifact {
+            .put_opaque(&OpaqueArtifact {
                 file_id: FilePathId::new("include/nlohmann/detail/macro_scope.hpp"),
                 content_hash: Hash256::from_bytes([47; 32]),
                 mime_type: Some("text/x-c++hdr".into()),
@@ -19642,7 +19939,7 @@ mod tests {
             .enumerate()
         {
             graph
-                .upsert_opaque_artifact(&OpaqueArtifact {
+                .put_opaque(&OpaqueArtifact {
                     file_id: FilePathId::new(format!("include/nlohmann/detail/macro_{idx}.hpp")),
                     content_hash: Hash256::from_bytes([30 + idx as u8; 32]),
                     mime_type: Some("text/x-c++hdr".into()),
@@ -19722,7 +20019,7 @@ mod tests {
 
         for (idx, path) in paths.iter().enumerate() {
             graph
-                .upsert_opaque_artifact(&OpaqueArtifact {
+                .put_opaque(&OpaqueArtifact {
                     file_id: FilePathId::new(*path),
                     content_hash: Hash256::from_bytes([idx as u8; 32]),
                     mime_type: Some("text/x-c++hdr".into()),
@@ -19773,7 +20070,7 @@ mod tests {
         let graph = kin_db::InMemoryGraph::new();
 
         graph
-            .upsert_opaque_artifact(&OpaqueArtifact {
+            .put_opaque(&OpaqueArtifact {
                 file_id: FilePathId::new("include/nlohmann/detail/meta/detected.hpp"),
                 content_hash: Hash256::from_bytes([48; 32]),
                 mime_type: Some("text/x-c++hdr".into()),
@@ -19837,7 +20134,7 @@ mod tests {
             ))
             .unwrap();
         graph
-            .upsert_opaque_artifact(&OpaqueArtifact {
+            .put_opaque(&OpaqueArtifact {
                 file_id: FilePathId::new(".release-notes/0.49.1.md"),
                 content_hash: Hash256::from_bytes([41; 32]),
                 mime_type: Some("text/markdown".into()),
@@ -19868,7 +20165,7 @@ mod tests {
         let graph = kin_db::InMemoryGraph::new();
 
         graph
-            .upsert_opaque_artifact(&OpaqueArtifact {
+            .put_opaque(&OpaqueArtifact {
                 file_id: FilePathId::new("src/libponyc/pass/behaviour_rules.c"),
                 content_hash: Hash256::from_bytes([44; 32]),
                 mime_type: Some("text/x-csrc".into()),
@@ -19876,7 +20173,7 @@ mod tests {
             })
             .unwrap();
         graph
-            .upsert_opaque_artifact(&OpaqueArtifact {
+            .put_opaque(&OpaqueArtifact {
                 file_id: FilePathId::new("src/libponyc/pass/constructor_rules.c"),
                 content_hash: Hash256::from_bytes([45; 32]),
                 mime_type: Some("text/x-csrc".into()),
@@ -19884,7 +20181,7 @@ mod tests {
             })
             .unwrap();
         graph
-            .upsert_opaque_artifact(&OpaqueArtifact {
+            .put_opaque(&OpaqueArtifact {
                 file_id: FilePathId::new("src/libponyc/expr/lambda.h"),
                 content_hash: Hash256::from_bytes([46; 32]),
                 mime_type: Some("text/x-chdr".into()),
@@ -19940,7 +20237,7 @@ mod tests {
             ))
             .unwrap();
         graph
-            .upsert_opaque_artifact(&OpaqueArtifact {
+            .put_opaque(&OpaqueArtifact {
                 file_id: FilePathId::new("lib/gbenchmark/mingw.py"),
                 content_hash: Hash256::from_bytes([42; 32]),
                 mime_type: Some("text/x-python".into()),
@@ -20251,7 +20548,7 @@ mod tests {
             .upsert_entity(&test_entity("cap", "src/libponyc/type/cap.c", 21, 40))
             .unwrap();
         graph
-            .upsert_opaque_artifact(&OpaqueArtifact {
+            .put_opaque(&OpaqueArtifact {
                 file_id: FilePathId::new("lib/gbenchmark/src/sysinfo.cc"),
                 content_hash: Hash256::from_bytes([43; 32]),
                 mime_type: Some("text/x-c++src".into()),
@@ -21019,7 +21316,7 @@ mod tests {
     fn extract_multihop_signals_follows_artifact_include_edges_from_file_hits() {
         let graph = kin_db::InMemoryGraph::new();
         graph
-            .upsert_opaque_artifact(&OpaqueArtifact {
+            .put_opaque(&OpaqueArtifact {
                 file_id: FilePathId::new("include/nlohmann/detail/iterators/iter_impl.hpp"),
                 content_hash: Hash256::from_bytes([71; 32]),
                 mime_type: Some("text/x-c++hdr".into()),
@@ -21027,7 +21324,7 @@ mod tests {
             })
             .unwrap();
         graph
-            .upsert_opaque_artifact(&OpaqueArtifact {
+            .put_opaque(&OpaqueArtifact {
                 file_id: FilePathId::new("include/nlohmann/detail/iterators/internal_iterator.hpp"),
                 content_hash: Hash256::from_bytes([72; 32]),
                 mime_type: Some("text/x-c++hdr".into()),
@@ -21038,10 +21335,12 @@ mod tests {
             .upsert_relation(&Relation {
                 id: RelationId::new(),
                 kind: RelationKind::Includes,
-                src: GraphNodeId::Artifact(ArtifactId::seed_from_path(
+                src: GraphNodeId::Artifact(test_artifact_id(
+                    &graph,
                     "include/nlohmann/detail/iterators/iter_impl.hpp",
                 )),
-                dst: GraphNodeId::Artifact(ArtifactId::seed_from_path(
+                dst: GraphNodeId::Artifact(test_artifact_id(
+                    &graph,
                     "include/nlohmann/detail/iterators/internal_iterator.hpp",
                 )),
                 confidence: 1.0,
@@ -21085,7 +21384,7 @@ mod tests {
         let generated = FilePathId::new("single_include/nlohmann/json.hpp");
         let source = FilePathId::new("include/nlohmann/detail/exceptions.hpp");
         graph
-            .upsert_opaque_artifact(&OpaqueArtifact {
+            .put_opaque(&OpaqueArtifact {
                 file_id: generated.clone(),
                 content_hash: Hash256::from_bytes([81; 32]),
                 mime_type: Some("text/x-c++hdr".into()),
@@ -21093,7 +21392,7 @@ mod tests {
             })
             .unwrap();
         graph
-            .upsert_opaque_artifact(&OpaqueArtifact {
+            .put_opaque(&OpaqueArtifact {
                 file_id: source.clone(),
                 content_hash: Hash256::from_bytes([82; 32]),
                 mime_type: Some("text/x-c++hdr".into()),
@@ -21101,8 +21400,8 @@ mod tests {
             })
             .unwrap();
 
-        let generated_id = graph.artifact_id_for_path(&generated).unwrap();
-        let source_id = graph.artifact_id_for_path(&source).unwrap();
+        let generated_id = test_artifact_id(&graph, &generated.0);
+        let source_id = test_artifact_id(&graph, &source.0);
         graph
             .upsert_relation(&Relation {
                 id: RelationId::new(),
@@ -21275,7 +21574,7 @@ mod tests {
         .enumerate()
         {
             graph
-                .upsert_opaque_artifact(&OpaqueArtifact {
+                .put_opaque(&OpaqueArtifact {
                     file_id: FilePathId::new(path),
                     content_hash: Hash256::from_bytes([idx as u8; 32]),
                     mime_type: Some("text/x-c++hdr".into()),
@@ -21283,12 +21582,16 @@ mod tests {
                 })
                 .unwrap();
         }
+        let app_artifact = test_artifact_id(&graph, "src/app.cpp");
+        let header_artifact = test_artifact_id(&graph, "include/app.hpp");
+        let internal_artifact = test_artifact_id(&graph, "include/detail/internal.hpp");
+        let test_artifact = test_artifact_id(&graph, "tests/test_app.cpp");
         graph
             .upsert_relation(&Relation {
                 id: RelationId::new(),
                 kind: RelationKind::Includes,
-                src: GraphNodeId::Artifact(ArtifactId::seed_from_path("src/app.cpp")),
-                dst: GraphNodeId::Artifact(ArtifactId::seed_from_path("include/app.hpp")),
+                src: GraphNodeId::Artifact(app_artifact),
+                dst: GraphNodeId::Artifact(header_artifact),
                 confidence: 1.0,
                 origin: RelationOrigin::Parsed,
                 created_in: None,
@@ -21306,10 +21609,8 @@ mod tests {
             .upsert_relation(&Relation {
                 id: RelationId::from_bytes([0xff; 16]),
                 kind: RelationKind::Includes,
-                src: GraphNodeId::Artifact(ArtifactId::seed_from_path("include/app.hpp")),
-                dst: GraphNodeId::Artifact(ArtifactId::seed_from_path(
-                    "include/detail/internal.hpp",
-                )),
+                src: GraphNodeId::Artifact(header_artifact),
+                dst: GraphNodeId::Artifact(internal_artifact),
                 confidence: 1.0,
                 origin: RelationOrigin::Parsed,
                 created_in: None,
@@ -21327,8 +21628,8 @@ mod tests {
             .upsert_relation(&Relation {
                 id: RelationId::from_bytes([0x00; 16]),
                 kind: RelationKind::Includes,
-                src: GraphNodeId::Artifact(ArtifactId::seed_from_path("tests/test_app.cpp")),
-                dst: GraphNodeId::Artifact(ArtifactId::seed_from_path("include/app.hpp")),
+                src: GraphNodeId::Artifact(test_artifact),
+                dst: GraphNodeId::Artifact(header_artifact),
                 confidence: 1.0,
                 origin: RelationOrigin::Parsed,
                 created_in: None,
@@ -21452,98 +21753,98 @@ mod tests {
     }
 
     #[test]
-    fn historical_locate_rehydrates_cochange_relations_from_reachable_changes() {
-        let graph = kin_db::InMemoryGraph::new();
+    fn historical_locate_uses_persisted_cochange_relations_from_reachable_changes() {
         let temp = tempfile::tempdir().unwrap();
-        let blob_store = kin_blobs::BlobStore::new(temp.path().join("objects")).unwrap();
-        let _layout = kin_core::KinLayout::new(temp.path().join(".kin"));
-
         let caller = test_entity("caller", "src/a.py", 1, 10);
         let peer = test_entity("peer", "src/b.py", 12, 24);
         let a_path = FilePathId::new("src/a.py");
         let b_path = FilePathId::new("src/b.py");
-        let a_hash_v1 = blob_store.write(b"def caller():\n    pass\n").unwrap();
-        let b_hash_v1 = blob_store.write(b"def peer():\n    pass\n").unwrap();
-        let a_hash_v2 = blob_store
-            .write(b"def caller():\n    return 'ok'\n")
-            .unwrap();
-        let b_hash_v2 = blob_store
-            .write(b"def peer():\n    return 'peer'\n")
-            .unwrap();
+        let a_body_v1 = b"def caller():\n    pass\n".as_slice();
+        let b_body_v1 = b"def peer():\n    pass\n".as_slice();
+        let a_body_v2 = b"def caller():\n    return 'ok'\n".as_slice();
+        let b_body_v2 = b"def peer():\n    return 'peer'\n".as_slice();
+        let a_hash_v1 = kin_blobs::digest(a_body_v1);
+        let b_hash_v1 = kin_blobs::digest(b_body_v1);
+        let a_hash_v2 = kin_blobs::digest(a_body_v2);
+        let b_hash_v2 = kin_blobs::digest(b_body_v2);
+        let a_artifact = ArtifactId::new();
+        let b_artifact = ArtifactId::new();
 
-        let add_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x61; 32]));
-        let genesis = SemanticChange {
-            id: add_id,
-            parents: vec![],
-            timestamp: Timestamp::now(),
-            author: AuthorId::new("test"),
-            message: "add files".to_string(),
-            entity_deltas: vec![
-                EntityDelta::Added(caller.clone()),
-                EntityDelta::Added(peer.clone()),
-            ],
-            relation_deltas: vec![],
-            artifact_deltas: vec![
-                ArtifactDelta {
-                    file_id: a_path.clone(),
-                    kind: ArtifactDeltaKind::Added,
-                    old_hash: None,
-                    new_hash: Some(a_hash_v1),
+        let genesis = native_change(
+            vec![],
+            "add files",
+            vec![
+                EntityDelta::Added {
+                    new: caller.clone(),
                 },
-                ArtifactDelta {
-                    file_id: b_path.clone(),
-                    kind: ArtifactDeltaKind::Added,
-                    old_hash: None,
-                    new_hash: Some(b_hash_v1),
+                EntityDelta::Added { new: peer.clone() },
+            ],
+            vec![
+                TreeDelta::Added {
+                    artifact_id: a_artifact,
+                    new: located(&a_path.0, a_hash_v1),
+                },
+                TreeDelta::Added {
+                    artifact_id: b_artifact,
+                    new: located(&b_path.0, b_hash_v1),
                 },
             ],
-            projected_files: vec![a_path.clone(), b_path.clone()],
-            spec_link: None,
-            evidence: vec![],
-            risk_summary: None,
-            authored_on: None,
+        );
+        let cochange_source = native_change(
+            vec![genesis.id],
+            "modify together",
+            Vec::new(),
+            vec![
+                TreeDelta::Updated {
+                    artifact_id: a_artifact,
+                    old: located(&a_path.0, a_hash_v1),
+                    new: located(&a_path.0, a_hash_v2),
+                },
+                TreeDelta::Updated {
+                    artifact_id: b_artifact,
+                    old: located(&b_path.0, b_hash_v1),
+                    new: located(&b_path.0, b_hash_v2),
+                },
+            ],
+        );
+        let mut enrichment = native_change(
+            vec![cochange_source.id],
+            "persist cochange enrichment",
+            Vec::new(),
+            Vec::new(),
+        );
+        enrichment.relation_deltas = vec![RelationDelta::Added {
+            new: Relation {
+                id: RelationId::new(),
+                kind: RelationKind::CoChanges,
+                src: GraphNodeId::Entity(caller.id),
+                dst: GraphNodeId::Entity(peer.id),
+                confidence: 0.8,
+                origin: RelationOrigin::Inferred,
+                created_in: Some(cochange_source.id),
+                import_source: None,
+                evidence: Vec::new(),
+            },
+        }];
+        enrichment.id = kin_core::compute_semantic_change_id(&enrichment).unwrap();
+        let head_id = enrichment.id;
+        let authority = persist_test_history(
+            temp.path(),
+            "locate-cochange-history",
+            vec![genesis, cochange_source, enrichment],
+            &[
+                (a_hash_v1, a_body_v1),
+                (b_hash_v1, b_body_v1),
+                (a_hash_v2, a_body_v2),
+                (b_hash_v2, b_body_v2),
+            ],
+        );
+        let history = {
+            let lease = authority.read_authority();
+            kin_db::InMemoryGraph::from_snapshot(lease.snapshot().clone()).unwrap()
         };
-        graph.create_change(&genesis).unwrap();
-
-        let modify_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x62; 32]));
-        let cochange_source = SemanticChange {
-            id: modify_id,
-            parents: vec![add_id],
-            timestamp: Timestamp::now(),
-            author: AuthorId::new("test"),
-            message: "modify together".to_string(),
-            entity_deltas: vec![],
-            relation_deltas: vec![],
-            artifact_deltas: vec![
-                ArtifactDelta {
-                    file_id: a_path.clone(),
-                    kind: ArtifactDeltaKind::Modified,
-                    old_hash: Some(a_hash_v1),
-                    new_hash: Some(a_hash_v2),
-                },
-                ArtifactDelta {
-                    file_id: b_path.clone(),
-                    kind: ArtifactDeltaKind::Modified,
-                    old_hash: Some(b_hash_v1),
-                    new_hash: Some(b_hash_v2),
-                },
-            ],
-            projected_files: vec![a_path.clone(), b_path.clone()],
-            spec_link: None,
-            evidence: vec![],
-            risk_summary: None,
-            authored_on: None,
-        };
-        graph.create_change(&cochange_source).unwrap();
-        crate::commands::cochange::refresh_from_changes(
-            &graph,
-            &[genesis.clone(), cochange_source.clone()],
-        )
-        .unwrap();
-        graph.flush_text_index().unwrap();
-
-        let changes = kin_core::collect_changes_at_ref(&graph, &modify_id).unwrap();
-        let historical = kin_core::build_graph_at_ref(&graph, &blob_store, &modify_id).unwrap();
+        let changes = kin_core::collect_changes_at_ref(&history, &head_id).unwrap();
+        let historical = kin_core::build_graph_at_ref(&authority, &head_id).unwrap();
         let seeds = HashMap::from([(
             String::from("src/a.py"),
             vec![FileHit {
@@ -21554,15 +21855,19 @@ mod tests {
 
         let before = extract_cochange_signals(&[&seeds], &historical).unwrap();
         assert!(
-            !before.contains_key("src/b.py"),
-            "historical graph replay alone should not retain mined cochange relations"
+            before.contains_key("src/b.py"),
+            "historical replay must retain graph-owned cochange relations"
         );
 
-        crate::commands::cochange::refresh_from_changes(&historical, &changes).unwrap();
+        assert_eq!(
+            crate::commands::cochange::refresh_from_changes(&historical, &changes).unwrap(),
+            0,
+            "historical query paths must not remine cochange state"
+        );
         let after = extract_cochange_signals(&[&seeds], &historical).unwrap();
         assert!(
             after.contains_key("src/b.py"),
-            "historical locate should restore cochange hits from reachable changes before ranking"
+            "historical locate should preserve persisted cochange hits before ranking"
         );
     }
 
@@ -21761,7 +22066,7 @@ mod tests {
         .enumerate()
         {
             graph
-                .upsert_opaque_artifact(&OpaqueArtifact {
+                .put_opaque(&OpaqueArtifact {
                     file_id: FilePathId::new(path),
                     content_hash: Hash256::from_bytes([80 + idx as u8; 32]),
                     mime_type: Some("text/x-c++src".into()),
@@ -21807,7 +22112,7 @@ mod tests {
         .enumerate()
         {
             graph
-                .upsert_opaque_artifact(&OpaqueArtifact {
+                .put_opaque(&OpaqueArtifact {
                     file_id: FilePathId::new(path),
                     content_hash: Hash256::from_bytes([90 + idx as u8; 32]),
                     mime_type: Some("text/x-c++src".into()),
@@ -21819,16 +22124,8 @@ mod tests {
         let relation = |src: &str, dst: &str| Relation {
             id: RelationId::new(),
             kind: RelationKind::Includes,
-            src: GraphNodeId::Artifact(
-                graph
-                    .artifact_id_for_path(&FilePathId::new(src))
-                    .expect("source artifact should be graph-owned"),
-            ),
-            dst: GraphNodeId::Artifact(
-                graph
-                    .artifact_id_for_path(&FilePathId::new(dst))
-                    .expect("target artifact should be graph-owned"),
-            ),
+            src: GraphNodeId::Artifact(test_artifact_id(&graph, src)),
+            dst: GraphNodeId::Artifact(test_artifact_id(&graph, dst)),
             confidence: 1.0,
             origin: RelationOrigin::Parsed,
             created_in: None,
@@ -21967,7 +22264,7 @@ mod tests {
             .upsert_entity(&test_entity("main", "src/main.c", 1, 20))
             .unwrap();
         graph
-            .upsert_opaque_artifact(&OpaqueArtifact {
+            .put_opaque(&OpaqueArtifact {
                 file_id: FilePathId::new("src/main.c"),
                 content_hash: Hash256::from_bytes([8; 32]),
                 mime_type: Some("text/x-source".into()),
@@ -22013,7 +22310,7 @@ mod tests {
         );
 
         graph
-            .upsert_opaque_artifact(&OpaqueArtifact {
+            .put_opaque(&OpaqueArtifact {
                 file_id: FilePathId::new("src/builtin.c"),
                 content_hash: Hash256::from_bytes([11; 32]),
                 mime_type: Some("text/x-source".into()),
@@ -22021,7 +22318,7 @@ mod tests {
             })
             .unwrap();
         graph
-            .upsert_opaque_artifact(&OpaqueArtifact {
+            .put_opaque(&OpaqueArtifact {
                 file_id: FilePathId::new("src/decNumber/example4.c"),
                 content_hash: Hash256::from_bytes([12; 32]),
                 mime_type: Some("text/x-source".into()),
@@ -22050,7 +22347,7 @@ mod tests {
             .upsert_entity(&test_entity("main", "src/main.c", 1, 20))
             .unwrap();
         graph
-            .upsert_opaque_artifact(&OpaqueArtifact {
+            .put_opaque(&OpaqueArtifact {
                 file_id: FilePathId::new("src/builtin.c"),
                 content_hash: Hash256::from_bytes([9; 32]),
                 mime_type: Some("text/x-source".into()),
@@ -22058,7 +22355,7 @@ mod tests {
             })
             .unwrap();
         graph
-            .upsert_opaque_artifact(&OpaqueArtifact {
+            .put_opaque(&OpaqueArtifact {
                 file_id: FilePathId::new("src/main.c"),
                 content_hash: Hash256::from_bytes([10; 32]),
                 mime_type: Some("text/x-source".into()),
@@ -22087,7 +22384,7 @@ mod tests {
             .upsert_entity(&test_entity("runtime", "src/runtime.c", 1, 20))
             .unwrap();
         graph
-            .upsert_opaque_artifact(&OpaqueArtifact {
+            .put_opaque(&OpaqueArtifact {
                 file_id: FilePathId::new("src/options.c"),
                 content_hash: Hash256::from_bytes([21; 32]),
                 mime_type: Some("text/x-source".into()),
@@ -22095,7 +22392,7 @@ mod tests {
             })
             .unwrap();
         graph
-            .upsert_opaque_artifact(&OpaqueArtifact {
+            .put_opaque(&OpaqueArtifact {
                 file_id: FilePathId::new("src/runtime.c"),
                 content_hash: Hash256::from_bytes([22; 32]),
                 mime_type: Some("text/x-source".into()),
@@ -22122,7 +22419,7 @@ mod tests {
             .upsert_entity(&test_entity("main", "programs/zstdcli.c", 1, 40))
             .unwrap();
         graph
-            .upsert_opaque_artifact(&OpaqueArtifact {
+            .put_opaque(&OpaqueArtifact {
                 file_id: FilePathId::new("programs/zstdcli.c"),
                 content_hash: Hash256::from_bytes([23; 32]),
                 mime_type: Some("text/x-source".into()),
@@ -22150,7 +22447,7 @@ mod tests {
             .upsert_entity(&test_entity("main", "programs/zstdcli.c", 1, 40))
             .unwrap();
         graph
-            .upsert_opaque_artifact(&OpaqueArtifact {
+            .put_opaque(&OpaqueArtifact {
                 file_id: FilePathId::new("programs/zstdcli.c"),
                 content_hash: Hash256::from_bytes([24; 32]),
                 mime_type: Some("text/x-source".into()),
@@ -22181,7 +22478,7 @@ mod tests {
                 .unwrap();
         }
         graph
-            .upsert_opaque_artifact(&OpaqueArtifact {
+            .put_opaque(&OpaqueArtifact {
                 file_id: FilePathId::new("programs/zstdcli.c"),
                 content_hash: Hash256::from_bytes([25; 32]),
                 mime_type: Some("text/x-source".into()),
@@ -22192,7 +22489,7 @@ mod tests {
             })
             .unwrap();
         graph
-            .upsert_opaque_artifact(&OpaqueArtifact {
+            .put_opaque(&OpaqueArtifact {
                 file_id: FilePathId::new("programs/fileio.h"),
                 content_hash: Hash256::from_bytes([26; 32]),
                 mime_type: Some("text/x-header".into()),
@@ -22202,7 +22499,7 @@ mod tests {
             })
             .unwrap();
         graph
-            .upsert_opaque_artifact(&OpaqueArtifact {
+            .put_opaque(&OpaqueArtifact {
                 file_id: FilePathId::new("programs/fileio_types.h"),
                 content_hash: Hash256::from_bytes([27; 32]),
                 mime_type: Some("text/x-header".into()),
@@ -22237,7 +22534,7 @@ mod tests {
             .upsert_entity(&test_entity("main", "programs/zstdcli.c", 1, 40))
             .unwrap();
         graph
-            .upsert_opaque_artifact(&OpaqueArtifact {
+            .put_opaque(&OpaqueArtifact {
                 file_id: FilePathId::new("programs/zstdcli.c"),
                 content_hash: Hash256::from_bytes([28; 32]),
                 mime_type: Some("text/x-source".into()),
@@ -22248,7 +22545,7 @@ mod tests {
             })
             .unwrap();
         graph
-            .upsert_opaque_artifact(&OpaqueArtifact {
+            .put_opaque(&OpaqueArtifact {
                 file_id: FilePathId::new("programs/fileio.h"),
                 content_hash: Hash256::from_bytes([29; 32]),
                 mime_type: Some("text/x-header".into()),
@@ -22258,7 +22555,7 @@ mod tests {
             })
             .unwrap();
         graph
-            .upsert_opaque_artifact(&OpaqueArtifact {
+            .put_opaque(&OpaqueArtifact {
                 file_id: FilePathId::new("programs/fileio_types.h"),
                 content_hash: Hash256::from_bytes([30; 32]),
                 mime_type: Some("text/x-header".into()),
@@ -22293,7 +22590,7 @@ mod tests {
         );
         graph.upsert_entity(&source).unwrap();
         graph
-            .upsert_opaque_artifact(&OpaqueArtifact {
+            .put_opaque(&OpaqueArtifact {
                 file_id: FilePathId::new("docs/pages/api-docs/autocomplete.json"),
                 content_hash: Hash256::from_bytes([3; 32]),
                 mime_type: Some("application/json".into()),
@@ -22314,7 +22611,7 @@ mod tests {
         let graph = kin_db::InMemoryGraph::new();
 
         graph
-            .upsert_opaque_artifact(&OpaqueArtifact {
+            .put_opaque(&OpaqueArtifact {
                 file_id: FilePathId::new("src/builtin.c"),
                 content_hash: Hash256::from_bytes([4; 32]),
                 mime_type: Some("text/x-source".into()),
@@ -22345,7 +22642,7 @@ mod tests {
         let stale_symbol = test_entity("JSON_PRIVATE_UNLESS_TESTED", "src/lib.cpp", 1, 2);
         graph.upsert_entity(&stale_symbol).unwrap();
         graph
-            .upsert_opaque_artifact(&OpaqueArtifact {
+            .put_opaque(&OpaqueArtifact {
                 file_id: FilePathId::new("src/lib.cpp"),
                 content_hash: Hash256::from_bytes([44; 32]),
                 mime_type: Some("text/x-source".into()),
@@ -22387,7 +22684,7 @@ mod tests {
         let graph = kin_db::InMemoryGraph::new();
 
         graph
-            .upsert_opaque_artifact(&OpaqueArtifact {
+            .put_opaque(&OpaqueArtifact {
                 file_id: FilePathId::new("test/libponyc/badpony.cc"),
                 content_hash: Hash256::from_bytes([5; 32]),
                 mime_type: Some("text/x-c++src".into()),
@@ -22406,7 +22703,7 @@ mod tests {
         let graph = kin_db::InMemoryGraph::new();
 
         graph
-            .upsert_opaque_artifact(&OpaqueArtifact {
+            .put_opaque(&OpaqueArtifact {
                 file_id: FilePathId::new("lib/zstd.h"),
                 content_hash: Hash256::from_bytes([35; 32]),
                 mime_type: Some("text/x-chdr".into()),
@@ -22414,7 +22711,7 @@ mod tests {
             })
             .unwrap();
         graph
-            .upsert_opaque_artifact(&OpaqueArtifact {
+            .put_opaque(&OpaqueArtifact {
                 file_id: FilePathId::new("contrib/pzstd/utils/Buffer.h"),
                 content_hash: Hash256::from_bytes([36; 32]),
                 mime_type: Some("text/x-chdr".into()),
@@ -22438,7 +22735,7 @@ mod tests {
         let graph = kin_db::InMemoryGraph::new();
 
         graph
-            .upsert_opaque_artifact(&OpaqueArtifact {
+            .put_opaque(&OpaqueArtifact {
                 file_id: FilePathId::new("test/libponyc/lexer.cc"),
                 content_hash: Hash256::from_bytes([33; 32]),
                 mime_type: Some("text/x-c++src".into()),
@@ -22449,7 +22746,7 @@ mod tests {
             })
             .unwrap();
         graph
-            .upsert_opaque_artifact(&OpaqueArtifact {
+            .put_opaque(&OpaqueArtifact {
                 file_id: FilePathId::new("packages/strings/_test.pony"),
                 content_hash: Hash256::from_bytes([34; 32]),
                 mime_type: Some("text/x-pony".into()),
@@ -22476,7 +22773,7 @@ mod tests {
         let graph = kin_db::InMemoryGraph::new();
 
         graph
-            .upsert_opaque_artifact(&OpaqueArtifact {
+            .put_opaque(&OpaqueArtifact {
                 file_id: FilePathId::new("COPYING"),
                 content_hash: Hash256::from_bytes([30; 32]),
                 mime_type: Some("text/plain".into()),
@@ -22538,7 +22835,7 @@ mod tests {
         graph.upsert_entity(&err_test).unwrap();
         graph.upsert_entity(&async_test).unwrap();
         graph
-            .upsert_opaque_artifact(&OpaqueArtifact {
+            .put_opaque(&OpaqueArtifact {
                 file_id: FilePathId::new("tracing-attributes/Cargo.toml"),
                 content_hash: Hash256::from_bytes([9; 32]),
                 mime_type: Some("text/toml".into()),
@@ -22589,7 +22886,7 @@ mod tests {
             ))
             .unwrap();
         graph
-            .upsert_opaque_artifact(&OpaqueArtifact {
+            .put_opaque(&OpaqueArtifact {
                 file_id: FilePathId::new("packages/regex/_test.pony"),
                 content_hash: Hash256::from_bytes([13; 32]),
                 mime_type: Some("text/x-pony".into()),
@@ -22597,7 +22894,7 @@ mod tests {
             })
             .unwrap();
         graph
-            .upsert_opaque_artifact(&OpaqueArtifact {
+            .put_opaque(&OpaqueArtifact {
                 file_id: FilePathId::new("packages/strings/_test.pony"),
                 content_hash: Hash256::from_bytes([14; 32]),
                 mime_type: Some("text/x-pony".into()),
@@ -22605,7 +22902,7 @@ mod tests {
             })
             .unwrap();
         graph
-            .upsert_opaque_artifact(&OpaqueArtifact {
+            .put_opaque(&OpaqueArtifact {
                 file_id: FilePathId::new("packages/ini/_test.pony"),
                 content_hash: Hash256::from_bytes([15; 32]),
                 mime_type: Some("text/x-pony".into()),
@@ -22633,7 +22930,7 @@ mod tests {
     fn boost_query_backed_test_artifacts_requires_strong_non_test_evidence() {
         let graph = kin_db::InMemoryGraph::new();
         graph
-            .upsert_opaque_artifact(&OpaqueArtifact {
+            .put_opaque(&OpaqueArtifact {
                 file_id: FilePathId::new("test/libponyc/badpony.cc"),
                 content_hash: Hash256::from_bytes([16; 32]),
                 mime_type: Some("text/x-c++src".into()),
@@ -22658,7 +22955,7 @@ mod tests {
     fn boost_query_backed_test_artifacts_skips_non_named_test_harness_overlap() {
         let graph = kin_db::InMemoryGraph::new();
         graph
-            .upsert_opaque_artifact(&OpaqueArtifact {
+            .put_opaque(&OpaqueArtifact {
                 file_id: FilePathId::new("test/libponyc/lexer.cc"),
                 content_hash: Hash256::from_bytes([31; 32]),
                 mime_type: Some("text/x-c++src".into()),
@@ -22669,7 +22966,7 @@ mod tests {
             })
             .unwrap();
         graph
-            .upsert_opaque_artifact(&OpaqueArtifact {
+            .put_opaque(&OpaqueArtifact {
                 file_id: FilePathId::new("packages/strings/_test.pony"),
                 content_hash: Hash256::from_bytes([32; 32]),
                 mime_type: Some("text/x-pony".into()),
@@ -22769,30 +23066,9 @@ mod tests {
     }
 
     #[test]
-    fn locate_at_ref_uses_historical_entity_and_artifact_state() {
-        let graph = kin_db::InMemoryGraph::new();
+    fn locate_at_ref_uses_historical_entity_and_tree_state() {
         let temp = tempfile::tempdir().unwrap();
-        let blob_store = kin_blobs::BlobStore::new(temp.path().join("objects")).unwrap();
-        let layout = kin_core::KinLayout::new(temp.path().join(".kin"));
-
-        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x71; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: genesis_id,
-                parents: vec![],
-                timestamp: Timestamp::now(),
-                author: AuthorId::new("test"),
-                message: "genesis".to_string(),
-                entity_deltas: vec![],
-                relation_deltas: vec![],
-                artifact_deltas: vec![],
-                projected_files: vec![],
-                spec_link: None,
-                evidence: vec![],
-                risk_summary: None,
-                authored_on: None,
-            })
-            .unwrap();
+        let genesis = native_change(Vec::new(), "genesis", Vec::new(), Vec::new());
 
         let entity_v1 = test_entity("handler", "src/lib.py", 1, 10);
         let mut entity_v2 = entity_v1.clone();
@@ -22800,70 +23076,77 @@ mod tests {
         entity_v2.signature = "def processor(value)".to_string();
         entity_v2.fingerprint.signature_hash = Hash256::from_bytes([0x72; 32]);
 
-        let artifact_path = FilePathId::new("docs/api.json");
-        let artifact_v1 = blob_store.write(br#"{"version":"handler guide"}"#).unwrap();
-        let artifact_v2 = blob_store
-            .write(br#"{"version":"processor guide"}"#)
-            .unwrap();
+        let tree_path = FilePathId::new("docs/api.json");
+        let source_path = FilePathId::new("src/lib.py");
+        let tree_body_v1 = br#"{"version":"handler guide"}"#.as_slice();
+        let tree_body_v2 = br#"{"version":"processor guide"}"#.as_slice();
+        let source_body_v1 = b"def handler(value):\n    return value\n".as_slice();
+        let source_body_v2 = b"def processor(value):\n    return value\n".as_slice();
+        let tree_hash_v1 = kin_blobs::digest(tree_body_v1);
+        let tree_hash_v2 = kin_blobs::digest(tree_body_v2);
+        let source_hash_v1 = kin_blobs::digest(source_body_v1);
+        let source_hash_v2 = kin_blobs::digest(source_body_v2);
+        let tree_artifact = ArtifactId::new();
+        let source_artifact = ArtifactId::new();
 
-        let add_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x75; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: add_id,
-                parents: vec![genesis_id],
-                timestamp: Timestamp::now(),
-                author: AuthorId::new("test"),
-                message: "add handler".to_string(),
-                entity_deltas: vec![EntityDelta::Added(entity_v1.clone())],
-                relation_deltas: vec![],
-                artifact_deltas: vec![ArtifactDelta {
-                    file_id: artifact_path.clone(),
-                    kind: ArtifactDeltaKind::Added,
-                    old_hash: None,
-                    new_hash: Some(artifact_v1),
-                }],
-                projected_files: vec![artifact_path.clone()],
-                spec_link: None,
-                evidence: vec![],
-                risk_summary: None,
-                authored_on: None,
-            })
-            .unwrap();
-
-        let modify_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x76; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: modify_id,
-                parents: vec![add_id],
-                timestamp: Timestamp::now(),
-                author: AuthorId::new("test"),
-                message: "modify handler".to_string(),
-                entity_deltas: vec![EntityDelta::Modified {
-                    old: entity_v1.clone(),
-                    new: entity_v2.clone(),
-                }],
-                relation_deltas: vec![],
-                artifact_deltas: vec![ArtifactDelta {
-                    file_id: artifact_path.clone(),
-                    kind: ArtifactDeltaKind::Modified,
-                    old_hash: Some(artifact_v1),
-                    new_hash: Some(artifact_v2),
-                }],
-                projected_files: vec![artifact_path.clone()],
-                spec_link: None,
-                evidence: vec![],
-                risk_summary: None,
-                authored_on: None,
-            })
-            .unwrap();
+        let add = native_change(
+            vec![genesis.id],
+            "add handler",
+            vec![EntityDelta::Added {
+                new: entity_v1.clone(),
+            }],
+            vec![
+                TreeDelta::Added {
+                    artifact_id: tree_artifact,
+                    new: located(&tree_path.0, tree_hash_v1),
+                },
+                TreeDelta::Added {
+                    artifact_id: source_artifact,
+                    new: located(&source_path.0, source_hash_v1),
+                },
+            ],
+        );
+        let modify = native_change(
+            vec![add.id],
+            "modify handler",
+            vec![EntityDelta::Modified {
+                old: entity_v1.clone(),
+                new: entity_v2.clone(),
+            }],
+            vec![
+                TreeDelta::Updated {
+                    artifact_id: tree_artifact,
+                    old: located(&tree_path.0, tree_hash_v1),
+                    new: located(&tree_path.0, tree_hash_v2),
+                },
+                TreeDelta::Updated {
+                    artifact_id: source_artifact,
+                    old: located(&source_path.0, source_hash_v1),
+                    new: located(&source_path.0, source_hash_v2),
+                },
+            ],
+        );
+        let add_id = add.id;
+        let modify_id = modify.id;
+        let authority = persist_test_history(
+            temp.path(),
+            "locate-ref-history",
+            vec![genesis, add, modify],
+            &[
+                (tree_hash_v1, tree_body_v1),
+                (tree_hash_v2, tree_body_v2),
+                (source_hash_v1, source_body_v1),
+                (source_hash_v2, source_body_v2),
+            ],
+        );
+        let current_graph = kin_core::build_graph_at_ref(&authority, &modify_id).unwrap();
 
         #[cfg(feature = "vector")]
-        load_complete_test_vectors(&graph, &[entity_v2.clone()]);
+        load_complete_test_vectors(&current_graph, &[entity_v2.clone()]);
 
-        let historical = run_with_graph_capture_at_ref(
-            &layout,
-            &graph,
-            &blob_store,
+        let historical = run_with_repository_authority_capture_at_ref(
+            &authority,
+            &current_graph,
             &add_id,
             "change:add",
             "handler failure",
@@ -22883,10 +23166,9 @@ mod tests {
             "historical locate should surface the pre-rename source file"
         );
 
-        let current = run_with_graph_capture_at_ref(
-            &layout,
-            &graph,
-            &blob_store,
+        let current = run_with_repository_authority_capture_at_ref(
+            &authority,
+            &current_graph,
             &modify_id,
             "change:modify",
             "handler failure",
@@ -22901,10 +23183,13 @@ mod tests {
             "current locate should not surface the renamed source file for the old query"
         );
 
-        let rebuilt = kin_core::build_graph_at_ref(&graph, &blob_store, &add_id).unwrap();
+        let rebuilt = kin_core::build_graph_at_ref(&authority, &add_id).unwrap();
         assert_eq!(
-            rebuilt.get_file_hash(&artifact_path.0),
-            Some(*artifact_v1.as_bytes())
+            rebuilt
+                .resolved_tree()
+                .artifact_at_path(&RepoPath::from_utf8(&tree_path.0).unwrap())
+                .and_then(|artifact| artifact.entry.blob_identity()),
+            Some(tree_hash_v1)
         );
         assert!(
             rebuilt
@@ -22912,8 +23197,8 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|artifact| {
-                    artifact.file_id == artifact_path
-                        && artifact.content_hash == artifact_v1
+                    artifact.file_id == tree_path
+                        && artifact.content_hash == tree_hash_v1
                         && artifact
                             .text_preview
                             .as_deref()

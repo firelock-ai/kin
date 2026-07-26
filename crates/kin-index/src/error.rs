@@ -23,8 +23,14 @@ pub enum IndexError {
     #[error("unsupported file: {0}")]
     UnsupportedFile(String),
 
+    #[error("invalid historical semantic input: {0}")]
+    InvalidHistoricalSemantics(String),
+
     #[error("watcher error: {0}")]
     Watcher(String),
+
+    #[error(transparent)]
+    IncompleteRepositoryScan(#[from] crate::repository::IncompleteRepositoryScan),
 }
 
 impl IndexError {

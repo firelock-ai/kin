@@ -93,22 +93,22 @@ On Windows, run `irm https://get.kinlab.dev/install.ps1 | iex` in PowerShell.
 Native Windows has a smaller capability envelope; read
 [Platform and maturity](#platform-and-maturity) below.
 
-### 2. Build graph truth for an existing repository
+### 2. Admit an existing repository as graph truth
 
 ```sh
 cd /path/to/your/repository
 kin init .
-kin status
-kin overview
 ```
 
-In an existing Git repository, `kin init` imports recent history by default and
-indexes the checked-out tree into `.kin/`. `kin status` starts or reuses the
-repository daemon and reports graph and embedding state. The graph is the answer
-authority for Kin queries; a missing or unavailable graph is reported instead of
-being hidden behind raw file search. Initial indexing time scales with repository
-size; the command sequence itself is the short path, not a fixed performance
-promise for every codebase.
+In a clean Git repository, `kin init` atomically admits complete reachable
+history, refs, raw objects, the exact workspace tree, and admission policy into
+repository-v6 graph authority. It never substitutes an exact-HEAD snapshot or
+raw-filesystem semantic rebuild. Remote-bearing repositories currently fail
+closed until exact Kin remote mapping is available.
+
+Repository admission does not run semantic enrichment. Query surfaces consume
+graph-owned enrichment when it exists and report its absence instead of hiding
+the gap behind raw file search.
 
 ### 3. Ask the graph a real question
 
@@ -125,10 +125,8 @@ Once embeddings are complete, your configured AI agent can use the vector-backed
 `semantic_locate` tool; `get_context_pack`, `find_references`, and
 `trace_data_flow` expose the graph neighborhood directly.
 
-`kin init` builds the graph without waiting for embeddings. At that point locate
-uses graph and lexical signals and reports that vector coverage is incomplete.
-Run `kin embed` to add local vector similarity, then confirm coverage with
-`kin status --json`.
+After graph-native semantic enrichment exists, run `kin embed` to add local
+vector similarity and confirm coverage with `kin status --json`.
 
 ## Review an AI-written change
 
@@ -148,21 +146,22 @@ act on.
 
 ## How Kin relates to Git
 
-Kin coexists with Git. It does not rewrite Git history, branches, or remotes.
+Kin is designed to replace Git as the repository authority. During brownfield
+adoption, Git remains an explicit import/export interoperability boundary; it
+never answers Kin runtime queries or repairs missing graph truth.
 
-- `kin init --git-history off|recent|full` controls bootstrap history import;
-  `recent` is the default for an existing Git repository.
-- `kin migrate` is the explicit deep-history migration path.
-- Git remains the interoperability and transport boundary while Kin owns the
-  semantic graph used by Kin commands.
-- `kin eject` removes `.kin/` graph state and leaves working files and `.git`
-  untouched.
-- `kin eject --revert-files` is a separate, destructive option that restores
-  the pre-init file snapshot after explicit confirmation. It still never
-  modifies `.git`.
+- `kin init` imports complete reachable Git history and exact parent edges.
+  Kin deliberately has no partial-history or snapshot-only initialization mode.
+- After import, Kin's graph owns repository identity, tree state, history, refs,
+  and semantic relations. Filesystem and Git views are projections.
+- `kin eject` first proves that the checked-out branch, graph blobs, and working
+  projection agree exactly. It then stops the daemon and atomically moves
+  `.kin/` to a recoverable archive outside the repository, leaving working
+  files and `.git` untouched. `--purge-metadata --yes` permanently removes that
+  archive after the same verification.
 
-This lets a team evaluate Kin inside an existing repository without giving up
-its Git remote, history, editor, compiler, or build system.
+This lets a team migrate an existing repository without giving up its editor,
+compiler, build system, or Git interoperability while Kin becomes authoritative.
 
 ## Platform and maturity
 

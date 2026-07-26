@@ -467,10 +467,8 @@ fn parse_go_deps(path: &Path, registry_repo_ids: &[String]) -> Vec<RepoDependenc
         // Single-line require: `require github.com/foo/bar v1.0.0`
         let module_line = if in_require {
             Some(trimmed)
-        } else if let Some(rest) = trimmed.strip_prefix("require ") {
-            Some(rest.trim())
         } else {
-            None
+            trimmed.strip_prefix("require ").map(str::trim)
         };
 
         if let Some(module_line) = module_line {
@@ -600,14 +598,14 @@ fn scan_rust_imports(content: &str, seen: &mut HashSet<String>, deps: &mut Vec<R
         for &(prefix, repo) in RUST_PROTOCOL_MAP {
             let pattern = format!("use {}::", prefix);
             let pattern_bare = format!("use {};", prefix);
-            if trimmed.starts_with(&pattern) || trimmed.starts_with(&pattern_bare) {
-                if seen.insert(repo.to_string()) {
-                    deps.push(RepoDependency {
-                        name: prefix.replace('_', "-"),
-                        provider_repo: Some(repo.to_string()),
-                        source: "protocol".to_string(),
-                    });
-                }
+            if (trimmed.starts_with(&pattern) || trimmed.starts_with(&pattern_bare))
+                && seen.insert(repo.to_string())
+            {
+                deps.push(RepoDependency {
+                    name: prefix.replace('_', "-"),
+                    provider_repo: Some(repo.to_string()),
+                    source: "protocol".to_string(),
+                });
             }
         }
     }
@@ -631,14 +629,12 @@ fn scan_ts_imports(content: &str, seen: &mut HashSet<String>, deps: &mut Vec<Rep
             None => continue,
         };
         for &(prefix, repo) in TS_PROTOCOL_MAP {
-            if module.starts_with(prefix) {
-                if seen.insert(repo.to_string()) {
-                    deps.push(RepoDependency {
-                        name: module.to_string(),
-                        provider_repo: Some(repo.to_string()),
-                        source: "protocol".to_string(),
-                    });
-                }
+            if module.starts_with(prefix) && seen.insert(repo.to_string()) {
+                deps.push(RepoDependency {
+                    name: module.to_string(),
+                    provider_repo: Some(repo.to_string()),
+                    source: "protocol".to_string(),
+                });
             }
         }
     }

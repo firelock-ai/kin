@@ -360,7 +360,15 @@ mod tests {
 
         // Create a valid snapshot with some data.
         let mut snapshot = kin_db::GraphSnapshot::empty();
-        snapshot.file_hashes.insert("main.rs".to_string(), [42; 32]);
+        let artifact_id = kin_model::ArtifactId::new();
+        let artifact_path = kin_model::RepoPath::from_utf8("main.rs").unwrap();
+        snapshot.resolved_tree =
+            kin_model::ResolvedTree::from_artifacts([kin_model::ResolvedArtifact::new(
+                artifact_id,
+                artifact_path.clone(),
+                kin_model::TreeEntry::blob(kin_model::Hash256::from_bytes([42; 32]), false),
+            )])
+            .unwrap();
         let bytes = snapshot.to_bytes().unwrap();
         fs::create_dir_all(layout.kindb_dir()).unwrap();
         fs::write(layout.kindb_snapshot_path(), &bytes).unwrap();
@@ -378,7 +386,7 @@ mod tests {
         // Verify it's empty now.
         let current = fs::read(layout.kindb_snapshot_path()).unwrap();
         let loaded = kin_db::GraphSnapshot::from_bytes(&current).unwrap();
-        assert!(loaded.file_hashes.is_empty());
+        assert!(loaded.resolved_tree.is_empty());
 
         // Restore from backup (simulate the restore logic).
         let backup_data = fs::read(&backup_path).unwrap();
@@ -388,7 +396,10 @@ mod tests {
         // Verify restoration.
         let restored_data = fs::read(layout.kindb_snapshot_path()).unwrap();
         let restored = kin_db::GraphSnapshot::from_bytes(&restored_data).unwrap();
-        assert_eq!(restored.file_hashes.len(), 1);
-        assert!(restored.file_hashes.contains_key("main.rs"));
+        assert_eq!(restored.resolved_tree.len(), 1);
+        assert_eq!(
+            restored.resolved_tree.artifact_id_at_path(&artifact_path),
+            Some(artifact_id)
+        );
     }
 }

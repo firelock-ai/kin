@@ -4,7 +4,7 @@
 //! Graph→file projection seam for MCP transaction commits.
 //!
 //! After `kin_transaction_commit` applies entity mutations to the graph,
-//! [`project_after_mcp_commit`] drives `project_overlay_to_files` so the
+//! [`project_after_mcp_commit`] drives exact transaction projection so the
 //! working-directory files stay in sync with graph truth. Without this step
 //! the next reconcile tick re-parses the unchanged file, detects a fingerprint
 //! mismatch (or a name mismatch for renames), and silently overwrites the
@@ -25,7 +25,7 @@
 //! A byte-range mismatch indicates a concurrent human file edit.  Conflicted
 //! entities are **skipped** (not spliced); a structured [`kin_model::ConflictObject`]
 //! is returned for each one so the caller can surface an actionable message.
-//! Non-conflicted entities in the same overlay still project normally
+//! Non-conflicted entities in the same transaction still project normally
 //! (skip-conflicted, not abort-all).
 //!
 //! # Reparse-equivalence invariant
@@ -41,8 +41,10 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use kin_index::FileEvent;
-use kin_model::{ConflictObject, Entity, EntityId, FilePathId, GraphOverlay};
-use kin_reconcile::{apply_overlay_to_graph, ReconcileError};
+use kin_model::{
+    ConflictObject, Entity, EntityDelta, EntityId, EntityStore, FilePathId, TransactionDelta,
+};
+use kin_reconcile::ReconcileError;
 
 use crate::state::DaemonState;
 
@@ -80,10 +82,10 @@ impl std::fmt::Display for McpProjectionError {
 /// Project entity mutations from an MCP commit into the working-directory files.
 ///
 /// Call this **after** the graph delta has been applied via
-/// `apply_transaction_delta`. It builds a [`GraphOverlay`] from the
-/// `pre_commit_entities` — the entities read from the graph *before* the commit
-/// so they carry the source spans set by the last reconcile — and feeds that
-/// overlay to [`kin_reconcile::Reconciler::project_overlay_to_files`].
+/// `apply_transaction_delta`. It reconstructs exact entity modifications from
+/// `pre_commit_entities` and the graph's post-commit state, then feeds one
+/// [`TransactionDelta`] to
+/// [`kin_reconcile::Reconciler::project_transaction_to_files`].
 ///
 /// # Arguments
 ///
@@ -126,17 +128,27 @@ pub async fn project_after_mcp_commit(
 > {
     let filesystem_reconcile_disabled = state.filesystem_reconcile_disabled();
 
-    // Build a GraphOverlay with entity_mods for every entity that has a source
-    // span (placement in a working-directory file). Span-less entities are new
-    // graph-only nodes with no file home yet — skip them gracefully.
-    let mut temp_overlay = GraphOverlay::default();
-    for entity in pre_commit_entities {
-        if entity.file_origin.is_some() && entity.span.is_some() {
-            temp_overlay.entity_mods.insert(entity.id, entity.clone());
+    // Reconstruct exact modifications from the before-images captured by the
+    // caller and the post-commit graph. Deleted and span-less entities have no
+    // projection target and are skipped.
+    let mut candidate_modifications = HashMap::new();
+    for old in pre_commit_entities {
+        if old.file_origin.is_some() && old.span.is_some() {
+            let current = state
+                .graph
+                .get_entity(&old.id)
+                .map_err(|error| McpProjectionError {
+                    file: old.file_origin.clone(),
+                    entity_id: old.id,
+                    reason: format!("cannot load post-commit entity state: {error}"),
+                })?;
+            if let Some(new) = current {
+                candidate_modifications.insert(old.id, (old.clone(), new));
+            }
         }
     }
 
-    if temp_overlay.entity_mods.is_empty() {
+    if candidate_modifications.is_empty() {
         // Nothing to project — all mutations were span-less (new entities or
         // relation-only operations). Not an error.
         return Ok((vec![], vec![], vec![]));
@@ -152,7 +164,7 @@ pub async fn project_after_mcp_commit(
     // Cold-projection priming.
     //
     // The reconciler's projection state (file layouts + content) is the map
-    // `project_overlay_to_files` uses to locate each entity's byte region and
+    // transaction projection uses to locate each entity's byte region and
     // splice the new body in. On a freshly-started or restarted daemon that map
     // is cold: `DaemonState::open` seeds the reconciler's LKG from the persisted
     // graph but never registers any file layout (no reconcile tick has run yet).
@@ -171,7 +183,7 @@ pub async fn project_after_mcp_commit(
     // Files missing from disk are left to the existing structured-error path.
     {
         let mut primed: HashSet<FilePathId> = HashSet::new();
-        for entity in temp_overlay.entity_mods.values() {
+        for (entity, _) in candidate_modifications.values() {
             let Some(span) = &entity.span else {
                 continue;
             };
@@ -195,13 +207,11 @@ pub async fn project_after_mcp_commit(
             if !path.exists() {
                 continue;
             }
-            let mut prime_overlay = GraphOverlay::default();
-            reconciler
+            let _priming_result = reconciler
                 .reconcile_file_change(
                     &FileEvent::Changed(path),
                     state.blobs.as_ref(),
                     state.graph.as_ref(),
-                    &mut prime_overlay,
                 )
                 .map_err(|e| reconcile_err_to_projection_err(e, pre_commit_entities))?;
         }
@@ -220,12 +230,12 @@ pub async fn project_after_mcp_commit(
     // case the concurrent-dogfood workflow exercises).
     // -----------------------------------------------------------------------
     let mut conflicts: Vec<ConflictObject> = Vec::new();
-    let mut clean_overlay = GraphOverlay::default();
+    let mut clean_modifications = HashMap::new();
 
-    for (entity_id, entity) in &temp_overlay.entity_mods {
+    for (entity_id, (old, entity)) in &candidate_modifications {
         let Some(span) = &entity.span else {
             // Span-less entity: cannot have a concurrent file conflict, project it.
-            clean_overlay.entity_mods.insert(*entity_id, entity.clone());
+            clean_modifications.insert(*entity_id, (old.clone(), entity.clone()));
             continue;
         };
 
@@ -239,7 +249,7 @@ pub async fn project_after_mcp_commit(
             // No cached content for this file: cannot compare, project it and let
             // the engine's own pre-write check (engine.rs line ~209) handle any
             // concurrent edit at the commit layer.
-            clean_overlay.entity_mods.insert(*entity_id, entity.clone());
+            clean_modifications.insert(*entity_id, (old.clone(), entity.clone()));
             continue;
         };
 
@@ -287,23 +297,28 @@ pub async fn project_after_mcp_commit(
             }
         }
 
-        clean_overlay.entity_mods.insert(*entity_id, entity.clone());
-    }
-
-    // Carry the agent-supplied new source text for each non-conflicted
-    // entity onto the overlay. `project_overlay_to_files` prefers this over the
-    // identity span-extract, so the file is written with the agent's new body.
-    let clean_ids: Vec<EntityId> = clean_overlay.entity_mods.keys().copied().collect();
-    for id in clean_ids {
-        if let Some(body) = supplied_bodies.get(&id) {
-            clean_overlay.entity_bodies.insert(id, body.clone());
-        }
+        clean_modifications.insert(*entity_id, (old.clone(), entity.clone()));
     }
 
     // If every entity had a conflict, nothing to project.
-    if clean_overlay.entity_mods.is_empty() {
+    if clean_modifications.is_empty() {
         return Ok((vec![], vec![], conflicts));
     }
+    let clean_bodies = supplied_bodies
+        .iter()
+        .filter(|(entity_id, _)| clean_modifications.contains_key(entity_id))
+        .map(|(entity_id, body)| (*entity_id, body.clone()))
+        .collect::<HashMap<_, _>>();
+    let clean_transaction = TransactionDelta {
+        entity_deltas: clean_modifications
+            .values()
+            .map(|(old, new)| EntityDelta::Modified {
+                old: old.clone(),
+                new: new.clone(),
+            })
+            .collect(),
+        ..TransactionDelta::default()
+    };
 
     // -----------------------------------------------------------------------
     // Project the non-conflicted entities.
@@ -312,22 +327,22 @@ pub async fn project_after_mcp_commit(
     // check below.  We only need it for files that will actually be modified,
     // but collecting it here (before the mutable borrow of reconciler for the
     // projection call) is the cleanest approach under Rust's borrow rules.
-    let pre_projection_content: std::collections::HashMap<FilePathId, Vec<u8>> = clean_overlay
-        .entity_mods
-        .values()
-        .filter_map(|e| e.span.as_ref())
-        .map(|span| {
-            let content = reconciler
-                .projection()
-                .get_content(&span.file)
-                .map(|b| b.to_vec())
-                .unwrap_or_default();
-            (span.file.clone(), content)
-        })
-        .collect();
+    let pre_projection_content: std::collections::HashMap<FilePathId, Vec<u8>> =
+        clean_modifications
+            .values()
+            .filter_map(|(_, entity)| entity.span.as_ref())
+            .map(|span| {
+                let content = reconciler
+                    .projection()
+                    .get_content(&span.file)
+                    .map(|b| b.to_vec())
+                    .unwrap_or_default();
+                (span.file.clone(), content)
+            })
+            .collect();
 
     let (modified_files, collision_warnings) = reconciler
-        .project_overlay_to_files(&clean_overlay)
+        .project_transaction_to_files(&clean_transaction, &clean_bodies)
         .map_err(|e| reconcile_err_to_projection_err(e, pre_commit_entities))?;
 
     // -----------------------------------------------------------------------
@@ -343,13 +358,13 @@ pub async fn project_after_mcp_commit(
     // "reparse-equivalence" because it guards the engine contract that a subsequent
     // reconcile must NOT see the projected entity as changed (no-clobber invariant).
     // -----------------------------------------------------------------------
-    for entity in clean_overlay.entity_mods.values() {
+    for (_, entity) in clean_modifications.values() {
         // A body edit intentionally rewrites the bytes at the entity's
         // span, so byte preservation does NOT apply. The no-clobber guarantee for
         // body edits is enforced instead by the LKG/graph resync below (which
         // re-derives the entity from the projected source). The check still
         // guards metadata-only edits, which must remain byte-identical.
-        if clean_overlay.entity_bodies.contains_key(&entity.id) {
+        if clean_bodies.contains_key(&entity.id) {
             continue;
         }
 
@@ -426,12 +441,12 @@ pub async fn project_after_mcp_commit(
     // Metadata-only edits carry no body and are skipped here: their projection is
     // byte-identical, so the LKG baseline already matches and no resync is needed.
     // -----------------------------------------------------------------------
-    if !clean_overlay.entity_bodies.is_empty() && !filesystem_reconcile_disabled {
-        let body_files: HashSet<FilePathId> = clean_overlay
-            .entity_mods
+    if !clean_bodies.is_empty() && !filesystem_reconcile_disabled {
+        let body_files: HashSet<FilePathId> = clean_modifications
             .values()
-            .filter(|e| clean_overlay.entity_bodies.contains_key(&e.id))
-            .filter_map(|e| e.span.as_ref().map(|s| s.file.clone()))
+            .map(|(_, entity)| entity)
+            .filter(|entity| clean_bodies.contains_key(&entity.id))
+            .filter_map(|entity| entity.span.as_ref().map(|span| span.file.clone()))
             .collect();
 
         for file_id in &modified_files {
@@ -439,24 +454,35 @@ pub async fn project_after_mcp_commit(
                 continue;
             }
             let path = state.layout.working_dir().join(file_id.0.as_str());
-            let mut resync_overlay = GraphOverlay::default();
-            reconciler
+            let result = reconciler
                 .reconcile_file_change(
                     &FileEvent::Changed(path),
                     state.blobs.as_ref(),
                     state.graph.as_ref(),
-                    &mut resync_overlay,
                 )
                 .map_err(|e| reconcile_err_to_projection_err(e, pre_commit_entities))?;
-            apply_overlay_to_graph(state.graph.as_ref(), &mut resync_overlay).map_err(|e| {
-                McpProjectionError {
+            let (outcome, delta) = result.into_parts();
+            state
+                .graph
+                .apply_transaction_delta(&delta)
+                .map_err(|error| McpProjectionError {
                     file: Some(file_id.clone()),
                     entity_id: EntityId::default(),
-                    reason: format!("no-clobber resync: failed to apply reconciled overlay: {e}"),
-                }
-            })?;
+                    reason: format!(
+                        "no-clobber resync: failed to apply reconciled transaction: {error}"
+                    ),
+                })?;
+            state
+                .persist_projection_truth_from_reconcile(&reconciler, &outcome)
+                .map_err(|error| McpProjectionError {
+                    file: Some(file_id.clone()),
+                    entity_id: EntityId::default(),
+                    reason: format!(
+                        "no-clobber resync: failed to publish projection truth: {error}"
+                    ),
+                })?;
         }
-    } else if !clean_overlay.entity_bodies.is_empty() {
+    } else if !clean_bodies.is_empty() {
         tracing::debug!(
             env = crate::loop_runner::DISABLE_FILESYSTEM_RECONCILE_ENV,
             "skipping post-projection filesystem reparse; graph remains authoritative"
@@ -466,7 +492,7 @@ pub async fn project_after_mcp_commit(
     Ok((modified_files, collision_warnings, conflicts))
 }
 
-/// Convert a [`ReconcileError`] from `project_overlay_to_files` into a
+/// Convert a [`ReconcileError`] from transaction projection into a
 /// [`McpProjectionError`] with as much entity + file context as available.
 fn reconcile_err_to_projection_err(
     err: ReconcileError,
@@ -513,10 +539,11 @@ mod tests {
     use kin_db::EntityStore;
     use kin_index::FileEvent;
     use kin_model::{
-        EntityKind, EntityMetadata, EntityRole, FilePathId, FingerprintAlgorithm, GraphOverlay,
-        Hash256, LanguageId, SemanticFingerprint, SourceSpan, Visibility,
+        ArtifactId, EntityKind, EntityMetadata, EntityRole, FilePathId, FingerprintAlgorithm,
+        Hash256, LanguageId, LocatedEntry, RepoPath, SemanticFingerprint, SourceSpan, TreeDelta,
+        TreeEntry, Visibility,
     };
-    use kin_reconcile::{apply_overlay_to_graph, Reconciler};
+    use kin_reconcile::{ReconcileResult, Reconciler};
 
     use crate::state::DaemonState;
 
@@ -526,14 +553,80 @@ mod tests {
     // ------------------------------------------------------------------
 
     fn make_test_state(working_dir: &std::path::Path) -> Arc<DaemonState> {
-        let kin_dir = working_dir.join(".kin");
-        std::fs::create_dir_all(kin_dir.join("objects")).unwrap();
-        std::fs::create_dir_all(kin_dir.join("working")).unwrap();
-        let layout = kin_core::KinLayout::new(kin_dir);
-        kin_core::manifest::KinManifest::new()
-            .save(&layout.manifest_path())
-            .unwrap();
-        Arc::new(DaemonState::open(layout).unwrap())
+        let initialized =
+            kin_core::init(working_dir).expect("repository-v6 test authority must initialize");
+        Arc::new(DaemonState::open(initialized.layout).unwrap())
+    }
+
+    fn reconcile_changed(
+        reconciler: &mut Reconciler,
+        state: &Arc<DaemonState>,
+        blob_store: &BlobStore,
+        file_path: &std::path::Path,
+    ) -> ReconcileResult {
+        let relative = file_path
+            .strip_prefix(state.layout.working_dir())
+            .expect("test file must be inside the repository");
+        let repo_path =
+            RepoPath::from_utf8(relative.to_string_lossy().into_owned()).expect("valid test path");
+        let content = std::fs::read(file_path).expect("test file must be readable");
+        let hash = blob_store
+            .write(&content)
+            .map(|hash| Hash256::from_bytes(hash.0))
+            .expect("exact test body must enter ingest CAS");
+        let new_entry = TreeEntry::blob(hash, false);
+        let existing = state
+            .graph
+            .resolved_tree()
+            .artifact_at_path(&repo_path)
+            .cloned();
+        let tree_delta = match existing {
+            Some(existing) if existing.entry == new_entry => None,
+            Some(existing) => Some(TreeDelta::Updated {
+                artifact_id: existing.artifact_id,
+                old: existing.located_entry(),
+                new: LocatedEntry::new(repo_path, new_entry),
+            }),
+            None => Some(TreeDelta::Added {
+                artifact_id: ArtifactId::new(),
+                new: LocatedEntry::new(repo_path, new_entry),
+            }),
+        };
+        if let Some(tree_delta) = tree_delta {
+            state
+                .graph
+                .apply_transaction_delta(&TransactionDelta {
+                    tree_deltas: vec![tree_delta],
+                    ..TransactionDelta::default()
+                })
+                .expect("exact test tree admission must apply");
+        }
+        reconciler
+            .reconcile_file_change(
+                &FileEvent::Changed(file_path.to_path_buf()),
+                blob_store,
+                state.graph.as_ref(),
+            )
+            .expect("reconcile must succeed")
+    }
+
+    fn apply_reconcile_result(state: &Arc<DaemonState>, result: &ReconcileResult) {
+        state
+            .graph
+            .apply_transaction_delta(&result.delta)
+            .expect("reconcile transaction must apply");
+    }
+
+    fn added_entity_named(result: &ReconcileResult, name: &str) -> Entity {
+        result
+            .delta
+            .entity_deltas
+            .iter()
+            .find_map(|delta| match delta {
+                EntityDelta::Added { new } if new.name == name => Some(new.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{name} must be present in the reconcile transaction"))
     }
 
     // ------------------------------------------------------------------
@@ -545,32 +638,13 @@ mod tests {
         state: &Arc<DaemonState>,
         file_path: &std::path::Path,
     ) {
-        let blob_store = BlobStore::new(state.layout.objects_dir()).expect("blob store must open");
-        let mut overlay = GraphOverlay::default();
-        reconciler
-            .reconcile_file_change(
-                &FileEvent::Changed(file_path.to_path_buf()),
-                &blob_store,
-                state.graph.as_ref(),
-                &mut overlay,
-            )
-            .expect("reconcile must succeed");
-
+        let blob_store =
+            BlobStore::new(state.layout.ingest_cas_dir()).expect("blob store must open");
+        let result = reconcile_changed(reconciler, state, &blob_store, file_path);
         assert!(
-            overlay.entity_mods.is_empty(),
-            "reconcile after projection must produce no entity_mods (no-clobber); \
-             got {} modification(s)",
-            overlay.entity_mods.len()
-        );
-        assert!(
-            overlay.entity_adds.is_empty(),
-            "reconcile after projection must produce no entity_adds; got {} add(s)",
-            overlay.entity_adds.len()
-        );
-        assert!(
-            overlay.entity_removes.is_empty(),
-            "reconcile after projection must produce no entity_removes; got {} removal(s)",
-            overlay.entity_removes.len()
+            result.delta.entity_deltas.is_empty(),
+            "reconcile after projection must produce no entity deltas (no-clobber); got {}",
+            result.delta.entity_deltas.len()
         );
     }
 
@@ -594,39 +668,23 @@ mod tests {
         let original = b"pub fn foo() -> i32 { 1 }\npub fn bar() -> i32 { 2 }\n";
         std::fs::write(&file_path, original).unwrap();
 
-        let blob_store = BlobStore::new(state.layout.objects_dir()).expect("blob store must open");
+        let blob_store =
+            BlobStore::new(state.layout.ingest_cas_dir()).expect("blob store must open");
 
-        // Step 1: First reconcile — entities enter as entity_adds, LKG primed.
+        // Step 1: First reconcile — entities enter as Added deltas, LKG primed.
         let mut reconciler = state.reconciler.write().await;
-        let mut overlay = GraphOverlay::default();
-        reconciler
-            .reconcile_file_change(
-                &FileEvent::Changed(file_path.clone()),
-                &blob_store,
-                state.graph.as_ref(),
-                &mut overlay,
-            )
-            .expect("first reconcile must succeed");
+        let result = reconcile_changed(&mut reconciler, &state, &blob_store, &file_path);
 
-        // After the first reconcile, entity_adds contains the newly discovered
-        // entities complete with source spans.  Grab "foo" from the overlay
-        // directly — this is the pre-commit entity: spans already set, before
-        // the agent's subsequent graph mutation.
-        let pre_commit_entity = overlay
-            .entity_adds
-            .values()
-            .find(|e| e.name == "foo")
-            .cloned()
-            .expect("foo must be present in the reconcile overlay");
+        // The transaction contains newly discovered entities complete with
+        // source spans. Grab "foo" before applying the later agent mutation.
+        let pre_commit_entity = added_entity_named(&result, "foo");
 
         assert!(
             pre_commit_entity.span.is_some(),
             "pre-commit entity must have a span (set by reconcile)"
         );
 
-        // Apply overlay to graph (normally done by loop_runner).
-        apply_overlay_to_graph(state.graph.as_ref(), &mut overlay)
-            .expect("apply overlay must succeed");
+        apply_reconcile_result(&state, &result);
 
         // Step 2: Simulate the graph-side commit (agent updates entity metadata
         // without changing the file). The graph now has a modified fingerprint
@@ -696,34 +754,20 @@ mod tests {
         let original = b"pub fn foo() -> i32 { 1 }\npub fn bar() -> i32 { 2 }\n";
         std::fs::write(&file_path, original).unwrap();
 
-        let blob_store = BlobStore::new(state.layout.objects_dir()).expect("blob store must open");
+        let blob_store =
+            BlobStore::new(state.layout.ingest_cas_dir()).expect("blob store must open");
 
         // Step 1: reconcile — entities enter with spans; LKG primed at the
         // ORIGINAL body fingerprint.
         let mut reconciler = state.reconciler.write().await;
-        let mut overlay = GraphOverlay::default();
-        reconciler
-            .reconcile_file_change(
-                &FileEvent::Changed(file_path.clone()),
-                &blob_store,
-                state.graph.as_ref(),
-                &mut overlay,
-            )
-            .expect("first reconcile must succeed");
-
-        let pre_commit_entity = overlay
-            .entity_adds
-            .values()
-            .find(|e| e.name == "foo")
-            .cloned()
-            .expect("foo must be present in the reconcile overlay");
+        let result = reconcile_changed(&mut reconciler, &state, &blob_store, &file_path);
+        let pre_commit_entity = added_entity_named(&result, "foo");
         let span = pre_commit_entity
             .span
             .clone()
             .expect("foo must have a span");
 
-        apply_overlay_to_graph(state.graph.as_ref(), &mut overlay)
-            .expect("apply overlay must succeed");
+        apply_reconcile_result(&state, &result);
         drop(reconciler);
 
         // The agent's NEW source for foo: take the exact bytes occupying foo's
@@ -824,25 +868,12 @@ mod tests {
         let original = b"pub fn foo() -> i32 { 1 }\npub fn bar() -> i32 { 2 }\n";
         std::fs::write(&file_path, original).unwrap();
 
-        let blob_store = BlobStore::new(state.layout.objects_dir()).unwrap();
+        let blob_store = BlobStore::new(state.layout.ingest_cas_dir()).unwrap();
         let mut reconciler = state.reconciler.write().await;
-        let mut overlay = GraphOverlay::default();
-        reconciler
-            .reconcile_file_change(
-                &FileEvent::Changed(file_path.clone()),
-                &blob_store,
-                state.graph.as_ref(),
-                &mut overlay,
-            )
-            .unwrap();
-        let pre_commit_entity = overlay
-            .entity_adds
-            .values()
-            .find(|entity| entity.name == "foo")
-            .cloned()
-            .unwrap();
+        let result = reconcile_changed(&mut reconciler, &state, &blob_store, &file_path);
+        let pre_commit_entity = added_entity_named(&result, "foo");
         let span = pre_commit_entity.span.clone().unwrap();
-        apply_overlay_to_graph(state.graph.as_ref(), &mut overlay).unwrap();
+        apply_reconcile_result(&state, &result);
         drop(reconciler);
 
         let mut committed = pre_commit_entity.clone();
@@ -899,25 +930,12 @@ mod tests {
 
         // Seed graph truth with a separate reconciler so the daemon projection
         // remains cold and would have taken the compatibility prime path.
-        let blob_store = BlobStore::new(state.layout.objects_dir()).unwrap();
+        let blob_store = BlobStore::new(state.layout.ingest_cas_dir()).unwrap();
         let mut discover = Reconciler::new(dir.path().to_path_buf());
-        let mut overlay = GraphOverlay::default();
-        discover
-            .reconcile_file_change(
-                &FileEvent::Changed(file_path.clone()),
-                &blob_store,
-                state.graph.as_ref(),
-                &mut overlay,
-            )
-            .unwrap();
-        let pre_commit_entity = overlay
-            .entity_adds
-            .values()
-            .find(|entity| entity.name == "foo")
-            .cloned()
-            .unwrap();
+        let result = reconcile_changed(&mut discover, &state, &blob_store, &file_path);
+        let pre_commit_entity = added_entity_named(&result, "foo");
         let span = pre_commit_entity.span.clone().unwrap();
-        apply_overlay_to_graph(state.graph.as_ref(), &mut overlay).unwrap();
+        apply_reconcile_result(&state, &result);
 
         let mut committed = pre_commit_entity.clone();
         committed.fingerprint.ast_hash = Hash256::from_bytes([0xef; 32]);
@@ -977,34 +995,21 @@ mod tests {
         let original = b"pub fn foo() -> i32 { 1 }\npub fn bar() -> i32 { 2 }\n";
         std::fs::write(&file_path, original).unwrap();
 
-        let blob_store = BlobStore::new(state.layout.objects_dir()).expect("blob store must open");
+        let blob_store =
+            BlobStore::new(state.layout.ingest_cas_dir()).expect("blob store must open");
 
         // Discover the entity (with its deterministic id + span) and seed the
         // graph using a SEPARATE reconciler, so the daemon's own
         // `state.reconciler` projection stays COLD — exactly the post-restart
         // state where no reconcile tick has registered a file layout yet.
         let mut discover = Reconciler::new(dir.path().to_path_buf());
-        let mut overlay = GraphOverlay::default();
-        discover
-            .reconcile_file_change(
-                &FileEvent::Changed(file_path.clone()),
-                &blob_store,
-                state.graph.as_ref(),
-                &mut overlay,
-            )
-            .expect("discovery reconcile must succeed");
-        let pre_commit_entity = overlay
-            .entity_adds
-            .values()
-            .find(|e| e.name == "foo")
-            .cloned()
-            .expect("foo must be present in the reconcile overlay");
+        let result = reconcile_changed(&mut discover, &state, &blob_store, &file_path);
+        let pre_commit_entity = added_entity_named(&result, "foo");
         let span = pre_commit_entity
             .span
             .clone()
             .expect("foo must have a span");
-        apply_overlay_to_graph(state.graph.as_ref(), &mut overlay)
-            .expect("apply overlay must succeed");
+        apply_reconcile_result(&state, &result);
 
         // Sanity: the daemon's projection is cold — no layout/content for the file.
         {
@@ -1120,7 +1125,7 @@ mod tests {
 
         // Build an entity with a span pointing to a file that does NOT exist
         // and has not been registered in the projection cache.  This causes
-        // project_overlay_to_files → BodyExtractionFailed.
+        // transaction projection → BodyExtractionFailed.
         let entity_id = EntityId::new();
         let bad_entity = kin_model::Entity {
             id: entity_id,
@@ -1154,6 +1159,9 @@ mod tests {
             created_in: None,
             superseded_by: None,
         };
+        let mut current = bad_entity.clone();
+        current.fingerprint.ast_hash = Hash256::from_bytes([0xfc; 32]);
+        state.graph.upsert_entity(&current).unwrap();
 
         let result = project_after_mcp_commit(&state, &[bad_entity], &HashMap::new()).await;
 
@@ -1197,29 +1205,19 @@ mod tests {
         let original = b"pub fn foo() -> i32 { 1 }\npub fn bar() -> i32 { 2 }\n";
         std::fs::write(&file_path, original).unwrap();
 
-        let blob_store = BlobStore::new(state.layout.objects_dir()).expect("blob store must open");
+        let blob_store =
+            BlobStore::new(state.layout.ingest_cas_dir()).expect("blob store must open");
 
         // Step 1: Reconcile to prime the projection cache.
         let mut reconciler = state.reconciler.write().await;
-        let mut overlay = GraphOverlay::default();
-        reconciler
-            .reconcile_file_change(
-                &FileEvent::Changed(file_path.clone()),
-                &blob_store,
-                state.graph.as_ref(),
-                &mut overlay,
-            )
-            .expect("reconcile must succeed");
-
-        let pre_commit_entity = overlay
-            .entity_adds
-            .values()
-            .find(|e| e.name == "foo")
-            .cloned()
-            .expect("foo must be present");
-
-        apply_overlay_to_graph(state.graph.as_ref(), &mut overlay).expect("apply must succeed");
+        let result = reconcile_changed(&mut reconciler, &state, &blob_store, &file_path);
+        let pre_commit_entity = added_entity_named(&result, "foo");
+        apply_reconcile_result(&state, &result);
         drop(reconciler);
+
+        let mut committed = pre_commit_entity.clone();
+        committed.fingerprint.ast_hash = Hash256::from_bytes([0xa5; 32]);
+        state.graph.upsert_entity(&committed).unwrap();
 
         // Step 2: Simulate a concurrent human edit that modifies the file AFTER
         // reconcile but BEFORE the MCP commit's projection.
@@ -1302,20 +1300,13 @@ mod tests {
         let content = b"pub fn foo() -> i32 { 1 }\n";
         std::fs::write(&file_path, content).unwrap();
 
-        let blob_store = BlobStore::new(state.layout.objects_dir()).expect("blob store must open");
+        let blob_store =
+            BlobStore::new(state.layout.ingest_cas_dir()).expect("blob store must open");
 
         // Reconcile to populate the reconciler's projection and the graph.
         let mut reconciler = state.reconciler.write().await;
-        let mut overlay = GraphOverlay::default();
-        reconciler
-            .reconcile_file_change(
-                &FileEvent::Changed(file_path.clone()),
-                &blob_store,
-                state.graph.as_ref(),
-                &mut overlay,
-            )
-            .expect("reconcile must succeed");
-        apply_overlay_to_graph(state.graph.as_ref(), &mut overlay).unwrap();
+        let result = reconcile_changed(&mut reconciler, &state, &blob_store, &file_path);
+        apply_reconcile_result(&state, &result);
 
         // Persist projection truth (layout + hash) to the graph so
         // rebuild_projection can restore it.

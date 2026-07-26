@@ -735,11 +735,7 @@ fn normalize_python_default(default: &str) -> Option<String> {
             '(' => expected_closers.push(')'),
             '[' => expected_closers.push(']'),
             '{' => expected_closers.push('}'),
-            ')' | ']' | '}' => {
-                if expected_closers.pop() != Some(ch) {
-                    return None;
-                }
-            }
+            ')' | ']' | '}' if expected_closers.pop() != Some(ch) => return None,
             _ => {}
         }
         normalized.push(ch);
@@ -3252,6 +3248,6 @@ mod tests {
         assert_eq!(grouped.len(), 2);
         // src/a.rs has two entities so at least 2 comments (could have coverage gap comments too)
         assert!(grouped["src/a.rs"].len() >= 2);
-        assert!(grouped["src/b.rs"].len() >= 1);
+        assert!(!grouped["src/b.rs"].is_empty());
     }
 }

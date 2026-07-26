@@ -92,9 +92,9 @@ fn seed_local_vectors(cache_graph_path: &Path) {
         .collect::<Vec<_>>();
 
     let artifact_ids = graph_snapshot
-        .artifact_index
-        .values()
-        .copied()
+        .resolved_tree
+        .artifacts()
+        .map(|artifact| artifact.artifact_id)
         .collect::<Vec<_>>();
 
     let vector_path = cache_graph_path.with_extension("kvec.seed");
@@ -132,10 +132,16 @@ fn seed_local_vectors(cache_graph_path: &Path) {
             )
             .expect("upsert entity revision vector");
     }
+    let descriptor = kin_db::IndexDescriptor {
+        model_id: Some("prepared-state-fixture@v1".to_string()),
+        graph_root: Some(hex::encode(graph.compute_root_hash())),
+    };
+    vectors.set_descriptor(descriptor.clone());
     vectors.save(&vector_path).expect("save vector index");
-    graph
-        .load_vector_index(&vector_path)
-        .expect("load vector index into graph");
+    assert!(matches!(
+        graph.load_vector_index_compatible(&vector_path, &descriptor),
+        kin_db::VectorIndexLoad::Loaded(_)
+    ));
     snapshot.save().expect("persist seeded vectors");
     fs::remove_file(vector_path).expect("remove temp vector file");
 }
@@ -180,7 +186,7 @@ fn prepared_state_publish_and_materialize_preserve_indexed_state() {
         .output()
         .expect("run kin init");
     let init_payload = parse_json_output(&init, "kin init --json");
-    assert_eq!(init_payload["schema"], "kin.init-result.v1");
+    assert_eq!(init_payload["schema"], "kin.init-result.v4");
 
     seed_local_vectors(&repo1.join(".kin/kindb/graph.kndb"));
 
@@ -195,7 +201,7 @@ fn prepared_state_publish_and_materialize_preserve_indexed_state() {
         .output()
         .expect("run kin prepared-state publish");
     let publish_payload = parse_json_output(&publish, "kin prepared-state publish --json");
-    assert_eq!(publish_payload["schema"], "kin.prepared-state.publish.v1");
+    assert_eq!(publish_payload["schema"], "kin.prepared-state.publish.v2");
     assert_eq!(publish_payload["text_index_present"], true);
     assert_eq!(publish_payload["vector_index_present"], true);
 
@@ -213,7 +219,7 @@ fn prepared_state_publish_and_materialize_preserve_indexed_state() {
         parse_json_output(&materialize, "kin prepared-state materialize --json");
     assert_eq!(
         materialize_payload["schema"],
-        "kin.prepared-state.materialize.v1"
+        "kin.prepared-state.materialize.v2"
     );
     assert_eq!(materialize_payload["validated"], true);
     assert_eq!(

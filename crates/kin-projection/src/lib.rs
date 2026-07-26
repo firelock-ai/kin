@@ -17,6 +17,7 @@ pub mod layout_tracker;
 pub mod living_docs;
 pub mod placement;
 pub mod splice;
+pub mod tree;
 
 pub use engine::{
     project_entity_mutations, project_entity_mutations_with_policy, project_file_from_entities,
@@ -28,3 +29,7 @@ pub use layout_tracker::{build_layout, entity_at_offset, entity_byte_range, upda
 pub use living_docs::generate_living_docs;
 pub use placement::{decide_placement, generate_file_template, PlacementDecision};
 pub use splice::{apply_splices, reconstruct_file, splice_entity, Splice};
+pub use tree::{
+    materialize_resolved_tree, transition_resolved_tree, verify_resolved_tree_materialization,
+    TreeProjectionReport,
+};

@@ -82,13 +82,6 @@ pub struct ReviewExecution {
     /// note, discussion, etc.). Always `false` for `Run` and `Shadow`, which
     /// are read-only evaluations.
     pub mutated: bool,
-    /// Count of historical changes a shadow evaluation lazily hydrated into
-    /// the graph (0 for every op other than `Shadow`, and 0 for a `Shadow`
-    /// whose base/head were already imported). Reported distinctly from
-    /// `mutated` so a cold import that persists thousands of changes is never
-    /// described the same way as a no-op: daemon owners persist the hydrated
-    /// state so the import happens once per repo instead of once per process.
-    pub hydrated_changes: usize,
 }
 
 #[derive(Serialize)]
@@ -186,7 +179,6 @@ pub async fn execute_review_request(
                 layout, graph, change, entities, files, changes, json,
             )?,
             mutated: false,
-            hydrated_changes: 0,
         }),
         ReviewRequest::Shadow {
             base,
@@ -195,16 +187,12 @@ pub async fn execute_review_request(
             source_url,
             author,
             json,
-        } => {
-            let (response, hydrated_changes) = build_shadow_run_response(
+        } => Ok(ReviewExecution {
+            response: build_shadow_run_response(
                 layout, graph, base, head, title, source_url, author, json,
-            )?;
-            Ok(ReviewExecution {
-                response,
-                mutated: false,
-                hydrated_changes,
-            })
-        }
+            )?,
+            mutated: false,
+        }),
         ReviewRequest::Create {
             title,
             base,
@@ -293,46 +281,16 @@ fn build_review_run_response(
     Ok(ReviewResponse { text, json: None })
 }
 
-/// Shadow review JSON payload: the gate report plus the two distinct
-/// bookkeeping signals a shadow evaluation can produce. Flattened alongside
-/// `report`'s own fields so existing consumers keep reading the report shape
-/// unchanged and additionally see these two counts.
+/// Shadow review JSON payload. The report is flattened so consumers can read
+/// the gate evidence directly; `review_mutations` makes the read-only boundary
+/// explicit.
 #[derive(Serialize)]
 struct ShadowReviewResponseJson<'a> {
     #[serde(flatten)]
     report: &'a kin_review::ShadowGateReport,
-    /// Historical changes lazily imported into the graph while resolving the
-    /// base/head refs (0 when both were already present). Reported as a real
-    /// count, never collapsed to a boolean, so a cold multi-thousand-change
-    /// import is never described the same way as a no-op.
-    hydrated_changes: usize,
     /// Mutations the review operation itself made to review/graph state.
-    /// Always 0: a shadow evaluation is read-only by construction. Reported
-    /// explicitly, distinct from `hydrated_changes`, so the two never blur
-    /// into a single collapsed signal.
+    /// Always 0: a shadow evaluation is read-only by construction.
     review_mutations: usize,
-}
-
-enum PreparedShadowRender {
-    Precomputed {
-        report: Box<kin_review::ShadowGateReport>,
-        json: bool,
-    },
-    Resolved {
-        request: kin_review::ShadowRequest,
-        json: bool,
-    },
-}
-
-pub struct PreparedShadowRequest {
-    hydrated_changes: usize,
-    render: Result<PreparedShadowRender>,
-}
-
-impl PreparedShadowRequest {
-    pub fn hydrated_changes(&self) -> usize {
-        self.hydrated_changes
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -345,207 +303,49 @@ fn build_shadow_run_response(
     source_url: Option<String>,
     author: Option<String>,
     json: bool,
-) -> Result<(ReviewResponse, usize)> {
-    let prepared =
-        prepare_shadow_request(layout, graph, base, head, title, source_url, author, json);
-    let hydrated_changes = prepared.hydrated_changes();
-    let response = render_prepared_shadow_request(graph, prepared)?;
-    Ok((response, hydrated_changes))
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn prepare_shadow_request(
-    layout: &kin_core::KinLayout,
-    graph: &kin_db::InMemoryGraph,
-    base: String,
-    head: String,
-    title: Option<String>,
-    source_url: Option<String>,
-    author: Option<String>,
-    json: bool,
-) -> PreparedShadowRequest {
-    // The everyday "your branch is behind main" case: base is not on head's
-    // ancestry. That gap is provable from the Git commit-parent DAG alone —
-    // no semantic hydration needed — so it is checked before either ref pays
-    // for a full history import. Returns `None` whenever the fast
-    // conclusion can't be drawn, in which case the normal resolve-and-hydrate
-    // path below runs exactly as it always has.
-    match shadow_ancestry_fast_path_gap(graph, layout, &base, &head, &title, &source_url, &author) {
-        Ok(Some(report)) => {
-            // The fast path never hydrates anything, so this is always a true
-            // zero, not a placeholder.
-            return PreparedShadowRequest {
-                hydrated_changes: 0,
-                render: Ok(PreparedShadowRender::Precomputed {
-                    report: Box::new(report),
-                    json,
-                }),
-            };
-        }
-        Ok(None) => {}
-        Err(error) => {
-            return PreparedShadowRequest {
-                hydrated_changes: 0,
-                render: Err(error),
-            };
-        }
-    }
-
-    // Resolve the head ref before the base ref. A review pair is almost always
-    // ancestor..descendant, so importing the head first hydrates the full git
-    // ancestry in a single pass; the base is then already present in the graph
-    // and resolves on the fast path instead of re-walking the shared history.
-    let prepared_head =
-        crate::commands::ref_lookup::prepare_ref_importing_git_if_needed_with_report(
-            graph,
-            layout,
-            Some(head.as_str()),
-        );
-    let mut hydrated_changes = prepared_head.hydrated_changes;
-    let resolved_head = match prepared_head
-        .into_result()
-        .with_context(|| format!("resolve shadow head ref '{}'", head))
-    {
-        Ok(resolved) => resolved,
-        Err(error) => {
-            return PreparedShadowRequest {
-                hydrated_changes,
-                render: Err(error),
-            };
-        }
-    };
-    let prepared_base =
-        crate::commands::ref_lookup::prepare_ref_importing_git_if_needed_with_report(
-            graph,
-            layout,
-            Some(base.as_str()),
-        );
-    hydrated_changes += prepared_base.hydrated_changes;
-    let resolved_base = match prepared_base
-        .into_result()
-        .with_context(|| format!("resolve shadow base ref '{}'", base))
-    {
-        Ok(resolved) => resolved,
-        Err(error) => {
-            return PreparedShadowRequest {
-                hydrated_changes,
-                render: Err(error),
-            };
-        }
-    };
+) -> Result<ReviewResponse> {
+    // Query surfaces never import or repair repository state. Both refs must
+    // already be present in graph authority through an explicit import, clone,
+    // fetch, or native change transaction.
+    let resolved_head =
+        crate::commands::ref_lookup::resolve_ref(graph, layout, Some(head.as_str()))
+            .with_context(|| format!("resolve shadow head ref '{}'", head))?;
+    let resolved_base =
+        crate::commands::ref_lookup::resolve_ref(graph, layout, Some(base.as_str()))
+            .with_context(|| format!("resolve shadow base ref '{}'", base))?;
 
     let request = kin_review::ShadowRequest {
         base_ref: base,
         head_ref: head,
-        resolved_base: resolved_base.head,
-        resolved_head: resolved_head.head,
+        resolved_base,
+        resolved_head,
         title,
         source_url,
         author,
         actor: crate::provenance::current_actor_label(),
     };
-
-    PreparedShadowRequest {
-        hydrated_changes,
-        render: Ok(PreparedShadowRender::Resolved { request, json }),
-    }
-}
-
-pub fn render_prepared_shadow_request(
-    graph: &kin_db::InMemoryGraph,
-    prepared: PreparedShadowRequest,
-) -> Result<ReviewResponse> {
-    let hydrated_changes = prepared.hydrated_changes;
-    match prepared.render? {
-        PreparedShadowRender::Precomputed { report, json } => {
-            shadow_response_from_report(&report, json, hydrated_changes)
-        }
-        PreparedShadowRender::Resolved { request, json } => {
-            let report = kin_review::build_shadow_report(graph, &request)?;
-            shadow_response_from_report(&report, json, hydrated_changes)
-        }
-    }
-}
-
-/// Cheap pre-check for the shadow path's `base_not_on_head_ancestry` gap.
-///
-/// Applies only when both refs are bare Git commit forms (`git:<oid>` or a
-/// 40-character hex oid) and at least one is not yet present in the graph —
-/// the only situation where the default path below pays for a full history
-/// import before `kin_review::build_shadow_report`'s own ancestry check
-/// would run. Reads only the on-disk Git commit-parent graph (via
-/// `kin_git::is_ancestor_commit`), never the working tree or blobs, so a
-/// stale base returns the existing gap report without importing anything.
-///
-/// Returns `Ok(None)` whenever the fast conclusion can't be drawn — either
-/// ref isn't a bare Git commit form, either commit is missing from the Git
-/// object database, or ancestry actually holds — so the caller falls
-/// through to the exact existing resolve-and-hydrate path, unchanged.
-#[allow(clippy::too_many_arguments)]
-fn shadow_ancestry_fast_path_gap(
-    graph: &kin_db::InMemoryGraph,
-    layout: &kin_core::KinLayout,
-    base: &str,
-    head: &str,
-    title: &Option<String>,
-    source_url: &Option<String>,
-    author: &Option<String>,
-) -> Result<Option<kin_review::ShadowGateReport>> {
-    let Some(base_oid) = crate::commands::ref_lookup::extract_git_ref(base) else {
-        return Ok(None);
-    };
-    let Some(head_oid) = crate::commands::ref_lookup::extract_git_ref(head) else {
-        return Ok(None);
-    };
-    let needs_check = crate::commands::ref_lookup::git_ref_requires_hydration(graph, base)
-        || crate::commands::ref_lookup::git_ref_requires_hydration(graph, head);
-    if !needs_check {
-        return Ok(None);
-    }
-
-    let Some(false) = kin_git::is_ancestor_commit(layout.working_dir(), base_oid, head_oid) else {
-        return Ok(None);
-    };
-
-    let request = kin_review::ShadowRequest {
-        base_ref: base.to_string(),
-        head_ref: head.to_string(),
-        resolved_base: kin_git::semantic_change_id_from_git_oid_hex(base_oid)?,
-        resolved_head: kin_git::semantic_change_id_from_git_oid_hex(head_oid)?,
-        title: title.clone(),
-        source_url: source_url.clone(),
-        author: author.clone(),
-        actor: crate::provenance::current_actor_label(),
-    };
-    Ok(Some(kin_review::build_shadow_report_base_off_ancestry(
-        graph, &request,
-    )?))
+    let report = kin_review::build_shadow_report(graph, &request)?;
+    shadow_response_from_report(&report, json)
 }
 
 fn shadow_response_from_report(
     report: &kin_review::ShadowGateReport,
     json: bool,
-    hydrated_changes: usize,
 ) -> Result<ReviewResponse> {
     if json {
         return Ok(ReviewResponse {
             text: String::new(),
             json: Some(serde_json::to_string_pretty(&ShadowReviewResponseJson {
                 report,
-                hydrated_changes,
                 review_mutations: 0,
             })?),
         });
     }
 
-    let mut text = kin_review::format_shadow_report(report);
-    if hydrated_changes > 0 {
-        writeln!(
-            text,
-            "\n(hydrated {hydrated_changes} historical change(s) into the graph; 0 review mutations)"
-        )?;
-    }
-    Ok(ReviewResponse { text, json: None })
+    Ok(ReviewResponse {
+        text: kin_review::format_shadow_report(report),
+        json: None,
+    })
 }
 
 fn compute_review(
@@ -623,13 +423,9 @@ fn compute_review(
         Some(h) => kin_model::SemanticChangeId::from_hash(
             kin_model::Hash256::from_hex(&h).map_err(|e| anyhow::anyhow!("invalid hash: {}", e))?,
         ),
-        None => {
-            let current = kin_core::read_current_branch(layout)?;
-            let branch = graph
-                .get_branch(&current)?
-                .ok_or_else(|| anyhow::anyhow!("branch '{}' not found", current))?;
-            branch.head
-        }
+        None => crate::commands::repository_authority::ActiveRepositoryAuthority::open(layout)?
+            .current_change_id()?
+            .ok_or_else(|| anyhow::anyhow!("repository-v6 workspace head is unborn"))?,
     };
 
     let semantic_change = graph
@@ -704,7 +500,7 @@ fn append_review_provenance(
             writeln!(text, "Changed entities: {}", changed_entity_count)?;
             for delta in &semantic_change.entity_deltas {
                 match delta {
-                    kin_model::EntityDelta::Added(e) => {
+                    kin_model::EntityDelta::Added { new: e } => {
                         writeln!(
                             text,
                             "  + {} ({:?}) by {}",
@@ -718,8 +514,8 @@ fn append_review_provenance(
                             new.name, new.kind, semantic_change.author
                         )?;
                     }
-                    kin_model::EntityDelta::Removed(id) => {
-                        writeln!(text, "  - {} by {}", id, semantic_change.author)?;
+                    kin_model::EntityDelta::Removed { old } => {
+                        writeln!(text, "  - {} by {}", old.id, semantic_change.author)?;
                     }
                 }
             }
@@ -879,7 +675,6 @@ fn create_review_with_graph(
             json: None,
         },
         mutated: true,
-        hydrated_changes: 0,
     })
 }
 
@@ -939,7 +734,6 @@ fn decide_review_with_graph(
             json: None,
         },
         mutated: true,
-        hydrated_changes: 0,
     })
 }
 
@@ -986,7 +780,6 @@ fn add_note_with_graph(
     Ok(ReviewExecution {
         response: ReviewResponse { text, json: None },
         mutated: true,
-        hydrated_changes: 0,
     })
 }
 
@@ -1047,7 +840,6 @@ fn start_discussion_with_graph(
     Ok(ReviewExecution {
         response: ReviewResponse { text, json: None },
         mutated: true,
-        hydrated_changes: 0,
     })
 }
 
@@ -1084,7 +876,6 @@ fn reply_discussion_with_graph(
             json: None,
         },
         mutated: true,
-        hydrated_changes: 0,
     })
 }
 
@@ -1107,7 +898,6 @@ fn resolve_discussion_with_graph(
             json: None,
         },
         mutated: true,
-        hydrated_changes: 0,
     })
 }
 
@@ -1145,7 +935,6 @@ fn assign_reviewer_with_graph(
             json: None,
         },
         mutated: true,
-        hydrated_changes: 0,
     })
 }
 
@@ -1188,7 +977,6 @@ fn list_reviews_with_graph(
                 json: None,
             },
             mutated: false,
-            hydrated_changes: 0,
         });
     }
 
@@ -1208,7 +996,6 @@ fn list_reviews_with_graph(
     Ok(ReviewExecution {
         response: ReviewResponse { text, json: None },
         mutated: false,
-        hydrated_changes: 0,
     })
 }
 
@@ -1301,7 +1088,6 @@ fn show_review_with_graph(
     Ok(ReviewExecution {
         response: ReviewResponse { text, json: None },
         mutated: false,
-        hydrated_changes: 0,
     })
 }
 
@@ -1397,14 +1183,10 @@ mod tests {
         assert_eq!(events[1].action, "review.create");
     }
 
-    /// The everyday "your branch is behind main" case: a stale, unrelated
-    /// base against a raw Git commit head that has never been imported.
-    /// Proves the fast path returns the identical `base_not_on_head_ancestry`
-    /// gap report without ever hydrating either side — checked structurally
-    /// (both refs still report "requires hydration" afterward), not by wall
-    /// clock, per the fix's own contract.
+    /// A query for raw Git commits that were never imported must fail from
+    /// graph authority without reading or mutating the adjacent Git checkout.
     #[test]
-    fn shadow_stale_base_returns_gap_report_without_hydrating() {
+    fn shadow_rejects_unimported_git_refs_without_mutating_graph() {
         use std::process::Command;
 
         let dir = tempfile::tempdir().unwrap();
@@ -1467,17 +1249,12 @@ mod tests {
 
         let layout = kin_core::KinLayout::new(repo.join(".kin"));
         let graph = kin_db::InMemoryGraph::new();
+        let branch_a_change =
+            kin_model::SemanticChangeId::from_hash(kin_model::Hash256::from_bytes([0xa1; 32]));
+        let branch_b_change =
+            kin_model::SemanticChangeId::from_hash(kin_model::Hash256::from_bytes([0xb2; 32]));
 
-        assert!(
-            crate::commands::ref_lookup::git_ref_requires_hydration(&graph, &branch_a),
-            "branch a must not be imported before the call"
-        );
-        assert!(
-            crate::commands::ref_lookup::git_ref_requires_hydration(&graph, &branch_b),
-            "branch b must not be imported before the call"
-        );
-
-        let (response, hydrated_changes) = build_shadow_run_response(
+        let error = build_shadow_run_response(
             &layout,
             &graph,
             branch_a.clone(),
@@ -1487,86 +1264,69 @@ mod tests {
             None,
             true,
         )
-        .expect("a stale base must produce a gap report, not an error");
-
-        assert_eq!(
-            hydrated_changes, 0,
-            "the fast path must report no hydration was performed"
-        );
-
-        let json: serde_json::Value =
-            serde_json::from_str(response.json.as_deref().expect("json response")).unwrap();
-        assert_eq!(json["hydrated_changes"], 0);
-        assert_eq!(json["review_mutations"], 0);
-        let gaps = json["evidence_gaps"].as_array().unwrap();
+        .expect_err("unimported Git refs must not be hydrated by a query");
         assert!(
-            gaps.iter()
-                .any(|gap| gap["kind"] == "base_not_on_head_ancestry"),
-            "expected a base_not_on_head_ancestry gap: {gaps:?}"
-        );
-
-        // Structural proof, not a timing assertion: neither commit was ever
-        // imported into the graph, so both still report "requires hydration".
-        assert!(
-            crate::commands::ref_lookup::git_ref_requires_hydration(&graph, &branch_a),
-            "branch a must remain un-imported: the fast path must not hydrate it"
+            crate::commands::ref_lookup::is_ref_resolution_error(&error),
+            "unimported Git refs must fail as a ref-resolution gap: {error:#}"
         );
         assert!(
-            crate::commands::ref_lookup::git_ref_requires_hydration(&graph, &branch_b),
-            "branch b must remain un-imported: the fast path must not hydrate it"
+            graph.get_change(&branch_a_change).unwrap().is_none(),
+            "review must leave the base absent"
+        );
+        assert!(
+            graph.get_change(&branch_b_change).unwrap().is_none(),
+            "review must leave the head absent"
         );
     }
 
-    /// Warm case: both `kin:` refs already resolve directly, so no Git
-    /// hydration ever runs. The response must report `hydrated_changes: 0`
-    /// distinctly from `review_mutations: 0` — two truthful zeros, not a
-    /// single collapsed flag — both in the returned count and in the actual
-    /// JSON payload a client parses.
+    /// Graph-owned refs produce a read-only report with no compatibility
+    /// bookkeeping fields.
     #[test]
-    fn shadow_reports_zero_hydrated_changes_when_refs_need_no_import() {
+    fn shadow_reports_read_only_marker_for_graph_refs() {
         let graph = kin_db::InMemoryGraph::new();
         let layout = kin_core::KinLayout::new(std::path::PathBuf::from("/nonexistent/.kin"));
 
-        let base_id =
-            kin_model::SemanticChangeId::from_hash(kin_model::Hash256::from_bytes([0x10; 32]));
-        let head_id =
-            kin_model::SemanticChangeId::from_hash(kin_model::Hash256::from_bytes([0x20; 32]));
-        graph
-            .create_change(&kin_model::SemanticChange {
-                id: base_id,
-                parents: vec![],
-                timestamp: kin_model::Timestamp::now(),
-                author: kin_model::AuthorId::new("test"),
-                message: "base".into(),
-                entity_deltas: vec![],
-                relation_deltas: vec![],
-                artifact_deltas: vec![],
-                projected_files: vec![],
-                spec_link: None,
-                evidence: vec![],
-                risk_summary: None,
-                authored_on: None,
-            })
-            .unwrap();
-        graph
-            .create_change(&kin_model::SemanticChange {
-                id: head_id,
-                parents: vec![base_id],
-                timestamp: kin_model::Timestamp::now(),
-                author: kin_model::AuthorId::new("test"),
-                message: "head".into(),
-                entity_deltas: vec![],
-                relation_deltas: vec![],
-                artifact_deltas: vec![],
-                projected_files: vec![],
-                spec_link: None,
-                evidence: vec![],
-                risk_summary: None,
-                authored_on: None,
-            })
-            .unwrap();
+        let mut base = kin_model::SemanticChange {
+            id: kin_model::SemanticChangeId::from_hash(kin_model::Hash256::from_bytes([0; 32])),
+            parents: vec![],
+            origin: kin_model::ChangeOrigin::Native,
+            timestamp: kin_model::Timestamp::now(),
+            author: kin_model::AuthorId::new("test"),
+            message: "base".into(),
+            entity_deltas: vec![],
+            relation_deltas: vec![],
+            tree_deltas: vec![],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            admission_policy_delta: None,
+        };
+        base.id = kin_model::compute_semantic_change_id(&base).unwrap();
+        let base_id = base.id;
+        graph.create_change(&base).unwrap();
 
-        let (response, hydrated_changes) = build_shadow_run_response(
+        let mut head = kin_model::SemanticChange {
+            id: kin_model::SemanticChangeId::from_hash(kin_model::Hash256::from_bytes([0; 32])),
+            parents: vec![base_id],
+            origin: kin_model::ChangeOrigin::Native,
+            timestamp: kin_model::Timestamp::now(),
+            author: kin_model::AuthorId::new("test"),
+            message: "head".into(),
+            entity_deltas: vec![],
+            relation_deltas: vec![],
+            tree_deltas: vec![],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            admission_policy_delta: None,
+        };
+        head.id = kin_model::compute_semantic_change_id(&head).unwrap();
+        let head_id = head.id;
+        graph.create_change(&head).unwrap();
+
+        let response = build_shadow_run_response(
             &layout,
             &graph,
             format!("kin:{base_id}"),
@@ -1578,13 +1338,9 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            hydrated_changes, 0,
-            "already-resolved refs must report zero hydrated changes"
-        );
         let json: serde_json::Value =
             serde_json::from_str(response.json.as_deref().expect("json response")).unwrap();
-        assert_eq!(json["hydrated_changes"], 0);
+        assert!(json.get("hydrated_changes").is_none());
         assert_eq!(json["review_mutations"], 0);
     }
 }

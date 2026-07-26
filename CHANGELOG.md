@@ -50,6 +50,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   budget and, for adaptively sized declarations, within the confident prefix
   (`KIN_LOCATE_FUSED_DECLARATION_CAP`, default 8). Explicit `--max-files`
   widths are honored as-is.
+### Changed
+
+- `kin exec` executes exact argv locally in the materialized session workspace;
+  shell parsing requires one explicitly quoted `--shell` script, the `kin run`
+  compatibility alias is removed, and the redundant daemon remote-exec endpoint
+  no longer exists.
+- Session launchers now require graph-backed materialization from a
+  repository-verified daemon, register one heartbeating session identity for
+  the child lifetime, scrub inherited Git/Compose/Kin path authority, and
+  preserve failed workspaces. `kin open` now supports only the proven blocking
+  lifecycles of VS Code and Cursor.
 
 ## [0.3.4] - 2026-07-24
 

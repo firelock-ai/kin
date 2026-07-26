@@ -1847,46 +1847,6 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
     )
     .await;
 
-    // Graceful shutdown: flush in-memory state to storage backend.
-    // On spot instance preemption, GKE sends SIGTERM with a 30-second grace period.
-    // This ensures overlays and uncommitted work are saved to GCS.
-    if let Some(backend) = &state.storage_backend {
-        info!("flushing state to storage backend before exit...");
-        let repo_id = state
-            .layout
-            .root()
-            .file_name()
-            .and_then(|n: &std::ffi::OsStr| n.to_str())
-            .unwrap_or("default");
-
-        // Save global working copy overlay for recovery after preemption.
-        let wc = state.working_copy.read().await;
-        if !wc.uncommitted_mutations.entity_bodies.is_empty() {
-            let overlay_bytes = serde_json::to_vec(&*wc).unwrap_or_default();
-            if let Err(e) = backend.save_overlay(repo_id, "_working_copy", &overlay_bytes) {
-                error!(error = %e, "failed to flush overlay on shutdown");
-            } else {
-                info!("overlay state flushed to storage backend");
-            }
-        }
-        drop(wc);
-
-        // Flush per-session overlays so agent work survives preemption.
-        let sessions = state.session_overlays.read().await;
-        for (session_id, overlay) in sessions.iter() {
-            if overlay.entity_bodies.is_empty() {
-                continue;
-            }
-            let overlay_bytes = serde_json::to_vec(overlay).unwrap_or_default();
-            if let Err(e) = backend.save_overlay(repo_id, &session_id.to_string(), &overlay_bytes) {
-                error!(session_id = %session_id, error = %e, "failed to flush session overlay");
-            } else {
-                info!(session_id = %session_id, "session overlay flushed");
-            }
-        }
-        drop(sessions);
-    }
-
     // Remove PID and port files after final flush work finishes, so a successor
     // daemon cannot start while this process is still draining persistent state.
     crate::lifecycle::remove_daemon_files_if_current_process(state.layout.root());

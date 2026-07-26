@@ -1,24 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-//! Native-mode command shims.
+//! Graph-projection command shims.
 //!
-//! When Kin launches an assistant or shell in native mode, it prepends a
-//! directory of small wrapper scripts to `$PATH`. These shims intercept
-//! common file-system commands (`cat`, `rg`, `find`, etc.) and
-//! transparently redirect them to `.kin/source-root/` so agents don't
-//! waste tokens on "file not found" failures against the empty control root.
+//! When Kin launches an assistant or shell against an exact workspace
+//! projection, it prepends a directory of small wrapper scripts to `$PATH`.
+//! These shims intercept common file-system commands (`cat`, `rg`, `find`,
+//! etc.) and keep them rooted at the selected graph-derived workspace.
+//! They are a compatibility view for ordinary tools, never a semantic query
+//! authority. Callers must provide an explicit projection or VFS mount; the
+//! shims fail closed when that binding is absent.
 //!
 //! Two shim strategies:
 //!
 //! - **Content shims** (cat, head, tail, sed): resolve individual file-path
 //!   arguments against `$KIN_SOURCE_ROOT` when they don't exist locally.
-//!   This lets `cat AGENTS.md` still read the bootstrap doc at the control
-//!   root while `cat src/main.rs` transparently reads from source-root.
+//!   This lets `cat AGENTS.md` still read a bootstrap document at the current
+//!   root while `cat src/main.rs` reads from the selected projection.
 //!
 //! - **Discovery shims** (rg, grep, find, ls, tree, fd, wc): `cd` into
 //!   `$KIN_SOURCE_ROOT` before executing, so searches and listings default
-//!   to the real source tree.
+//!   to the selected projection.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -29,7 +31,7 @@ use crate::layout::KinLayout;
 /// Commands that get the content-shim treatment (path-level resolution).
 const CONTENT_COMMANDS: &[&str] = &["cat", "head", "tail", "sed", "bat"];
 
-/// Commands that get the discovery-shim treatment (cd to source-root).
+/// Commands that get the discovery-shim treatment (cd to the projection root).
 const DISCOVERY_COMMANDS: &[&str] = &["rg", "grep", "find", "fd", "ls", "tree", "wc"];
 
 /// Generate (or regenerate) the shim directory at `.kin/shims/`.
@@ -50,8 +52,8 @@ pub fn ensure_shim_dir(layout: &KinLayout) -> Result<PathBuf> {
     Ok(shim_dir)
 }
 
-/// Build the environment variables needed for shims to function, targeting a
-/// specific root directory.
+/// Build the environment variables needed for shims to function, targeting an
+/// explicit graph-derived projection or VFS mount.
 ///
 /// Returns a list of `(key, value)` pairs to set on the launched process:
 /// - `KIN_SOURCE_ROOT` — absolute path to the shim target root
@@ -60,7 +62,10 @@ pub fn ensure_shim_dir(layout: &KinLayout) -> Result<PathBuf> {
 /// - `KIN_DISCOVERY_MODE` — optional discovery policy (`redirect` or `deny`)
 /// - `KIN_CONTENT_MODE` — optional content-read policy (`redirect` or `deny`)
 pub fn shim_env_for_root(shim_dir: &Path, target_root: &Path) -> Vec<(String, String)> {
-    let original_path = std::env::var("PATH").unwrap_or_default();
+    let original_path = select_original_path(
+        std::env::var("KIN_ORIGINAL_PATH").ok(),
+        std::env::var("PATH").ok(),
+    );
     let new_path = format!("{}:{}", shim_dir.display(), original_path);
 
     vec![
@@ -73,10 +78,21 @@ pub fn shim_env_for_root(shim_dir: &Path, target_root: &Path) -> Vec<(String, St
     ]
 }
 
-/// Build the environment variables needed for shims to function against the
-/// repository's canonical source surface.
-pub fn shim_env(layout: &KinLayout, shim_dir: &Path) -> Vec<(String, String)> {
-    shim_env_for_root(shim_dir, &layout.source_root_dir())
+/// Return the caller's host PATH without a previously-installed Kin shim
+/// prefix. Session launchers use this as their baseline before installing
+/// exactly one shim set for the new workspace.
+pub fn unshimmed_path() -> String {
+    select_original_path(
+        std::env::var("KIN_ORIGINAL_PATH").ok(),
+        std::env::var("PATH").ok(),
+    )
+}
+
+fn select_original_path(previous_original: Option<String>, current: Option<String>) -> String {
+    previous_original
+        .filter(|value| !value.is_empty())
+        .or(current)
+        .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -88,7 +104,7 @@ pub fn shim_env(layout: &KinLayout, shim_dir: &Path) -> Vec<(String, String)> {
 fn content_shim_script(cmd: &str) -> String {
     format!(
         r#"#!/bin/bash
-# Kin native-mode shim for {cmd}
+# Kin graph-projection shim for {cmd}
 # Resolves file paths against $KIN_SOURCE_ROOT when not found locally.
 REAL="$(PATH="$KIN_ORIGINAL_PATH" command -v {cmd})"
 [[ -z "$REAL" ]] && {{ echo "{cmd}: command not found" >&2; exit 127; }}
@@ -99,8 +115,9 @@ if [[ "$KIN_CONTENT_MODE" == "deny" ]]; then
     echo "Use: kin context <entity>" >&2
     exit 87
 fi
-if [[ -z "$KIN_SOURCE_ROOT" ]]; then
-    exec "$REAL" "$@"
+if [[ -z "$KIN_SOURCE_ROOT" || ! -d "$KIN_SOURCE_ROOT" ]]; then
+    echo "{cmd}: no graph-derived Kin projection is bound" >&2
+    exit 88
 fi
 args=()
 for arg in "$@"; do
@@ -135,13 +152,13 @@ exec "$REAL" "${{args[@]}}"
     )
 }
 
-/// Discovery shim: changes to `$KIN_SOURCE_ROOT` before executing so
-/// searches and listings target the real source tree by default.
+/// Discovery shim: changes to `$KIN_SOURCE_ROOT` before executing so searches
+/// and listings target the selected exact workspace projection by default.
 fn discovery_shim_script(cmd: &str) -> String {
     format!(
         r#"#!/bin/bash
-# Kin native-mode shim for {cmd}
-# Searches source-root by default instead of the empty control root.
+# Kin graph-projection shim for {cmd}
+# Searches the selected exact workspace projection by default.
 # If KIN_DISCOVERY_MODE=deny, blocks filesystem discovery and tells
 # the caller to use Kin-native discovery commands instead.
 REAL="$(PATH="$KIN_ORIGINAL_PATH" command -v {cmd})"
@@ -153,9 +170,11 @@ if [[ "$KIN_DISCOVERY_MODE" == "deny" ]]; then
     echo "Use: kin context <entity>" >&2
     exit 86
 fi
-if [[ -n "$KIN_SOURCE_ROOT" && -d "$KIN_SOURCE_ROOT" ]]; then
-    cd "$KIN_SOURCE_ROOT"
+if [[ -z "$KIN_SOURCE_ROOT" || ! -d "$KIN_SOURCE_ROOT" ]]; then
+    echo "{cmd}: no graph-derived Kin projection is bound" >&2
+    exit 88
 fi
+cd "$KIN_SOURCE_ROOT" || exit 88
 if [[ -n "$KIN_SHIM_LOG" ]]; then
     _kin_args=$(printf '%q ' "$@")
     _kin_cwd=$(pwd)
@@ -202,6 +221,7 @@ mod tests {
         let script = content_shim_script("cat");
         assert!(script.contains("KIN_CONTENT_MODE"));
         assert!(script.contains("direct file reads are disabled"));
+        assert!(script.contains("no graph-derived Kin projection is bound"));
         assert!(script.contains("KIN_SOURCE_ROOT"));
         assert!(script.contains("KIN_ORIGINAL_PATH"));
         assert!(script.contains("command -v cat"));
@@ -210,11 +230,12 @@ mod tests {
     }
 
     #[test]
-    fn discovery_shim_cds_to_source_root() {
+    fn discovery_shim_requires_and_enters_projection_root() {
         let script = discovery_shim_script("rg");
         assert!(script.contains("KIN_DISCOVERY_MODE"));
         assert!(script.contains("filesystem discovery is disabled"));
-        assert!(script.contains("cd \"$KIN_SOURCE_ROOT\""));
+        assert!(script.contains("no graph-derived Kin projection is bound"));
+        assert!(script.contains("cd \"$KIN_SOURCE_ROOT\" || exit 88"));
         assert!(script.contains("command -v rg"));
         assert!(script.contains("exec"));
         assert!(script.contains("KIN_SHIM_LOG"));
@@ -273,7 +294,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let kin_dir = dir.path().join(".kin");
         std::fs::create_dir_all(&kin_dir).unwrap();
-        std::fs::write(kin_dir.join("HEAD"), "main").unwrap();
 
         let layout = KinLayout::discover(dir.path()).unwrap();
         let shim_dir = ensure_shim_dir(&layout).unwrap();
@@ -299,30 +319,6 @@ mod tests {
     }
 
     #[test]
-    fn shim_env_prepends_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let kin_dir = dir.path().join(".kin");
-        std::fs::create_dir_all(&kin_dir).unwrap();
-        std::fs::write(kin_dir.join("HEAD"), "main").unwrap();
-
-        let layout = KinLayout::discover(dir.path()).unwrap();
-        let shim_dir = kin_dir.join("shims");
-        std::fs::create_dir_all(&shim_dir).unwrap();
-
-        let env = shim_env(&layout, &shim_dir);
-        let path_entry = env.iter().find(|(k, _)| k == "PATH").unwrap();
-        assert!(
-            path_entry
-                .1
-                .starts_with(&shim_dir.to_string_lossy().to_string()),
-            "PATH should start with shim dir"
-        );
-
-        let source_root = env.iter().find(|(k, _)| k == "KIN_SOURCE_ROOT").unwrap();
-        assert!(source_root.1.contains("source-root"));
-    }
-
-    #[test]
     fn shim_env_for_root_targets_custom_workspace() {
         let dir = tempfile::tempdir().unwrap();
         let shim_dir = dir.path().join("shims");
@@ -333,5 +329,20 @@ mod tests {
         let env = shim_env_for_root(&shim_dir, &target_root);
         let source_root = env.iter().find(|(k, _)| k == "KIN_SOURCE_ROOT").unwrap();
         assert_eq!(source_root.1, target_root.to_string_lossy());
+    }
+
+    #[test]
+    fn nested_shim_path_reuses_the_unshimmed_baseline() {
+        assert_eq!(
+            super::select_original_path(
+                Some("/usr/local/bin:/usr/bin".into()),
+                Some("/repo/.kin/shims:/usr/local/bin:/usr/bin".into()),
+            ),
+            "/usr/local/bin:/usr/bin"
+        );
+        assert_eq!(
+            super::select_original_path(None, Some("/opt/bin:/usr/bin".into())),
+            "/opt/bin:/usr/bin"
+        );
     }
 }

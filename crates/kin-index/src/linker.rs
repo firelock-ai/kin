@@ -20,6 +20,29 @@ use kin_parser::{
     is_call_extraction_incomplete_marker, CallArgShape, ExtractedRelation, FileImport,
 };
 
+use crate::error::{IndexError, Result as IndexResult};
+
+/// Graph-assigned artifact identities keyed by repository-relative path.
+///
+/// Linking never derives identity from a path. Callers must resolve or allocate
+/// these IDs through graph authority before asking the linker to create
+/// artifact-level relations.
+pub type ArtifactIdentityMap = HashMap<String, ArtifactId>;
+
+fn require_artifact_identities<'a>(
+    paths: impl IntoIterator<Item = &'a str>,
+    artifact_ids: &ArtifactIdentityMap,
+) -> IndexResult<()> {
+    for path in paths {
+        if !artifact_ids.contains_key(path) {
+            return Err(IndexError::Graph(format!(
+                "missing graph-assigned artifact identity for {path}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Persisted provenance marker for call-shape evidence produced by a linker
 /// that preserves every occurrence on one logical `(src, dst, Calls)` edge.
 ///
@@ -150,8 +173,11 @@ const INDEX_FILENAMES: &[&str] = &["index.ts", "index.tsx", "index.js", "index.j
 /// 4. Resolves each ExtractedRelation to entity-ID-based Relations
 ///
 /// Returns a deduplicated list of resolved Relations.
-pub fn link_cross_file(files: &[FileParseData]) -> Vec<Relation> {
-    link_cross_file_internal(files, None)
+pub fn link_cross_file(
+    files: &[FileParseData],
+    artifact_ids: &ArtifactIdentityMap,
+) -> IndexResult<Vec<Relation>> {
+    link_cross_file_internal(files, artifact_ids, None)
 }
 
 /// Resolve cross-file relations with explicit parser completeness.
@@ -161,25 +187,30 @@ pub fn link_cross_file(files: &[FileParseData]) -> Vec<Relation> {
 /// recovery omitted every call relation in that file.
 pub fn link_cross_file_with_completeness(
     files: &[FileParseData],
+    artifact_ids: &ArtifactIdentityMap,
     completeness: &FileParseCompletenessMap,
-) -> Vec<Relation> {
-    link_cross_file_internal(files, Some(completeness))
+) -> IndexResult<Vec<Relation>> {
+    link_cross_file_internal(files, artifact_ids, Some(completeness))
 }
 
 fn link_cross_file_internal(
     files: &[FileParseData],
+    artifact_ids: &ArtifactIdentityMap,
     completeness: Option<&FileParseCompletenessMap>,
-) -> Vec<Relation> {
+) -> IndexResult<Vec<Relation>> {
     let _span = tracing::info_span!("kin.index.link_cross_file", files = files.len()).entered();
     let universe_entities: Vec<Entity> = files
         .iter()
         .flat_map(|file| file.entities.iter().cloned())
         .collect();
-    link_cross_file_against_entities_internal(files, &universe_entities, completeness)
+    link_cross_file_against_entities_internal(files, &universe_entities, artifact_ids, completeness)
 }
 
 /// Resolve cross-file relations while carrying parser-emitted tests alongside the input.
-pub fn link_cross_file_with_tests(files: &[FileParseDataWithTests]) -> Vec<Relation> {
+pub fn link_cross_file_with_tests(
+    files: &[FileParseDataWithTests],
+    artifact_ids: &ArtifactIdentityMap,
+) -> IndexResult<Vec<Relation>> {
     let linkable: Vec<FileParseData> = files
         .iter()
         .map(|file| FileParseData {
@@ -189,15 +220,16 @@ pub fn link_cross_file_with_tests(files: &[FileParseDataWithTests]) -> Vec<Relat
             imports: file.imports.clone(),
         })
         .collect();
-    link_cross_file(&linkable)
+    link_cross_file(&linkable, artifact_ids)
 }
 
 /// Resolve cross-file relations while retaining parser tests and explicit
 /// parse completeness.
 pub fn link_cross_file_with_tests_and_completeness(
     files: &[FileParseDataWithTests],
+    artifact_ids: &ArtifactIdentityMap,
     completeness: &FileParseCompletenessMap,
-) -> Vec<Relation> {
+) -> IndexResult<Vec<Relation>> {
     let linkable: Vec<FileParseData> = files
         .iter()
         .map(|file| FileParseData {
@@ -207,7 +239,7 @@ pub fn link_cross_file_with_tests_and_completeness(
             imports: file.imports.clone(),
         })
         .collect();
-    link_cross_file_with_completeness(&linkable, completeness)
+    link_cross_file_with_completeness(&linkable, artifact_ids, completeness)
 }
 
 /// Total order over entities so cross-file linking is order-independent.
@@ -253,8 +285,9 @@ fn bare_entity_name(name: &str) -> &str {
 pub fn link_cross_file_against_entities(
     files: &[FileParseData],
     universe_entities: &[Entity],
-) -> Vec<Relation> {
-    link_cross_file_against_entities_internal(files, universe_entities, None)
+    artifact_ids: &ArtifactIdentityMap,
+) -> IndexResult<Vec<Relation>> {
+    link_cross_file_against_entities_internal(files, universe_entities, artifact_ids, None)
 }
 
 /// Resolve a parsed subset against a broader entity universe while honoring
@@ -262,16 +295,23 @@ pub fn link_cross_file_against_entities(
 pub fn link_cross_file_against_entities_with_completeness(
     files: &[FileParseData],
     universe_entities: &[Entity],
+    artifact_ids: &ArtifactIdentityMap,
     completeness: &FileParseCompletenessMap,
-) -> Vec<Relation> {
-    link_cross_file_against_entities_internal(files, universe_entities, Some(completeness))
+) -> IndexResult<Vec<Relation>> {
+    link_cross_file_against_entities_internal(
+        files,
+        universe_entities,
+        artifact_ids,
+        Some(completeness),
+    )
 }
 
 fn link_cross_file_against_entities_internal(
     files: &[FileParseData],
     universe_entities: &[Entity],
+    artifact_ids: &ArtifactIdentityMap,
     completeness: Option<&FileParseCompletenessMap>,
-) -> Vec<Relation> {
+) -> IndexResult<Vec<Relation>> {
     let _span = tracing::info_span!(
         "kin.index.link_cross_file_against_entities",
         files = files.len(),
@@ -280,6 +320,7 @@ fn link_cross_file_against_entities_internal(
     .entered();
 
     let ctx = build_link_context(files, universe_entities);
+    require_artifact_identities(ctx.known_files.iter().copied(), artifact_ids)?;
 
     let total_files = files.len();
     let progress_interval = std::cmp::max(total_files / 50, 1);
@@ -307,7 +348,7 @@ fn link_cross_file_against_entities_internal(
                     let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
                     let total =
                         found.fetch_add(relations.len(), Ordering::Relaxed) + relations.len();
-                    if done % progress_interval == 0 || done == total_files {
+                    if done.is_multiple_of(progress_interval) || done == total_files {
                         eprint!(
                             "\r  Linking: [{}/{}] {}% | {} relations | {:.1}s",
                             done,
@@ -323,13 +364,13 @@ fn link_cross_file_against_entities_internal(
             .collect()
     };
 
-    let resolved = merge_resolved(per_file_relations, files, &ctx, completeness);
+    let resolved = merge_resolved(per_file_relations, files, &ctx, artifact_ids, completeness);
 
     if total_files > 0 {
         eprintln!(); // newline after \r progress
     }
     debug!(resolved = resolved.len(), "cross-file linking complete");
-    resolved
+    Ok(resolved)
 }
 
 /// Read-only indices shared across per-file relation resolution.
@@ -339,6 +380,10 @@ struct LinkContext<'a> {
     entity_by_name: HashMap<&'a str, Vec<(&'a str, EntityId)>>,
     entity_by_bare_name: HashMap<&'a str, Vec<(&'a str, EntityId)>>,
     entity_kind_by_id: HashMap<EntityId, EntityKind>,
+    /// Parser-reported language for every entity. Blind name/locality
+    /// inference must fail closed when either side is absent and may only
+    /// connect equal or explicitly compatible language families.
+    entity_language_by_id: HashMap<EntityId, LanguageId>,
     /// C/C++ callee id -> the argument-count bounds parsed from its signature.
     /// Absent for a callee whose language does not carry call arity or whose
     /// parameter list could not be read, so the linker prunes an overloaded
@@ -354,6 +399,67 @@ struct LinkContext<'a> {
     /// keyed per file because class names repeat across a repo (django alone
     /// has dozens of `Command` classes).
     class_bases_by_file_class: HashMap<(&'a str, &'a str), Vec<&'a str>>,
+}
+
+/// Whether two parser-reported languages may participate in a relation inferred
+/// solely from a name or locality heuristic.
+///
+/// Cross-language relations need stronger evidence (an import/include/module
+/// pin, a parser-qualified path, or an explicit hierarchy edge). Keeping this
+/// compatibility list narrow prevents an unrelated same-name symbol in another
+/// language from becoming a fabricated dependency.
+fn blind_inference_languages_compatible(src: LanguageId, dst: LanguageId) -> bool {
+    blind_inference_language_is_known(src)
+        && blind_inference_language_is_known(dst)
+        && (src == dst
+            || matches!(
+                (src, dst),
+                (LanguageId::C, LanguageId::Cpp)
+                    | (LanguageId::Cpp, LanguageId::C)
+                    | (LanguageId::JavaScript, LanguageId::TypeScript)
+                    | (LanguageId::TypeScript, LanguageId::JavaScript)
+                    | (LanguageId::Java, LanguageId::Kotlin)
+                    | (LanguageId::Kotlin, LanguageId::Java)
+            ))
+}
+
+/// Keep a future `Unknown`/opaque language marker out of blind inference even
+/// when both endpoints carry that same marker. Unsupported artifacts retain
+/// artifact-level membership/search benefits without gaining fabricated
+/// entity relations.
+#[allow(unreachable_patterns)]
+fn blind_inference_language_is_known(language: LanguageId) -> bool {
+    matches!(
+        language,
+        LanguageId::TypeScript
+            | LanguageId::JavaScript
+            | LanguageId::Python
+            | LanguageId::Go
+            | LanguageId::Java
+            | LanguageId::Rust
+            | LanguageId::C
+            | LanguageId::Cpp
+            | LanguageId::CSharp
+            | LanguageId::Ruby
+            | LanguageId::Php
+            | LanguageId::Swift
+            | LanguageId::Kotlin
+            | LanguageId::Hcl
+    )
+}
+
+/// Fail-closed language gate for blind inference. Missing language evidence is
+/// not permission to connect two entities.
+fn blind_inference_target_allowed(
+    src: EntityId,
+    dst: EntityId,
+    languages: &HashMap<EntityId, LanguageId>,
+) -> bool {
+    languages
+        .get(&src)
+        .zip(languages.get(&dst))
+        .map(|(&src, &dst)| blind_inference_languages_compatible(src, dst))
+        .unwrap_or(false)
 }
 
 fn build_link_context<'a>(
@@ -373,6 +479,7 @@ fn build_link_context<'a>(
         entity_by_name,
         entity_by_bare_name,
         entity_kind_by_id,
+        entity_language_by_id,
         entity_arity_by_id,
         entity_count_by_file,
         known_files,
@@ -386,12 +493,14 @@ fn build_link_context<'a>(
         let mut entity_by_name: HashMap<&str, Vec<(&str, EntityId)>> = HashMap::new();
         let mut entity_by_bare_name: HashMap<&str, Vec<(&str, EntityId)>> = HashMap::new();
         let mut entity_kind_by_id: HashMap<EntityId, EntityKind> = HashMap::new();
+        let mut entity_language_by_id: HashMap<EntityId, LanguageId> = HashMap::new();
         let mut entity_arity_by_id: HashMap<EntityId, ArityBounds> = HashMap::new();
         let mut entity_count_by_file: HashMap<&str, usize> = HashMap::new();
         let mut known_files: HashSet<&str> = HashSet::new();
 
         for &entity in &sorted_universe {
             entity_kind_by_id.insert(entity.id, entity.kind);
+            entity_language_by_id.insert(entity.id, entity.language);
             let Some(file_path) = entity.file_origin.as_ref().map(|path| path.0.as_str()) else {
                 continue;
             };
@@ -425,6 +534,7 @@ fn build_link_context<'a>(
             entity_by_name,
             entity_by_bare_name,
             entity_kind_by_id,
+            entity_language_by_id,
             entity_arity_by_id,
             entity_count_by_file,
             known_files,
@@ -486,6 +596,7 @@ fn build_link_context<'a>(
         entity_by_name,
         entity_by_bare_name,
         entity_kind_by_id,
+        entity_language_by_id,
         entity_arity_by_id,
         entity_count_by_file,
         known_files,
@@ -613,6 +724,9 @@ fn resolve_one_file(
                 file.file_path.as_str(),
                 &mut cross_file_twins,
             );
+            cross_file_twins.retain(|dst_id| {
+                blind_inference_target_allowed(src_id, *dst_id, &ctx.entity_language_by_id)
+            });
             let cross_file_twins =
                 prune_ids_by_arity(cross_file_twins, call_arity, &ctx.entity_arity_by_id);
             if !cross_file_twins.is_empty() && cross_file_twins.len() < AMBIGUOUS_CALL_FANOUT_CAP {
@@ -751,6 +865,17 @@ fn resolve_one_file(
             ImportPinnedTarget::NoPin => {}
         }
 
+        // From this point on, exact-name candidates are blind inference: import
+        // and module pins above have already had their chance to resolve with
+        // stronger evidence. Only equal/compatible language families may
+        // participate in name or locality selection.
+        let other_file_candidates: Vec<_> = other_file_candidates
+            .into_iter()
+            .filter(|(_, dst_id)| {
+                blind_inference_target_allowed(src_id, *dst_id, &ctx.entity_language_by_id)
+            })
+            .collect();
+
         // (c) Global name-match fallback
         let bare_candidates = if rel.kind == RelationKind::Calls {
             ctx.entity_by_bare_name
@@ -836,7 +961,9 @@ fn resolve_one_file(
         {
             let mut distinct_targets: HashSet<EntityId> = HashSet::new();
             for &(fp, dst_id) in bare_candidates {
-                if fp != file.file_path.as_str() {
+                if fp != file.file_path.as_str()
+                    && blind_inference_target_allowed(src_id, dst_id, &ctx.entity_language_by_id)
+                {
                     distinct_targets.insert(dst_id);
                 }
             }
@@ -948,6 +1075,7 @@ fn merge_resolved(
     per_file_relations: Vec<Vec<Relation>>,
     files: &[FileParseData],
     ctx: &LinkContext<'_>,
+    artifact_ids: &ArtifactIdentityMap,
     completeness: Option<&FileParseCompletenessMap>,
 ) -> Vec<Relation> {
     let mut resolved = Vec::new();
@@ -981,7 +1109,12 @@ fn merge_resolved(
                 file.imports
                     .iter()
                     .filter_map(|imp| {
-                        make_artifact_import_relation(&file.file_path, imp, &ctx.known_files)
+                        make_artifact_import_relation(
+                            &file.file_path,
+                            imp,
+                            &ctx.known_files,
+                            artifact_ids,
+                        )
                     })
                     .collect()
             })
@@ -996,7 +1129,7 @@ fn merge_resolved(
         }
     }
 
-    append_parse_coverage_relations(&mut resolved, files, completeness);
+    append_parse_coverage_relations(&mut resolved, files, artifact_ids, completeness);
 
     resolved
 }
@@ -1007,13 +1140,14 @@ fn merge_resolved(
 fn link_cross_file_against_entities_serial(
     files: &[FileParseData],
     universe_entities: &[Entity],
+    artifact_ids: &ArtifactIdentityMap,
 ) -> Vec<Relation> {
     let ctx = build_link_context(files, universe_entities);
     let per_file_relations: Vec<Vec<Relation>> = files
         .iter()
         .map(|file| resolve_one_file(file, &ctx, None))
         .collect();
-    merge_resolved(per_file_relations, files, &ctx, None)
+    merge_resolved(per_file_relations, files, &ctx, artifact_ids, None)
 }
 
 /// Serial counterpart of [`build_include_graph`], retained as the byte-identical
@@ -1056,6 +1190,7 @@ fn merge_resolved_serial(
     per_file_relations: Vec<Vec<Relation>>,
     files: &[FileParseData],
     ctx: &LinkContext<'_>,
+    artifact_ids: &ArtifactIdentityMap,
 ) -> Vec<Relation> {
     let mut resolved = Vec::new();
     let mut relation_indices = HashMap::new();
@@ -1067,7 +1202,8 @@ fn merge_resolved_serial(
     let mut seen_artifact: HashSet<(GraphNodeId, GraphNodeId, RelationKind)> = HashSet::new();
     for file in files {
         for imp in &file.imports {
-            if let Some(rel) = make_artifact_import_relation(&file.file_path, imp, &ctx.known_files)
+            if let Some(rel) =
+                make_artifact_import_relation(&file.file_path, imp, &ctx.known_files, artifact_ids)
             {
                 let key = (rel.src, rel.dst, rel.kind);
                 if seen_artifact.insert(key) {
@@ -2671,18 +2807,11 @@ where
     })
 }
 
-// Graph-less caller: the cross-file linker pipeline builds these artifact
-// import/include edges purely from parse data (`FileParseData` + `known_files`)
-// before any `GraphSnapshot`/`artifact_index` exists — its output is what the
-// graph is later constructed from (commit/init/import/migrate/ref_view). There
-// is no `artifact_index` to resolve graph-assigned IDs against here, so we keep
-// the deterministic path derivation. This matches the canonical kin-db approach
-// for index-time, snapshot-less artifact IDs (e.g. `ensure_artifact_id` /
-// `build_artifact_indexes_from_paths`), which also stay path-derived.
 fn make_artifact_import_relation<S>(
     importer_file: &str,
     import: &FileImport,
     known_files: &HashSet<S>,
+    artifact_ids: &ArtifactIdentityMap,
 ) -> Option<Relation>
 where
     S: std::borrow::Borrow<str> + std::hash::Hash + Eq,
@@ -2693,8 +2822,8 @@ where
     } else {
         RelationKind::Imports
     };
-    let src = GraphNodeId::Artifact(ArtifactId::seed_from_path(importer_file));
-    let dst = GraphNodeId::Artifact(ArtifactId::seed_from_path(&resolved_path));
+    let src = GraphNodeId::Artifact(*artifact_ids.get(importer_file)?);
+    let dst = GraphNodeId::Artifact(*artifact_ids.get(&resolved_path)?);
     let evidence = RelationEvidence {
         source_path: Some(import.module_path.clone()),
         resolved_path: Some(resolved_path.clone()),
@@ -2721,47 +2850,36 @@ where
     })
 }
 
-const CALL_SHAPE_COVERAGE_FULL_HUB_PREFIX: &str =
-    "kin-internal://call-shape-parse-coverage/full-v1/";
-const CALL_SHAPE_COVERAGE_INCOMPLETE_HUB_PREFIX: &str =
-    "kin-internal://call-shape-parse-coverage/incomplete-v1/";
-
 /// Build the graph-owned file-level call-coverage certificate used by
-/// ref-scoped review. The destination hub differs across states so a
-/// Full-to-Partial transition changes relation identity even in history paths
-/// that compare relation IDs before deciding what to replace.
+/// ref-scoped review. Coverage state lives in relation evidence; history paths
+/// compare the complete relation payload and replace changed evidence.
 fn make_parse_coverage_relation(
     file_path: &str,
+    artifact_id: ArtifactId,
     completeness: Option<&ParseCompleteness>,
     call_extraction_complete: bool,
 ) -> Relation {
     let is_full = call_extraction_complete && matches!(completeness, Some(ParseCompleteness::Full));
-    let (hub_prefix, parser_rule, token) = if !call_extraction_complete {
+    let (parser_rule, token) = if !call_extraction_complete {
         (
-            CALL_SHAPE_COVERAGE_INCOMPLETE_HUB_PREFIX,
             CALL_SHAPE_EXTRACTION_COVERAGE_INCOMPLETE_V1,
             "call-extraction-incomplete",
         )
     } else if is_full {
-        (
-            CALL_SHAPE_COVERAGE_FULL_HUB_PREFIX,
-            CALL_SHAPE_PARSE_COVERAGE_FULL_V1,
-            "full",
-        )
+        (CALL_SHAPE_PARSE_COVERAGE_FULL_V1, "full")
     } else {
         (
-            CALL_SHAPE_COVERAGE_INCOMPLETE_HUB_PREFIX,
             CALL_SHAPE_PARSE_COVERAGE_INCOMPLETE_V1,
             completeness
                 .map(ParseCompleteness::bucket)
                 .unwrap_or("missing"),
         )
     };
-    // Each file gets its own reserved status endpoint. A shared hub would make
-    // unrelated source artifacts appear connected at traversal depth two.
-    let hub = format!("{hub_prefix}{file_path}");
-    let src = GraphNodeId::Artifact(ArtifactId::seed_from_path(file_path));
-    let dst = GraphNodeId::Artifact(ArtifactId::seed_from_path(&hub));
+    // Coverage is evidence about the graph-owned artifact itself. A self-loop
+    // avoids fabricating a second path-derived pseudo-artifact; evidence
+    // changes still replace the relation when completeness changes.
+    let src = GraphNodeId::Artifact(artifact_id);
+    let dst = src;
     let kind = RelationKind::DependsOn;
     Relation {
         id: stable_relation_node_id(&src, &dst, &kind),
@@ -2785,6 +2903,7 @@ fn make_parse_coverage_relation(
 fn append_parse_coverage_relations(
     resolved: &mut Vec<Relation>,
     files: &[FileParseData],
+    artifact_ids: &ArtifactIdentityMap,
     completeness: Option<&FileParseCompletenessMap>,
 ) {
     let Some(completeness) = completeness else {
@@ -2793,12 +2912,16 @@ fn append_parse_coverage_relations(
     let mut seen = HashSet::new();
     for file in files {
         if seen.insert(file.file_path.as_str()) {
+            let artifact_id = *artifact_ids
+                .get(&file.file_path)
+                .expect("artifact identities were validated before linking");
             let call_extraction_complete = !file
                 .relations
                 .iter()
                 .any(is_call_extraction_incomplete_marker);
             resolved.push(make_parse_coverage_relation(
                 &file.file_path,
+                artifact_id,
                 completeness.get(&file.file_path),
                 call_extraction_complete,
             ));
@@ -3252,9 +3375,8 @@ fn parse_package_import(module_path: &str) -> Option<(String, String)> {
         return None;
     }
 
-    if module_path.starts_with('@') {
+    if let Some(without_at) = module_path.strip_prefix('@') {
         // Scoped package: @scope/name[/subpath]
-        let without_at = &module_path[1..];
         let parts: Vec<&str> = without_at.splitn(3, '/').collect();
         if parts.len() < 2 {
             return None; // Invalid scoped package
@@ -3331,6 +3453,8 @@ fn resolve_default_export(target_file: &str, universe_entities: &[&Entity]) -> O
 /// Keeps entity indices in-memory to avoid O(N) universe cloning and map rebuilding
 /// per commit during history hydration.
 pub struct IncrementalLinker {
+    /// Graph-assigned artifact identity for every known repository path.
+    artifact_ids: ArtifactIdentityMap,
     /// file_path -> entity_name -> EntityId
     pub entity_by_file_name: HashMap<String, HashMap<String, EntityId>>,
     /// entity_name -> Vec<(file_path, EntityId)>
@@ -3342,6 +3466,9 @@ pub struct IncrementalLinker {
     pub entity_by_bare_name: HashMap<String, Vec<(String, EntityId)>>,
     /// entity_id -> kind
     pub entity_kind_by_id: HashMap<EntityId, EntityKind>,
+    /// entity_id -> parser-reported language. Blind name/locality inference is
+    /// fail-closed against this map.
+    pub entity_language_by_id: HashMap<EntityId, LanguageId>,
     /// C/C++ callee id -> argument-count bounds parsed from its signature. The
     /// incremental mirror of the batch linker's `entity_arity_by_id`; backs
     /// overload arity pruning on the live-edit path.
@@ -3379,10 +3506,12 @@ type ClassBasesByFileCheckpointV1 = Vec<(String, Vec<(String, Vec<String>)>)>;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IncrementalLinkerCheckpointV1 {
+    artifact_ids: Vec<(String, ArtifactId)>,
     entity_by_file_name: Vec<(String, Vec<(String, EntityId)>)>,
     entity_by_name: Vec<(String, Vec<(String, EntityId)>)>,
     entity_by_bare_name: Vec<(String, Vec<(String, EntityId)>)>,
     entity_kind_by_id: Vec<(EntityId, EntityKind)>,
+    entity_language_by_id: Vec<(EntityId, LanguageId)>,
     entity_arity_by_id: Vec<(EntityId, ArityBounds)>,
     known_files: Vec<String>,
     entities_by_file: Vec<(String, Vec<(EntityId, Visibility)>)>,
@@ -3391,7 +3520,7 @@ pub struct IncrementalLinkerCheckpointV1 {
 }
 
 /// Bump whenever [`IncrementalLinkerCheckpointV1`] or linker semantics change.
-pub const INCREMENTAL_LINKER_CHECKPOINT_VERSION: u32 = 1;
+pub const INCREMENTAL_LINKER_CHECKPOINT_VERSION: u32 = 3;
 
 /// Build-time kin-index identity included in the composite hydration
 /// checkpoint version key.
@@ -3429,13 +3558,21 @@ where
     Ok(set)
 }
 
+impl Default for IncrementalLinker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl IncrementalLinker {
     pub fn new() -> Self {
         Self {
+            artifact_ids: HashMap::new(),
             entity_by_file_name: HashMap::new(),
             entity_by_name: HashMap::new(),
             entity_by_bare_name: HashMap::new(),
             entity_kind_by_id: HashMap::new(),
+            entity_language_by_id: HashMap::new(),
             entity_arity_by_id: HashMap::new(),
             known_files: HashSet::new(),
             entities_by_file: HashMap::new(),
@@ -3447,16 +3584,24 @@ impl IncrementalLinker {
     /// Convert the live linker to its canonical checkpoint representation.
     pub fn to_checkpoint_v1(&self) -> IncrementalLinkerCheckpointV1 {
         let Self {
+            artifact_ids,
             entity_by_file_name,
             entity_by_name,
             entity_by_bare_name,
             entity_kind_by_id,
+            entity_language_by_id,
             entity_arity_by_id,
             known_files,
             entities_by_file,
             include_targets_by_file,
             class_bases_by_file,
         } = self;
+
+        let mut artifact_ids: Vec<_> = artifact_ids
+            .iter()
+            .map(|(path, id)| (path.clone(), *id))
+            .collect();
+        artifact_ids.sort_by(|a, b| a.0.cmp(&b.0));
 
         let mut entity_by_file_name: Vec<_> = entity_by_file_name
             .iter()
@@ -3489,6 +3634,12 @@ impl IncrementalLinker {
             .collect();
         entity_kind_by_id.sort_by_key(|(id, _)| *id);
 
+        let mut entity_language_by_id: Vec<_> = entity_language_by_id
+            .iter()
+            .map(|(id, language)| (*id, *language))
+            .collect();
+        entity_language_by_id.sort_by_key(|(id, _)| *id);
+
         let mut entity_arity_by_id: Vec<_> = entity_arity_by_id
             .iter()
             .map(|(id, bounds)| (*id, *bounds))
@@ -3517,10 +3668,12 @@ impl IncrementalLinker {
         class_bases_by_file.sort_by(|a, b| a.0.cmp(&b.0));
 
         IncrementalLinkerCheckpointV1 {
+            artifact_ids,
             entity_by_file_name,
             entity_by_name,
             entity_by_bare_name,
             entity_kind_by_id,
+            entity_language_by_id,
             entity_arity_by_id,
             known_files,
             entities_by_file,
@@ -3532,10 +3685,12 @@ impl IncrementalLinker {
     /// Restore a linker checkpoint, refusing duplicate keys or set members.
     pub fn from_checkpoint_v1(checkpoint: IncrementalLinkerCheckpointV1) -> Result<Self, String> {
         let IncrementalLinkerCheckpointV1 {
+            artifact_ids,
             entity_by_file_name,
             entity_by_name,
             entity_by_bare_name,
             entity_kind_by_id,
+            entity_language_by_id,
             entity_arity_by_id,
             known_files,
             entities_by_file,
@@ -3554,13 +3709,50 @@ impl IncrementalLinker {
             "entity_by_file_name",
         )?;
 
+        let artifact_ids = checkpoint_hash_map(artifact_ids, "artifact_ids")?;
+        let known_files = checkpoint_hash_set(known_files, "known_files")?;
+        let identity_paths = artifact_ids.keys().cloned().collect::<HashSet<_>>();
+        if identity_paths != known_files {
+            let mut missing = known_files
+                .difference(&identity_paths)
+                .cloned()
+                .collect::<Vec<_>>();
+            let mut stale = identity_paths
+                .difference(&known_files)
+                .cloned()
+                .collect::<Vec<_>>();
+            missing.sort();
+            stale.sort();
+            return Err(format!(
+                "incremental-linker checkpoint artifact identity mismatch: \
+                 missing={missing:?}, stale={stale:?}"
+            ));
+        }
+
+        let entity_kind_by_id = checkpoint_hash_map(entity_kind_by_id, "entity_kind_by_id")?;
+        let entity_language_by_id =
+            checkpoint_hash_map(entity_language_by_id, "entity_language_by_id")?;
+        let kind_ids = entity_kind_by_id.keys().copied().collect::<HashSet<_>>();
+        let language_ids = entity_language_by_id
+            .keys()
+            .copied()
+            .collect::<HashSet<_>>();
+        if kind_ids != language_ids {
+            return Err(
+                "incremental-linker checkpoint entity language coverage does not match entity kind coverage"
+                    .to_string(),
+            );
+        }
+
         Ok(Self {
+            artifact_ids,
             entity_by_file_name,
             entity_by_name: checkpoint_hash_map(entity_by_name, "entity_by_name")?,
             entity_by_bare_name: checkpoint_hash_map(entity_by_bare_name, "entity_by_bare_name")?,
-            entity_kind_by_id: checkpoint_hash_map(entity_kind_by_id, "entity_kind_by_id")?,
+            entity_kind_by_id,
+            entity_language_by_id,
             entity_arity_by_id: checkpoint_hash_map(entity_arity_by_id, "entity_arity_by_id")?,
-            known_files: checkpoint_hash_set(known_files, "known_files")?,
+            known_files,
             entities_by_file: checkpoint_hash_map(entities_by_file, "entities_by_file")?,
             include_targets_by_file: checkpoint_hash_map(
                 include_targets_by_file,
@@ -3573,10 +3765,12 @@ impl IncrementalLinker {
     /// Remove a file and all its associated entities from the indexes.
     pub fn remove_file(&mut self, file_path: &str) {
         self.known_files.remove(file_path);
+        self.artifact_ids.remove(file_path);
 
         if let Some(file_entities) = self.entity_by_file_name.remove(file_path) {
             for (entity_name, entity_id) in file_entities {
                 self.entity_kind_by_id.remove(&entity_id);
+                self.entity_language_by_id.remove(&entity_id);
                 self.entity_arity_by_id.remove(&entity_id);
                 if let Some(candidates) = self.entity_by_name.get_mut(&entity_name) {
                     candidates.retain(|(fp, _)| fp != file_path);
@@ -3636,11 +3830,16 @@ impl IncrementalLinker {
         }
     }
 
-    /// Add or update a file and its entities in the indexes.
-    pub fn add_file(&mut self, file_path: &str, entities: &[Entity]) {
+    /// Add or update one explicitly admitted file and its entities.
+    ///
+    /// Artifact identity is mandatory and installed atomically with file
+    /// membership. A remove followed by path reuse therefore cannot inherit
+    /// the removed artifact's identity.
+    pub fn add_file(&mut self, file_path: &str, artifact_id: ArtifactId, entities: &[Entity]) {
         self.remove_file(file_path);
 
         self.known_files.insert(file_path.to_string());
+        self.artifact_ids.insert(file_path.to_string(), artifact_id);
 
         let mut file_entities_map = HashMap::new();
         let mut file_entities_list = Vec::new();
@@ -3648,6 +3847,8 @@ impl IncrementalLinker {
         for entity in entities {
             file_entities_map.insert(entity.name.clone(), entity.id);
             self.entity_kind_by_id.insert(entity.id, entity.kind);
+            self.entity_language_by_id
+                .insert(entity.id, entity.language);
             if let Some(bounds) = callee_arity_bounds(entity) {
                 self.entity_arity_by_id.insert(entity.id, bounds);
             }
@@ -3701,7 +3902,7 @@ fn resolve_default_export_incremental(
 pub fn link_cross_file_incremental(
     files: &[FileParseData],
     linker: &IncrementalLinker,
-) -> Vec<Relation> {
+) -> IndexResult<Vec<Relation>> {
     link_cross_file_incremental_internal(files, linker, None)
 }
 
@@ -3711,7 +3912,7 @@ pub fn link_cross_file_incremental_with_completeness(
     files: &[FileParseData],
     linker: &IncrementalLinker,
     completeness: &FileParseCompletenessMap,
-) -> Vec<Relation> {
+) -> IndexResult<Vec<Relation>> {
     link_cross_file_incremental_internal(files, linker, Some(completeness))
 }
 
@@ -3719,9 +3920,13 @@ fn link_cross_file_incremental_internal(
     files: &[FileParseData],
     linker: &IncrementalLinker,
     completeness: Option<&FileParseCompletenessMap>,
-) -> Vec<Relation> {
+) -> IndexResult<Vec<Relation>> {
     let _span =
         tracing::info_span!("kin.index.link_cross_file_incremental", files = files.len()).entered();
+    require_artifact_identities(
+        linker.known_files.iter().map(String::as_str),
+        &linker.artifact_ids,
+    )?;
 
     // Read-only step-local overlays shared by every per-file resolution. Built
     // once so the parallel per-file pass and its serial reference both resolve
@@ -3758,7 +3963,7 @@ fn link_cross_file_incremental_internal(
             if total_files > 50 {
                 let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
                 let total = found.fetch_add(relations.len(), Ordering::Relaxed) + relations.len();
-                if done % progress_interval == 0 || done == total_files {
+                if done.is_multiple_of(progress_interval) || done == total_files {
                     eprint!(
                         "\r  Linking: [{}/{}] {}% | {} relations | {:.1}s",
                         done,
@@ -3776,7 +3981,12 @@ fn link_cross_file_incremental_internal(
         eprintln!(); // newline after \r progress
     }
 
-    merge_incremental_resolved(per_file_relations, files, linker, completeness)
+    Ok(merge_incremental_resolved(
+        per_file_relations,
+        files,
+        linker,
+        completeness,
+    ))
 }
 
 /// Resolve the name-based relations of a single file into entity-ID relations
@@ -3865,7 +4075,7 @@ fn resolve_one_file_incremental(
             if let Some(dst_id) = resolve_reachable_macro_target_incremental(
                 &file.file_path,
                 &rel.dst_name,
-                &include_graph,
+                include_graph,
                 linker,
             ) {
                 accumulate_relation(
@@ -3905,6 +4115,9 @@ fn resolve_one_file_incremental(
                     }
                 }
             }
+            cross_file_twins.retain(|dst_id| {
+                blind_inference_target_allowed(src_id, *dst_id, &linker.entity_language_by_id)
+            });
             let cross_file_twins =
                 prune_ids_by_arity(cross_file_twins, call_arity, &linker.entity_arity_by_id);
             if !cross_file_twins.is_empty() && cross_file_twins.len() < AMBIGUOUS_CALL_FANOUT_CAP {
@@ -3939,8 +4152,8 @@ fn resolve_one_file_incremental(
                         owner,
                         method,
                         linker,
-                        &import_map,
-                        &class_bases,
+                        import_map,
+                        class_bases,
                     ) {
                         accumulate_relation(
                             &mut resolved,
@@ -4047,6 +4260,16 @@ fn resolve_one_file_incremental(
             ImportPinnedTarget::NoPin => {}
         }
 
+        // Import/module pins above are permitted to cross language boundaries.
+        // Everything below is blind name/locality inference and is therefore
+        // restricted to equal or explicitly compatible language families.
+        let other_file_candidates: Vec<_> = other_file_candidates
+            .into_iter()
+            .filter(|(_, dst_id)| {
+                blind_inference_target_allowed(src_id, *dst_id, &linker.entity_language_by_id)
+            })
+            .collect();
+
         // Arity gate mirroring the batch linker: drop the exact-name candidates
         // an overloaded C/C++ callee's recorded call-site argument count cannot
         // reach before (c)/(c2) bind. Fail-open and a no-op without recorded
@@ -4075,7 +4298,7 @@ fn resolve_one_file_incremental(
                     )
                 });
                 let closure = caller_include_closure
-                    .get_or_insert_with(|| include_closure_depths(&file.file_path, &include_graph));
+                    .get_or_insert_with(|| include_closure_depths(&file.file_path, include_graph));
                 disambiguate_same_name_candidates(
                     &file.file_path,
                     targets,
@@ -4128,7 +4351,14 @@ fn resolve_one_file_incremental(
             if let Some(bare_candidates) = linker.entity_by_bare_name.get(dst_lookup) {
                 let distinct_targets: HashSet<EntityId> = bare_candidates
                     .iter()
-                    .filter(|(fp, _)| fp != &file.file_path)
+                    .filter(|(fp, dst_id)| {
+                        fp != &file.file_path
+                            && blind_inference_target_allowed(
+                                src_id,
+                                *dst_id,
+                                &linker.entity_language_by_id,
+                            )
+                    })
                     .map(|(_, id)| *id)
                     .collect();
                 let distinct_targets =
@@ -4154,15 +4384,15 @@ fn resolve_one_file_incremental(
         if name_fallback_allowed && rel.kind == RelationKind::Calls {
             if let Some((owner, method)) = split_scoped_receiver_method(rel.dst_name.as_str()) {
                 if let Some((owner_file, owner_class)) =
-                    locate_base_class_incremental(&file.file_path, owner, linker, &import_map)
+                    locate_base_class_incremental(&file.file_path, owner, linker, import_map)
                 {
                     if let Some(dst_id) = resolve_inherited_method_incremental(
                         &owner_file,
                         &owner_class,
                         method,
                         linker,
-                        &import_map,
-                        &class_bases,
+                        import_map,
+                        class_bases,
                     ) {
                         accumulate_relation(
                             &mut resolved,
@@ -4314,9 +4544,12 @@ fn merge_incremental_resolved(
     let mut seen_artifact: HashSet<(GraphNodeId, GraphNodeId, RelationKind)> = HashSet::new();
     for file in files {
         for imp in &file.imports {
-            if let Some(rel) =
-                make_artifact_import_relation(&file.file_path, imp, &linker.known_files)
-            {
+            if let Some(rel) = make_artifact_import_relation(
+                &file.file_path,
+                imp,
+                &linker.known_files,
+                &linker.artifact_ids,
+            ) {
                 let key = (rel.src, rel.dst, rel.kind);
                 if seen_artifact.insert(key) {
                     resolved.push(rel);
@@ -4325,7 +4558,7 @@ fn merge_incremental_resolved(
         }
     }
 
-    append_parse_coverage_relations(&mut resolved, files, completeness);
+    append_parse_coverage_relations(&mut resolved, files, &linker.artifact_ids, completeness);
 
     resolved
 }
@@ -4374,16 +4607,161 @@ fn normalize_path(path: &Path) -> PathBuf {
 }
 
 #[cfg(test)]
-// Test fixtures construct artifact endpoints by path because they assert on
-// the linker's snapshot-less output (see `make_artifact_import_relation`),
-// where graph-assigned IDs are path-derived. Matches kin-model's own test
-// module, which also allows the deprecated path constructor.
 mod tests {
     use super::*;
     use kin_model::{
         ArtifactId, EntityKind, EntityMetadata, EntityRole, FilePathId, FingerprintAlgorithm,
         GraphNodeId, Hash256, LanguageId, SemanticFingerprint, SourceSpan, Visibility,
     };
+    use std::sync::{Mutex, OnceLock};
+
+    /// Test-only admission registry. The first fixture that admits a path gets
+    /// a fresh graph-style identity; later assertions resolve that stored ID.
+    /// Identity is never derived from path content.
+    fn admitted_artifact_id(path: &str) -> ArtifactId {
+        static IDS: OnceLock<Mutex<HashMap<String, ArtifactId>>> = OnceLock::new();
+        let mut ids = IDS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .expect("test artifact admission lock poisoned");
+        *ids.entry(path.to_string()).or_insert_with(ArtifactId::new)
+    }
+
+    fn admitted_artifacts<'a>(paths: impl IntoIterator<Item = &'a str>) -> ArtifactIdentityMap {
+        paths
+            .into_iter()
+            .map(|path| (path.to_string(), admitted_artifact_id(path)))
+            .collect()
+    }
+
+    fn artifact_ids_for(
+        files: &[FileParseData],
+        universe_entities: &[Entity],
+    ) -> ArtifactIdentityMap {
+        admitted_artifacts(
+            files.iter().map(|file| file.file_path.as_str()).chain(
+                universe_entities
+                    .iter()
+                    .filter_map(|entity| entity.file_origin.as_ref().map(|path| path.0.as_str())),
+            ),
+        )
+    }
+
+    /// Compatibility-shaped test helpers keep the large linker behavior
+    /// matrix readable while exercising the production identity-required API.
+    #[track_caller]
+    fn link_cross_file(files: &[FileParseData]) -> Vec<Relation> {
+        let universe = files
+            .iter()
+            .flat_map(|file| file.entities.iter().cloned())
+            .collect::<Vec<_>>();
+        let artifact_ids = artifact_ids_for(files, &universe);
+        super::link_cross_file(files, &artifact_ids).expect("test paths were explicitly admitted")
+    }
+
+    #[track_caller]
+    fn link_cross_file_with_completeness(
+        files: &[FileParseData],
+        completeness: &FileParseCompletenessMap,
+    ) -> Vec<Relation> {
+        let universe = files
+            .iter()
+            .flat_map(|file| file.entities.iter().cloned())
+            .collect::<Vec<_>>();
+        let artifact_ids = artifact_ids_for(files, &universe);
+        super::link_cross_file_with_completeness(files, &artifact_ids, completeness)
+            .expect("test paths were explicitly admitted")
+    }
+
+    #[track_caller]
+    fn link_cross_file_against_entities(
+        files: &[FileParseData],
+        universe_entities: &[Entity],
+    ) -> Vec<Relation> {
+        let artifact_ids = artifact_ids_for(files, universe_entities);
+        super::link_cross_file_against_entities(files, universe_entities, &artifact_ids)
+            .expect("test paths were explicitly admitted")
+    }
+
+    fn admitted_incremental_linker(linker: &IncrementalLinker) -> IncrementalLinker {
+        let mut checkpoint = linker.to_checkpoint_v1();
+        let existing = checkpoint
+            .artifact_ids
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect::<HashSet<_>>();
+        for path in &checkpoint.known_files {
+            if !existing.contains(path) {
+                checkpoint
+                    .artifact_ids
+                    .push((path.clone(), admitted_artifact_id(path)));
+            }
+        }
+        checkpoint
+            .artifact_ids
+            .sort_by(|left, right| left.0.cmp(&right.0));
+        IncrementalLinker::from_checkpoint_v1(checkpoint).expect("clone test linker")
+    }
+
+    #[track_caller]
+    fn link_cross_file_incremental(
+        files: &[FileParseData],
+        linker: &IncrementalLinker,
+    ) -> Vec<Relation> {
+        let linker = admitted_incremental_linker(linker);
+        super::link_cross_file_incremental(files, &linker)
+            .expect("test paths were explicitly admitted")
+    }
+
+    #[track_caller]
+    fn link_cross_file_incremental_with_completeness(
+        files: &[FileParseData],
+        linker: &IncrementalLinker,
+        completeness: &FileParseCompletenessMap,
+    ) -> Vec<Relation> {
+        let linker = admitted_incremental_linker(linker);
+        super::link_cross_file_incremental_with_completeness(files, &linker, completeness)
+            .expect("test paths were explicitly admitted")
+    }
+
+    #[test]
+    fn linker_fails_closed_without_graph_assigned_artifact_identity() {
+        let files = [FileParseData {
+            file_path: "src/lib.rs".to_string(),
+            entities: vec![make_entity("run", "src/lib.rs")],
+            relations: Vec::new(),
+            imports: Vec::new(),
+        }];
+        let error = super::link_cross_file(&files, &ArtifactIdentityMap::new())
+            .expect_err("linking must not fabricate an artifact identity");
+        assert!(error
+            .to_string()
+            .contains("missing graph-assigned artifact identity for src/lib.rs"));
+    }
+
+    #[test]
+    fn incremental_remove_then_path_reuse_cannot_retain_artifact_identity() {
+        let mut linker = IncrementalLinker::new();
+        let removed_identity = ArtifactId::new();
+        let replacement_identity = ArtifactId::new();
+
+        linker.add_file("assets/data.bin", removed_identity, &[]);
+        assert_eq!(
+            linker.artifact_ids.get("assets/data.bin"),
+            Some(&removed_identity)
+        );
+
+        linker.remove_file("assets/data.bin");
+        assert!(!linker.known_files.contains("assets/data.bin"));
+        assert!(!linker.artifact_ids.contains_key("assets/data.bin"));
+
+        linker.add_file("assets/data.bin", replacement_identity, &[]);
+        assert_eq!(
+            linker.artifact_ids.get("assets/data.bin"),
+            Some(&replacement_identity)
+        );
+        assert_ne!(removed_identity, replacement_identity);
+    }
 
     #[test]
     fn published_file_parse_carriers_keep_the_pre_completeness_struct_literal_api() {
@@ -4416,12 +4794,16 @@ mod tests {
             };
             for (file, name, id) in entries {
                 linker
+                    .artifact_ids
+                    .insert(file.to_string(), admitted_artifact_id(file));
+                linker
                     .entity_by_file_name
                     .insert(file.to_string(), HashMap::from([(name.to_string(), id)]));
                 linker
                     .entity_by_name
                     .insert(name.to_string(), vec![(file.to_string(), id)]);
                 linker.entity_kind_by_id.insert(id, EntityKind::Function);
+                linker.entity_language_by_id.insert(id, LanguageId::Rust);
                 linker.known_files.insert(file.to_string());
                 linker
                     .entities_by_file
@@ -4669,7 +5051,11 @@ mod tests {
         let batch_reversed = edge_evidence(&link_cross_file(&reversed));
 
         let mut incremental = IncrementalLinker::new();
-        incremental.add_file("src/a.py", &[caller.clone(), target.clone()]);
+        incremental.add_file(
+            "src/a.py",
+            admitted_artifact_id("src/a.py"),
+            &[caller.clone(), target.clone()],
+        );
         let incremental_forward =
             edge_evidence(&link_cross_file_incremental(&forward, &incremental));
         let incremental_reversed =
@@ -4785,7 +5171,11 @@ mod tests {
         let batch_relations = link_cross_file_with_completeness(&files, &completeness);
         let batch = evidence(&batch_relations);
         let mut linker = IncrementalLinker::new();
-        linker.add_file("src/a.py", &[caller.clone(), target.clone()]);
+        linker.add_file(
+            "src/a.py",
+            admitted_artifact_id("src/a.py"),
+            &[caller.clone(), target.clone()],
+        );
         let incremental_relations =
             link_cross_file_incremental_with_completeness(&files, &linker, &completeness);
         let incremental = evidence(&incremental_relations);
@@ -4850,7 +5240,11 @@ mod tests {
         };
 
         let mut linker = IncrementalLinker::new();
-        linker.add_file("src/a.py", &[caller.clone(), target.clone()]);
+        linker.add_file(
+            "src/a.py",
+            admitted_artifact_id("src/a.py"),
+            &[caller.clone(), target.clone()],
+        );
         let compat_batch = link_cross_file(&files);
         let compat_incremental = link_cross_file_incremental(&files, &linker);
         assert_downgraded(&compat_batch);
@@ -4926,7 +5320,11 @@ mod tests {
         let batch = link_cross_file_with_completeness(&files, &completeness);
         let mut linker = IncrementalLinker::new();
         for file in &files {
-            linker.add_file(&file.file_path, &file.entities);
+            linker.add_file(
+                &file.file_path,
+                admitted_artifact_id(&file.file_path),
+                &file.entities,
+            );
         }
         let incremental =
             link_cross_file_incremental_with_completeness(&files, &linker, &completeness);
@@ -4964,10 +5362,11 @@ mod tests {
                 .expect("bad.py coverage marker")
                 .id
         };
-        assert_ne!(
+        assert_eq!(
             marker_id(&batch, CALL_SHAPE_PARSE_COVERAGE_INCOMPLETE_V1),
             marker_id(&restored, CALL_SHAPE_PARSE_COVERAGE_FULL_V1),
-            "Full/Partial transitions need distinct IDs so incremental history replaces the marker"
+            "coverage changes update one graph-owned artifact relation; they must not \
+             fabricate a new relation identity from path or evidence"
         );
     }
 
@@ -5006,7 +5405,11 @@ mod tests {
         let incremental_edge = |files: &[FileParseData]| {
             let mut linker = IncrementalLinker::new();
             for file in files {
-                linker.add_file(&file.file_path, &file.entities);
+                linker.add_file(
+                    &file.file_path,
+                    admitted_artifact_id(&file.file_path),
+                    &file.entities,
+                );
             }
             find_calls_edge(
                 &link_cross_file_incremental(files, &linker),
@@ -5089,11 +5492,11 @@ mod tests {
             .expect("expected Imports relation");
         assert_eq!(
             imports.src,
-            GraphNodeId::Artifact(ArtifactId::seed_from_path("src/routes/api.ts"))
+            GraphNodeId::Artifact(admitted_artifact_id("src/routes/api.ts"))
         );
         assert_eq!(
             imports.dst,
-            GraphNodeId::Artifact(ArtifactId::seed_from_path("src/utils/tools.ts"))
+            GraphNodeId::Artifact(admitted_artifact_id("src/utils/tools.ts"))
         );
         assert_eq!(imports.import_source.as_deref(), Some("../utils/tools"));
     }
@@ -5141,11 +5544,11 @@ mod tests {
             .expect("expected Imports relation");
         assert_eq!(
             imports.src,
-            GraphNodeId::Artifact(ArtifactId::seed_from_path("src/routes/api.ts"))
+            GraphNodeId::Artifact(admitted_artifact_id("src/routes/api.ts"))
         );
         assert_eq!(
             imports.dst,
-            GraphNodeId::Artifact(ArtifactId::seed_from_path("src/utils/tools.ts"))
+            GraphNodeId::Artifact(admitted_artifact_id("src/utils/tools.ts"))
         );
         assert_eq!(imports.import_source.as_deref(), Some("../utils/tools"));
     }
@@ -5268,9 +5671,10 @@ mod tests {
             .iter()
             .flat_map(|file| file.entities.iter().cloned())
             .collect();
+        let artifact_ids = artifact_ids_for(&files, &universe);
 
         let parallel = link_cross_file_against_entities(&files, &universe);
-        let serial = link_cross_file_against_entities_serial(&files, &universe);
+        let serial = link_cross_file_against_entities_serial(&files, &universe, &artifact_ids);
 
         assert_eq!(
             format!("{parallel:?}"),
@@ -5380,6 +5784,7 @@ mod tests {
             .flat_map(|f| f.entities.iter().cloned())
             .collect();
         let ctx = build_link_context(&files, &universe);
+        let artifact_ids = artifact_ids_for(&files, &universe);
 
         // resolve_one_file is deterministic, so building the per-file relations
         // twice yields identical inputs for the two merge paths.
@@ -5392,8 +5797,8 @@ mod tests {
             .map(|f| resolve_one_file(f, &ctx, None))
             .collect();
 
-        let parallel = merge_resolved(pfr_parallel, &files, &ctx, None);
-        let serial = merge_resolved_serial(pfr_serial, &files, &ctx);
+        let parallel = merge_resolved(pfr_parallel, &files, &ctx, &artifact_ids, None);
+        let serial = merge_resolved_serial(pfr_serial, &files, &ctx, &artifact_ids);
 
         assert_eq!(
             format!("{parallel:?}"),
@@ -5440,6 +5845,159 @@ mod tests {
     }
 
     #[test]
+    fn blind_name_inference_does_not_connect_typescript_to_python_same_name() {
+        let caller = make_entity("main", "src/app.ts");
+        let mut unrelated = make_entity("execute", "tools/worker.py");
+        unrelated.language = LanguageId::Python;
+        let files = vec![
+            FileParseData {
+                file_path: "src/app.ts".to_string(),
+                entities: vec![caller.clone()],
+                relations: vec![ExtractedRelation {
+                    call_shape: None,
+                    kind: RelationKind::Calls,
+                    src_name: "main".to_string(),
+                    dst_name: "execute".to_string(),
+                    import_source: None,
+                }],
+                imports: vec![],
+            },
+            FileParseData {
+                file_path: "tools/worker.py".to_string(),
+                entities: vec![unrelated.clone()],
+                relations: vec![],
+                imports: vec![],
+            },
+        ];
+
+        assert!(
+            find_calls_edge(&link_cross_file(&files), &caller, &unrelated).is_none(),
+            "a same-name Python symbol is not evidence for a TypeScript call"
+        );
+
+        let mut linker = IncrementalLinker::new();
+        for file in &files {
+            linker.add_file(
+                &file.file_path,
+                admitted_artifact_id(&file.file_path),
+                &file.entities,
+            );
+        }
+        assert!(
+            find_calls_edge(
+                &link_cross_file_incremental(&files, &linker),
+                &caller,
+                &unrelated,
+            )
+            .is_none(),
+            "incremental linking must apply the same language gate"
+        );
+    }
+
+    #[test]
+    fn blind_inference_requires_language_evidence_for_both_entities() {
+        let src = EntityId::new();
+        let dst = EntityId::new();
+        let mut languages = HashMap::new();
+        assert!(!blind_inference_target_allowed(src, dst, &languages));
+        languages.insert(src, LanguageId::Rust);
+        assert!(!blind_inference_target_allowed(src, dst, &languages));
+    }
+
+    #[test]
+    fn blind_name_inference_allows_documented_javascript_typescript_family() {
+        let caller = make_entity("main", "src/app.ts");
+        let mut target = make_entity("execute", "src/worker.js");
+        target.language = LanguageId::JavaScript;
+        let files = vec![
+            FileParseData {
+                file_path: "src/app.ts".to_string(),
+                entities: vec![caller.clone()],
+                relations: vec![ExtractedRelation {
+                    call_shape: None,
+                    kind: RelationKind::Calls,
+                    src_name: "main".to_string(),
+                    dst_name: "execute".to_string(),
+                    import_source: None,
+                }],
+                imports: vec![],
+            },
+            FileParseData {
+                file_path: "src/worker.js".to_string(),
+                entities: vec![target.clone()],
+                relations: vec![],
+                imports: vec![],
+            },
+        ];
+
+        let batch = link_cross_file(&files);
+        assert!(find_calls_edge(&batch, &caller, &target).is_some());
+
+        let mut linker = IncrementalLinker::new();
+        for file in &files {
+            linker.add_file(
+                &file.file_path,
+                admitted_artifact_id(&file.file_path),
+                &file.entities,
+            );
+        }
+        let incremental = link_cross_file_incremental(&files, &linker);
+        assert!(find_calls_edge(&incremental, &caller, &target).is_some());
+    }
+
+    #[test]
+    fn explicit_import_evidence_may_connect_typescript_to_python() {
+        let caller = make_entity("handler", "src/routes/api.ts");
+        let mut target = make_entity("execute", "src/utils/worker.py");
+        target.language = LanguageId::Python;
+        let files = vec![
+            FileParseData {
+                file_path: "src/routes/api.ts".to_string(),
+                entities: vec![caller.clone()],
+                relations: vec![ExtractedRelation {
+                    call_shape: None,
+                    kind: RelationKind::Calls,
+                    src_name: "handler".to_string(),
+                    dst_name: "execute".to_string(),
+                    import_source: None,
+                }],
+                imports: vec![FileImport {
+                    module_path: "../utils/worker".to_string(),
+                    specifiers: vec![kin_parser::ImportedName {
+                        local_name: "execute".to_string(),
+                        original_name: None,
+                        is_default: false,
+                    }],
+                }],
+            },
+            FileParseData {
+                file_path: "src/utils/worker.py".to_string(),
+                entities: vec![target.clone()],
+                relations: vec![],
+                imports: vec![],
+            },
+        ];
+
+        let batch = link_cross_file(&files);
+        let batch_edge = find_calls_edge(&batch, &caller, &target)
+            .expect("explicit module/import evidence may cross languages");
+        assert_eq!(batch_edge.confidence, 0.95);
+
+        let mut linker = IncrementalLinker::new();
+        for file in &files {
+            linker.add_file(
+                &file.file_path,
+                admitted_artifact_id(&file.file_path),
+                &file.entities,
+            );
+        }
+        let incremental = link_cross_file_incremental(&files, &linker);
+        let incremental_edge = find_calls_edge(&incremental, &caller, &target)
+            .expect("incremental import evidence may cross languages");
+        assert_eq!(incremental_edge.confidence, 0.95);
+    }
+
+    #[test]
     fn macro_use_resolves_through_reachable_include() {
         let caller = make_entity("main", "src/app.cpp");
         let macro_def = make_macro_entity("JSON_PRIVATE_UNLESS_TESTED", "include/json/macros.hpp");
@@ -5483,11 +6041,9 @@ mod tests {
         assert!(
             result.iter().any(|rel| {
                 rel.kind == RelationKind::Includes
-                    && rel.src == GraphNodeId::Artifact(ArtifactId::seed_from_path("src/app.cpp"))
+                    && rel.src == GraphNodeId::Artifact(admitted_artifact_id("src/app.cpp"))
                     && rel.dst
-                        == GraphNodeId::Artifact(ArtifactId::seed_from_path(
-                            "include/json/macros.hpp",
-                        ))
+                        == GraphNodeId::Artifact(admitted_artifact_id("include/json/macros.hpp"))
             }),
             "include directive should be preserved as an artifact edge"
         );
@@ -5545,7 +6101,7 @@ mod tests {
             &known_files,
             |path| {
                 if known_files.contains(path) {
-                    Some(ArtifactId::seed_from_path(path))
+                    Some(admitted_artifact_id(path))
                 } else {
                     None
                 }
@@ -5556,7 +6112,7 @@ mod tests {
         assert!(relations.iter().all(|rel| {
             rel.kind == RelationKind::DerivedFrom
                 && rel.src
-                    == GraphNodeId::Artifact(ArtifactId::seed_from_path(
+                    == GraphNodeId::Artifact(admitted_artifact_id(
                         "single_include/nlohmann/json.hpp",
                     ))
         }));
@@ -5564,7 +6120,7 @@ mod tests {
             .iter()
             .find(|rel| {
                 rel.dst
-                    == GraphNodeId::Artifact(ArtifactId::seed_from_path(
+                    == GraphNodeId::Artifact(admitted_artifact_id(
                         "include/nlohmann/detail/exceptions.hpp",
                     ))
             })
@@ -5810,8 +6366,16 @@ void f();
         let callee = make_entity("Reconciler::project_overlay_to_files", "src/reconciler.rs");
 
         let mut linker = IncrementalLinker::new();
-        linker.add_file("src/wiring.rs", std::slice::from_ref(&caller));
-        linker.add_file("src/reconciler.rs", std::slice::from_ref(&callee));
+        linker.add_file(
+            "src/wiring.rs",
+            admitted_artifact_id("src/wiring.rs"),
+            std::slice::from_ref(&caller),
+        );
+        linker.add_file(
+            "src/reconciler.rs",
+            admitted_artifact_id("src/reconciler.rs"),
+            std::slice::from_ref(&callee),
+        );
 
         let files = vec![FileParseData {
             file_path: "src/wiring.rs".to_string(),
@@ -5851,20 +6415,40 @@ void f();
         // determinism-sensitive path).
         let common_a = make_entity("common", "src/common_a.ts");
         let common_b = make_entity("common", "src/common_b.ts");
-        linker.add_file("src/common_a.ts", std::slice::from_ref(&common_a));
-        linker.add_file("src/common_b.ts", std::slice::from_ref(&common_b));
+        linker.add_file(
+            "src/common_a.ts",
+            admitted_artifact_id("src/common_a.ts"),
+            std::slice::from_ref(&common_a),
+        );
+        linker.add_file(
+            "src/common_b.ts",
+            admitted_artifact_id("src/common_b.ts"),
+            std::slice::from_ref(&common_b),
+        );
 
         // A single unambiguous cross-file call target.
         let target = make_entity("shared_target", "src/target.ts");
-        linker.add_file("src/target.ts", std::slice::from_ref(&target));
+        linker.add_file(
+            "src/target.ts",
+            admitted_artifact_id("src/target.ts"),
+            std::slice::from_ref(&target),
+        );
 
         // Two receiver-method implementors sharing a bare leaf `work`, so bare
         // `work` calls fan out through `sorted_fanout_targets` (a canonical sort
         // whose stability the parallel pass must preserve).
         let widget_work = make_entity("Widget::work", "src/impl_foo.ts");
         let gadget_work = make_entity("Gadget::work", "src/impl_bar.ts");
-        linker.add_file("src/impl_foo.ts", std::slice::from_ref(&widget_work));
-        linker.add_file("src/impl_bar.ts", std::slice::from_ref(&gadget_work));
+        linker.add_file(
+            "src/impl_foo.ts",
+            admitted_artifact_id("src/impl_foo.ts"),
+            std::slice::from_ref(&widget_work),
+        );
+        linker.add_file(
+            "src/impl_bar.ts",
+            admitted_artifact_id("src/impl_bar.ts"),
+            std::slice::from_ref(&gadget_work),
+        );
 
         // Many caller files spread the parallel pass across worker threads. Each
         // mixes a same-file call, an unambiguous cross-file call, an ambiguous
@@ -5873,7 +6457,7 @@ void f();
             let path = format!("src/caller{i}.ts");
             let a = make_entity(&format!("a{i}"), &path);
             let b = make_entity(&format!("b{i}"), &path);
-            linker.add_file(&path, &[a.clone(), b.clone()]);
+            linker.add_file(&path, admitted_artifact_id(&path), &[a.clone(), b.clone()]);
             files.push(FileParseData {
                 file_path: path,
                 entities: vec![a, b],
@@ -5947,9 +6531,21 @@ void f();
         let bar_new = make_entity("Bar::new", "src/bar.rs");
 
         let mut linker = IncrementalLinker::new();
-        linker.add_file("src/caller.rs", std::slice::from_ref(&caller));
-        linker.add_file("src/foo.rs", std::slice::from_ref(&foo_new));
-        linker.add_file("src/bar.rs", std::slice::from_ref(&bar_new));
+        linker.add_file(
+            "src/caller.rs",
+            admitted_artifact_id("src/caller.rs"),
+            std::slice::from_ref(&caller),
+        );
+        linker.add_file(
+            "src/foo.rs",
+            admitted_artifact_id("src/foo.rs"),
+            std::slice::from_ref(&foo_new),
+        );
+        linker.add_file(
+            "src/bar.rs",
+            admitted_artifact_id("src/bar.rs"),
+            std::slice::from_ref(&bar_new),
+        );
 
         let files = vec![FileParseData {
             file_path: "src/caller.rs".to_string(),
@@ -6132,11 +6728,11 @@ void f();
             .expect("expected Imports relation");
         assert_eq!(
             imports.src,
-            GraphNodeId::Artifact(ArtifactId::seed_from_path("src/api.ts"))
+            GraphNodeId::Artifact(admitted_artifact_id("src/api.ts"))
         );
         assert_eq!(
             imports.dst,
-            GraphNodeId::Artifact(ArtifactId::seed_from_path("src/utils.ts"))
+            GraphNodeId::Artifact(admitted_artifact_id("src/utils.ts"))
         );
         assert_eq!(imports.import_source.as_deref(), Some("./utils"));
     }
@@ -6173,11 +6769,11 @@ void f();
         assert_eq!(result[0].kind, RelationKind::Imports);
         assert_eq!(
             result[0].src,
-            GraphNodeId::Artifact(ArtifactId::seed_from_path("src/routes/api.ts"))
+            GraphNodeId::Artifact(admitted_artifact_id("src/routes/api.ts"))
         );
         assert_eq!(
             result[0].dst,
-            GraphNodeId::Artifact(ArtifactId::seed_from_path("src/utils/tools.ts"))
+            GraphNodeId::Artifact(admitted_artifact_id("src/utils/tools.ts"))
         );
         assert_eq!(result[0].import_source.as_deref(), Some("../utils/tools"));
     }
@@ -6218,11 +6814,11 @@ void f();
         assert_eq!(result[0].kind, RelationKind::Includes);
         assert_eq!(
             result[0].src,
-            GraphNodeId::Artifact(ArtifactId::seed_from_path("src/main.cpp"))
+            GraphNodeId::Artifact(admitted_artifact_id("src/main.cpp"))
         );
         assert_eq!(
             result[0].dst,
-            GraphNodeId::Artifact(ArtifactId::seed_from_path(
+            GraphNodeId::Artifact(admitted_artifact_id(
                 "include/nlohmann/detail/input/binary_reader.hpp"
             ))
         );
@@ -6311,11 +6907,11 @@ void f();
         assert_eq!(result[0].kind, RelationKind::Imports);
         assert_eq!(
             result[0].src,
-            GraphNodeId::Artifact(ArtifactId::seed_from_path("src/api.ts"))
+            GraphNodeId::Artifact(admitted_artifact_id("src/api.ts"))
         );
         assert_eq!(
             result[0].dst,
-            GraphNodeId::Artifact(ArtifactId::seed_from_path("src/util.ts"))
+            GraphNodeId::Artifact(admitted_artifact_id("src/util.ts"))
         );
     }
 
@@ -6949,8 +7545,16 @@ void f();
         let target = rust_fn("run", "src/work.rs");
 
         let mut linker = IncrementalLinker::new();
-        linker.add_file("src/caller.rs", std::slice::from_ref(&caller));
-        linker.add_file("src/work.rs", std::slice::from_ref(&target));
+        linker.add_file(
+            "src/caller.rs",
+            admitted_artifact_id("src/caller.rs"),
+            std::slice::from_ref(&caller),
+        );
+        linker.add_file(
+            "src/work.rs",
+            admitted_artifact_id("src/work.rs"),
+            std::slice::from_ref(&target),
+        );
 
         let files = vec![FileParseData {
             file_path: "src/caller.rs".to_string(),
@@ -6971,8 +7575,16 @@ void f();
         let method = make_method_entity("Widget::make", "src/model.rs");
 
         let mut linker = IncrementalLinker::new();
-        linker.add_file("src/caller.rs", std::slice::from_ref(&caller));
-        linker.add_file("src/model.rs", std::slice::from_ref(&method));
+        linker.add_file(
+            "src/caller.rs",
+            admitted_artifact_id("src/caller.rs"),
+            std::slice::from_ref(&caller),
+        );
+        linker.add_file(
+            "src/model.rs",
+            admitted_artifact_id("src/model.rs"),
+            std::slice::from_ref(&method),
+        );
 
         let files = vec![FileParseData {
             file_path: "src/caller.rs".to_string(),
@@ -6999,10 +7611,26 @@ void f();
         let run_c = rust_fn("run", "src/c.rs");
 
         let mut linker = IncrementalLinker::new();
-        linker.add_file("src/caller.rs", std::slice::from_ref(&caller));
-        linker.add_file("src/a.rs", std::slice::from_ref(&run_a));
-        linker.add_file("src/b.rs", std::slice::from_ref(&run_b));
-        linker.add_file("src/c.rs", std::slice::from_ref(&run_c));
+        linker.add_file(
+            "src/caller.rs",
+            admitted_artifact_id("src/caller.rs"),
+            std::slice::from_ref(&caller),
+        );
+        linker.add_file(
+            "src/a.rs",
+            admitted_artifact_id("src/a.rs"),
+            std::slice::from_ref(&run_a),
+        );
+        linker.add_file(
+            "src/b.rs",
+            admitted_artifact_id("src/b.rs"),
+            std::slice::from_ref(&run_b),
+        );
+        linker.add_file(
+            "src/c.rs",
+            admitted_artifact_id("src/c.rs"),
+            std::slice::from_ref(&run_c),
+        );
 
         let files = vec![FileParseData {
             file_path: "src/caller.rs".to_string(),
@@ -7146,8 +7774,16 @@ void f();
         let definition = rust_fn("compute", "src/impl.rs");
 
         let mut linker = IncrementalLinker::new();
-        linker.add_file("src/caller.rs", &[caller.clone(), prototype.clone()]);
-        linker.add_file("src/impl.rs", std::slice::from_ref(&definition));
+        linker.add_file(
+            "src/caller.rs",
+            admitted_artifact_id("src/caller.rs"),
+            &[caller.clone(), prototype.clone()],
+        );
+        linker.add_file(
+            "src/impl.rs",
+            admitted_artifact_id("src/impl.rs"),
+            std::slice::from_ref(&definition),
+        );
 
         let files = vec![FileParseData {
             file_path: "src/caller.rs".to_string(),
@@ -7325,7 +7961,11 @@ void f();
 
             let mut linker = IncrementalLinker::new();
             for file in &files {
-                linker.add_file(&file.file_path, &file.entities);
+                linker.add_file(
+                    &file.file_path,
+                    admitted_artifact_id(&file.file_path),
+                    &file.entities,
+                );
             }
             let incremental = calls_set(&link_cross_file_incremental(&files, &linker));
 
@@ -7538,10 +8178,19 @@ void f();
         // Decoy first: bucket order would pick it without the pin.
         linker.add_file(
             "pkg/cmd/project/create/create.go",
+            admitted_artifact_id("pkg/cmd/project/create/create.go"),
             std::slice::from_ref(&decoy),
         );
-        linker.add_file("pkg/cmd/pr/create/create.go", std::slice::from_ref(&target));
-        linker.add_file("pkg/cmd/pr/pr.go", std::slice::from_ref(&caller));
+        linker.add_file(
+            "pkg/cmd/pr/create/create.go",
+            admitted_artifact_id("pkg/cmd/pr/create/create.go"),
+            std::slice::from_ref(&target),
+        );
+        linker.add_file(
+            "pkg/cmd/pr/pr.go",
+            admitted_artifact_id("pkg/cmd/pr/pr.go"),
+            std::slice::from_ref(&caller),
+        );
 
         let files = vec![FileParseData {
             file_path: "pkg/cmd/pr/pr.go".to_string(),
@@ -7568,10 +8217,19 @@ void f();
         let caller = go_fn("TestCreateRun", "pkg/cmd/pr/create/create_test.go");
 
         let mut linker = IncrementalLinker::new();
-        linker.add_file("pkg/cmd/label/create.go", std::slice::from_ref(&decoy));
-        linker.add_file("pkg/cmd/pr/create/create.go", std::slice::from_ref(&target));
+        linker.add_file(
+            "pkg/cmd/label/create.go",
+            admitted_artifact_id("pkg/cmd/label/create.go"),
+            std::slice::from_ref(&decoy),
+        );
+        linker.add_file(
+            "pkg/cmd/pr/create/create.go",
+            admitted_artifact_id("pkg/cmd/pr/create/create.go"),
+            std::slice::from_ref(&target),
+        );
         linker.add_file(
             "pkg/cmd/pr/create/create_test.go",
+            admitted_artifact_id("pkg/cmd/pr/create/create_test.go"),
             std::slice::from_ref(&caller),
         );
 
@@ -7789,15 +8447,22 @@ void f();
         // closure signal.
         linker.add_file(
             "single_include/catch2/catch.hpp",
+            admitted_artifact_id("single_include/catch2/catch.hpp"),
             std::slice::from_ref(&bundled),
         );
         linker.add_file(
             "include/internal/catch_tostring.h",
+            admitted_artifact_id("include/internal/catch_tostring.h"),
             std::slice::from_ref(&target),
         );
-        linker.add_file("include/catch.hpp", &[]);
+        linker.add_file(
+            "include/catch.hpp",
+            admitted_artifact_id("include/catch.hpp"),
+            &[],
+        );
         linker.add_file(
             "projects/SelfTest/ToStringTests.cpp",
+            admitted_artifact_id("projects/SelfTest/ToStringTests.cpp"),
             std::slice::from_ref(&caller),
         );
         // Earlier step: the umbrella header was parsed and its include edge
@@ -7837,14 +8502,17 @@ void f();
         let mut linker = IncrementalLinker::new();
         linker.add_file(
             "single_include/catch2/catch.hpp",
+            admitted_artifact_id("single_include/catch2/catch.hpp"),
             &[bundled.clone(), bundled_extra_a, bundled_extra_b],
         );
         linker.add_file(
             "include/internal/catch_session.h",
+            admitted_artifact_id("include/internal/catch_session.h"),
             std::slice::from_ref(&target),
         );
         linker.add_file(
             "projects/SelfTest/MainTests.cpp",
+            admitted_artifact_id("projects/SelfTest/MainTests.cpp"),
             std::slice::from_ref(&caller),
         );
 
@@ -7877,15 +8545,22 @@ void f();
         let mut linker = IncrementalLinker::new();
         linker.add_file(
             "single_include/catch2/catch.hpp",
+            admitted_artifact_id("single_include/catch2/catch.hpp"),
             std::slice::from_ref(&bundled),
         );
         linker.add_file(
             "include/internal/catch_tostring.h",
+            admitted_artifact_id("include/internal/catch_tostring.h"),
             std::slice::from_ref(&target),
         );
-        linker.add_file("include/catch.hpp", &[]);
+        linker.add_file(
+            "include/catch.hpp",
+            admitted_artifact_id("include/catch.hpp"),
+            &[],
+        );
         linker.add_file(
             "projects/SelfTest/ToStringTests.cpp",
+            admitted_artifact_id("projects/SelfTest/ToStringTests.cpp"),
             std::slice::from_ref(&caller),
         );
         linker.record_file_includes(&[FileParseData {

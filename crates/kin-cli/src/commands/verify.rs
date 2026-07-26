@@ -575,7 +575,7 @@ where
 
     for delta in &change.entity_deltas {
         match delta {
-            EntityDelta::Added(entity) => {
+            EntityDelta::Added { new: entity } => {
                 let plan = build_verification_plan_for_entity(graph, entity.clone(), depth)?;
                 for test in &plan.tests {
                     if seen_test_ids.insert(test.test_id) {
@@ -593,7 +593,7 @@ where
                 }
                 entity_plans.push(plan);
             }
-            EntityDelta::Removed(entity_id) => removed_entities.push(*entity_id),
+            EntityDelta::Removed { old } => removed_entities.push(old.id),
         }
     }
     let latest_test_runs = build_latest_test_runs(graph, &tests)?;
@@ -788,14 +788,9 @@ where
 {
     let change_id = match change_id {
         Some(hash) => parse_change_id(hash)?,
-        None => {
-            let current = kin_core::read_current_branch(layout)?;
-            let branch = graph
-                .get_branch(&current)
-                .map_err(|err| anyhow!(err.to_string()))?
-                .ok_or_else(|| anyhow!("branch '{}' not found", current))?;
-            branch.head
-        }
+        None => crate::commands::repository_authority::ActiveRepositoryAuthority::open(layout)?
+            .current_change_id()?
+            .ok_or_else(|| anyhow!("repository-v6 workspace head is unborn"))?,
     };
 
     graph
@@ -929,15 +924,11 @@ fn store_evidence_blob(layout: &kin_core::KinLayout, evidence_text: &str) -> Opt
     bytes.copy_from_slice(&result);
     let hash = Hash256::from_bytes(bytes);
 
-    let blob_dir = layout.objects_dir();
-    if blob_dir.exists() {
-        let hex = hash.to_string();
-        let shard_dir = blob_dir.join(&hex[..2]);
-        let _ = std::fs::create_dir_all(&shard_dir);
-        let blob_path = shard_dir.join(&hex[2..]);
-        let _ = std::fs::write(&blob_path, evidence_text.as_bytes());
-    }
-
+    let authority =
+        crate::commands::repository_authority::ActiveRepositoryAuthority::open(layout).ok()?;
+    authority
+        .save_source_blob(hash, evidence_text.as_bytes())
+        .ok()?;
     Some(hash)
 }
 
@@ -945,7 +936,7 @@ fn store_evidence_blob(layout: &kin_core::KinLayout, evidence_text: &str) -> Opt
 mod tests {
     use super::*;
     use kin_model::{
-        AuthorId, BranchName, EntityId, EntityKind, EntityMetadata, EntityRole, FilePathId,
+        AuthorId, ChangeOrigin, EntityId, EntityKind, EntityMetadata, EntityRole, FilePathId,
         FingerprintAlgorithm, GraphNodeId, IdentityRef, LanguageId, Priority, ProvenanceStore,
         Relation, RelationId, RelationKind, RelationOrigin, SemanticFingerprint, TestKind,
         Visibility, WorkStatus, WorkStore,
@@ -1178,6 +1169,7 @@ mod tests {
         let change = SemanticChange {
             id: SemanticChangeId::from_hash(Hash256::from_bytes([7; 32])),
             parents: vec![],
+            origin: ChangeOrigin::Native,
             timestamp: Timestamp::now(),
             author: AuthorId::new("test"),
             message: "touch checkout core".into(),
@@ -1186,12 +1178,12 @@ mod tests {
                 new: callee.clone(),
             }],
             relation_deltas: vec![],
-            artifact_deltas: vec![],
+            tree_deltas: vec![],
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],
             risk_summary: None,
-            authored_on: Some(BranchName::new("main")),
+            admission_policy_delta: None,
         };
 
         let plan = build_change_verification_plan(graph.as_ref(), &change, 1).unwrap();

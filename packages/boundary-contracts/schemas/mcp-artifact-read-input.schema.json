@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "kin://contracts/mcp-artifact-read-input",
+  "description": "Lossless selector for reading one graph-owned repository artifact at an exact semantic change.",
+  "type": "object",
+  "properties": {
+    "artifact_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "description": "Stable graph-assigned artifact identity."
+    },
+    "path": {
+      "type": "object",
+      "description": "Byte-exact repository path. Display labels are not accepted as authority.",
+      "properties": {
+        "bytes_hex": {
+          "type": "string",
+          "pattern": "^(?:[0-9a-f]{2})+$"
+        }
+      },
+      "required": ["bytes_hex"],
+      "additionalProperties": false
+    },
+    "source_change_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "Exact semantic change ID. Defaults to the current graph branch head."
+    }
+  },
+  "anyOf": [
+    { "required": ["artifact_id"] },
+    { "required": ["path"] }
+  ],
+  "additionalProperties": false
+}

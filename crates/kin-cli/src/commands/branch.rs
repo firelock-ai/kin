@@ -1,17 +1,54 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
+//! Repository-v6 branch reads and exact ref transactions.
+
 use anyhow::{Context, Result};
-use kin_model::{Branch, BranchName, ChangeStore, Hash256, SemanticChangeId};
+use kin_model::{
+    compute_resolved_tree_hash, AuthorId, EffectiveAdmissionPolicyStamp, OperationId,
+    RefExpectation, RefMutation, RefName, RefTarget, RefUpdatePolicy, RepoPath,
+    RepositoryCommitReceipt, RepositoryId, RepositoryTransaction, ResolvedTree, RootBundle,
+    TreeEntry, WorkspaceExpectation, WorkspaceHead, WorkspaceId, WorkspaceMutation,
+    REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+};
 use serde::{Deserialize, Serialize};
+
+use super::repository_authority::{parse_ref_name, ActiveRepositoryAuthority};
+
+pub const BRANCH_LIST_SCHEMA: &str = "kin.branch-list.v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum BranchRequest {
     List,
-    Create { name: String },
-    Delete { name: String },
-    Switch { name: String },
+    Create { name: RefName },
+    Delete { name: RefName },
+    Switch { name: RefName },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BranchListEntry {
+    pub name: RefName,
+    pub target: RefTarget,
+    pub active: bool,
+    pub default: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BranchListReport {
+    pub schema: String,
+    pub authority: String,
+    pub repository_id: RepositoryId,
+    pub authority_generation: u64,
+    pub roots: RootBundle,
+    pub workspace_id: WorkspaceId,
+    pub workspace_generation: u64,
+    pub workspace_head: WorkspaceHead,
+    pub repository_ref_count: usize,
+    pub branch_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_ref: Option<RefName>,
+    pub branches: Vec<BranchListEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -20,26 +57,485 @@ pub struct BranchResponse {
     pub lines: Vec<String>,
     #[serde(default)]
     pub mutated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report: Option<BranchListReport>,
 }
 
-pub async fn list() -> Result<()> {
-    let layout = discover_layout()?;
-    print_branch_response(run_daemon_branch(&layout, &BranchRequest::List).await?)
+pub fn inspect(layout: &kin_core::KinLayout) -> Result<BranchListReport> {
+    let authority = ActiveRepositoryAuthority::open(layout)?;
+    let lease = authority.manager().read_authority();
+    let metadata = lease.metadata();
+    let workspace = metadata
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.workspace_id == authority.workspace_id)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "repository {} has no workspace {} in repository-v6 authority",
+                authority.repository_id,
+                authority.workspace_id
+            )
+        })?;
+    let active_ref = match &workspace.head {
+        WorkspaceHead::Symbolic { target } => Some(target),
+        WorkspaceHead::Detached { .. } => None,
+    };
+    let default_ref = metadata.ref_state.default_ref.clone();
+    let branches = metadata
+        .ref_state
+        .refs
+        .iter()
+        .filter(|repository_ref| repository_ref.name.is_branch())
+        .map(|repository_ref| BranchListEntry {
+            name: repository_ref.name.clone(),
+            target: repository_ref.target.clone(),
+            active: active_ref == Some(&repository_ref.name),
+            default: default_ref.as_ref() == Some(&repository_ref.name),
+        })
+        .collect::<Vec<_>>();
+
+    Ok(BranchListReport {
+        schema: BRANCH_LIST_SCHEMA.to_string(),
+        authority: "repository-v6".to_string(),
+        repository_id: authority.repository_id.clone(),
+        authority_generation: lease.roots().generation,
+        roots: lease.roots().clone(),
+        workspace_id: workspace.workspace_id,
+        workspace_generation: workspace.generation,
+        workspace_head: workspace.head.clone(),
+        repository_ref_count: metadata.ref_state.refs.len(),
+        branch_count: branches.len(),
+        default_ref,
+        branches,
+    })
 }
 
-pub async fn create(name: String) -> Result<()> {
+pub fn list(json: bool) -> Result<()> {
     let layout = discover_layout()?;
-    print_branch_response(run_daemon_branch(&layout, &BranchRequest::Create { name }).await?)
+    let report = inspect(&layout)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        for line in render_lines(&report) {
+            println!("{line}");
+        }
+    }
+    Ok(())
 }
 
-pub async fn delete(name: String) -> Result<()> {
+pub fn create(name: RefName) -> Result<()> {
     let layout = discover_layout()?;
-    print_branch_response(run_daemon_branch(&layout, &BranchRequest::Delete { name }).await?)
+    let response = create_at(&layout, &name)?;
+    print_lines(response);
+    Ok(())
 }
 
-pub async fn switch(name: String) -> Result<()> {
+pub fn delete(name: RefName) -> Result<()> {
     let layout = discover_layout()?;
-    print_branch_response(run_daemon_branch(&layout, &BranchRequest::Switch { name }).await?)
+    let response = delete_at(&layout, &name)?;
+    print_lines(response);
+    Ok(())
+}
+
+pub fn switch(name: RefName) -> Result<()> {
+    let layout = discover_layout()?;
+    let response = switch_at(&layout, &name)?;
+    print_lines(response);
+    Ok(())
+}
+
+pub fn parse_branch_ref(name: Option<&str>, ref_hex: Option<&str>) -> Result<RefName> {
+    let name = match (name, ref_hex) {
+        (Some(name), None) => parse_ref_name(name)?,
+        (None, Some(encoded)) => {
+            let bytes = hex::decode(encoded)
+                .with_context(|| format!("invalid repository ref hex '{encoded}'"))?;
+            if hex::encode(&bytes) != encoded {
+                anyhow::bail!(
+                    "repository ref hex must use canonical lowercase hexadecimal encoding"
+                );
+            }
+            RefName::from_bytes(bytes)
+                .map_err(|error| anyhow::anyhow!("invalid byte-exact repository ref: {error}"))?
+        }
+        (Some(_), Some(_)) => {
+            anyhow::bail!("provide either a branch name or --ref-hex, not both")
+        }
+        (None, None) => anyhow::bail!("provide a branch name or --ref-hex"),
+    };
+    require_branch_ref(&name)?;
+    Ok(name)
+}
+
+pub fn execute_branch_request(
+    layout: &kin_core::KinLayout,
+    _graph: &kin_db::InMemoryGraph,
+    request: &BranchRequest,
+) -> Result<BranchResponse> {
+    match request {
+        BranchRequest::List => {
+            let report = inspect(layout)?;
+            Ok(BranchResponse {
+                lines: render_lines(&report),
+                mutated: false,
+                report: Some(report),
+            })
+        }
+        BranchRequest::Create { name } => create_at(layout, name),
+        BranchRequest::Delete { name } => delete_at(layout, name),
+        BranchRequest::Switch { name } => switch_at(layout, name),
+    }
+}
+
+fn create_at(layout: &kin_core::KinLayout, name: &RefName) -> Result<BranchResponse> {
+    require_branch_ref(name)?;
+    let authority = ActiveRepositoryAuthority::open(layout)?;
+    let receipt = create_ref_with_hook(&authority, name, || Ok(()))?;
+    let target = receipt
+        .operation
+        .ref_mutations
+        .first()
+        .and_then(|mutation| mutation.new_target.as_ref())
+        .expect("branch creation receipt contains its target");
+    Ok(BranchResponse {
+        lines: vec![format!(
+            "Created {} at {} (authority generation {})",
+            name,
+            render_target(target),
+            receipt.generation
+        )],
+        mutated: true,
+        report: None,
+    })
+}
+
+fn create_ref_with_hook(
+    authority: &ActiveRepositoryAuthority,
+    name: &RefName,
+    before_commit: impl FnOnce() -> Result<()>,
+) -> Result<RepositoryCommitReceipt> {
+    let lease = authority.manager().read_authority();
+    let metadata = lease.metadata();
+    if metadata
+        .ref_state
+        .refs
+        .iter()
+        .any(|repository_ref| &repository_ref.name == name)
+    {
+        anyhow::bail!("branch {name} already exists");
+    }
+    let workspace = metadata
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.workspace_id == authority.workspace_id)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "repository {} has no workspace {} in repository-v6 authority",
+                authority.repository_id,
+                authority.workspace_id
+            )
+        })?;
+    let target = workspace.base_target.clone().ok_or_else(|| {
+        anyhow::anyhow!(
+            "cannot create branch {name} from unborn workspace {}",
+            workspace.workspace_id
+        )
+    })?;
+    if matches!(target, RefTarget::Symbolic { .. }) {
+        anyhow::bail!(
+            "workspace {} base target is symbolic instead of resolved",
+            workspace.workspace_id
+        );
+    }
+    let transaction = ref_transaction(
+        authority,
+        lease.roots().clone(),
+        "create exact repository branch",
+        RefMutation {
+            name: name.clone(),
+            expected: RefExpectation::MustNotExist,
+            new_target: Some(target),
+            policy: RefUpdatePolicy::FastForwardOnly,
+        },
+    );
+    drop(lease);
+    before_commit()?;
+    authority
+        .manager()
+        .commit_repository_transaction(transaction)
+        .with_context(|| format!("create repository-v6 branch {name}"))
+}
+
+fn delete_at(layout: &kin_core::KinLayout, name: &RefName) -> Result<BranchResponse> {
+    require_branch_ref(name)?;
+    let authority = ActiveRepositoryAuthority::open(layout)?;
+    let receipt = delete_ref_with_hook(&authority, name, || Ok(()))?;
+    Ok(BranchResponse {
+        lines: vec![format!(
+            "Deleted {} (authority generation {})",
+            name, receipt.generation
+        )],
+        mutated: true,
+        report: None,
+    })
+}
+
+fn delete_ref_with_hook(
+    authority: &ActiveRepositoryAuthority,
+    name: &RefName,
+    before_commit: impl FnOnce() -> Result<()>,
+) -> Result<RepositoryCommitReceipt> {
+    let lease = authority.manager().read_authority();
+    let metadata = lease.metadata();
+    let target = metadata
+        .ref_state
+        .refs
+        .iter()
+        .find(|repository_ref| &repository_ref.name == name)
+        .map(|repository_ref| repository_ref.target.clone())
+        .ok_or_else(|| anyhow::anyhow!("branch {name} does not exist"))?;
+    if metadata.ref_state.default_ref.as_ref() == Some(name) {
+        anyhow::bail!(
+            "cannot delete default branch {name}; move the repository default ref atomically first"
+        );
+    }
+    if let Some(workspace) = metadata.workspaces.iter().find(
+        |workspace| matches!(&workspace.head, WorkspaceHead::Symbolic { target } if target == name),
+    ) {
+        anyhow::bail!(
+            "cannot delete branch {name}; workspace {} has it checked out",
+            workspace.workspace_id
+        );
+    }
+    let transaction = ref_transaction(
+        authority,
+        lease.roots().clone(),
+        "delete exact repository branch",
+        RefMutation {
+            name: name.clone(),
+            expected: RefExpectation::MustEqual { target },
+            new_target: None,
+            policy: RefUpdatePolicy::ForceWithLease,
+        },
+    );
+    drop(lease);
+    before_commit()?;
+    authority
+        .manager()
+        .commit_repository_transaction(transaction)
+        .with_context(|| format!("delete repository-v6 branch {name}"))
+}
+
+fn switch_at(layout: &kin_core::KinLayout, name: &RefName) -> Result<BranchResponse> {
+    require_branch_ref(name)?;
+    let authority = ActiveRepositoryAuthority::open(layout)?;
+    let lease = authority.manager().read_authority();
+    let roots = lease.roots().clone();
+    let metadata = lease.metadata();
+    let workspace = metadata
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.workspace_id == authority.workspace_id)
+        .cloned()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "repository {} has no workspace {} in repository-v6 authority",
+                authority.repository_id,
+                authority.workspace_id
+            )
+        })?;
+    if workspace.is_dirty() {
+        anyhow::bail!(
+            "workspace {} has graph-owned changes; commit or explicitly preserve them before \
+             switching branches",
+            workspace.workspace_id
+        );
+    }
+    let target = lease
+        .resolve_ref_target(name)
+        .with_context(|| format!("resolve repository branch {name} from one authority lease"))?
+        .ok_or_else(|| anyhow::anyhow!("repository branch {name} does not exist"))?;
+    let target_change_id = lease
+        .resolve_target_change_id(&target)
+        .with_context(|| format!("resolve exact semantic target for branch {name}"))?;
+    let target_shared_policy = metadata
+        .admission_policies
+        .iter()
+        .find(|resolved| resolved.change_id == target_change_id)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "target change {target_change_id} has no repository-v6 admission-policy record"
+            )
+        })?
+        .policy
+        .clone()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "target change {target_change_id} has unresolved admission policy and cannot \
+                 become a clean workspace"
+            )
+        })?;
+    let mut snapshot = lease.snapshot().clone();
+    snapshot.repository_authority = None;
+    drop(lease);
+
+    let graph = kin_db::InMemoryGraph::from_snapshot(snapshot)
+        .context("prepare graph-owned branch target")?;
+    let target_tree = kin_core::tree::resolve_change_tree(&graph, &target_change_id)
+        .with_context(|| format!("resolve exact tree for branch {name}"))?;
+    let target_tree_hash =
+        compute_resolved_tree_hash(&target_tree).context("hash exact branch target tree")?;
+    if matches!(&workspace.head, WorkspaceHead::Symbolic { target } if target == name)
+        && workspace.base_target.as_ref() == Some(&target)
+        && workspace.tree == target_tree
+    {
+        return Ok(BranchResponse {
+            lines: vec![format!(
+                "Already on {} (authority generation {})",
+                name, roots.generation
+            )],
+            mutated: false,
+            report: None,
+        });
+    }
+
+    let tree_deltas = kin_core::exact_tree_correction(&workspace.tree, &target_tree)
+        .context("plan exact branch workspace transition")?;
+    let transaction = RepositoryTransaction {
+        schema_version: REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+        operation_id: OperationId::new(),
+        repository_id: authority.repository_id.clone(),
+        expected_generation: roots.generation,
+        expected_roots: roots,
+        actor: AuthorId::new("kin-branch-command"),
+        reason: "switch exact repository workspace branch".to_string(),
+        external_objects: Vec::new(),
+        git_authority_delta: None,
+        changes: Vec::new(),
+        aliases: Vec::new(),
+        ref_mutations: Vec::new(),
+        default_ref_mutation: None,
+        workspace_mutation: Some(WorkspaceMutation {
+            workspace_id: workspace.workspace_id,
+            expected: WorkspaceExpectation::MustEqual {
+                generation: workspace.generation,
+                head: workspace.head.clone(),
+                base_target: workspace.base_target.clone(),
+                base_tree_hash: workspace.base_tree_hash,
+                tree_hash: workspace.tree_hash,
+                admission_policy: workspace.admission_policy,
+            },
+            new_generation: workspace
+                .generation
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("workspace generation overflow"))?,
+            new_head: WorkspaceHead::Symbolic {
+                target: name.clone(),
+            },
+            new_base_target: Some(target),
+            new_base_tree_hash: Some(target_tree_hash),
+            tree_deltas,
+            new_tree_hash: target_tree_hash,
+            new_shared_admission_policy: target_shared_policy.clone(),
+            new_admission_policy: EffectiveAdmissionPolicyStamp {
+                shared: target_shared_policy.stamp(),
+                local: workspace.admission_policy.local,
+            },
+        }),
+        local_overlay_delta: None,
+    };
+    let previous_bodies = load_tree_bodies(&authority, &workspace.tree, "current workspace")?;
+    let target_bodies = load_tree_bodies(&authority, &target_tree, "branch target")?;
+    let (materialized, receipt) =
+        kin_core::tree::reconcile_source_tree_and_commit_repository_transaction(
+            layout.working_dir(),
+            &workspace.tree,
+            &target_tree,
+            previous_bodies
+                .iter()
+                .map(|body| (&body.path, body.entry, body.bytes.as_slice())),
+            target_bodies
+                .iter()
+                .map(|body| (&body.path, body.entry, body.bytes.as_slice())),
+            authority.manager(),
+            transaction,
+        )
+        .with_context(|| format!("switch repository-v6 workspace to branch {name}"))?;
+
+    Ok(BranchResponse {
+        lines: vec![format!(
+            "Switched to {} at change {} ({} projected entries, authority generation {})",
+            name, target_change_id, materialized, receipt.generation
+        )],
+        mutated: true,
+        report: None,
+    })
+}
+
+struct SourceBody {
+    path: RepoPath,
+    entry: TreeEntry,
+    bytes: Vec<u8>,
+}
+
+fn load_tree_bodies(
+    authority: &ActiveRepositoryAuthority,
+    tree: &ResolvedTree,
+    label: &str,
+) -> Result<Vec<SourceBody>> {
+    let mut bodies = Vec::with_capacity(tree.len());
+    for artifact in tree.artifacts() {
+        let digest = artifact.entry.blob_identity().ok_or_else(|| {
+            anyhow::anyhow!(
+                "{label} contains gitlink {}; exact submodule projection is not implemented",
+                artifact.path
+            )
+        })?;
+        bodies.push(SourceBody {
+            path: artifact.path.clone(),
+            entry: artifact.entry,
+            bytes: authority.load_source_blob(digest).with_context(|| {
+                format!(
+                    "load {label} body {} for graph-owned path {}",
+                    digest, artifact.path
+                )
+            })?,
+        });
+    }
+    bodies.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(bodies)
+}
+
+fn ref_transaction(
+    authority: &ActiveRepositoryAuthority,
+    roots: RootBundle,
+    reason: &str,
+    mutation: RefMutation,
+) -> RepositoryTransaction {
+    RepositoryTransaction {
+        schema_version: REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+        operation_id: OperationId::new(),
+        repository_id: authority.repository_id.clone(),
+        expected_generation: roots.generation,
+        expected_roots: roots,
+        actor: AuthorId::new("kin-branch-command"),
+        reason: reason.to_string(),
+        external_objects: Vec::new(),
+        git_authority_delta: None,
+        changes: Vec::new(),
+        aliases: Vec::new(),
+        ref_mutations: vec![mutation],
+        default_ref_mutation: None,
+        workspace_mutation: None,
+        local_overlay_delta: None,
+    }
+}
+
+fn require_branch_ref(name: &RefName) -> Result<()> {
+    if !name.is_branch() {
+        anyhow::bail!("branch command requires a ref below refs/heads/, found {name}");
+    }
+    Ok(())
 }
 
 fn discover_layout() -> Result<kin_core::KinLayout> {
@@ -47,728 +543,45 @@ fn discover_layout() -> Result<kin_core::KinLayout> {
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))
 }
 
-async fn run_daemon_branch(
-    layout: &kin_core::KinLayout,
-    request: &BranchRequest,
-) -> Result<BranchResponse> {
-    let daemon_url = std::env::var("KIN_DAEMON_URL")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .map(Some)
-        .unwrap_or(crate::daemon_client::resolve_daemon_url(layout).await?);
-    let base_url = daemon_url.ok_or_else(|| {
-        anyhow::anyhow!(
-            "Kin daemon is required for branch commands but no daemon endpoint is available"
-        )
-    })?;
-    let client = crate::daemon_client::DaemonClient::from_base_url(base_url)?;
-    client.branch(request).await.context("daemon branch failed")
-}
-
-fn print_branch_response(response: BranchResponse) -> Result<()> {
+fn print_lines(response: BranchResponse) {
     for line in response.lines {
         println!("{line}");
     }
-    Ok(())
 }
 
-pub fn execute_branch_request(
-    layout: &kin_core::KinLayout,
-    graph: &kin_db::InMemoryGraph,
-    request: &BranchRequest,
-) -> Result<BranchResponse> {
-    match request {
-        BranchRequest::List => branch_list(layout, graph),
-        BranchRequest::Create { name } => branch_create(layout, graph, name),
-        BranchRequest::Delete { name } => branch_delete(graph, name),
-        BranchRequest::Switch { name } => branch_switch(layout, graph, name),
+fn render_lines(report: &BranchListReport) -> Vec<String> {
+    if report.branches.is_empty() {
+        return vec![format!(
+            "(no branches; workspace head is {})",
+            render_head(&report.workspace_head)
+        )];
     }
-}
-
-fn branch_list(
-    layout: &kin_core::KinLayout,
-    graph: &kin_db::InMemoryGraph,
-) -> Result<BranchResponse> {
-    let branches = graph.list_branches()?;
-    let current = kin_core::read_current_branch(layout)?;
-
-    let lines = if branches.is_empty() {
-        vec!["No branches".to_string()]
-    } else {
-        branches
-            .iter()
-            .map(|branch| {
-                let marker = if branch.name == current { "* " } else { "  " };
-                format!("{}{} -> {}", marker, branch.name, branch.head)
-            })
-            .collect()
-    };
-
-    Ok(BranchResponse {
-        lines,
-        mutated: false,
-    })
-}
-
-fn branch_create(
-    layout: &kin_core::KinLayout,
-    graph: &kin_db::InMemoryGraph,
-    name: &str,
-) -> Result<BranchResponse> {
-    let current = kin_core::read_current_branch(layout)?;
-    let current_branch = graph
-        .get_branch(&current)?
-        .ok_or_else(|| anyhow::anyhow!("current branch '{}' not found in graph", current))?;
-    let branch = Branch {
-        name: BranchName::new(name),
-        head: current_branch.head,
-    };
-    graph.create_branch(&branch)?;
-    Ok(BranchResponse {
-        lines: vec![format!(
-            "Created branch '{}' at {}",
-            name, current_branch.head
-        )],
-        mutated: true,
-    })
-}
-
-fn branch_delete(graph: &kin_db::InMemoryGraph, name: &str) -> Result<BranchResponse> {
-    graph.delete_branch(&BranchName::new(name))?;
-    Ok(BranchResponse {
-        lines: vec![format!("Deleted branch '{}'", name)],
-        mutated: true,
-    })
-}
-
-fn branch_switch(
-    layout: &kin_core::KinLayout,
-    graph: &kin_db::InMemoryGraph,
-    name: &str,
-) -> Result<BranchResponse> {
-    branch_switch_with_pre_mutation_hook(layout, graph, name, || {})
-}
-
-fn branch_switch_with_pre_mutation_hook(
-    layout: &kin_core::KinLayout,
-    graph: &kin_db::InMemoryGraph,
-    name: &str,
-    after_read_only_preflight: impl FnOnce(),
-) -> Result<BranchResponse> {
-    branch_switch_with_hooks(
-        layout,
-        graph,
-        name,
-        after_read_only_preflight,
-        |_layout, _branch| Ok(()),
-    )
-}
-
-fn branch_switch_with_hooks(
-    layout: &kin_core::KinLayout,
-    graph: &kin_db::InMemoryGraph,
-    name: &str,
-    after_read_only_preflight: impl FnOnce(),
-    before_head_commit: impl FnOnce(&kin_core::KinLayout, &BranchName) -> Result<()>,
-) -> Result<BranchResponse> {
-    let previous_name = kin_core::read_current_branch(layout)?;
-    let previous_branch = graph
-        .get_branch(&previous_name)?
-        .ok_or_else(|| anyhow::anyhow!("current branch '{}' not found in graph", previous_name))?;
-    let branch = graph.get_branch(&BranchName::new(name))?;
-    let Some(branch) = branch else {
-        anyhow::bail!("branch '{}' not found", name);
-    };
-
-    let blob_store = kin_blobs::BlobStore::new(layout.objects_dir())
-        .map_err(|e| anyhow::anyhow!("failed to open blob store: {}", e))?;
-    let files_written = kin_core::tree::checkout_branch_between_heads_transactional_with_hooks(
-        graph,
-        &blob_store,
-        layout,
-        &previous_name.to_string(),
-        &previous_branch.head,
-        &branch.name.to_string(),
-        &branch.head,
-        after_read_only_preflight,
-        || {
-            let current_target = graph
-                .get_branch(&branch.name)
-                .map_err(|error| kin_core::KinError::Graph(error.to_string()))?
-                .ok_or_else(|| {
-                    kin_core::KinError::Graph(format!(
-                        "branch '{}' disappeared during switch",
-                        branch.name
-                    ))
-                })?;
-            if current_target.head != branch.head {
-                return Err(kin_core::KinError::Graph(format!(
-                    "branch '{}' advanced from {} to {} during switch; current branch marker was not changed",
-                    branch.name, branch.head, current_target.head
-                )));
-            }
-            before_head_commit(layout, &branch.name).map_err(|error| {
-                kin_core::KinError::Other(format!(
-                    "validate branch authority before HEAD publication: {error:#}"
-                ))
-            })
-        },
-    )?;
-    let mut lines = vec![format!(
-        "Switched to branch '{}' at {}",
-        branch.name, branch.head
-    )];
-    if files_written > 0 {
-        lines.push(format!("  {} file(s) updated", files_written));
-    }
-    Ok(BranchResponse {
-        lines,
-        mutated: false,
-    })
-}
-
-#[allow(dead_code)]
-fn parse_change_id(s: &str) -> Result<SemanticChangeId> {
-    let hash = Hash256::from_hex(s)
-        .map_err(|_| anyhow::anyhow!("invalid change ID (expected 64 hex chars): {}", s))?;
-    Ok(SemanticChangeId::from_hash(hash))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use kin_model::{ArtifactDelta, ArtifactDeltaKind, AuthorId, SemanticChange, Timestamp};
-
-    fn source_change(
-        id_byte: u8,
-        parent: SemanticChangeId,
-        artifact_deltas: Vec<ArtifactDelta>,
-    ) -> SemanticChange {
-        SemanticChange {
-            id: SemanticChangeId::from_hash(Hash256::from_bytes([id_byte; 32])),
-            parents: vec![parent],
-            timestamp: Timestamp::now(),
-            author: AuthorId::new("branch-switch-test"),
-            message: format!("branch switch fixture {id_byte}"),
-            entity_deltas: vec![],
-            relation_deltas: vec![],
-            artifact_deltas,
-            projected_files: vec![],
-            spec_link: None,
-            evidence: vec![],
-            risk_summary: None,
-            authored_on: None,
-        }
-    }
-
-    #[cfg(any(unix, windows))]
-    #[test]
-    fn branch_switch_removes_only_old_tracked_paths() {
-        let repo = tempfile::tempdir().unwrap();
-        let layout = kin_core::init(repo.path()).unwrap().layout;
-        let graph = kin_db::InMemoryGraph::new();
-        let genesis = kin_core::build_genesis_change();
-        graph.create_change(&genesis).unwrap();
-        let blob_store = kin_blobs::BlobStore::new(layout.objects_dir()).unwrap();
-
-        let shared_blob = blob_store.write(b"shared on main\n").unwrap();
-        let shared_hash = Hash256::from_bytes(shared_blob.0);
-        let main_change = source_change(
-            0x61,
-            genesis.id,
-            vec![ArtifactDelta {
-                file_id: kin_model::FilePathId::new("src/shared.rs"),
-                kind: ArtifactDeltaKind::AddedRegularFile,
-                old_hash: None,
-                new_hash: Some(shared_hash),
-            }],
-        );
-        graph.create_change(&main_change).unwrap();
-
-        let stale_blob = blob_store.write(b"feature only\n").unwrap();
-        let stale_hash = Hash256::from_bytes(stale_blob.0);
-        let feature_change = source_change(
-            0x62,
-            main_change.id,
-            vec![ArtifactDelta {
-                file_id: kin_model::FilePathId::new("src/feature_only.rs"),
-                kind: ArtifactDeltaKind::AddedRegularFile,
-                old_hash: None,
-                new_hash: Some(stale_hash),
-            }],
-        );
-        graph.create_change(&feature_change).unwrap();
-        graph
-            .create_branch(&Branch {
-                name: BranchName::new("main"),
-                head: main_change.id,
-            })
-            .unwrap();
-        graph
-            .create_branch(&Branch {
-                name: BranchName::new("feature"),
-                head: feature_change.id,
-            })
-            .unwrap();
-        kin_core::write_current_branch(&layout, &BranchName::new("feature")).unwrap();
-
-        std::fs::create_dir_all(repo.path().join("src")).unwrap();
-        std::fs::write(layout.root().join("preserve-control"), b"preserve kin\n").unwrap();
-        std::fs::write(repo.path().join("src/shared.rs"), b"shared on main\n").unwrap();
-        std::fs::write(repo.path().join("src/feature_only.rs"), b"feature only\n").unwrap();
-        std::fs::write(repo.path().join("notes.txt"), b"untracked user bytes\n").unwrap();
-        std::fs::create_dir_all(repo.path().join(".git")).unwrap();
-        std::fs::write(repo.path().join(".git/config"), b"preserve git\n").unwrap();
-        std::fs::create_dir_all(repo.path().join(".kin-session")).unwrap();
-        std::fs::write(
-            repo.path().join(".kin-session/base.json"),
-            b"preserve session\n",
-        )
-        .unwrap();
-        std::fs::create_dir_all(repo.path().join("target/debug")).unwrap();
-        std::fs::write(repo.path().join("target/debug/cache"), b"preserve build\n").unwrap();
-
-        branch_switch(&layout, &graph, "main").unwrap();
-
-        assert_eq!(
-            std::fs::read(repo.path().join("src/shared.rs")).unwrap(),
-            b"shared on main\n"
-        );
-        assert!(!repo.path().join("src/feature_only.rs").exists());
-        assert_eq!(
-            std::fs::read(repo.path().join("notes.txt")).unwrap(),
-            b"untracked user bytes\n"
-        );
-        assert!(layout.root().join("preserve-control").exists());
-        assert!(repo.path().join(".git/config").exists());
-        assert!(repo.path().join(".kin-session/base.json").exists());
-        assert!(repo.path().join("target/debug/cache").exists());
-        assert_eq!(
-            kin_core::read_current_branch(&layout).unwrap(),
-            BranchName::new("main")
-        );
-    }
-
-    #[cfg(any(unix, windows))]
-    #[test]
-    fn branch_switch_refuses_modified_tracked_overwrite_without_partial_mutation() {
-        let repo = tempfile::tempdir().unwrap();
-        let layout = kin_core::init(repo.path()).unwrap().layout;
-        let graph = kin_db::InMemoryGraph::new();
-        let genesis = kin_core::build_genesis_change();
-        graph.create_change(&genesis).unwrap();
-        let blob_store = kin_blobs::BlobStore::new(layout.objects_dir()).unwrap();
-
-        let main_blob = blob_store.write(b"shared on main\n").unwrap();
-        let main_hash = Hash256::from_bytes(main_blob.0);
-        let main_change = source_change(
-            0x63,
-            genesis.id,
-            vec![ArtifactDelta {
-                file_id: kin_model::FilePathId::new("src/shared.rs"),
-                kind: ArtifactDeltaKind::AddedRegularFile,
-                old_hash: None,
-                new_hash: Some(main_hash),
-            }],
-        );
-        graph.create_change(&main_change).unwrap();
-
-        let feature_blob = blob_store.write(b"shared on feature\n").unwrap();
-        let feature_hash = Hash256::from_bytes(feature_blob.0);
-        let stale_blob = blob_store.write(b"feature only\n").unwrap();
-        let stale_hash = Hash256::from_bytes(stale_blob.0);
-        let feature_change = source_change(
-            0x64,
-            main_change.id,
-            vec![
-                ArtifactDelta {
-                    file_id: kin_model::FilePathId::new("src/shared.rs"),
-                    kind: ArtifactDeltaKind::ModifiedRegularFile,
-                    old_hash: Some(main_hash),
-                    new_hash: Some(feature_hash),
-                },
-                ArtifactDelta {
-                    file_id: kin_model::FilePathId::new("src/feature_only.rs"),
-                    kind: ArtifactDeltaKind::AddedRegularFile,
-                    old_hash: None,
-                    new_hash: Some(stale_hash),
-                },
-            ],
-        );
-        graph.create_change(&feature_change).unwrap();
-        graph
-            .create_branch(&Branch {
-                name: BranchName::new("main"),
-                head: main_change.id,
-            })
-            .unwrap();
-        graph
-            .create_branch(&Branch {
-                name: BranchName::new("feature"),
-                head: feature_change.id,
-            })
-            .unwrap();
-        kin_core::write_current_branch(&layout, &BranchName::new("feature")).unwrap();
-
-        std::fs::create_dir_all(repo.path().join("src")).unwrap();
-        std::fs::write(repo.path().join("src/shared.rs"), b"user-edited feature\n").unwrap();
-        std::fs::write(repo.path().join("src/feature_only.rs"), b"feature only\n").unwrap();
-
-        let error = branch_switch(&layout, &graph, "main").unwrap_err();
-
-        assert!(error
-            .to_string()
-            .contains("differs from current branch source"));
-        assert_eq!(
-            std::fs::read(repo.path().join("src/shared.rs")).unwrap(),
-            b"user-edited feature\n"
-        );
-        assert_eq!(
-            std::fs::read(repo.path().join("src/feature_only.rs")).unwrap(),
-            b"feature only\n"
-        );
-        assert_eq!(
-            kin_core::read_current_branch(&layout).unwrap(),
-            BranchName::new("feature")
-        );
-    }
-
-    #[cfg(any(unix, windows))]
-    #[test]
-    fn branch_switch_refuses_modified_tracked_removal_without_partial_mutation() {
-        let repo = tempfile::tempdir().unwrap();
-        let layout = kin_core::init(repo.path()).unwrap().layout;
-        let graph = kin_db::InMemoryGraph::new();
-        let genesis = kin_core::build_genesis_change();
-        graph.create_change(&genesis).unwrap();
-        let blob_store = kin_blobs::BlobStore::new(layout.objects_dir()).unwrap();
-
-        let main_blob = blob_store.write(b"shared on main\n").unwrap();
-        let main_hash = Hash256::from_bytes(main_blob.0);
-        let main_change = source_change(
-            0x65,
-            genesis.id,
-            vec![ArtifactDelta {
-                file_id: kin_model::FilePathId::new("src/shared.rs"),
-                kind: ArtifactDeltaKind::AddedRegularFile,
-                old_hash: None,
-                new_hash: Some(main_hash),
-            }],
-        );
-        graph.create_change(&main_change).unwrap();
-
-        let feature_shared_blob = blob_store.write(b"shared on feature\n").unwrap();
-        let feature_shared_hash = Hash256::from_bytes(feature_shared_blob.0);
-        let removed_blob = blob_store.write(b"feature removable\n").unwrap();
-        let removed_hash = Hash256::from_bytes(removed_blob.0);
-        let feature_change = source_change(
-            0x66,
-            main_change.id,
-            vec![
-                ArtifactDelta {
-                    file_id: kin_model::FilePathId::new("src/shared.rs"),
-                    kind: ArtifactDeltaKind::ModifiedRegularFile,
-                    old_hash: Some(main_hash),
-                    new_hash: Some(feature_shared_hash),
-                },
-                ArtifactDelta {
-                    file_id: kin_model::FilePathId::new("src/remove_on_main.rs"),
-                    kind: ArtifactDeltaKind::AddedRegularFile,
-                    old_hash: None,
-                    new_hash: Some(removed_hash),
-                },
-            ],
-        );
-        graph.create_change(&feature_change).unwrap();
-        graph
-            .create_branch(&Branch {
-                name: BranchName::new("main"),
-                head: main_change.id,
-            })
-            .unwrap();
-        graph
-            .create_branch(&Branch {
-                name: BranchName::new("feature"),
-                head: feature_change.id,
-            })
-            .unwrap();
-        kin_core::write_current_branch(&layout, &BranchName::new("feature")).unwrap();
-
-        std::fs::create_dir_all(repo.path().join("src")).unwrap();
-        std::fs::write(repo.path().join("src/shared.rs"), b"shared on feature\n").unwrap();
-        std::fs::write(
-            repo.path().join("src/remove_on_main.rs"),
-            b"user-edited removable\n",
-        )
-        .unwrap();
-
-        let error = branch_switch(&layout, &graph, "main").unwrap_err();
-
-        assert!(error
-            .to_string()
-            .contains("differs from current branch source"));
-        assert_eq!(
-            std::fs::read(repo.path().join("src/shared.rs")).unwrap(),
-            b"shared on feature\n"
-        );
-        assert_eq!(
-            std::fs::read(repo.path().join("src/remove_on_main.rs")).unwrap(),
-            b"user-edited removable\n"
-        );
-        assert_eq!(
-            kin_core::read_current_branch(&layout).unwrap(),
-            BranchName::new("feature")
-        );
-    }
-
-    #[cfg(any(unix, windows))]
-    #[test]
-    fn branch_switch_revalidates_post_preflight_editor_replacement_before_head() {
-        let repo = tempfile::tempdir().unwrap();
-        let layout = kin_core::init(repo.path()).unwrap().layout;
-        let graph = kin_db::InMemoryGraph::new();
-        let genesis = kin_core::build_genesis_change();
-        graph.create_change(&genesis).unwrap();
-        let blob_store = kin_blobs::BlobStore::new(layout.objects_dir()).unwrap();
-
-        let main_hash = Hash256::from_bytes(blob_store.write(b"main bytes\n").unwrap().0);
-        let main = source_change(
-            0x67,
-            genesis.id,
-            vec![ArtifactDelta {
-                file_id: kin_model::FilePathId::new("src/shared.rs"),
-                kind: ArtifactDeltaKind::AddedRegularFile,
-                old_hash: None,
-                new_hash: Some(main_hash),
-            }],
-        );
-        graph.create_change(&main).unwrap();
-        let feature_hash = Hash256::from_bytes(blob_store.write(b"feature bytes\n").unwrap().0);
-        let feature = source_change(
-            0x68,
-            main.id,
-            vec![ArtifactDelta {
-                file_id: kin_model::FilePathId::new("src/shared.rs"),
-                kind: ArtifactDeltaKind::ModifiedRegularFile,
-                old_hash: Some(main_hash),
-                new_hash: Some(feature_hash),
-            }],
-        );
-        graph.create_change(&feature).unwrap();
-        graph
-            .create_branch(&Branch {
-                name: BranchName::new("main"),
-                head: main.id,
-            })
-            .unwrap();
-        graph
-            .create_branch(&Branch {
-                name: BranchName::new("feature"),
-                head: feature.id,
-            })
-            .unwrap();
-        kin_core::write_current_branch(&layout, &BranchName::new("feature")).unwrap();
-        std::fs::create_dir_all(repo.path().join("src")).unwrap();
-        let path = repo.path().join("src/shared.rs");
-        std::fs::write(&path, b"feature bytes\n").unwrap();
-
-        let error = branch_switch_with_pre_mutation_hook(&layout, &graph, "main", || {
-            let replacement = repo.path().join("src/editor.tmp");
-            std::fs::write(&replacement, b"editor bytes\n").unwrap();
-            std::fs::remove_file(&path).unwrap();
-            std::fs::rename(replacement, &path).unwrap();
+    report
+        .branches
+        .iter()
+        .map(|branch| {
+            let active = if branch.active { "*" } else { " " };
+            let default = if branch.default { " [default]" } else { "" };
+            format!(
+                "{active} {} -> {}{default}",
+                branch.name,
+                render_target(&branch.target)
+            )
         })
-        .unwrap_err();
+        .collect()
+}
 
-        assert!(error
-            .to_string()
-            .contains("differs from current branch source"));
-        assert_eq!(std::fs::read(&path).unwrap(), b"editor bytes\n");
-        assert_eq!(
-            kin_core::read_current_branch(&layout).unwrap(),
-            BranchName::new("feature")
-        );
+fn render_head(head: &WorkspaceHead) -> String {
+    match head {
+        WorkspaceHead::Symbolic { target } => format!("symbolic {target}"),
+        WorkspaceHead::Detached { target } => format!("detached {}", render_target(target)),
     }
+}
 
-    #[cfg(any(unix, windows))]
-    #[test]
-    fn branch_switch_revalidates_target_head_before_writing_current_branch() {
-        let repo = tempfile::tempdir().unwrap();
-        let layout = kin_core::init(repo.path()).unwrap().layout;
-        let graph = kin_db::InMemoryGraph::new();
-        let genesis = kin_core::build_genesis_change();
-        graph.create_change(&genesis).unwrap();
-        let blob_store = kin_blobs::BlobStore::new(layout.objects_dir()).unwrap();
-
-        let main_hash = Hash256::from_bytes(blob_store.write(b"main bytes\n").unwrap().0);
-        let main = source_change(
-            0x69,
-            genesis.id,
-            vec![ArtifactDelta {
-                file_id: kin_model::FilePathId::new("src/shared.rs"),
-                kind: ArtifactDeltaKind::AddedRegularFile,
-                old_hash: None,
-                new_hash: Some(main_hash),
-            }],
-        );
-        graph.create_change(&main).unwrap();
-        let feature_hash = Hash256::from_bytes(blob_store.write(b"feature bytes\n").unwrap().0);
-        let feature = source_change(
-            0x6a,
-            main.id,
-            vec![ArtifactDelta {
-                file_id: kin_model::FilePathId::new("src/shared.rs"),
-                kind: ArtifactDeltaKind::ModifiedRegularFile,
-                old_hash: Some(main_hash),
-                new_hash: Some(feature_hash),
-            }],
-        );
-        graph.create_change(&feature).unwrap();
-        let advanced_hash = Hash256::from_bytes(blob_store.write(b"advanced bytes\n").unwrap().0);
-        let advanced = source_change(
-            0x6b,
-            feature.id,
-            vec![ArtifactDelta {
-                file_id: kin_model::FilePathId::new("src/shared.rs"),
-                kind: ArtifactDeltaKind::ModifiedRegularFile,
-                old_hash: Some(feature_hash),
-                new_hash: Some(advanced_hash),
-            }],
-        );
-        graph.create_change(&advanced).unwrap();
-        graph
-            .create_branch(&Branch {
-                name: BranchName::new("main"),
-                head: main.id,
-            })
-            .unwrap();
-        graph
-            .create_branch(&Branch {
-                name: BranchName::new("feature"),
-                head: feature.id,
-            })
-            .unwrap();
-        kin_core::write_current_branch(&layout, &BranchName::new("main")).unwrap();
-        std::fs::create_dir_all(repo.path().join("src")).unwrap();
-        std::fs::write(repo.path().join("src/shared.rs"), b"main bytes\n").unwrap();
-
-        let error = branch_switch_with_pre_mutation_hook(&layout, &graph, "feature", || {
-            graph
-                .update_branch_head(&BranchName::new("feature"), &advanced.id)
-                .unwrap();
-        })
-        .unwrap_err();
-
-        assert!(format!("{error:#}").contains("advanced"));
-        assert_eq!(
-            kin_core::read_current_branch(&layout).unwrap(),
-            BranchName::new("main")
-        );
-        assert_eq!(
-            graph
-                .get_branch(&BranchName::new("feature"))
-                .unwrap()
-                .unwrap()
-                .head,
-            advanced.id
-        );
-        assert_eq!(
-            graph
-                .get_branch(&BranchName::new("main"))
-                .unwrap()
-                .unwrap()
-                .head,
-            main.id
-        );
-        assert_eq!(
-            std::fs::read(repo.path().join("src/shared.rs")).unwrap(),
-            b"main bytes\n"
-        );
-    }
-
-    #[cfg(any(unix, windows))]
-    #[test]
-    fn branch_switch_head_write_failure_restores_prior_tree_head_and_graph() {
-        let repo = tempfile::tempdir().unwrap();
-        let layout = kin_core::init(repo.path()).unwrap().layout;
-        let graph = kin_db::InMemoryGraph::new();
-        let genesis = kin_core::build_genesis_change();
-        graph.create_change(&genesis).unwrap();
-        let blob_store = kin_blobs::BlobStore::new(layout.objects_dir()).unwrap();
-
-        let main_hash = Hash256::from_bytes(blob_store.write(b"main bytes\n").unwrap().0);
-        let main = source_change(
-            0x6c,
-            genesis.id,
-            vec![ArtifactDelta {
-                file_id: kin_model::FilePathId::new("src/shared.rs"),
-                kind: ArtifactDeltaKind::AddedRegularFile,
-                old_hash: None,
-                new_hash: Some(main_hash),
-            }],
-        );
-        graph.create_change(&main).unwrap();
-        let feature_hash = Hash256::from_bytes(blob_store.write(b"feature bytes\n").unwrap().0);
-        let feature = source_change(
-            0x6d,
-            main.id,
-            vec![ArtifactDelta {
-                file_id: kin_model::FilePathId::new("src/shared.rs"),
-                kind: ArtifactDeltaKind::ModifiedRegularFile,
-                old_hash: Some(main_hash),
-                new_hash: Some(feature_hash),
-            }],
-        );
-        graph.create_change(&feature).unwrap();
-        graph
-            .create_branch(&Branch {
-                name: BranchName::new("main"),
-                head: main.id,
-            })
-            .unwrap();
-        graph
-            .create_branch(&Branch {
-                name: BranchName::new("feature"),
-                head: feature.id,
-            })
-            .unwrap();
-        kin_core::write_current_branch(&layout, &BranchName::new("main")).unwrap();
-        std::fs::create_dir_all(repo.path().join("src")).unwrap();
-        std::fs::write(repo.path().join("src/shared.rs"), b"main bytes\n").unwrap();
-
-        let error = branch_switch_with_hooks(
-            &layout,
-            &graph,
-            "feature",
-            || {},
-            |_layout, _branch| anyhow::bail!("injected HEAD write failure"),
-        )
-        .unwrap_err();
-
-        assert!(format!("{error:#}").contains("injected HEAD write failure"));
-        assert_eq!(
-            kin_core::read_current_branch(&layout).unwrap(),
-            BranchName::new("main")
-        );
-        assert_eq!(
-            std::fs::read(repo.path().join("src/shared.rs")).unwrap(),
-            b"main bytes\n"
-        );
-        assert_eq!(
-            graph
-                .get_branch(&BranchName::new("main"))
-                .unwrap()
-                .unwrap()
-                .head,
-            main.id
-        );
-        assert_eq!(
-            graph
-                .get_branch(&BranchName::new("feature"))
-                .unwrap()
-                .unwrap()
-                .head,
-            feature.id
-        );
+fn render_target(target: &RefTarget) -> String {
+    match target {
+        RefTarget::Change { change_id } => format!("change {change_id}"),
+        RefTarget::ExternalObject { object } => format!("{:?} {}", object.kind, object.oid),
+        RefTarget::Symbolic { target } => format!("symbolic {target}"),
     }
 }

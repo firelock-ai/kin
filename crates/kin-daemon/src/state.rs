@@ -7,12 +7,12 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize,
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use kin_blobs::BlobStore;
+use kin_blobs::{BlobError, BlobStore};
 use kin_core::KinLayout;
-use kin_db::StorageBackend;
+use kin_db::{LocalFileBackend, RepositoryAuthorityManager, StorageBackend};
 use kin_model::{
-    ChangeStore, EntityId, EntityStore, FilePathId, GraphOverlay, Hash256, SemanticChange,
-    SemanticChangeId, SourceEntryKind, SourceTreeResolution, WorkingCopy,
+    ChangeStore, EntityId, EntityStore, FilePathId, Hash256, RepoPath, RepositoryId, ResolvedTree,
+    SemanticChange, SemanticChangeId, TreeEntry, WorkspaceId,
 };
 use kin_projection::ProjectionState;
 use kin_reconcile::Reconciler;
@@ -72,39 +72,6 @@ impl ChangeStore for ProspectiveChangeStore<'_> {
         head: &SemanticChangeId,
     ) -> std::result::Result<Vec<SemanticChange>, Self::Error> {
         self.graph.get_changes_since(base, head)
-    }
-
-    fn get_branch(
-        &self,
-        name: &kin_model::BranchName,
-    ) -> std::result::Result<Option<kin_model::Branch>, Self::Error> {
-        self.graph.get_branch(name)
-    }
-
-    fn create_branch(&self, _branch: &kin_model::Branch) -> std::result::Result<(), Self::Error> {
-        Err(kin_db::KinDbError::StorageError(
-            "prospective exact-source replay is read-only".to_string(),
-        ))
-    }
-
-    fn update_branch_head(
-        &self,
-        _name: &kin_model::BranchName,
-        _new_head: &SemanticChangeId,
-    ) -> std::result::Result<(), Self::Error> {
-        Err(kin_db::KinDbError::StorageError(
-            "prospective exact-source replay is read-only".to_string(),
-        ))
-    }
-
-    fn delete_branch(&self, _name: &kin_model::BranchName) -> std::result::Result<(), Self::Error> {
-        Err(kin_db::KinDbError::StorageError(
-            "prospective exact-source replay is read-only".to_string(),
-        ))
-    }
-
-    fn list_branches(&self) -> std::result::Result<Vec<kin_model::Branch>, Self::Error> {
-        self.graph.list_branches()
     }
 }
 
@@ -469,8 +436,7 @@ pub enum DaemonEvent {
         file_path: Option<String>,
         /// Originating session, when the change came from a request that carried
         /// one (the VFS `/vfs/file-changed` and `/vfs/write-notify` handlers).
-        /// `None` for anonymous FS-reconcile-loop changes — never inferred by
-        /// time-correlating `OverlayUpdated` with later events. Additive: `serde`
+        /// `None` for anonymous FS-reconcile-loop changes. Additive: `serde`
         /// default keeps existing payloads and consumers working unchanged.
         #[serde(default)]
         session_id: Option<String>,
@@ -480,8 +446,6 @@ pub enum DaemonEvent {
         paths_added: Vec<String>,
         paths_removed: Vec<String>,
     },
-    /// A session's overlay was updated.
-    OverlayUpdated { session_id: String },
     /// The graph root hash changed (commit happened).
     GraphRootChanged {
         old_root_hash: Option<String>,
@@ -661,7 +625,7 @@ pub(crate) struct VfsTreeCacheKey {
 #[derive(Debug)]
 pub(crate) struct VfsTreeSnapshot {
     pub key: VfsTreeCacheKey,
-    pub files: Arc<HashMap<FilePathId, Hash256>>,
+    pub files: Arc<HashMap<FilePathId, kin_model::TreeEntry>>,
     pub timestamps: Arc<HashMap<FilePathId, u64>>,
 }
 
@@ -715,40 +679,32 @@ fn exact_source_storage_error(message: impl Into<String>) -> DaemonError {
 
 fn exact_source_objects<'a>(
     changes: impl IntoIterator<Item = &'a SemanticChange>,
-) -> Result<Vec<(Hash256, FilePathId, SemanticChangeId, SourceEntryKind)>> {
+) -> Result<Vec<(Hash256, RepoPath, SemanticChangeId, TreeEntry)>> {
     let mut objects = Vec::new();
     for change in changes {
-        for delta in &change.artifact_deltas {
-            if delta.kind.is_removed() {
-                continue;
-            }
-            let Some(kind) = delta.kind.source_entry_kind() else {
-                // Legacy mode-unknown history stays an explicit exact-tree gap;
-                // this object preflight must not normalize it into a mode.
+        for delta in &change.tree_deltas {
+            let Some(located) = delta.new_state() else {
                 continue;
             };
-            let hash = delta.new_hash.ok_or_else(|| {
-                exact_source_storage_error(format!(
-                    "exact source delta for {} in change {} has no content identity",
-                    delta.file_id, change.id
-                ))
-            })?;
-            objects.push((hash, delta.file_id.clone(), change.id, kind));
+            let Some(hash) = located.entry.blob_identity() else {
+                continue;
+            };
+            objects.push((hash, located.path.clone(), change.id, located.entry));
         }
     }
     objects.sort_by(|left, right| {
         left.0
             .as_bytes()
             .cmp(right.0.as_bytes())
-            .then_with(|| left.1 .0.cmp(&right.1 .0))
+            .then_with(|| left.1.cmp(&right.1))
             .then_with(|| left.2 .0.as_bytes().cmp(right.2 .0.as_bytes()))
     });
     Ok(objects)
 }
 
 fn validate_exact_source_bytes(
-    file_id: &FilePathId,
-    kind: SourceEntryKind,
+    path: &RepoPath,
+    entry: TreeEntry,
     expected: Hash256,
     data: &[u8],
     authority: &str,
@@ -756,13 +712,13 @@ fn validate_exact_source_bytes(
     let actual = kin_blobs::digest_bytes(data);
     if actual != *expected.as_bytes() {
         return Err(exact_source_storage_error(format!(
-            "{authority} exact source bytes for {file_id} do not match {expected}: found {}",
+            "{authority} exact source bytes for {path} do not match {expected}: found {}",
             hex::encode(actual)
         )));
     }
-    kin_core::validate_source_entry(file_id, kind, data).map_err(|error| {
+    kin_core::validate_source_entry(path, entry, data).map_err(|error| {
         exact_source_storage_error(format!(
-            "{authority} exact source entry {file_id} at {expected} is not materializable: {error}"
+            "{authority} exact source entry {path} at {expected} is not materializable: {error}"
         ))
     })
 }
@@ -813,7 +769,6 @@ pub struct DaemonState {
     pub layout: KinLayout,
     pub graph: Arc<kin_db::InMemoryGraph>,
     pub blobs: Arc<BlobStore>,
-    pub working_copy: RwLock<WorkingCopy>,
     pub reconciler: RwLock<Reconciler>,
     /// Cached FileLayouts for all tracked files.
     /// Populated on init, updated on commits.
@@ -882,11 +837,6 @@ pub struct DaemonState {
     /// Broadcast channel for SSE invalidation events.
     /// Subscribers (VFS daemon, spine, KinLab) receive real-time notifications.
     pub event_tx: tokio::sync::broadcast::Sender<DaemonEvent>,
-    /// Per-session overlay mutations. Each agent session gets its own overlay
-    /// so uncommitted work is isolated. Read merge order:
-    /// committed graph → global overlay (working_copy) → session overlay.
-    pub session_overlays:
-        RwLock<std::collections::HashMap<kin_model::SessionId, kin_model::GraphOverlay>>,
     /// Per-session temporal scopes. When a session has an active scope,
     /// all queries see the cached historical graph instead of the live graph.
     /// Max MAX_CONCURRENT_SCOPES sessions can have active scopes simultaneously.
@@ -952,9 +902,6 @@ pub struct DaemonState {
     /// Channel for LSP enrichment messages (incremental or sweep).
     /// None if LSP enrichment is disabled (no servers found).
     pub lsp_enrichment_tx: Option<tokio::sync::mpsc::Sender<LspEnrichmentMessage>>,
-    /// Cached SemanticChangeId → Git OID mapping for fast scope switching.
-    /// Built lazily on first `set_scope` call, reused for subsequent calls.
-    pub change_oid_cache: std::sync::RwLock<Option<kin_core::ChangeOidCache>>,
     /// Repo ID resolved once at construction. Cached to avoid re-reading
     /// `.kin/manifest.json` on every snapshot save — under high host
     /// concurrency those reads contend and surface as opaque "Core error"
@@ -996,17 +943,6 @@ pub struct DaemonState {
     pub locate_rankings: Mutex<HashMap<String, CachedLocateRanking>>,
     /// Cached `semantic_locate` result pages keyed by paging-cursor key.
     pub semantic_locate_pages: Mutex<HashMap<String, CachedSemanticPage>>,
-    /// Serializes lazy git-ancestry hydration — the full-history import behind a
-    /// `review`/`history`/`blame`/`locate --ref`/`scope` ref that names an
-    /// unimported Git commit. At most one such import runs at a time: two
-    /// concurrent deep imports roughly double peak memory and can OOM-kill the
-    /// daemon. Concurrent requests for the SAME unimported commit coalesce —
-    /// whoever wins the gate imports it, and later waiters observe it already
-    /// present (the get-or-build guard in `hydrate_imported_git_ref`) and skip
-    /// the re-import. Held across the request `.await` (and moved into the
-    /// `set_scope` blocking task), so it is a tokio mutex behind an `Arc` — not
-    /// the std locks used for the synchronous critical sections above.
-    pub hydration_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// Cached full locate entity-ranking for cursor paging. The daemon caches the
@@ -1219,18 +1155,6 @@ impl DaemonState {
             .unwrap_or(0)
     }
 
-    /// Look for the `.kin/kindb/graph.kndb` snapshot file in the workspace.
-    fn find_kndb_path(layout: &KinLayout) -> Option<std::path::PathBuf> {
-        let kndb_path = layout.kindb_snapshot_path();
-        if kndb_path.exists()
-            || kin_db::SnapshotManager::local_authority_exists(kndb_path.as_path())
-        {
-            Some(kndb_path)
-        } else {
-            None
-        }
-    }
-
     /// Open an existing .kin/ directory and create daemon state.
     pub fn open(layout: KinLayout) -> Result<Self> {
         let explicit_repo_id = std::env::var("KIN_REPO_ID")
@@ -1244,9 +1168,76 @@ impl DaemonState {
         Self::open_with_repo_id(layout, Some(repo_id))
     }
 
+    /// Hydrate the daemon's non-authoritative ingestion/projection CAS from one
+    /// exact graph-owned workspace tree.
+    ///
+    /// Repository CAS remains the only source authority. This cache is rebuilt
+    /// exclusively from verified repository bytes; it never repairs from Git,
+    /// a checkout, or the working filesystem.
+    fn hydrate_ingest_cas<B: StorageBackend + ?Sized + 'static>(
+        authority: &RepositoryAuthorityManager<B>,
+        tree: &ResolvedTree,
+        blobs: &BlobStore,
+    ) -> Result<usize> {
+        let mut hydrated = HashSet::new();
+        for artifact in tree.artifacts() {
+            let Some(hash) = artifact.entry.blob_identity() else {
+                // Gitlinks identify another repository commit and deliberately
+                // carry no local source body.
+                continue;
+            };
+            if !hydrated.insert(hash) {
+                continue;
+            }
+            let authoritative = authority.load_source_blob(hash)?.ok_or_else(|| {
+                DaemonError::Graph(kin_db::KinDbError::StorageError(format!(
+                    "workspace artifact {} references source body {} absent from repository authority",
+                    artifact.path, hash
+                )))
+            })?;
+
+            match blobs.read(&hash) {
+                Ok(cached) if cached == authoritative => continue,
+                Ok(_) => {
+                    return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
+                        format!(
+                            "derived ingestion CAS body {} differs from repository authority despite matching its content address",
+                            hash
+                        ),
+                    )))
+                }
+                Err(BlobError::NotFound { .. } | BlobError::HashMismatch { .. }) => {
+                    // HashMismatch quarantines the corrupt derived object, so
+                    // this write can atomically heal it from authority.
+                }
+                Err(error) => return Err(DaemonError::Blob(error)),
+            }
+
+            let installed_hash = blobs.write(&authoritative)?;
+            if installed_hash != hash {
+                return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
+                    format!(
+                        "repository authority body {} hydrated under unexpected derived CAS identity {}",
+                        hash, installed_hash
+                    ),
+                )));
+            }
+            let installed = blobs.read(&hash)?;
+            if installed != authoritative {
+                return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
+                    format!(
+                        "derived ingestion CAS did not retain exact repository authority body {}",
+                        hash
+                    ),
+                )));
+            }
+        }
+        Ok(hydrated.len())
+    }
+
     /// Open local daemon state with a repository identity already resolved by
-    /// the process entrypoint. This keeps CLI flags and manifest-derived
-    /// authority from being discarded in favor of an unrelated ambient value.
+    /// the process entrypoint. Local overrides must name the manifest's exact
+    /// authority; they cannot rebind one workspace to another repository.
     pub fn open_with_repo_id(layout: KinLayout, explicit_repo_id: Option<&str>) -> Result<Self> {
         // Up-front compatibility gate. A repo created by a pre-0.2 kin carries
         // an on-disk graph/index that this build's post-load embed/readiness
@@ -1266,63 +1257,85 @@ impl DaemonState {
             }
         }
 
-        // Reclaim stale repo locks (daemon.lock + kin-db's graph.lock) left by a
-        // dead daemon whose forked child leaked the flock fd — otherwise the
-        // SnapshotManager::open below fails with a spurious lock error (os error
-        // 35) even though no live daemon owns the repo. A no-op unless the
-        // recorded owner PID is present and dead, so a live daemon's locks are
-        // never touched.
+        // Reclaim stale daemon/runtime locks left by a dead process. A no-op
+        // unless the recorded owner PID is present and dead, so a live
+        // daemon's locks are never touched.
         let _ = crate::lifecycle::reclaim_stale_locks(layout.root());
 
+        // Resolve repository identity before opening any graph state. The
+        // repository-v6 envelope is the only local startup authority; the old
+        // standalone graph.kndb snapshot is not a fallback.
+        let cached_repo_id = kin_core::manifest::resolve_repo_id(&layout, explicit_repo_id)
+            .map_err(DaemonError::from)?;
+        let manifest = kin_core::manifest::KinManifest::load(&layout.manifest_path())
+            .map_err(DaemonError::from)?;
+        if manifest.repo_id != cached_repo_id {
+            return Err(DaemonError::Core(kin_core::KinError::Config(format!(
+                "local repository override {} does not match manifest authority {}; open the matching repository instead",
+                cached_repo_id, manifest.repo_id
+            ))));
+        }
+        let workspace_uuid = uuid::Uuid::parse_str(&manifest.workspace_id).map_err(|error| {
+            DaemonError::Core(kin_core::KinError::Config(format!(
+                "invalid workspace identity in manifest: {error}"
+            )))
+        })?;
+        let workspace_id = WorkspaceId::from_uuid(workspace_uuid);
+        let repository_id = RepositoryId::new(cached_repo_id.clone()).map_err(|error| {
+            DaemonError::Core(kin_core::KinError::Config(format!(
+                "invalid repository identity in manifest: {error}"
+            )))
+        })?;
+        let authority = RepositoryAuthorityManager::open(
+            repository_id.clone(),
+            Arc::new(LocalFileBackend::new(layout.kindb_dir())),
+        )
+        .map_err(DaemonError::Graph)?;
+        let lease = authority.read_authority();
+        let workspace_snapshot = lease
+            .workspace_graph_snapshot(&workspace_id)
+            .map_err(DaemonError::Graph)?
+            .ok_or_else(|| {
+                DaemonError::Graph(kin_db::KinDbError::StorageError(format!(
+                    "repository {} authority has no manifest workspace {}",
+                    repository_id, workspace_id
+                )))
+            })?;
         let text_index_path = layout.text_index_dir();
         let locate_only = Self::locate_only_snapshot_mode();
-        let (graph, generation, loaded_snapshot) =
-            if let Some(kndb_path) = Self::find_kndb_path(&layout) {
-                let snapshot_mgr = if locate_only {
-                    kin_db::SnapshotManager::open_read_only_for_locate(&kndb_path)
-                } else {
-                    kin_db::SnapshotManager::open(&kndb_path)
-                };
-                match snapshot_mgr {
-                    Ok(snapshot_mgr) => {
-                        let g = snapshot_mgr.graph();
-                        info!(
-                            locate_only = locate_only,
-                            "Loaded graph from {}",
-                            kndb_path.display()
-                        );
-                        (g, snapshot_mgr.generation(), true)
-                    }
-                    Err(e) => {
-                        return Err(DaemonError::Io(std::io::Error::other(format!(
-                            "failed to load persisted graph snapshot from {}: {}",
-                            kndb_path.display(),
-                            e
-                        ))));
-                    }
-                }
-            } else {
-                (
-                    Arc::new(kin_db::InMemoryGraph::with_text_index(
-                        text_index_path.clone(),
-                    )),
-                    kin_db::GENERATION_INIT,
-                    false,
-                )
-            };
+        let generation = lease.roots().generation;
+        let loaded_snapshot = generation > 0;
+        let workspace_artifact_count = workspace_snapshot.resolved_tree.len();
+        let blobs = BlobStore::new(layout.ingest_cas_dir()).map_err(DaemonError::from)?;
+        let hydrated_source_bodies =
+            Self::hydrate_ingest_cas(&authority, &workspace_snapshot.resolved_tree, &blobs)?;
+        let graph = if locate_only {
+            kin_db::InMemoryGraph::from_snapshot_with_text_index_read_only(
+                workspace_snapshot,
+                text_index_path.clone(),
+            )
+        } else {
+            kin_db::InMemoryGraph::from_snapshot_with_text_index(
+                workspace_snapshot,
+                text_index_path.clone(),
+            )
+        }
+        .map(Arc::new)
+        .map_err(DaemonError::Graph)?;
+        info!(
+            repository = %cached_repo_id,
+            workspace = %workspace_id,
+            generation,
+            locate_only,
+            workspace_artifacts = workspace_artifact_count,
+            hydrated_source_bodies,
+            "loaded daemon query graph from workspace-scoped repository-v6 authority"
+        );
+        drop(lease);
+        drop(authority);
 
-        let blobs = BlobStore::new(layout.objects_dir()).map_err(DaemonError::from)?;
-        // No post-open vector-index load here: `SnapshotManager::open` /
-        // `open_read_only_for_locate` already performed the validated load during
-        // graph construction. A raw force-load on top would re-install a stale
-        // sidecar and trigger the embed-worker reset loop.
-
-        // Compute the deterministic genesis change ID.
-        let genesis = kin_core::build_genesis_change();
-        let working_copy = WorkingCopy {
-            base_change: genesis.id,
-            uncommitted_mutations: GraphOverlay::default(),
-        };
+        // The repository snapshot above is authoritative. Vector/text
+        // structures built from it are derived query surfaces only.
 
         let mut reconciler = Reconciler::new(layout.working_dir().to_path_buf());
         // Seed LKG from persisted graph so the first reconcile after daemon
@@ -1342,12 +1355,6 @@ impl DaemonState {
         // don't see a reset after daemon restart.
         let persisted_vfs_version = Self::load_persisted_vfs_version(&layout);
 
-        // Resolve the daemon's repository identity once. KIN_PRIMARY_REPO_ID is
-        // retained as the multi-repo compatibility alias, but it feeds the same
-        // cached authority used by graph, MCP, and spine paths.
-        let cached_repo_id = kin_core::manifest::resolve_repo_id(&layout, explicit_repo_id)
-            .map_err(DaemonError::from)?;
-
         // Baseline for the shutdown anti-wipe guard: the entity count loaded
         // from the on-disk snapshot. Read before `graph` is moved into the state.
         let loaded_entity_count = graph.entity_count();
@@ -1358,7 +1365,6 @@ impl DaemonState {
             layout,
             graph,
             blobs: Arc::new(blobs),
-            working_copy: RwLock::new(working_copy),
             reconciler: RwLock::new(reconciler),
             projection: RwLock::new(ProjectionState::new()),
             coordinator,
@@ -1393,7 +1399,6 @@ impl DaemonState {
             #[cfg(test)]
             vfs_tree_build_test_hook: std::sync::Mutex::new(None),
             event_tx: tokio::sync::broadcast::channel(256).0,
-            session_overlays: RwLock::new(std::collections::HashMap::new()),
             session_scopes: RwLock::new(HashMap::new()),
             spine: std::sync::OnceLock::new(),
             spine_refresh_gate: tokio::sync::Mutex::new(()),
@@ -1410,7 +1415,6 @@ impl DaemonState {
             last_activity_ms: AtomicU64::new(0),
             active_requests: AtomicU64::new(0),
             lsp_enrichment_tx: None,
-            change_oid_cache: std::sync::RwLock::new(None),
             cached_repo_id,
             is_shutdown: AtomicBool::new(false),
             persisted_entity_count: AtomicU64::new(loaded_entity_count as u64),
@@ -1419,7 +1423,6 @@ impl DaemonState {
             mcp_transactions: Mutex::new(HashMap::new()),
             locate_rankings: Mutex::new(HashMap::new()),
             semantic_locate_pages: Mutex::new(HashMap::new()),
-            hydration_gate: Arc::new(tokio::sync::Mutex::new(())),
         };
         // Restore in-flight MCP transactions persisted before a restart
         // so staged-but-uncommitted work is not silently dropped across a daemon
@@ -1474,7 +1477,8 @@ impl DaemonState {
                     let g = kin_db::InMemoryGraph::from_snapshot_with_text_index(
                         recovered.snapshot,
                         text_index_path.clone(),
-                    );
+                    )
+                    .map_err(DaemonError::from)?;
                     info!(
                         repo_id,
                         generation = recovered.generation,
@@ -1497,16 +1501,11 @@ impl DaemonState {
                 }
             };
 
-        let blobs = BlobStore::new(layout.objects_dir()).map_err(DaemonError::from)?;
+        let blobs = BlobStore::new(layout.ingest_cas_dir()).map_err(DaemonError::from)?;
         // The backend path builds the graph via `from_snapshot_with_text_index`,
         // which does NOT load the vector-index sidecar — do the validated load
         // here (no-ops if no/stale sidecar).
         Self::load_validated_vector_index(&layout, graph.as_ref());
-        let genesis = kin_core::build_genesis_change();
-        let working_copy = WorkingCopy {
-            base_change: genesis.id,
-            uncommitted_mutations: GraphOverlay::default(),
-        };
         let mut reconciler = Reconciler::new(layout.working_dir().to_path_buf());
         reconciler.seed_lkg_entities_from_graph(graph.as_ref());
 
@@ -1528,7 +1527,6 @@ impl DaemonState {
             layout,
             graph: Arc::clone(&graph),
             blobs: Arc::new(blobs),
-            working_copy: RwLock::new(working_copy),
             reconciler: RwLock::new(reconciler),
             projection: RwLock::new(ProjectionState::new()),
             coordinator,
@@ -1563,7 +1561,6 @@ impl DaemonState {
             #[cfg(test)]
             vfs_tree_build_test_hook: std::sync::Mutex::new(None),
             event_tx: tokio::sync::broadcast::channel(256).0,
-            session_overlays: RwLock::new(std::collections::HashMap::new()),
             session_scopes: RwLock::new(HashMap::new()),
             spine: std::sync::OnceLock::new(),
             spine_refresh_gate: tokio::sync::Mutex::new(()),
@@ -1580,7 +1577,6 @@ impl DaemonState {
             last_activity_ms: AtomicU64::new(0),
             active_requests: AtomicU64::new(0),
             lsp_enrichment_tx: None,
-            change_oid_cache: std::sync::RwLock::new(None),
             cached_repo_id: repo_id.to_string(),
             is_shutdown: AtomicBool::new(false),
             persisted_entity_count: AtomicU64::new(loaded_entity_count as u64),
@@ -1589,7 +1585,6 @@ impl DaemonState {
             mcp_transactions: Mutex::new(HashMap::new()),
             locate_rankings: Mutex::new(HashMap::new()),
             semantic_locate_pages: Mutex::new(HashMap::new()),
-            hydration_gate: Arc::new(tokio::sync::Mutex::new(())),
         };
 
         // Restore in-flight MCP transactions persisted before a restart.
@@ -2424,10 +2419,13 @@ impl DaemonState {
         {
             Some(recovered) => {
                 let text_index_path = self.layout.text_index_dir();
-                let graph = Arc::new(kin_db::InMemoryGraph::from_snapshot_with_text_index(
-                    recovered.snapshot,
-                    text_index_path,
-                ));
+                let graph = Arc::new(
+                    kin_db::InMemoryGraph::from_snapshot_with_text_index(
+                        recovered.snapshot,
+                        text_index_path,
+                    )
+                    .map_err(DaemonError::from)?,
+                );
                 info!(
                     repo_id,
                     generation = recovered.generation,
@@ -2540,8 +2538,27 @@ impl DaemonState {
                 self.graph
                     .upsert_file_layout(&layout)
                     .map_err(DaemonError::from)?;
-                self.graph
-                    .set_file_hash(&file_id.0, kin_blobs::digest_bytes(content));
+                let entry = self
+                    .graph
+                    .get_tree_entry(file_id)
+                    .map_err(DaemonError::from)?
+                    .ok_or_else(|| {
+                        exact_source_storage_error(format!(
+                            "semantic enrichment for {file_id} preceded exact working-tree admission"
+                        ))
+                    })?;
+                let expected = entry.blob_identity().ok_or_else(|| {
+                    exact_source_storage_error(format!(
+                        "semantic enrichment for {file_id} cannot target a gitlink"
+                    ))
+                })?;
+                let actual = kin_blobs::digest_bytes(content);
+                if actual != *expected.as_bytes() {
+                    return Err(exact_source_storage_error(format!(
+                        "semantic enrichment bytes for {file_id} do not match graph-owned tree entry {}",
+                        expected
+                    )));
+                }
             }
             kin_reconcile::ReconcileOutcome::FileRemoved { file_id, .. } => {
                 self.graph
@@ -2573,43 +2590,6 @@ impl DaemonState {
         // Persist asynchronously — don't block the mutation path.
         let path = self.layout.root().join("vfs_version");
         let _ = std::fs::write(&path, v.to_string());
-    }
-
-    /// Get or create a session-scoped overlay for the given session.
-    pub async fn get_or_create_session_overlay(
-        &self,
-        session_id: &kin_model::SessionId,
-    ) -> kin_model::GraphOverlay {
-        let overlays = self.session_overlays.read().await;
-        if let Some(overlay) = overlays.get(session_id) {
-            return overlay.clone();
-        }
-        drop(overlays);
-        let mut overlays = self.session_overlays.write().await;
-        overlays
-            .entry(session_id.clone())
-            .or_insert_with(kin_model::GraphOverlay::default)
-            .clone()
-    }
-
-    /// Update a session's overlay with new mutations.
-    pub async fn update_session_overlay(
-        &self,
-        session_id: &kin_model::SessionId,
-        overlay: kin_model::GraphOverlay,
-    ) {
-        let mut overlays = self.session_overlays.write().await;
-        overlays.insert(session_id.clone(), overlay);
-        self.bump_version();
-        self.emit_event(DaemonEvent::OverlayUpdated {
-            session_id: session_id.to_string(),
-        });
-    }
-
-    /// Drop a session's overlay (on session end or commit).
-    pub async fn remove_session_overlay(&self, session_id: &kin_model::SessionId) {
-        let mut overlays = self.session_overlays.write().await;
-        overlays.remove(session_id);
     }
 
     /// Set a temporal scope for a session. If max concurrent scopes reached,
@@ -2738,41 +2718,10 @@ impl DaemonState {
         (Arc::clone(&self.graph), RequestGraphAuthority::Head)
     }
 
-    /// Resolve the graph authority for a request that may hydrate a Git ref.
-    ///
-    /// Ref hydration mutates the selected graph even though blame/history are
-    /// query surfaces. Treat an active temporal scope like a write lease:
-    /// prune expired entries and refresh the selected scope under the same
-    /// write lock used to clone its graph. This gives hydration a fresh scope
-    /// lease instead of starting from a nearly-expired one. Callers must still
-    /// re-resolve through this method after waiting on the global hydration
-    /// gate because the session scope may have changed while the request was
-    /// queued.
-    pub(crate) async fn graph_for_ref_hydration_with_authority(
-        &self,
-        session_id: Option<&kin_model::SessionId>,
-    ) -> (Arc<kin_db::InMemoryGraph>, RequestGraphAuthority) {
-        if let Some(session_id) = session_id {
-            let mut scopes = self.session_scopes.write().await;
-            scopes.retain(|_, scope| !scope.is_expired());
-            if let Some(scope) = scopes.get_mut(session_id) {
-                scope.created_at = Instant::now();
-                return (
-                    Arc::clone(&scope.cached_graph),
-                    RequestGraphAuthority::SessionScope,
-                );
-            }
-        }
-
-        (Arc::clone(&self.graph), RequestGraphAuthority::Head)
-    }
-
-    /// Revalidate that the authority selected before ref hydration still owns
-    /// the exact graph that was mutated. Session scopes may expire or be
-    /// replaced while synchronous history import is running; in that case the
-    /// old graph is an orphan and must not be acknowledged as current session
-    /// state. HEAD ownership is stable for the daemon lifetime.
-    pub(crate) async fn ref_hydration_authority_is_current(
+    /// Revalidate that a selected request graph is still owned by the same
+    /// authority. Session scopes may expire or be replaced during a long read;
+    /// HEAD ownership is stable for the daemon lifetime.
+    pub(crate) async fn graph_authority_is_current(
         &self,
         session_id: Option<&kin_model::SessionId>,
         graph: &Arc<kin_db::InMemoryGraph>,
@@ -2901,8 +2850,7 @@ impl DaemonState {
     /// Persist every exact-mode source object referenced by `changes` before
     /// the graph authority that names those objects is committed.
     ///
-    /// Legacy mode-unknown deltas remain explicit graph gaps and are skipped;
-    /// exact deltas fail closed when neither the local content-addressed store
+    /// Exact deltas fail closed when neither the local content-addressed store
     /// nor the backend already has the named bytes. Durable source objects may
     /// safely precede a failed graph CAS because they are immutable and
     /// content-addressed, while committing the graph first would create an
@@ -2920,14 +2868,14 @@ impl DaemonState {
         {
             let mut paths = objects
                 .iter()
-                .map(|(_, file_id, change_id, _)| (*change_id, file_id))
+                .map(|(_, path, change_id, _)| (*change_id, path))
                 .collect::<Vec<_>>();
             paths.sort_by(|left, right| {
                 left.0
                      .0
                     .as_bytes()
                     .cmp(right.0 .0.as_bytes())
-                    .then_with(|| left.1 .0.cmp(&right.1 .0))
+                    .then_with(|| left.1.cmp(right.1))
             });
             let mut start = 0;
             while start < paths.len() {
@@ -2936,14 +2884,12 @@ impl DaemonState {
                 while end < paths.len() && paths[end].0 == change_id {
                     end += 1;
                 }
-                kin_core::validate_source_paths(
-                    paths[start..end].iter().map(|(_, file_id)| *file_id),
-                )
-                .map_err(|error| {
-                    exact_source_storage_error(format!(
-                        "exact source change {change_id} is not materializable: {error}"
-                    ))
-                })?;
+                kin_core::validate_source_paths(paths[start..end].iter().map(|(_, path)| *path))
+                    .map_err(|error| {
+                        exact_source_storage_error(format!(
+                            "exact source change {change_id} is not materializable: {error}"
+                        ))
+                    })?;
                 start = end;
             }
         }
@@ -2958,8 +2904,8 @@ impl DaemonState {
             let digest = *hash.as_bytes();
             match self.blobs.read(&kin_blobs::Hash256(digest)) {
                 Ok(data) => {
-                    for (_, file_id, _, kind) in &objects[start..end] {
-                        validate_exact_source_bytes(file_id, *kind, hash, &data, "local")?;
+                    for (_, path, _, entry) in &objects[start..end] {
+                        validate_exact_source_bytes(path, *entry, hash, &data, "local")?;
                     }
                     backend
                         .save_source_blob(repo_id, digest, &data)
@@ -2970,13 +2916,13 @@ impl DaemonState {
                     .map_err(DaemonError::from)?
                 {
                     Some(data) => {
-                        for (_, file_id, _, kind) in &objects[start..end] {
-                            validate_exact_source_bytes(file_id, *kind, hash, &data, "backend")?;
+                        for (_, path, _, entry) in &objects[start..end] {
+                            validate_exact_source_bytes(path, *entry, hash, &data, "backend")?;
                         }
-                        let (_, first_file_id, first_change_id, _) = &objects[start];
+                        let (_, first_path, first_change_id, _) = &objects[start];
                         warn!(
                             repo_id,
-                            file = %first_file_id,
+                            file = %first_path,
                             change = %first_change_id,
                             hash = %hash,
                             references = end - start,
@@ -2985,11 +2931,11 @@ impl DaemonState {
                         );
                     }
                     None => {
-                        let (_, file_id, change_id, _) = &objects[start];
+                        let (_, path, change_id, _) = &objects[start];
                         return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
                             format!(
                                 "exact source bytes for {} in change {} at {} are absent from both local and backend authority: {local_error}",
-                                file_id, change_id, hash
+                                path, change_id, hash
                             ),
                         )));
                     }
@@ -3021,34 +2967,20 @@ impl DaemonState {
             graph,
             incoming: change,
         };
-        let entries = match prospective
-            .resolve_source_tree_at(&change.id)
-            .map_err(DaemonError::from)?
-        {
-            SourceTreeResolution::Exact { entries } => entries,
-            SourceTreeResolution::Incomplete { gaps } => {
-                let gaps = gaps
-                    .iter()
-                    .map(|gap| format!("{}@{}:{:?}", gap.file_id, gap.change_id, gap.reason))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                return Err(exact_source_storage_error(format!(
-                    "incoming source history at {} is not exact: {gaps}",
-                    change.id
-                )));
-            }
-        };
+        let entries = prospective
+            .resolve_tree_at(&change.id)
+            .map_err(DaemonError::from)?;
         self.preflight_materializable_source_entries(entries, "incoming exact")
     }
 
     fn preflight_materializable_source_entries(
         &self,
-        entries: HashMap<FilePathId, kin_model::ResolvedSourceEntry>,
+        entries: ResolvedTree,
         purpose: &str,
     ) -> Result<()> {
-        let mut entries: Vec<_> = entries.into_iter().collect();
-        entries.sort_by(|left, right| left.0 .0.cmp(&right.0 .0));
-        kin_core::validate_source_paths(entries.iter().map(|(file_id, _)| file_id)).map_err(
+        let mut entries = entries.into_artifacts().collect::<Vec<_>>();
+        entries.sort_by(|left, right| left.path.cmp(&right.path));
+        kin_core::validate_source_paths(entries.iter().map(|artifact| &artifact.path)).map_err(
             |error| {
                 exact_source_storage_error(format!(
                     "{purpose} source tree is not materializable: {error}"
@@ -3056,17 +2988,20 @@ impl DaemonState {
             },
         )?;
         entries.sort_by(|left, right| {
-            left.1
-                .hash
-                .as_bytes()
-                .cmp(right.1.hash.as_bytes())
-                .then_with(|| left.0 .0.cmp(&right.0 .0))
+            left.entry
+                .blob_identity()
+                .cmp(&right.entry.blob_identity())
+                .then_with(|| left.path.cmp(&right.path))
         });
         let mut start = 0;
         while start < entries.len() {
-            let source_hash = entries[start].1.hash;
+            let Some(source_hash) = entries[start].entry.blob_identity() else {
+                // Gitlinks have no repository-owned source body.
+                start += 1;
+                continue;
+            };
             let mut end = start + 1;
-            while end < entries.len() && entries[end].1.hash == source_hash {
+            while end < entries.len() && entries[end].entry.blob_identity() == Some(source_hash) {
                 end += 1;
             }
             let digest = *source_hash.as_bytes();
@@ -3077,7 +3012,7 @@ impl DaemonState {
                     .ok_or_else(|| {
                         exact_source_storage_error(format!(
                             "{purpose} source bytes for {} at {} are absent from backend authority",
-                            entries[start].0, source_hash
+                            entries[start].path, source_hash
                         ))
                     })?;
                 (data, "backend")
@@ -3088,13 +3023,19 @@ impl DaemonState {
                     .map_err(|error| {
                         exact_source_storage_error(format!(
                             "{purpose} source bytes for {} at {} are absent or corrupt in local authority: {error}",
-                            entries[start].0, source_hash
+                            entries[start].path, source_hash
                         ))
                     })?;
                 (data, "local")
             };
-            for (file_id, source) in &entries[start..end] {
-                validate_exact_source_bytes(file_id, source.kind, source.hash, &data, authority)?;
+            for artifact in &entries[start..end] {
+                validate_exact_source_bytes(
+                    &artifact.path,
+                    artifact.entry,
+                    source_hash,
+                    &data,
+                    authority,
+                )?;
             }
             start = end;
         }
@@ -3112,22 +3053,7 @@ impl DaemonState {
         graph: &kin_db::InMemoryGraph,
         head: &SemanticChangeId,
     ) -> Result<()> {
-        let entries = match graph
-            .resolve_source_tree_at(head)
-            .map_err(DaemonError::from)?
-        {
-            SourceTreeResolution::Exact { entries } => entries,
-            SourceTreeResolution::Incomplete { gaps } => {
-                let gaps = gaps
-                    .iter()
-                    .map(|gap| format!("{}@{}:{:?}", gap.file_id, gap.change_id, gap.reason))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                return Err(exact_source_storage_error(format!(
-                    "release source history at {head} is not exact: {gaps}"
-                )));
-            }
-        };
+        let entries = graph.resolve_tree_at(head).map_err(DaemonError::from)?;
 
         self.preflight_materializable_source_entries(entries, &format!("release source at {head}"))
     }
@@ -3193,9 +3119,9 @@ impl DaemonState {
                 || self.graph.full_snapshot_required()
                 || !backend.supports_incremental_deltas()
             {
-                let (bytes, graph_root_hash, persistence_epoch) = self
+                let (bytes, graph_root_hash, retrieval_authority_hash, persistence_epoch) = self
                     .graph
-                    .begin_snapshot_persistence(None)
+                    .begin_snapshot_persistence_with_retrieval_hash(None)
                     .map_err(DaemonError::from)?;
                 let persistence_attempt =
                     GraphPersistenceAttempt::new(self.graph.as_ref(), persistence_epoch);
@@ -3213,6 +3139,7 @@ impl DaemonState {
                     self.layout.kindb_snapshot_path().as_path(),
                     self.graph.as_ref(),
                     graph_root_hash,
+                    retrieval_authority_hash,
                     persistence_epoch,
                 )
                 .map_err(DaemonError::from)?;
@@ -3502,7 +3429,10 @@ impl DaemonState {
                             ),
                         )));
                     }
-                    Arc::new(kin_db::InMemoryGraph::from_snapshot(recovered.snapshot))
+                    Arc::new(
+                        kin_db::InMemoryGraph::from_snapshot(recovered.snapshot)
+                            .map_err(DaemonError::from)?,
+                    )
                 }
                 None if generation == kin_db::GENERATION_INIT => Arc::clone(&self.graph),
                 None => {
@@ -3601,94 +3531,24 @@ impl DaemonState {
 
     /// Rebuild projection state from the current graph.
     ///
-    /// Primary path: loads each persisted [`FileLayout`] and its blob-backed
-    /// base content from graph truth via [`ProjectionState::from_graph`].
-    ///
-    /// Fallback path: if a file layout exists in the graph but its file hash
-    /// has not yet been persisted (older snapshots from before file hashes were
-    /// always written), `from_graph` returns
-    /// [`ProjectionError::BaseContentUnavailable`].  Rather than hard-failing
-    /// and leaving the daemon unable to serve VFS reads or accept projected
-    /// writes, the fallback iterates layouts individually: files whose hash IS
-    /// present are loaded from blobs (graph-backed); files whose hash is absent
-    /// are loaded from the working-directory copy on disk (migration-debt path).
-    /// Files that are neither in blobs nor on disk are skipped with a warning.
+    /// Loads every persisted [`FileLayout`] and its blob-backed base content
+    /// from the graph's exact resolved tree. Missing entries or blobs are
+    /// authority gaps and fail loudly; runtime projection never repairs graph
+    /// truth from raw filesystem contents.
     ///
     /// Called after graph init, snapshot load, or a write-notify reconcile.
     pub async fn rebuild_projection(&self) -> Result<()> {
         let mut projection = self.projection.write().await;
 
-        // Fast path: all file hashes persisted — build directly from graph truth.
-        match ProjectionState::from_graph(self.graph.as_ref(), self.blobs.as_ref()) {
-            Ok(state) => {
-                let registered = state.file_ids().len();
-                *projection = state;
-                info!(
-                    files = registered,
-                    "rebuilt projection state from persisted graph truth"
-                );
-                return Ok(());
-            }
-            Err(kin_projection::ProjectionError::BaseContentUnavailable { .. }) => {
-                // Fall through to the per-file fallback below.
-            }
-            Err(e) => return Err(DaemonError::from(e)),
-        }
-
-        // Fallback path: some file hashes are absent (older snapshot).
-        // Build the projection file-by-file, reading from disk when blobs lack
-        // the content.  This is migration debt — once all snapshots are on the
-        // current schema (hashes always persisted) this path becomes unreachable.
-        let layouts = self.graph.list_file_layouts().map_err(DaemonError::from)?;
-        let mut new_projection = ProjectionState::new();
-        let mut loaded = 0usize;
-        let mut disk_fallback = 0usize;
-        let mut skipped = 0usize;
-
-        for layout in layouts {
-            let file_id = layout.file_id.clone();
-
-            // Try to load content from blobs (graph-backed, preferred).
-            // InMemoryGraph::get_file_hash takes &str and returns Option<[u8; 32]>.
-            let blob_content = self
-                .graph
-                .get_file_hash(&file_id.0)
-                .and_then(|raw| self.blobs.read(&kin_blobs::Hash256::from_bytes(raw)).ok());
-
-            if let Some(content) = blob_content {
-                new_projection.register_file(layout, content);
-                loaded += 1;
-                continue;
-            }
-
-            // Blob not available: fall back to the on-disk working copy.
-            let file_path = self.layout.working_dir().join(file_id.0.as_str());
-            match std::fs::read(&file_path) {
-                Ok(content) => {
-                    new_projection.register_file(layout, content);
-                    disk_fallback += 1;
-                }
-                Err(e) => {
-                    // File is neither in blobs nor on disk (deleted, not yet
-                    // checked out, etc.) — skip it rather than hard-failing.
-                    warn!(
-                        file = %file_id,
-                        error = %e,
-                        "skipping projection rebuild for file not in blobs or disk \
-                         (migration-debt fallback)"
-                    );
-                    skipped += 1;
-                }
-            }
-        }
-
-        *projection = new_projection;
+        let tree = self.graph.resolved_tree();
+        let state =
+            ProjectionState::from_resolved_tree(self.graph.as_ref(), self.blobs.as_ref(), &tree)
+                .map_err(DaemonError::from)?;
+        let registered = state.file_ids().len();
+        *projection = state;
         info!(
-            files = loaded + disk_fallback,
-            graph_backed = loaded,
-            disk_fallback = disk_fallback,
-            skipped = skipped,
-            "rebuilt projection state via per-file fallback (older snapshot without file hashes)"
+            files = registered,
+            "rebuilt projection state from persisted graph truth"
         );
         Ok(())
     }
@@ -3697,8 +3557,8 @@ impl DaemonState {
     ///
     /// This is the warm path after reconcile/VFS writes: removed files are
     /// evicted from the projection cache, and added/modified files are loaded
-    /// from graph-owned layout + blob content. Missing hashes retain the same
-    /// per-file working-tree fallback used by `rebuild_projection`.
+    /// from graph-owned layout + blob content. Missing entries or blobs fail
+    /// loudly instead of being repaired from the filesystem.
     pub async fn refresh_projection(&self, changed: &ProjectionChangedSet) -> Result<()> {
         if changed.is_empty() {
             return Ok(());
@@ -3706,7 +3566,6 @@ impl DaemonState {
 
         let mut projection = self.projection.write().await;
         let mut loaded = 0usize;
-        let mut disk_fallback = 0usize;
         let mut removed = 0usize;
         let mut skipped = 0usize;
 
@@ -3726,39 +3585,36 @@ impl DaemonState {
                 continue;
             };
 
-            let blob_content = self
+            let entry = self
                 .graph
-                .get_file_hash(&file_id.0)
-                .and_then(|raw| self.blobs.read(&kin_blobs::Hash256::from_bytes(raw)).ok());
-
-            if let Some(content) = blob_content {
-                projection.register_file(layout, content);
-                loaded += 1;
-                continue;
-            }
-
-            let file_path = self.layout.working_dir().join(file_id.0.as_str());
-            match std::fs::read(&file_path) {
-                Ok(content) => {
-                    projection.register_file(layout, content);
-                    disk_fallback += 1;
-                }
-                Err(e) => {
-                    projection.remove_file(file_id);
-                    warn!(
-                        file = %file_id,
-                        error = %e,
-                        "skipping projection refresh for file not in blobs or disk"
-                    );
-                    skipped += 1;
-                }
-            }
+                .get_tree_entry(file_id)
+                .map_err(DaemonError::from)?
+                .ok_or_else(|| {
+                    exact_source_storage_error(format!(
+                        "projection refresh for {file_id} has no graph-owned tree entry"
+                    ))
+                })?;
+            let TreeEntry::Blob { hash, .. } = entry else {
+                return Err(exact_source_storage_error(format!(
+                    "projection refresh for {file_id} has a layout attached to a non-blob tree entry"
+                )));
+            };
+            let content = self
+                .blobs
+                .read(&kin_blobs::Hash256(*hash.as_bytes()))
+                .map_err(|error| {
+                    exact_source_storage_error(format!(
+                        "projection refresh for {file_id} cannot load graph-owned blob {}: {error}",
+                        hash
+                    ))
+                })?;
+            projection.register_file(layout, content);
+            loaded += 1;
         }
 
         info!(
-            upserted = loaded + disk_fallback,
+            upserted = loaded,
             graph_backed = loaded,
-            disk_fallback,
             removed,
             skipped,
             "refreshed projection state for changed files"
@@ -3992,12 +3848,10 @@ impl Drop for EmbedPassGuard<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(feature = "vector")]
-    use kin_db::VectorIndex;
     use kin_model::{
-        Entity, EntityKind, EntityMetadata, FileLayout, FilePathId, FingerprintAlgorithm,
-        GraphOverlay, Hash256, ImportSection, LanguageId, ParseCompleteness, SemanticFingerprint,
-        Visibility, WorkingCopy,
+        ArtifactId, ChangeOrigin, Entity, EntityKind, EntityMetadata, FileLayout, FilePathId,
+        FingerprintAlgorithm, Hash256, ImportSection, LanguageId, LocatedEntry, ParseCompleteness,
+        RepoPath, SemanticFingerprint, TreeDelta, Visibility,
     };
     use kin_reconcile::ReconcileOutcome;
     use serde_json::json;
@@ -4036,9 +3890,6 @@ mod tests {
         fail_cleanup: AtomicBool,
         delta_block: Option<DeltaSaveBlock>,
         recovery_loads: Option<Arc<AtomicU64>>,
-        source_loads: Option<Arc<AtomicU64>>,
-        source_saves: Option<Arc<AtomicU64>>,
-        source_override: Option<Vec<u8>>,
     }
 
     struct DeltaSaveBlock {
@@ -4054,9 +3905,6 @@ mod tests {
                 fail_cleanup: AtomicBool::new(fail_cleanup),
                 delta_block: None,
                 recovery_loads: None,
-                source_loads: None,
-                source_saves: None,
-                source_override: None,
             }
         }
 
@@ -4074,9 +3922,6 @@ mod tests {
                     block_once: AtomicBool::new(true),
                 }),
                 recovery_loads: None,
-                source_loads: None,
-                source_saves: None,
-                source_override: None,
             }
         }
 
@@ -4086,37 +3931,6 @@ mod tests {
                 fail_cleanup: AtomicBool::new(false),
                 delta_block: None,
                 recovery_loads: Some(recovery_loads),
-                source_loads: None,
-                source_saves: None,
-                source_override: None,
-            }
-        }
-
-        fn counting_source(
-            path: &std::path::Path,
-            source_loads: Arc<AtomicU64>,
-            source_saves: Arc<AtomicU64>,
-        ) -> Self {
-            Self {
-                inner: kin_db::LocalFileBackend::new(path),
-                fail_cleanup: AtomicBool::new(false),
-                delta_block: None,
-                recovery_loads: None,
-                source_loads: Some(source_loads),
-                source_saves: Some(source_saves),
-                source_override: None,
-            }
-        }
-
-        fn corrupt_source(path: &std::path::Path, bytes: Vec<u8>) -> Self {
-            Self {
-                inner: kin_db::LocalFileBackend::new(path),
-                fail_cleanup: AtomicBool::new(false),
-                delta_block: None,
-                recovery_loads: None,
-                source_loads: None,
-                source_saves: None,
-                source_override: Some(bytes),
             }
         }
     }
@@ -4132,32 +3946,6 @@ mod tests {
         ) -> std::result::Result<Option<(Vec<u8>, kin_db::Generation)>, kin_db::KinDbError>
         {
             self.inner.load_snapshot(repo_id)
-        }
-
-        fn save_source_blob(
-            &self,
-            repo_id: &str,
-            digest: [u8; 32],
-            data: &[u8],
-        ) -> std::result::Result<(), kin_db::KinDbError> {
-            if let Some(saves) = &self.source_saves {
-                saves.fetch_add(1, Ordering::SeqCst);
-            }
-            self.inner.save_source_blob(repo_id, digest, data)
-        }
-
-        fn load_source_blob(
-            &self,
-            repo_id: &str,
-            digest: [u8; 32],
-        ) -> std::result::Result<Option<Vec<u8>>, kin_db::KinDbError> {
-            if let Some(loads) = &self.source_loads {
-                loads.fetch_add(1, Ordering::SeqCst);
-            }
-            if let Some(bytes) = &self.source_override {
-                return Ok(Some(bytes.clone()));
-            }
-            self.inner.load_source_blob(repo_id, digest)
         }
 
         fn load_snapshot_authority(
@@ -4260,125 +4048,40 @@ mod tests {
         }
     }
 
-    fn exact_source_change(
-        id_byte: u8,
-        file_id: &str,
-        kind: kin_model::ArtifactDeltaKind,
-        hash: Hash256,
-    ) -> kin_model::SemanticChange {
+    fn exact_source_change(id_byte: u8, path: &str, entry: TreeEntry) -> kin_model::SemanticChange {
         kin_model::SemanticChange {
             id: kin_model::SemanticChangeId::from_hash(Hash256::from_bytes([id_byte; 32])),
+            origin: ChangeOrigin::Native,
             parents: vec![],
             author: kin_model::AuthorId::new("exact-source-preflight-test"),
             message: "exact source preflight fixture".to_string(),
             timestamp: kin_model::Timestamp::now(),
             entity_deltas: vec![],
             relation_deltas: vec![],
-            artifact_deltas: vec![kin_model::ArtifactDelta {
-                file_id: FilePathId::new(file_id),
-                kind,
-                old_hash: None,
-                new_hash: Some(hash),
+            tree_deltas: vec![TreeDelta::Added {
+                artifact_id: ArtifactId::new(),
+                new: LocatedEntry::new(RepoPath::from_utf8(path).unwrap(), entry),
             }],
+            admission_policy_delta: None,
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],
             risk_summary: None,
-            authored_on: None,
         }
     }
 
     fn local_object_path(layout: &KinLayout, hash: Hash256) -> std::path::PathBuf {
         let encoded = hash.to_string();
-        layout.objects_dir().join(&encoded[..2]).join(&encoded[2..])
+        layout
+            .ingest_cas_dir()
+            .join(&encoded[..2])
+            .join(&encoded[2..])
     }
 
     fn test_state(layout: KinLayout, working_dir: &std::path::Path) -> DaemonState {
-        let snapshot_generation =
-            if kin_db::SnapshotManager::local_authority_exists(layout.kindb_snapshot_path()) {
-                kin_db::SnapshotManager::open_read_only(layout.kindb_snapshot_path())
-                    .unwrap()
-                    .generation()
-            } else {
-                kin_db::GENERATION_INIT
-            };
-        let graph = Arc::new(kin_db::InMemoryGraph::with_text_index(
-            layout.text_index_dir(),
-        ));
-        let blobs = BlobStore::new(layout.objects_dir()).unwrap();
-        let genesis = kin_core::build_genesis_change();
-        let working_copy = WorkingCopy {
-            base_change: genesis.id,
-            uncommitted_mutations: GraphOverlay::default(),
-        };
-        let coordinator = SessionCoordinator::new(Arc::clone(&graph));
-        let loaded_entity_count = graph.entity_count();
-        let coordination_events =
-            CoordinationEventLog::open(&layout, "test-repo").expect("open coordination log");
-
-        DaemonState {
-            layout,
-            graph,
-            blobs: Arc::new(blobs),
-            working_copy: RwLock::new(working_copy),
-            reconciler: RwLock::new(Reconciler::new(working_dir.to_path_buf())),
-            projection: RwLock::new(ProjectionState::new()),
-            coordinator,
-            coordination_gate: tokio::sync::Mutex::new(()),
-            graph_authority_clock: Arc::new(GraphAuthorityClock::default()),
-            coordination_mode: std::sync::RwLock::new(
-                kin_mcp::CoordinationEnforcementMode::from_env(),
-            ),
-            coordination_events,
-            coordination_event_persist_failures: AtomicU64::new(0),
-            started_at: Instant::now(),
-            is_initialized: AtomicBool::new(false),
-            reconciliation_status: AtomicU8::new(RECON_IDLE),
-            storage_backend: None,
-            filesystem_reconcile_disabled: AtomicBool::new(false),
-            snapshot_generation: AtomicU64::new(snapshot_generation),
-            post_commit_finalization_pending: AtomicBool::new(false),
-            pending_persistence_event: Mutex::new(None),
-            #[cfg(test)]
-            finalization_fail_once: AtomicBool::new(false),
-            #[cfg(test)]
-            snapshot_save_fail_once: AtomicBool::new(false),
-            vfs_version: AtomicU64::new(0),
-            vfs_tree_cache: std::sync::RwLock::new(None),
-            vfs_tree_build_lock: tokio::sync::Mutex::new(()),
-            #[cfg(test)]
-            vfs_tree_build_count: AtomicU64::new(0),
-            #[cfg(test)]
-            vfs_tree_build_test_hook: std::sync::Mutex::new(None),
-            event_tx: tokio::sync::broadcast::channel(256).0,
-            session_overlays: RwLock::new(std::collections::HashMap::new()),
-            session_scopes: RwLock::new(HashMap::new()),
-            spine: std::sync::OnceLock::new(),
-            spine_refresh_gate: tokio::sync::Mutex::new(()),
-            repo_graphs: RwLock::new(HashMap::new()),
-            allowed_repo_ids: None,
-            dirty: AtomicBool::new(false),
-            mutation_epoch: AtomicU64::new(0),
-            embedding_work: Mutex::new(()),
-            persist_lock: Mutex::new(()),
-            last_save: std::sync::Mutex::new(Instant::now()),
-            last_mutation: std::sync::Mutex::new(Instant::now()),
-            active_embed_passes: AtomicU32::new(0),
-            background_embed_paused: AtomicBool::new(false),
-            last_activity_ms: AtomicU64::new(0),
-            active_requests: AtomicU64::new(0),
-            lsp_enrichment_tx: None,
-            change_oid_cache: std::sync::RwLock::new(None),
-            cached_repo_id: "test-repo".to_string(),
-            is_shutdown: AtomicBool::new(false),
-            persisted_entity_count: AtomicU64::new(loaded_entity_count as u64),
-            mass_deletion_blocked: AtomicBool::new(false),
-            embed_worker_failed: AtomicBool::new(false),
-            mcp_transactions: Mutex::new(HashMap::new()),
-            locate_rankings: Mutex::new(HashMap::new()),
-            semantic_locate_pages: Mutex::new(HashMap::new()),
-            hydration_gate: Arc::new(tokio::sync::Mutex::new(())),
-        }
+        assert_eq!(layout.working_dir(), working_dir);
+        DaemonState::open(layout)
+            .expect("daemon test fixtures must open through repository-v6 workspace authority")
     }
 
     fn test_entity(name: &str, file_path: &str) -> Entity {
@@ -4687,6 +4390,21 @@ mod tests {
         let mut reconciler = Reconciler::new(repo_dir.path().to_path_buf());
         let file_id = FilePathId::new("src/lib.rs");
         let content = b"fn persisted() {}\n".to_vec();
+        let content_hash = Hash256::from_bytes(kin_blobs::digest_bytes(&content));
+        state.blobs.write(&content).unwrap();
+        state
+            .graph
+            .apply_transaction_delta(&kin_model::TransactionDelta {
+                tree_deltas: vec![TreeDelta::Added {
+                    artifact_id: ArtifactId::new(),
+                    new: LocatedEntry::new(
+                        RepoPath::from_utf8(&file_id.0).unwrap(),
+                        TreeEntry::blob(content_hash, false),
+                    ),
+                }],
+                ..Default::default()
+            })
+            .unwrap();
 
         reconciler
             .projection_mut()
@@ -4708,8 +4426,8 @@ mod tests {
         let persisted_layout = state.graph.get_file_layout(&file_id).unwrap().unwrap();
         assert_eq!(persisted_layout.file_id, file_id);
         assert_eq!(
-            state.graph.get_file_hash(&file_id.0),
-            Some(kin_blobs::digest_bytes(&content))
+            state.graph.get_tree_entry(&file_id).unwrap(),
+            Some(TreeEntry::blob(content_hash, false))
         );
     }
 
@@ -5245,15 +4963,13 @@ mod tests {
         let repo_dir = tempfile::tempdir().unwrap();
         let init = kin_core::init(repo_dir.path()).unwrap();
         let layout = init.layout;
-        let snapshot_path = layout.kindb_snapshot_path();
-        let mut authority_name = std::ffi::OsString::from(snapshot_path.as_os_str());
-        authority_name.push(".authority.json");
+        let manifest = kin_core::manifest::KinManifest::load(&layout.manifest_path()).unwrap();
+        let repository_dir = layout.kindb_dir().join(&manifest.repo_id);
         let authority: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(authority_name).unwrap()).unwrap();
+            serde_json::from_slice(&std::fs::read(repository_dir.join("authority.json")).unwrap())
+                .unwrap();
         let snapshot_file = authority["snapshot_file"].as_str().unwrap();
-        let mut versions_name = std::ffi::OsString::from(snapshot_path.as_os_str());
-        versions_name.push(".snapshots");
-        let authoritative_snapshot = std::path::PathBuf::from(versions_name).join(snapshot_file);
+        let authoritative_snapshot = repository_dir.join("snapshots").join(snapshot_file);
         std::fs::write(authoritative_snapshot, b"not-a-valid-kndb").unwrap();
 
         let err = match DaemonState::open(layout) {
@@ -5261,8 +4977,14 @@ mod tests {
             Err(err) => err,
         };
         let message = err.to_string();
-        assert!(message.contains("failed to load persisted graph snapshot"));
-        assert!(message.contains("graph.kndb"));
+        assert!(
+            message.contains("snapshot digest mismatch"),
+            "unexpected repository authority corruption error: {message}"
+        );
+        assert!(
+            message.contains(&manifest.repo_id),
+            "corruption error must identify the repository namespace: {message}"
+        );
     }
 
     #[test]
@@ -5311,545 +5033,64 @@ mod tests {
     }
 
     #[test]
-    fn open_with_repo_id_preserves_entrypoint_authority() {
+    fn open_materializes_exact_workspace_tree_and_bodies_from_repository_authority() {
         let repo_dir = tempfile::tempdir().unwrap();
+        let compose = b"services:\n  api:\n    image: kin:dev\n";
+        let binary = [0_u8, 0xff, 0x80, b'\n'];
+        std::fs::write(repo_dir.path().join("compose.yaml"), compose).unwrap();
+        std::fs::create_dir_all(repo_dir.path().join("assets")).unwrap();
+        std::fs::write(repo_dir.path().join("assets/data.bin"), binary).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("compose.yaml", repo_dir.path().join("compose-current"))
+            .unwrap();
+
         let init = kin_core::init(repo_dir.path()).unwrap();
-        let state = DaemonState::open_with_repo_id(init.layout, Some("entrypoint-repo"))
-            .expect("an entrypoint-resolved repository id must open");
-        assert_eq!(state.cached_repo_id, "entrypoint-repo");
-    }
+        let state = DaemonState::open(init.layout)
+            .expect("repository-v6 workspace authority must materialize directly");
+        let tree = state.graph.resolved_tree();
+        let compose_artifact = tree
+            .artifact_at_path(&RepoPath::from_utf8("compose.yaml").unwrap())
+            .expect("Compose is exact repository-tree authority");
+        let compose_hash = compose_artifact
+            .entry
+            .blob_identity()
+            .expect("Compose is a blob");
+        assert_eq!(state.blobs.read(&compose_hash).unwrap(), compose);
 
-    #[cfg(feature = "vector")]
-    #[test]
-    fn open_rejects_stale_vector_index_sidecar() {
-        // A persisted vector sidecar whose metadata root hash does NOT match the
-        // graph must be REJECTED on open, not installed. Installing a stale-
-        // dimension index is exactly what triggered the embed-worker reset loop;
-        // `DaemonState::open` now relies solely on the validated load that
-        // `SnapshotManager::open` performs during construction (no raw force-load
-        // override). The embed worker rebuilds the index from the live embedder.
-        let repo_dir = tempfile::tempdir().unwrap();
-        let init = kin_core::init(repo_dir.path()).unwrap();
-        let layout = init.layout;
-        let snapshot_path = layout.kindb_snapshot_path();
-        let vector_path = layout.kindb_vector_index_path();
-        let metadata_path = vector_path.with_extension("kvec.meta.json");
+        let binary_artifact = tree
+            .artifact_at_path(&RepoPath::from_utf8("assets/data.bin").unwrap())
+            .expect("binary assets are exact repository-tree authority");
+        let binary_hash = binary_artifact
+            .entry
+            .blob_identity()
+            .expect("binary asset is a blob");
+        assert_eq!(state.blobs.read(&binary_hash).unwrap(), binary);
 
-        let mgr = kin_db::SnapshotManager::open(&snapshot_path).unwrap();
-        let graph = mgr.graph();
-        let entity = test_entity("vector_reader", "src/lib.rs");
-        graph.upsert_entity(&entity).unwrap();
-        mgr.save().unwrap();
-
-        // Write a sidecar with a deliberately mismatched (stale) root hash.
-        let vectors = VectorIndex::new(4).unwrap();
-        vectors.upsert(entity.id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
-        vectors.save(&vector_path).unwrap();
-        std::fs::write(
-            &metadata_path,
-            serde_json::to_vec(&json!({
-                "version": 1,
-                "graph_root_hash": hex::encode([42u8; 32]),
-                "dimensions": 4,
-                "indexed": 1
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        drop(mgr);
-
-        let state = DaemonState::open(layout).unwrap();
-        assert_eq!(
-            state.graph.embedding_status().indexed,
-            0,
-            "stale-root-hash vector sidecar must be rejected, not installed"
-        );
+        #[cfg(unix)]
+        {
+            let symlink_artifact = tree
+                .artifact_at_path(&RepoPath::from_utf8("compose-current").unwrap())
+                .expect("symlinks are exact repository-tree authority");
+            assert!(matches!(symlink_artifact.entry, TreeEntry::Symlink { .. }));
+            let target_hash = symlink_artifact.entry.blob_identity().unwrap();
+            assert_eq!(state.blobs.read(&target_hash).unwrap(), b"compose.yaml");
+        }
     }
 
     #[test]
-    fn first_publish_commit_persists_under_v2_repo_prefix_and_reloads_with_refs() {
-        // Hosted publish->serve: a full-content commit into the served
-        // graph must persist through the StorageBackend at `<prefix>/<repo>/graph.kndb`
-        // (the GCS `v2/<repo>/` layout, reproduced here with a LocalFileBackend rooted
-        // at `v2/`) and survive a pod restart with its branch refs intact. A fresh
-        // served graph has no branch, so the branch is created before the head update
-        // (update_branch_head errors NotFound otherwise).
-        use kin_db::LocalFileBackend;
-        use kin_model::{
-            AuthorId, Branch, BranchName, ChangeStore, EntityDelta, SemanticChange,
-            SemanticChangeId, Timestamp,
-        };
-
+    fn open_with_repo_id_rejects_identity_other_than_manifest_authority() {
         let repo_dir = tempfile::tempdir().unwrap();
         let init = kin_core::init(repo_dir.path()).unwrap();
-        let layout = init.layout;
-
-        let storage = tempfile::tempdir().unwrap();
-        let v2_root = storage.path().join("v2");
-        let repo_id = "kin";
-        let branch_name = BranchName::new("main");
-
-        let state = DaemonState::open_with_backend(
-            layout.clone(),
-            Box::new(LocalFileBackend::new(&v2_root)),
-            repo_id,
-            None,
-        )
-        .unwrap();
-        assert_eq!(
-            state.graph.entity_count(),
-            0,
-            "a fresh hosted repo starts with an empty served graph"
-        );
-
-        let entity = test_entity("served_fn", "src/lib.rs");
-        state.graph.upsert_entity(&entity).unwrap();
-
-        let change = SemanticChange {
-            id: SemanticChangeId::from_hash(Hash256::from_bytes([7; 32])),
-            parents: vec![],
-            author: AuthorId::new("tester"),
-            message: "first publish".to_string(),
-            timestamp: Timestamp::now(),
-            entity_deltas: vec![EntityDelta::Added(entity.clone())],
-            relation_deltas: vec![],
-            artifact_deltas: vec![],
-            projected_files: vec![],
-            spec_link: None,
-            evidence: vec![],
-            risk_summary: None,
-            authored_on: None,
+        let error = match DaemonState::open_with_repo_id(init.layout, Some("entrypoint-repo")) {
+            Ok(_) => panic!("local workspace authority cannot be rebound to another repository"),
+            Err(error) => error,
         };
-        let change_id = change.id;
-        state
-            .graph
-            .create_branch(&Branch {
-                name: branch_name.clone(),
-                head: change_id,
-            })
-            .unwrap();
-        state.graph.create_change(&change).unwrap();
-        state
-            .graph
-            .update_branch_head(&branch_name, &change_id)
-            .unwrap();
-        state.save_snapshot_full().unwrap();
-
-        let persisted = v2_root.join(repo_id).join("graph.kndb");
         assert!(
-            persisted.exists(),
-            "served commit must persist under v2/<repo>/graph.kndb at {}",
-            persisted.display()
+            error
+                .to_string()
+                .contains("does not match manifest authority"),
+            "unexpected identity mismatch error: {error}"
         );
-
-        drop(state);
-
-        let reopened = DaemonState::open_with_backend(
-            layout,
-            Box::new(LocalFileBackend::new(&v2_root)),
-            repo_id,
-            None,
-        )
-        .unwrap();
-        assert_eq!(
-            reopened.graph.entity_count(),
-            1,
-            "published content must survive reload from the v2 backend"
-        );
-        let branches = reopened.graph.list_branches().unwrap();
-        assert!(
-            branches
-                .iter()
-                .any(|b| b.name == branch_name && b.head == change_id),
-            "published branch head must be visible after reload (refs non-empty)"
-        );
-    }
-
-    #[test]
-    fn storage_backend_replays_sequential_deltas_after_restart() {
-        use kin_db::LocalFileBackend;
-
-        let repo_dir = tempfile::tempdir().unwrap();
-        let init = kin_core::init(repo_dir.path()).unwrap();
-        let layout = init.layout;
-        let storage = tempfile::tempdir().unwrap();
-        let repo_id = "restart-repo";
-
-        let state = DaemonState::open_with_backend(
-            layout.clone(),
-            Box::new(LocalFileBackend::new(storage.path())),
-            repo_id,
-            None,
-        )
-        .unwrap();
-
-        let base = test_entity("base_entity", "src/base.rs");
-        state.graph.upsert_entity(&base).unwrap();
-        state
-            .save_snapshot()
-            .expect("generation zero must promote a full base snapshot");
-        assert_eq!(state.snapshot_generation.load(Ordering::SeqCst), 1);
-
-        let first_delta_entity = test_entity("first_delta_entity", "src/first.rs");
-        state.graph.upsert_entity(&first_delta_entity).unwrap();
-        state.save_snapshot().expect("persist first delta");
-        assert_eq!(state.snapshot_generation.load(Ordering::SeqCst), 2);
-
-        let second_delta_entity = test_entity("second_delta_entity", "src/second.rs");
-        state.graph.upsert_entity(&second_delta_entity).unwrap();
-        state.save_snapshot().expect("persist second delta");
-        assert_eq!(state.snapshot_generation.load(Ordering::SeqCst), 3);
-        drop(state);
-
-        let reopened = DaemonState::open_with_backend(
-            layout,
-            Box::new(LocalFileBackend::new(storage.path())),
-            repo_id,
-            None,
-        )
-        .expect("base snapshot plus deltas must reopen");
-        assert_eq!(reopened.snapshot_generation.load(Ordering::SeqCst), 3);
-        let entities = reopened.graph.list_all_entities().unwrap();
-        let names: HashSet<_> = entities.iter().map(|entity| entity.name.as_str()).collect();
-        assert_eq!(entities.len(), 3);
-        assert!(names.contains("base_entity"));
-        assert!(names.contains("first_delta_entity"));
-        assert!(names.contains("second_delta_entity"));
-    }
-
-    #[test]
-    fn storage_backend_persists_exact_source_objects_before_full_and_delta_authority() {
-        use kin_db::{LocalFileBackend, StorageBackend};
-        use kin_model::{
-            ArtifactDelta, ArtifactDeltaKind, AuthorId, Branch, BranchName, ChangeStore,
-            SemanticChange, SemanticChangeId, Timestamp,
-        };
-
-        let repo_dir = tempfile::tempdir().unwrap();
-        let init = kin_core::init(repo_dir.path()).unwrap();
-        let layout = init.layout;
-        let storage = tempfile::tempdir().unwrap();
-        let repo_id = "exact-source-restart";
-        let branch_name = BranchName::new("main");
-
-        let state = DaemonState::open_with_backend(
-            layout.clone(),
-            Box::new(LocalFileBackend::new(storage.path())),
-            repo_id,
-            None,
-        )
-        .unwrap();
-        let executable = b"#!/bin/sh\necho kin\n";
-        let executable_hash = state.blobs.write(executable).unwrap();
-        let executable_hash = Hash256::from_bytes(executable_hash.0);
-        let first = SemanticChange {
-            id: SemanticChangeId::from_hash(Hash256::from_bytes([31; 32])),
-            parents: vec![],
-            author: AuthorId::new("tester"),
-            message: "add executable".to_string(),
-            timestamp: Timestamp::now(),
-            entity_deltas: vec![],
-            relation_deltas: vec![],
-            artifact_deltas: vec![ArtifactDelta {
-                file_id: FilePathId("bin/kin".to_string()),
-                kind: ArtifactDeltaKind::AddedExecutableFile,
-                old_hash: None,
-                new_hash: Some(executable_hash),
-            }],
-            projected_files: vec![],
-            spec_link: None,
-            evidence: vec![],
-            risk_summary: None,
-            authored_on: None,
-        };
-        state.graph.create_change(&first).unwrap();
-        state
-            .graph
-            .create_branch(&Branch {
-                name: branch_name.clone(),
-                head: first.id,
-            })
-            .unwrap();
-        state.save_snapshot_full().unwrap();
-        assert_eq!(state.snapshot_generation.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            LocalFileBackend::new(storage.path())
-                .load_source_blob(repo_id, *executable_hash.as_bytes())
-                .unwrap()
-                .as_deref(),
-            Some(executable.as_slice())
-        );
-        drop(state);
-
-        let reopened = DaemonState::open_with_backend(
-            layout.clone(),
-            Box::new(LocalFileBackend::new(storage.path())),
-            repo_id,
-            None,
-        )
-        .unwrap();
-        let target = b"bin/kin";
-        let target_hash = reopened.blobs.write(target).unwrap();
-        let target_hash = Hash256::from_bytes(target_hash.0);
-        let second = SemanticChange {
-            id: SemanticChangeId::from_hash(Hash256::from_bytes([32; 32])),
-            parents: vec![first.id],
-            author: AuthorId::new("tester"),
-            message: "add symlink".to_string(),
-            timestamp: Timestamp::now(),
-            entity_deltas: vec![],
-            relation_deltas: vec![],
-            artifact_deltas: vec![ArtifactDelta {
-                file_id: FilePathId("current".to_string()),
-                kind: ArtifactDeltaKind::AddedSymlink,
-                old_hash: None,
-                new_hash: Some(target_hash),
-            }],
-            projected_files: vec![],
-            spec_link: None,
-            evidence: vec![],
-            risk_summary: None,
-            authored_on: None,
-        };
-        reopened.graph.create_change(&second).unwrap();
-        reopened
-            .graph
-            .update_branch_head(&branch_name, &second.id)
-            .unwrap();
-        reopened.save_snapshot().unwrap();
-        assert_eq!(reopened.snapshot_generation.load(Ordering::SeqCst), 2);
-        assert_eq!(
-            LocalFileBackend::new(storage.path())
-                .load_source_blob(repo_id, *target_hash.as_bytes())
-                .unwrap()
-                .as_deref(),
-            Some(target.as_slice())
-        );
-        drop(reopened);
-
-        let reopened = DaemonState::open_with_backend(
-            layout,
-            Box::new(LocalFileBackend::new(storage.path())),
-            repo_id,
-            None,
-        )
-        .unwrap();
-        let exact = reopened.graph.resolve_source_tree_at(&second.id).unwrap();
-        let kin_model::SourceTreeResolution::Exact { entries } = exact else {
-            panic!("persisted exact source history reopened as incomplete")
-        };
-        assert_eq!(
-            entries[&FilePathId("bin/kin".to_string())].kind,
-            kin_model::SourceEntryKind::File { executable: true }
-        );
-        assert_eq!(
-            entries[&FilePathId("current".to_string())].kind,
-            kin_model::SourceEntryKind::Symlink
-        );
-    }
-
-    #[test]
-    fn exact_source_persistence_and_preflight_load_each_content_hash_once() {
-        use kin_db::StorageBackend;
-        use kin_model::{
-            ArtifactDelta, ArtifactDeltaKind, AuthorId, ChangeStore, SemanticChange,
-            SemanticChangeId, Timestamp,
-        };
-
-        let repo_dir = tempfile::tempdir().unwrap();
-        let init = kin_core::init(repo_dir.path()).unwrap();
-        let storage = tempfile::tempdir().unwrap();
-        let repo_id = "deduplicated-exact-source";
-        let source_loads = Arc::new(AtomicU64::new(0));
-        let source_saves = Arc::new(AtomicU64::new(0));
-        let backend = CleanupFailOnceBackend::counting_source(
-            storage.path(),
-            Arc::clone(&source_loads),
-            Arc::clone(&source_saves),
-        );
-        let bytes = b"shared exact source bytes\n";
-        let digest = kin_blobs::digest_bytes(bytes);
-        backend
-            .inner
-            .save_source_blob(repo_id, digest, bytes)
-            .unwrap();
-        let hash = Hash256::from_bytes(digest);
-        let change = SemanticChange {
-            id: SemanticChangeId::from_hash(Hash256::from_bytes([0x93; 32])),
-            parents: vec![],
-            author: AuthorId::new("tester"),
-            message: "reuse one immutable source object".to_string(),
-            timestamp: Timestamp::now(),
-            entity_deltas: vec![],
-            relation_deltas: vec![],
-            artifact_deltas: vec![
-                ArtifactDelta {
-                    file_id: FilePathId("src/first.rs".to_string()),
-                    kind: ArtifactDeltaKind::AddedRegularFile,
-                    old_hash: None,
-                    new_hash: Some(hash),
-                },
-                ArtifactDelta {
-                    file_id: FilePathId("src/second.rs".to_string()),
-                    kind: ArtifactDeltaKind::AddedRegularFile,
-                    old_hash: None,
-                    new_hash: Some(hash),
-                },
-            ],
-            projected_files: vec![],
-            spec_link: None,
-            evidence: vec![],
-            risk_summary: None,
-            authored_on: None,
-        };
-        let state =
-            DaemonState::open_with_backend(init.layout, Box::new(backend), repo_id, None).unwrap();
-        state.graph.create_change(&change).unwrap();
-
-        source_loads.store(0, Ordering::SeqCst);
-        source_saves.store(0, Ordering::SeqCst);
-        state
-            .persist_exact_source_objects(
-                state.storage_backend.as_deref().unwrap(),
-                repo_id,
-                std::iter::once(&change),
-            )
-            .unwrap();
-        assert_eq!(source_loads.load(Ordering::SeqCst), 1);
-        assert_eq!(source_saves.load(Ordering::SeqCst), 0);
-
-        source_loads.store(0, Ordering::SeqCst);
-        state
-            .preflight_exact_source_tree(&state.graph, &change.id)
-            .unwrap();
-        assert_eq!(source_loads.load(Ordering::SeqCst), 1);
-
-        state.blobs.write(bytes).unwrap();
-        source_loads.store(0, Ordering::SeqCst);
-        source_saves.store(0, Ordering::SeqCst);
-        state
-            .persist_exact_source_objects(
-                state.storage_backend.as_deref().unwrap(),
-                repo_id,
-                std::iter::once(&change),
-            )
-            .unwrap();
-        assert_eq!(source_loads.load(Ordering::SeqCst), 0);
-        assert_eq!(source_saves.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn storage_backend_rejects_exact_graph_authority_when_source_bytes_are_missing() {
-        use kin_db::{LocalFileBackend, StorageBackend};
-        use kin_model::{
-            ArtifactDelta, ArtifactDeltaKind, AuthorId, ChangeStore, SemanticChange,
-            SemanticChangeId, Timestamp,
-        };
-
-        let repo_dir = tempfile::tempdir().unwrap();
-        let init = kin_core::init(repo_dir.path()).unwrap();
-        let storage = tempfile::tempdir().unwrap();
-        let repo_id = "missing-exact-source";
-        let state = DaemonState::open_with_backend(
-            init.layout,
-            Box::new(LocalFileBackend::new(storage.path())),
-            repo_id,
-            None,
-        )
-        .unwrap();
-        let missing_hash = Hash256::from_bytes([99; 32]);
-        state
-            .graph
-            .create_change(&SemanticChange {
-                id: SemanticChangeId::from_hash(Hash256::from_bytes([33; 32])),
-                parents: vec![],
-                author: AuthorId::new("tester"),
-                message: "missing source".to_string(),
-                timestamp: Timestamp::now(),
-                entity_deltas: vec![],
-                relation_deltas: vec![],
-                artifact_deltas: vec![ArtifactDelta {
-                    file_id: FilePathId("src/lib.rs".to_string()),
-                    kind: ArtifactDeltaKind::AddedRegularFile,
-                    old_hash: None,
-                    new_hash: Some(missing_hash),
-                }],
-                projected_files: vec![],
-                spec_link: None,
-                evidence: vec![],
-                risk_summary: None,
-                authored_on: None,
-            })
-            .unwrap();
-
-        let error = state
-            .save_snapshot_full()
-            .expect_err("graph authority must not name unavailable exact source bytes");
-        assert!(error
-            .to_string()
-            .contains("absent from both local and backend authority"));
-        assert_eq!(state.snapshot_generation.load(Ordering::SeqCst), 0);
-        assert!(LocalFileBackend::new(storage.path())
-            .load_snapshot(repo_id)
-            .unwrap()
-            .is_none());
-    }
-
-    #[test]
-    fn corrupt_backend_exact_source_preflight_preserves_graph_and_generation() {
-        use kin_db::{LocalFileBackend, StorageBackend};
-        use kin_model::{
-            ArtifactDelta, ArtifactDeltaKind, AuthorId, ChangeStore, SemanticChange,
-            SemanticChangeId, Timestamp,
-        };
-
-        let repo_dir = tempfile::tempdir().unwrap();
-        let init = kin_core::init(repo_dir.path()).unwrap();
-        let storage = tempfile::tempdir().unwrap();
-        let repo_id = "corrupt-exact-source";
-        let state = DaemonState::open_with_backend(
-            init.layout,
-            Box::new(CleanupFailOnceBackend::corrupt_source(
-                storage.path(),
-                b"wrong backend bytes".to_vec(),
-            )),
-            repo_id,
-            None,
-        )
-        .unwrap();
-        let expected_hash =
-            Hash256::from_bytes(kin_blobs::digest_bytes(b"expected exact source bytes"));
-        let change = SemanticChange {
-            id: SemanticChangeId::from_hash(Hash256::from_bytes([34; 32])),
-            parents: vec![],
-            author: AuthorId::new("tester"),
-            message: "corrupt backend source".to_string(),
-            timestamp: Timestamp::now(),
-            entity_deltas: vec![],
-            relation_deltas: vec![],
-            artifact_deltas: vec![ArtifactDelta {
-                file_id: FilePathId("src/lib.rs".to_string()),
-                kind: ArtifactDeltaKind::AddedRegularFile,
-                old_hash: None,
-                new_hash: Some(expected_hash),
-            }],
-            projected_files: vec![],
-            spec_link: None,
-            evidence: vec![],
-            risk_summary: None,
-            authored_on: None,
-        };
-
-        let error = state
-            .preflight_exact_source_change(&state.graph, &change)
-            .expect_err("backend bytes with the wrong digest must fail before graph mutation");
-        assert!(error.to_string().contains("do not match"));
-        assert!(state.graph.get_change(&change.id).unwrap().is_none());
-        assert_eq!(state.snapshot_generation.load(Ordering::SeqCst), 0);
-        assert!(LocalFileBackend::new(storage.path())
-            .load_snapshot(repo_id)
-            .unwrap()
-            .is_none());
     }
 
     #[test]
@@ -5860,12 +5101,7 @@ mod tests {
         let bytes = b"verified local source\n";
         let blob_hash = state.blobs.write(bytes).unwrap();
         let hash = Hash256::from_bytes(blob_hash.0);
-        let change = exact_source_change(
-            35,
-            "src/lib.rs",
-            kin_model::ArtifactDeltaKind::AddedRegularFile,
-            hash,
-        );
+        let change = exact_source_change(35, "src/lib.rs", TreeEntry::blob(hash, false));
 
         state
             .preflight_exact_source_change(&state.graph, &change)
@@ -5890,8 +5126,7 @@ mod tests {
             let change = exact_source_change(
                 if corrupt { 36 } else { 37 },
                 "src/lib.rs",
-                kin_model::ArtifactDeltaKind::AddedRegularFile,
-                hash,
+                TreeEntry::blob(hash, false),
             );
             let root_before = state.graph.compute_root_hash();
             let generation_before = state.snapshot_generation.load(Ordering::SeqCst);
@@ -5915,17 +5150,13 @@ mod tests {
         let cases = [
             (
                 ".kin/authority",
-                kin_model::ArtifactDeltaKind::AddedRegularFile,
+                false,
                 b"must not enter control state".as_slice(),
             ),
-            (
-                "src/escape",
-                kin_model::ArtifactDeltaKind::AddedSymlink,
-                b"../../outside".as_slice(),
-            ),
+            ("src/escape", true, b"../../outside".as_slice()),
         ];
 
-        for (index, (file_id, kind, bytes)) in cases.into_iter().enumerate() {
+        for (index, (file_id, symlink, bytes)) in cases.into_iter().enumerate() {
             let repo_dir = tempfile::tempdir().unwrap();
             let init = kin_core::init(repo_dir.path()).unwrap();
             let state = test_state(init.layout, repo_dir.path());
@@ -5933,8 +5164,11 @@ mod tests {
             let change = exact_source_change(
                 38 + index as u8,
                 file_id,
-                kind,
-                Hash256::from_bytes(blob_hash.0),
+                if symlink {
+                    TreeEntry::symlink(Hash256::from_bytes(blob_hash.0))
+                } else {
+                    TreeEntry::blob(Hash256::from_bytes(blob_hash.0), false)
+                },
             );
             let root_before = state.graph.compute_root_hash();
             let generation_before = state.snapshot_generation.load(Ordering::SeqCst);
@@ -5960,17 +5194,13 @@ mod tests {
         let state = test_state(init.layout, repo_dir.path());
         let file_hash = Hash256::from_bytes(state.blobs.write(b"file bytes").unwrap().0);
         let child_hash = Hash256::from_bytes(state.blobs.write(b"child bytes").unwrap().0);
-        let mut change = exact_source_change(
-            40,
-            "pkg",
-            kin_model::ArtifactDeltaKind::AddedRegularFile,
-            file_hash,
-        );
-        change.artifact_deltas.push(kin_model::ArtifactDelta {
-            file_id: FilePathId::new("pkg/lib.rs"),
-            kind: kin_model::ArtifactDeltaKind::AddedRegularFile,
-            old_hash: None,
-            new_hash: Some(child_hash),
+        let mut change = exact_source_change(40, "pkg", TreeEntry::blob(file_hash, false));
+        change.tree_deltas.push(TreeDelta::Added {
+            artifact_id: ArtifactId::new(),
+            new: LocatedEntry::new(
+                RepoPath::from_utf8("pkg/lib.rs").unwrap(),
+                TreeEntry::blob(child_hash, false),
+            ),
         });
         let root_before = state.graph.compute_root_hash();
         let generation_before = state.snapshot_generation.load(Ordering::SeqCst);
@@ -5994,21 +5224,11 @@ mod tests {
         let init = kin_core::init(repo_dir.path()).unwrap();
         let state = test_state(init.layout, repo_dir.path());
         let child_hash = Hash256::from_bytes(state.blobs.write(b"parent child bytes").unwrap().0);
-        let parent = exact_source_change(
-            41,
-            "pkg/lib.rs",
-            kin_model::ArtifactDeltaKind::AddedRegularFile,
-            child_hash,
-        );
+        let parent = exact_source_change(41, "pkg/lib.rs", TreeEntry::blob(child_hash, false));
         state.graph.create_change(&parent).unwrap();
 
         let file_hash = Hash256::from_bytes(state.blobs.write(b"incoming file bytes").unwrap().0);
-        let mut incoming = exact_source_change(
-            42,
-            "pkg",
-            kin_model::ArtifactDeltaKind::AddedRegularFile,
-            file_hash,
-        );
+        let mut incoming = exact_source_change(42, "pkg", TreeEntry::blob(file_hash, false));
         incoming.parents = vec![parent.id];
         let root_before = state.graph.compute_root_hash();
 
@@ -6027,27 +5247,19 @@ mod tests {
         let init = kin_core::init(repo_dir.path()).unwrap();
         let state = test_state(init.layout, repo_dir.path());
         let child_hash = Hash256::from_bytes(state.blobs.write(b"left child bytes").unwrap().0);
-        let left = exact_source_change(
-            43,
-            "pkg/lib.rs",
-            kin_model::ArtifactDeltaKind::AddedRegularFile,
-            child_hash,
-        );
+        let left = exact_source_change(43, "pkg/lib.rs", TreeEntry::blob(child_hash, false));
         let file_hash = Hash256::from_bytes(state.blobs.write(b"right file bytes").unwrap().0);
-        let right = exact_source_change(
-            44,
-            "pkg",
-            kin_model::ArtifactDeltaKind::AddedRegularFile,
-            file_hash,
-        );
+        let right = exact_source_change(44, "pkg", TreeEntry::blob(file_hash, false));
         state.graph.create_change(&left).unwrap();
         state.graph.create_change(&right).unwrap();
 
         let mut merge = exact_source_change(
             45,
             "merge-marker.txt",
-            kin_model::ArtifactDeltaKind::AddedRegularFile,
-            Hash256::from_bytes(state.blobs.write(b"merge marker").unwrap().0),
+            TreeEntry::blob(
+                Hash256::from_bytes(state.blobs.write(b"merge marker").unwrap().0),
+                false,
+            ),
         );
         merge.parents = vec![left.id, right.id];
         let root_before = state.graph.compute_root_hash();
