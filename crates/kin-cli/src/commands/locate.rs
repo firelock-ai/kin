@@ -9853,6 +9853,23 @@ fn graph_artifact_id_at_utf8_path(
     artifact_id
 }
 
+fn graph_utf8_path_for_artifact_id(
+    graph: &kin_db::InMemoryGraph,
+    artifact_id: &kin_model::ArtifactId,
+) -> Option<String> {
+    let path = graph.repo_path_for_artifact_id(artifact_id)?;
+    let Some(path_utf8) = path.as_utf8() else {
+        tracing::warn!(
+            target: "kin.locate.graph_gap",
+            ?artifact_id,
+            path = %path,
+            "semantic locate cannot present this byte-exact artifact path on its UTF-8 path surface"
+        );
+        return None;
+    };
+    Some(path_utf8.to_owned())
+}
+
 fn require_graph_artifact_id(
     graph: &kin_db::InMemoryGraph,
     path: &str,
@@ -10886,9 +10903,8 @@ fn relation_adjacent_artifact_path(
     };
 
     if let GraphNodeId::Artifact(artifact_id) = other {
-        if let Some(path) = graph.path_for_artifact_id(&artifact_id) {
-            return Some((path.0, GraphNodeId::Artifact(artifact_id)));
-        }
+        return graph_utf8_path_for_artifact_id(graph, &artifact_id)
+            .map(|path| (path, GraphNodeId::Artifact(artifact_id)));
     }
 
     relation_projected_artifact_path(rel, from_node).and_then(|path| {
@@ -13600,10 +13616,7 @@ fn projection_contributor_retention_paths_with_limits(
                 continue;
             }
             let contributor_path = match relation.dst {
-                GraphNodeId::Artifact(dst_id) => graph
-                    .path_for_artifact_id(&dst_id)
-                    .map(|path| path.0)
-                    .or_else(|| relation_projection_resolved_path(&relation)),
+                GraphNodeId::Artifact(dst_id) => graph_utf8_path_for_artifact_id(graph, &dst_id),
                 _ => None,
             };
             let Some(contributor_path) = contributor_path else {
@@ -13655,13 +13668,6 @@ fn relation_has_projection_marker_evidence(relation: &kin_model::Relation) -> bo
             || evidence.token.as_deref() == Some("#include")
                 && evidence.resolved_path.as_deref().is_some()
     })
-}
-
-fn relation_projection_resolved_path(relation: &kin_model::Relation) -> Option<String> {
-    relation
-        .evidence
-        .iter()
-        .find_map(|evidence| evidence.resolved_path.clone())
 }
 
 fn priority_backing_applies_for_path(
