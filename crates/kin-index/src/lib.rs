@@ -9,6 +9,7 @@
 //! Key design: the indexer updates the WorkingCopy overlay only. It does NOT
 //! create SemanticChange nodes — that is `kin commit`'s job.
 
+pub mod admission;
 pub mod artifacts;
 pub mod classifier;
 pub mod error;
@@ -20,6 +21,12 @@ pub mod repository;
 pub mod support;
 pub mod watcher;
 
+pub use admission::{
+    enforce_sensitive_admission, is_intrinsic_repository_control_path, AdmissionCase,
+    AdmissionDecision, AdmissionDecisionReason, AdmissionMatcherError, AdmissionRuleProvenance,
+    AdmissionRuleSource, ResolvedAdmissionMatcher, ResolvedAdmissionRuleSet,
+    SensitiveAdmissionError, SensitiveAdmissionGrant, SensitiveArtifactKind, SensitiveFindingKind,
+};
 pub use artifacts::extract_artifact;
 pub use classifier::{FileClassification, FileClassifier};
 pub use error::{IndexError, Result};

@@ -88,6 +88,8 @@ tree-sitter-hcl = "1.1"
 
 # Git interop
 gix = { version = "0.84", default-features = false, features = ["max-performance-safe", "sha1"] }
+gix-ignore = "0.21"
+bstr = "1"
 
 # HTTP / MCP
 axum = "0.8"
