@@ -17,18 +17,23 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 
 use kin_model::{
-    AuthorId, AuthorityRoot, ChangeStore, DefaultRefExpectation, DefaultRefMutation,
+    ArtifactId, AuthorId, AuthorityRoot, ChangeStore, DefaultRefExpectation, DefaultRefMutation,
     ExternalChangeAlias, ExternalObjectId, ExternalObjectKind, ExternalObjectRecord,
     FrozenLocalOverlay, GitExternalAuthority, GitObjectBodyLoader, GitObjectDependencyKind,
-    GitObjectId, GitTreeEntryMode, Hash256, ModelError, OperationId, RefExpectation, RefMutation,
-    RefName, RefTarget, RefUpdatePolicy, RepoPath, RepositoryAuthorityStore,
-    RepositoryCommitOutcome, RepositoryCommitReceipt, RepositoryId, RepositoryOperationRecord,
-    RepositoryRef, RepositoryRefState, RepositoryTransaction, RootBundle, SemanticChangeId,
+    GitObjectId, GitTreeEntryMode, Hash256, LocalAdmissionRuleSourceKind, ModelError, OperationId,
+    RefExpectation, RefMutation, RefName, RefTarget, RefUpdatePolicy, RepoPath,
+    RepositoryAuthorityStore, RepositoryCommitOutcome, RepositoryCommitReceipt, RepositoryId,
+    RepositoryOperationRecord, RepositoryRef, RepositoryRefState, RepositoryTransaction,
+    ResolvedArtifact, ResolvedTree, RootBundle, SemanticChangeId, SensitiveArtifactKind,
     SharedAdmissionPolicy, Timestamp, TreeEntry, WorkspaceHead, WorkspaceId,
     WorkspaceSnapshotBinding, WorkspaceState, WorkspaceTreeArtifact, WorkspaceTreeSnapshot,
     REPOSITORY_ROOT_SCHEMA_VERSION,
 };
 
+use crate::admission::{
+    enforce_sensitive_admission, AdmissionRuleSource as ResolvedAdmissionRuleSource,
+    ResolvedAdmissionMatcher, ResolvedAdmissionRuleSet,
+};
 use crate::engine::InMemoryGraph;
 use crate::error::KinDbError;
 use crate::storage::authority::{
@@ -783,6 +788,7 @@ fn prepare_successor<B: StorageBackend + ?Sized>(
         transaction.local_overlay_delta.as_ref(),
     )?;
     apply_workspace(backend, &snapshot, &mut metadata, transaction)?;
+    verify_transaction_admission(backend, current, &snapshot, &metadata, transaction)?;
     validate_new_change_bodies(
         backend,
         &transaction.repository_id,
@@ -1596,6 +1602,445 @@ fn apply_workspace<B: StorageBackend + ?Sized>(
     workspaces.insert(mutation.workspace_id, next);
     metadata.workspaces = workspaces.into_values().collect();
     Ok(())
+}
+
+/// Recompute repository admission from the successor authority itself.
+///
+/// A transaction contains desired state, never a trusted scan verdict. This
+/// verifier consumes only immutable CAS bodies plus the exact policy, overlay,
+/// history, Git authority, and workspace state that would be published.
+fn verify_transaction_admission<B: StorageBackend + ?Sized>(
+    backend: &B,
+    current: &RepositoryAuthorityState,
+    snapshot: &GraphSnapshot,
+    metadata: &PersistedRepositoryAuthority,
+    transaction: &RepositoryTransaction,
+) -> Result<(), KinDbError> {
+    verify_workspace_admission(backend, current, snapshot, metadata, transaction)?;
+    verify_native_change_admission(backend, snapshot, metadata, transaction)
+}
+
+fn verify_workspace_admission<B: StorageBackend + ?Sized>(
+    backend: &B,
+    current: &RepositoryAuthorityState,
+    snapshot: &GraphSnapshot,
+    metadata: &PersistedRepositoryAuthority,
+    transaction: &RepositoryTransaction,
+) -> Result<(), KinDbError> {
+    let Some(mutation) = &transaction.workspace_mutation else {
+        return Ok(());
+    };
+    let workspace = metadata
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.workspace_id == mutation.workspace_id)
+        .ok_or_else(|| {
+            storage(format!(
+                "successor workspace {} is absent during admission verification",
+                mutation.workspace_id
+            ))
+        })?;
+    let overlay = local_overlay_for_workspace(metadata, workspace)?;
+    let matcher = resolve_admission_matcher(
+        backend,
+        &transaction.repository_id,
+        &workspace.shared_admission_policy,
+        overlay,
+    )?;
+
+    let mut tracked = BTreeSet::<ArtifactId>::new();
+    let mut admitted_gitlinks = BTreeSet::new();
+    if let Some(previous) = current
+        .metadata()
+        .workspaces
+        .iter()
+        .find(|candidate| candidate.workspace_id == workspace.workspace_id)
+    {
+        tracked.extend(
+            previous
+                .tree
+                .artifacts()
+                .map(|artifact| artifact.artifact_id),
+        );
+        admitted_gitlinks.extend(previous.tree.artifacts().filter_map(|artifact| {
+            let TreeEntry::Gitlink { target } = artifact.entry else {
+                return None;
+            };
+            Some((artifact.artifact_id, target))
+        }));
+    }
+
+    // A previously admitted commit is already repository authority. A new
+    // Git-origin base is also tracked, but only after the exact raw-object
+    // authority/projection checks above succeeded. A new Native base is not
+    // self-authorizing and is scanned as new input below.
+    if let Some(base_target) = &workspace.base_target {
+        let change_id = target_change_id(metadata, base_target)?;
+        let change = snapshot
+            .changes
+            .get(&change_id)
+            .ok_or_else(|| ModelError::ChangeNotFound(change_id.to_string()))?;
+        let was_already_admitted = current.snapshot.changes.contains_key(&change_id);
+        let is_verified_git = matches!(change.origin, kin_model::ChangeOrigin::GitCommit { .. });
+        if was_already_admitted || is_verified_git {
+            let base = resolve_change_tree(snapshot, change_id)?;
+            tracked.extend(base.artifacts().map(|artifact| artifact.artifact_id));
+            admitted_gitlinks.extend(base.artifacts().filter_map(|artifact| {
+                let TreeEntry::Gitlink { target } = artifact.entry else {
+                    return None;
+                };
+                Some((artifact.artifact_id, target))
+            }));
+        }
+    }
+
+    for artifact in workspace.tree.artifacts_by_path() {
+        let gitlink_is_admitted = match artifact.entry {
+            TreeEntry::Gitlink { target } => {
+                admitted_gitlinks.contains(&(artifact.artifact_id, target))
+            }
+            TreeEntry::Blob { .. } | TreeEntry::Symlink { .. } => false,
+        };
+        verify_artifact_admission(
+            backend,
+            &transaction.repository_id,
+            &matcher,
+            artifact,
+            ArtifactAdmissionContext {
+                policy: &workspace.shared_admission_policy,
+                tracked: tracked.contains(&artifact.artifact_id),
+                gitlink_is_admitted,
+                label: "workspace",
+            },
+        )?;
+    }
+    Ok(())
+}
+
+fn verify_native_change_admission<B: StorageBackend + ?Sized>(
+    backend: &B,
+    snapshot: &GraphSnapshot,
+    metadata: &PersistedRepositoryAuthority,
+    transaction: &RepositoryTransaction,
+) -> Result<(), KinDbError> {
+    let native_changes = transaction
+        .changes
+        .iter()
+        .filter(|change| matches!(change.origin, kin_model::ChangeOrigin::Native));
+    for change in native_changes {
+        let candidate = resolve_change_tree(snapshot, change.id)?;
+        let mut parent_artifacts = BTreeSet::<ArtifactId>::new();
+        let mut parent_gitlinks = BTreeSet::new();
+        for parent in &change.parents {
+            let parent_tree = resolve_change_tree(snapshot, *parent)?;
+            parent_artifacts.extend(parent_tree.artifacts().map(|artifact| artifact.artifact_id));
+            parent_gitlinks.extend(parent_tree.artifacts().filter_map(|artifact| {
+                let TreeEntry::Gitlink { target } = artifact.entry else {
+                    return None;
+                };
+                Some((artifact.artifact_id, target))
+            }));
+        }
+        for artifact in candidate.artifacts() {
+            let TreeEntry::Gitlink { target } = artifact.entry else {
+                continue;
+            };
+            if !parent_gitlinks.contains(&(artifact.artifact_id, target)) {
+                return Err(ModelError::InvalidOperation(format!(
+                    "native change {} introduces gitlink {} at {} without verified Git external authority",
+                    change.id, target, artifact.path
+                ))
+                .into());
+            }
+        }
+        let introduced = candidate
+            .artifacts_by_path()
+            .filter(|artifact| !parent_artifacts.contains(&artifact.artifact_id))
+            .collect::<Vec<_>>();
+        if introduced.is_empty() {
+            continue;
+        }
+
+        // The current v3 contract binds one Native admission to the workspace
+        // that publishes it. History-only Native imports and multi-change
+        // synthetic batches have no trustworthy local case/overlay context and
+        // therefore fail closed until they gain an explicit graph-native
+        // admission context.
+        let mutation = transaction.workspace_mutation.as_ref().ok_or_else(|| {
+            ModelError::InvalidOperation(format!(
+                "native change {} introduces artifacts without a bound workspace admission context",
+                change.id
+            ))
+        })?;
+        let workspace = metadata
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == mutation.workspace_id)
+            .ok_or_else(|| {
+                storage(format!(
+                    "successor workspace {} is absent during Native admission verification",
+                    mutation.workspace_id
+                ))
+            })?;
+        let base_change = workspace
+            .base_target
+            .as_ref()
+            .map(|target| target_change_id(metadata, target))
+            .transpose()?;
+        if base_change != Some(change.id) {
+            return Err(ModelError::InvalidOperation(format!(
+                "native change {} introduces artifacts but successor workspace {} is not based on that exact change",
+                change.id, workspace.workspace_id
+            ))
+            .into());
+        }
+        for artifact in &introduced {
+            if workspace.tree.get(&artifact.artifact_id) != Some(*artifact) {
+                return Err(ModelError::InvalidOperation(format!(
+                    "native change {} artifact {} is not present exactly in successor workspace {}",
+                    change.id, artifact.path, workspace.workspace_id
+                ))
+                .into());
+            }
+        }
+
+        let policy = metadata
+            .admission_policies
+            .iter()
+            .find(|resolved| resolved.change_id == change.id)
+            .and_then(|resolved| resolved.policy.as_ref())
+            .ok_or_else(|| {
+                ModelError::InvalidOperation(format!(
+                    "native change {} introduces artifacts without a resolved shared admission policy",
+                    change.id
+                ))
+            })?;
+        let overlay = local_overlay_for_workspace(metadata, workspace)?;
+        let matcher =
+            resolve_admission_matcher(backend, &transaction.repository_id, policy, overlay)?;
+        for artifact in introduced {
+            verify_artifact_admission(
+                backend,
+                &transaction.repository_id,
+                &matcher,
+                artifact,
+                ArtifactAdmissionContext {
+                    policy,
+                    tracked: false,
+                    gitlink_is_admitted: false,
+                    label: &format!("native change {}", change.id),
+                },
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn local_overlay_for_workspace<'a>(
+    metadata: &'a PersistedRepositoryAuthority,
+    workspace: &WorkspaceState,
+) -> Result<&'a FrozenLocalOverlay, KinDbError> {
+    metadata
+        .local_overlays
+        .iter()
+        .find(|overlay| {
+            overlay.workspace_id == workspace.workspace_id
+                && overlay.stamp() == workspace.admission_policy.local
+        })
+        .ok_or_else(|| {
+            ModelError::Conflict(format!(
+                "workspace {} admission overlay is absent from successor authority",
+                workspace.workspace_id
+            ))
+            .into()
+        })
+}
+
+fn resolve_admission_matcher<B: StorageBackend + ?Sized>(
+    backend: &B,
+    repository_id: &RepositoryId,
+    shared: &SharedAdmissionPolicy,
+    overlay: &FrozenLocalOverlay,
+) -> Result<ResolvedAdmissionMatcher, KinDbError> {
+    shared.validate()?;
+    overlay.validate()?;
+
+    let mut low_local = Vec::new();
+    let mut high_local = Vec::new();
+    let mut prior_tier = 0_u8;
+    for source in &overlay.sources {
+        let tier = match source.kind {
+            LocalAdmissionRuleSourceKind::GitGlobalExclude => 0,
+            LocalAdmissionRuleSourceKind::GitInfoExclude => 1,
+            LocalAdmissionRuleSourceKind::KinLocal => 2,
+        };
+        if tier < prior_tier {
+            return Err(ModelError::InvalidOperation(format!(
+                "workspace {} local admission sources are not ordered global, info, then Kin-local",
+                overlay.workspace_id
+            ))
+            .into());
+        }
+        prior_tier = tier;
+        let body = load_exact_body(
+            backend,
+            repository_id,
+            source.body_hash,
+            source.body_len,
+            "local admission rule source",
+        )?;
+        let resolved_source = match source.kind {
+            LocalAdmissionRuleSourceKind::GitGlobalExclude => {
+                ResolvedAdmissionRuleSource::GlobalExclude
+            }
+            LocalAdmissionRuleSourceKind::GitInfoExclude => {
+                ResolvedAdmissionRuleSource::InfoExclude
+            }
+            LocalAdmissionRuleSourceKind::KinLocal => ResolvedAdmissionRuleSource::KinLocal {
+                ordinal: source.precedence,
+            },
+        };
+        let entry = (
+            resolved_source,
+            None,
+            source.body_hash,
+            source.body_len,
+            body,
+        );
+        if source.kind == LocalAdmissionRuleSourceKind::KinLocal {
+            high_local.push(entry);
+        } else {
+            low_local.push(entry);
+        }
+    }
+
+    let mut rule_sets = Vec::new();
+    for (source, base_directory, content_hash, content_len, contents) in low_local {
+        push_resolved_rule(
+            &mut rule_sets,
+            source,
+            base_directory,
+            content_hash,
+            content_len,
+            contents,
+        )?;
+    }
+    for source in &shared.sources {
+        let body = load_exact_body(
+            backend,
+            repository_id,
+            source.body_hash,
+            source.body_len,
+            &format!("shared admission source {}", source.path),
+        )?;
+        push_resolved_rule(
+            &mut rule_sets,
+            ResolvedAdmissionRuleSource::Shared {
+                source_path: source.path.clone(),
+            },
+            source.base_directory.clone(),
+            source.body_hash,
+            source.body_len,
+            body,
+        )?;
+    }
+    for (source, base_directory, content_hash, content_len, contents) in high_local {
+        push_resolved_rule(
+            &mut rule_sets,
+            source,
+            base_directory,
+            content_hash,
+            content_len,
+            contents,
+        )?;
+    }
+    ResolvedAdmissionMatcher::compile(overlay.case, rule_sets)
+        .map_err(|error| storage(format!("compile graph-owned admission policy: {error}")))
+}
+
+fn push_resolved_rule(
+    rule_sets: &mut Vec<ResolvedAdmissionRuleSet>,
+    source: ResolvedAdmissionRuleSource,
+    base_directory: Option<RepoPath>,
+    content_hash: Hash256,
+    content_len: u64,
+    contents: Vec<u8>,
+) -> Result<(), KinDbError> {
+    let precedence = u32::try_from(rule_sets.len())
+        .map_err(|_| storage("resolved admission source count exceeds u32".to_string()))?;
+    rule_sets.push(ResolvedAdmissionRuleSet::new(
+        source,
+        precedence,
+        base_directory,
+        content_hash,
+        content_len,
+        contents,
+    ));
+    Ok(())
+}
+
+struct ArtifactAdmissionContext<'a> {
+    policy: &'a SharedAdmissionPolicy,
+    tracked: bool,
+    gitlink_is_admitted: bool,
+    label: &'a str,
+}
+
+fn verify_artifact_admission<B: StorageBackend + ?Sized>(
+    backend: &B,
+    repository_id: &RepositoryId,
+    matcher: &ResolvedAdmissionMatcher,
+    artifact: &ResolvedArtifact,
+    context: ArtifactAdmissionContext<'_>,
+) -> Result<(), KinDbError> {
+    let decision = matcher.decide(&artifact.path, false, context.tracked);
+    if decision.is_ignored() {
+        return Err(ModelError::InvalidOperation(format!(
+            "{} artifact {} is excluded by the exact graph-owned admission policy",
+            context.label, artifact.path
+        ))
+        .into());
+    }
+    let (content_hash, kind) = match artifact.entry {
+        TreeEntry::Blob { hash, executable } => (hash, SensitiveArtifactKind::Blob { executable }),
+        TreeEntry::Symlink { target_blob } => (target_blob, SensitiveArtifactKind::Symlink),
+        TreeEntry::Gitlink { .. } if context.gitlink_is_admitted => return Ok(()),
+        TreeEntry::Gitlink { target } => {
+            return Err(ModelError::InvalidOperation(format!(
+                "{} introduces gitlink {} at {} without verified Git external authority",
+                context.label, target, artifact.path
+            ))
+            .into())
+        }
+    };
+    if context.tracked {
+        return Ok(());
+    }
+    let body = load_unbounded_body(
+        backend,
+        repository_id,
+        content_hash,
+        &format!("{} artifact {}", context.label, artifact.path),
+    )?;
+    enforce_sensitive_admission(
+        &artifact.path,
+        content_hash,
+        kind,
+        &body,
+        false,
+        &context.policy.sensitive_allowances,
+    )
+    .map_err(|error| ModelError::InvalidOperation(error.to_string()).into())
+}
+
+fn resolve_change_tree(
+    snapshot: &GraphSnapshot,
+    change_id: SemanticChangeId,
+) -> Result<ResolvedTree, KinDbError> {
+    let mut replay = snapshot.clone();
+    replay.repository_authority = None;
+    let graph = InMemoryGraph::from_snapshot(replay)?;
+    graph.resolve_tree_at(&change_id)
 }
 
 fn validate_history_replay(
@@ -2580,11 +3025,11 @@ mod tests {
     use super::*;
     use kin_model::{
         compute_resolved_tree_hash, compute_semantic_change_id, AdmissionCase,
-        AdmissionPolicyDelta, AdmissionRuleSource, AdmissionRuleSourceKind, AdmissionScanToken,
-        ArtifactId, AuthorId, ChangeOrigin, DefaultRefMutation, EffectiveAdmissionPolicyStamp,
-        FrozenLocalOverlayDelta, GitExternalAuthorityDelta, GitObjectFormat, GitRawRef,
-        GitRawTarget, LocatedEntry, RefMutation, RepoPath, ResolvedTree, SemanticChange, TreeDelta,
-        WorkspaceExpectation, WorkspaceMutation, ADMISSION_POLICY_SEMANTICS_VERSION,
+        AdmissionPolicyDelta, AdmissionRuleSource, AdmissionRuleSourceKind, ArtifactId, AuthorId,
+        ChangeOrigin, DefaultRefMutation, EffectiveAdmissionPolicyStamp, FrozenLocalOverlayDelta,
+        GitExternalAuthorityDelta, GitObjectFormat, GitRawRef, GitRawTarget, LocatedEntry,
+        RefMutation, RepoPath, ResolvedTree, SemanticChange, SensitiveArtifactAllowance,
+        SensitiveArtifactKind, TreeDelta, WorkspaceExpectation, WorkspaceMutation,
         REPOSITORY_TRANSACTION_SCHEMA_VERSION,
     };
     use parking_lot::Mutex;
@@ -2827,7 +3272,6 @@ mod tests {
             default_ref_mutation: None,
             workspace_mutation: None,
             local_overlay_delta: None,
-            admission_scan_token: None,
         }
     }
 
@@ -2876,25 +3320,13 @@ mod tests {
             manager.save_source_blob(digest(body), body).unwrap();
         }
 
-        let mut tree_deltas: Vec<_> = fixtures
+        let tree_deltas: Vec<_> = fixtures
             .iter()
             .map(|(artifact, path, _, entry)| TreeDelta::Added {
                 artifact_id: ArtifactId(Uuid::from_u128(*artifact)),
                 new: LocatedEntry::new(RepoPath::from_bytes(path.clone()).unwrap(), *entry),
             })
             .collect();
-        tree_deltas.push(TreeDelta::Added {
-            artifact_id: ArtifactId(Uuid::from_u128(17)),
-            new: LocatedEntry::new(
-                RepoPath::from_utf8("vendor/semantic-runtime").unwrap(),
-                TreeEntry::gitlink(GitObjectId::sha1(
-                    hex::decode("1111111111111111111111111111111111111111")
-                        .unwrap()
-                        .try_into()
-                        .unwrap(),
-                )),
-            ),
-        });
         let tree = ResolvedTree::default().apply(&tree_deltas).unwrap();
         let tree_hash = compute_resolved_tree_hash(&tree).unwrap();
         let shared = SharedAdmissionPolicy::empty(0);
@@ -2956,18 +3388,90 @@ mod tests {
             expected: DefaultRefExpectation::MustBeUnset,
             new_default: Some(main),
         });
-        transaction.admission_scan_token = Some(AdmissionScanToken {
-            repository_id: repository_id(),
-            workspace_id,
-            workspace_generation: 0,
-            workspace_head: workspace_mutation.new_head.clone(),
-            baseline_tree_hash: compute_resolved_tree_hash(&ResolvedTree::default()).unwrap(),
-            observed_tree_hash: tree_hash,
-            matcher_semantics_version: ADMISSION_POLICY_SEMANTICS_VERSION,
-            shared_policy: policy.shared,
-            local_overlay: policy.local,
-        });
         transaction.workspace_mutation = Some(workspace_mutation);
+        transaction.local_overlay_delta = Some(FrozenLocalOverlayDelta::initialize(overlay));
+        transaction
+    }
+
+    fn native_root_with_policy(
+        manager: &RepositoryAuthorityManager<MemoryBackend>,
+        case: AdmissionCase,
+        path: &str,
+        body: &[u8],
+        ignore_body: Option<&[u8]>,
+        allow_sensitive: bool,
+    ) -> RepositoryTransaction {
+        let mut transaction = arbitrary_repository_transaction(manager);
+        manager.save_source_blob(digest(body), body).unwrap();
+
+        let mut sources = Vec::new();
+        let mut additions = Vec::new();
+        if let Some(ignore_body) = ignore_body {
+            let ignore_hash = digest(ignore_body);
+            manager.save_source_blob(ignore_hash, ignore_body).unwrap();
+            sources.push(AdmissionRuleSource {
+                kind: AdmissionRuleSourceKind::GitIgnore,
+                path: RepoPath::from_utf8(".gitignore").unwrap(),
+                base_directory: None,
+                body_hash: ignore_hash,
+                body_len: ignore_body.len() as u64,
+                precedence: 0,
+            });
+            additions.push(TreeDelta::Added {
+                artifact_id: ArtifactId(Uuid::from_u128(30)),
+                new: LocatedEntry::new(
+                    RepoPath::from_utf8(".gitignore").unwrap(),
+                    TreeEntry::blob(ignore_hash, false),
+                ),
+            });
+        }
+
+        let path = RepoPath::from_utf8(path).unwrap();
+        let body_hash = digest(body);
+        additions.push(TreeDelta::Added {
+            artifact_id: ArtifactId(Uuid::from_u128(31)),
+            new: LocatedEntry::new(path.clone(), TreeEntry::blob(body_hash, false)),
+        });
+        let allowances = allow_sensitive
+            .then(|| SensitiveArtifactAllowance {
+                path,
+                content_hash: body_hash,
+                kind: SensitiveArtifactKind::Blob { executable: false },
+                approved_by: AuthorId::new("authority-test"),
+                reason: "explicit exact test allowance".to_string(),
+            })
+            .into_iter()
+            .collect();
+        let shared = SharedAdmissionPolicy::new(0, sources, allowances).unwrap();
+
+        let change = transaction.changes.first_mut().unwrap();
+        change.tree_deltas.extend(additions);
+        change.admission_policy_delta = Some(AdmissionPolicyDelta::initialize(shared.clone()));
+        change.id = SemanticChangeId::from_hash(Hash256::from_bytes([0; 32]));
+        change.id = compute_semantic_change_id(change).unwrap();
+        let change_id = change.id;
+        let tree_deltas = change.tree_deltas.clone();
+        let tree = ResolvedTree::default().apply(&tree_deltas).unwrap();
+        let tree_hash = compute_resolved_tree_hash(&tree).unwrap();
+
+        let workspace_id = transaction
+            .workspace_mutation
+            .as_ref()
+            .unwrap()
+            .workspace_id;
+        let overlay = FrozenLocalOverlay::new(workspace_id, 0, case, Vec::new()).unwrap();
+        let effective = EffectiveAdmissionPolicyStamp {
+            shared: shared.stamp(),
+            local: overlay.stamp(),
+        };
+        let workspace = transaction.workspace_mutation.as_mut().unwrap();
+        workspace.new_base_target = Some(RefTarget::change(change_id));
+        workspace.new_base_tree_hash = Some(tree_hash);
+        workspace.tree_deltas = tree_deltas;
+        workspace.new_tree_hash = tree_hash;
+        workspace.new_shared_admission_policy = shared;
+        workspace.new_admission_policy = effective;
+        transaction.ref_mutations[0].new_target = Some(RefTarget::change(change_id));
         transaction.local_overlay_delta = Some(FrozenLocalOverlayDelta::initialize(overlay));
         transaction
     }
@@ -3004,17 +3508,6 @@ mod tests {
         };
 
         let mut transaction = transaction_shell(manager, operation);
-        transaction.admission_scan_token = Some(AdmissionScanToken {
-            repository_id: repository_id(),
-            workspace_id,
-            workspace_generation: 0,
-            workspace_head: head,
-            baseline_tree_hash: empty_tree_hash,
-            observed_tree_hash: empty_tree_hash,
-            matcher_semantics_version: ADMISSION_POLICY_SEMANTICS_VERSION,
-            shared_policy: policy.shared,
-            local_overlay: policy.local,
-        });
         transaction.workspace_mutation = Some(workspace_mutation);
         transaction.local_overlay_delta = Some(FrozenLocalOverlayDelta::initialize(overlay));
         transaction
@@ -3289,17 +3782,6 @@ mod tests {
             new_admission_policy: policy,
         });
         transaction.local_overlay_delta = Some(FrozenLocalOverlayDelta::initialize(overlay));
-        transaction.admission_scan_token = Some(AdmissionScanToken {
-            repository_id: repository_id(),
-            workspace_id,
-            workspace_generation: 0,
-            workspace_head: head_state,
-            baseline_tree_hash: compute_resolved_tree_hash(&ResolvedTree::default()).unwrap(),
-            observed_tree_hash: tree_hash,
-            matcher_semantics_version: ADMISSION_POLICY_SEMANTICS_VERSION,
-            shared_policy: policy.shared,
-            local_overlay: policy.local,
-        });
         (transaction, change_id, target)
     }
 
@@ -3833,7 +4315,7 @@ mod tests {
         assert_eq!(current.metadata().receipts.len(), 1);
         assert_eq!(current.metadata().ref_state.refs.len(), 1);
         let workspace = &current.metadata().workspaces[0];
-        assert_eq!(workspace.tree.len(), 7);
+        assert_eq!(workspace.tree.len(), 6);
         let non_utf8 =
             RepoPath::from_bytes(b"assets/data-\xff.bin".to_vec()).expect("valid exact path");
         assert_eq!(
@@ -3872,15 +4354,6 @@ mod tests {
             b"compose.yaml".len() as u64
         );
         assert_eq!(
-            projection
-                .artifacts
-                .iter()
-                .find(|artifact| artifact.path.as_bytes() == b"vendor/semantic-runtime")
-                .unwrap()
-                .size,
-            0
-        );
-        assert_eq!(
             projection.identity().unwrap(),
             manager
                 .workspace_tree_snapshot(&repository_id(), &workspace.workspace_id)
@@ -3899,6 +4372,262 @@ mod tests {
             RepositoryAuthorityManager::open(repository_id(), Arc::clone(&backend)).unwrap();
         assert_eq!(reopened.read_authority().generation(), 1);
         assert_eq!(reopened.read_authority().metadata().receipts.len(), 1);
+    }
+
+    #[test]
+    fn caller_admission_claim_is_not_part_of_the_clean_slate_transaction_contract() {
+        let manager = initial_manager(Arc::new(MemoryBackend::default()));
+        let transaction = arbitrary_repository_transaction(&manager);
+        let mut encoded = serde_json::to_value(transaction).unwrap();
+        encoded.as_object_mut().unwrap().insert(
+            "admission_scan_token".to_string(),
+            serde_json::json!({"caller_claimed_safe": true}),
+        );
+
+        let error = serde_json::from_value::<RepositoryTransaction>(encoded)
+            .expect_err("caller admission claims must be rejected as unknown authority input");
+        assert!(
+            error.to_string().contains("unknown field"),
+            "unexpected forged-claim error: {error}"
+        );
+    }
+
+    #[test]
+    fn authority_rejects_ignored_and_sensitive_native_additions_atomically() {
+        let ignored_manager = initial_manager(Arc::new(MemoryBackend::default()));
+        let ignored = native_root_with_policy(
+            &ignored_manager,
+            AdmissionCase::Sensitive,
+            "build/output.bin",
+            b"harmless output\n",
+            Some(b"build/\n"),
+            false,
+        );
+        let error = ignored_manager
+            .commit_repository_transaction(ignored)
+            .expect_err("an ignored Native addition must not acquire authority");
+        assert!(
+            error
+                .to_string()
+                .contains("excluded by the exact graph-owned admission policy"),
+            "unexpected ignored-addition error: {error}"
+        );
+        assert_eq!(ignored_manager.read_authority().generation(), 0);
+
+        let sensitive_manager = initial_manager(Arc::new(MemoryBackend::default()));
+        let sensitive = native_root_with_policy(
+            &sensitive_manager,
+            AdmissionCase::Sensitive,
+            ".env",
+            b"TOKEN=supersecret123\n",
+            None,
+            false,
+        );
+        let error = sensitive_manager
+            .commit_repository_transaction(sensitive)
+            .expect_err("an unapproved sensitive Native addition must not acquire authority");
+        assert!(
+            error.to_string().contains("untracked sensitive content"),
+            "unexpected sensitive-addition error: {error}"
+        );
+        assert_eq!(sensitive_manager.read_authority().generation(), 0);
+    }
+
+    #[test]
+    fn authority_uses_the_frozen_case_behavior_for_ignore_matching() {
+        let sensitive_manager = initial_manager(Arc::new(MemoryBackend::default()));
+        let case_sensitive = native_root_with_policy(
+            &sensitive_manager,
+            AdmissionCase::Sensitive,
+            "secrets/value.txt",
+            b"harmless\n",
+            Some(b"SECRETS/\n"),
+            false,
+        );
+        sensitive_manager
+            .commit_repository_transaction(case_sensitive)
+            .unwrap();
+
+        let folded_manager = initial_manager(Arc::new(MemoryBackend::default()));
+        let folded = native_root_with_policy(
+            &folded_manager,
+            AdmissionCase::FoldAscii,
+            "secrets/value.txt",
+            b"harmless\n",
+            Some(b"SECRETS/\n"),
+            false,
+        );
+        let error = folded_manager
+            .commit_repository_transaction(folded)
+            .expect_err("ASCII-folded matching must reject the case alias");
+        assert!(
+            error
+                .to_string()
+                .contains("excluded by the exact graph-owned admission policy"),
+            "unexpected folded-case error: {error}"
+        );
+        assert_eq!(folded_manager.read_authority().generation(), 0);
+    }
+
+    #[test]
+    fn tracked_sensitive_artifact_remains_admitted_without_a_new_allowance() {
+        let manager = initial_manager(Arc::new(MemoryBackend::default()));
+        let initial = native_root_with_policy(
+            &manager,
+            AdmissionCase::Sensitive,
+            ".env",
+            b"TOKEN=initial-secret\n",
+            None,
+            true,
+        );
+        manager.commit_repository_transaction(initial).unwrap();
+
+        let current = manager.read_authority().metadata().workspaces[0].clone();
+        let path = RepoPath::from_utf8(".env").unwrap();
+        let artifact = current.tree.artifact_at_path(&path).unwrap();
+        let next_body = b"TOKEN=rotated-secret\n";
+        let next_hash = digest(next_body);
+        manager.save_source_blob(next_hash, next_body).unwrap();
+        let delta = TreeDelta::Updated {
+            artifact_id: artifact.artifact_id,
+            old: artifact.located_entry(),
+            new: LocatedEntry::new(path, TreeEntry::blob(next_hash, false)),
+        };
+        let next_tree = current.tree.apply(std::slice::from_ref(&delta)).unwrap();
+        let next_policy = SharedAdmissionPolicy::new(1, Vec::new(), Vec::new()).unwrap();
+        let next_effective = EffectiveAdmissionPolicyStamp {
+            shared: next_policy.stamp(),
+            local: current.admission_policy.local,
+        };
+        let mutation = WorkspaceMutation {
+            workspace_id: current.workspace_id,
+            expected: WorkspaceExpectation::MustEqual {
+                generation: current.generation,
+                head: current.head.clone(),
+                base_target: current.base_target.clone(),
+                base_tree_hash: current.base_tree_hash,
+                tree_hash: current.tree_hash,
+                admission_policy: current.admission_policy,
+            },
+            new_generation: current.generation + 1,
+            new_head: current.head.clone(),
+            new_base_target: current.base_target.clone(),
+            new_base_tree_hash: current.base_tree_hash,
+            tree_deltas: vec![delta],
+            new_tree_hash: compute_resolved_tree_hash(&next_tree).unwrap(),
+            new_shared_admission_policy: next_policy,
+            new_admission_policy: next_effective,
+        };
+        let mut transaction = transaction_shell(&manager, 0xad01);
+        transaction.workspace_mutation = Some(mutation);
+        manager.commit_repository_transaction(transaction).unwrap();
+
+        let retained = manager.read_authority().metadata().workspaces[0]
+            .tree
+            .artifact_at_path(&RepoPath::from_utf8(".env").unwrap())
+            .unwrap()
+            .entry;
+        assert_eq!(retained, TreeEntry::blob(next_hash, false));
+    }
+
+    #[test]
+    fn admission_policy_bodies_must_be_present_and_digest_exact() {
+        let missing_backend = Arc::new(MemoryBackend::default());
+        let missing_manager = initial_manager(Arc::clone(&missing_backend));
+        let missing = native_root_with_policy(
+            &missing_manager,
+            AdmissionCase::Sensitive,
+            "src/main.rs",
+            b"fn main() {}\n",
+            Some(b"target/\n"),
+            false,
+        );
+        let policy_hash = missing
+            .workspace_mutation
+            .as_ref()
+            .unwrap()
+            .new_shared_admission_policy
+            .sources[0]
+            .body_hash;
+        missing_backend.blobs.lock().remove(policy_hash.as_bytes());
+        let error = missing_manager
+            .commit_repository_transaction(missing)
+            .expect_err("missing matcher bytes must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("absent from immutable source CAS"),
+            "unexpected missing-policy error: {error}"
+        );
+        assert_eq!(missing_manager.read_authority().generation(), 0);
+
+        let tampered_backend = Arc::new(MemoryBackend::default());
+        let tampered_manager = initial_manager(Arc::clone(&tampered_backend));
+        let tampered = native_root_with_policy(
+            &tampered_manager,
+            AdmissionCase::Sensitive,
+            "src/main.rs",
+            b"fn main() {}\n",
+            Some(b"target/\n"),
+            false,
+        );
+        let policy_hash = tampered
+            .workspace_mutation
+            .as_ref()
+            .unwrap()
+            .new_shared_admission_policy
+            .sources[0]
+            .body_hash;
+        tampered_backend
+            .blobs
+            .lock()
+            .insert(*policy_hash.as_bytes(), b"tamper!\n".to_vec());
+        let error = tampered_manager
+            .commit_repository_transaction(tampered)
+            .expect_err("tampered matcher bytes must fail closed");
+        assert!(
+            error.to_string().contains("digest mismatch"),
+            "unexpected tampered-policy error: {error}"
+        );
+        assert_eq!(tampered_manager.read_authority().generation(), 0);
+    }
+
+    #[test]
+    fn native_gitlink_without_external_authority_is_rejected() {
+        let manager = initial_manager(Arc::new(MemoryBackend::default()));
+        let mut transaction = arbitrary_repository_transaction(&manager);
+        let gitlink = TreeDelta::Added {
+            artifact_id: ArtifactId(Uuid::from_u128(17)),
+            new: LocatedEntry::new(
+                RepoPath::from_utf8("vendor/semantic-runtime").unwrap(),
+                TreeEntry::gitlink(GitObjectId::sha1([0x11; 20])),
+            ),
+        };
+        let change = transaction.changes.first_mut().unwrap();
+        change.tree_deltas.push(gitlink);
+        change.id = SemanticChangeId::from_hash(Hash256::from_bytes([0; 32]));
+        change.id = compute_semantic_change_id(change).unwrap();
+        let change_id = change.id;
+        let tree_deltas = change.tree_deltas.clone();
+        let tree = ResolvedTree::default().apply(&tree_deltas).unwrap();
+        let tree_hash = compute_resolved_tree_hash(&tree).unwrap();
+        let workspace = transaction.workspace_mutation.as_mut().unwrap();
+        workspace.new_base_target = Some(RefTarget::change(change_id));
+        workspace.new_base_tree_hash = Some(tree_hash);
+        workspace.tree_deltas = tree_deltas;
+        workspace.new_tree_hash = tree_hash;
+        transaction.ref_mutations[0].new_target = Some(RefTarget::change(change_id));
+
+        let error = manager
+            .commit_repository_transaction(transaction)
+            .expect_err("Native gitlinks require explicit external authority");
+        assert!(
+            error
+                .to_string()
+                .contains("without verified Git external authority"),
+            "unexpected Native gitlink error: {error}"
+        );
+        assert_eq!(manager.read_authority().generation(), 0);
     }
 
     #[test]
@@ -3967,17 +4696,6 @@ mod tests {
             new_admission_policy: before_workspace.admission_policy,
         };
         let mut transaction = transaction_shell(&manager, 0xa11);
-        transaction.admission_scan_token = Some(AdmissionScanToken {
-            repository_id: repository_id(),
-            workspace_id: before_workspace.workspace_id,
-            workspace_generation: before_workspace.generation,
-            workspace_head: before_workspace.head.clone(),
-            baseline_tree_hash: before_workspace.tree_hash,
-            observed_tree_hash: next_tree_hash,
-            matcher_semantics_version: ADMISSION_POLICY_SEMANTICS_VERSION,
-            shared_policy: before_workspace.admission_policy.shared,
-            local_overlay: before_workspace.admission_policy.local,
-        });
         transaction.workspace_mutation = Some(mutation);
         manager.commit_repository_transaction(transaction).unwrap();
 
@@ -4108,12 +4826,6 @@ mod tests {
         let workspace = transaction.workspace_mutation.as_mut().unwrap();
         workspace.new_shared_admission_policy = unrelated.clone();
         workspace.new_admission_policy.shared = unrelated.stamp();
-        transaction
-            .admission_scan_token
-            .as_mut()
-            .unwrap()
-            .shared_policy = unrelated.stamp();
-
         let error = manager
             .commit_repository_transaction(transaction)
             .expect_err("clean policy drift must not acquire repository authority");
@@ -4216,17 +4928,6 @@ mod tests {
             new_admission_policy: effective,
         };
         let mut transaction = transaction_shell(&manager, 25);
-        transaction.admission_scan_token = Some(AdmissionScanToken {
-            repository_id: repository_id(),
-            workspace_id: current.workspace_id,
-            workspace_generation: current.generation,
-            workspace_head: current.head.clone(),
-            baseline_tree_hash: current.tree_hash,
-            observed_tree_hash: tree_hash,
-            matcher_semantics_version: ADMISSION_POLICY_SEMANTICS_VERSION,
-            shared_policy: effective.shared,
-            local_overlay: effective.local,
-        });
         transaction.workspace_mutation = Some(mutation);
 
         manager.commit_repository_transaction(transaction).unwrap();
@@ -4394,14 +5095,23 @@ mod tests {
     fn divergent_refs_resolve_exact_trees_without_a_global_head_view() {
         let backend = Arc::new(MemoryBackend::default());
         let manager = initial_manager(Arc::clone(&backend));
-        let artifact_id = ArtifactId(Uuid::from_u128(70));
+        manager
+            .commit_repository_transaction(arbitrary_repository_transaction(&manager))
+            .unwrap();
+        let lease = manager.read_authority();
+        let old_target = lease.metadata().ref_state.refs[0].target.clone();
+        let old_change = target_change_id(lease.metadata(), &old_target).unwrap();
+        let path = RepoPath::from_utf8("compose.yaml").unwrap();
+        let old_artifact = lease.metadata().workspaces[0]
+            .tree
+            .artifact_at_path(&path)
+            .unwrap()
+            .clone();
+        drop(lease);
+
         let fixtures = [
-            (b"main body\n".as_slice(), "main", b"main".as_slice()),
-            (
-                b"alternate body\n".as_slice(),
-                "alternate",
-                b"alternate".as_slice(),
-            ),
+            (b"main body\n".as_slice(), "main"),
+            (b"alternate body\n".as_slice(), "alternate"),
         ];
         let timestamp = Timestamp(
             chrono::DateTime::parse_from_rfc3339("2026-07-26T13:00:00Z")
@@ -4409,24 +5119,22 @@ mod tests {
                 .with_timezone(&chrono::Utc),
         );
         let mut changes = Vec::new();
-        for (body, message, _) in fixtures {
+        for (body, message) in fixtures {
             let body_hash = digest(body);
             manager.save_source_blob(body_hash, body).unwrap();
             let mut change = SemanticChange {
                 id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
                 origin: ChangeOrigin::Native,
-                parents: Vec::new(),
+                parents: vec![old_change],
                 timestamp: timestamp.clone(),
                 author: AuthorId::new("authority-test"),
                 message: message.to_string(),
                 entity_deltas: Vec::new(),
                 relation_deltas: Vec::new(),
-                tree_deltas: vec![TreeDelta::Added {
-                    artifact_id,
-                    new: LocatedEntry::new(
-                        RepoPath::from_utf8("README.md").unwrap(),
-                        TreeEntry::blob(body_hash, false),
-                    ),
+                tree_deltas: vec![TreeDelta::Updated {
+                    artifact_id: old_artifact.artifact_id,
+                    old: old_artifact.located_entry(),
+                    new: LocatedEntry::new(path.clone(), TreeEntry::blob(body_hash, false)),
                 }],
                 admission_policy_delta: None,
                 projected_files: Vec::new(),
@@ -4445,7 +5153,7 @@ mod tests {
         transaction.ref_mutations = vec![
             RefMutation {
                 name: RefName::branch(b"main").unwrap(),
-                expected: RefExpectation::MustNotExist,
+                expected: RefExpectation::MustEqual { target: old_target },
                 new_target: Some(RefTarget::change(main_id)),
                 policy: RefUpdatePolicy::FastForwardOnly,
             },
@@ -4467,7 +5175,6 @@ mod tests {
         let graph = InMemoryGraph::from_snapshot(history).unwrap();
         let main = graph.resolve_tree_at(&main_id).unwrap();
         let alternate = graph.resolve_tree_at(&alternate_id).unwrap();
-        let path = RepoPath::from_utf8("README.md").unwrap();
         assert_ne!(
             main.artifact_at_path(&path).unwrap().entry,
             alternate.artifact_at_path(&path).unwrap().entry
@@ -4483,7 +5190,8 @@ mod tests {
             .metadata()
             .ref_state
             .default_ref
-            .is_none());
+            .as_ref()
+            .is_some_and(|name| name == &RefName::branch(b"main").unwrap()));
     }
 
     #[test]

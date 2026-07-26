@@ -734,12 +734,11 @@ mod tests {
     use futures_util::stream::BoxStream;
     use futures_util::StreamExt;
     use kin_model::{
-        compute_resolved_tree_hash, AdmissionCase, AdmissionScanToken, AuthorId,
-        DefaultRefExpectation, DefaultRefMutation, EffectiveAdmissionPolicyStamp,
-        FrozenLocalOverlay, FrozenLocalOverlayDelta, OperationId, RefName, RepositoryId,
-        RepositoryTransaction, ResolvedTree, SharedAdmissionPolicy, WorkspaceExpectation,
-        WorkspaceHead, WorkspaceId, WorkspaceMutation, ADMISSION_POLICY_SEMANTICS_VERSION,
-        REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+        compute_resolved_tree_hash, AdmissionCase, AuthorId, DefaultRefExpectation,
+        DefaultRefMutation, EffectiveAdmissionPolicyStamp, FrozenLocalOverlay,
+        FrozenLocalOverlayDelta, OperationId, RefName, RepositoryId, RepositoryTransaction,
+        ResolvedTree, SharedAdmissionPolicy, WorkspaceExpectation, WorkspaceHead, WorkspaceId,
+        WorkspaceMutation, REPOSITORY_TRANSACTION_SCHEMA_VERSION,
     };
     use object_store::memory::InMemory;
     use object_store::{
@@ -1017,17 +1016,6 @@ mod tests {
             }),
             workspace_mutation: Some(workspace_mutation),
             local_overlay_delta: Some(FrozenLocalOverlayDelta::initialize(overlay)),
-            admission_scan_token: Some(AdmissionScanToken {
-                repository_id: repository_id.clone(),
-                workspace_id,
-                workspace_generation: 0,
-                workspace_head: head,
-                baseline_tree_hash: tree_hash,
-                observed_tree_hash: tree_hash,
-                matcher_semantics_version: ADMISSION_POLICY_SEMANTICS_VERSION,
-                shared_policy: policy.shared,
-                local_overlay: policy.local,
-            }),
         };
         drop(lease);
         transaction
