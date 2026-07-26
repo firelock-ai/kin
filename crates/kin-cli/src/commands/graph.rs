@@ -1079,7 +1079,7 @@ mod tests {
 
         let file_id = FilePathId::new("src/lib.rs");
         let blob_hash = if let Some(source) = source {
-            let blob_store = kin_blobs::BlobStore::new(layout.objects_dir()).unwrap();
+            let blob_store = kin_blobs::BlobStore::new(layout.ingest_cas_dir()).unwrap();
             blob_store.write(source).unwrap()
         } else {
             Hash256::from_bytes([0x99; 32])
@@ -1212,7 +1212,7 @@ mod tests {
         let path = RepoPath::from_utf8(fixture.file_id.0.clone()).unwrap();
         let parent_tree = fixture.graph.resolve_tree_at(&parent).unwrap();
         let old_artifact = parent_tree.artifact_at_path(&path).unwrap();
-        let replacement_hash = kin_blobs::BlobStore::new(fixture.layout.objects_dir())
+        let replacement_hash = kin_blobs::BlobStore::new(fixture.layout.ingest_cas_dir())
             .unwrap()
             .write(b"fn replacement() {}\n")
             .unwrap();
