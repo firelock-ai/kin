@@ -194,24 +194,57 @@ pub fn handle_release_check<G: GraphStore>(
         .transpose()?;
     let expected_entity_count = release_optional_entity_count(args)?;
 
-    let mut branches = store.list_branches().map_err(McpError::graph)?;
-    branches.sort_by(|left, right| left.name.0.cmp(&right.name.0));
+    let layout = super::artifacts::active_layout()?;
+    let authority = super::repository_authority::ActiveRepositoryAuthority::open(&layout)?;
+    let mut branches = authority
+        .repository_refs()
+        .into_iter()
+        .filter(|repository_ref| repository_ref.name.is_branch())
+        .collect::<Vec<_>>();
+    branches.sort_by(|left, right| left.name.as_bytes().cmp(right.name.as_bytes()));
     let branch = if let Some(name) = requested_branch {
-        store
-            .get_branch(&kin_model::BranchName::new(&name))
-            .map_err(McpError::graph)?
+        let name = super::repository_authority::parse_branch_ref(&name)?;
+        authority
+            .repository_ref(&name)
             .ok_or_else(|| McpError::InvalidParams(format!("branch not found: {name}")))?
-    } else if let Some(main) = branches.iter().find(|branch| branch.name.0 == "main") {
+    } else if let Some(default_ref) = authority.default_ref() {
+        branches
+            .iter()
+            .find(|branch| branch.name == default_ref)
+            .cloned()
+            .or_else(|| {
+                branches
+                    .iter()
+                    .find(|branch| branch.name.as_bytes() == b"refs/heads/main")
+                    .cloned()
+            })
+            .or_else(|| match branches.as_slice() {
+                [only] => Some(only.clone()),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                McpError::InvalidParams(
+                    "kin_release_check requires branch when the default ref is unborn and \
+                     repository authority has zero or multiple branches"
+                        .to_string(),
+                )
+            })?
+    } else if let Some(main) = branches
+        .iter()
+        .find(|branch| branch.name.as_bytes() == b"refs/heads/main")
+    {
         main.clone()
     } else if let [only] = branches.as_slice() {
         only.clone()
     } else {
         return Err(McpError::InvalidParams(
-            "kin_release_check requires branch when graph truth has zero or multiple branches"
+            "kin_release_check requires branch when repository authority has zero or multiple \
+             branches"
                 .to_string(),
         ));
     };
-    let source_head = requested_source.unwrap_or(branch.head);
+    let branch_head = authority.resolve_target(&branch.target)?;
+    let source_head = requested_source.unwrap_or(branch_head);
     store
         .get_change(&source_head)
         .map_err(McpError::graph)?
@@ -277,8 +310,12 @@ pub fn handle_release_check<G: GraphStore>(
     // This tool is advisory and cannot hold the daemon's mutation gate, but it
     // must at least detect a branch move that happened while the source checks
     // above were running. Publication still performs the authoritative CAS.
-    let final_branch = store.get_branch(&branch.name).map_err(McpError::graph)?;
-    let final_branch_head = final_branch.as_ref().map(|branch| branch.head);
+    let final_authority = super::repository_authority::ActiveRepositoryAuthority::open(&layout)?;
+    let final_branch = final_authority.repository_ref(&branch.name);
+    let final_branch_head = final_branch
+        .as_ref()
+        .map(|repository_ref| final_authority.resolve_target(&repository_ref.target))
+        .transpose()?;
     match final_branch_head {
         Some(head) if head == source_head => {}
         Some(head) => blockers.push(format!(
@@ -295,6 +332,7 @@ pub fn handle_release_check<G: GraphStore>(
         "pass": blockers.is_empty(),
         "blockers": blockers,
         "branch": branch.name.to_string(),
+        "branch_ref": branch.name,
         "branch_head": final_branch_head.map(|head| head.to_string()),
         "source_change_id": source_head.to_string(),
         "source_entity_count": source_state.entities.len(),
@@ -304,7 +342,7 @@ pub fn handle_release_check<G: GraphStore>(
             "coverage_ratio": coverage.coverage_ratio,
             "missing_proof_count": coverage.missing_proof.len(),
         },
-        "authority": "advisory_graph_only",
+        "authority": "repository_v6_advisory",
         "daemon_admission_required": true,
         "proof_authority": if source_state.entities.is_empty() {
             "empty_source_vacuous"
