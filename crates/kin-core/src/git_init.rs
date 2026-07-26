@@ -13,8 +13,8 @@ use std::path::Path;
 use kin_blobs::BlobStore;
 use kin_git::{
     admit_semantic_git_import, build_git_external_authority, capture_lossless_git_repository,
-    plan_semantic_git_import, preflight_git_migration, GitLocalIgnoreSourceKind,
-    GitMigrationPreflightProof, LosslessGitRepository,
+    plan_semantic_git_import, preflight_git_migration, preflight_git_migration_after_publication,
+    GitLocalIgnoreSourceKind, GitMigrationPreflightProof, LosslessGitRepository,
 };
 use kin_model::{
     compute_resolved_tree_hash, AdmissionCase, AdmissionScanToken, AuthorId,
@@ -31,9 +31,7 @@ use crate::config::{
     KinConfig,
 };
 use crate::error::{KinError, Result};
-use crate::init::{
-    prepare_repository_layout_at, publish_repository_layout_after_check, InitResult,
-};
+use crate::init::{prepare_repository_layout_at, publish_repository_layout_linearized, InitResult};
 use crate::manifest::KinManifest;
 
 /// Admit one clean materialized Git worktree as a complete Kin repository.
@@ -48,6 +46,14 @@ pub fn init_from_git(working_dir: &Path) -> Result<InitResult> {
 fn init_from_git_with_hook(
     working_dir: &Path,
     before_final_source_proof: impl FnOnce(),
+) -> Result<InitResult> {
+    init_from_git_with_hooks(working_dir, before_final_source_proof, || {})
+}
+
+fn init_from_git_with_hooks(
+    working_dir: &Path,
+    before_final_source_proof: impl FnOnce(),
+    after_repository_publication: impl FnOnce(),
 ) -> Result<InitResult> {
     let source = canonical_new_repository_root(working_dir)?;
     require_git_boundary(&source)?;
@@ -111,7 +117,7 @@ fn init_from_git_with_hook(
         .map_err(|error| KinError::Other(format!("invalid Git bootstrap transaction: {error}")))?;
     prepared.commit_repository_bootstrap(&transaction)?;
 
-    let result = publish_repository_layout_after_check(prepared, || {
+    let result = publish_repository_layout_linearized(prepared, |publication| {
         before_final_source_proof();
         let final_proof =
             preflight_git_migration(&source, &snapshot, &semantic_plan, &capture_store)
@@ -119,6 +125,23 @@ fn init_from_git_with_hook(
         if final_proof != source_proof {
             return Err(KinError::Other(
                 "Git source proof changed before repository publication; retry from a fresh capture"
+                    .to_string(),
+            ));
+        }
+        let published = publication.publish()?;
+        after_repository_publication();
+        let published_proof = preflight_git_migration_after_publication(
+            &source,
+            published.path(),
+            &snapshot,
+            &semantic_plan,
+            &capture_store,
+        )
+        .map_err(|error| git_boundary_error("prove Git source after publication", error))?;
+        if published_proof != source_proof {
+            return Err(KinError::Other(
+                "Git source proof changed across repository publication; published authority is \
+                 not safe to use without recovery"
                     .to_string(),
             ));
         }
@@ -601,6 +624,35 @@ mod tests {
         assert!(error.contains("source proof changed"), "{error}");
         assert!(!error.contains("changed.example.invalid"), "{error}");
         assert!(!source.join(".kin").exists());
+        assert_no_staging_directories(root.path());
+    }
+
+    #[test]
+    fn source_drift_immediately_after_publication_is_detected_fail_loud() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        initialize_git(&source);
+        std::fs::write(source.join("README.md"), b"exact source\n").unwrap();
+        git(&source, ["add", "--all"]);
+        git(&source, ["commit", "-m", "initial"]);
+
+        let source_for_hook = source.clone();
+        let error = init_from_git_with_hooks(
+            &source,
+            || {},
+            move || {
+                std::fs::write(source_for_hook.join("README.md"), b"raced source\n").unwrap();
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            KinError::RepositoryPublishedButUncertain { .. }
+        ));
+        assert!(error.to_string().contains("after publication"));
+        assert!(source.join(".kin").is_dir());
         assert_no_staging_directories(root.path());
     }
 
