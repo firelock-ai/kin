@@ -553,11 +553,6 @@ enum Command {
         /// Target directory (defaults to repo name)
         path: Option<String>,
     },
-    /// Import a repository (git URL or local path) into Kin
-    Import {
-        /// Repository URL (https/git) or local path
-        url: String,
-    },
     /// Restore a file from a specific change
     Checkout {
         /// File path to restore
@@ -2485,7 +2480,6 @@ fn main() -> Result<()> {
                 Command::Push { remote } => commands::push::run(remote).await,
                 Command::Pull { remote } => commands::pull::run(remote).await,
                 Command::Clone { url, path } => commands::clone::run(url, path).await,
-                Command::Import { url } => commands::import::run(url).await,
                 Command::Checkout { path, change } => commands::checkout::run(path, change).await,
                 Command::Verify { action } => match action {
                     VerifyAction::Entity { entity } => commands::verify::run(entity).await,
@@ -3003,6 +2997,7 @@ mod tests {
     fn git_interop_exposes_only_exact_export() {
         on_cli_test_stack(|| {
             for args in [
+                &["kin", "import", "https://example.com/repo.git"][..],
                 &["kin", "git", "import"][..],
                 &["kin", "git", "sync"][..],
                 &["kin", "git", "sync", "--in-place"][..],
