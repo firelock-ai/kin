@@ -328,43 +328,18 @@ fn semantic_change_payload(change: &SemanticChange) -> Result<SemanticChangePayl
     })
 }
 
-fn reverse_artifact_index(
-    artifact_index: &HashMap<FilePathId, ArtifactId>,
-) -> HashMap<ArtifactId, FilePathId> {
-    let mut artifact_reverse = HashMap::new();
-    for (path, id) in artifact_index {
-        artifact_reverse.entry(*id).or_insert_with(|| path.clone());
-    }
-    artifact_reverse
+fn repo_path_for_file_path(path: &FilePathId) -> Result<RepoPath, KinDbError> {
+    RepoPath::from_utf8(&path.0).map_err(|error| {
+        KinDbError::StorageError(format!("invalid repository path {}: {error}", path.0))
+    })
 }
 
-fn validate_artifact_indexes(entity_data: &EntityData) -> Result<(), KinDbError> {
-    for (path, artifact_id) in &entity_data.artifact_index {
-        match entity_data.artifact_reverse.get(artifact_id) {
-            Some(reverse_path) if reverse_path == path => {}
-            Some(reverse_path) => {
-                return Err(KinDbError::StorageError(format!(
-                    "artifact identity {artifact_id:?} maps forward to {} but backward to {}",
-                    path.0, reverse_path.0
-                )));
-            }
-            None => {
-                return Err(KinDbError::StorageError(format!(
-                    "artifact identity {artifact_id:?} for {} is missing its reverse mapping",
-                    path.0
-                )));
-            }
-        }
-    }
-    for (artifact_id, path) in &entity_data.artifact_reverse {
-        if entity_data.artifact_index.get(path) != Some(artifact_id) {
-            return Err(KinDbError::StorageError(format!(
-                "artifact reverse mapping {artifact_id:?} -> {} has no matching forward mapping",
-                path.0
-            )));
-        }
-    }
-    Ok(())
+fn file_path_for_repo_path(path: &RepoPath) -> Option<FilePathId> {
+    path.as_utf8().map(FilePathId::new)
+}
+
+fn tree_state_error(error: TreeStateError) -> KinDbError {
+    KinDbError::StorageError(format!("repository tree transition rejected: {error}"))
 }
 
 fn topologically_order_changes<I>(changes: I) -> Vec<SemanticChange>
@@ -403,6 +378,55 @@ where
         }
     }
     ordered
+}
+
+fn find_artifact_revision(
+    changes: impl IntoIterator<Item = (SemanticChangeId, SemanticChange)>,
+    target: ArtifactRevisionId,
+) -> Option<ArtifactRevision> {
+    let mut active_by_change =
+        HashMap::<SemanticChangeId, HashMap<ArtifactId, ArtifactRevisionId>>::new();
+    for change in topologically_order_changes(changes) {
+        let mut active = change
+            .parents
+            .first()
+            .and_then(|parent| active_by_change.get(parent))
+            .cloned()
+            .unwrap_or_default();
+        for delta in &change.tree_deltas {
+            let artifact_id = delta.artifact_id();
+            let Some(located) = delta.new_state() else {
+                active.remove(&artifact_id);
+                continue;
+            };
+            let mut predecessors = Vec::new();
+            for parent in &change.parents {
+                let Some(predecessor) = active_by_change
+                    .get(parent)
+                    .and_then(|parent_active| parent_active.get(&artifact_id))
+                    .copied()
+                else {
+                    continue;
+                };
+                if !predecessors.contains(&predecessor) {
+                    predecessors.push(predecessor);
+                }
+            }
+            let revision = ArtifactRevision::new(
+                artifact_id,
+                located.path.clone(),
+                located.entry,
+                change.id,
+                predecessors,
+            );
+            active.insert(artifact_id, revision.revision_id);
+            if revision.revision_id == target {
+                return Some(revision);
+            }
+        }
+        active_by_change.insert(change.id, active);
+    }
+    None
 }
 
 fn entity_matches_revision(left: &Entity, right: &Entity) -> bool {
@@ -853,8 +877,8 @@ struct EntityData {
     node_incoming: HashMap<GraphNodeId, Vec<RelationId>>,
     /// Secondary indexes for fast lookup.
     indexes: IndexSet,
-    /// Exact graph-owned working tree: file path → blob identity + source kind.
-    working_tree: HashMap<String, TreeEntry>,
+    /// Exact graph-owned repository tree and artifact identity authority.
+    resolved_tree: ResolvedTree,
     /// Shallow file tracking (C2 tier).
     shallow_files: HashMap<FilePathId, ShallowTrackedFile>,
     /// Persisted file layouts for projection.
@@ -863,10 +887,6 @@ struct EntityData {
     structured_artifacts: HashMap<FilePathId, StructuredArtifact>,
     /// Opaque artifact tracking (C0 tier).
     opaque_artifacts: HashMap<FilePathId, OpaqueArtifact>,
-    /// Forward: FilePathId → ArtifactId (O(1) lookup)
-    artifact_index: HashMap<FilePathId, ArtifactId>,
-    /// Reverse: ArtifactId → FilePathId (O(1) reverse lookup)
-    artifact_reverse: HashMap<ArtifactId, FilePathId>,
 }
 
 impl GraphHashSource for EntityData {
@@ -1691,13 +1711,11 @@ impl InMemoryGraph {
                 node_outgoing: HashMap::new(),
                 node_incoming: HashMap::new(),
                 indexes: IndexSet::new(),
-                working_tree: HashMap::new(),
+                resolved_tree: ResolvedTree::default(),
                 shallow_files: HashMap::new(),
                 file_layouts: HashMap::new(),
                 structured_artifacts: HashMap::new(),
                 opaque_artifacts: HashMap::new(),
-                artifact_index: HashMap::new(),
-                artifact_reverse: HashMap::new(),
             }),
             changes: RwLock::new(ChangeData {
                 changes: HashMap::new(),
@@ -1904,12 +1922,11 @@ impl InMemoryGraph {
             file_layouts,
             structured_artifacts,
             opaque_artifacts,
-            working_tree,
+            resolved_tree,
             sessions,
             intents,
             downstream_warnings,
             entity_revisions,
-            artifact_index,
         } = snapshot;
         let entity_revisions: HashMap<EntityId, Vec<EntityRevision>> =
             if entity_revisions.is_empty() && !changes.is_empty() {
@@ -2056,9 +2073,6 @@ impl InMemoryGraph {
             .into_iter()
             .map(|artifact| (artifact.file_id.clone(), artifact))
             .collect();
-        let artifact_index: HashMap<FilePathId, ArtifactId> = artifact_index.into_iter().collect();
-        let artifact_reverse = reverse_artifact_index(&artifact_index);
-
         let entity_data = EntityData {
             entities: entities.into_iter().collect(),
             entity_revisions,
@@ -2068,13 +2082,11 @@ impl InMemoryGraph {
             node_outgoing,
             node_incoming,
             indexes,
-            working_tree: working_tree.into_iter().collect(),
+            resolved_tree,
             shallow_files,
             file_layouts,
             structured_artifacts,
             opaque_artifacts,
-            artifact_index,
-            artifact_reverse,
         };
         let merkle = MerkleCache::from_source(&entity_data);
 
@@ -2167,7 +2179,7 @@ impl InMemoryGraph {
             file_layouts,
             structured_artifacts,
             opaque_artifacts,
-            artifact_index,
+            resolved_tree,
         } = snapshot;
         let _span = tracing::info_span!(
             "kindb.graph.from_locate_snapshot",
@@ -2269,9 +2281,6 @@ impl InMemoryGraph {
             .into_iter()
             .map(|artifact| (artifact.file_id.clone(), artifact))
             .collect();
-        let artifact_index: HashMap<FilePathId, ArtifactId> = artifact_index.into_iter().collect();
-        let artifact_reverse = reverse_artifact_index(&artifact_index);
-
         let entity_data = EntityData {
             entities,
             entity_revisions: kin_model::graph::derive_entity_revisions_from_changes(
@@ -2287,13 +2296,11 @@ impl InMemoryGraph {
             node_outgoing,
             node_incoming,
             indexes,
-            working_tree: HashMap::new(),
+            resolved_tree,
             shallow_files,
             file_layouts,
             structured_artifacts,
             opaque_artifacts,
-            artifact_index,
-            artifact_reverse,
         };
         let merkle = MerkleCache::from_source(&entity_data);
 
@@ -2382,12 +2389,14 @@ impl InMemoryGraph {
         let _span = tracing::info_span!("kindb.graph.rebuild_text_index_with_root_hash").entered();
         let docs = {
             let ent = source.entities.read();
-            Self::collect_text_index_docs(&ent)
+            Self::collect_text_index_docs(&ent)?
         };
         self.try_rebuild_text_index_from_docs(docs, root_hash)
     }
 
-    fn collect_text_index_docs(ent: &EntityData) -> Vec<(RetrievalKey, Vec<(String, f32)>)> {
+    fn collect_text_index_docs(
+        ent: &EntityData,
+    ) -> Result<Vec<(RetrievalKey, Vec<(String, f32)>)>, KinDbError> {
         let _span = tracing::info_span!(
             "kindb.graph.rebuild_text_index.collect",
             entities = ent.entities.len(),
@@ -2405,8 +2414,8 @@ impl InMemoryGraph {
             };
             (RetrievalKey::Entity(entity.id), fields)
         });
-        let artifact_docs = collect_artifact_text_index_docs(ent);
-        entity_docs.chain(artifact_docs).collect()
+        let artifact_docs = collect_artifact_text_index_docs(ent)?;
+        Ok(entity_docs.chain(artifact_docs).collect())
     }
 
     fn try_rebuild_text_index_from_docs(
@@ -2594,7 +2603,7 @@ impl InMemoryGraph {
         if !exact {
             return Ok(false);
         }
-        let docs = Self::collect_text_index_docs(&ent);
+        let docs = Self::collect_text_index_docs(&ent)?;
         self.try_rebuild_text_index_from_docs(docs, expected_root_hash)?;
         persist_additional()?;
         Ok(true)
@@ -2697,24 +2706,14 @@ impl InMemoryGraph {
         record_relation_edge_delta(&mut pending, ent, relation);
     }
 
-    fn record_working_tree_delta_upsert(&self, path: String, entry: TreeEntry) {
+    fn record_resolved_tree_delta_upsert(&self, artifact_id: ArtifactId, entry: LocatedEntry) {
         let mut pending = self.pending_delta.lock();
-        delta_map_upsert(&mut pending.delta.working_tree, path, entry);
+        delta_map_upsert(&mut pending.delta.resolved_tree, artifact_id, entry);
     }
 
-    fn record_working_tree_delta_remove(&self, path: String) {
+    fn record_resolved_tree_delta_remove(&self, artifact_id: ArtifactId) {
         let mut pending = self.pending_delta.lock();
-        delta_map_remove(&mut pending.delta.working_tree, path);
-    }
-
-    fn record_artifact_index_delta_upsert(&self, path: FilePathId, artifact_id: ArtifactId) {
-        let mut pending = self.pending_delta.lock();
-        delta_map_upsert(&mut pending.delta.artifact_index, path, artifact_id);
-    }
-
-    fn record_artifact_index_delta_remove(&self, path: FilePathId) {
-        let mut pending = self.pending_delta.lock();
-        delta_map_remove(&mut pending.delta.artifact_index, path);
+        delta_map_remove(&mut pending.delta.resolved_tree, artifact_id);
     }
 
     fn record_shallow_file_delta_upsert(
@@ -3009,7 +3008,7 @@ impl InMemoryGraph {
         let ver = self.verification.read();
         let prv = self.provenance.read();
         let ses = self.sessions.read();
-        validate_artifact_indexes(&ent)?;
+        validate_entity_enrichment_admission(&ent)?;
         let t_lock = t0.elapsed();
 
         let t1 = std::time::Instant::now();
@@ -3033,12 +3032,11 @@ impl InMemoryGraph {
                 relations: &ent.relations,
                 outgoing: &ent.outgoing,
                 incoming: &ent.incoming,
-                working_tree: &ent.working_tree,
+                resolved_tree: &ent.resolved_tree,
                 shallow_files: &ent.shallow_files,
                 file_layouts: &ent.file_layouts,
                 structured_artifacts: &ent.structured_artifacts,
                 opaque_artifacts: &ent.opaque_artifacts,
-                artifact_index: &ent.artifact_index,
                 changes: &chg.changes,
                 change_children: &chg.change_children,
                 branches: &chg.branches,
@@ -3089,53 +3087,38 @@ impl InMemoryGraph {
         Ok((bytes, graph_root_hash, persistence_epoch))
     }
 
-    /// O(1) lookup: file path → graph-assigned ArtifactId
-    pub fn artifact_id_for_path(&self, path: &FilePathId) -> Option<ArtifactId> {
-        self.entities.read().artifact_index.get(path).copied()
+    /// Return a snapshot of the exact graph-owned repository tree.
+    pub fn resolved_tree(&self) -> ResolvedTree {
+        self.entities.read().resolved_tree.clone()
     }
 
-    /// O(1) reverse lookup: ArtifactId → file path
-    pub fn path_for_artifact_id(&self, id: &ArtifactId) -> Option<FilePathId> {
-        self.entities.read().artifact_reverse.get(id).cloned()
+    /// Resolve a byte-exact repository path to its admitted artifact identity.
+    pub fn artifact_id_at_path(&self, path: &RepoPath) -> Option<ArtifactId> {
+        self.entities.read().resolved_tree.artifact_id_at_path(path)
     }
 
-    /// Idempotent: returns the graph-owned ID if assigned, otherwise mints and
-    /// persists the path's first identity.
-    pub fn ensure_artifact_id(&self, path: &FilePathId) -> ArtifactId {
-        let mut ent = self.entities.write();
-        if let Some(id) = ent.artifact_index.get(path) {
-            *id
-        } else {
-            let mut new_id = ArtifactId::new();
-            while ent.artifact_reverse.contains_key(&new_id) {
-                new_id = ArtifactId::new();
-            }
-            ent.artifact_index.insert(path.clone(), new_id);
-            ent.artifact_reverse.insert(new_id, path.clone());
-            self.record_artifact_index_delta_upsert(path.clone(), new_id);
-            new_id
-        }
+    /// Resolve an admitted artifact identity to its exact tree record.
+    pub fn resolved_artifact(&self, id: &ArtifactId) -> Option<ResolvedArtifact> {
+        self.entities.read().resolved_tree.get(id).cloned()
     }
 
-    /// Move artifact identity across paths (file rename).
-    pub fn rename_artifact(
-        &self,
-        old_path: &FilePathId,
-        new_path: &FilePathId,
-    ) -> Option<ArtifactId> {
-        let mut ent = self.entities.write();
-        if old_path == new_path {
-            return ent.artifact_index.get(old_path).copied();
-        }
-        if ent.artifact_index.contains_key(new_path) {
-            return None;
-        }
-        let id = ent.artifact_index.remove(old_path)?;
-        ent.artifact_index.insert(new_path.clone(), id);
-        ent.artifact_reverse.insert(id, new_path.clone());
-        self.record_artifact_index_delta_remove(old_path.clone());
-        self.record_artifact_index_delta_upsert(new_path.clone(), id);
-        Some(id)
+    /// Resolve an admitted artifact identity to its byte-exact path.
+    pub fn repo_path_for_artifact_id(&self, id: &ArtifactId) -> Option<RepoPath> {
+        self.entities
+            .read()
+            .resolved_tree
+            .get(id)
+            .map(|artifact| artifact.path.clone())
+    }
+
+    fn require_artifact_id(&self, path: &FilePathId) -> Result<ArtifactId, KinDbError> {
+        let repo_path = repo_path_for_file_path(path)?;
+        self.artifact_id_at_path(&repo_path).ok_or_else(|| {
+            KinDbError::StorageError(format!(
+                "semantic enrichment requires an admitted repository artifact at {}",
+                path.0
+            ))
+        })
     }
 
     /// Return all entity→entity edges in a single lock acquisition.
@@ -3172,7 +3155,7 @@ impl InMemoryGraph {
             relations: ent.relations.into_iter().collect(),
             outgoing: ent.outgoing.into_iter().collect(),
             incoming: ent.incoming.into_iter().collect(),
-            working_tree: ent.working_tree.into_iter().collect(),
+            resolved_tree: ent.resolved_tree,
             shallow_files: ent.shallow_files.into_values().collect(),
             file_layouts: ent.file_layouts.into_values().collect(),
             structured_artifacts: ent.structured_artifacts.into_values().collect(),
@@ -3200,7 +3183,6 @@ impl InMemoryGraph {
             sessions: ses.sessions.into_iter().collect(),
             intents: ses.intents.into_iter().collect(),
             downstream_warnings: ses.downstream_warnings,
-            artifact_index: ent.artifact_index.into_iter().collect(),
         }
     }
 
@@ -3351,7 +3333,7 @@ impl InMemoryGraph {
             file_layout_count: ent.file_layouts.len(),
             structured_artifact_count: ent.structured_artifacts.len(),
             opaque_artifact_count: ent.opaque_artifacts.len(),
-            working_tree_entry_count: ent.working_tree.len(),
+            working_tree_entry_count: ent.resolved_tree.len(),
             text_indexed_entity_count,
             text_index_coverage_percent: coverage_percent(
                 text_indexed_entity_count,
@@ -3482,52 +3464,42 @@ impl InMemoryGraph {
                 .find(|rev| rev.revision_id == *rev_id)
                 .map(|rev| ResolvedRetrievalItem::Entity(rev.entity.clone())),
             RetrievalKey::Artifact(artifact_id) => {
-                let file_path = ent.artifact_reverse.get(artifact_id)?;
+                let file_path = file_path_for_repo_path(&ent.resolved_tree.get(artifact_id)?.path)?;
                 ent.shallow_files
-                    .get(file_path)
+                    .get(&file_path)
                     .cloned()
                     .map(ResolvedRetrievalItem::ShallowFile)
                     .or_else(|| {
                         ent.structured_artifacts
-                            .get(file_path)
+                            .get(&file_path)
                             .cloned()
                             .map(ResolvedRetrievalItem::StructuredArtifact)
                     })
                     .or_else(|| {
                         ent.opaque_artifacts
-                            .get(file_path)
+                            .get(&file_path)
                             .cloned()
                             .map(ResolvedRetrievalItem::OpaqueArtifact)
                     })
             }
             RetrievalKey::ArtifactRevision(rev_id) => {
                 let chg = self.changes.read();
-                for change in chg.changes.values() {
-                    for delta in &change.tree_deltas {
-                        if let Some(entry) = delta.new_entry() {
-                            let derived_id = ArtifactRevisionId::for_artifact_change(
-                                delta.file_id(),
-                                &change.id,
-                                &entry,
-                            );
-                            if derived_id == *rev_id {
-                                return Some(ResolvedRetrievalItem::ShallowFile(
-                                    ShallowTrackedFile {
-                                        file_id: delta.file_id().clone(),
-                                        language_hint: String::new(),
-                                        declaration_count: 0,
-                                        import_count: 0,
-                                        syntax_hash: entry.blob_hash,
-                                        signature_hash: None,
-                                        declaration_names: vec![],
-                                        import_paths: vec![],
-                                    },
-                                ));
-                            }
-                        }
-                    }
-                }
-                None
+                let revision = find_artifact_revision(
+                    chg.changes.iter().map(|(id, change)| (*id, change.clone())),
+                    *rev_id,
+                )?;
+                let file_id = file_path_for_repo_path(&revision.path)?;
+                let syntax_hash = revision.entry.blob_identity()?;
+                Some(ResolvedRetrievalItem::ShallowFile(ShallowTrackedFile {
+                    file_id,
+                    language_hint: String::new(),
+                    declaration_count: 0,
+                    import_count: 0,
+                    syntax_hash,
+                    signature_hash: None,
+                    declaration_names: vec![],
+                    import_paths: vec![],
+                }))
             }
         }
     }
@@ -5361,21 +5333,11 @@ impl InMemoryGraph {
 
     /// Delete a shallow tracked file by file path.
     pub fn delete_shallow_file(&self, file_id: &FilePathId) -> Result<(), KinDbError> {
-        let artifact_id = self.artifact_id_for_path(file_id).unwrap_or_else(|| {
-            let id = ArtifactId::seed_from_file_id(file_id);
-            id
-        });
+        let artifact_id = self.require_artifact_id(file_id)?;
 
         let mut ent = self.entities.write();
         let old = ent.shallow_files.remove(file_id);
         self.record_shallow_file_delta_remove(old, file_id.clone());
-        if !ent.structured_artifacts.contains_key(file_id)
-            && !ent.opaque_artifacts.contains_key(file_id)
-        {
-            ent.artifact_index.remove(file_id);
-            ent.artifact_reverse.remove(&artifact_id);
-            self.record_artifact_index_delta_remove(file_id.clone());
-        }
         drop(ent);
 
         let key = RetrievalKey::Artifact(artifact_id);
@@ -5471,35 +5433,6 @@ impl InMemoryGraph {
     // Incremental indexing helpers
     // -------------------------------------------------------------------
 
-    /// Publish one exact working-tree entry.
-    pub fn set_working_tree_entry(&self, path: &str, entry: TreeEntry) {
-        self.entities
-            .write()
-            .working_tree
-            .insert(path.to_string(), entry);
-        self.record_working_tree_delta_upsert(path.to_string(), entry);
-    }
-
-    /// Read one exact working-tree entry.
-    pub fn get_working_tree_entry(&self, path: &str) -> Option<TreeEntry> {
-        self.entities.read().working_tree.get(path).copied()
-    }
-
-    /// Snapshot the complete exact working tree.
-    pub fn working_tree_entries(&self) -> HashMap<String, TreeEntry> {
-        self.entities.read().working_tree.clone()
-    }
-
-    /// Remove one exact working-tree entry without changing its semantic
-    /// enrichment facets.
-    pub fn remove_working_tree_entry(&self, path: &str) -> Option<TreeEntry> {
-        let removed = self.entities.write().working_tree.remove(path);
-        if removed.is_some() {
-            self.record_working_tree_delta_remove(path.to_string());
-        }
-        removed
-    }
-
     /// Remove all entities and their outgoing relations for entities in a given file.
     ///
     /// Incoming relations from OTHER files pointing to removed entities are kept
@@ -5578,16 +5511,80 @@ impl InMemoryGraph {
         entity_ids
     }
 
-    /// Get all paths present in the exact graph-owned working tree.
-    pub fn working_tree_paths(&self) -> Vec<String> {
-        self.entities.read().working_tree.keys().cloned().collect()
+    /// Get all byte-exact paths present in the graph-owned repository tree.
+    pub fn repository_paths(&self) -> Vec<RepoPath> {
+        self.entities
+            .read()
+            .resolved_tree
+            .artifacts_by_path()
+            .map(|artifact| artifact.path.clone())
+            .collect()
+    }
+
+    /// Admit or update one UTF-8 artifact through the real tree transaction
+    /// path. Test-only ingestion helper; production callers supply identities
+    /// and deltas at the import/reconcile boundary.
+    #[cfg(test)]
+    pub(crate) fn admit_artifact_for_test(&self, path: &str, entry: TreeEntry) -> ArtifactId {
+        let path = RepoPath::from_utf8(path).expect("valid test repository path");
+        let existing = self.resolved_tree().artifact_at_path(&path).cloned();
+        let artifact_id = existing
+            .as_ref()
+            .map(|artifact| artifact.artifact_id)
+            .unwrap_or_else(ArtifactId::new);
+        if existing
+            .as_ref()
+            .is_some_and(|artifact| artifact.entry == entry)
+        {
+            return artifact_id;
+        }
+        let tree_delta = match existing {
+            Some(artifact) => TreeDelta::Updated {
+                artifact_id,
+                old: artifact.located_entry(),
+                new: LocatedEntry::new(path, entry),
+            },
+            None => TreeDelta::Added {
+                artifact_id,
+                new: LocatedEntry::new(path, entry),
+            },
+        };
+        self.apply_transaction_delta(&TransactionDelta {
+            entity_deltas: Vec::new(),
+            relation_deltas: Vec::new(),
+            tree_deltas: vec![tree_delta],
+        })
+        .expect("test artifact admission");
+        artifact_id
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tree_entry_for_test(&self, path: &str) -> Option<TreeEntry> {
+        let path = RepoPath::from_utf8(path).ok()?;
+        self.resolved_tree()
+            .artifact_at_path(&path)
+            .map(|artifact| artifact.entry)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn remove_admitted_artifact_for_test(&self, path: &str) -> Option<TreeEntry> {
+        let path = RepoPath::from_utf8(path).ok()?;
+        let artifact = self.resolved_tree().artifact_at_path(&path).cloned()?;
+        self.apply_transaction_delta(&TransactionDelta {
+            entity_deltas: Vec::new(),
+            relation_deltas: Vec::new(),
+            tree_deltas: vec![TreeDelta::Removed {
+                artifact_id: artifact.artifact_id,
+                old: artifact.located_entry(),
+            }],
+        })
+        .expect("test artifact removal");
+        Some(artifact.entry)
     }
 
     /// Get file paths that have at least one entity (function, class, etc.).
-    /// Unlike `working_tree_paths` which returns every tracked file (including
-    /// build artifacts, configs, etc.), this returns only files the parser
-    /// extracted semantic entities from — the graph-native authority on what
-    /// constitutes source code.
+    /// Unlike [`Self::repository_paths`], which returns every admitted artifact,
+    /// this returns only files the parser extracted semantic entities from.
     pub fn entity_bearing_file_paths(&self) -> Vec<String> {
         self.entities.read().indexes.file.keys().cloned().collect()
     }
@@ -5642,38 +5639,54 @@ fn remove_relations_for_entity(ent: &mut EntityData, entity_id: &EntityId) -> Ve
     removed
 }
 
-fn collect_artifact_text_index_docs<'a>(
-    ent: &'a EntityData,
-) -> impl Iterator<Item = (RetrievalKey, Vec<(String, f32)>)> + 'a {
-    ent.shallow_files
-        .values()
-        .map(|file| {
-            let id = ent
-                .artifact_index
-                .get(&file.file_id)
-                .copied()
-                .unwrap_or_else(|| ArtifactId::seed_from_file_id(&file.file_id));
-            (RetrievalKey::Artifact(id), shallow_file_fields(file))
-        })
-        .chain(ent.structured_artifacts.values().map(|artifact| {
-            let id = ent
-                .artifact_index
-                .get(&artifact.file_id)
-                .copied()
-                .unwrap_or_else(|| ArtifactId::seed_from_file_id(&artifact.file_id));
-            (
-                RetrievalKey::Artifact(id),
-                structured_artifact_fields(artifact),
-            )
-        }))
-        .chain(ent.opaque_artifacts.values().map(|artifact| {
-            let id = ent
-                .artifact_index
-                .get(&artifact.file_id)
-                .copied()
-                .unwrap_or_else(|| ArtifactId::seed_from_file_id(&artifact.file_id));
-            (RetrievalKey::Artifact(id), opaque_artifact_fields(artifact))
-        }))
+fn admitted_artifact_id(ent: &EntityData, file_id: &FilePathId) -> Result<ArtifactId, KinDbError> {
+    let path = repo_path_for_file_path(file_id)?;
+    ent.resolved_tree.artifact_id_at_path(&path).ok_or_else(|| {
+        KinDbError::StorageError(format!(
+            "semantic enrichment exists without admitted repository identity at {}",
+            file_id.0
+        ))
+    })
+}
+
+fn validate_entity_enrichment_admission(ent: &EntityData) -> Result<(), KinDbError> {
+    for file_id in ent
+        .shallow_files
+        .keys()
+        .chain(ent.file_layouts.keys())
+        .chain(ent.structured_artifacts.keys())
+        .chain(ent.opaque_artifacts.keys())
+    {
+        admitted_artifact_id(ent, file_id)?;
+    }
+    Ok(())
+}
+
+fn collect_artifact_text_index_docs(
+    ent: &EntityData,
+) -> Result<Vec<(RetrievalKey, Vec<(String, f32)>)>, KinDbError> {
+    let mut docs = Vec::with_capacity(
+        ent.shallow_files.len() + ent.structured_artifacts.len() + ent.opaque_artifacts.len(),
+    );
+    for file in ent.shallow_files.values() {
+        docs.push((
+            RetrievalKey::Artifact(admitted_artifact_id(ent, &file.file_id)?),
+            shallow_file_fields(file),
+        ));
+    }
+    for artifact in ent.structured_artifacts.values() {
+        docs.push((
+            RetrievalKey::Artifact(admitted_artifact_id(ent, &artifact.file_id)?),
+            structured_artifact_fields(artifact),
+        ));
+    }
+    for artifact in ent.opaque_artifacts.values() {
+        docs.push((
+            RetrievalKey::Artifact(admitted_artifact_id(ent, &artifact.file_id)?),
+            opaque_artifact_fields(artifact),
+        ));
+    }
+    Ok(docs)
 }
 
 #[cfg(feature = "vector")]
@@ -5682,21 +5695,18 @@ fn collect_artifact_ids(ent: &EntityData) -> Vec<ArtifactId> {
         ent.shallow_files.len() + ent.structured_artifacts.len() + ent.opaque_artifacts.len(),
     );
 
-    for file_id in ent.shallow_files.keys() {
-        if let Some(id) = ent.artifact_index.get(file_id) {
-            ids.push(*id);
-        }
-    }
-    for file_id in ent.structured_artifacts.keys() {
-        if let Some(id) = ent.artifact_index.get(file_id) {
-            ids.push(*id);
-        }
-    }
-    for file_id in ent.opaque_artifacts.keys() {
-        if let Some(id) = ent.artifact_index.get(file_id) {
-            ids.push(*id);
-        }
-    }
+    ids.extend(ent.shallow_files.keys().map(|file_id| {
+        admitted_artifact_id(ent, file_id)
+            .expect("validated shallow enrichment must have repository identity")
+    }));
+    ids.extend(ent.structured_artifacts.keys().map(|file_id| {
+        admitted_artifact_id(ent, file_id)
+            .expect("validated structured enrichment must have repository identity")
+    }));
+    ids.extend(ent.opaque_artifacts.keys().map(|file_id| {
+        admitted_artifact_id(ent, file_id)
+            .expect("validated opaque enrichment must have repository identity")
+    }));
 
     ids
 }
@@ -5706,23 +5716,23 @@ fn artifact_embedding_doc(
     ent: &EntityData,
     artifact_id: &ArtifactId,
 ) -> Option<(RetrievalKey, String)> {
-    let file_path = ent.artifact_reverse.get(artifact_id)?;
+    let file_path = file_path_for_repo_path(&ent.resolved_tree.get(artifact_id)?.path)?;
 
-    if let Some(file) = ent.shallow_files.get(file_path) {
+    if let Some(file) = ent.shallow_files.get(&file_path) {
         return Some((
             RetrievalKey::Artifact(*artifact_id),
             crate::embed::format_shallow_text(file),
         ));
     }
 
-    if let Some(artifact) = ent.structured_artifacts.get(file_path) {
+    if let Some(artifact) = ent.structured_artifacts.get(&file_path) {
         return Some((
             RetrievalKey::Artifact(*artifact_id),
             crate::embed::format_artifact_text(artifact),
         ));
     }
 
-    if let Some(artifact) = ent.opaque_artifacts.get(file_path) {
+    if let Some(artifact) = ent.opaque_artifacts.get(&file_path) {
         return Some((
             RetrievalKey::Artifact(*artifact_id),
             crate::embed::format_opaque_text(artifact),
@@ -5955,15 +5965,8 @@ fn relation_embedding_label(kind: RelationKind, outgoing: bool) -> &'static str 
 impl EntityStore for InMemoryGraph {
     type Error = KinDbError;
 
-    // Graph-assigned artifact identity: generic `GraphStore` consumers resolve a
-    // path to its graph-owned `ArtifactId` through this override (delegates to the
-    // inherent O(1) artifact-index lookup) rather than re-deriving from the path.
-    fn artifact_id_for_path(&self, path: &FilePathId) -> Option<ArtifactId> {
-        InMemoryGraph::artifact_id_for_path(self, path)
-    }
-
-    fn ensure_artifact_id(&self, path: &FilePathId) -> Result<ArtifactId, KinDbError> {
-        Ok(InMemoryGraph::ensure_artifact_id(self, path))
+    fn artifact_id_at_path(&self, path: &RepoPath) -> Option<ArtifactId> {
+        InMemoryGraph::artifact_id_at_path(self, path)
     }
 
     // -----------------------------------------------------------------------
@@ -6465,7 +6468,7 @@ impl EntityStore for InMemoryGraph {
     }
 
     fn upsert_shallow_file(&self, shallow: &ShallowTrackedFile) -> Result<(), KinDbError> {
-        let artifact_id = self.ensure_artifact_id(&shallow.file_id);
+        let artifact_id = self.require_artifact_id(&shallow.file_id)?;
         let old = self
             .entities
             .write()
@@ -6497,7 +6500,7 @@ impl EntityStore for InMemoryGraph {
     }
 
     fn upsert_structured_artifact(&self, artifact: &StructuredArtifact) -> Result<(), KinDbError> {
-        let artifact_id = self.ensure_artifact_id(&artifact.file_id);
+        let artifact_id = self.require_artifact_id(&artifact.file_id)?;
         let old = self
             .entities
             .write()
@@ -6534,20 +6537,11 @@ impl EntityStore for InMemoryGraph {
     }
 
     fn delete_structured_artifact(&self, file_id: &FilePathId) -> Result<(), KinDbError> {
-        let artifact_id = self.artifact_id_for_path(file_id).unwrap_or_else(|| {
-            let id = ArtifactId::seed_from_file_id(file_id);
-            id
-        });
+        let artifact_id = self.require_artifact_id(file_id)?;
 
         let mut ent = self.entities.write();
         let old = ent.structured_artifacts.remove(file_id);
         self.record_structured_artifact_delta_remove(old, file_id.clone());
-        // Only remove the index if there are no other artifact types using this path
-        if !ent.shallow_files.contains_key(file_id) && !ent.opaque_artifacts.contains_key(file_id) {
-            ent.artifact_index.remove(file_id);
-            ent.artifact_reverse.remove(&artifact_id);
-            self.record_artifact_index_delta_remove(file_id.clone());
-        }
         drop(ent);
 
         let key = RetrievalKey::Artifact(artifact_id);
@@ -6561,7 +6555,7 @@ impl EntityStore for InMemoryGraph {
     }
 
     fn upsert_opaque_artifact(&self, artifact: &OpaqueArtifact) -> Result<(), KinDbError> {
-        let artifact_id = self.ensure_artifact_id(&artifact.file_id);
+        let artifact_id = self.require_artifact_id(&artifact.file_id)?;
         let old = self
             .entities
             .write()
@@ -6593,22 +6587,11 @@ impl EntityStore for InMemoryGraph {
     }
 
     fn delete_opaque_artifact(&self, file_id: &FilePathId) -> Result<(), KinDbError> {
-        let artifact_id = self.artifact_id_for_path(file_id).unwrap_or_else(|| {
-            let id = ArtifactId::seed_from_file_id(file_id);
-            id
-        });
+        let artifact_id = self.require_artifact_id(file_id)?;
 
         let mut ent = self.entities.write();
         let old = ent.opaque_artifacts.remove(file_id);
         self.record_opaque_artifact_delta_remove(old, file_id.clone());
-        // Only remove the index if there are no other artifact types using this path
-        if !ent.shallow_files.contains_key(file_id)
-            && !ent.structured_artifacts.contains_key(file_id)
-        {
-            ent.artifact_index.remove(file_id);
-            ent.artifact_reverse.remove(&artifact_id);
-            self.record_artifact_index_delta_remove(file_id.clone());
-        }
         drop(ent);
 
         let key = RetrievalKey::Artifact(artifact_id);
@@ -6622,7 +6605,7 @@ impl EntityStore for InMemoryGraph {
     }
 
     fn upsert_file_layout(&self, layout: &FileLayout) -> Result<(), KinDbError> {
-        self.ensure_artifact_id(&layout.file_id);
+        self.require_artifact_id(&layout.file_id)?;
         let old = self
             .entities
             .write()
@@ -6647,26 +6630,21 @@ impl EntityStore for InMemoryGraph {
     }
 
     fn get_tree_entry(&self, file_id: &FilePathId) -> Result<Option<TreeEntry>, KinDbError> {
-        Ok(self.entities.read().working_tree.get(&file_id.0).copied())
+        let path = repo_path_for_file_path(file_id)?;
+        Ok(self
+            .entities
+            .read()
+            .resolved_tree
+            .artifact_at_path(&path)
+            .map(|artifact| artifact.entry))
     }
 
     fn delete_file_layout(&self, file_id: &FilePathId) -> Result<(), KinDbError> {
-        let artifact_id = self.artifact_id_for_path(file_id).unwrap_or_else(|| {
-            let id = ArtifactId::seed_from_file_id(file_id);
-            id
-        });
+        self.require_artifact_id(file_id)?;
 
         let mut ent = self.entities.write();
         let old = ent.file_layouts.remove(file_id);
         self.record_file_layout_delta_remove(old, file_id.clone());
-        if !ent.shallow_files.contains_key(file_id)
-            && !ent.structured_artifacts.contains_key(file_id)
-            && !ent.opaque_artifacts.contains_key(file_id)
-        {
-            ent.artifact_index.remove(file_id);
-            ent.artifact_reverse.remove(&artifact_id);
-            self.record_artifact_index_delta_remove(file_id.clone());
-        }
         Ok(())
     }
 
@@ -6678,50 +6656,25 @@ impl EntityStore for InMemoryGraph {
         {
             let mut ent = self.entities.write();
 
-            // Validate the complete tree transition before mutating any graph
-            // domain. This keeps tree, entity, and relation changes atomic and
-            // prevents a stale caller from silently overwriting graph truth.
-            let mut staged_tree = HashMap::<String, Option<TreeEntry>>::new();
-            for tree_delta in &delta.tree_deltas {
-                let path = tree_delta.file_id().0.clone();
-                let actual = staged_tree
-                    .get(&path)
-                    .copied()
-                    .unwrap_or_else(|| ent.working_tree.get(&path).copied());
-                let (expected, next) = match tree_delta {
-                    TreeDelta::Added { new_entry, .. } => (None, Some(*new_entry)),
-                    TreeDelta::Modified {
-                        old_entry,
-                        new_entry,
-                        ..
-                    } => (Some(*old_entry), Some(*new_entry)),
-                    TreeDelta::Removed { old_entry, .. } => (Some(*old_entry), None),
-                };
-                if actual != expected {
-                    return Err(KinDbError::WorkingTreeConflict {
-                        path,
-                        reason: format!("expected {expected:?}, found {actual:?}"),
-                    });
-                }
-                staged_tree.insert(tree_delta.file_id().0.clone(), next);
-            }
+            // Validate the complete identity-bearing tree transition against
+            // one parent state before mutating any graph domain. ResolvedTree
+            // removes every old location before inserting any new location, so
+            // swaps, cycles, and remove-then-reuse are one atomic transaction.
+            let staged_tree = ent
+                .resolved_tree
+                .apply(&delta.tree_deltas)
+                .map_err(tree_state_error)?;
 
-            // 1. Process exact repository-tree deltas.
+            // 1. Publish exact repository-tree truth and its persistence delta.
             for tree_delta in &delta.tree_deltas {
-                match tree_delta {
-                    TreeDelta::Added { file_id, new_entry }
-                    | TreeDelta::Modified {
-                        file_id, new_entry, ..
-                    } => {
-                        ent.working_tree.insert(file_id.0.clone(), *new_entry);
-                        self.record_working_tree_delta_upsert(file_id.0.clone(), *new_entry);
-                    }
-                    TreeDelta::Removed { file_id, .. } => {
-                        ent.working_tree.remove(&file_id.0);
-                        self.record_working_tree_delta_remove(file_id.0.clone());
-                    }
+                let artifact_id = tree_delta.artifact_id();
+                if let Some(new) = tree_delta.new_state() {
+                    self.record_resolved_tree_delta_upsert(artifact_id, new.clone());
+                } else {
+                    self.record_resolved_tree_delta_remove(artifact_id);
                 }
             }
+            ent.resolved_tree = staged_tree;
 
             // 2. Process entity deltas.
             for ent_delta in &delta.entity_deltas {
@@ -9042,12 +8995,29 @@ mod tests {
         }
     }
 
+    fn test_repo_path(path: &str) -> RepoPath {
+        RepoPath::from_utf8(path).unwrap()
+    }
+
+    fn test_located(path: &str, entry: TreeEntry) -> LocatedEntry {
+        LocatedEntry::new(test_repo_path(path), entry)
+    }
+
+    fn admit_enrichment(
+        graph: &InMemoryGraph,
+        file_id: &FilePathId,
+        content_hash: Hash256,
+    ) -> ArtifactId {
+        graph.admit_artifact_for_test(&file_id.0, TreeEntry::blob(content_hash, false))
+    }
+
     #[test]
     fn transaction_applies_exact_non_language_tree_transitions() {
         let graph = InMemoryGraph::new();
         let file_id = FilePathId::new("compose.yaml");
-        let regular = TreeEntry::regular(Hash256::from_bytes([0x11; 32]), false);
-        let executable = TreeEntry::regular(Hash256::from_bytes([0x11; 32]), true);
+        let artifact_id = ArtifactId::new();
+        let regular = TreeEntry::blob(Hash256::from_bytes([0x11; 32]), false);
+        let executable = TreeEntry::blob(Hash256::from_bytes([0x11; 32]), true);
         let symlink = TreeEntry::symlink(Hash256::from_bytes([0x22; 32]));
 
         graph
@@ -9055,8 +9025,8 @@ mod tests {
                 entity_deltas: Vec::new(),
                 relation_deltas: Vec::new(),
                 tree_deltas: vec![TreeDelta::Added {
-                    file_id: file_id.clone(),
-                    new_entry: regular,
+                    artifact_id,
+                    new: test_located(&file_id.0, regular),
                 }],
             })
             .unwrap();
@@ -9066,10 +9036,10 @@ mod tests {
             .apply_transaction_delta(&TransactionDelta {
                 entity_deltas: Vec::new(),
                 relation_deltas: Vec::new(),
-                tree_deltas: vec![TreeDelta::Modified {
-                    file_id: file_id.clone(),
-                    old_entry: regular,
-                    new_entry: executable,
+                tree_deltas: vec![TreeDelta::Updated {
+                    artifact_id,
+                    old: test_located(&file_id.0, regular),
+                    new: test_located(&file_id.0, executable),
                 }],
             })
             .unwrap();
@@ -9079,10 +9049,10 @@ mod tests {
             .apply_transaction_delta(&TransactionDelta {
                 entity_deltas: Vec::new(),
                 relation_deltas: Vec::new(),
-                tree_deltas: vec![TreeDelta::Modified {
-                    file_id: file_id.clone(),
-                    old_entry: executable,
-                    new_entry: symlink,
+                tree_deltas: vec![TreeDelta::Updated {
+                    artifact_id,
+                    old: test_located(&file_id.0, executable),
+                    new: test_located(&file_id.0, symlink),
                 }],
             })
             .unwrap();
@@ -9093,25 +9063,27 @@ mod tests {
     fn stale_tree_transition_rejects_all_graph_mutations_atomically() {
         let graph = InMemoryGraph::new();
         let file_id = FilePathId::new("Dockerfile");
-        let current = TreeEntry::regular(Hash256::from_bytes([0x31; 32]), false);
-        let stale = TreeEntry::regular(Hash256::from_bytes([0x32; 32]), false);
-        let replacement = TreeEntry::regular(Hash256::from_bytes([0x33; 32]), true);
-        graph.set_working_tree_entry(&file_id.0, current);
+        let current = TreeEntry::blob(Hash256::from_bytes([0x31; 32]), false);
+        let stale = TreeEntry::blob(Hash256::from_bytes([0x32; 32]), false);
+        let replacement = TreeEntry::blob(Hash256::from_bytes([0x33; 32]), true);
+        let artifact_id = graph.admit_artifact_for_test(&file_id.0, current);
         let entity = test_entity("must_not_land", "src/lib.rs");
 
         let error = graph
             .apply_transaction_delta(&TransactionDelta {
                 entity_deltas: vec![EntityDelta::Added(entity.clone())],
                 relation_deltas: Vec::new(),
-                tree_deltas: vec![TreeDelta::Modified {
-                    file_id: file_id.clone(),
-                    old_entry: stale,
-                    new_entry: replacement,
+                tree_deltas: vec![TreeDelta::Updated {
+                    artifact_id,
+                    old: test_located(&file_id.0, stale),
+                    new: test_located(&file_id.0, replacement),
                 }],
             })
             .unwrap_err();
 
-        assert!(matches!(error, KinDbError::WorkingTreeConflict { .. }));
+        assert!(error
+            .to_string()
+            .contains("repository tree transition rejected"));
         assert_eq!(graph.get_tree_entry(&file_id).unwrap(), Some(current));
         assert!(graph.get_entity(&entity.id).unwrap().is_none());
     }
@@ -9768,9 +9740,12 @@ mod tests {
         let artifact_file_id = artifact.file_id.clone();
         snapshot.structured_artifacts.push(artifact);
         let artifact_id = ArtifactId::new();
-        snapshot
-            .artifact_index
-            .insert(artifact_file_id.clone(), artifact_id);
+        snapshot.resolved_tree = ResolvedTree::from_artifacts([ResolvedArtifact::new(
+            artifact_id,
+            test_repo_path(&artifact_file_id.0),
+            TreeEntry::blob(Hash256::from_bytes([9; 32]), false),
+        )])
+        .unwrap();
 
         let graph =
             InMemoryGraph::from_snapshot_with_text_index(snapshot, dir.path().join("text-index"));
@@ -9778,7 +9753,7 @@ mod tests {
         // Current snapshots carry graph-assigned artifact identity explicitly;
         // restore consumes it without deriving identity from the path.
         assert_eq!(
-            graph.artifact_id_for_path(&artifact_file_id),
+            graph.artifact_id_at_path(&test_repo_path(&artifact_file_id.0)),
             Some(artifact_id)
         );
         let artifact_key = RetrievalKey::Artifact(artifact_id);
@@ -9807,14 +9782,15 @@ mod tests {
             content_hash: Hash256::from_bytes([9; 32]),
             text_preview: Some("build install".into()),
         };
+        admit_enrichment(&graph, &artifact.file_id, artifact.content_hash);
         graph.upsert_structured_artifact(&artifact).unwrap();
         graph.flush_text_index().unwrap();
 
-        // Identity is graph-assigned by the upsert: read it back from the index.
+        // Read back the identity assigned by explicit tree admission.
         let artifact_key = RetrievalKey::Artifact(
             graph
-                .artifact_id_for_path(&artifact.file_id)
-                .expect("upserted artifact must have a graph-assigned id"),
+                .artifact_id_at_path(&test_repo_path(&artifact.file_id.0))
+                .expect("admitted artifact must have a graph-owned id"),
         );
 
         let hits = graph.text_search("build install", 10).unwrap();
@@ -9844,14 +9820,15 @@ mod tests {
             content_hash: Hash256::from_bytes([7; 32]),
             text_preview: Some("build clean".into()),
         };
+        admit_enrichment(&graph, &artifact.file_id, artifact.content_hash);
         graph.upsert_structured_artifact(&artifact).unwrap();
         graph.flush_text_index().unwrap();
 
-        // Identity is graph-assigned by the upsert: capture it before deletion.
+        // Capture the explicitly admitted identity before enrichment deletion.
         let artifact_key = RetrievalKey::Artifact(
             graph
-                .artifact_id_for_path(&artifact.file_id)
-                .expect("upserted artifact must have a graph-assigned id"),
+                .artifact_id_at_path(&test_repo_path(&artifact.file_id.0))
+                .expect("admitted artifact must have a graph-owned id"),
         );
         assert!(graph
             .text_search("build clean", 10)
@@ -11201,6 +11178,7 @@ mod tests {
             .unwrap();
 
         let file_id = FilePathId::new("docs/config.json");
+        let artifact_id = ArtifactId::new();
         let content_hash = Hash256::from_bytes([0x45; 32]);
         let add_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x46; 32]));
         graph
@@ -11213,8 +11191,8 @@ mod tests {
                 entity_deltas: vec![],
                 relation_deltas: vec![],
                 tree_deltas: vec![TreeDelta::Added {
-                    file_id: file_id.clone(),
-                    new_entry: TreeEntry::regular(content_hash, false),
+                    artifact_id,
+                    new: test_located(&file_id.0, TreeEntry::blob(content_hash, false)),
                 }],
                 projected_files: vec![file_id.clone()],
                 spec_link: None,
@@ -11226,8 +11204,8 @@ mod tests {
 
         let state = graph.resolve_graph_at(&add_id).unwrap();
         assert_eq!(
-            state.tree.get(&file_id),
-            Some(&TreeEntry::regular(content_hash, false))
+            state.tree.get(&artifact_id).map(|artifact| artifact.entry),
+            Some(TreeEntry::blob(content_hash, false))
         );
     }
 
@@ -11539,6 +11517,7 @@ mod tests {
             .unwrap();
 
         let file_id = FilePathId::new("docs/config.json");
+        let artifact_id = ArtifactId::new();
         let v1 = Hash256::from_bytes([0x67; 32]);
         let add_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x68; 32]));
         graph
@@ -11551,8 +11530,8 @@ mod tests {
                 entity_deltas: vec![],
                 relation_deltas: vec![],
                 tree_deltas: vec![TreeDelta::Added {
-                    file_id: file_id.clone(),
-                    new_entry: TreeEntry::regular(v1, false),
+                    artifact_id,
+                    new: test_located(&file_id.0, TreeEntry::blob(v1, false)),
                 }],
                 projected_files: vec![file_id.clone()],
                 spec_link: None,
@@ -11573,10 +11552,10 @@ mod tests {
                 message: "modify artifact".to_string(),
                 entity_deltas: vec![],
                 relation_deltas: vec![],
-                tree_deltas: vec![TreeDelta::Modified {
-                    file_id: file_id.clone(),
-                    old_entry: TreeEntry::regular(v1, false),
-                    new_entry: TreeEntry::regular(v2, false),
+                tree_deltas: vec![TreeDelta::Updated {
+                    artifact_id,
+                    old: test_located(&file_id.0, TreeEntry::blob(v1, false)),
+                    new: test_located(&file_id.0, TreeEntry::blob(v2, false)),
                 }],
                 projected_files: vec![file_id.clone()],
                 spec_link: None,
@@ -11597,8 +11576,8 @@ mod tests {
                 entity_deltas: vec![],
                 relation_deltas: vec![],
                 tree_deltas: vec![TreeDelta::Removed {
-                    file_id: file_id.clone(),
-                    old_entry: TreeEntry::regular(v2, false),
+                    artifact_id,
+                    old: test_located(&file_id.0, TreeEntry::blob(v2, false)),
                 }],
                 projected_files: vec![file_id.clone()],
                 spec_link: None,
@@ -11609,15 +11588,13 @@ mod tests {
             .unwrap();
 
         let revisions = graph
-            .get_artifact_revisions_at(&file_id, &remove_id)
+            .get_artifact_revisions_at(&artifact_id, &remove_id)
             .unwrap();
         assert_eq!(revisions.len(), 2);
-        assert_eq!(revisions[0].entry, TreeEntry::regular(v1, false));
-        assert_eq!(revisions[0].ended_by, Some(modify_id));
-        assert_eq!(revisions[1].entry, TreeEntry::regular(v2, false));
-        assert_eq!(revisions[1].ended_by, Some(remove_id));
+        assert_eq!(revisions[0].entry, TreeEntry::blob(v1, false));
+        assert_eq!(revisions[1].entry, TreeEntry::blob(v2, false));
         assert!(graph
-            .resolve_artifact_revision_at(&file_id, &remove_id)
+            .resolve_artifact_revision_at(&artifact_id, &remove_id)
             .unwrap()
             .is_none());
     }
@@ -11646,6 +11623,7 @@ mod tests {
             .unwrap();
 
         let file_id = FilePathId::new("docs/config.json");
+        let artifact_id = ArtifactId::new();
         let v1 = Hash256::from_bytes([0x62; 32]);
         let add_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x63; 32]));
         graph
@@ -11658,8 +11636,8 @@ mod tests {
                 entity_deltas: vec![],
                 relation_deltas: vec![],
                 tree_deltas: vec![TreeDelta::Added {
-                    file_id: file_id.clone(),
-                    new_entry: TreeEntry::regular(v1, false),
+                    artifact_id,
+                    new: test_located(&file_id.0, TreeEntry::blob(v1, false)),
                 }],
                 projected_files: vec![file_id.clone()],
                 spec_link: None,
@@ -11680,10 +11658,10 @@ mod tests {
                 message: "modify artifact".to_string(),
                 entity_deltas: vec![],
                 relation_deltas: vec![],
-                tree_deltas: vec![TreeDelta::Modified {
-                    file_id: file_id.clone(),
-                    old_entry: TreeEntry::regular(v1, false),
-                    new_entry: TreeEntry::regular(v2, false),
+                tree_deltas: vec![TreeDelta::Updated {
+                    artifact_id,
+                    old: test_located(&file_id.0, TreeEntry::blob(v1, false)),
+                    new: test_located(&file_id.0, TreeEntry::blob(v2, false)),
                 }],
                 projected_files: vec![file_id.clone()],
                 spec_link: None,
@@ -11694,12 +11672,15 @@ mod tests {
             .unwrap();
 
         let at_add = graph.resolve_tree_at(&add_id).unwrap();
-        assert_eq!(at_add.get(&file_id), Some(&TreeEntry::regular(v1, false)));
+        assert_eq!(
+            at_add.get(&artifact_id).map(|artifact| artifact.entry),
+            Some(TreeEntry::blob(v1, false))
+        );
 
         let at_modify = graph.resolve_tree_at(&modify_id).unwrap();
         assert_eq!(
-            at_modify.get(&file_id),
-            Some(&TreeEntry::regular(v2, false))
+            at_modify.get(&artifact_id).map(|artifact| artifact.entry),
+            Some(TreeEntry::blob(v2, false))
         );
     }
 
@@ -11727,6 +11708,7 @@ mod tests {
             .unwrap();
 
         let file_id = FilePathId::new("docs/config.json");
+        let artifact_id = ArtifactId::new();
         let v1 = Hash256::from_bytes([0x67; 32]);
         let add_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x68; 32]));
         graph
@@ -11739,8 +11721,8 @@ mod tests {
                 entity_deltas: vec![],
                 relation_deltas: vec![],
                 tree_deltas: vec![TreeDelta::Added {
-                    file_id: file_id.clone(),
-                    new_entry: TreeEntry::regular(v1, false),
+                    artifact_id,
+                    new: test_located(&file_id.0, TreeEntry::blob(v1, false)),
                 }],
                 projected_files: vec![file_id.clone()],
                 spec_link: None,
@@ -11761,10 +11743,10 @@ mod tests {
                 message: "modify artifact".to_string(),
                 entity_deltas: vec![],
                 relation_deltas: vec![],
-                tree_deltas: vec![TreeDelta::Modified {
-                    file_id: file_id.clone(),
-                    old_entry: TreeEntry::regular(v1, false),
-                    new_entry: TreeEntry::regular(v2, false),
+                tree_deltas: vec![TreeDelta::Updated {
+                    artifact_id,
+                    old: test_located(&file_id.0, TreeEntry::blob(v1, false)),
+                    new: test_located(&file_id.0, TreeEntry::blob(v2, false)),
                 }],
                 projected_files: vec![file_id.clone()],
                 spec_link: None,
@@ -11775,17 +11757,15 @@ mod tests {
             .unwrap();
 
         let revisions = graph
-            .get_artifact_revisions_at(&file_id, &modify_id)
+            .get_artifact_revisions_at(&artifact_id, &modify_id)
             .unwrap();
         assert_eq!(revisions.len(), 2);
-        assert_eq!(revisions[0].entry, TreeEntry::regular(v1, false));
-        assert_eq!(revisions[0].ended_by, Some(modify_id));
-        assert_eq!(revisions[1].entry, TreeEntry::regular(v2, false));
+        assert_eq!(revisions[0].entry, TreeEntry::blob(v1, false));
+        assert_eq!(revisions[1].entry, TreeEntry::blob(v2, false));
         assert_eq!(
-            revisions[1].previous_revision,
-            Some(revisions[0].revision_id)
+            revisions[1].predecessor_revisions,
+            vec![revisions[0].revision_id]
         );
-        assert_eq!(revisions[1].ended_by, None);
     }
 
     #[test]
@@ -12071,6 +12051,7 @@ mod tests {
             import_paths: vec!["zstd.h".into()],
         };
 
+        admit_enrichment(&graph, &sf.file_id, sf.syntax_hash);
         graph.upsert_shallow_file(&sf).unwrap();
         let files = graph.list_shallow_files().unwrap();
         assert_eq!(files.len(), 1);
@@ -12110,6 +12091,8 @@ mod tests {
             text_preview: Some("<svg".into()),
         };
 
+        admit_enrichment(&graph, &structured.file_id, structured.content_hash);
+        admit_enrichment(&graph, &opaque.file_id, opaque.content_hash);
         graph.upsert_structured_artifact(&structured).unwrap();
         graph.upsert_opaque_artifact(&opaque).unwrap();
 
@@ -12170,14 +12153,22 @@ mod tests {
             text_preview: Some("<svg".into()),
         };
 
+        admit_enrichment(&graph, &shallow.file_id, shallow.syntax_hash);
+        admit_enrichment(&graph, &structured.file_id, structured.content_hash);
+        admit_enrichment(&graph, &opaque.file_id, opaque.content_hash);
         graph.upsert_shallow_file(&shallow).unwrap();
         graph.upsert_structured_artifact(&structured).unwrap();
         graph.upsert_opaque_artifact(&opaque).unwrap();
 
-        // Identity is graph-assigned by the upserts above: read it back.
-        let shallow_id = graph.artifact_id_for_path(&shallow.file_id).unwrap();
-        let structured_id = graph.artifact_id_for_path(&structured.file_id).unwrap();
-        let opaque_id = graph.artifact_id_for_path(&opaque.file_id).unwrap();
+        let shallow_id = graph
+            .artifact_id_at_path(&test_repo_path(&shallow.file_id.0))
+            .unwrap();
+        let structured_id = graph
+            .artifact_id_at_path(&test_repo_path(&structured.file_id.0))
+            .unwrap();
+        let opaque_id = graph
+            .artifact_id_at_path(&test_repo_path(&opaque.file_id.0))
+            .unwrap();
 
         {
             let queue = graph.artifact_embedding_queue.lock();
@@ -12211,32 +12202,42 @@ mod tests {
             regions: vec![SourceRegion::Trivia { byte_range: 0..12 }],
         };
 
+        admit_enrichment(&graph, &file_id, Hash256::from_bytes([0x15; 32]));
         graph.upsert_file_layout(&layout).unwrap();
         let fetched = graph.get_file_layout(&file_id).unwrap().unwrap();
         assert_eq!(fetched.parse_completeness, layout.parse_completeness);
         assert_eq!(graph.list_file_layouts().unwrap().len(), 1);
-        assert!(
-            graph.artifact_id_for_path(&file_id).is_some(),
-            "source file layouts must register graph artifact IDs for artifact relations"
-        );
+        assert!(graph
+            .artifact_id_at_path(&test_repo_path(&file_id.0))
+            .is_some());
 
         graph.delete_file_layout(&file_id).unwrap();
         assert!(graph.get_file_layout(&file_id).unwrap().is_none());
         assert!(
-            graph.artifact_id_for_path(&file_id).is_none(),
-            "deleting the last file-surface owner should remove the artifact index entry"
+            graph
+                .artifact_id_at_path(&test_repo_path(&file_id.0))
+                .is_some(),
+            "deleting enrichment must not erase repository identity"
         );
     }
 
     #[test]
-    fn first_artifact_identity_is_graph_assigned_not_path_derived() {
+    fn artifact_identity_only_enters_through_tree_admission() {
         let path = FilePathId::new("src/lib.rs");
         let graph = InMemoryGraph::new();
+        assert!(graph
+            .artifact_id_at_path(&test_repo_path(&path.0))
+            .is_none());
 
-        let assigned = graph.ensure_artifact_id(&path);
+        let assigned = graph.admit_artifact_for_test(
+            &path.0,
+            TreeEntry::blob(Hash256::from_bytes([0; 32]), false),
+        );
 
-        assert_ne!(assigned, ArtifactId::seed_from_path(&path.0));
-        assert_eq!(graph.ensure_artifact_id(&path), assigned);
+        assert_eq!(
+            graph.artifact_id_at_path(&test_repo_path(&path.0)),
+            Some(assigned)
+        );
     }
 
     #[test]
@@ -12245,21 +12246,33 @@ mod tests {
         let renamed_path = FilePathId::new("src/current.rs");
         let left = InMemoryGraph::new();
         let right = InMemoryGraph::new();
+        let entry = TreeEntry::blob(Hash256::from_bytes([1; 32]), false);
 
-        let left_id = left.ensure_artifact_id(&original_path);
-        let right_id = right.ensure_artifact_id(&original_path);
+        let left_id = left.admit_artifact_for_test(&original_path.0, entry);
+        let right_id = right.admit_artifact_for_test(&original_path.0, entry);
         assert_ne!(left_id, right_id);
 
+        for (graph, artifact_id) in [(&left, left_id), (&right, right_id)] {
+            graph
+                .apply_transaction_delta(&TransactionDelta {
+                    entity_deltas: Vec::new(),
+                    relation_deltas: Vec::new(),
+                    tree_deltas: vec![TreeDelta::Updated {
+                        artifact_id,
+                        old: test_located(&original_path.0, entry),
+                        new: test_located(&renamed_path.0, entry),
+                    }],
+                })
+                .unwrap();
+        }
         assert_eq!(
-            left.rename_artifact(&original_path, &renamed_path),
+            left.artifact_id_at_path(&test_repo_path(&renamed_path.0)),
             Some(left_id)
         );
         assert_eq!(
-            right.rename_artifact(&original_path, &renamed_path),
+            right.artifact_id_at_path(&test_repo_path(&renamed_path.0)),
             Some(right_id)
         );
-        assert_eq!(left.artifact_id_for_path(&renamed_path), Some(left_id));
-        assert_eq!(right.artifact_id_for_path(&renamed_path), Some(right_id));
     }
 
     #[test]
@@ -12925,16 +12938,21 @@ mod tests {
             mime_type: Some("image/svg+xml".into()),
             text_preview: Some("<svg".into()),
         };
+        admit_enrichment(&graph, &structured.file_id, structured.content_hash);
+        admit_enrichment(&graph, &opaque.file_id, opaque.content_hash);
         graph.upsert_structured_artifact(&structured).unwrap();
         graph.upsert_opaque_artifact(&opaque).unwrap();
 
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("vectors.usearch");
         let index = crate::VectorIndex::new(2).unwrap();
-        // Identity is graph-assigned by the upsert above: read it back so the
-        // pre-seeded vector index entry matches what the graph will look for.
-        let structured_key =
-            RetrievalKey::Artifact(graph.artifact_id_for_path(&structured.file_id).unwrap());
+        // Use the explicitly admitted identity so the pre-seeded vector entry
+        // matches the graph-owned repository tree.
+        let structured_key = RetrievalKey::Artifact(
+            graph
+                .artifact_id_at_path(&test_repo_path(&structured.file_id.0))
+                .unwrap(),
+        );
         index
             .upsert_retrievable(structured_key, &[1.0, 0.0])
             .unwrap();
@@ -12944,7 +12962,9 @@ mod tests {
         graph.artifact_embedding_queue.lock().clear();
         graph.queue_missing_artifacts_for_embedding();
 
-        let opaque_id = graph.artifact_id_for_path(&opaque.file_id).unwrap();
+        let opaque_id = graph
+            .artifact_id_at_path(&test_repo_path(&opaque.file_id.0))
+            .unwrap();
         let queue = graph.artifact_embedding_queue.lock();
         assert_eq!(queue.len(), 1);
         assert!(queue.contains(&opaque_id));
@@ -13183,6 +13203,7 @@ mod tests {
             content_hash: Hash256::from_bytes([0x45; 32]),
             text_preview: Some("build".into()),
         };
+        admit_enrichment(&graph, &artifact.file_id, artifact.content_hash);
         graph.upsert_structured_artifact(&artifact).unwrap();
 
         let dir = tempfile::TempDir::new().unwrap();
@@ -13216,7 +13237,10 @@ mod tests {
         // Source files can have graph-native artifact identities for relations
         // and projection, but only shallow/structured/opaque artifact records
         // have document text that the artifact embedder can vectorize.
-        graph.ensure_artifact_id(&FilePathId::new("src/lib.rs"));
+        graph.admit_artifact_for_test(
+            "src/lib.rs",
+            TreeEntry::blob(Hash256::from_bytes([0x46; 32]), false),
+        );
 
         let status = graph.embedding_status();
         assert_eq!(status.total, 1);
@@ -13281,6 +13305,7 @@ mod tests {
             declaration_names: vec!["README".into()],
             import_paths: vec![],
         };
+        admit_enrichment(&graph, &shallow.file_id, shallow.syntax_hash);
         graph.upsert_shallow_file(&shallow).unwrap();
 
         let layout = FileLayout {
@@ -13292,6 +13317,7 @@ mod tests {
             },
             regions: vec![SourceRegion::Trivia { byte_range: 0..8 }],
         };
+        admit_enrichment(&graph, &layout.file_id, Hash256::from_bytes([1; 32]));
         graph.upsert_file_layout(&layout).unwrap();
 
         let structured = StructuredArtifact {
@@ -13300,6 +13326,7 @@ mod tests {
             content_hash: Hash256::from_bytes([2; 32]),
             text_preview: Some("build test".into()),
         };
+        admit_enrichment(&graph, &structured.file_id, structured.content_hash);
         graph.upsert_structured_artifact(&structured).unwrap();
 
         let opaque = OpaqueArtifact {
@@ -13308,10 +13335,10 @@ mod tests {
             mime_type: Some("image/svg+xml".into()),
             text_preview: Some("<svg".into()),
         };
+        admit_enrichment(&graph, &opaque.file_id, opaque.content_hash);
         graph.upsert_opaque_artifact(&opaque).unwrap();
 
-        // Publish one exact working-tree entry.
-        graph.set_working_tree_entry("src/a.rs", crate::types::regular_tree_entry(1));
+        // The source path was already admitted before its layout enrichment.
         graph.flush_text_index().unwrap();
 
         #[cfg(feature = "vector")]
@@ -13336,7 +13363,7 @@ mod tests {
         assert_eq!(stats.shallow_file_count, 1);
         assert_eq!(stats.structured_artifact_count, 1);
         assert_eq!(stats.opaque_artifact_count, 1);
-        assert_eq!(stats.working_tree_entry_count, 1);
+        assert_eq!(stats.working_tree_entry_count, 4);
         assert_eq!(stats.text_indexed_entity_count, 3);
         assert!((stats.text_index_coverage_percent - 100.0).abs() < f64::EPSILON);
         #[cfg(feature = "vector")]

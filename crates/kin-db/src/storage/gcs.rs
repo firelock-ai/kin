@@ -1055,8 +1055,7 @@ mod tests {
         let repo_id = "restart-repo";
 
         let mut base = GraphSnapshot::empty();
-        base.working_tree
-            .insert("base.rs".to_string(), crate::types::regular_tree_entry(1));
+        base.admit_artifact_for_test("base.rs".to_string(), crate::types::regular_tree_entry(1));
         let gen1 = backend
             .save_snapshot(repo_id, &base.to_bytes().unwrap(), GENERATION_INIT)
             .unwrap();
@@ -1064,7 +1063,7 @@ mod tests {
         assert_eq!(stale_gen, gen1);
 
         let mut current = base.clone();
-        current.working_tree.insert(
+        current.admit_artifact_for_test(
             "current.rs".to_string(),
             crate::types::regular_tree_entry(2),
         );
@@ -1081,10 +1080,10 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(recovered.generation, gen2);
-        assert_eq!(recovered.snapshot.working_tree, current.working_tree);
+        assert_eq!(recovered.snapshot.resolved_tree, current.resolved_tree);
 
         let mut after_reopen = recovered.snapshot;
-        after_reopen.working_tree.insert(
+        after_reopen.admit_artifact_for_test(
             "after-reopen.rs".to_string(),
             crate::types::regular_tree_entry(3),
         );
@@ -1098,8 +1097,8 @@ mod tests {
                 .unwrap();
         assert_eq!(final_recovery.generation, gen3);
         assert_eq!(
-            final_recovery.snapshot.working_tree,
-            after_reopen.working_tree
+            final_recovery.snapshot.resolved_tree,
+            after_reopen.resolved_tree
         );
     }
 
@@ -1200,8 +1199,7 @@ mod tests {
         let repo = "cas-test-repo";
 
         let mut base = GraphSnapshot::empty();
-        base.working_tree
-            .insert("base.rs".to_string(), crate::types::regular_tree_entry(1));
+        base.admit_artifact_for_test("base.rs".to_string(), crate::types::regular_tree_entry(1));
         let bytes = base.to_bytes().unwrap();
         let gen1 = backend
             .save_snapshot(repo, &bytes, GENERATION_INIT)
@@ -1210,7 +1208,7 @@ mod tests {
         assert_eq!(stale_gen, gen1);
 
         let mut current = base.clone();
-        current.working_tree.insert(
+        current.admit_artifact_for_test(
             "current.rs".to_string(),
             crate::types::regular_tree_entry(2),
         );
@@ -1226,7 +1224,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(recovered.generation, gen2);
-        assert_eq!(recovered.snapshot.working_tree, current.working_tree);
+        assert_eq!(recovered.snapshot.resolved_tree, current.resolved_tree);
 
         eprintln!(
             "gens: create={gen1} update={gen2} recovered={}",

@@ -61,6 +61,7 @@ impl CompactionStats {
 /// This is the on-disk format. We use std::collections::HashMap here
 /// (not hashbrown) for stable serde compatibility.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GraphSnapshot {
     pub version: u32,
     pub entities: HashMap<EntityId, Entity>,
@@ -91,14 +92,13 @@ pub struct GraphSnapshot {
     pub file_layouts: Vec<FileLayout>,
     pub structured_artifacts: Vec<StructuredArtifact>,
     pub opaque_artifacts: Vec<OpaqueArtifact>,
-    /// Exact graph-owned working tree. Every tracked path has a blob identity
-    /// and materialization kind; parser support is not part of admission.
-    pub working_tree: HashMap<String, TreeEntry>,
+    /// Exact graph-owned repository tree. Artifact identity, byte-exact path,
+    /// content identity, and materialization kind are one validated authority.
+    pub resolved_tree: ResolvedTree,
     pub sessions: HashMap<SessionId, AgentSession>,
     pub intents: HashMap<IntentId, Intent>,
     pub downstream_warnings: Vec<(IntentId, EntityId, String)>,
     pub entity_revisions: HashMap<EntityId, Vec<EntityRevision>>,
-    pub artifact_index: HashMap<FilePathId, ArtifactId>,
 }
 
 /// Lightweight snapshot view for locate-only cold starts.
@@ -122,7 +122,7 @@ pub(crate) struct LocateGraphSnapshot {
     pub file_layouts: Vec<FileLayout>,
     pub structured_artifacts: Vec<StructuredArtifact>,
     pub opaque_artifacts: Vec<OpaqueArtifact>,
-    pub artifact_index: FastHashMap<FilePathId, ArtifactId>,
+    pub resolved_tree: ResolvedTree,
 }
 
 fn relation_kind_used_by_locate(kind: RelationKind) -> bool {
@@ -249,7 +249,7 @@ impl<'de> Deserialize<'de> for FilteredLocateRelationMap {
 
 impl GraphSnapshot {
     /// Current format version.
-    pub const CURRENT_VERSION: u32 = 9;
+    pub const CURRENT_VERSION: u32 = 10;
 
     /// The only on-disk format version this pre-release binary accepts.
     pub const MIN_SUPPORTED_VERSION: u32 = Self::CURRENT_VERSION;
@@ -296,13 +296,41 @@ impl GraphSnapshot {
             file_layouts: Vec::new(),
             structured_artifacts: Vec::new(),
             opaque_artifacts: Vec::new(),
-            working_tree: HashMap::new(),
+            resolved_tree: ResolvedTree::default(),
             sessions: HashMap::new(),
             intents: HashMap::new(),
             downstream_warnings: Vec::new(),
             entity_revisions: HashMap::new(),
-            artifact_index: HashMap::new(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn admit_artifact_for_test(&mut self, path: String, entry: TreeEntry) -> ArtifactId {
+        let path = RepoPath::from_utf8(&path).expect("valid test repository path");
+        let existing = self.resolved_tree.artifact_at_path(&path).cloned();
+        let artifact_id = existing
+            .as_ref()
+            .map(|artifact| artifact.artifact_id)
+            .unwrap_or_else(ArtifactId::new);
+        let mut artifacts: Vec<_> = self.resolved_tree.clone().into_artifacts().collect();
+        artifacts.retain(|artifact| artifact.artifact_id != artifact_id);
+        artifacts.push(ResolvedArtifact::new(artifact_id, path, entry));
+        self.resolved_tree =
+            ResolvedTree::from_artifacts(artifacts).expect("valid test repository tree");
+        artifact_id
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tree_entry_for_test(&self, path: &str) -> Option<TreeEntry> {
+        let path = RepoPath::from_utf8(path).ok()?;
+        self.resolved_tree
+            .artifact_at_path(&path)
+            .map(|artifact| artifact.entry)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_artifact_path_for_test(&self, path: &str) -> bool {
+        self.tree_entry_for_test(path).is_some()
     }
 
     /// Compact the snapshot by removing orphaned data.
@@ -332,7 +360,11 @@ impl GraphSnapshot {
 
         // 1. Remove orphaned relations (missing node on either endpoint)
         let before = self.relations.len();
-        let artifact_ids: HashSet<ArtifactId> = self.artifact_index.values().copied().collect();
+        let artifact_ids: HashSet<ArtifactId> = self
+            .resolved_tree
+            .artifacts()
+            .map(|artifact| artifact.artifact_id)
+            .collect();
         self.relations.retain(|_, rel| {
             graph_node_exists(
                 rel.src,
@@ -437,7 +469,7 @@ impl GraphSnapshot {
                 Self::CURRENT_VERSION
             )));
         }
-        self.validate_artifact_index()?;
+        self.validate_enrichment_admission()?;
         let body = rmp_serde::to_vec(self).map_err(|e| {
             crate::error::KinDbError::StorageError(format!("serialization failed: {e}"))
         })?;
@@ -464,9 +496,9 @@ impl GraphSnapshot {
 
     /// Deserialize a snapshot from bytes (with header validation).
     ///
-    /// The pre-release v9 format is the first format with an exact universal
-    /// repository tree. Earlier hash-only snapshots cannot be upgraded without
-    /// inventing file modes, so they fail closed and must be rebuilt.
+    /// The pre-release v10 format is the first format with one validated,
+    /// identity-bearing universal repository tree. Earlier split tree/index
+    /// snapshots fail closed and must be rebuilt.
     pub fn from_bytes(data: &[u8]) -> Result<Self, crate::error::KinDbError> {
         Self::from_bytes_with_persisted_root_hash(data).map(|(snapshot, _)| snapshot)
     }
@@ -495,8 +527,7 @@ impl GraphSnapshot {
             Self::CURRENT_VERSION => Self::decode_current_snapshot(frame.body)?,
             _ => unreachable!("decode_frame validates supported versions"),
         };
-        snapshot.validate_artifact_index()?;
-
+        snapshot.validate_enrichment_admission()?;
         let persisted_root_hash = if verify_checksum {
             Self::decode_root_hash_trailer(data, &frame)?
         } else {
@@ -551,9 +582,9 @@ impl GraphSnapshot {
 
         match version {
             Self::CURRENT_VERSION => {
-                let checksum_end = Self::require_checksum_slot(data, body_len, "v9")?;
+                let checksum_end = Self::require_checksum_slot(data, body_len, "v10")?;
                 let body_checksum = if verify_checksum {
-                    Some(Self::verify_checksum(data, body_len, "v9")?)
+                    Some(Self::verify_checksum(data, body_len, "v10")?)
                 } else {
                     None
                 };
@@ -586,13 +617,33 @@ impl GraphSnapshot {
         })
     }
 
-    fn validate_artifact_index(&self) -> Result<(), crate::error::KinDbError> {
-        let mut reverse = HashMap::<ArtifactId, &FilePathId>::new();
-        for (path, artifact_id) in &self.artifact_index {
-            if let Some(existing_path) = reverse.insert(*artifact_id, path) {
+    pub(crate) fn validate_enrichment_admission(&self) -> Result<(), crate::error::KinDbError> {
+        let file_ids = self
+            .shallow_files
+            .iter()
+            .map(|file| &file.file_id)
+            .chain(self.file_layouts.iter().map(|layout| &layout.file_id))
+            .chain(
+                self.structured_artifacts
+                    .iter()
+                    .map(|artifact| &artifact.file_id),
+            )
+            .chain(
+                self.opaque_artifacts
+                    .iter()
+                    .map(|artifact| &artifact.file_id),
+            );
+        for file_id in file_ids {
+            let path = RepoPath::from_utf8(&file_id.0).map_err(|error| {
+                crate::error::KinDbError::StorageError(format!(
+                    "semantic enrichment has invalid repository path {}: {error}",
+                    file_id.0
+                ))
+            })?;
+            if self.resolved_tree.artifact_id_at_path(&path).is_none() {
                 return Err(crate::error::KinDbError::StorageError(format!(
-                    "artifact identity {artifact_id:?} is assigned to both {} and {}",
-                    existing_path.0, path.0
+                    "semantic enrichment exists without admitted repository identity at {}",
+                    file_id.0
                 )));
             }
         }
@@ -749,18 +800,7 @@ impl LocateGraphSnapshot {
             GraphSnapshot::CURRENT_VERSION => Self::decode_current_snapshot(frame.body)?,
             _ => unreachable!("decode_frame validates supported versions"),
         };
-        {
-            let mut reverse = HashMap::<ArtifactId, &FilePathId>::new();
-            for (path, artifact_id) in &snapshot.artifact_index {
-                if let Some(existing_path) = reverse.insert(*artifact_id, path) {
-                    return Err(crate::error::KinDbError::StorageError(format!(
-                        "artifact identity {artifact_id:?} is assigned to both {} and {}",
-                        existing_path.0, path.0
-                    )));
-                }
-            }
-        }
-
+        snapshot.validate_enrichment_admission()?;
         let persisted_root_hash = if verify_checksum {
             GraphSnapshot::decode_root_hash_trailer(data, &frame)?
         } else {
@@ -774,6 +814,39 @@ impl LocateGraphSnapshot {
         rmp_serde::from_slice(body).map_err(|e| {
             crate::error::KinDbError::StorageError(format!("deserialization failed: {e}"))
         })
+    }
+
+    fn validate_enrichment_admission(&self) -> Result<(), crate::error::KinDbError> {
+        let file_ids = self
+            .shallow_files
+            .iter()
+            .map(|file| &file.file_id)
+            .chain(self.file_layouts.iter().map(|layout| &layout.file_id))
+            .chain(
+                self.structured_artifacts
+                    .iter()
+                    .map(|artifact| &artifact.file_id),
+            )
+            .chain(
+                self.opaque_artifacts
+                    .iter()
+                    .map(|artifact| &artifact.file_id),
+            );
+        for file_id in file_ids {
+            let path = RepoPath::from_utf8(&file_id.0).map_err(|error| {
+                crate::error::KinDbError::StorageError(format!(
+                    "semantic enrichment has invalid repository path {}: {error}",
+                    file_id.0
+                ))
+            })?;
+            if self.resolved_tree.artifact_id_at_path(&path).is_none() {
+                return Err(crate::error::KinDbError::StorageError(format!(
+                    "semantic enrichment exists without admitted repository identity at {}",
+                    file_id.0
+                )));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -797,7 +870,7 @@ impl From<GraphSnapshot> for LocateGraphSnapshot {
             file_layouts: value.file_layouts,
             structured_artifacts: value.structured_artifacts,
             opaque_artifacts: value.opaque_artifacts,
-            artifact_index: value.artifact_index.into_iter().collect(),
+            resolved_tree: value.resolved_tree,
         }
     }
 }
@@ -813,7 +886,7 @@ impl From<LocateGraphSnapshot> for GraphSnapshot {
         snapshot.file_layouts = value.file_layouts;
         snapshot.structured_artifacts = value.structured_artifacts;
         snapshot.opaque_artifacts = value.opaque_artifacts;
-        snapshot.artifact_index = value.artifact_index.into_iter().collect();
+        snapshot.resolved_tree = value.resolved_tree;
         snapshot
     }
 }
@@ -877,14 +950,15 @@ impl<'de> Deserialize<'de> for LocateGraphSnapshot {
                     .next_element()?
                     .ok_or_else(|| serde::de::Error::invalid_length(28, &self))?;
 
-                for index in 29..34 {
+                let resolved_tree = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(29, &self))?;
+
+                for index in 30..34 {
                     let _: IgnoredAny = seq
                         .next_element()?
                         .ok_or_else(|| serde::de::Error::invalid_length(index, &self))?;
                 }
-                let artifact_index = seq
-                    .next_element()?
-                    .ok_or_else(|| serde::de::Error::invalid_length(34, &self))?;
 
                 Ok(LocateGraphSnapshot {
                     version,
@@ -895,7 +969,7 @@ impl<'de> Deserialize<'de> for LocateGraphSnapshot {
                     file_layouts,
                     structured_artifacts,
                     opaque_artifacts,
-                    artifact_index,
+                    resolved_tree,
                 })
             }
         }
@@ -920,7 +994,7 @@ struct SnapshotFrame<'a> {
 /// (hashbrown maps + vecs), we avoid the ~18 GB clone that `to_snapshot()`
 /// materialises for large graphs.
 ///
-/// The `Serialize` impl manually writes 35 fields in the same positional
+/// The `Serialize` impl manually writes 34 fields in the same positional
 /// order as the derive(Serialize) on `GraphSnapshot`, so the resulting
 /// msgpack is byte-for-byte compatible with the owned version.
 pub struct BorrowedGraphSnapshot<'a> {
@@ -929,12 +1003,11 @@ pub struct BorrowedGraphSnapshot<'a> {
     pub relations: &'a hashbrown::HashMap<RelationId, Relation>,
     pub outgoing: &'a hashbrown::HashMap<EntityId, Vec<RelationId>>,
     pub incoming: &'a hashbrown::HashMap<EntityId, Vec<RelationId>>,
-    pub working_tree: &'a hashbrown::HashMap<String, TreeEntry>,
+    pub resolved_tree: &'a ResolvedTree,
     pub shallow_files: &'a hashbrown::HashMap<FilePathId, ShallowTrackedFile>,
     pub file_layouts: &'a hashbrown::HashMap<FilePathId, FileLayout>,
     pub structured_artifacts: &'a hashbrown::HashMap<FilePathId, StructuredArtifact>,
     pub opaque_artifacts: &'a hashbrown::HashMap<FilePathId, OpaqueArtifact>,
-    pub artifact_index: &'a hashbrown::HashMap<FilePathId, ArtifactId>,
     // ChangeData fields
     pub changes: &'a hashbrown::HashMap<SemanticChangeId, SemanticChange>,
     pub change_children: &'a hashbrown::HashMap<SemanticChangeId, Vec<SemanticChangeId>>,
@@ -970,10 +1043,10 @@ pub struct BorrowedGraphSnapshot<'a> {
 impl<'a> Serialize for BorrowedGraphSnapshot<'a> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        // Must produce exactly 35 fields in the same order as GraphSnapshot's
+        // Must produce exactly 34 fields in the same order as GraphSnapshot's
         // derive(Serialize).  rmp_serde serializes structs as arrays, so
         // position (not name) determines the mapping.
-        let mut state = serializer.serialize_struct("GraphSnapshot", 35)?;
+        let mut state = serializer.serialize_struct("GraphSnapshot", 34)?;
 
         // 1. version
         state.serialize_field("version", &GraphSnapshot::CURRENT_VERSION)?;
@@ -1042,8 +1115,8 @@ impl<'a> Serialize for BorrowedGraphSnapshot<'a> {
             "opaque_artifacts",
             &HashMapValuesAsSeq(self.opaque_artifacts),
         )?;
-        // 30. working_tree
-        state.serialize_field("working_tree", self.working_tree)?;
+        // 30. resolved_tree
+        state.serialize_field("resolved_tree", self.resolved_tree)?;
         // 31. sessions
         state.serialize_field("sessions", self.sessions)?;
         // 32. intents
@@ -1052,9 +1125,6 @@ impl<'a> Serialize for BorrowedGraphSnapshot<'a> {
         state.serialize_field("downstream_warnings", self.downstream_warnings)?;
         // 34. entity_revisions
         state.serialize_field("entity_revisions", self.entity_revisions)?;
-        // 35. artifact_index
-        state.serialize_field("artifact_index", self.artifact_index)?;
-
         state.end()
     }
 }
@@ -1234,9 +1304,12 @@ mod tests {
             declaration_names: vec!["caller".into(), "callee".into()],
             import_paths: Vec::new(),
         });
-        snapshot
-            .artifact_index
-            .insert(file_id.clone(), assigned_artifact_id);
+        snapshot.resolved_tree = ResolvedTree::from_artifacts([ResolvedArtifact::new(
+            assigned_artifact_id,
+            RepoPath::from_utf8(&file_id.0).unwrap(),
+            TreeEntry::blob(Hash256::from_bytes([1; 32]), false),
+        )])
+        .unwrap();
 
         let persisted_root_hash = [7; 32];
         let bytes = snapshot
@@ -1251,8 +1324,10 @@ mod tests {
         assert_eq!(locate_snapshot.changes.len(), 1);
         assert_eq!(locate_snapshot.shallow_files.len(), 1);
         assert_eq!(
-            locate_snapshot.artifact_index.get(&file_id),
-            Some(&assigned_artifact_id)
+            locate_snapshot
+                .resolved_tree
+                .artifact_id_at_path(&RepoPath::from_utf8(&file_id.0).unwrap()),
+            Some(assigned_artifact_id)
         );
 
         let decoded: GraphSnapshot = locate_snapshot.into();
@@ -1260,8 +1335,10 @@ mod tests {
         assert_eq!(decoded.relations.len(), 1);
         assert_eq!(decoded.changes.len(), 1);
         assert_eq!(
-            decoded.artifact_index.get(&file_id),
-            Some(&assigned_artifact_id)
+            decoded
+                .resolved_tree
+                .artifact_id_at_path(&RepoPath::from_utf8(&file_id.0).unwrap()),
+            Some(assigned_artifact_id)
         );
         assert!(decoded.outgoing.is_empty());
         assert!(decoded.incoming.is_empty());
@@ -1280,18 +1357,44 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_rejects_duplicate_artifact_identity_assignments() {
-        let mut snapshot = GraphSnapshot::empty();
+    fn snapshot_deserialization_rejects_duplicate_artifact_identity_assignments() {
+        let snapshot = GraphSnapshot::empty();
         let artifact_id = ArtifactId::new();
-        snapshot
-            .artifact_index
-            .insert(FilePathId::new("compose.yaml"), artifact_id);
-        snapshot
-            .artifact_index
-            .insert(FilePathId::new("Cargo.lock"), artifact_id);
+        let mut encoded = serde_json::to_value(snapshot).unwrap();
+        encoded["resolved_tree"] = serde_json::json!({
+            "artifacts": [
+                ResolvedArtifact::new(
+                    artifact_id,
+                    RepoPath::from_utf8("compose.yaml").unwrap(),
+                    TreeEntry::blob(Hash256::from_bytes([1; 32]), false),
+                ),
+                ResolvedArtifact::new(
+                    artifact_id,
+                    RepoPath::from_utf8("Cargo.lock").unwrap(),
+                    TreeEntry::blob(Hash256::from_bytes([2; 32]), false),
+                ),
+            ]
+        });
+
+        let error = serde_json::from_value::<GraphSnapshot>(encoded).unwrap_err();
+        assert!(error.to_string().contains("more than once"));
+    }
+
+    #[test]
+    fn snapshot_rejects_semantic_enrichment_without_tree_admission() {
+        let mut snapshot = GraphSnapshot::empty();
+        snapshot.structured_artifacts.push(StructuredArtifact {
+            file_id: FilePathId::new("compose.yaml"),
+            kind: ArtifactKind::ComposeFile,
+            content_hash: Hash256::from_bytes([7; 32]),
+            text_preview: Some("services:".into()),
+        });
 
         let error = snapshot.to_bytes().unwrap_err();
-        assert!(error.to_string().contains("assigned to both"));
+
+        assert!(error
+            .to_string()
+            .contains("without admitted repository identity"));
     }
 
     #[test]
@@ -1356,9 +1459,19 @@ mod tests {
                 parse_completeness: ParseCompleteness::Full,
             });
         }
-        snap.artifact_index
-            .insert(generated_path.clone(), generated_id);
-        snap.artifact_index.insert(source_path.clone(), source_id);
+        snap.resolved_tree = ResolvedTree::from_artifacts([
+            ResolvedArtifact::new(
+                generated_id,
+                RepoPath::from_utf8(&generated_path.0).unwrap(),
+                TreeEntry::blob(Hash256::from_bytes([1; 32]), false),
+            ),
+            ResolvedArtifact::new(
+                source_id,
+                RepoPath::from_utf8(&source_path.0).unwrap(),
+                TreeEntry::blob(Hash256::from_bytes([2; 32]), false),
+            ),
+        ])
+        .unwrap();
 
         let relation = Relation {
             id: RelationId::new(),
@@ -1527,7 +1640,7 @@ mod tests {
 
         snap.version = 1;
         let error = snap.to_bytes().unwrap_err();
-        assert!(error.to_string().contains("exactly v9"));
+        assert!(error.to_string().contains("exactly v10"));
     }
 
     #[test]
@@ -1543,26 +1656,50 @@ mod tests {
     #[test]
     fn roundtrip_preserves_executable_symlink_and_unsupported_paths() {
         let mut snapshot = GraphSnapshot::empty();
-        let executable = TreeEntry::regular(Hash256::from_bytes([0x41; 32]), true);
+        let executable = TreeEntry::blob(Hash256::from_bytes([0x41; 32]), true);
         let symlink = TreeEntry::symlink(Hash256::from_bytes([0x42; 32]));
-        let opaque = TreeEntry::regular(Hash256::from_bytes([0x43; 32]), false);
-        snapshot
-            .working_tree
-            .insert("scripts/deploy".to_string(), executable);
-        snapshot
-            .working_tree
-            .insert("current-config".to_string(), symlink);
-        snapshot
-            .working_tree
-            .insert("assets/model.unsupported".to_string(), opaque);
+        let opaque = TreeEntry::blob(Hash256::from_bytes([0x43; 32]), false);
+        snapshot.resolved_tree = ResolvedTree::from_artifacts([
+            ResolvedArtifact::new(
+                ArtifactId::new(),
+                RepoPath::from_utf8("scripts/deploy").unwrap(),
+                executable,
+            ),
+            ResolvedArtifact::new(
+                ArtifactId::new(),
+                RepoPath::from_utf8("current-config").unwrap(),
+                symlink,
+            ),
+            ResolvedArtifact::new(
+                ArtifactId::new(),
+                RepoPath::from_utf8("assets/model.unsupported").unwrap(),
+                opaque,
+            ),
+        ])
+        .unwrap();
 
         let loaded = GraphSnapshot::from_bytes(&snapshot.to_bytes().unwrap()).unwrap();
 
-        assert_eq!(loaded.working_tree.get("scripts/deploy"), Some(&executable));
-        assert_eq!(loaded.working_tree.get("current-config"), Some(&symlink));
         assert_eq!(
-            loaded.working_tree.get("assets/model.unsupported"),
-            Some(&opaque)
+            loaded
+                .resolved_tree
+                .artifact_at_path(&RepoPath::from_utf8("scripts/deploy").unwrap())
+                .map(|artifact| artifact.entry),
+            Some(executable)
+        );
+        assert_eq!(
+            loaded
+                .resolved_tree
+                .artifact_at_path(&RepoPath::from_utf8("current-config").unwrap())
+                .map(|artifact| artifact.entry),
+            Some(symlink)
+        );
+        assert_eq!(
+            loaded
+                .resolved_tree
+                .artifact_at_path(&RepoPath::from_utf8("assets/model.unsupported").unwrap())
+                .map(|artifact| artifact.entry),
+            Some(opaque)
         );
     }
 
@@ -1589,6 +1726,21 @@ mod tests {
                 "missing {field} should fail explicitly: {error}"
             );
         }
+    }
+
+    #[test]
+    fn current_snapshot_rejects_unknown_persisted_fields() {
+        let mut encoded = serde_json::to_value(GraphSnapshot::empty()).unwrap();
+        encoded
+            .as_object_mut()
+            .expect("snapshot serializes as a map")
+            .insert("working_tree".to_string(), serde_json::json!([]));
+
+        let error = serde_json::from_value::<GraphSnapshot>(encoded).unwrap_err();
+        assert!(
+            error.to_string().contains("unknown field `working_tree`"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
@@ -1806,6 +1958,10 @@ mod tests {
     #[test]
     fn snapshot_roundtrips_file_layouts() {
         let mut snapshot = GraphSnapshot::empty();
+        snapshot.admit_artifact_for_test(
+            "src/lib.rs".to_string(),
+            crate::types::regular_tree_entry(1),
+        );
         snapshot.file_layouts.push(FileLayout {
             file_id: FilePathId::new("src/lib.rs"),
             parse_completeness: ParseCompleteness::Partial("1 parse error range(s)".into()),

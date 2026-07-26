@@ -421,7 +421,7 @@ impl TieredGraph {
                 .read()
                 .clone()
                 .unwrap_or_else(|| ManagedHotScope::from_snapshot(&hot_snapshot));
-            merge_hot_into_cold(cold, hot_snapshot.clone(), &scope)
+            merge_hot_into_cold(cold, hot_snapshot.clone(), &scope)?
         } else {
             hot_snapshot.clone()
         };
@@ -525,7 +525,7 @@ fn merge_hot_into_cold(
     mut cold: GraphSnapshot,
     hot: GraphSnapshot,
     scope: &ManagedHotScope,
-) -> GraphSnapshot {
+) -> Result<GraphSnapshot, KinDbError> {
     cold.version = GraphSnapshot::CURRENT_VERSION;
     let hot_entity_ids: HashSet<_> = hot.entities.keys().copied().collect();
     let deleted_managed_entities: HashSet<_> = scope
@@ -652,7 +652,18 @@ fn merge_hot_into_cold(
         cold.opaque_artifacts.extend(hot.opaque_artifacts);
     }
 
-    cold.working_tree.extend(hot.working_tree);
+    let mut artifacts: Vec<_> = cold.resolved_tree.into_artifacts().collect();
+    for incoming in hot.resolved_tree.into_artifacts() {
+        artifacts.retain(|artifact| {
+            artifact.artifact_id != incoming.artifact_id && artifact.path != incoming.path
+        });
+        artifacts.push(incoming);
+    }
+    cold.resolved_tree = ResolvedTree::from_artifacts(artifacts).map_err(|error| {
+        KinDbError::StorageError(format!(
+            "tiered repository-tree merge violates identity/path authority: {error}"
+        ))
+    })?;
     cold.sessions.extend(hot.sessions);
     cold.intents.extend(hot.intents);
 
@@ -665,7 +676,7 @@ fn merge_hot_into_cold(
         );
     }
     rebuild_relation_indexes(&mut cold);
-    cold
+    Ok(cold)
 }
 
 fn rebuild_relation_indexes(snapshot: &mut GraphSnapshot) {

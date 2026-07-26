@@ -47,9 +47,6 @@ pub enum KinDbError {
     #[error("concurrent access error: {0}")]
     ConcurrentAccessError(String),
 
-    #[error("working-tree conflict at {path}: {reason}")]
-    WorkingTreeConflict { path: String, reason: String },
-
     #[error("slice conversion error: {0}")]
     SliceConversionError(String),
 }

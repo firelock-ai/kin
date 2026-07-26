@@ -804,7 +804,7 @@ mod tests {
         let expected = Generation::try_from(i64::MAX).unwrap();
         let replacement = {
             let mut snapshot = GraphSnapshot::empty();
-            snapshot.working_tree.insert(
+            snapshot.admit_artifact_for_test(
                 "replacement.rs".to_string(),
                 crate::types::regular_tree_entry(8),
             );
@@ -820,7 +820,7 @@ mod tests {
         assert_eq!(
             GraphSnapshot::from_bytes(&authority.snapshot_bytes)
                 .unwrap()
-                .working_tree
+                .resolved_tree
                 .len(),
             0
         );
@@ -956,8 +956,7 @@ mod tests {
         let db_path = dir.path().join("restart.db");
         let repo_id = "restart-repo";
         let mut base = GraphSnapshot::empty();
-        base.working_tree
-            .insert("base.rs".to_string(), crate::types::regular_tree_entry(1));
+        base.admit_artifact_for_test("base.rs".to_string(), crate::types::regular_tree_entry(1));
 
         {
             let backend = SqliteBackend::new(&db_path).unwrap();
@@ -966,18 +965,20 @@ mod tests {
                 .unwrap();
 
             let mut after_first = base.clone();
-            after_first
-                .working_tree
-                .insert("first.rs".to_string(), crate::types::regular_tree_entry(2));
+            after_first.admit_artifact_for_test(
+                "first.rs".to_string(),
+                crate::types::regular_tree_entry(2),
+            );
             let first = crate::storage::delta::compute_graph_delta(&base, &after_first, gen1);
             let gen2 = backend
                 .save_delta(repo_id, &first.to_bytes().unwrap(), gen1)
                 .unwrap();
 
             let mut after_second = after_first.clone();
-            after_second
-                .working_tree
-                .insert("second.rs".to_string(), crate::types::regular_tree_entry(3));
+            after_second.admit_artifact_for_test(
+                "second.rs".to_string(),
+                crate::types::regular_tree_entry(3),
+            );
             let second =
                 crate::storage::delta::compute_graph_delta(&after_first, &after_second, gen2);
             backend
@@ -989,18 +990,20 @@ mod tests {
         let (base_bytes, base_generation) = reopened.load_snapshot(repo_id).unwrap().unwrap();
         assert_eq!(base_generation, 1, "tuple generation describes base bytes");
         assert_eq!(
-            GraphSnapshot::from_bytes(&base_bytes).unwrap().working_tree,
-            base.working_tree
+            GraphSnapshot::from_bytes(&base_bytes)
+                .unwrap()
+                .resolved_tree,
+            base.resolved_tree
         );
         let recovered = crate::storage::backend::load_recovered_snapshot(&reopened, repo_id)
             .unwrap()
             .expect("snapshot exists");
         assert_eq!(recovered.generation, 3);
         assert_eq!(recovered.deltas_applied, 2);
-        assert_eq!(recovered.snapshot.working_tree.len(), 3);
-        assert!(recovered.snapshot.working_tree.contains_key("base.rs"));
-        assert!(recovered.snapshot.working_tree.contains_key("first.rs"));
-        assert!(recovered.snapshot.working_tree.contains_key("second.rs"));
+        assert_eq!(recovered.snapshot.resolved_tree.len(), 3);
+        assert!(recovered.snapshot.has_artifact_path_for_test("base.rs"));
+        assert!(recovered.snapshot.has_artifact_path_for_test("first.rs"));
+        assert!(recovered.snapshot.has_artifact_path_for_test("second.rs"));
     }
 
     #[test]
@@ -1018,7 +1021,7 @@ mod tests {
             .save_snapshot(repo_id, &base.to_bytes().unwrap(), GENERATION_INIT)
             .unwrap();
         let mut promoted = base.clone();
-        promoted.working_tree.insert(
+        promoted.admit_artifact_for_test(
             "promoted.rs".to_string(),
             crate::types::regular_tree_entry(4),
         );
@@ -1044,7 +1047,7 @@ mod tests {
         checked_rx.recv().unwrap();
 
         let mut with_concurrent = promoted.clone();
-        with_concurrent.working_tree.insert(
+        with_concurrent.admit_artifact_for_test(
             "concurrent.rs".to_string(),
             crate::types::regular_tree_entry(5),
         );
@@ -1081,7 +1084,7 @@ mod tests {
         assert_eq!(recovered.generation, gen4);
         assert!(recovered
             .snapshot
-            .working_tree
+            .resolved_tree
             .contains_key("concurrent.rs"));
     }
 }

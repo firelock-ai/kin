@@ -4,14 +4,14 @@
 //! Re-exports of canonical types from kin-model.
 //!
 //! All kin-db code uses kin-model's types directly. This module provides
-//! a single import point for backwards compatibility within kin-db.
+//! a single import point for kin-db.
 
 // IDs
 pub use kin_model::{
     ArtifactId, ArtifactRevisionId, AuthorId, BranchId, BranchName, ConflictId, ContractId,
-    EntityId, EntityRevisionId, EvidenceId, FilePathId, Hash256, IntentId, LanguageId, RelationId,
-    RelationRevisionId, RetrievalKey, RetrievalKeyFileResolver, SemanticChangeId, SessionId,
-    SpecId, TreeEntry, TreeEntryKind,
+    EntityId, EntityRevisionId, EvidenceId, FilePathId, GitObjectId, Hash256, IntentId, LanguageId,
+    RelationId, RelationRevisionId, RepoPath, ResolvedArtifact, ResolvedTree, RetrievalKey,
+    RetrievalKeyFileResolver, SemanticChangeId, SessionId, SpecId, TreeEntry, TreeStateError,
 };
 
 // Entity types
@@ -24,7 +24,9 @@ pub use kin_model::{
 pub use kin_model::{GraphNodeId, Relation, RelationKind, RelationOrigin, RelationRevision};
 
 pub use kin_model::ArtifactRevision;
-pub use kin_model::{EntityDelta, RelationDelta, SemanticChange, TransactionDelta, TreeDelta};
+pub use kin_model::{
+    EntityDelta, LocatedEntry, RelationDelta, SemanticChange, TransactionDelta, TreeDelta,
+};
 
 // Branch types
 pub use kin_model::{Branch, GraphOverlay, MergeState, WorkingCopy};
@@ -78,5 +80,5 @@ pub use kin_model::GraphStats;
 
 #[cfg(test)]
 pub(crate) fn regular_tree_entry(byte: u8) -> TreeEntry {
-    TreeEntry::regular(Hash256::from_bytes([byte; 32]), false)
+    TreeEntry::blob(Hash256::from_bytes([byte; 32]), false)
 }

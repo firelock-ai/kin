@@ -12,11 +12,9 @@
 //! |----------|------|---------|
 //! | Authority | `graph.kndb.authority.json` | Atomic committed snapshot base/head generations and graph root |
 //! | Versioned snapshot | `graph.kndb.snapshots/{gen:020}.kndb` | Immutable committed GraphSnapshot base |
-//! | Compatibility projection | `graph.kndb` | Canonical projection for legacy readers; not recovery authority |
 //! | Delta journal | `graph.kndb.deltas/{gen:020}.kndd` | Contiguous committed changes after the snapshot base |
 //! | Lock file | `graph.lock` | flock sentinel for exclusive process access |
-//! | Recovery candidate | `graph.kndb.tmp` | In-flight compatibility projection write |
-//! | Recovery marker | `graph.kndb.tmp.meta` | SHA-256 + byte length of graph.kndb.tmp for crash validation |
+//! | Atomic staging | Adjacent unique candidate + deterministic marker | Crash-safe install of each immutable snapshot or authority manifest |
 //!
 //! ## Persisted artifacts (StorageBackend/LocalFileBackend path):
 //!
@@ -186,7 +184,7 @@ fn backend_artifacts_stay_consistent() {
     assert_eq!(deltas.len(), 1);
 
     let loaded_delta = GraphSnapshotDelta::from_bytes(&deltas[0].0).unwrap();
-    apply_graph_delta(&mut loaded_snapshot, &loaded_delta);
+    apply_graph_delta(&mut loaded_snapshot, &loaded_delta).unwrap();
 
     assert_eq!(loaded_snapshot.entities.len(), 2);
     assert!(loaded_snapshot.entities.contains_key(&e1.id));
@@ -207,8 +205,8 @@ fn backend_artifacts_stay_consistent() {
     );
 }
 
-/// A compatibility-projection write that crashes before the authority commit
-/// must not replace the last committed graph truth.
+/// An immutable snapshot installed before its authority commit must not replace
+/// the last committed graph truth.
 #[test]
 fn crash_before_authority_commit_keeps_old_snapshot_truth() {
     let dir = TempDir::new().unwrap();
@@ -225,51 +223,27 @@ fn crash_before_authority_commit_keeps_old_snapshot_truth() {
         e1_id
     };
 
-    // Now simulate a crash: write a new snapshot to .tmp with marker,
-    // but delete the primary (as if rename hadn't happened yet).
+    // Simulate a crash after the next immutable snapshot reached its final
+    // generation path but before the authority manifest moved to that
+    // generation.
     let new_entity = test_entity("crash_recovery");
     let new_entity_id = new_entity.id;
-    {
+    let uncommitted_snapshot_path = {
         let mgr = SnapshotManager::open(&path).unwrap();
         let graph = mgr.graph();
         graph.upsert_entity(&new_entity).unwrap();
-        // Manually write recovery candidate without promoting.
         let snapshot = graph.to_snapshot();
-        let bytes = snapshot.to_bytes().unwrap();
+        let bytes = snapshot
+            .to_bytes_with_persisted_root_hash(graph.compute_root_hash())
+            .unwrap();
+        let candidate =
+            append_suffix(&path, ".snapshots").join(format!("{:020}.kndb", mgr.generation() + 1));
+        std::fs::create_dir_all(candidate.parent().unwrap()).unwrap();
+        std::fs::write(&candidate, bytes).unwrap();
+        candidate
+    };
 
-        // Append the suffix to the full path (graph.kndb.tmp /
-        // graph.kndb.tmp.meta), matching the production recovery_tmp_path
-        // derivation so reopen recovery finds these files.
-        let mut tmp_name = std::ffi::OsString::from(path.as_os_str());
-        tmp_name.push(".tmp");
-        let tmp_path = std::path::PathBuf::from(tmp_name);
-        let mut marker_name = std::ffi::OsString::from(path.as_os_str());
-        marker_name.push(".tmp.meta");
-        let marker_path = std::path::PathBuf::from(marker_name);
-
-        // Write tmp file.
-        std::fs::write(&tmp_path, &bytes).unwrap();
-
-        // Write marker with correct checksum.
-        let digest: [u8; 32] = {
-            use sha2::{Digest, Sha256};
-            Sha256::digest(&bytes).into()
-        };
-        let marker = serde_json::json!({
-            "version": 1,
-            "byte_len": bytes.len() as u64,
-            "sha256": digest,
-        });
-        std::fs::write(&marker_path, serde_json::to_vec(&marker).unwrap()).unwrap();
-
-        drop(mgr);
-
-        // Delete the primary to simulate crash before rename.
-        std::fs::remove_file(&path).unwrap();
-    }
-
-    // Recovery reads committed authority, not the uncommitted compatibility
-    // candidate, then heals the canonical projection from immutable truth.
+    // Reopen reads only the immutable generation named by committed authority.
     let recovered_mgr = SnapshotManager::open(&path).unwrap();
     let graph = recovered_mgr.graph();
 
@@ -279,15 +253,15 @@ fn crash_before_authority_commit_keeps_old_snapshot_truth() {
     );
     assert!(
         graph.get_entity(&new_entity_id).unwrap().is_none(),
-        "uncommitted compatibility candidate must not override authority"
+        "uncommitted immutable candidate must not override authority"
     );
-
-    // The compatibility projection should be restored from authority and the
-    // stale recovery candidate consumed.
-    assert!(path.exists(), "compatibility projection should be restored");
     assert!(
-        !append_suffix(&path, ".tmp").exists(),
-        "recovery .tmp should be consumed"
+        uncommitted_snapshot_path.exists(),
+        "a future generation may remain for an in-flight writer but is not authority"
+    );
+    assert!(
+        !path.exists(),
+        "the logical namespace is not a raw snapshot"
     );
 }
 
@@ -307,8 +281,7 @@ fn corrupt_snapshot_no_recovery_fails_cleanly() {
         mgr.save().unwrap();
     }
 
-    // Corrupt the immutable snapshot named by authority. Corrupting only the
-    // compatibility projection cannot affect committed graph truth.
+    // Corrupt the immutable snapshot named by authority.
     let authoritative_path = authoritative_snapshot_path(&path);
     let mut bytes = std::fs::read(&authoritative_path).unwrap();
     for byte in bytes.iter_mut().take(20) {

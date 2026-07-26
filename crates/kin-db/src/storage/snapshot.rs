@@ -882,7 +882,7 @@ fn apply_local_deltas(
                 delta.base_generation
             )));
         }
-        apply_graph_delta(&mut snapshot, &delta);
+        apply_graph_delta(&mut snapshot, &delta)?;
         applied += 1;
         recovered_generation = *generation;
         if *generation < authority.head_generation {
@@ -3057,13 +3057,13 @@ mod tests {
         let graph = mgr.graph();
         let mut entity = test_entity("delta_fn");
         graph.upsert_entity(&entity).unwrap();
-        graph.set_working_tree_entry("src/main.rs", crate::types::regular_tree_entry(1));
+        graph.admit_artifact_for_test("src/main.rs", crate::types::regular_tree_entry(1));
         mgr.save().unwrap();
         assert_eq!(local_delta_count(&path).unwrap(), 0);
 
         entity.signature = "fn delta_fn() -> i32".to_string();
         graph.upsert_entity(&entity).unwrap();
-        graph.set_working_tree_entry("src/main.rs", crate::types::regular_tree_entry(2));
+        graph.admit_artifact_for_test("src/main.rs", crate::types::regular_tree_entry(2));
 
         let generation = SnapshotManager::save_graph_delta(&path, graph.as_ref(), 1)
             .unwrap()
@@ -3080,7 +3080,7 @@ mod tests {
             .expect("delta entity should replay on reopen");
         assert_eq!(loaded.signature, "fn delta_fn() -> i32");
         assert_eq!(
-            reopened_graph.get_working_tree_entry("src/main.rs"),
+            reopened_graph.tree_entry_for_test("src/main.rs"),
             Some(regular_tree_entry(2)),
             "exact tree entry should replay on reopen"
         );
@@ -3386,7 +3386,7 @@ mod tests {
         let (mut snapshot, persisted_root) =
             GraphSnapshot::from_bytes_with_persisted_root_hash(&bytes).unwrap();
         let original_graph_root = compute_graph_root_hash(&snapshot);
-        snapshot.working_tree.insert(
+        snapshot.admit_artifact_for_test(
             "tampered-non-entity.rs".to_string(),
             crate::types::regular_tree_entry(8),
         );
@@ -4015,6 +4015,7 @@ mod tests {
         graph.upsert_entity(&callee).unwrap();
         graph.create_change(&change).unwrap();
         graph.upsert_relation(&relation).unwrap();
+        graph.admit_artifact_for_test("src/main.rs", crate::types::regular_tree_entry(3));
         graph
             .upsert_shallow_file(&ShallowTrackedFile {
                 file_id: FilePathId::new("src/main.rs"),
@@ -4051,7 +4052,7 @@ mod tests {
     }
 
     #[test]
-    fn open_read_only_for_locate_decodes_snapshot_with_working_tree() {
+    fn open_read_only_for_locate_decodes_snapshot_with_resolved_tree() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("graph.kndb");
 
@@ -4109,10 +4110,10 @@ mod tests {
         graph.upsert_relation(&calls).unwrap();
         graph.upsert_relation(&cochange).unwrap();
 
-        // A non-empty exact working tree exercises the positional field that
-        // the locate decoder must drain rather than misread as artifact_index.
-        graph.set_working_tree_entry("src/main.rs", crate::types::regular_tree_entry(7));
-        graph.set_working_tree_entry("src/lib.rs", crate::types::regular_tree_entry(9));
+        // A non-empty resolved tree exercises the positional field that the
+        // locate decoder must preserve as identity-bearing repository truth.
+        graph.admit_artifact_for_test("src/main.rs", crate::types::regular_tree_entry(7));
+        graph.admit_artifact_for_test("src/lib.rs", crate::types::regular_tree_entry(9));
 
         graph
             .upsert_shallow_file(&ShallowTrackedFile {
@@ -4252,7 +4253,7 @@ mod tests {
         assert!(local_versioned_snapshot_path(&path, generation).exists());
         assert!(
             !path.exists(),
-            "the requested path is a namespace root, not a compatibility projection"
+            "the requested path is a logical namespace, not persisted graph bytes"
         );
     }
 
@@ -4383,6 +4384,9 @@ mod tests {
             declaration_names: vec!["main".into()],
             import_paths: vec![],
         };
+        graph.admit_artifact_for_test("src/main.rs", crate::types::regular_tree_entry(9));
+        graph.admit_artifact_for_test("Makefile", crate::types::regular_tree_entry(5));
+        graph.admit_artifact_for_test("assets/logo.svg", crate::types::regular_tree_entry(6));
         graph.upsert_shallow_file(&shallow).unwrap();
         graph
             .upsert_structured_artifact(&StructuredArtifact {
@@ -4400,8 +4404,6 @@ mod tests {
                 text_preview: Some("<svg".into()),
             })
             .unwrap();
-        graph.set_working_tree_entry("src/main.rs", crate::types::regular_tree_entry(9));
-
         let work = WorkItem {
             work_id: WorkId::new(),
             kind: WorkKind::Task,
@@ -4543,7 +4545,7 @@ mod tests {
         assert_eq!(graph.list_structured_artifacts().unwrap().len(), 1);
         assert_eq!(graph.list_opaque_artifacts().unwrap().len(), 1);
         assert_eq!(
-            graph.get_working_tree_entry("src/main.rs"),
+            graph.tree_entry_for_test("src/main.rs"),
             Some(regular_tree_entry(9))
         );
         assert_eq!(
@@ -5262,6 +5264,10 @@ mod tests {
             content_hash: Hash256::from_bytes([0x31; 32]),
             text_preview: Some("build test".into()),
         };
+        let artifact_id = graph.admit_artifact_for_test(
+            &artifact.file_id.0,
+            TreeEntry::blob(artifact.content_hash, false),
+        );
         graph.upsert_entity(&entity).unwrap();
         graph.upsert_structured_artifact(&artifact).unwrap();
         mgr.save().unwrap();
@@ -5269,11 +5275,7 @@ mod tests {
         let vectors = VectorIndex::new(4).unwrap();
         vectors.upsert(entity.id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
         vectors
-            .upsert_retrievable(
-                // Identity is graph-assigned by the upsert above: read it back.
-                RetrievalKey::Artifact(graph.artifact_id_for_path(&artifact.file_id).unwrap()),
-                &[0.0, 1.0, 0.0, 0.0],
-            )
+            .upsert_retrievable(RetrievalKey::Artifact(artifact_id), &[0.0, 1.0, 0.0, 0.0])
             .unwrap();
         vectors.save(&vector_path).unwrap();
         write_vector_index_metadata(
@@ -5943,11 +5945,19 @@ mod tests {
         graph.upsert_entity(&entity).unwrap();
         let old_path = FilePathId::new("config/old-name.yaml");
         let new_path = FilePathId::new("config/current.yaml");
-        let artifact_id = graph.ensure_artifact_id(&old_path);
-        assert_eq!(
-            graph.rename_artifact(&old_path, &new_path),
-            Some(artifact_id)
-        );
+        let entry = crate::types::regular_tree_entry(7);
+        let artifact_id = graph.admit_artifact_for_test(&old_path.0, entry);
+        graph
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: Vec::new(),
+                relation_deltas: Vec::new(),
+                tree_deltas: vec![TreeDelta::Updated {
+                    artifact_id,
+                    old: LocatedEntry::new(RepoPath::from_utf8(&old_path.0).unwrap(), entry),
+                    new: LocatedEntry::new(RepoPath::from_utf8(&new_path.0).unwrap(), entry),
+                }],
+            })
+            .unwrap();
 
         // Save via borrowed path (now the default)
         SnapshotManager::save_graph(&snap_path, &graph).unwrap();
@@ -5961,8 +5971,16 @@ mod tests {
         assert_eq!(loaded_entity.name, "RoundTrip");
         assert_eq!(loaded_entity.kind, EntityKind::Function);
         assert_eq!(loaded_entity.language, LanguageId::Rust);
-        assert_eq!(loaded.artifact_index.get(&new_path), Some(&artifact_id));
-        assert!(!loaded.artifact_index.contains_key(&old_path));
+        assert_eq!(
+            loaded
+                .resolved_tree
+                .artifact_id_at_path(&RepoPath::from_utf8(&new_path.0).unwrap()),
+            Some(artifact_id)
+        );
+        assert!(loaded
+            .resolved_tree
+            .artifact_id_at_path(&RepoPath::from_utf8(&old_path.0).unwrap())
+            .is_none());
     }
 
     #[test]

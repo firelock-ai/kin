@@ -704,11 +704,11 @@ pub fn compute_root_hash_generic(
 /// that persist a truth hash should persist [`RepoTruthHash`] instead of a bare
 /// digest so a format upgrade is distinguishable from an actual change in repo
 /// truth.
-pub const REPO_TRUTH_HASH_VERSION: u32 = 3;
+pub const REPO_TRUTH_HASH_VERSION: u32 = 4;
 
 /// Domain separator for the repo-truth digest. Carries the encoding version so
 /// a v1 digest can never be mistaken for a v2 digest of the same snapshot.
-const REPO_TRUTH_DOMAIN: &[u8] = b"kin-repo-truth-v2:";
+const REPO_TRUTH_DOMAIN: &[u8] = b"kin-repo-truth-v4:";
 
 /// A repo-truth digest tagged with the encoding version that produced it.
 ///
@@ -817,14 +817,13 @@ pub fn compute_repo_truth_hash(snapshot: &GraphSnapshot) -> MerkleHash {
         file_layouts,
         structured_artifacts,
         opaque_artifacts,
-        working_tree,
+        resolved_tree,
         sessions,
         intents,
         downstream_warnings,
         // Re-derived from `changes` whenever it is empty, so a load can
         // legitimately populate it on an otherwise unchanged repo.
         entity_revisions: _,
-        artifact_index,
     } = snapshot;
 
     let mut hasher = Sha256::new();
@@ -869,8 +868,8 @@ pub fn compute_repo_truth_hash(snapshot: &GraphSnapshot) -> MerkleHash {
     hash_vec_domain(&mut hasher, "file_layouts", file_layouts);
     hash_vec_domain(&mut hasher, "artifacts_structured", structured_artifacts);
     hash_vec_domain(&mut hasher, "artifacts_opaque", opaque_artifacts);
-    hash_map_domain(&mut hasher, "working_tree", working_tree);
-    hash_map_domain(&mut hasher, "artifact_index", artifact_index);
+    let resolved_artifacts: Vec<_> = resolved_tree.artifacts().cloned().collect();
+    hash_vec_domain(&mut hasher, "resolved_tree", &resolved_artifacts);
 
     hash_map_domain(&mut hasher, "sessions", sessions);
     hash_map_domain(&mut hasher, "intents", intents);
@@ -2128,26 +2127,72 @@ mod tests {
     fn repo_truth_hash_covers_tree_mode_and_symlink_kind() {
         let hash = Hash256::from_bytes([0x5a; 32]);
         let mut regular = GraphSnapshot::empty();
-        regular
-            .working_tree
-            .insert("tool".to_string(), TreeEntry::regular(hash, false));
+        regular.admit_artifact_for_test("tool".to_string(), TreeEntry::blob(hash, false));
         let regular_root = compute_repo_truth_hash(&regular);
 
         let mut executable = regular.clone();
-        executable
-            .working_tree
-            .insert("tool".to_string(), TreeEntry::regular(hash, true));
+        executable.admit_artifact_for_test("tool".to_string(), TreeEntry::blob(hash, true));
         let executable_root = compute_repo_truth_hash(&executable);
 
         let mut symlink = regular.clone();
-        symlink
-            .working_tree
-            .insert("tool".to_string(), TreeEntry::symlink(hash));
+        symlink.admit_artifact_for_test("tool".to_string(), TreeEntry::symlink(hash));
         let symlink_root = compute_repo_truth_hash(&symlink);
 
         assert_ne!(regular_root, executable_root);
         assert_ne!(regular_root, symlink_root);
         assert_ne!(executable_root, symlink_root);
+    }
+
+    #[test]
+    fn repo_truth_hash_covers_artifact_identity_path_and_gitlink_target() {
+        let artifact_id = ArtifactId::new();
+        let other_id = ArtifactId::new();
+        let path = RepoPath::from_utf8("vendor/dependency").unwrap();
+        let moved_path = RepoPath::from_utf8("third_party/dependency").unwrap();
+        let target = GitObjectId::sha1([1; 20]);
+        let other_target = GitObjectId::sha1([2; 20]);
+
+        let snapshot = |id, path: RepoPath, target| {
+            let mut snapshot = GraphSnapshot::empty();
+            snapshot.resolved_tree = ResolvedTree::from_artifacts([ResolvedArtifact::new(
+                id,
+                path,
+                TreeEntry::gitlink(target),
+            )])
+            .unwrap();
+            snapshot
+        };
+        let baseline = compute_repo_truth_hash(&snapshot(artifact_id, path.clone(), target));
+        let identity_changed = compute_repo_truth_hash(&snapshot(other_id, path.clone(), target));
+        let path_changed = compute_repo_truth_hash(&snapshot(artifact_id, moved_path, target));
+        let target_changed = compute_repo_truth_hash(&snapshot(artifact_id, path, other_target));
+
+        assert_ne!(baseline, identity_changed);
+        assert_ne!(baseline, path_changed);
+        assert_ne!(baseline, target_changed);
+    }
+
+    #[test]
+    fn repo_truth_hash_is_independent_of_resolved_tree_insertion_order() {
+        let left = ResolvedArtifact::new(
+            ArtifactId::new(),
+            RepoPath::from_utf8("a").unwrap(),
+            crate::types::regular_tree_entry(1),
+        );
+        let right = ResolvedArtifact::new(
+            ArtifactId::new(),
+            RepoPath::from_utf8("b").unwrap(),
+            crate::types::regular_tree_entry(2),
+        );
+        let mut first = GraphSnapshot::empty();
+        first.resolved_tree = ResolvedTree::from_artifacts([left.clone(), right.clone()]).unwrap();
+        let mut second = GraphSnapshot::empty();
+        second.resolved_tree = ResolvedTree::from_artifacts([right, left]).unwrap();
+
+        assert_eq!(
+            compute_repo_truth_hash(&first),
+            compute_repo_truth_hash(&second)
+        );
     }
 
     fn map_elements_encode<K, V>(map: &HashMap<K, V>) -> bool
@@ -2166,6 +2211,11 @@ mod tests {
 
     fn vec_elements_encode<T: serde::Serialize>(items: &[T]) -> bool {
         items.iter().all(|item| serde_json::to_value(item).is_ok())
+    }
+
+    fn resolved_tree_elements_encode(tree: &ResolvedTree) -> bool {
+        tree.artifacts()
+            .all(|artifact| serde_json::to_value(artifact).is_ok())
     }
 
     /// Guards the `JSON_TAG_UNENCODABLE` branch in [`canonical_element_hash`]:
@@ -2200,7 +2250,7 @@ mod tests {
                 head: SemanticChangeId::from_hash(Hash256::from_bytes([0x91; 32])),
             },
         );
-        snapshot.working_tree.insert(
+        snapshot.admit_artifact_for_test(
             "src/main.rs".to_string(),
             crate::types::regular_tree_entry(7),
         );
@@ -2252,10 +2302,9 @@ mod tests {
                 "artifacts_opaque",
                 vec_elements_encode(&snapshot.opaque_artifacts),
             ),
-            ("working_tree", map_elements_encode(&snapshot.working_tree)),
             (
-                "artifact_index",
-                map_elements_encode(&snapshot.artifact_index),
+                "resolved_tree",
+                resolved_tree_elements_encode(&snapshot.resolved_tree),
             ),
             ("sessions", map_elements_encode(&snapshot.sessions)),
             ("intents", map_elements_encode(&snapshot.intents)),

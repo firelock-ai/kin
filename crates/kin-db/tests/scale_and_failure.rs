@@ -138,11 +138,10 @@ fn generate_snapshot(n: usize, rels_per_entity: usize) -> (GraphSnapshot, Vec<En
         file_layouts: Vec::new(),
         structured_artifacts: Vec::new(),
         opaque_artifacts: Vec::new(),
-        working_tree: HashMap::new(),
+        resolved_tree: ResolvedTree::default(),
         sessions: HashMap::new(),
         intents: HashMap::new(),
         downstream_warnings: Vec::new(),
-        artifact_index: HashMap::new(),
     };
 
     (snapshot, entity_ids)
@@ -285,8 +284,8 @@ fn corrupt_snapshot_detected() {
         mgr.save().unwrap();
     }
 
-    // Corrupt the immutable snapshot named by authority. The canonical path is
-    // only a compatibility projection and cannot override committed truth.
+    // Corrupt the immutable snapshot named by authority. The logical namespace
+    // path contains no graph bytes and cannot override committed truth.
     let authoritative_path = authoritative_snapshot_path(&path);
     let mut bytes = std::fs::read(&authoritative_path).unwrap();
     assert!(bytes.len() > 40, "snapshot should be non-trivial");

@@ -1162,14 +1162,14 @@ mod tests {
         std::fs::write(&path, &original_primary).unwrap();
 
         let mut candidate = GraphSnapshot::empty();
-        candidate.working_tree.insert(
+        candidate.admit_artifact_for_test(
             "candidate.rs".to_string(),
             crate::types::regular_tree_entry(1),
         );
         write_recovery_candidate_bytes(&path, &candidate.to_bytes().unwrap()).unwrap();
 
         let mut replacement = GraphSnapshot::empty();
-        replacement.working_tree.insert(
+        replacement.admit_artifact_for_test(
             "replacement.rs".to_string(),
             crate::types::regular_tree_entry(2),
         );
