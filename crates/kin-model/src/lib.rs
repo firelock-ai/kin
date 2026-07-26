@@ -75,10 +75,11 @@ pub use federation::{
 };
 pub use git_authority::{
     decode_git_external_object, DecodedGitObject, GitCommitCanonicalIdentity, GitCommitProjection,
-    GitExternalAuthority, GitExternalAuthorityError, GitMaterialHead, GitObjectBodyLoader,
-    GitObjectClosureEntry, GitObjectClosureManifest, GitObjectDependency, GitObjectDependencyKind,
-    GitObjectFormat, GitObjectRoot, GitObjectRootSource, GitRawRef, GitRawTarget, GitTreeEntryMode,
-    GitTreeEntryName, GitTreeEntryNameError, GIT_EXTERNAL_AUTHORITY_SCHEMA_VERSION,
+    GitExternalAuthority, GitExternalAuthorityDelta, GitExternalAuthorityError, GitMaterialHead,
+    GitObjectBodyLoader, GitObjectClosureEntry, GitObjectClosureManifest, GitObjectDependency,
+    GitObjectDependencyKind, GitObjectFormat, GitObjectRoot, GitObjectRootSource, GitRawRef,
+    GitRawTarget, GitTreeEntryMode, GitTreeEntryName, GitTreeEntryNameError,
+    GIT_EXTERNAL_AUTHORITY_SCHEMA_VERSION,
 };
 pub use graph::{
     ChangeStore, EntityFilter, EntityStore, GraphStore, ProvenanceStore, ReviewStore, SessionStore,

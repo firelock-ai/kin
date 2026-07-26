@@ -395,6 +395,18 @@ pub struct GitExternalAuthority {
     pub commit_projections: Vec<GitCommitProjection>,
 }
 
+/// Exact, self-inverting mutation of one repository's external Git authority.
+///
+/// The complete old and new values make this a compare-and-swap contract for
+/// storage. Object bodies remain in the caller-owned CAS and closure records
+/// may refer to bodies admitted by earlier transactions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GitExternalAuthorityDelta {
+    pub old: Option<GitExternalAuthority>,
+    pub new: Option<GitExternalAuthority>,
+}
+
 /// Caller-provided access to exact raw bodies in Kin's blob CAS.
 pub trait GitObjectBodyLoader {
     type Error: fmt::Display;
@@ -484,8 +496,119 @@ pub enum GitExternalAuthorityError {
     NonCanonicalCommitProjections,
     #[error("material HEAD does not match raw HEAD, refs, and decoded objects")]
     NonCanonicalMaterialHead,
+    #[error("Git external-authority delta has no old or new state")]
+    EmptyDelta,
+    #[error("Git external-authority delta is a no-op")]
+    NoOpDelta,
+    #[error("Git external-authority delta changes repository identity from {old} to {new}")]
+    DeltaRepositoryMismatch {
+        old: RepositoryId,
+        new: RepositoryId,
+    },
+    #[error("Git external-authority delta changes object format from {old} to {new}")]
+    DeltaObjectFormatMismatch {
+        old: GitObjectFormat,
+        new: GitObjectFormat,
+    },
+    #[error(
+        "Git external-authority repository {actual} does not match enclosing repository {expected}"
+    )]
+    EnclosingRepositoryMismatch {
+        actual: RepositoryId,
+        expected: RepositoryId,
+    },
     #[error("canonical commit identity input exceeds u64")]
     IdentityOverflow,
+}
+
+impl GitExternalAuthorityDelta {
+    pub fn initialize(new: GitExternalAuthority) -> Self {
+        Self {
+            old: None,
+            new: Some(new),
+        }
+    }
+
+    pub fn update(old: GitExternalAuthority, new: GitExternalAuthority) -> Self {
+        Self {
+            old: Some(old),
+            new: Some(new),
+        }
+    }
+
+    pub fn remove(old: GitExternalAuthority) -> Self {
+        Self {
+            old: Some(old),
+            new: None,
+        }
+    }
+
+    pub fn inverse(&self) -> Self {
+        Self {
+            old: self.new.clone(),
+            new: self.old.clone(),
+        }
+    }
+
+    pub fn repository_id(&self) -> Option<&RepositoryId> {
+        self.new
+            .as_ref()
+            .or(self.old.as_ref())
+            .map(|authority| &authority.repository_id)
+    }
+
+    /// Validate initial, update, or removal shape without loading object bodies.
+    ///
+    /// This deliberately does not require closure records to appear in the
+    /// enclosing transaction's newly admitted object list. Durable storage
+    /// validates the old value and resolves the new closure against the union
+    /// of existing and newly written CAS records.
+    pub fn validate(&self) -> std::result::Result<(), GitExternalAuthorityError> {
+        if self.old.is_none() && self.new.is_none() {
+            return Err(GitExternalAuthorityError::EmptyDelta);
+        }
+        if self.old == self.new {
+            return Err(GitExternalAuthorityError::NoOpDelta);
+        }
+        if let Some(old) = &self.old {
+            old.validate_shape()?;
+        }
+        if let Some(new) = &self.new {
+            new.validate_shape()?;
+        }
+        if let (Some(old), Some(new)) = (&self.old, &self.new) {
+            if old.repository_id != new.repository_id {
+                return Err(GitExternalAuthorityError::DeltaRepositoryMismatch {
+                    old: old.repository_id.clone(),
+                    new: new.repository_id.clone(),
+                });
+            }
+            if old.object_format != new.object_format {
+                return Err(GitExternalAuthorityError::DeltaObjectFormatMismatch {
+                    old: old.object_format,
+                    new: new.object_format,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    pub fn validate_for_repository(
+        &self,
+        repository_id: &RepositoryId,
+    ) -> std::result::Result<(), GitExternalAuthorityError> {
+        self.validate()?;
+        let actual = self
+            .repository_id()
+            .expect("a validated authority delta has one side");
+        if actual != repository_id {
+            return Err(GitExternalAuthorityError::EnclosingRepositoryMismatch {
+                actual: actual.clone(),
+                expected: repository_id.clone(),
+            });
+        }
+        Ok(())
+    }
 }
 
 impl GitExternalAuthority {
@@ -541,15 +664,19 @@ impl GitExternalAuthority {
             closure,
             commit_projections,
         };
+        authority.validate_shape()?;
         authority.validate_against_decoded(&decoded)?;
         Ok(authority)
     }
 
-    /// Independently re-load, decode, and validate every authority field.
-    pub fn validate_with_body_loader<L: GitObjectBodyLoader>(
-        &self,
-        body_loader: &mut L,
-    ) -> std::result::Result<(), GitExternalAuthorityError> {
+    /// Validate every authority field that can be proven without loading CAS
+    /// bodies.
+    ///
+    /// This covers schema, canonical ordering, typed closure reachability,
+    /// commit projection identity, and material-HEAD derivation. Use
+    /// [`Self::validate_with_body_loader`] when raw bodies are available to
+    /// additionally prove every record and decoded dependency.
+    pub fn validate_shape(&self) -> std::result::Result<(), GitExternalAuthorityError> {
         if self.schema_version != GIT_EXTERNAL_AUTHORITY_SCHEMA_VERSION {
             return Err(GitExternalAuthorityError::UnsupportedSchema {
                 actual: self.schema_version,
@@ -571,6 +698,16 @@ impl GitExternalAuthority {
             return Err(GitExternalAuthorityError::NonCanonicalRoots);
         }
         validate_closure_structure(self.object_format, &self.closure)?;
+        let declared = decoded_from_manifest(self)?;
+        self.validate_against_decoded(&declared)
+    }
+
+    /// Independently re-load, decode, and validate every authority field.
+    pub fn validate_with_body_loader<L: GitObjectBodyLoader>(
+        &self,
+        body_loader: &mut L,
+    ) -> std::result::Result<(), GitExternalAuthorityError> {
+        self.validate_shape()?;
 
         let records = self
             .closure
@@ -615,6 +752,52 @@ impl GitExternalAuthority {
         }
         Ok(())
     }
+}
+
+fn decoded_from_manifest(
+    authority: &GitExternalAuthority,
+) -> std::result::Result<BTreeMap<ExternalObjectId, DecodedGitObject>, GitExternalAuthorityError> {
+    let mut decoded = BTreeMap::new();
+    for entry in &authority.closure.objects {
+        let commit_projection = if entry.record.object.kind == ExternalObjectKind::Commit {
+            let Some((tree, parents)) = entry.dependencies.split_first() else {
+                return Err(GitExternalAuthorityError::NonCanonicalDependencies {
+                    object: entry.record.object,
+                });
+            };
+            if !matches!(tree.kind, GitObjectDependencyKind::CommitTree) {
+                return Err(GitExternalAuthorityError::NonCanonicalDependencies {
+                    object: entry.record.object,
+                });
+            }
+            let parent_oids = parents
+                .iter()
+                .map(|parent| parent.target.oid)
+                .collect::<Vec<_>>();
+            Some(GitCommitProjection {
+                commit_oid: entry.record.object.oid,
+                raw_tree_oid: tree.target.oid,
+                parent_oids: parent_oids.clone(),
+                canonical_identity: compute_commit_identity(
+                    authority.object_format,
+                    &entry.record,
+                    tree.target.oid,
+                    &parent_oids,
+                )?,
+            })
+        } else {
+            None
+        };
+        decoded.insert(
+            entry.record.object,
+            DecodedGitObject {
+                object: entry.record.object,
+                dependencies: entry.dependencies.clone(),
+                commit_projection,
+            },
+        );
+    }
+    Ok(decoded)
 }
 
 /// Decode and validate one exact raw object without repository or filesystem
@@ -2142,6 +2325,96 @@ mod tests {
         assert!(matches!(
             validation_error(&identity, &fixture.bodies),
             GitExternalAuthorityError::NonCanonicalCommitProjections
+        ));
+    }
+
+    #[test]
+    fn authority_delta_initial_update_removal_and_inverse_are_exact() {
+        let fixture = fixture(GitObjectFormat::Sha1);
+        let old = fixture.authority;
+        let mut loader = fixture.bodies.clone();
+        let new = GitExternalAuthority::from_raw_parts(
+            old.repository_id.clone(),
+            old.object_format,
+            old.raw_refs.clone(),
+            direct(fixture.head.object),
+            fixture.records,
+            &mut loader,
+        )
+        .unwrap();
+        assert_ne!(old, new);
+
+        let initialize = GitExternalAuthorityDelta::initialize(old.clone());
+        initialize.validate().unwrap();
+        assert_eq!(
+            initialize.repository_id(),
+            Some(&RepositoryId::new("repo").unwrap())
+        );
+        let removal = initialize.inverse();
+        assert_eq!(removal, GitExternalAuthorityDelta::remove(old.clone()));
+        removal.validate().unwrap();
+        assert_eq!(removal.inverse(), initialize);
+
+        let update = GitExternalAuthorityDelta::update(old.clone(), new.clone());
+        update.validate().unwrap();
+        update
+            .validate_for_repository(&RepositoryId::new("repo").unwrap())
+            .unwrap();
+        let inverse = update.inverse();
+        inverse.validate().unwrap();
+        assert_eq!(
+            inverse,
+            GitExternalAuthorityDelta::update(new.clone(), old.clone())
+        );
+        assert_eq!(inverse.inverse(), update);
+
+        let encoded = serde_json::to_vec(&update).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<GitExternalAuthorityDelta>(&encoded).unwrap(),
+            update
+        );
+    }
+
+    #[test]
+    fn authority_delta_rejects_empty_noop_mixed_identity_and_malformed_sides() {
+        let sha1 = fixture(GitObjectFormat::Sha1).authority;
+        let sha256 = fixture(GitObjectFormat::Sha256).authority;
+
+        assert!(matches!(
+            GitExternalAuthorityDelta {
+                old: None,
+                new: None,
+            }
+            .validate(),
+            Err(GitExternalAuthorityError::EmptyDelta)
+        ));
+        assert!(matches!(
+            GitExternalAuthorityDelta::update(sha1.clone(), sha1.clone()).validate(),
+            Err(GitExternalAuthorityError::NoOpDelta)
+        ));
+
+        let mut other_repository = sha1.clone();
+        other_repository.repository_id = RepositoryId::new("other").unwrap();
+        assert!(matches!(
+            GitExternalAuthorityDelta::update(sha1.clone(), other_repository).validate(),
+            Err(GitExternalAuthorityError::DeltaRepositoryMismatch { .. })
+        ));
+        assert!(matches!(
+            GitExternalAuthorityDelta::update(sha1.clone(), sha256).validate(),
+            Err(GitExternalAuthorityError::DeltaObjectFormatMismatch { .. })
+        ));
+        assert!(matches!(
+            GitExternalAuthorityDelta::initialize(sha1.clone())
+                .validate_for_repository(&RepositoryId::new("other").unwrap()),
+            Err(GitExternalAuthorityError::EnclosingRepositoryMismatch { .. })
+        ));
+
+        let mut malformed = sha1;
+        malformed.commit_projections[0].canonical_identity =
+            GitCommitCanonicalIdentity::from_hash(Hash256::from_bytes([0xee; 32]));
+        assert!(matches!(
+            GitExternalAuthorityDelta::initialize(malformed).validate(),
+            Err(GitExternalAuthorityError::NonCanonicalCommitProjections)
         ));
     }
 

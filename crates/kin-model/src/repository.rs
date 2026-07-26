@@ -11,12 +11,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::{
     identity::canonical_json_bytes, validate_semantic_change_id, AdmissionScanToken, AuthorId,
     DefaultRefMutation, EffectiveAdmissionPolicyStamp, ExternalChangeAlias, ExternalObjectKind,
-    ExternalObjectRecord, FrozenLocalOverlayDelta, GitObjectId, Hash256, ModelError, OperationId,
-    RefMutation, RefName, RefTarget, RepositoryId, RepositoryRef, ResolvedTree, Result,
-    SemanticChange, SemanticChangeId, SharedAdmissionPolicy, TreeDelta, WorkspaceHead, WorkspaceId,
+    ExternalObjectRecord, FrozenLocalOverlayDelta, GitExternalAuthorityDelta, GitObjectId, Hash256,
+    ModelError, OperationId, RefMutation, RefName, RefTarget, RepositoryId, RepositoryRef,
+    ResolvedTree, Result, SemanticChange, SemanticChangeId, SharedAdmissionPolicy, TreeDelta,
+    WorkspaceHead, WorkspaceId,
 };
 
-pub const REPOSITORY_TRANSACTION_SCHEMA_VERSION: u32 = 1;
+pub const REPOSITORY_TRANSACTION_SCHEMA_VERSION: u32 = 2;
 pub const REPOSITORY_ROOT_SCHEMA_VERSION: u32 = 1;
 
 /// One versioned digest in the repository authority root bundle.
@@ -556,10 +557,13 @@ pub struct RepositoryOperationRecord {
     pub operation_id: OperationId,
     pub repository_id: RepositoryId,
     /// Canonical identity of the complete committed transaction, including
-    /// history, raw-object descriptors, aliases, refs, workspace, and policy.
+    /// history, raw-object descriptors, Git authority, aliases, refs,
+    /// workspace, and policy.
     pub transaction_hash: Hash256,
     pub actor: AuthorId,
     pub committed_at: crate::Timestamp,
+    /// Exact authority transition retained in the append-only audit record.
+    pub git_authority_delta: Option<GitExternalAuthorityDelta>,
     pub ref_mutations: Vec<RefMutation>,
     pub default_ref_mutation: Option<DefaultRefMutation>,
     pub workspace_mutation: Option<WorkspaceMutation>,
@@ -575,6 +579,7 @@ struct RepositoryOperationIdentity<'a> {
     transaction_hash: Hash256,
     actor: &'a AuthorId,
     committed_at: &'a crate::Timestamp,
+    git_authority_delta: &'a Option<GitExternalAuthorityDelta>,
     ref_mutations: &'a [RefMutation],
     default_ref_mutation: &'a Option<DefaultRefMutation>,
     workspace_mutation: &'a Option<WorkspaceMutation>,
@@ -598,6 +603,15 @@ impl RepositoryOperationRecord {
                 "repository operation roots must advance generation from {} to {}",
                 self.roots_before.generation, next_generation
             )));
+        }
+        if let Some(delta) = &self.git_authority_delta {
+            delta
+                .validate_for_repository(&self.repository_id)
+                .map_err(|error| {
+                    ModelError::InvalidOperation(format!(
+                        "invalid Git external-authority operation delta: {error}"
+                    ))
+                })?;
         }
         let mut refs = BTreeSet::new();
         for mutation in &self.ref_mutations {
@@ -636,13 +650,14 @@ impl RepositoryOperationRecord {
             workspace.tree_deltas.sort_by_key(TreeDelta::artifact_id);
         }
         hash_serialized(
-            b"kin-repository-operation-v1\0",
+            b"kin-repository-operation-v2\0",
             &RepositoryOperationIdentity {
                 operation_id: canonical.operation_id,
                 repository_id: &canonical.repository_id,
                 transaction_hash: canonical.transaction_hash,
                 actor: &canonical.actor,
                 committed_at: &canonical.committed_at,
+                git_authority_delta: &canonical.git_authority_delta,
                 ref_mutations: &canonical.ref_mutations,
                 default_ref_mutation: &canonical.default_ref_mutation,
                 workspace_mutation: &canonical.workspace_mutation,
@@ -664,6 +679,9 @@ pub struct RepositoryTransaction {
     pub actor: AuthorId,
     pub reason: String,
     pub external_objects: Vec<ExternalObjectRecord>,
+    /// Exact compare-and-swap of repository-scoped Git authority. Closure
+    /// records may already exist in CAS and need not be repeated above.
+    pub git_authority_delta: Option<GitExternalAuthorityDelta>,
     pub changes: Vec<SemanticChange>,
     pub aliases: Vec<ExternalChangeAlias>,
     pub ref_mutations: Vec<RefMutation>,
@@ -695,6 +713,7 @@ impl RepositoryTransaction {
             ));
         }
         if self.external_objects.is_empty()
+            && self.git_authority_delta.is_none()
             && self.changes.is_empty()
             && self.aliases.is_empty()
             && self.ref_mutations.is_empty()
@@ -733,6 +752,16 @@ impl RepositoryTransaction {
                     object.object.oid
                 )));
             }
+        }
+
+        if let Some(delta) = &self.git_authority_delta {
+            delta
+                .validate_for_repository(&self.repository_id)
+                .map_err(|error| {
+                    ModelError::InvalidOperation(format!(
+                        "invalid Git external-authority transaction delta: {error}"
+                    ))
+                })?;
         }
 
         let mut aliases = BTreeMap::new();
@@ -882,7 +911,7 @@ impl RepositoryTransaction {
         if let Some(workspace) = &mut canonical.workspace_mutation {
             workspace.tree_deltas.sort_by_key(TreeDelta::artifact_id);
         }
-        hash_serialized(b"kin-repository-transaction-v1\0", &canonical)
+        hash_serialized(b"kin-repository-transaction-v2\0", &canonical)
     }
 }
 
@@ -994,14 +1023,33 @@ fn hash_serialized(domain: &[u8], value: &impl Serialize) -> Result<Hash256> {
 
 #[cfg(test)]
 mod tests {
+    use std::convert::Infallible;
+
+    use sha1::Sha1;
+
     use super::*;
     use crate::{
         AdmissionPolicyStamp, AdmissionRuleSource, AdmissionRuleSourceKind, ArtifactId,
-        FrozenLocalOverlay, LocalOverlayHash, LocalOverlayStamp, LocatedEntry, RefExpectation,
-        RefUpdatePolicy, RepoPath, SharedAdmissionPolicy, TreeEntry,
+        ExternalObjectId, FrozenLocalOverlay, GitExternalAuthority, GitObjectBodyLoader,
+        GitObjectFormat, GitRawRef, GitRawTarget, LocalOverlayHash, LocalOverlayStamp,
+        LocatedEntry, RefExpectation, RefUpdatePolicy, RepoPath, SharedAdmissionPolicy, TreeEntry,
         ADMISSION_POLICY_SEMANTICS_VERSION,
     };
     use uuid::Uuid;
+
+    #[derive(Default)]
+    struct TestBodies(BTreeMap<Hash256, Vec<u8>>);
+
+    impl GitObjectBodyLoader for TestBodies {
+        type Error = Infallible;
+
+        fn load_body(
+            &mut self,
+            body_hash: &Hash256,
+        ) -> std::result::Result<Option<Vec<u8>>, Self::Error> {
+            Ok(self.0.get(body_hash).cloned())
+        }
+    }
 
     fn root(byte: u8) -> AuthorityRoot {
         AuthorityRoot::new(
@@ -1021,6 +1069,42 @@ mod tests {
             replication: root(5),
             local_state: root(6),
         }
+    }
+
+    fn blob_git_authority(repository_id: RepositoryId, body: &[u8]) -> GitExternalAuthority {
+        let mut envelope = format!("blob {}\0", body.len()).into_bytes();
+        envelope.extend_from_slice(body);
+        let digest = Sha1::digest(&envelope);
+        let mut oid = [0_u8; 20];
+        oid.copy_from_slice(&digest);
+        let object = ExternalObjectId::new(ExternalObjectKind::Blob, GitObjectId::sha1(oid));
+        let record =
+            ExternalObjectRecord::from_raw(ExternalObjectKind::Blob, object.oid, body).unwrap();
+        let mut bodies = TestBodies::default();
+        bodies.0.insert(record.body_hash, body.to_vec());
+        let main = RefName::branch(b"main").unwrap();
+        GitExternalAuthority::from_raw_parts(
+            repository_id,
+            GitObjectFormat::Sha1,
+            vec![GitRawRef {
+                name: main.clone(),
+                target: GitRawTarget::Direct { object },
+            }],
+            GitRawTarget::Symbolic { target: main },
+            vec![record],
+            &mut bodies,
+        )
+        .unwrap()
+    }
+
+    fn authority_only_transaction(delta: GitExternalAuthorityDelta) -> RepositoryTransaction {
+        let mut transaction = workspace_transaction();
+        transaction.reason = "replace external Git authority atomically".to_string();
+        transaction.git_authority_delta = Some(delta);
+        transaction.workspace_mutation = None;
+        transaction.local_overlay_delta = None;
+        transaction.admission_scan_token = None;
+        transaction
     }
 
     #[test]
@@ -1156,6 +1240,7 @@ mod tests {
             actor: AuthorId::new("actor"),
             reason: "capture exact workspace".to_string(),
             external_objects: Vec::new(),
+            git_authority_delta: None,
             changes: Vec::new(),
             aliases: Vec::new(),
             ref_mutations: Vec::new(),
@@ -1360,6 +1445,7 @@ mod tests {
                     .unwrap()
                     .with_timezone(&chrono::Utc),
             ),
+            git_authority_delta: None,
             ref_mutations: Vec::new(),
             default_ref_mutation: None,
             workspace_mutation: original.workspace_mutation,
@@ -1549,6 +1635,137 @@ mod tests {
     }
 
     #[test]
+    fn git_authority_delta_is_an_atomic_transaction_mutation_without_readding_cas_records() {
+        assert_eq!(REPOSITORY_TRANSACTION_SCHEMA_VERSION, 2);
+        let repository_id = RepositoryId::new("repo").unwrap();
+        let old = blob_git_authority(repository_id.clone(), b"services:\n  old: {}\n");
+        let new = blob_git_authority(repository_id, b"services:\n  new: {}\n");
+
+        let initial =
+            authority_only_transaction(GitExternalAuthorityDelta::initialize(old.clone()));
+        assert!(initial.external_objects.is_empty());
+        assert!(!old.closure.objects.is_empty());
+        initial.validate().unwrap();
+
+        let update =
+            authority_only_transaction(GitExternalAuthorityDelta::update(old.clone(), new.clone()));
+        update.validate().unwrap();
+        let update_hash = update.transaction_hash().unwrap();
+        assert_eq!(
+            update_hash.to_string(),
+            "e97097078bd8df6540e63965765f581e9576d1c7bbecb04452ce76b78f870964",
+            "repository transaction v2 identity is schema-pinned"
+        );
+        assert_ne!(initial.transaction_hash().unwrap(), update_hash);
+
+        let removal = authority_only_transaction(GitExternalAuthorityDelta::remove(new.clone()));
+        removal.validate().unwrap();
+        assert_ne!(
+            update.transaction_hash().unwrap(),
+            removal.transaction_hash().unwrap()
+        );
+
+        let inverse = authority_only_transaction(GitExternalAuthorityDelta::remove(old).inverse());
+        inverse.validate().unwrap();
+        assert_ne!(
+            removal.transaction_hash().unwrap(),
+            inverse.transaction_hash().unwrap()
+        );
+    }
+
+    #[test]
+    fn transaction_schema_and_repository_identity_fail_closed_for_git_authority() {
+        let authority = blob_git_authority(RepositoryId::new("repo").unwrap(), b"authority body");
+        let transaction =
+            authority_only_transaction(GitExternalAuthorityDelta::initialize(authority.clone()));
+        transaction.validate().unwrap();
+
+        let mut wrong_repository = transaction.clone();
+        wrong_repository.repository_id = RepositoryId::new("other").unwrap();
+        let error = wrong_repository.validate().unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("does not match enclosing repository"));
+
+        let mut no_op = transaction.clone();
+        no_op.git_authority_delta = Some(GitExternalAuthorityDelta::update(
+            authority.clone(),
+            authority,
+        ));
+        assert!(no_op.validate().unwrap_err().to_string().contains("no-op"));
+
+        let mut v1 = transaction.clone();
+        v1.schema_version = 1;
+        assert!(v1
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported repository transaction version 1"));
+
+        let value = serde_json::to_value(&transaction).unwrap();
+        assert!(value.get("git_authority_delta").is_some());
+        let schema = serde_json::to_value(schemars::schema_for!(RepositoryTransaction)).unwrap();
+        assert!(schema.pointer("/properties/git_authority_delta").is_some());
+    }
+
+    #[test]
+    fn operation_record_validates_and_binds_the_exact_git_authority_delta() {
+        let repository_id = RepositoryId::new("repo").unwrap();
+        let old = blob_git_authority(repository_id.clone(), b"old");
+        let new = blob_git_authority(repository_id.clone(), b"new");
+        let delta = GitExternalAuthorityDelta::update(old.clone(), new.clone());
+        let transaction = authority_only_transaction(delta.clone());
+        let transaction_hash = transaction.transaction_hash().unwrap();
+        let mut roots_after = roots();
+        roots_after.generation = 8;
+        let operation = RepositoryOperationRecord {
+            operation_id: transaction.operation_id,
+            repository_id,
+            transaction_hash,
+            actor: transaction.actor,
+            committed_at: crate::Timestamp::from(
+                chrono::DateTime::parse_from_rfc3339("2026-01-02T03:04:05Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+            ),
+            git_authority_delta: Some(delta),
+            ref_mutations: Vec::new(),
+            default_ref_mutation: None,
+            workspace_mutation: None,
+            local_overlay_delta: None,
+            roots_before: roots(),
+            roots_after,
+        };
+        operation.validate().unwrap();
+        let identity = operation.identity_hash().unwrap();
+        assert_eq!(
+            identity.to_string(),
+            "6ac1f83097659543be35696fd78429b778b68bc51bb2bc90ce8d3760078cbd85",
+            "repository operation v2 identity is schema-pinned"
+        );
+
+        let mut changed = operation.clone();
+        changed.git_authority_delta = Some(GitExternalAuthorityDelta::remove(new.clone()));
+        assert_ne!(changed.identity_hash().unwrap(), identity);
+
+        let mut wrong_repository = operation.clone();
+        wrong_repository.repository_id = RepositoryId::new("other").unwrap();
+        assert!(wrong_repository
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("does not match enclosing repository"));
+
+        let mut malformed = operation;
+        malformed.git_authority_delta = Some(GitExternalAuthorityDelta::update(old.clone(), old));
+        assert!(malformed
+            .identity_hash()
+            .unwrap_err()
+            .to_string()
+            .contains("no-op"));
+    }
+
+    #[test]
     fn operation_identity_excludes_circular_roots_and_canonicalizes_ref_order() {
         let target =
             RefTarget::change(SemanticChangeId::from_hash(Hash256::from_bytes([0x81; 32])));
@@ -1576,6 +1793,7 @@ mod tests {
                     .unwrap()
                     .with_timezone(&chrono::Utc),
             ),
+            git_authority_delta: None,
             ref_mutations: vec![second, first],
             default_ref_mutation: None,
             workspace_mutation: None,
@@ -1606,6 +1824,7 @@ mod tests {
             actor: AuthorId::new("actor"),
             reason: "test".to_string(),
             external_objects: Vec::new(),
+            git_authority_delta: None,
             changes: Vec::new(),
             aliases: Vec::new(),
             ref_mutations: vec![
