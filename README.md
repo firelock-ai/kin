@@ -171,10 +171,10 @@ never answers Kin runtime queries or repairs missing graph truth.
   sibling archive.
   Credential-free remote and branch-tracking settings sealed during import are
   restored without copying ambient Git configuration.
-  `--purge-metadata --yes` permanently removes that archive only after the same
-  verification and handoff. Capability-anchored eject is currently available
-  on Unix hosts; Windows fails before namespace mutation until an equally
-  durable retained-handle transaction is available.
+  Kin intentionally retains that archive until the operator has independently
+  backed up and removes it. Capability-anchored eject is currently available on
+  Unix hosts; Windows fails before namespace mutation until an equally durable
+  retained-handle transaction is available.
 
 This lets a team migrate an existing repository without giving up its editor,
 compiler, build system, or Git interoperability while Kin becomes authoritative.

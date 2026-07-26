@@ -100,9 +100,6 @@ enum Command {
         /// Skip the typed "eject" confirmation.
         #[arg(long)]
         yes: bool,
-        /// Permanently delete the detached metadata archive after the atomic move.
-        #[arg(long, requires = "yes")]
-        purge_metadata: bool,
     },
     /// Show downstream impact of an entity
     Impact {
@@ -1923,10 +1920,7 @@ fn main() -> Result<()> {
                     ),
                 },
                 Command::Diff { base, head, json } => commands::diff::run(base, head, json),
-                Command::Eject {
-                    yes,
-                    purge_metadata,
-                } => commands::eject::run(yes, purge_metadata).await,
+                Command::Eject { yes } => commands::eject::run(yes).await,
                 Command::Impact {
                     entity,
                     depth,

@@ -163,7 +163,8 @@
       "acceptance_spec": [
         "verify every projected path, kind, mode, symlink target, and blob against one durable workspace generation",
         "stop graph projection, freeze the same authority roots, and atomically detach the locked .kin namespace only after exact replacement Git is durable",
-        "restore only the credential-free Git remote, tracking, refspec, and push configuration sealed during exact admission"
+        "restore only the credential-free Git remote, tracking, refspec, and push configuration sealed during exact admission",
+        "retain detached Kin authority and any previous Git directory in a recoverable sibling archive; recursive purge is not an eject product surface"
       ],
       "evidence_tests": [
         "crates/kin-cli/tests/eject_round_trip.rs"

@@ -345,7 +345,11 @@ fn eject_refuses_a_projection_that_differs_from_current_graph_ref() {
     assert!(metadata_archives(&repo).is_empty());
 
     fs::write(repo.join("compose.yaml"), original).unwrap();
-    run_kin_ok(&repo, &registry, &["eject", "--yes", "--purge-metadata"]);
+    run_kin_ok(&repo, &registry, &["eject", "--yes"]);
+    let archives = metadata_archives(&repo);
+    assert_eq!(archives.len(), 1);
+    assert!(archives[0].join("kin").is_dir());
+    assert!(archives[0].join("previous-git").exists());
 }
 
 #[test]
@@ -417,7 +421,7 @@ fn native_unborn_repository_ejects_to_an_unborn_ordinary_git_repository() {
     fs::create_dir(&repo).unwrap();
 
     run_kin_ok(&repo, &registry, &["init", "."]);
-    run_kin_ok(&repo, &registry, &["eject", "--yes", "--purge-metadata"]);
+    run_kin_ok(&repo, &registry, &["eject", "--yes"]);
 
     assert!(!repo.join(".kin").exists());
     assert!(repo.join(".git").is_dir());
@@ -448,7 +452,9 @@ fn native_unborn_repository_ejects_to_an_unborn_ordinary_git_repository() {
             && object_counts.lines().any(|line| line == "in-pack: 0"),
         "unborn eject must not invent unreachable Git objects:\n{object_counts}"
     );
-    assert!(metadata_archives(&repo).is_empty());
+    let archives = metadata_archives(&repo);
+    assert_eq!(archives.len(), 1);
+    assert!(archives[0].join("kin").is_dir());
 }
 
 #[test]
@@ -475,11 +481,14 @@ fn exact_git_repo_ejects_without_language_support() {
         .collect::<BTreeMap<_, _>>();
 
     run_kin_ok(&repo, &registry, &["init", "."]);
-    run_kin_ok(&repo, &registry, &["eject", "--yes", "--purge-metadata"]);
+    run_kin_ok(&repo, &registry, &["eject", "--yes"]);
 
     assert!(!repo.join(".kin").exists());
     assert!(repo.join(".git").exists());
-    assert!(metadata_archives(&repo).is_empty());
+    let archives = metadata_archives(&repo);
+    assert_eq!(archives.len(), 1);
+    assert!(archives[0].join("kin").is_dir());
+    assert!(archives[0].join("previous-git").exists());
     for (path, expected) in before {
         assert_eq!(entry_state(&repo.join(path)), expected);
     }
@@ -557,5 +566,10 @@ fn legacy_snapshot_restore_flag_is_not_a_product_surface() {
     assert_refused(&output, "unexpected argument");
     assert!(repo.join(".kin").exists());
 
-    run_kin_ok(&repo, &registry, &["eject", "--yes", "--purge-metadata"]);
+    let output = run_kin(&repo, &registry, &["eject", "--purge-metadata", "--yes"]);
+    assert_refused(&output, "unexpected argument");
+    assert!(repo.join(".kin").exists());
+    assert!(metadata_archives(&repo).is_empty());
+
+    run_kin_ok(&repo, &registry, &["eject", "--yes"]);
 }
