@@ -34,21 +34,12 @@ pub struct SessionWorkspaceResponse {
 }
 
 pub(crate) async fn create_session_workspace(
-    layout: &kin_core::KinLayout,
+    binding: &super::session_process::VerifiedRepoBinding,
     session_dir: &std::path::Path,
     strategy: Option<MaterializeStrategy>,
     scope: Option<&str>,
 ) -> Result<MaterializedWorkspace> {
-    let base_url = match std::env::var("KIN_DAEMON_URL")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-    {
-        Some(base_url) => base_url,
-        None => crate::daemon_client::resolve_daemon_url(layout)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("kin daemon is required"))?,
-    };
-    let client = crate::daemon_client::DaemonClient::from_base_url(base_url)?;
+    let client = binding.client(None)?;
     let response = client
         .session_workspace(&SessionWorkspaceRequest {
             session_dir: session_dir.display().to_string(),
@@ -56,18 +47,69 @@ pub(crate) async fn create_session_workspace(
             scope: scope.map(str::to_string),
         })
         .await?;
+    validate_materialized_workspace_response(response, session_dir)
+}
+
+fn validate_materialized_workspace_response(
+    response: SessionWorkspaceResponse,
+    session_dir: &Path,
+) -> Result<MaterializedWorkspace> {
     let strategy = response
         .strategy
         .parse::<MaterializeStrategy>()
         .map_err(|error| anyhow::anyhow!("{}", error))?;
-    let source_kind = match response.source_kind.as_str() {
-        "blob-tree" => MaterializationSourceKind::BlobTree,
-        "filesystem" => MaterializationSourceKind::Filesystem,
-        other => anyhow::bail!("daemon returned unknown materialization source: {other}"),
-    };
+    if response.source_kind != "blob-tree" {
+        anyhow::bail!(
+            "daemon returned non-graph materialization source `{}`; session launch requires blob-tree authority",
+            response.source_kind
+        );
+    }
+    let source_kind = MaterializationSourceKind::BlobTree;
+    let response_root = std::path::PathBuf::from(&response.root);
+    if response_root != session_dir {
+        anyhow::bail!(
+            "daemon returned session root {}, expected {}",
+            response_root.display(),
+            session_dir.display()
+        );
+    }
+    let metadata = std::fs::symlink_metadata(&response_root).map_err(|error| {
+        anyhow::anyhow!(
+            "inspect daemon-returned session root {}: {}",
+            response_root.display(),
+            error
+        )
+    })?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        anyhow::bail!(
+            "daemon-returned session root is not a real directory: {}",
+            response_root.display()
+        );
+    }
+    let expected_canonical = std::fs::canonicalize(session_dir).map_err(|error| {
+        anyhow::anyhow!(
+            "canonicalize requested session root {}: {}",
+            session_dir.display(),
+            error
+        )
+    })?;
+    let response_canonical = std::fs::canonicalize(&response_root).map_err(|error| {
+        anyhow::anyhow!(
+            "canonicalize daemon-returned session root {}: {}",
+            response_root.display(),
+            error
+        )
+    })?;
+    if response_canonical != expected_canonical {
+        anyhow::bail!(
+            "daemon returned canonical session root {}, expected {}",
+            response_canonical.display(),
+            expected_canonical.display()
+        );
+    }
 
     Ok(MaterializedWorkspace::from_existing(
-        std::path::PathBuf::from(response.root),
+        response_root,
         strategy,
         source_kind,
     ))
@@ -1324,6 +1366,75 @@ mod tests {
         SemanticChange, SemanticChangeId,
     };
     use std::fs;
+
+    #[test]
+    fn daemon_workspace_response_requires_graph_source_and_exact_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_dir = dir.path().join("session");
+        fs::create_dir(&session_dir).unwrap();
+
+        let filesystem_error = validate_materialized_workspace_response(
+            SessionWorkspaceResponse {
+                root: session_dir.display().to_string(),
+                strategy: "copy".to_string(),
+                source_kind: "filesystem".to_string(),
+            },
+            &session_dir,
+        )
+        .unwrap_err();
+        assert!(filesystem_error
+            .to_string()
+            .contains("requires blob-tree authority"));
+
+        let wrong_root = dir.path().join("other-session");
+        fs::create_dir(&wrong_root).unwrap();
+        let root_error = validate_materialized_workspace_response(
+            SessionWorkspaceResponse {
+                root: wrong_root.display().to_string(),
+                strategy: "copy".to_string(),
+                source_kind: "blob-tree".to_string(),
+            },
+            &session_dir,
+        )
+        .unwrap_err();
+        assert!(root_error.to_string().contains("expected"));
+
+        let workspace = validate_materialized_workspace_response(
+            SessionWorkspaceResponse {
+                root: session_dir.display().to_string(),
+                strategy: "copy".to_string(),
+                source_kind: "blob-tree".to_string(),
+            },
+            &session_dir,
+        )
+        .unwrap();
+        assert_eq!(workspace.root, session_dir);
+        assert_eq!(workspace.source_kind(), MaterializationSourceKind::BlobTree);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_workspace_response_rejects_a_symlink_root() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("outside");
+        let session_dir = dir.path().join("session");
+        fs::create_dir(&target).unwrap();
+        symlink(&target, &session_dir).unwrap();
+
+        let error = validate_materialized_workspace_response(
+            SessionWorkspaceResponse {
+                root: session_dir.display().to_string(),
+                strategy: "copy".to_string(),
+                source_kind: "blob-tree".to_string(),
+            },
+            &session_dir,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("not a real directory"));
+    }
 
     fn commit_id(byte: u8) -> SemanticChangeId {
         SemanticChangeId::from_hash(Hash256::from_bytes([byte; 32]))

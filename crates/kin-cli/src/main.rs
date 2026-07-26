@@ -583,11 +583,13 @@ enum Command {
         action: VerifyAction,
     },
     /// Run a command in a graph-backed session workspace
-    #[command(visible_alias = "run")]
     Exec {
         /// Command to run (put kin flags before it: `kin exec --keep -- npm test`)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         command: Vec<String>,
+        /// Interpret the command through the platform shell instead of preserving argv boundaries
+        #[arg(long)]
+        shell: bool,
         /// Keep the session workspace after the run and defer reconcile
         #[arg(long)]
         keep: bool,
@@ -774,7 +776,7 @@ enum Command {
     },
     /// Launch an editor in a materialized session workspace
     Open {
-        /// Editor to launch: code, cursor, or any editor command
+        /// Editor to launch: code or cursor
         editor: String,
         /// In native mode, block filesystem discovery commands and require Kin discovery
         #[arg(long)]
@@ -782,9 +784,6 @@ enum Command {
         /// In native mode, block both filesystem discovery and direct file reads
         #[arg(long, conflicts_with = "restrict_discovery")]
         restrict_filesystem: bool,
-        /// Wait for the editor to exit, then reconcile and clean up automatically
-        #[arg(long)]
-        wait: bool,
     },
     /// Launch an assistant with Kin guidance injected
     With {
@@ -2557,11 +2556,12 @@ fn main() -> Result<()> {
                 },
                 Command::Exec {
                     command,
+                    shell,
                     keep,
                     discard,
                     strategy,
                     scope,
-                } => commands::exec::run_full(command, keep, discard, strategy, scope).await,
+                } => commands::exec::run_full(command, shell, keep, discard, strategy, scope).await,
                 Command::Telemetry { action } => match action {
                     TelemetryAction::Status => commands::telemetry::run_status().await,
                     TelemetryAction::Consent => commands::telemetry::run_consent().await,
@@ -2816,10 +2816,7 @@ fn main() -> Result<()> {
                     editor,
                     restrict_discovery,
                     restrict_filesystem,
-                    wait,
-                } => {
-                    commands::open::run(editor, restrict_discovery, restrict_filesystem, wait).await
-                }
+                } => commands::open::run(editor, restrict_discovery, restrict_filesystem).await,
                 Command::Reconcile { session, cleanup } => {
                     commands::reconcile::run(session, cleanup).await
                 }
@@ -3159,6 +3156,52 @@ mod tests {
                 "--ack-restart",
             ])
             .is_err());
+        });
+    }
+
+    #[test]
+    fn exec_shell_mode_is_explicit_and_direct_mode_preserves_cli_parts() {
+        on_cli_test_stack(|| {
+            let direct = Cli::try_parse_from([
+                "kin",
+                "exec",
+                "--",
+                "printf",
+                "value with spaces",
+                "literal;semicolon",
+            ])
+            .unwrap();
+            match direct.command {
+                Command::Exec { command, shell, .. } => {
+                    assert!(!shell);
+                    assert_eq!(
+                        command,
+                        vec!["printf", "value with spaces", "literal;semicolon"]
+                    );
+                }
+                _ => panic!("expected exec command"),
+            }
+
+            let shell = Cli::try_parse_from([
+                "kin",
+                "exec",
+                "--shell",
+                "--",
+                "printf '%s' \"$KIN_REPO_ID\"",
+            ])
+            .unwrap();
+            match shell.command {
+                Command::Exec { command, shell, .. } => {
+                    assert!(shell);
+                    assert_eq!(command, vec!["printf '%s' \"$KIN_REPO_ID\""]);
+                }
+                _ => panic!("expected exec command"),
+            }
+
+            assert!(
+                Cli::try_parse_from(["kin", "run", "--", "true"]).is_err(),
+                "the pre-release `run` compatibility alias must not remain"
+            );
         });
     }
 }

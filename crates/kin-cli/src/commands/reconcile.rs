@@ -88,6 +88,32 @@ pub async fn reconcile_session_dir(
     }
 }
 
+/// Reconcile through the endpoint and bearer token already verified for the
+/// session's repository. This path deliberately carries no ambient
+/// `KIN_DAEMON_URL` or `KIN_SESSION_ID` authority.
+pub(crate) async fn reconcile_session_dir_with_binding(
+    binding: &super::session_process::VerifiedRepoBinding,
+    session_dir: &Path,
+) -> Result<ReconcileSummary> {
+    #[cfg(test)]
+    {
+        let snap = crate::backend::open_kindb_snapshot(binding.layout())
+            .map_err(|e| anyhow::anyhow!("failed to open graph store: {}", e))?;
+        reconcile_session_dir_with_snapshot(binding.layout(), session_dir, snap)
+    }
+
+    #[cfg(not(test))]
+    {
+        binding
+            .client(None)?
+            .reconcile(&ReconcileRequest {
+                session_dir: session_dir.to_path_buf(),
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("daemon reconcile failed: {}", e))
+    }
+}
+
 /// Test-only sync variant that opens the snapshot directly (no daemon).
 #[cfg(test)]
 fn reconcile_session_dir_sync(
@@ -870,6 +896,9 @@ fn collect_recursive(dir: &Path, root: &Path, files: &mut Vec<PathBuf>) -> Resul
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
 
+        if dir == root && name_str == super::session_process::SESSION_CONTEXT_FILE {
+            continue;
+        }
         if kin_index::should_skip_dir(&name_str) {
             continue;
         }
@@ -1330,6 +1359,22 @@ mod tests {
 
         assert_eq!(files.len(), 1);
         assert_eq!(files[0], PathBuf::from("src.rs"));
+    }
+
+    #[test]
+    fn collect_relative_files_skips_session_context_at_workspace_root() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(
+            root.join(super::super::session_process::SESSION_CONTEXT_FILE),
+            r#"{"session_id":"private-runtime-state"}"#,
+        )
+        .unwrap();
+        fs::write(root.join("compose.yaml"), "services: {}\n").unwrap();
+
+        let files = collect_relative_files(root).unwrap();
+
+        assert_eq!(files, vec![PathBuf::from("compose.yaml")]);
     }
 
     // --- diff_directories tests ---

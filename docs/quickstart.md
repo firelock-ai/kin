@@ -216,7 +216,7 @@ venv-like execution contract, so you never need to know which files are
 materialized before running the repo:
 
 ```sh
-kin exec -- npm test          # one-shot command (alias: kin run)
+kin exec -- npm test          # one-shot command
 kin shell                     # interactive shell in a session workspace
 kin with --session claude -- "fix the failing test"   # agent inside a session
 ```

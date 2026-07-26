@@ -12,21 +12,34 @@ enum SessionCloseoutStyle {
     Shell,
 }
 
-pub async fn finalize_open_session(layout: &kin_core::KinLayout, session_dir: &Path) -> Result<()> {
+pub(crate) async fn finalize_open_session(
+    binding: &super::session_process::VerifiedRepoBinding,
+    session_dir: &Path,
+    exit_code: i32,
+) -> Result<()> {
     let stdout = std::io::stdout();
     let mut stdout = stdout.lock();
-    finalize_session(layout, session_dir, &mut stdout, SessionCloseoutStyle::Open).await
+    finalize_session(
+        binding,
+        session_dir,
+        exit_code,
+        &mut stdout,
+        SessionCloseoutStyle::Open,
+    )
+    .await
 }
 
-pub async fn finalize_shell_session(
-    layout: &kin_core::KinLayout,
+pub(crate) async fn finalize_shell_session(
+    binding: &super::session_process::VerifiedRepoBinding,
     session_dir: &Path,
+    exit_code: i32,
 ) -> Result<()> {
     let stderr = std::io::stderr();
     let mut stderr = stderr.lock();
     finalize_session(
-        layout,
+        binding,
         session_dir,
+        exit_code,
         &mut stderr,
         SessionCloseoutStyle::Shell,
     )
@@ -39,24 +52,52 @@ pub async fn finalize_open_session_with_writer<W: Write>(
     session_dir: &Path,
     writer: &mut W,
 ) -> Result<()> {
-    finalize_session(layout, session_dir, writer, SessionCloseoutStyle::Open).await
+    let binding = test_binding(layout);
+    finalize_session(&binding, session_dir, 0, writer, SessionCloseoutStyle::Open).await
 }
 
-pub async fn finalize_shell_session_with_writer<W: Write>(
-    layout: &kin_core::KinLayout,
+pub(crate) async fn finalize_shell_session_with_writer<W: Write>(
+    binding: &super::session_process::VerifiedRepoBinding,
     session_dir: &Path,
+    exit_code: i32,
     writer: &mut W,
 ) -> Result<()> {
-    finalize_session(layout, session_dir, writer, SessionCloseoutStyle::Shell).await
+    finalize_session(
+        binding,
+        session_dir,
+        exit_code,
+        writer,
+        SessionCloseoutStyle::Shell,
+    )
+    .await
 }
 
 async fn finalize_session<W: Write>(
-    layout: &kin_core::KinLayout,
+    binding: &super::session_process::VerifiedRepoBinding,
     session_dir: &Path,
+    exit_code: i32,
     writer: &mut W,
     style: SessionCloseoutStyle,
 ) -> Result<()> {
-    match super::reconcile::reconcile_session_dir(layout, session_dir).await {
+    if exit_code != 0 {
+        writeln!(
+            writer,
+            "{} exited unsuccessfully; session workspace kept at: {}",
+            match style {
+                SessionCloseoutStyle::Open => "Editor",
+                SessionCloseoutStyle::Shell => "Shell",
+            },
+            session_dir.display()
+        )?;
+        writeln!(
+            writer,
+            "To reconcile its changes anyway: kin reconcile {} --cleanup",
+            session_id_hint(session_dir)
+        )?;
+        return Ok(());
+    }
+
+    match super::reconcile::reconcile_session_dir_with_binding(binding, session_dir).await {
         Ok(summary) => {
             if summary.change_count == 0 {
                 writeln!(writer, "No session changes detected.")?;
@@ -127,6 +168,19 @@ async fn finalize_session<W: Write>(
     }
 }
 
+#[cfg(test)]
+pub(crate) fn test_binding(
+    layout: &kin_core::KinLayout,
+) -> super::session_process::VerifiedRepoBinding {
+    super::session_process::VerifiedRepoBinding::for_test(
+        layout.clone(),
+        "http://127.0.0.1:9/test",
+        "test-repo",
+        None,
+        std::env::var("PATH").unwrap_or_default(),
+    )
+}
+
 fn cleanup_success_message(style: SessionCloseoutStyle, session_dir: &Path) -> String {
     match style {
         SessionCloseoutStyle::Open => {
@@ -143,4 +197,30 @@ fn session_id_hint(session_dir: &Path) -> String {
         .and_then(|name| name.strip_prefix("session-"))
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| session_dir.display().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn unsuccessful_shell_preserves_workspace_without_reconcile() {
+        let repo = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo.path()).unwrap();
+        let layout = init.layout;
+        let session_dir = layout.root().join("runs/session-failed");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(session_dir.join("compose.yaml"), "services: {}\n").unwrap();
+        let mut output = Vec::new();
+
+        finalize_shell_session_with_writer(&test_binding(&layout), &session_dir, 23, &mut output)
+            .await
+            .unwrap();
+
+        assert!(session_dir.join("compose.yaml").exists());
+        assert!(!repo.path().join("compose.yaml").exists());
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("exited unsuccessfully"));
+        assert!(output.contains("kin reconcile failed --cleanup"));
+    }
 }

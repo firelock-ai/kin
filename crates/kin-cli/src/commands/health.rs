@@ -549,7 +549,7 @@ fn session_runtime_check_for(layout: Option<&kin_core::KinLayout>) -> HealthChec
             "session_runtime",
             "Session runtime",
             HealthStatus::Healthy,
-            "run project tools with `kin exec -- <cmd>` (alias `kin run`), \
+            "run project tools with `kin exec -- <cmd>`, \
              open an interactive env with `kin shell`, \
              launch agents with `kin with --session <assistant>`",
         )
@@ -723,7 +723,7 @@ pub(crate) fn mcp_client_config_paths() -> Vec<(&'static str, &'static str, Path
 
 fn current_health_repo() -> Option<PathBuf> {
     let cwd = env::current_dir().ok()?;
-    let layout = kin_core::KinLayout::discover_with_daemon_url(&cwd, None)?;
+    let layout = kin_core::KinLayout::discover(&cwd)?;
     Some(layout.working_dir().to_path_buf())
 }
 

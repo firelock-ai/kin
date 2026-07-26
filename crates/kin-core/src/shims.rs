@@ -60,7 +60,10 @@ pub fn ensure_shim_dir(layout: &KinLayout) -> Result<PathBuf> {
 /// - `KIN_DISCOVERY_MODE` — optional discovery policy (`redirect` or `deny`)
 /// - `KIN_CONTENT_MODE` — optional content-read policy (`redirect` or `deny`)
 pub fn shim_env_for_root(shim_dir: &Path, target_root: &Path) -> Vec<(String, String)> {
-    let original_path = std::env::var("PATH").unwrap_or_default();
+    let original_path = select_original_path(
+        std::env::var("KIN_ORIGINAL_PATH").ok(),
+        std::env::var("PATH").ok(),
+    );
     let new_path = format!("{}:{}", shim_dir.display(), original_path);
 
     vec![
@@ -71,6 +74,23 @@ pub fn shim_env_for_root(shim_dir: &Path, target_root: &Path) -> Vec<(String, St
         ("KIN_ORIGINAL_PATH".into(), original_path),
         ("PATH".into(), new_path),
     ]
+}
+
+/// Return the caller's host PATH without a previously-installed Kin shim
+/// prefix. Session launchers use this as their baseline before installing
+/// exactly one shim set for the new workspace.
+pub fn unshimmed_path() -> String {
+    select_original_path(
+        std::env::var("KIN_ORIGINAL_PATH").ok(),
+        std::env::var("PATH").ok(),
+    )
+}
+
+fn select_original_path(previous_original: Option<String>, current: Option<String>) -> String {
+    previous_original
+        .filter(|value| !value.is_empty())
+        .or(current)
+        .unwrap_or_default()
 }
 
 /// Build the environment variables needed for shims to function against the
@@ -333,5 +353,20 @@ mod tests {
         let env = shim_env_for_root(&shim_dir, &target_root);
         let source_root = env.iter().find(|(k, _)| k == "KIN_SOURCE_ROOT").unwrap();
         assert_eq!(source_root.1, target_root.to_string_lossy());
+    }
+
+    #[test]
+    fn nested_shim_path_reuses_the_unshimmed_baseline() {
+        assert_eq!(
+            super::select_original_path(
+                Some("/usr/local/bin:/usr/bin".into()),
+                Some("/repo/.kin/shims:/usr/local/bin:/usr/bin".into()),
+            ),
+            "/usr/local/bin:/usr/bin"
+        );
+        assert_eq!(
+            super::select_original_path(None, Some("/opt/bin:/usr/bin".into())),
+            "/opt/bin:/usr/bin"
+        );
     }
 }

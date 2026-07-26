@@ -76,6 +76,7 @@ pub mod secret;
 pub mod security;
 pub mod session_base;
 pub mod session_closeout;
+pub(crate) mod session_process;
 pub mod session_workspace;
 pub mod setup;
 pub mod setup_ledger;

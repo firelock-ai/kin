@@ -196,7 +196,6 @@ pub const OPERATIONAL: &[EnvVarSpec] = &[
     EnvVarSpec { name: "KIN_DAEMON_BIND_HOST", kind: Kind::Str, default: "", sensitivity: Sensitivity::Operational, summary: "host/interface the daemon binds its HTTP endpoint to" },
     EnvVarSpec { name: "KIN_DAEMON_STOP_TIMEOUT_SECS", kind: Kind::Secs, default: "30", sensitivity: Sensitivity::Operational, summary: "ceiling in seconds kin daemon stop waits for a signaled daemon to exit" },
     EnvVarSpec { name: "KIN_DAEMON_REQUIRE_TOKEN", kind: Kind::Bool, default: "true", sensitivity: Sensitivity::Operational, summary: "require a bearer token for all daemon requests; set falsy to opt out" },
-    EnvVarSpec { name: "KIN_DAEMON_ALLOW_EXEC", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Operational, summary: "permit the daemon to run exec commands" },
     EnvVarSpec { name: "KIN_DAEMON_WATCH_PID", kind: Kind::Usize, default: "", sensitivity: Sensitivity::Operational, summary: "pid the daemon watches; it exits when that process dies" },
     EnvVarSpec { name: "KIN_DAEMON_EMBED_BATCH_SIZE", kind: Kind::Usize, default: "", sensitivity: Sensitivity::Operational, summary: "embedding batch size for daemon-side embed passes" },
     EnvVarSpec { name: "KIN_DAEMON_BOOTSTRAP_EXPORT_CONCURRENCY", kind: Kind::Usize, default: "", sensitivity: Sensitivity::Operational, summary: "concurrency for the daemon bootstrap export" },

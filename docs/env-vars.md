@@ -72,7 +72,6 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 
 | Variable | Kind | Default | Sensitivity | Description |
 | --- | --- | --- | --- | --- |
-| `KIN_DAEMON_ALLOW_EXEC` | bool | false | operational | permit the daemon to run exec commands |
 | `KIN_DAEMON_AUTH_TOKEN` | secret | *(unset)* | secret | bearer token for authenticated daemon requests |
 | `KIN_DAEMON_BIN` | path | *(unset)* | operational | override path to the kin-daemon binary |
 | `KIN_DAEMON_BIND_HOST` | string | *(unset)* | operational | host/interface the daemon binds its HTTP endpoint to |
