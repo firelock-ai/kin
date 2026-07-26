@@ -4172,7 +4172,10 @@ mod tests {
     }
 
     fn test_state(layout: KinLayout, working_dir: &std::path::Path) -> DaemonState {
-        assert_eq!(layout.working_dir(), working_dir);
+        let canonical_working_dir = working_dir
+            .canonicalize()
+            .expect("daemon fixture working directory must canonicalize");
+        assert_eq!(layout.working_dir(), canonical_working_dir.as_path());
         DaemonState::open(layout)
             .expect("daemon test fixtures must open through repository-v6 workspace authority")
     }
@@ -5146,14 +5149,42 @@ mod tests {
         let repo_dir = tempfile::tempdir().unwrap();
         let compose = b"services:\n  api:\n    image: kin:dev\n";
         let binary = [0_u8, 0xff, 0x80, b'\n'];
-        std::fs::write(repo_dir.path().join("compose.yaml"), compose).unwrap();
-        std::fs::create_dir_all(repo_dir.path().join("assets")).unwrap();
-        std::fs::write(repo_dir.path().join("assets/data.bin"), binary).unwrap();
-        #[cfg(unix)]
-        std::os::unix::fs::symlink("compose.yaml", repo_dir.path().join("compose-current"))
-            .unwrap();
-
         let init = kin_core::init(repo_dir.path()).unwrap();
+        let blobs = BlobStore::new(init.layout.ingest_cas_dir()).unwrap();
+        let compose_hash = Hash256::from_bytes(blobs.write(compose).unwrap().0);
+        let binary_hash = Hash256::from_bytes(blobs.write(&binary).unwrap().0);
+        let mut artifacts = vec![
+            ResolvedArtifact::new(
+                ArtifactId::new(),
+                RepoPath::from_utf8("compose.yaml").unwrap(),
+                TreeEntry::blob(compose_hash, false),
+            ),
+            ResolvedArtifact::new(
+                ArtifactId::new(),
+                RepoPath::from_utf8("assets/data.bin").unwrap(),
+                TreeEntry::blob(binary_hash, false),
+            ),
+        ];
+        #[cfg(unix)]
+        {
+            let symlink_hash = Hash256::from_bytes(blobs.write(b"compose.yaml").unwrap().0);
+            artifacts.push(ResolvedArtifact::new(
+                ArtifactId::new(),
+                RepoPath::from_utf8("compose-current").unwrap(),
+                TreeEntry::symlink(symlink_hash),
+            ));
+        }
+        let desired = ResolvedTree::from_artifacts(artifacts).unwrap();
+        crate::repository_commit::publish_workspace_tree(
+            &init.layout,
+            &blobs,
+            &desired,
+            kin_model::OperationId::new(),
+            kin_model::AuthorId::new("authority-open-test"),
+        )
+        .unwrap()
+        .expect("exact workspace admission must advance authority");
+
         let state = DaemonState::open(init.layout)
             .expect("repository-v6 workspace authority must materialize directly");
         let tree = state.graph.resolved_tree();
