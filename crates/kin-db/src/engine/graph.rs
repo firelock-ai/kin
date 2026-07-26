@@ -3106,7 +3106,7 @@ impl InMemoryGraph {
         if let Some(id) = ent.artifact_index.get(path) {
             *id
         } else {
-            let mut new_id = ArtifactId::seed_from_path(&path.0);
+            let mut new_id = ArtifactId::new();
             while ent.artifact_reverse.contains_key(&new_id) {
                 new_id = ArtifactId::new();
             }
@@ -12214,6 +12214,40 @@ mod tests {
             graph.artifact_id_for_path(&file_id).is_none(),
             "deleting the last file-surface owner should remove the artifact index entry"
         );
+    }
+
+    #[test]
+    fn first_artifact_identity_is_graph_assigned_not_path_derived() {
+        let path = FilePathId::new("src/lib.rs");
+        let graph = InMemoryGraph::new();
+
+        let assigned = graph.ensure_artifact_id(&path);
+
+        assert_ne!(assigned, ArtifactId::seed_from_path(&path.0));
+        assert_eq!(graph.ensure_artifact_id(&path), assigned);
+    }
+
+    #[test]
+    fn independent_graphs_assign_distinct_identities_to_the_same_path_history() {
+        let original_path = FilePathId::new("src/original.rs");
+        let renamed_path = FilePathId::new("src/current.rs");
+        let left = InMemoryGraph::new();
+        let right = InMemoryGraph::new();
+
+        let left_id = left.ensure_artifact_id(&original_path);
+        let right_id = right.ensure_artifact_id(&original_path);
+        assert_ne!(left_id, right_id);
+
+        assert_eq!(
+            left.rename_artifact(&original_path, &renamed_path),
+            Some(left_id)
+        );
+        assert_eq!(
+            right.rename_artifact(&original_path, &renamed_path),
+            Some(right_id)
+        );
+        assert_eq!(left.artifact_id_for_path(&renamed_path), Some(left_id));
+        assert_eq!(right.artifact_id_for_path(&renamed_path), Some(right_id));
     }
 
     #[test]
