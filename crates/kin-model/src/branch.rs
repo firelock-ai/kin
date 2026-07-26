@@ -88,7 +88,7 @@ mod tests {
         let decoded: WorkingCopy = serde_json::from_str(&encoded).unwrap();
         assert_eq!(
             decoded.uncommitted_mutations.tree_deltas[0]
-                .new()
+                .new_state()
                 .map(|located| located.entry),
             Some(entry)
         );

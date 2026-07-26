@@ -288,8 +288,8 @@ mod tests {
         let relation = Relation {
             id: RelationId::new(),
             kind: RelationKind::Includes,
-            src: GraphNodeId::Artifact(ArtifactId::seed_from_path("src/app.cpp")),
-            dst: GraphNodeId::Artifact(ArtifactId::seed_from_path("include/app.hpp")),
+            src: GraphNodeId::Artifact(ArtifactId::new()),
+            dst: GraphNodeId::Artifact(ArtifactId::new()),
             confidence: 1.0,
             origin: RelationOrigin::Parsed,
             created_in: None,

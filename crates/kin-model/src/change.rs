@@ -13,6 +13,7 @@ use crate::timestamp::Timestamp;
 
 /// Kin's native commit — the unit of semantic history.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SemanticChange {
     /// Content-addressed hash.
     pub id: SemanticChangeId,
@@ -53,6 +54,7 @@ pub enum RelationDelta {
 
 /// Delta for a batch of transactional graph changes.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct TransactionDelta {
     pub entity_deltas: Vec<EntityDelta>,
     pub relation_deltas: Vec<RelationDelta>,
@@ -145,14 +147,14 @@ impl TreeDelta {
         }
     }
 
-    pub const fn old(&self) -> Option<&LocatedEntry> {
+    pub const fn old_state(&self) -> Option<&LocatedEntry> {
         match self {
             Self::Added { .. } => None,
             Self::Updated { old, .. } | Self::Removed { old, .. } => Some(old),
         }
     }
 
-    pub const fn new(&self) -> Option<&LocatedEntry> {
+    pub const fn new_state(&self) -> Option<&LocatedEntry> {
         match self {
             Self::Added { new, .. } | Self::Updated { new, .. } => Some(new),
             Self::Removed { .. } => None,
@@ -333,13 +335,13 @@ impl ResolvedTree {
 
         let mut next = self.clone();
         for delta in deltas {
-            if let Some(old) = delta.old() {
+            if let Some(old) = delta.old_state() {
                 next.by_path.remove(&old.path);
                 next.by_id.remove(&delta.artifact_id());
             }
         }
         for delta in deltas {
-            let Some(new) = delta.new() else {
+            let Some(new) = delta.new_state() else {
                 continue;
             };
             let artifact_id = delta.artifact_id();
@@ -449,8 +451,8 @@ mod tests {
 
         assert_eq!(parsed, delta);
         assert_eq!(parsed.artifact_id(), artifact_id);
-        assert_eq!(parsed.old().unwrap().entry, old_entry);
-        assert_eq!(parsed.new().unwrap().entry, new_entry);
+        assert_eq!(parsed.old_state().unwrap().entry, old_entry);
+        assert_eq!(parsed.new_state().unwrap().entry, new_entry);
         assert!(parsed.is_updated());
     }
 
@@ -482,11 +484,11 @@ mod tests {
             old: LocatedEntry::new(path("Dockerfile"), entry),
         };
 
-        assert_eq!(added.old(), None);
-        assert_eq!(added.new().unwrap().entry, entry);
+        assert_eq!(added.old_state(), None);
+        assert_eq!(added.new_state().unwrap().entry, entry);
         assert!(added.is_added());
-        assert_eq!(removed.old().unwrap().entry, entry);
-        assert_eq!(removed.new(), None);
+        assert_eq!(removed.old_state().unwrap().entry, entry);
+        assert_eq!(removed.new_state(), None);
         assert!(removed.is_removed());
     }
 

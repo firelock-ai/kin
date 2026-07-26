@@ -260,8 +260,7 @@ pub trait ChangeStore: Send + Sync {
         id: &EntityId,
         head: &SemanticChangeId,
     ) -> std::result::Result<Vec<SemanticChange>, Self::Error> {
-        let (changes, _order) = collect_changes_topologically(self, head)?;
-        Ok(changes
+        Ok(collect_changes_first_parent(self, head)?
             .into_iter()
             .filter(|change| entity_is_touched_by_change(change, id))
             .collect())
@@ -292,8 +291,10 @@ pub trait ChangeStore: Send + Sync {
         id: &RelationId,
         head: &SemanticChangeId,
     ) -> std::result::Result<Vec<RelationRevision>, Self::Error> {
-        let (changes, _order) = collect_changes_topologically(self, head)?;
-        Ok(replay_relation_revisions(changes, id))
+        Ok(replay_relation_revisions(
+            collect_changes_first_parent(self, head)?,
+            id,
+        ))
     }
     fn resolve_relation_revision_at(
         &self,
@@ -308,22 +309,30 @@ pub trait ChangeStore: Send + Sync {
     }
     fn get_artifact_revisions_at(
         &self,
-        file_id: &FilePathId,
+        artifact_id: &crate::ArtifactId,
         head: &SemanticChangeId,
     ) -> std::result::Result<Vec<ArtifactRevision>, Self::Error> {
         let (changes, _order) = collect_changes_topologically(self, head)?;
-        Ok(replay_artifact_revisions(changes, file_id))
+        resolve_tree_states(&changes).map_err(Self::Error::from)?;
+        Ok(replay_artifact_revisions(&changes, artifact_id)
+            .map_err(Self::Error::from)?
+            .revisions)
     }
     fn resolve_artifact_revision_at(
         &self,
-        file_id: &FilePathId,
+        artifact_id: &crate::ArtifactId,
         head: &SemanticChangeId,
     ) -> std::result::Result<Option<ArtifactRevision>, Self::Error> {
-        Ok(self
-            .get_artifact_revisions_at(file_id, head)?
+        let (changes, _order) = collect_changes_topologically(self, head)?;
+        resolve_tree_states(&changes).map_err(Self::Error::from)?;
+        let replay = replay_artifact_revisions(&changes, artifact_id).map_err(Self::Error::from)?;
+        let Some(active_revision) = replay.active_at.get(head).copied().flatten() else {
+            return Ok(None);
+        };
+        Ok(replay
+            .revisions
             .into_iter()
-            .rev()
-            .find(|revision| revision.ended_by.is_none()))
+            .find(|revision| revision.revision_id == active_revision))
     }
     fn resolve_entity_at(
         &self,
@@ -338,9 +347,9 @@ pub trait ChangeStore: Send + Sync {
         &self,
         head: &SemanticChangeId,
     ) -> std::result::Result<ResolvedGraphState, Self::Error> {
-        let (changes, _order) = collect_changes_topologically(self, head)?;
-        let mut state = replay_graph_state(changes.clone());
-        state.tree = replay_tree(changes).map_err(Self::Error::from)?;
+        let first_parent_history = collect_changes_first_parent(self, head)?;
+        let mut state = replay_graph_state(first_parent_history.clone());
+        state.tree = replay_tree(first_parent_history).map_err(Self::Error::from)?;
         Ok(state)
     }
     /// Resolve the exact repository tree at `head`.
@@ -348,8 +357,7 @@ pub trait ChangeStore: Send + Sync {
         &self,
         head: &SemanticChangeId,
     ) -> std::result::Result<ResolvedTree, Self::Error> {
-        let (changes, _order) = collect_changes_topologically(self, head)?;
-        replay_tree(changes).map_err(Self::Error::from)
+        replay_tree(collect_changes_first_parent(self, head)?).map_err(Self::Error::from)
     }
     /// Build a topological ordinal map for all changes reachable from `head`.
     ///
@@ -791,6 +799,93 @@ fn collect_changes_topologically<G: ChangeStore + ?Sized>(
     Ok((ordered, change_order))
 }
 
+/// Fetch the material state lineage for `head`.
+///
+/// Every change is interpreted relative to its first declared parent. Other
+/// parents remain ancestry and revision-contribution links; resolving state
+/// neither fetches nor implicitly unions them.
+fn collect_changes_first_parent<G: ChangeStore + ?Sized>(
+    store: &G,
+    head: &SemanticChangeId,
+) -> std::result::Result<Vec<SemanticChange>, G::Error> {
+    let mut seen = HashSet::new();
+    let mut reverse_history = Vec::new();
+    let mut current = Some(*head);
+
+    while let Some(change_id) = current {
+        if !seen.insert(change_id) {
+            return Err(ModelError::Conflict(format!(
+                "cycle in first-parent history at change {change_id}"
+            ))
+            .into());
+        }
+        let change = store
+            .get_change(&change_id)?
+            .ok_or_else(|| ModelError::ChangeNotFound(change_id.to_string()))?;
+        reverse_history.push(change.clone());
+        current = change.parents.first().copied();
+    }
+
+    reverse_history.reverse();
+    Ok(reverse_history)
+}
+
+/// Resolve every reachable change against its own first parent.
+///
+/// Keeping states keyed by change prevents deltas from divergent siblings
+/// from being folded together merely because both are ancestors of a merge.
+fn resolve_tree_states(
+    changes: &[SemanticChange],
+) -> std::result::Result<HashMap<SemanticChangeId, ResolvedTree>, ModelError> {
+    let mut states: HashMap<SemanticChangeId, ResolvedTree> = HashMap::new();
+
+    for change in changes {
+        for parent in &change.parents {
+            if !states.contains_key(parent) {
+                return Err(ModelError::ChangeNotFound(parent.to_string()));
+            }
+        }
+        let parent = change
+            .parents
+            .first()
+            .map(|parent| {
+                states
+                    .get(parent)
+                    .cloned()
+                    .ok_or_else(|| ModelError::ChangeNotFound(parent.to_string()))
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let state = parent.apply(&change.tree_deltas).map_err(|error| {
+            ModelError::Conflict(format!(
+                "invalid repository tree transition in change {}: {error}",
+                change.id
+            ))
+        })?;
+        states.insert(change.id, state);
+    }
+
+    Ok(states)
+}
+
+fn replay_tree<I>(changes: I) -> std::result::Result<ResolvedTree, ModelError>
+where
+    I: IntoIterator<Item = SemanticChange>,
+{
+    let mut tree = ResolvedTree::default();
+
+    for change in changes {
+        tree = tree.apply(&change.tree_deltas).map_err(|error| {
+            ModelError::Conflict(format!(
+                "invalid repository tree transition in change {}: {error}",
+                change.id
+            ))
+        })?;
+    }
+
+    Ok(tree)
+}
+
 fn replay_graph_state<I>(changes: I) -> ResolvedGraphState
 where
     I: IntoIterator<Item = SemanticChange>,
@@ -930,70 +1025,81 @@ where
     revisions
 }
 
-fn replay_artifact_revisions<I>(changes: I, file_id: &FilePathId) -> Vec<ArtifactRevision>
-where
-    I: IntoIterator<Item = SemanticChange>,
-{
-    let mut revisions: Vec<ArtifactRevision> = Vec::new();
-    let mut active_revision: Option<usize> = None;
-
-    for change in changes {
-        let change_id = change.id;
-        for delta in change.tree_deltas {
-            let path_matches = |path: &crate::RepoPath| path.as_utf8() == Some(file_id.0.as_str());
-            if !delta.old().is_some_and(|old| path_matches(&old.path))
-                && !delta.new().is_some_and(|new| path_matches(&new.path))
-            {
-                continue;
-            }
-
-            let Some(new) = delta.new().filter(|new| path_matches(&new.path)) else {
-                if let Some(index) = active_revision.take() {
-                    if let Some(revision) = revisions.get_mut(index) {
-                        revision.mark_ended(change_id);
-                    }
-                }
-                continue;
-            };
-            let previous_revision = active_revision
-                .and_then(|index| revisions.get_mut(index))
-                .map(|revision| {
-                    revision.mark_ended(change_id);
-                    revision.revision_id
-                });
-            revisions.push(ArtifactRevision::new(
-                FilePathId::new(
-                    new.path
-                        .as_utf8()
-                        .expect("path match proves the path is valid UTF-8"),
-                ),
-                new.entry,
-                change_id,
-                previous_revision,
-            ));
-            active_revision = Some(revisions.len() - 1);
-        }
-    }
-
-    revisions
+struct ArtifactRevisionReplay {
+    revisions: Vec<ArtifactRevision>,
+    active_at: HashMap<SemanticChangeId, Option<ArtifactRevisionId>>,
 }
 
-fn replay_tree<I>(changes: I) -> std::result::Result<ResolvedTree, ModelError>
-where
-    I: IntoIterator<Item = SemanticChange>,
-{
-    let mut tree = ResolvedTree::default();
+/// Replay one artifact's revision graph while keeping material state
+/// first-parent-relative.
+///
+/// A new revision points to the revisions active at each declared parent.
+/// Parent order is preserved and duplicate revision IDs are removed.
+fn replay_artifact_revisions(
+    changes: &[SemanticChange],
+    artifact_id: &crate::ArtifactId,
+) -> std::result::Result<ArtifactRevisionReplay, ModelError> {
+    let mut revisions = Vec::new();
+    let mut active_at = HashMap::new();
 
     for change in changes {
-        tree = tree.apply(&change.tree_deltas).map_err(|error| {
-            ModelError::Conflict(format!(
-                "invalid repository tree transition in change {}: {error}",
+        for parent in &change.parents {
+            if !active_at.contains_key(parent) {
+                return Err(ModelError::ChangeNotFound(parent.to_string()));
+            }
+        }
+
+        let first_parent_active = change
+            .parents
+            .first()
+            .and_then(|parent| active_at.get(parent).copied().flatten());
+        let mut matching = change
+            .tree_deltas
+            .iter()
+            .filter(|delta| delta.artifact_id() == *artifact_id);
+        let delta = matching.next();
+        if matching.next().is_some() {
+            return Err(ModelError::Conflict(format!(
+                "tree transaction contains more than one delta for artifact {artifact_id:?} in change {}",
                 change.id
-            ))
-        })?;
+            )));
+        }
+
+        let active = match delta {
+            None => first_parent_active,
+            Some(delta) => {
+                let Some(new) = delta.new_state() else {
+                    active_at.insert(change.id, None);
+                    continue;
+                };
+                let mut predecessor_revisions = Vec::new();
+                for parent in &change.parents {
+                    let Some(predecessor) = active_at.get(parent).copied().flatten() else {
+                        continue;
+                    };
+                    if !predecessor_revisions.contains(&predecessor) {
+                        predecessor_revisions.push(predecessor);
+                    }
+                }
+                let revision = ArtifactRevision::new(
+                    *artifact_id,
+                    new.path.clone(),
+                    new.entry,
+                    change.id,
+                    predecessor_revisions,
+                );
+                let revision_id = revision.revision_id;
+                revisions.push(revision);
+                Some(revision_id)
+            }
+        };
+        active_at.insert(change.id, active);
     }
 
-    Ok(tree)
+    Ok(ArtifactRevisionReplay {
+        revisions,
+        active_at,
+    })
 }
 
 fn entity_is_touched_by_change(change: &SemanticChange, entity_id: &EntityId) -> bool {
@@ -1844,15 +1950,25 @@ mod tests {
         }
     }
 
+    fn resolved_tree_at(changes: Vec<SemanticChange>, head: SemanticChangeId) -> ResolvedTree {
+        resolve_tree_states(&changes)
+            .unwrap()
+            .remove(&head)
+            .unwrap()
+    }
+
     #[derive(Default)]
     struct HistoryStore {
         changes: HashMap<SemanticChangeId, SemanticChange>,
     }
 
     impl HistoryStore {
-        fn with_change(change: SemanticChange) -> Self {
+        fn from_changes(changes: impl IntoIterator<Item = SemanticChange>) -> Self {
             Self {
-                changes: HashMap::from([(change.id, change)]),
+                changes: changes
+                    .into_iter()
+                    .map(|change| (change.id, change))
+                    .collect(),
             }
         }
     }
@@ -1938,19 +2054,158 @@ mod tests {
     }
 
     #[test]
-    fn resolve_tree_at_fails_closed_when_reachable_parent_is_missing() {
+    fn resolve_tree_at_fails_closed_when_first_parent_is_missing() {
+        let second_parent = make_change_id(239);
         let missing_parent = make_change_id(241);
         let head = make_change_id(242);
-        let store = HistoryStore::with_change(make_semantic_change(
-            head,
-            vec![missing_parent],
-            Vec::new(),
-            Vec::new(),
-        ));
+        let store = HistoryStore::from_changes([
+            make_semantic_change(second_parent, vec![], Vec::new(), Vec::new()),
+            make_semantic_change(
+                head,
+                vec![missing_parent, second_parent],
+                Vec::new(),
+                Vec::new(),
+            ),
+        ]);
 
         let error = store.resolve_tree_at(&head).unwrap_err();
 
         assert_missing_change(error, missing_parent);
+    }
+
+    #[test]
+    fn state_resolution_needs_only_first_parent_but_lineage_needs_all_parents() {
+        let first_parent = make_change_id(243);
+        let missing_contributor = make_change_id(244);
+        let head = make_change_id(245);
+        let artifact_id = ArtifactId::new();
+        let entry = TreeEntry::blob(Hash256::from_bytes([0xf5; 32]), false);
+        let mut root = make_semantic_change(first_parent, vec![], vec![], vec![]);
+        root.tree_deltas = vec![TreeDelta::Added {
+            artifact_id,
+            new: LocatedEntry::new(repo_path("artifact"), entry),
+        }];
+        let merge = make_semantic_change(
+            head,
+            vec![first_parent, missing_contributor],
+            vec![],
+            vec![],
+        );
+        let store = HistoryStore::from_changes([root, merge]);
+
+        assert_eq!(
+            store
+                .resolve_tree_at(&head)
+                .unwrap()
+                .get(&artifact_id)
+                .map(|artifact| artifact.entry),
+            Some(entry)
+        );
+        let error = store
+            .resolve_artifact_revision_at(&artifact_id, &head)
+            .unwrap_err();
+        assert_missing_change(error, missing_contributor);
+    }
+
+    #[test]
+    fn divergent_sibling_state_is_not_folded_into_merge_result() {
+        let root_id = make_change_id(20);
+        let left_id = make_change_id(21);
+        let right_id = make_change_id(22);
+        let merge_id = make_change_id(23);
+        let shared = ArtifactId::new();
+        let right_only = ArtifactId::new();
+        let right_only_entity = make_entity(EntityId::new(), "right_only");
+        let base = TreeEntry::blob(Hash256::from_bytes([0x20; 32]), false);
+        let left = TreeEntry::blob(Hash256::from_bytes([0x21; 32]), false);
+        let right = TreeEntry::blob(Hash256::from_bytes([0x22; 32]), false);
+        let right_only_entry = TreeEntry::blob(Hash256::from_bytes([0x23; 32]), false);
+
+        let mut root = make_semantic_change(root_id, vec![], vec![], vec![]);
+        root.tree_deltas = vec![TreeDelta::Added {
+            artifact_id: shared,
+            new: LocatedEntry::new(repo_path("shared"), base),
+        }];
+        let mut left_change = make_semantic_change(left_id, vec![root_id], vec![], vec![]);
+        left_change.tree_deltas = vec![TreeDelta::Updated {
+            artifact_id: shared,
+            old: LocatedEntry::new(repo_path("shared"), base),
+            new: LocatedEntry::new(repo_path("shared"), left),
+        }];
+        let mut right_change = make_semantic_change(
+            right_id,
+            vec![root_id],
+            vec![EntityDelta::Added(right_only_entity.clone())],
+            vec![],
+        );
+        right_change.tree_deltas = vec![
+            TreeDelta::Updated {
+                artifact_id: shared,
+                old: LocatedEntry::new(repo_path("shared"), base),
+                new: LocatedEntry::new(repo_path("shared"), right),
+            },
+            TreeDelta::Added {
+                artifact_id: right_only,
+                new: LocatedEntry::new(repo_path("right-only"), right_only_entry),
+            },
+        ];
+        let merge = make_semantic_change(merge_id, vec![left_id, right_id], vec![], vec![]);
+        let store = HistoryStore::from_changes([root, left_change, right_change, merge]);
+
+        let tree = store.resolve_tree_at(&merge_id).unwrap();
+
+        assert_eq!(tree.get(&shared).map(|artifact| artifact.entry), Some(left));
+        assert!(tree.get(&right_only).is_none());
+        assert!(!store
+            .resolve_graph_at(&merge_id)
+            .unwrap()
+            .entities
+            .contains_key(&right_only_entity.id));
+    }
+
+    #[test]
+    fn explicit_merge_result_is_applied_relative_to_first_parent() {
+        let root_id = make_change_id(30);
+        let left_id = make_change_id(31);
+        let right_id = make_change_id(32);
+        let merge_id = make_change_id(33);
+        let artifact_id = ArtifactId::new();
+        let base = TreeEntry::blob(Hash256::from_bytes([0x30; 32]), false);
+        let left = TreeEntry::blob(Hash256::from_bytes([0x31; 32]), false);
+        let right = TreeEntry::blob(Hash256::from_bytes([0x32; 32]), false);
+        let merged = TreeEntry::blob(Hash256::from_bytes([0x33; 32]), false);
+
+        let mut root = make_semantic_change(root_id, vec![], vec![], vec![]);
+        root.tree_deltas = vec![TreeDelta::Added {
+            artifact_id,
+            new: LocatedEntry::new(repo_path("artifact"), base),
+        }];
+        let mut left_change = make_semantic_change(left_id, vec![root_id], vec![], vec![]);
+        left_change.tree_deltas = vec![TreeDelta::Updated {
+            artifact_id,
+            old: LocatedEntry::new(repo_path("artifact"), base),
+            new: LocatedEntry::new(repo_path("artifact"), left),
+        }];
+        let mut right_change = make_semantic_change(right_id, vec![root_id], vec![], vec![]);
+        right_change.tree_deltas = vec![TreeDelta::Updated {
+            artifact_id,
+            old: LocatedEntry::new(repo_path("artifact"), base),
+            new: LocatedEntry::new(repo_path("artifact"), right),
+        }];
+        let mut merge = make_semantic_change(merge_id, vec![left_id, right_id], vec![], vec![]);
+        merge.tree_deltas = vec![TreeDelta::Updated {
+            artifact_id,
+            old: LocatedEntry::new(repo_path("artifact"), left),
+            new: LocatedEntry::new(repo_path("artifact"), merged),
+        }];
+        let store = HistoryStore::from_changes([root, left_change, right_change, merge]);
+
+        let tree = store.resolve_tree_at(&merge_id).unwrap();
+
+        assert_eq!(
+            tree.get(&artifact_id).map(|artifact| artifact.entry),
+            Some(merged)
+        );
     }
 
     #[test]
@@ -2000,7 +2255,7 @@ mod tests {
             },
         ];
 
-        let entries = replay_tree([first, second]).unwrap();
+        let entries = resolved_tree_at(vec![first, second], c2);
         assert_eq!(
             entries.get(&regular).map(|value| value.entry),
             Some(regular_v2)
@@ -2040,7 +2295,7 @@ mod tests {
             old: LocatedEntry::new(repo_path("compose.yaml"), compose_entry),
         }];
 
-        let entries = replay_tree([added, removed]).unwrap();
+        let entries = resolved_tree_at(vec![added, removed], c2);
         assert!(entries.get(&compose).is_none());
         assert_eq!(
             entries.get(&dockerfile).map(|value| value.entry),
@@ -2068,8 +2323,7 @@ mod tests {
         }];
 
         assert_eq!(
-            replay_tree([added, mode_changed])
-                .unwrap()
+            resolved_tree_at(vec![added, mode_changed], c2)
                 .get(&artifact_id)
                 .map(|value| value.entry),
             Some(executable)
@@ -2081,6 +2335,179 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn rename_preserves_artifact_identity_and_revision_lineage() {
+        let add_id = make_change_id(40);
+        let rename_id = make_change_id(41);
+        let artifact_id = ArtifactId::new();
+        let old_path = RepoPath::from_bytes(vec![b'o', b'l', b'd', b'/', 0xff]).unwrap();
+        let new_path = RepoPath::from_bytes(vec![b'n', b'e', b'w', b'/', 0xfe]).unwrap();
+        let entry = TreeEntry::blob(Hash256::from_bytes([0x40; 32]), false);
+        let mut add = make_semantic_change(add_id, vec![], vec![], vec![]);
+        add.tree_deltas = vec![TreeDelta::Added {
+            artifact_id,
+            new: LocatedEntry::new(old_path.clone(), entry),
+        }];
+        let mut rename = make_semantic_change(rename_id, vec![add_id], vec![], vec![]);
+        rename.tree_deltas = vec![TreeDelta::Updated {
+            artifact_id,
+            old: LocatedEntry::new(old_path, entry),
+            new: LocatedEntry::new(new_path.clone(), entry),
+        }];
+        let store = HistoryStore::from_changes([add, rename]);
+
+        let revisions = store
+            .get_artifact_revisions_at(&artifact_id, &rename_id)
+            .unwrap();
+        let first = revisions
+            .iter()
+            .find(|revision| revision.introduced_by == add_id)
+            .unwrap();
+        let renamed = revisions
+            .iter()
+            .find(|revision| revision.introduced_by == rename_id)
+            .unwrap();
+        let active = store
+            .resolve_artifact_revision_at(&artifact_id, &rename_id)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(revisions.len(), 2);
+        assert_eq!(renamed.artifact_id, artifact_id);
+        assert_eq!(renamed.path, new_path);
+        assert_eq!(renamed.predecessor_revisions, vec![first.revision_id]);
+        assert_eq!(active.revision_id, renamed.revision_id);
+        assert_eq!(
+            store
+                .resolve_tree_at(&rename_id)
+                .unwrap()
+                .artifact_id_at_path(&renamed.path),
+            Some(artifact_id)
+        );
+    }
+
+    #[test]
+    fn path_reuse_does_not_join_distinct_artifact_lineages() {
+        let add_id = make_change_id(42);
+        let replace_id = make_change_id(43);
+        let old_artifact = ArtifactId::new();
+        let new_artifact = ArtifactId::new();
+        let old_entry = TreeEntry::blob(Hash256::from_bytes([0x42; 32]), false);
+        let new_entry = TreeEntry::blob(Hash256::from_bytes([0x43; 32]), false);
+        let reused_path = repo_path("README");
+        let mut add = make_semantic_change(add_id, vec![], vec![], vec![]);
+        add.tree_deltas = vec![TreeDelta::Added {
+            artifact_id: old_artifact,
+            new: LocatedEntry::new(reused_path.clone(), old_entry),
+        }];
+        let mut replace = make_semantic_change(replace_id, vec![add_id], vec![], vec![]);
+        replace.tree_deltas = vec![
+            TreeDelta::Removed {
+                artifact_id: old_artifact,
+                old: LocatedEntry::new(reused_path.clone(), old_entry),
+            },
+            TreeDelta::Added {
+                artifact_id: new_artifact,
+                new: LocatedEntry::new(reused_path.clone(), new_entry),
+            },
+        ];
+        let store = HistoryStore::from_changes([add, replace]);
+
+        let new_revisions = store
+            .get_artifact_revisions_at(&new_artifact, &replace_id)
+            .unwrap();
+
+        assert_eq!(new_revisions.len(), 1);
+        assert!(new_revisions[0].predecessor_revisions.is_empty());
+        assert!(store
+            .resolve_artifact_revision_at(&old_artifact, &replace_id)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            store
+                .resolve_tree_at(&replace_id)
+                .unwrap()
+                .artifact_id_at_path(&reused_path),
+            Some(new_artifact)
+        );
+    }
+
+    #[test]
+    fn merge_revision_records_all_parent_predecessors_in_parent_order() {
+        let root_id = make_change_id(50);
+        let left_id = make_change_id(51);
+        let right_id = make_change_id(52);
+        let merge_id = make_change_id(53);
+        let artifact_id = ArtifactId::new();
+        let base = TreeEntry::blob(Hash256::from_bytes([0x50; 32]), false);
+        let left = TreeEntry::blob(Hash256::from_bytes([0x51; 32]), false);
+        let right = TreeEntry::blob(Hash256::from_bytes([0x52; 32]), false);
+        let merged = TreeEntry::blob(Hash256::from_bytes([0x53; 32]), false);
+
+        let mut root = make_semantic_change(root_id, vec![], vec![], vec![]);
+        root.tree_deltas = vec![TreeDelta::Added {
+            artifact_id,
+            new: LocatedEntry::new(repo_path("artifact"), base),
+        }];
+        let mut left_change = make_semantic_change(left_id, vec![root_id], vec![], vec![]);
+        left_change.tree_deltas = vec![TreeDelta::Updated {
+            artifact_id,
+            old: LocatedEntry::new(repo_path("artifact"), base),
+            new: LocatedEntry::new(repo_path("artifact"), left),
+        }];
+        let mut right_change = make_semantic_change(right_id, vec![root_id], vec![], vec![]);
+        right_change.tree_deltas = vec![TreeDelta::Updated {
+            artifact_id,
+            old: LocatedEntry::new(repo_path("artifact"), base),
+            new: LocatedEntry::new(repo_path("artifact"), right),
+        }];
+        let mut merge = make_semantic_change(merge_id, vec![left_id, right_id], vec![], vec![]);
+        merge.tree_deltas = vec![TreeDelta::Updated {
+            artifact_id,
+            old: LocatedEntry::new(repo_path("artifact"), left),
+            new: LocatedEntry::new(repo_path("artifact"), merged),
+        }];
+        let store = HistoryStore::from_changes([root, left_change, right_change, merge]);
+
+        let revisions = store
+            .get_artifact_revisions_at(&artifact_id, &merge_id)
+            .unwrap();
+        let root_revision = revisions
+            .iter()
+            .find(|revision| revision.introduced_by == root_id)
+            .unwrap();
+        let left_revision = revisions
+            .iter()
+            .find(|revision| revision.introduced_by == left_id)
+            .unwrap();
+        let right_revision = revisions
+            .iter()
+            .find(|revision| revision.introduced_by == right_id)
+            .unwrap();
+        let merge_revision = revisions
+            .iter()
+            .find(|revision| revision.introduced_by == merge_id)
+            .unwrap();
+        let active = store
+            .resolve_artifact_revision_at(&artifact_id, &merge_id)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            left_revision.predecessor_revisions,
+            vec![root_revision.revision_id]
+        );
+        assert_eq!(
+            right_revision.predecessor_revisions,
+            vec![root_revision.revision_id]
+        );
+        assert_eq!(
+            merge_revision.predecessor_revisions,
+            vec![left_revision.revision_id, right_revision.revision_id]
+        );
+        assert_eq!(active.revision_id, merge_revision.revision_id);
     }
 
     #[test]
