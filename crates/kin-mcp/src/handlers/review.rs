@@ -230,52 +230,50 @@ fn resolve_shadow_ref<G: GraphStore>(store: &G, reference: &str) -> Result<Seman
         return resolve_shadow_git(store, git_oid);
     }
 
-    if let Ok(Some(branch)) = store.get_branch(&kin_model::BranchName::new(reference)) {
-        return Ok(branch.head);
-    }
-
     if reference.len() == 40 {
         return resolve_shadow_git(store, reference);
     }
 
-    resolve_shadow_change(store, reference)
+    if reference.len() == 64 {
+        return resolve_shadow_change(store, reference);
+    }
+
+    resolve_shadow_branch(store, reference)
 }
 
 fn resolve_shadow_branch<G: GraphStore>(store: &G, branch_name: &str) -> Result<SemanticChangeId> {
-    match store
-        .get_branch(&kin_model::BranchName::new(branch_name))
-        .map_err(McpError::graph)?
-    {
-        Some(branch) => Ok(branch.head),
-        None => Err(McpError::InvalidParams(format!(
-            "branch '{}' not found in the graph",
-            branch_name
-        ))),
-    }
+    let layout = super::artifacts::active_layout()?;
+    let authority = super::repository_authority::ActiveRepositoryAuthority::open(&layout)?;
+    let ref_name = super::repository_authority::parse_branch_ref(branch_name)?;
+    let change_id = authority.resolve_named_ref(&ref_name)?;
+    ensure_shadow_change(store, change_id, branch_name)
 }
 
 fn resolve_shadow_change<G: GraphStore>(store: &G, change_ref: &str) -> Result<SemanticChangeId> {
     let change_id = parse_change_id(change_ref)?;
+    ensure_shadow_change(store, change_id, change_ref)
+}
+
+fn ensure_shadow_change<G: GraphStore>(
+    store: &G,
+    change_id: SemanticChangeId,
+    reference: &str,
+) -> Result<SemanticChangeId> {
     match store.get_change(&change_id).map_err(McpError::graph)? {
         Some(_) => Ok(change_id),
         None => Err(McpError::InvalidParams(format!(
-            "change '{}' not found in the graph",
-            change_ref
+            "change '{}' resolved to {}, which is not materialized in graph authority",
+            reference, change_id
         ))),
     }
 }
 
 fn resolve_shadow_git<G: GraphStore>(store: &G, git_oid: &str) -> Result<SemanticChangeId> {
-    let change_id = kin_git::semantic_change_id_from_git_oid_hex(git_oid)
-        .map_err(|e| McpError::InvalidParams(format!("invalid git commit '{}': {}", git_oid, e)))?;
-    match store.get_change(&change_id).map_err(McpError::graph)? {
-        Some(_) => Ok(change_id),
-        None => Err(McpError::InvalidParams(format!(
-            "imported Git commit '{}' is not in the graph; import its history first (e.g. run \
-             `kin review shadow` in the repo, which hydrates imported Git refs)",
-            git_oid
-        ))),
-    }
+    let oid = super::repository_authority::parse_git_object_id(git_oid)?;
+    let layout = super::artifacts::active_layout()?;
+    let authority = super::repository_authority::ActiveRepositoryAuthority::open(&layout)?;
+    let change_id = authority.resolve_git_oid(oid)?;
+    ensure_shadow_change(store, change_id, git_oid)
 }
 
 pub fn handle_shadow_gate_report<G: GraphStore>(

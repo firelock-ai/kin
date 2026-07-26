@@ -402,19 +402,25 @@ fn build_graph_validate_response(
         ));
     }
 
-    // Check for orphaned entities (file_origin that doesn't exist on disk)
-    let source_root = kin_core::source_dir(layout);
+    // Check for orphaned entities against graph-owned exact tree membership.
+    // The working directory is only a projection and cannot invalidate graph
+    // authority.
+    let resolved_tree = graph.resolved_tree();
     let mut orphaned = 0usize;
     for e in &entities {
         if let Some(ref fo) = e.file_origin {
-            if !source_root.join(&fo.0).exists() {
+            let present = kin_model::RepoPath::from_utf8(fo.0.clone())
+                .ok()
+                .and_then(|path| resolved_tree.artifact_at_path(&path))
+                .is_some();
+            if !present {
                 orphaned += 1;
             }
         }
     }
     if orphaned > 0 {
         issues.push(format!(
-            "{} orphaned entities (file no longer exists on disk)",
+            "{} orphaned entities (file is absent from graph-owned exact tree)",
             orphaned
         ));
     }
@@ -796,104 +802,44 @@ fn graph_source_record(
 
 pub(crate) fn read_entity_file_bytes_from_graph(
     layout: &kin_core::KinLayout,
-    graph: &impl GraphStore,
+    _graph: &impl GraphStore,
     entity: &Entity,
 ) -> Result<Vec<u8>> {
     let file_id = entity
         .file_origin
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("entity '{}' has no file origin", entity.name))?;
-    let branch_name = kin_core::read_current_branch(layout)?;
-    let branch = graph.get_branch(&branch_name)?.ok_or_else(|| {
-        anyhow::anyhow!(
-            "current branch '{}' is absent from graph truth; refusing to select an unrelated branch",
-            branch_name
-        )
-    })?;
-    let revision = graph
-        .resolve_entity_revision_at(&entity.id, &branch.head)?
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "entity {} has no active committed revision at branch '{}' head {}",
-                entity.id,
-                branch.name,
-                branch.head
-            )
-        })?;
-    if revision.entity.file_origin != entity.file_origin || revision.entity.span != entity.span {
-        anyhow::bail!(
-            "entity {} is not the active committed source revision at branch '{}' head {}",
-            entity.id,
-            branch.name,
-            branch.head
-        );
-    }
     let path = kin_model::RepoPath::from_utf8(file_id.0.clone()).with_context(|| {
         format!(
             "entity source path '{}' is not repository-relative",
             file_id.0
         )
     })?;
-    let tree = graph
-        .resolve_tree_at(&branch.head)
-        .with_context(|| format!("resolve exact repository tree at {}", branch.head))?;
-    let artifact = tree.artifact_at_path(&path).ok_or_else(|| {
+    let authority = super::repository_authority::ActiveRepositoryAuthority::open(layout)?;
+    let workspace = authority.workspace()?;
+    let artifact = workspace.tree.artifact_at_path(&path).ok_or_else(|| {
         anyhow::anyhow!(
-            "entity source '{}' is absent from exact graph tree at branch '{}' head {}",
+            "entity source '{}' is absent from repository-v6 workspace {} at generation {}",
             file_id.0,
-            branch.name,
-            branch.head
+            workspace.workspace_id,
+            workspace.generation
         )
     })?;
-    let introduced_tree = graph
-        .resolve_tree_at(&revision.introduced_by)
-        .with_context(|| {
-            format!(
-                "resolve entity {} introduction tree at {}",
-                entity.id, revision.introduced_by
-            )
-        })?;
-    let introduced_artifact = introduced_tree.artifact_at_path(&path).ok_or_else(|| {
-        anyhow::anyhow!(
-            "entity {} revision {} was introduced without an artifact at '{}'",
-            entity.id,
-            revision.revision_id,
-            file_id.0
-        )
-    })?;
-    if introduced_artifact.artifact_id != artifact.artifact_id {
+    let kin_model::TreeEntry::Blob { hash, .. } = artifact.entry else {
         anyhow::bail!(
-            "entity source path '{}' was reused: entity {} is bound to artifact {:?}, current artifact is {:?}",
-            file_id.0,
-            entity.id,
-            introduced_artifact.artifact_id,
-            artifact.artifact_id
-        );
-    }
-    let kin_model::TreeEntry::Blob {
-        hash: blob_identity,
-        ..
-    } = artifact.entry
-    else {
-        anyhow::bail!(
-            "entity source '{}' resolves to non-source entry {:?} for artifact {:?} at branch '{}' head {}",
+            "entity source '{}' resolves to non-source entry {:?} for artifact {:?} in repository-v6 workspace {}",
             file_id.0,
             artifact.entry,
             artifact.artifact_id,
-            branch.name,
-            branch.head
+            workspace.workspace_id
         );
     };
-    let blob_store = kin_blobs::BlobStore::new(layout.objects_dir())?;
-    let blob_hash = kin_blobs::Hash256(*blob_identity.as_bytes());
-    blob_store
-        .read(&blob_hash)
-        .with_context(|| {
-            format!(
-                "graph blob for artifact {:?} at '{}' is unavailable (hash {}, branch '{}', head {}); source body cannot be read",
-                artifact.artifact_id, file_id.0, blob_hash, branch.name, branch.head
-            )
-        })
+    authority.load_source_blob(hash).with_context(|| {
+        format!(
+            "repository-v6 source body for artifact {:?} at '{}' is unavailable",
+            artifact.artifact_id, file_id.0
+        )
+    })
 }
 
 #[cfg(test)]

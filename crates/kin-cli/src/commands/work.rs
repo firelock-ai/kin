@@ -841,7 +841,7 @@ pub fn execute_work_request(
         WorkRequest::TodoImport { path } => {
             let scan_root = path
                 .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| kin_core::source_dir(_layout));
+                .unwrap_or_else(|| _layout.working_dir().to_path_buf());
             let todos = kin_parser::extract_todos(&scan_root)?;
             let existing = graph.list_work_items(&WorkFilter::default())?;
             let mut existing_keys: HashSet<(WorkKind, String, String)> = existing

@@ -199,23 +199,6 @@ pub struct ScopeResponse {
     pub ttl_remaining_secs: u64,
 }
 
-#[derive(Debug, Serialize)]
-pub(crate) struct SessionRegistrationRequest {
-    pub vendor: String,
-    pub client_name: String,
-    pub transport: String,
-    pub pid: Option<u32>,
-    pub cwd: String,
-    pub capabilities: kin_model::SessionCapabilities,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub session_id: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct SessionRegistrationResponse {
-    pub session_id: String,
-}
-
 /// Client for the kin daemon HTTP API.
 #[derive(Clone)]
 pub struct DaemonClient {
@@ -1181,69 +1164,6 @@ impl DaemonClient {
         resp.json()
             .await
             .context("parse daemon session workspace response")
-    }
-
-    pub(crate) async fn register_session(
-        &self,
-        request: &SessionRegistrationRequest,
-    ) -> Result<SessionRegistrationResponse> {
-        let resp = self
-            .send(
-                self.client
-                    .post(format!("{}/session", self.base_url))
-                    .json(request),
-                "register daemon session",
-            )
-            .await?;
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            bail!(
-                "daemon session registration error (HTTP {}): {}",
-                status,
-                body
-            );
-        }
-        resp.json()
-            .await
-            .context("parse daemon session registration response")
-    }
-
-    pub(crate) async fn heartbeat_session(&self, session_id: &str) -> Result<()> {
-        let resp = self
-            .send(
-                self.client
-                    .post(format!(
-                        "{}/session/{}/heartbeat",
-                        self.base_url, session_id
-                    ))
-                    .timeout(Duration::from_secs(5)),
-                "heartbeat daemon session",
-            )
-            .await?;
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            bail!("daemon session heartbeat error (HTTP {}): {}", status, body);
-        }
-        Ok(())
-    }
-
-    pub(crate) async fn end_session(&self, session_id: &str) -> Result<()> {
-        let resp = self
-            .send(
-                self.client
-                    .delete(format!("{}/session/{}", self.base_url, session_id))
-                    .timeout(Duration::from_secs(5)),
-                "end daemon session",
-            )
-            .await?;
-        if !resp.status().is_success() && resp.status().as_u16() != 404 {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            bail!("daemon session end error (HTTP {}): {}", status, body);
-        }
-        Ok(())
     }
 
     pub async fn work(
@@ -2528,24 +2448,6 @@ fn is_connection_error(err: &reqwest::Error) -> bool {
 
 pub async fn ensure_daemon_running(kin_root: &Path) -> Result<String> {
     ensure_daemon_running_with_idle_timeout(kin_root, None).await
-}
-
-/// Resolve or start the repository daemon for a long-lived materialized
-/// session. This deliberately ignores an ambient endpoint (the caller verifies
-/// that separately), honors `KIN_NO_DAEMON`, and gives newly spawned daemons
-/// the interactive-session idle window.
-pub(crate) async fn ensure_session_daemon_running(layout: &KinLayout) -> Result<String> {
-    if is_transient_bool_env("KIN_NO_DAEMON") {
-        return supervisor_route_for_repo_if_running_async(layout.root())
-            .await
-            .ok_or_else(|| {
-                anyhow!(
-                    "daemon autostart is disabled by KIN_NO_DAEMON and no daemon is registered for {}",
-                    layout.working_dir().display()
-                )
-            });
-    }
-    ensure_daemon_running_with_idle_timeout(layout.root(), Some(MCP_IDLE_TIMEOUT_SECS)).await
 }
 
 /// Like [`ensure_daemon_running`] but lets the caller inject a specific idle

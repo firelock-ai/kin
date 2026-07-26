@@ -11,6 +11,7 @@ pub mod common;
 pub mod bench;
 pub mod entities;
 pub mod provenance;
+pub(crate) mod repository_authority;
 pub mod review;
 pub mod sessions;
 pub mod verification;

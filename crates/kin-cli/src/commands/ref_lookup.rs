@@ -2,16 +2,11 @@
 // Copyright 2026 Firelock, LLC
 
 use anyhow::{anyhow, bail, Result};
-use kin_model::{BranchName, Entity, EntityFilter, GraphStore};
-use kin_model::{Hash256, SemanticChangeId};
+use kin_model::{Entity, EntityFilter, GraphStore, Hash256, SemanticChangeId};
 
-/// A reference did not resolve to a semantic change — unknown ref syntax, a
-/// ref that legitimately does not exist, or a relative-ref hop (`^N`/`~N`)
-/// that runs past the start of history.
-///
-/// Distinguished from other failure modes (graph/backend faults) so callers
-/// can report it as a client-input error (e.g. HTTP 400) rather than an
-/// internal server error, without matching on message text.
+use super::repository_authority::{parse_git_object_id, parse_ref_name, ActiveRepositoryAuthority};
+
+/// A reference did not resolve through repository-v6 authority.
 #[derive(Debug)]
 pub struct RefResolutionError {
     reference: String,
@@ -19,9 +14,9 @@ pub struct RefResolutionError {
 }
 
 impl std::fmt::Display for RefResolutionError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
-            f,
+            formatter,
             "cannot resolve ref '{}': {}",
             self.reference, self.reason
         )
@@ -37,19 +32,15 @@ fn ref_error(reference: impl Into<String>, reason: impl Into<String>) -> anyhow:
     })
 }
 
-/// True when `err` is, or wraps via added context, a [`RefResolutionError`].
-/// Lets callers outside this crate classify a failure as a client-input
-/// problem (bad ref) without depending on `anyhow` themselves or matching on
-/// message text — they only need to name the error type, which they can
-/// reach through their existing dependency on this crate.
-pub fn is_ref_resolution_error(err: &anyhow::Error) -> bool {
-    err.chain()
+pub fn is_ref_resolution_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
         .any(|cause| cause.downcast_ref::<RefResolutionError>().is_some())
 }
 
 pub(crate) fn parse_change_id(input: &str) -> Result<SemanticChangeId> {
     Ok(SemanticChangeId::from_hash(
-        Hash256::from_hex(input).map_err(|err| anyhow!("invalid change hash: {}", err))?,
+        Hash256::from_hex(input).map_err(|error| anyhow!("invalid change hash: {error}"))?,
     ))
 }
 
@@ -62,17 +53,17 @@ where
     G: GraphStore,
     <G as GraphStore>::Error: std::fmt::Display + Send + Sync + 'static,
 {
-    match reference {
-        Some(reference) => resolve_explicit_ref(graph, layout, reference),
-        None => {
-            let current = kin_core::read_current_branch(layout)?;
-            let branch = graph
-                .get_branch(&current)
-                .map_err(|err| anyhow!(err.to_string()))?
-                .ok_or_else(|| anyhow!("branch '{}' not found", current))?;
-            Ok(branch.head)
-        }
+    let reference = reference.unwrap_or("HEAD");
+    if reference.contains("@{") {
+        return Err(ref_error(
+            reference,
+            "reflog/upstream '@{...}' syntax is not supported",
+        ));
     }
+
+    let (core, hops) = split_relative_hops(reference)?;
+    let head = resolve_ref_core(graph, layout, reference, core)?;
+    apply_parent_hops(graph, reference, head, &hops)
 }
 
 pub(crate) fn resolve_entity_query<G>(graph: &G, entity_query: &str) -> Result<Entity>
@@ -86,11 +77,11 @@ where
     };
     let entities = graph
         .query_entities(&filter)
-        .map_err(|err| anyhow!(err.to_string()))?;
+        .map_err(|error| anyhow!(error.to_string()))?;
     choose_entity_match(entities, entity_query).or_else(|_| {
         let all = graph
             .list_all_entities()
-            .map_err(|err| anyhow!(err.to_string()))?;
+            .map_err(|error| anyhow!(error.to_string()))?;
         choose_entity_match(all, entity_query)
     })
 }
@@ -106,7 +97,7 @@ where
 {
     let state = graph
         .resolve_graph_at(head)
-        .map_err(|err| anyhow!(err.to_string()))?;
+        .map_err(|error| anyhow!(error.to_string()))?;
     let entities = state
         .entities
         .into_values()
@@ -115,20 +106,9 @@ where
     choose_entity_match(entities, entity_query)
 }
 
-/// One relative-ref hop applied after a base ref resolves: select the Nth
-/// parent (1-indexed) of the commit reached so far.
 #[derive(Debug, Clone, Copy)]
 struct ParentHop(usize);
 
-/// Split trailing `^`, `^N`, `~`, `~N` operators off the end of `reference`,
-/// returning the remaining base-ref text and the hops to apply, in
-/// application order (closest to the base first). Mirrors git's own suffix
-/// grammar (see `git-rev-parse(1)`, "Specifying Revisions"): bare `^`/`~` is
-/// one first-parent hop, `~N` desugars to N repeated first-parent hops, and
-/// `^N` selects the Nth parent directly (relevant only at merge commits,
-/// where parent order matters). Branch/tag names cannot themselves contain
-/// `^` or `~` under Git's own ref-name rules, so peeling trailing operators
-/// never misreads a legitimate name.
 fn split_relative_hops(reference: &str) -> Result<(&str, Vec<ParentHop>)> {
     let mut hops = Vec::new();
     let mut rest = reference;
@@ -140,30 +120,26 @@ fn split_relative_hops(reference: &str) -> Result<(&str, Vec<ParentHop>)> {
         }
         if last.is_ascii_digit() {
             let digits_start = rest
-                .rfind(|c: char| !c.is_ascii_digit())
-                .map(|i| i + 1)
+                .rfind(|character: char| !character.is_ascii_digit())
+                .map(|index| index + 1)
                 .unwrap_or(0);
             if digits_start == 0 {
-                // The whole remaining string is digits (e.g. a bare numeric
-                // ref) — not a `^N`/`~N` suffix, stop peeling.
                 break;
             }
             let marker = rest.as_bytes()[digits_start - 1];
             if marker != b'^' && marker != b'~' {
                 break;
             }
-            let n: usize = rest[digits_start..]
+            let count: usize = rest[digits_start..]
                 .parse()
                 .map_err(|_| ref_error(reference, "parent index is out of range"))?;
             if marker == b'^' {
-                if n == 0 {
-                    // `^0` names the commit itself, not a parent hop — stop
-                    // peeling and let core resolution handle (or reject) it.
+                if count == 0 {
                     break;
                 }
-                hops.push(ParentHop(n));
+                hops.push(ParentHop(count));
             } else {
-                hops.extend(std::iter::repeat_n(ParentHop(1), n));
+                hops.extend(std::iter::repeat_n(ParentHop(1), count));
             }
             rest = &rest[..digits_start - 1];
             continue;
@@ -173,7 +149,6 @@ fn split_relative_hops(reference: &str) -> Result<(&str, Vec<ParentHop>)> {
     Ok((rest, hops))
 }
 
-/// Walk `hops` from `head`, following recorded parents in the graph.
 fn apply_parent_hops<G>(
     graph: &G,
     original: &str,
@@ -187,14 +162,13 @@ where
     for hop in hops {
         let change = graph
             .get_change(&head)
-            .map_err(|err| anyhow!(err.to_string()))?
-            .ok_or_else(|| ref_error(original, format!("change {} not found in history", head)))?;
+            .map_err(|error| anyhow!(error.to_string()))?
+            .ok_or_else(|| ref_error(original, format!("change {head} not found in history")))?;
         head = *change.parents.get(hop.0 - 1).ok_or_else(|| {
             ref_error(
                 original,
                 format!(
-                    "{} has {} parent(s), no parent #{}",
-                    head,
+                    "{head} has {} parent(s), no parent #{}",
                     change.parents.len(),
                     hop.0
                 ),
@@ -204,32 +178,6 @@ where
     Ok(head)
 }
 
-fn resolve_explicit_ref<G>(
-    graph: &G,
-    layout: &kin_core::KinLayout,
-    reference: &str,
-) -> Result<SemanticChangeId>
-where
-    G: GraphStore,
-    <G as GraphStore>::Error: std::fmt::Display + Send + Sync + 'static,
-{
-    if reference.contains("@{") {
-        return Err(ref_error(
-            reference,
-            "reflog/upstream '@{...}' ref syntax is not supported",
-        ));
-    }
-
-    let (core, hops) = split_relative_hops(reference)?;
-    let head = resolve_ref_core(graph, layout, reference, core)?;
-    apply_parent_hops(graph, reference, head, &hops)
-}
-
-/// Resolve the non-relative "core" of a reference: exactly `HEAD`, a
-/// `branch:`/`git:`/`kin:`/`change:`-prefixed form, a bare branch name, a
-/// 40-character Git commit hash, or a Kin change id. `original` is the full,
-/// pre-peel reference text the caller supplied, threaded through only so
-/// error messages point at what was actually typed.
 fn resolve_ref_core<G>(
     graph: &G,
     layout: &kin_core::KinLayout,
@@ -240,23 +188,6 @@ where
     G: GraphStore,
     <G as GraphStore>::Error: std::fmt::Display + Send + Sync + 'static,
 {
-    if core == "HEAD" {
-        let current = kin_core::read_current_branch(layout)?;
-        let branch = graph
-            .get_branch(&current)
-            .map_err(|err| anyhow!(err.to_string()))?
-            .ok_or_else(|| ref_error(original, format!("branch '{}' not found", current)))?;
-        return Ok(branch.head);
-    }
-
-    if let Some(branch_name) = core.strip_prefix("branch:") {
-        return resolve_branch_head(graph, original, branch_name);
-    }
-
-    if let Some(git_oid) = core.strip_prefix("git:") {
-        return resolve_imported_git_ref(graph, original, git_oid);
-    }
-
     if let Some(change_ref) = core
         .strip_prefix("kin:")
         .or_else(|| core.strip_prefix("change:"))
@@ -264,111 +195,120 @@ where
         return resolve_semantic_change(graph, original, change_ref);
     }
 
-    if let Some(branch) = graph
-        .get_branch(&BranchName::new(core))
-        .map_err(|err| anyhow!(err.to_string()))?
-    {
-        return Ok(branch.head);
-    }
-
-    if core.len() == 40 {
-        if let Ok(imported_change_id) = resolve_imported_git_ref(graph, original, core) {
-            return Ok(imported_change_id);
+    // A full semantic change id is unambiguous when that change is present.
+    if core.len() == 64 {
+        if let Ok(change_id) = parse_change_id(core) {
+            if graph
+                .get_change(&change_id)
+                .map_err(|error| anyhow!(error.to_string()))?
+                .is_some()
+            {
+                return Ok(change_id);
+            }
         }
     }
 
-    if is_abbreviated_git_hex(core) {
+    let authority = ActiveRepositoryAuthority::open(layout).map_err(|error| {
+        ref_error(
+            original,
+            format!("repository-v6 authority is unavailable: {error:#}"),
+        )
+    })?;
+
+    let resolved = if core == "HEAD" {
+        authority
+            .current_change_id()
+            .map_err(|error| {
+                ref_error(
+                    original,
+                    format!("repository-v6 workspace head is invalid: {error:#}"),
+                )
+            })?
+            .ok_or_else(|| ref_error(original, "repository-v6 workspace head is unborn"))?
+    } else if let Some(branch_name) = core.strip_prefix("branch:") {
+        resolve_named_authority_ref(&authority, original, branch_name)?
+    } else if let Some(git_oid) = core.strip_prefix("git:") {
+        resolve_imported_git_ref(&authority, original, git_oid)?
+    } else if matches!(core.len(), 40 | 64) && core.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        resolve_imported_git_ref(&authority, original, core)?
+    } else if is_abbreviated_git_hex(core) {
         return Err(ref_error(
             original,
             format!(
-                "Git commit prefix '{}' cannot be resolved from graph authority; use a full imported object id",
-                core
+                "Git commit prefix '{core}' cannot be resolved from exact alias authority; use a full object ID"
+            ),
+        ));
+    } else {
+        resolve_named_authority_ref(&authority, original, core)?
+    };
+
+    if graph
+        .get_change(&resolved)
+        .map_err(|error| anyhow!(error.to_string()))?
+        .is_none()
+    {
+        return Err(ref_error(
+            original,
+            format!(
+                "repository-v6 authority resolves to semantic change {resolved}, but the active graph projection does not contain it"
             ),
         ));
     }
-
-    if parse_change_id(core).is_ok() {
-        return resolve_semantic_change(graph, original, core);
-    }
-
-    Err(ref_error(original, format!("unknown ref '{}'", core)))
+    Ok(resolved)
 }
 
-/// True for a plausible abbreviated Git commit hash: 4–39 hex characters.
-/// Full 40-character ids resolve through the exact-id path instead, and
-/// anything shorter than Git's 4-character minimum never expands.
-fn is_abbreviated_git_hex(core: &str) -> bool {
-    (4..40).contains(&core.len()) && core.bytes().all(|b| b.is_ascii_hexdigit())
-}
-
-fn resolve_branch_head<G>(graph: &G, original: &str, branch_name: &str) -> Result<SemanticChangeId>
-where
-    G: GraphStore,
-    <G as GraphStore>::Error: std::fmt::Display + Send + Sync + 'static,
-{
-    if let Some(branch) = graph
-        .get_branch(&BranchName::new(branch_name))
-        .map_err(|err| anyhow!(err.to_string()))?
-    {
-        return Ok(branch.head);
-    }
-
-    Err(ref_error(
-        original,
-        format!("branch '{}' not found", branch_name),
-    ))
-}
-
-fn resolve_imported_git_ref<G>(graph: &G, original: &str, git_oid: &str) -> Result<SemanticChangeId>
-where
-    G: GraphStore,
-    <G as GraphStore>::Error: std::fmt::Display + Send + Sync + 'static,
-{
-    let imported_change_id = kin_git::semantic_change_id_from_git_oid_hex(git_oid)?;
-    if graph
-        .get_change(&imported_change_id)
-        .map_err(|err| anyhow!(err.to_string()))?
-        .is_some()
-    {
-        Ok(imported_change_id)
-    } else {
-        Err(ref_error(
-            original,
-            format!(
-                "Git commit '{}' is not present in graph authority; import repository history explicitly before querying it",
-                git_oid
-            ),
-        ))
-    }
-}
-
-fn resolve_semantic_change<G>(
-    graph: &G,
+fn resolve_named_authority_ref(
+    authority: &ActiveRepositoryAuthority,
     original: &str,
-    change_ref: &str,
-) -> Result<SemanticChangeId>
+    value: &str,
+) -> Result<SemanticChangeId> {
+    let name = parse_ref_name(value)
+        .map_err(|error| ref_error(original, format!("invalid repository ref: {error:#}")))?;
+    authority
+        .resolve_named_ref(&name)
+        .map_err(|error| ref_error(original, error.to_string()))
+}
+
+fn resolve_imported_git_ref(
+    authority: &ActiveRepositoryAuthority,
+    original: &str,
+    value: &str,
+) -> Result<SemanticChangeId> {
+    let oid = parse_git_object_id(value)
+        .map_err(|error| ref_error(original, format!("invalid Git object ID: {error:#}")))?;
+    authority
+        .resolve_git_oid(&oid)
+        .map_err(|error| ref_error(original, error.to_string()))
+}
+
+fn resolve_semantic_change<G>(graph: &G, original: &str, value: &str) -> Result<SemanticChangeId>
 where
     G: GraphStore,
     <G as GraphStore>::Error: std::fmt::Display + Send + Sync + 'static,
 {
-    let change_id = parse_change_id(change_ref)?;
+    let change_id =
+        parse_change_id(value).map_err(|error| ref_error(original, error.to_string()))?;
     if graph
         .get_change(&change_id)
-        .map_err(|err| anyhow!(err.to_string()))?
+        .map_err(|error| anyhow!(error.to_string()))?
         .is_some()
     {
         Ok(change_id)
     } else {
         Err(ref_error(
             original,
-            format!("change {} not found", change_id),
+            format!("change {change_id} not found in graph authority"),
         ))
     }
 }
 
+fn is_abbreviated_git_hex(value: &str) -> bool {
+    (4..40).contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 fn choose_entity_match(mut entities: Vec<Entity>, entity_query: &str) -> Result<Entity> {
     if entities.is_empty() {
-        bail!("No entity matching '{}' found.", entity_query);
+        bail!("No entity matching '{entity_query}' found.");
     }
 
     entities.sort_by(|left, right| {
@@ -376,21 +316,18 @@ fn choose_entity_match(mut entities: Vec<Entity>, entity_query: &str) -> Result<
             .cmp(&right.name)
             .then_with(|| left.id.to_string().cmp(&right.id.to_string()))
     });
-
     if let Some(exact) = entities
         .iter()
         .find(|entity| entity.id.to_string() == entity_query || entity.name == entity_query)
     {
         return Ok(exact.clone());
     }
-
     if let Some(case_insensitive) = entities
         .iter()
         .find(|entity| entity.name.eq_ignore_ascii_case(entity_query))
     {
         return Ok(case_insensitive.clone());
     }
-
     match entities.as_slice() {
         [entity] => Ok(entity.clone()),
         many => {
@@ -400,11 +337,7 @@ fn choose_entity_match(mut entities: Vec<Entity>, entity_query: &str) -> Result<
                 .map(|entity| entity.name.as_str())
                 .collect::<Vec<_>>()
                 .join(", ");
-            bail!(
-                "Multiple entities match '{}': {}. Use a more exact name.",
-                entity_query,
-                preview
-            );
+            bail!("Multiple entities match '{entity_query}': {preview}. Use a more exact name.")
         }
     }
 }
@@ -428,144 +361,24 @@ fn name_matches_pattern(name: &str, pattern: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kin_db::InMemoryGraph;
-    use kin_model::{AuthorId, Branch, ChangeStore, SemanticChange, Timestamp};
+    use kin_model::{AuthorId, ChangeOrigin, ChangeStore, SemanticChange, Timestamp};
 
-    fn temp_layout() -> kin_core::KinLayout {
-        let temp = tempfile::tempdir().unwrap();
-        let kin_dir = temp.path().join(".kin");
-        std::fs::create_dir_all(&kin_dir).unwrap();
-        // Keep the tempdir alive by leaking it for the test process lifetime.
-        let leaked = temp.keep();
-        kin_core::KinLayout::new(leaked.join(".kin"))
-    }
-
-    #[test]
-    fn resolve_ref_accepts_imported_git_commit_sha() {
-        let graph = InMemoryGraph::new();
-        let layout = temp_layout();
-        let git_oid = "1111111111111111111111111111111111111111";
-        let imported_id = kin_git::semantic_change_id_from_git_oid_hex(git_oid).unwrap();
-        graph
-            .create_change(&SemanticChange {
-                id: imported_id,
-                parents: vec![],
-                timestamp: Timestamp::now(),
-                author: AuthorId::new("test"),
-                message: "imported git commit".to_string(),
-                entity_deltas: vec![],
-                relation_deltas: vec![],
-                tree_deltas: vec![],
-                projected_files: vec![],
-                spec_link: None,
-                evidence: vec![],
-                risk_summary: None,
-                authored_on: None,
-            })
-            .unwrap();
-
-        let resolved = resolve_ref(&graph, &layout, Some(git_oid)).unwrap();
-        assert_eq!(resolved, imported_id);
-    }
-
-    #[test]
-    fn resolve_ref_accepts_prefixed_git_commit_sha() {
-        let graph = InMemoryGraph::new();
-        let layout = temp_layout();
-        let git_oid = "1111111111111111111111111111111111111111";
-        let imported_id = kin_git::semantic_change_id_from_git_oid_hex(git_oid).unwrap();
-        graph
-            .create_change(&SemanticChange {
-                id: imported_id,
-                parents: vec![],
-                timestamp: Timestamp::now(),
-                author: AuthorId::new("test"),
-                message: "imported git commit".to_string(),
-                entity_deltas: vec![],
-                relation_deltas: vec![],
-                tree_deltas: vec![],
-                projected_files: vec![],
-                spec_link: None,
-                evidence: vec![],
-                risk_summary: None,
-                authored_on: None,
-            })
-            .unwrap();
-
-        let resolved = resolve_ref(&graph, &layout, Some(&format!("git:{git_oid}"))).unwrap();
-        assert_eq!(resolved, imported_id);
-    }
-
-    #[test]
-    fn resolve_ref_accepts_prefixed_change_id() {
-        let graph = InMemoryGraph::new();
-        let layout = temp_layout();
-        let change = SemanticChange {
-            id: SemanticChangeId::from_hash(Hash256::from_bytes([0x41; 32])),
-            parents: vec![],
-            timestamp: Timestamp::now(),
-            author: AuthorId::new("test"),
-            message: "kin change".to_string(),
-            entity_deltas: vec![],
-            relation_deltas: vec![],
-            tree_deltas: vec![],
-            projected_files: vec![],
-            spec_link: None,
-            evidence: vec![],
-            risk_summary: None,
-            authored_on: None,
-        };
-        graph.create_change(&change).unwrap();
-
-        let resolved = resolve_ref(&graph, &layout, Some(&format!("kin:{}", change.id))).unwrap();
-        assert_eq!(resolved, change.id);
-    }
-
-    #[test]
-    fn resolve_ref_accepts_prefixed_branch_name() {
-        let graph = InMemoryGraph::new();
-        let layout = temp_layout();
-        let change = SemanticChange {
-            id: SemanticChangeId::from_hash(Hash256::from_bytes([0x52; 32])),
-            parents: vec![],
-            timestamp: Timestamp::now(),
-            author: AuthorId::new("test"),
-            message: "branch tip".to_string(),
-            entity_deltas: vec![],
-            relation_deltas: vec![],
-            tree_deltas: vec![],
-            projected_files: vec![],
-            spec_link: None,
-            evidence: vec![],
-            risk_summary: None,
-            authored_on: None,
-        };
-        graph.create_change(&change).unwrap();
-        let branch = Branch {
-            name: BranchName::new("feature/history"),
-            head: change.id,
-        };
-        graph.create_branch(&branch).unwrap();
-
-        let resolved = resolve_ref(&graph, &layout, Some("branch:feature/history")).unwrap();
-        assert_eq!(resolved, branch.head);
-    }
-
-    fn make_change(id: SemanticChangeId, parents: Vec<SemanticChangeId>) -> SemanticChange {
+    fn change(id: SemanticChangeId, parents: Vec<SemanticChangeId>) -> SemanticChange {
         SemanticChange {
             id,
+            origin: ChangeOrigin::Native,
             parents,
             timestamp: Timestamp::now(),
             author: AuthorId::new("test"),
             message: "test change".to_string(),
-            entity_deltas: vec![],
-            relation_deltas: vec![],
-            tree_deltas: vec![],
-            projected_files: vec![],
+            entity_deltas: Vec::new(),
+            relation_deltas: Vec::new(),
+            tree_deltas: Vec::new(),
+            admission_policy_delta: None,
+            projected_files: Vec::new(),
             spec_link: None,
-            evidence: vec![],
+            evidence: Vec::new(),
             risk_summary: None,
-            authored_on: None,
         }
     }
 
@@ -573,179 +386,41 @@ mod tests {
         SemanticChangeId::from_hash(Hash256::from_bytes([byte; 32]))
     }
 
-    /// A layout with `main` checked out as the current branch, backed by a
-    /// native chain `grandparent <- parent <- head`, where `head` is a merge
-    /// of `parent` and `other_parent` (so `^2`-style parent selection has
-    /// something real to select).
-    fn temp_layout_on_main(graph: &InMemoryGraph) -> (kin_core::KinLayout, [SemanticChangeId; 4]) {
-        let layout = temp_layout();
-        kin_core::write_current_branch(&layout, &BranchName::new("main")).unwrap();
-
-        let grandparent = change_id(0x01);
-        let parent = change_id(0x02);
-        let other_parent = change_id(0x03);
-        let head = change_id(0x04);
-
-        graph
-            .create_change(&make_change(grandparent, vec![]))
-            .unwrap();
-        graph
-            .create_change(&make_change(parent, vec![grandparent]))
-            .unwrap();
-        graph
-            .create_change(&make_change(other_parent, vec![]))
-            .unwrap();
-        graph
-            .create_change(&make_change(head, vec![parent, other_parent]))
-            .unwrap();
-        graph
-            .create_branch(&Branch {
-                name: BranchName::new("main"),
-                head,
-            })
-            .unwrap();
-
-        (layout, [grandparent, parent, other_parent, head])
-    }
-
-    // ── Caret/tilde/relative-ref peeling ──
-
     #[test]
-    fn resolve_ref_head_caret_matches_head_tilde_one() {
-        let graph = InMemoryGraph::new();
-        let (layout, [_grandparent, parent, _other_parent, _head]) = temp_layout_on_main(&graph);
+    fn explicit_semantic_change_and_parent_hops_need_no_file_or_git_fallback() {
+        let graph = kin_db::InMemoryGraph::new();
+        let parent = change_id(0x21);
+        let head = change_id(0x22);
+        graph.create_change(&change(parent, Vec::new())).unwrap();
+        graph.create_change(&change(head, vec![parent])).unwrap();
+        let layout = kin_core::KinLayout::new(std::path::PathBuf::from("/absent/.kin"));
 
-        let caret = resolve_ref(&graph, &layout, Some("HEAD^")).unwrap();
-        let tilde = resolve_ref(&graph, &layout, Some("HEAD~1")).unwrap();
-        assert_eq!(caret, parent, "HEAD^ must select the first parent");
-        assert_eq!(caret, tilde, "HEAD^ and HEAD~1 must agree");
-    }
-
-    #[test]
-    fn resolve_ref_caret_n_selects_that_parent_by_position() {
-        let graph = InMemoryGraph::new();
-        let (layout, [_grandparent, parent, other_parent, _head]) = temp_layout_on_main(&graph);
-
-        let first = resolve_ref(&graph, &layout, Some("HEAD^1")).unwrap();
-        let second = resolve_ref(&graph, &layout, Some("HEAD^2")).unwrap();
         assert_eq!(
-            first, parent,
-            "HEAD^1 must select the first recorded parent"
-        );
-        assert_eq!(
-            second, other_parent,
-            "HEAD^2 must select the second recorded parent (the merged-in side)"
+            resolve_ref(&graph, &layout, Some(&format!("kin:{head}^"))).unwrap(),
+            parent
         );
     }
 
     #[test]
-    fn resolve_ref_chained_hops_walk_in_order() {
-        let graph = InMemoryGraph::new();
-        let (layout, [grandparent, _parent, _other_parent, _head]) = temp_layout_on_main(&graph);
-
-        let resolved = resolve_ref(&graph, &layout, Some("HEAD^1~1")).unwrap();
-        assert_eq!(
-            resolved, grandparent,
-            "HEAD^1~1 is first-parent then first-parent again"
-        );
-
-        let resolved_bare = resolve_ref(&graph, &layout, Some("HEAD^^")).unwrap();
-        assert_eq!(
-            resolved_bare, grandparent,
-            "HEAD^^ is two first-parent hops, same as HEAD^1~1 here"
-        );
+    fn head_without_repository_authority_is_a_classified_failure() {
+        let graph = kin_db::InMemoryGraph::new();
+        let layout = kin_core::KinLayout::new(std::path::PathBuf::from("/absent/.kin"));
+        let error = resolve_ref(&graph, &layout, None).unwrap_err();
+        assert!(is_ref_resolution_error(&error));
+        assert!(error.to_string().contains("repository-v6 authority"));
     }
 
     #[test]
-    fn resolve_ref_tilde_n_desugars_to_n_first_parent_hops() {
-        let graph = InMemoryGraph::new();
-        let (layout, [grandparent, _parent, _other_parent, _head]) = temp_layout_on_main(&graph);
-
-        let resolved = resolve_ref(&graph, &layout, Some("HEAD~2")).unwrap();
-        assert_eq!(resolved, grandparent);
-    }
-
-    #[test]
-    fn resolve_ref_hop_past_history_start_fails_cleanly_not_opaque() {
-        let graph = InMemoryGraph::new();
-        let (layout, _ids) = temp_layout_on_main(&graph);
-
-        let err = resolve_ref(&graph, &layout, Some("HEAD~50")).unwrap_err();
-        assert!(
-            is_ref_resolution_error(&err),
-            "a hop past the start of history must be a RefResolutionError, not an opaque error: {err:#}"
-        );
-    }
-
-    #[test]
-    fn resolve_ref_rejects_reflog_upstream_syntax_cleanly() {
-        let graph = InMemoryGraph::new();
-        let (layout, _ids) = temp_layout_on_main(&graph);
-
-        let err = resolve_ref(&graph, &layout, Some("HEAD@{upstream}")).unwrap_err();
-        assert!(
-            is_ref_resolution_error(&err),
-            "unsupported '@{{...}}' syntax must fail as a clean ref-resolution error, not panic or 500: {err:#}"
-        );
-    }
-
-    #[test]
-    fn resolve_ref_unknown_ref_is_classified_as_ref_resolution_error() {
-        let graph = InMemoryGraph::new();
-        let layout = temp_layout();
-
-        let err = resolve_ref(&graph, &layout, Some("this-branch-does-not-exist")).unwrap_err();
-        assert!(
-            is_ref_resolution_error(&err),
-            "an unknown ref must be classified as a client-input error: {err:#}"
-        );
-    }
-
-    #[test]
-    fn resolve_ref_caret_applies_after_any_core_form_not_just_head() {
-        let graph = InMemoryGraph::new();
-        let layout = temp_layout();
-        let git_oid = "2222222222222222222222222222222222222222";
-        let imported_id = kin_git::semantic_change_id_from_git_oid_hex(git_oid).unwrap();
-        let parent_id = change_id(0x09);
-        graph
-            .create_change(&make_change(parent_id, vec![]))
-            .unwrap();
-        graph
-            .create_change(&make_change(imported_id, vec![parent_id]))
-            .unwrap();
-
-        let resolved = resolve_ref(&graph, &layout, Some(&format!("{git_oid}^"))).unwrap();
-        assert_eq!(
-            resolved, parent_id,
-            "relative hops must apply after any resolved core ref, not just HEAD"
-        );
-    }
-
-    #[test]
-    fn split_relative_hops_parses_caret_and_tilde_chains() {
-        let (core, hops) = split_relative_hops("HEAD").unwrap();
-        assert_eq!(core, "HEAD");
-        assert!(hops.is_empty());
-
-        let (core, hops) = split_relative_hops("HEAD^").unwrap();
-        assert_eq!(core, "HEAD");
-        assert_eq!(hops.len(), 1);
-        assert_eq!(hops[0].0, 1);
-
-        let (core, hops) = split_relative_hops("HEAD^2").unwrap();
-        assert_eq!(core, "HEAD");
-        assert_eq!(hops.len(), 1);
-        assert_eq!(hops[0].0, 2);
-
-        let (core, hops) = split_relative_hops("HEAD~3").unwrap();
-        assert_eq!(core, "HEAD");
-        assert_eq!(hops.len(), 3);
-        assert!(hops.iter().all(|h| h.0 == 1));
-
-        let (core, hops) = split_relative_hops("HEAD~2^").unwrap();
-        assert_eq!(core, "HEAD");
-        assert_eq!(hops.len(), 3);
-        assert!(hops.iter().all(|h| h.0 == 1));
+    fn full_git_oid_is_not_converted_into_a_synthetic_change_id() {
+        let graph = kin_db::InMemoryGraph::new();
+        let layout = kin_core::KinLayout::new(std::path::PathBuf::from("/absent/.kin"));
+        let error = resolve_ref(
+            &graph,
+            &layout,
+            Some("1111111111111111111111111111111111111111"),
+        )
+        .unwrap_err();
+        assert!(is_ref_resolution_error(&error));
+        assert!(error.to_string().contains("repository-v6 authority"));
     }
 }

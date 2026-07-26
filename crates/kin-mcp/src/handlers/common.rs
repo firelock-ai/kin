@@ -1045,7 +1045,8 @@ fn resolve_entity_source_authority<G: GraphStore>(
     }
 
     let layout = super::artifacts::active_layout()?;
-    let source_change_id = super::artifacts::active_source_head(store, &layout)?;
+    let authority = super::repository_authority::ActiveRepositoryAuthority::open(&layout)?;
+    let source_change_id = authority.current_source_change_id()?;
     let revision = store
         .resolve_entity_revision_at(&entity.id, &source_change_id)
         .map_err(McpError::graph)?
@@ -1113,16 +1114,12 @@ fn resolve_entity_source_authority<G: GraphStore>(
             entity.id, current_artifact.entry, current_artifact.artifact_id
         )));
     };
-    let blobs = kin_blobs::BlobStore::new(layout.objects_dir())
-        .map_err(|error| graph_source_gap(format!("cannot open blob store: {error}")))?;
-    let bytes = blobs
-        .read(&kin_blobs::Hash256(*hash.as_bytes()))
-        .map_err(|error| {
-            graph_source_gap(format!(
-                "blob {hash} for entity {} artifact {:?} is unavailable or corrupt: {error}",
-                entity.id, current_artifact.artifact_id
-            ))
-        })?;
+    let bytes = authority.load_source_blob(hash).map_err(|error| {
+        graph_source_gap(format!(
+            "blob {hash} for entity {} artifact {:?} is unavailable or corrupt: {error}",
+            entity.id, current_artifact.artifact_id
+        ))
+    })?;
     let span = revision
         .entity
         .span
