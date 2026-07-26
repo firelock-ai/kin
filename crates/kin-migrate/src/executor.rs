@@ -1,264 +1,711 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::path::{Component, Path, PathBuf};
+use std::process::Command;
 use std::time::Instant;
 
 use chrono::{DateTime, Utc};
 use kin_blobs::BlobStore;
-use kin_core::{build_genesis_change, init, KinConfig, KinLayout};
-use kin_model::{Branch, BranchName, ChangeStore, GraphStore};
-use rayon::prelude::*;
-use serde::{Deserialize, Serialize};
-use tracing::info;
-
-use crate::checkpoint::{
-    clear_checkpoint, read_checkpoint, should_checkpoint, write_checkpoint, MigrateCheckpoint,
+use kin_core::{init, KinConfig, KinLayout};
+use kin_model::{
+    Branch, BranchName, ChangeStore, Entity, EntityStore, FileLayout, FilePathId, GraphStore,
+    OpaqueArtifact, ParseCompleteness, Relation, RepoPath, ResolvedTree, SemanticChangeId,
+    ShallowTrackedFile, StructuredArtifact, TreeEntry,
 };
-use crate::converter::convert;
-use crate::error::{MigrateError, Result};
-use crate::resource_threads::{proof_profile_requested, with_resource_rayon_pool};
-use crate::scanner::scan_repo;
-use crate::strategy::{plan_migration, MigrationPlan, MigrationStrategy};
+use serde::{Deserialize, Serialize};
+use tracing::{info, warn};
 
-/// Result of a completed migration.
+use crate::converter::{convert, ConversionResult};
+use crate::error::{MigrateError, Result};
+use crate::strategy::{MigrationPlan, MigrationStrategy};
+
+/// Result of a completed graph-authoritative migration.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MigrationResult {
-    /// Path to the Kin repository root.
+    /// Path to the published Kin repository root.
     pub kin_root: String,
     /// Migration strategy used.
     pub strategy: MigrationStrategy,
-    /// Number of Git commits imported as SemanticChange objects.
+    /// Number of Git commits imported as exact tree/history changes.
     pub commits_imported: usize,
-    /// Number of source files indexed.
+    /// Number of UTF-8 regular-file paths that received an enrichment facet.
+    ///
+    /// This is not repository membership. The resolved tree can contain more
+    /// entries (non-UTF8 paths, symlinks, and gitlinks) than this count.
     pub files_indexed: usize,
-    /// Total entities extracted from source files.
+    /// Total entities extracted from graph-owned head blobs.
     pub entities_extracted: usize,
-    /// Total relations extracted.
+    /// Total relations extracted or linked from graph-owned head blobs.
     pub relations_extracted: usize,
     /// Genesis change ID.
     pub genesis_id: String,
-    /// Default branch name.
+    /// Published branch name.
     pub default_branch: Option<String>,
     /// Duration in milliseconds.
     pub duration_ms: u64,
-    /// When the migration was completed.
+    /// When publication completed.
     pub completed_at: DateTime<Utc>,
 }
 
-/// Execute a full migration: scan -> plan -> init -> convert -> commit to graph.
+#[derive(Debug)]
+struct EffectivePlan {
+    plan: MigrationPlan,
+    same_target: bool,
+}
+
+#[derive(Debug)]
+struct ImportedHead {
+    change_id: SemanticChangeId,
+    git_oid: String,
+    tree: ResolvedTree,
+}
+
+#[derive(Debug, Default)]
+struct PreparedEnrichment {
+    files_indexed: usize,
+    entities: Vec<Entity>,
+    relations: Vec<Relation>,
+    layouts: Vec<FileLayout>,
+    shallow_files: Vec<ShallowTrackedFile>,
+    structured_artifacts: Vec<StructuredArtifact>,
+    opaque_artifacts: Vec<OpaqueArtifact>,
+}
+
+impl PreparedEnrichment {
+    fn entity_count(&self) -> usize {
+        self.entities.len()
+    }
+
+    fn relation_count(&self) -> usize {
+        self.relations.len()
+    }
+}
+
+/// Execute a migration through a hidden, fully verified staging repository.
 ///
-/// This is the top-level entry point for `kin migrate`. It orchestrates:
-/// 1. Scanning the source Git repo
-/// 2. Planning the migration (exact snapshot vs full reachable history)
-/// 3. Initializing the .kin/ directory
-/// 4. Converting Git history + indexing source files
-/// 5. Committing changes and entities to the graph store
-pub fn execute_migration<G: GraphStore>(
-    plan: &MigrationPlan,
-    graph: &G,
-) -> Result<MigrationResult> {
-    let _span = tracing::info_span!(
-        "kin.migrate.execute",
-        source = %plan.source.display(),
-        target = %plan.target.display(),
-        strategy = ?plan.strategy,
-        files = plan.source_files.len()
-    )
-    .entered();
+/// The externally visible failure boundary is publication:
+///
+/// 1. Import exact Git tree/history into a staging blob store.
+/// 2. Resolve and validate the imported head without graph mutation.
+/// 3. Read every referenced blob back by hash and prepare optional enrichment.
+/// 4. Atomically admit the imported change batch into the staging graph.
+/// 5. Persist enrichment, then publish the branch head last.
+/// 6. Save and reopen-verify the staging graph.
+/// 7. For a distinct target, project the exact resolved tree into a separate
+///    staging root, attach the verified `.kin`, and rename the complete root
+///    into place. For an in-place migration, recheck Git HEAD/status and rename
+///    only the verified `.kin` into place.
+///
+/// A failed operation before step 7 leaves no `.kin` at the requested target.
+/// Registry registration happens after publication and is repairable metadata;
+/// failure there is warned without invalidating the already complete repo.
+pub fn execute_migration_persisted(plan: &MigrationPlan) -> Result<MigrationResult> {
     let start = Instant::now();
-
-    // Check target isn't already initialized.
-    let kin_dir = plan.target.join(".kin");
-    if kin_dir.exists() {
-        return Err(MigrateError::AlreadyInitialized(
-            plan.target.display().to_string(),
-        ));
+    let effective = preflight_plan(plan)?;
+    if effective.same_target {
+        verify_same_target_source(&effective.plan, None)?;
     }
 
+    let target_parent = effective.plan.target.parent().ok_or_else(|| {
+        MigrateError::Other(format!(
+            "migration target has no parent: {}",
+            effective.plan.target.display()
+        ))
+    })?;
+    std::fs::create_dir_all(target_parent)
+        .map_err(|error| MigrateError::io(target_parent, error))?;
+    let transaction = tempfile::Builder::new()
+        .prefix(".kin-migrate-transaction-")
+        .tempdir_in(target_parent)
+        .map_err(|error| MigrateError::io(target_parent, error))?;
+    let control_root = transaction.path().join("control");
+    std::fs::create_dir(&control_root).map_err(|error| MigrateError::io(&control_root, error))?;
+
+    let init_result = init(&control_root).map_err(|error| MigrateError::Init(error.to_string()))?;
+    let snapshot_path = init_result.layout.kindb_snapshot_path();
+    let snapshot = open_snapshot_retrying(&snapshot_path)?;
+    let graph = snapshot.graph();
+    let branch_name = configure_staging_branch(
+        graph.as_ref(),
+        &init_result.layout,
+        &init_result.config,
+        init_result.genesis_id,
+        effective.plan.branch.as_deref(),
+    )?;
+    let blob_store = BlobStore::new(init_result.layout.objects_dir())
+        .map_err(|error| MigrateError::Blob(error.to_string()))?;
+
+    // Exact Git admission is the first semantic operation. The returned
+    // changes and blob objects are canonical staging truth before any parser is
+    // allowed to run.
+    let conversion = convert(&effective.plan, init_result.genesis_id, &blob_store)?;
+    let imported_head = resolve_imported_head(&conversion, init_result.genesis_id)?;
+    verify_selected_ref_unchanged(&effective.plan, &imported_head.git_oid)?;
+
+    if !effective.same_target {
+        reject_unmaterializable_gitlinks(&imported_head.tree)?;
+    }
+
+    // Enrichment is computed only from the resolved head and bytes read back
+    // from the content-addressed store. Missing/corrupt blobs fail here, before
+    // the staging graph changes.
+    let enrichment = prepare_head_enrichment(&imported_head.tree, &blob_store)?;
+
+    // kin-db validates every immutable payload before mutation and admits this
+    // batch under one changes lock. The branch remains at genesis until every
+    // enrichment facet below has persisted successfully.
+    graph
+        .create_changes(
+            conversion
+                .imported_changes
+                .iter()
+                .map(|imported| imported.change.clone())
+                .collect(),
+        )
+        .map_err(|error| MigrateError::Graph(error.to_string()))?;
+    persist_enrichment(graph.as_ref(), &enrichment)?;
+    graph
+        .update_branch_head(&BranchName::new(&branch_name), &imported_head.change_id)
+        .map_err(|error| MigrateError::Graph(error.to_string()))?;
+    verify_graph_state(
+        graph.as_ref(),
+        &branch_name,
+        imported_head.change_id,
+        &imported_head.tree,
+    )?;
+    crate::finalize::build_and_save_kidx(&snapshot_path, graph.as_ref())?;
+    snapshot
+        .save()
+        .map_err(|error| MigrateError::Graph(error.to_string()))?;
+    drop(graph);
+    drop(snapshot);
+    verify_persisted_graph(
+        &snapshot_path,
+        &branch_name,
+        imported_head.change_id,
+        &imported_head.tree,
+    )?;
+
+    if effective.same_target {
+        // Close the time-of-check/time-of-use window before making `.kin`
+        // visible in the source worktree.
+        verify_same_target_source(&effective.plan, Some(&imported_head.git_oid))?;
+        publish_in_place(&control_root, &effective.plan.target)?;
+    } else {
+        let publish_root = transaction.path().join("repository");
+        kin_projection::materialize_resolved_tree(&publish_root, &imported_head.tree, &blob_store)
+            .map_err(|error| MigrateError::Projection(error.to_string()))?;
+        attach_staged_kin(&control_root, &publish_root)?;
+        publish_distinct_target(&publish_root, &effective.plan.target)?;
+    }
+    drop(blob_store);
+
+    if let Err(error) =
+        crate::finalize::update_registry(&effective.plan.target, enrichment.entity_count())
     {
-        let _span = tracing::info_span!(
-            "kin.migrate.materialize_target_workspace",
-            source = %plan.source.display(),
-            target = %plan.target.display()
-        )
-        .entered();
-        materialize_target_workspace(plan)?;
-    }
-
-    // Step 1: Initialize .kin/ directory.
-    let init_result = {
-        let _span = tracing::info_span!(
-            "kin.migrate.init_repo",
-            target = %plan.target.display()
-        )
-        .entered();
-        init(&plan.target).map_err(|e| MigrateError::Init(e.to_string()))?
-    };
-
-    info!(
-        repo_id = %init_result.manifest.repo_id,
-        "kin repository initialized at {}",
-        plan.target.display()
-    );
-
-    // Step 2: Set up blob store.
-    let blob_store = {
-        let _span = tracing::info_span!(
-            "kin.migrate.open_blob_store",
-            path = %init_result.layout.objects_dir().display()
-        )
-        .entered();
-        BlobStore::new(init_result.layout.objects_dir())
-            .map_err(|e| MigrateError::Blob(e.to_string()))?
-    };
-
-    // Step 3: Build genesis change and write to graph.
-    let genesis = build_genesis_change();
-    let genesis_id = genesis.id;
-
-    // Create the main branch pointing to genesis.
-    let branch_name = plan.branch.as_deref().unwrap_or("main");
-    kin_core::init_graph(graph, &genesis, branch_name)
-        .map_err(|e| MigrateError::Graph(e.to_string()))?;
-
-    // Check for an existing checkpoint to support --resume.
-    let checkpoint = read_checkpoint(&plan.target)?;
-    let skip_count = checkpoint.as_ref().map_or(0, |cp| cp.total_processed);
-    if let Some(ref cp) = checkpoint {
-        info!(
-            last_commit = %cp.last_commit,
-            total_processed = cp.total_processed,
-            "resuming migration from checkpoint"
+        warn!(
+            target = %effective.plan.target.display(),
+            error = %error,
+            "migration published successfully but local registry registration needs repair"
         );
     }
 
-    // Step 4: Convert Git history and index source files.
-    let conversion = {
-        let _span =
-            tracing::info_span!("kin.migrate.convert_plan", files = plan.source_files.len())
-                .entered();
-        convert(plan, genesis_id, &blob_store)?
-    };
-
-    let (files_indexed, entities_extracted, relations_extracted) = {
-        let _span = tracing::info_span!(
-            "kin.migrate.persist_semantic_index",
-            files = plan.source_files.len()
-        )
-        .entered();
-        persist_semantic_index(plan, &blob_store, graph)?
-    };
-
-    // Step 5: Write imported changes to the graph.
-    let mut commits_processed = skip_count;
-    {
-        let _span = tracing::info_span!(
-            "kin.migrate.persist_changes",
-            changes = conversion.imported_changes.len(),
-            skip = skip_count
-        )
-        .entered();
-        for (i, imported) in conversion.imported_changes.iter().enumerate() {
-            if i < skip_count {
-                continue;
-            }
-
-            graph
-                .create_change(&imported.change)
-                .map_err(|e| MigrateError::Graph(e.to_string()))?;
-
-            commits_processed += 1;
-
-            if should_checkpoint(commits_processed) {
-                let cp = MigrateCheckpoint::new(
-                    imported.change.id.to_string(),
-                    commits_processed,
-                    entities_extracted,
-                    relations_extracted,
-                    files_indexed,
-                );
-                write_checkpoint(&plan.target, &cp)?;
-                info!(
-                    commits_processed,
-                    last_commit = %imported.change.id,
-                    "migration checkpoint written"
-                );
-            }
-        }
-    }
-
-    // Update branch head to the latest imported change.
-    if let Some(last) = conversion.imported_changes.last() {
-        let branch = kin_model::BranchName::new(branch_name);
-        graph
-            .update_branch_head(&branch, &last.change.id)
-            .map_err(|e| MigrateError::Graph(e.to_string()))?;
-    }
-
-    // Migration succeeded — remove the checkpoint file.
-    clear_checkpoint(&plan.target)?;
-
     let elapsed = start.elapsed();
-
     let result = MigrationResult {
-        kin_root: plan.target.display().to_string(),
-        strategy: plan.strategy,
+        kin_root: effective.plan.target.display().to_string(),
+        strategy: effective.plan.strategy,
         commits_imported: conversion.imported_changes.len(),
-        files_indexed,
-        entities_extracted,
-        relations_extracted,
-        genesis_id: genesis_id.to_string(),
-        default_branch: Some(branch_name.to_string()),
+        files_indexed: enrichment.files_indexed,
+        entities_extracted: enrichment.entity_count(),
+        relations_extracted: enrichment.relation_count(),
+        genesis_id: init_result.genesis_id.to_string(),
+        default_branch: Some(branch_name),
         duration_ms: elapsed.as_millis() as u64,
         completed_at: Utc::now(),
     };
-
     info!(
         commits = result.commits_imported,
         files = result.files_indexed,
         entities = result.entities_extracted,
+        relations = result.relations_extracted,
         duration_ms = result.duration_ms,
-        "migration complete"
+        "graph-authoritative migration published"
     );
-
     Ok(result)
 }
 
-/// Open a KinDB snapshot, retrying briefly on transient exclusive-lock
-/// contention.
-///
-/// kin-db's `SnapshotManager::open` takes the graph's OS-level lock with a
-/// *non-blocking* `flock(LOCK_EX|LOCK_NB)`, so it fails immediately with
-/// `EAGAIN` ("Resource temporarily unavailable") if a previous handle on the
-/// same graph has not finished releasing yet. A persisted migration opens the
-/// freshly-created target graph several times in quick succession (align default
-/// branch, main index pass, verify), and these transient self-overlaps would
-/// otherwise surface as flaky `LockError`s even though no other process is
-/// involved. Retrying with a short bounded backoff turns the non-blocking
-/// acquire into an effectively-blocking one without modifying kin-db.
+fn preflight_plan(plan: &MigrationPlan) -> Result<EffectivePlan> {
+    let source = plan
+        .source
+        .canonicalize()
+        .map_err(|error| MigrateError::io(&plan.source, error))?;
+    let target = if plan.target.exists() {
+        plan.target
+            .canonicalize()
+            .map_err(|error| MigrateError::io(&plan.target, error))?
+    } else {
+        absolute_normalized(&plan.target)?
+    };
+    let same_target = source == target;
+
+    if target.join(".kin").exists() {
+        return Err(MigrateError::AlreadyInitialized(
+            target.display().to_string(),
+        ));
+    }
+    if !same_target && (target.starts_with(&source) || source.starts_with(&target)) {
+        return Err(MigrateError::Other(format!(
+            "distinct-target migration requires non-nested paths: source={} target={}",
+            source.display(),
+            target.display()
+        )));
+    }
+    if !same_target {
+        ensure_empty_target(&target)?;
+    }
+
+    Ok(EffectivePlan {
+        plan: MigrationPlan {
+            source,
+            target,
+            strategy: plan.strategy,
+            branch: plan.branch.clone(),
+        },
+        same_target,
+    })
+}
+
+fn absolute_normalized(path: &Path) -> Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| MigrateError::io(path, error))?
+            .join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+    Ok(normalized)
+}
+
+fn ensure_empty_target(target: &Path) -> Result<()> {
+    let metadata = match std::fs::symlink_metadata(target) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(MigrateError::io(target, error)),
+    };
+    if !metadata.file_type().is_dir() {
+        return Err(MigrateError::Other(format!(
+            "distinct-target migration requires an absent or empty directory: {}",
+            target.display()
+        )));
+    }
+    let mut entries = std::fs::read_dir(target).map_err(|error| MigrateError::io(target, error))?;
+    if entries
+        .next()
+        .transpose()
+        .map_err(|error| MigrateError::io(target, error))?
+        .is_some()
+    {
+        return Err(MigrateError::Other(format!(
+            "distinct-target migration requires an empty target directory: {}",
+            target.display()
+        )));
+    }
+    Ok(())
+}
+
+fn verify_same_target_source(plan: &MigrationPlan, expected_oid: Option<&str>) -> Result<()> {
+    let status = git_output(
+        &plan.source,
+        &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+    )?;
+    if !status.is_empty() {
+        return Err(MigrateError::Other(
+            "in-place migration requires a clean Git worktree with no untracked files".to_string(),
+        ));
+    }
+
+    let current = git_commit_oid(&plan.source, "HEAD")?;
+    let selected = selected_ref_oid(plan)?;
+    if current != selected {
+        return Err(MigrateError::Other(format!(
+            "in-place migration selected Git commit {selected}, but the checked-out worktree is {current}"
+        )));
+    }
+    if let Some(expected) = expected_oid {
+        if current != expected {
+            return Err(MigrateError::Other(format!(
+                "Git HEAD changed during migration: imported {expected}, now {current}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn verify_selected_ref_unchanged(plan: &MigrationPlan, expected_oid: &str) -> Result<()> {
+    let actual = selected_ref_oid(plan)?;
+    if actual != expected_oid {
+        return Err(MigrateError::Other(format!(
+            "selected Git ref changed during migration: imported {expected_oid}, now {actual}"
+        )));
+    }
+    Ok(())
+}
+
+fn selected_ref_oid(plan: &MigrationPlan) -> Result<String> {
+    match &plan.branch {
+        Some(branch) => git_commit_oid(&plan.source, &format!("refs/heads/{branch}")),
+        None => git_commit_oid(&plan.source, "HEAD"),
+    }
+}
+
+fn git_commit_oid(repo: &Path, revision: &str) -> Result<String> {
+    let peeled = format!("{revision}^{{commit}}");
+    let output = git_output(repo, &["rev-parse", "--verify", &peeled])?;
+    String::from_utf8(output)
+        .map(|value| value.trim().to_string())
+        .map_err(|error| MigrateError::Other(format!("Git returned a non-UTF8 object id: {error}")))
+}
+
+fn git_output(repo: &Path, args: &[&str]) -> Result<Vec<u8>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .map_err(|error| MigrateError::io(repo, error))?;
+    if !output.status.success() {
+        return Err(MigrateError::GitImport(format!(
+            "git {} failed in {}: {}",
+            args.join(" "),
+            repo.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(output.stdout)
+}
+
+fn configure_staging_branch(
+    graph: &kin_db::InMemoryGraph,
+    layout: &KinLayout,
+    config: &KinConfig,
+    genesis_id: SemanticChangeId,
+    requested: Option<&str>,
+) -> Result<String> {
+    let branch_name = requested.unwrap_or(&config.default_branch).to_string();
+    if branch_name != config.default_branch {
+        graph
+            .create_branch(&Branch {
+                name: BranchName::new(&branch_name),
+                head: genesis_id,
+            })
+            .map_err(|error| MigrateError::Graph(error.to_string()))?;
+        graph
+            .delete_branch(&BranchName::new(&config.default_branch))
+            .map_err(|error| MigrateError::Graph(error.to_string()))?;
+        let mut updated = config.clone();
+        updated.default_branch = branch_name.clone();
+        updated
+            .save(&layout.config_path())
+            .map_err(|error| MigrateError::Init(error.to_string()))?;
+        std::fs::write(layout.head_path(), &branch_name)
+            .map_err(|error| MigrateError::io(layout.head_path(), error))?;
+    }
+    Ok(branch_name)
+}
+
+fn resolve_imported_head(
+    conversion: &ConversionResult,
+    genesis_id: SemanticChangeId,
+) -> Result<ImportedHead> {
+    let last = conversion.imported_changes.last().ok_or_else(|| {
+        MigrateError::GitImport("selected Git ref contains no importable commit".to_string())
+    })?;
+    let mut states = HashMap::new();
+    states.insert(genesis_id, ResolvedTree::default());
+    let mut seen = HashSet::new();
+
+    for imported in &conversion.imported_changes {
+        let change = &imported.change;
+        if !seen.insert(change.id) {
+            return Err(MigrateError::Graph(format!(
+                "imported history contains duplicate change {}",
+                change.id
+            )));
+        }
+        if change.parents.is_empty() {
+            return Err(MigrateError::Graph(format!(
+                "imported change {} has no boundary or Git parent",
+                change.id
+            )));
+        }
+        for parent in &change.parents {
+            if !states.contains_key(parent) {
+                return Err(MigrateError::Graph(format!(
+                    "imported change {} references unresolved parent {}",
+                    change.id, parent
+                )));
+            }
+        }
+        let parent = states
+            .get(&change.parents[0])
+            .expect("all imported parents were validated");
+        let tree = parent.apply(&change.tree_deltas).map_err(|error| {
+            MigrateError::Graph(format!(
+                "invalid exact tree transition in imported change {}: {error}",
+                change.id
+            ))
+        })?;
+        states.insert(change.id, tree);
+    }
+
+    let tree = states.remove(&last.change.id).ok_or_else(|| {
+        MigrateError::Graph(format!(
+            "imported head {} did not resolve to a repository tree",
+            last.change.id
+        ))
+    })?;
+    Ok(ImportedHead {
+        change_id: last.change.id,
+        git_oid: last.git_oid.clone(),
+        tree,
+    })
+}
+
+fn reject_unmaterializable_gitlinks(tree: &ResolvedTree) -> Result<()> {
+    if let Some(artifact) = tree
+        .artifacts_by_path()
+        .find(|artifact| matches!(artifact.entry, TreeEntry::Gitlink { .. }))
+    {
+        return Err(MigrateError::Projection(format!(
+            "distinct-target migration cannot materialize gitlink {} without an admitted submodule tree",
+            artifact.path
+        )));
+    }
+    Ok(())
+}
+
+fn prepare_head_enrichment(
+    tree: &ResolvedTree,
+    blob_store: &BlobStore,
+) -> Result<PreparedEnrichment> {
+    let mut prepared = PreparedEnrichment::default();
+    let mut file_parse_data: Vec<kin_index::linker::FileParseDataWithTests> = Vec::new();
+    let mut parse_completeness = kin_index::FileParseCompletenessMap::new();
+    let mut artifact_ids = kin_index::linker::ArtifactIdentityMap::new();
+    let pipeline = kin_index::IndexPipeline::new();
+
+    for artifact in tree.artifacts_by_path() {
+        let Some(hash) = artifact.entry.blob_identity() else {
+            // Gitlinks are exact tree truth but do not name repository-owned
+            // bytes, so they have no file enrichment facet.
+            continue;
+        };
+        let blob_hash = kin_blobs::Hash256::from_bytes(*hash.as_bytes());
+        let content = blob_store.read(&blob_hash).map_err(|error| {
+            MigrateError::Blob(format!(
+                "tree entry {} references unavailable blob {}: {error}",
+                artifact.path, hash
+            ))
+        })?;
+
+        // Symlink bytes are a link target, not source or artifact contents.
+        if !matches!(artifact.entry, TreeEntry::Blob { .. }) {
+            continue;
+        }
+        let Some(path) = artifact.path.as_utf8() else {
+            // The byte-exact path remains in the resolved tree. Semantic facets
+            // are UTF-8 keyed and must never invent a lossy alias.
+            continue;
+        };
+        let file_id = FilePathId::new(path);
+        artifact_ids.insert(path.to_string(), artifact.artifact_id);
+        prepared.files_indexed += 1;
+
+        let indexed = match pipeline.index_any_content(&file_id, &content, blob_hash) {
+            Ok(indexed) => indexed,
+            Err(error) => {
+                // Parser/structured-adapter support is optional. Exact bytes
+                // are already admitted; a failed optional enricher degrades to
+                // an opaque facet rather than rejecting repository content.
+                warn!(
+                    path,
+                    error = %error,
+                    "optional semantic enrichment failed; retaining opaque facet"
+                );
+                kin_index::IndexedAny::OpaqueArtifact(OpaqueArtifact {
+                    file_id: file_id.clone(),
+                    content_hash: hash,
+                    mime_type: None,
+                    text_preview: None,
+                })
+            }
+        };
+
+        match indexed {
+            kin_index::IndexedAny::EntitySource(indexed) => {
+                parse_completeness.insert(
+                    indexed.file_id.0.clone(),
+                    indexed.file_layout.parse_completeness.clone(),
+                );
+                prepared.layouts.push(indexed.file_layout.clone());
+                prepared.entities.extend(indexed.entities.iter().cloned());
+                prepared.relations.extend(indexed.relations.iter().cloned());
+                file_parse_data.push(kin_index::linker::FileParseDataWithTests {
+                    file_path: indexed.file_id.0,
+                    entities: indexed.entities,
+                    relations: indexed.extracted_relations,
+                    imports: indexed.imports,
+                    tests: Vec::new(),
+                });
+            }
+            kin_index::IndexedAny::ShallowSyntax(shallow) => {
+                prepared.shallow_files.push(shallow_tracked_file(shallow));
+            }
+            kin_index::IndexedAny::StructuredArtifact(artifact) => {
+                prepared.structured_artifacts.push(artifact);
+            }
+            kin_index::IndexedAny::OpaqueArtifact(artifact) => {
+                prepared.opaque_artifacts.push(artifact);
+            }
+        }
+    }
+
+    let linked = kin_index::linker::link_cross_file_with_tests_and_completeness(
+        &file_parse_data,
+        &artifact_ids,
+        &parse_completeness,
+    )
+    .map_err(|error| MigrateError::Index(error.to_string()))?;
+    prepared.relations.extend(linked);
+    Ok(prepared)
+}
+
+fn shallow_tracked_file(shallow: kin_parser::ShallowFile) -> ShallowTrackedFile {
+    ShallowTrackedFile {
+        file_id: shallow.file_id,
+        language_hint: shallow.language_hint.unwrap_or_default(),
+        declaration_count: shallow.declarations.len(),
+        import_count: shallow.imports.len(),
+        syntax_hash: shallow.fingerprint.syntax_hash,
+        signature_hash: shallow.fingerprint.signature_hash,
+        declaration_names: shallow
+            .declarations
+            .into_iter()
+            .map(|declaration| declaration.name)
+            .collect(),
+        import_paths: shallow
+            .imports
+            .into_iter()
+            .map(|import| import.raw_path)
+            .collect(),
+    }
+}
+
+fn persist_enrichment(
+    graph: &kin_db::InMemoryGraph,
+    enrichment: &PreparedEnrichment,
+) -> Result<()> {
+    for layout in &enrichment.layouts {
+        graph
+            .upsert_file_layout(layout)
+            .map_err(|error| MigrateError::Graph(error.to_string()))?;
+    }
+    for shallow in &enrichment.shallow_files {
+        graph
+            .upsert_shallow_file(shallow)
+            .map_err(|error| MigrateError::Graph(error.to_string()))?;
+    }
+    for artifact in &enrichment.structured_artifacts {
+        graph
+            .upsert_structured_artifact(artifact)
+            .map_err(|error| MigrateError::Graph(error.to_string()))?;
+    }
+    for artifact in &enrichment.opaque_artifacts {
+        graph
+            .upsert_opaque_artifact(artifact)
+            .map_err(|error| MigrateError::Graph(error.to_string()))?;
+    }
+    graph
+        .upsert_entities_batch(&enrichment.entities)
+        .map_err(|error| MigrateError::Graph(error.to_string()))?;
+    graph
+        .upsert_relations_batch(&enrichment.relations)
+        .map_err(|error| MigrateError::Graph(error.to_string()))?;
+    Ok(())
+}
+
+fn verify_graph_state(
+    graph: &kin_db::InMemoryGraph,
+    branch_name: &str,
+    expected_head: SemanticChangeId,
+    expected_tree: &ResolvedTree,
+) -> Result<()> {
+    let branch = graph
+        .get_branch(&BranchName::new(branch_name))
+        .map_err(|error| MigrateError::Graph(error.to_string()))?
+        .ok_or_else(|| {
+            MigrateError::Graph(format!(
+                "migration verification failed: branch {branch_name:?} is missing"
+            ))
+        })?;
+    if branch.head != expected_head {
+        return Err(MigrateError::Graph(format!(
+            "migration verification failed: branch {branch_name:?} head {} != {}",
+            branch.head, expected_head
+        )));
+    }
+    let tree = graph
+        .resolve_tree_at(&expected_head)
+        .map_err(|error| MigrateError::Graph(error.to_string()))?;
+    if &tree != expected_tree {
+        return Err(MigrateError::Graph(
+            "migration verification failed: persisted head tree differs from imported tree"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn verify_persisted_graph(
+    snapshot_path: &Path,
+    branch_name: &str,
+    expected_head: SemanticChangeId,
+    expected_tree: &ResolvedTree,
+) -> Result<()> {
+    let snapshot = open_snapshot_retrying(snapshot_path)?;
+    let graph = snapshot.graph();
+    verify_graph_state(graph.as_ref(), branch_name, expected_head, expected_tree)
+}
+
 fn open_snapshot_retrying(path: impl AsRef<Path>) -> Result<kin_db::SnapshotManager> {
-    // ~5s worst case (200 * 25ms); the uncontended path returns on attempt 1.
     const MAX_ATTEMPTS: u32 = 200;
     const BACKOFF: std::time::Duration = std::time::Duration::from_millis(25);
 
     let path = path.as_ref();
-    let mut attempt: u32 = 1;
+    let mut attempt = 1;
     loop {
         match kin_db::SnapshotManager::open(path) {
             Ok(snapshot) => return Ok(snapshot),
-            Err(e) => {
-                let msg = e.to_string();
-                let transient = msg.contains("lock error")
-                    || msg.to_lowercase().contains("temporarily unavailable");
+            Err(error) => {
+                let message = error.to_string();
+                let transient = message.contains("lock error")
+                    || message.to_lowercase().contains("temporarily unavailable");
                 if !transient || attempt >= MAX_ATTEMPTS {
-                    return Err(MigrateError::Graph(msg));
-                }
-                if attempt == 1 {
-                    tracing::debug!(
-                        path = %path.display(),
-                        "graph lock contended on open; retrying with bounded backoff"
-                    );
+                    return Err(MigrateError::Graph(message));
                 }
                 std::thread::sleep(BACKOFF);
                 attempt += 1;
@@ -267,577 +714,33 @@ fn open_snapshot_retrying(path: impl AsRef<Path>) -> Result<kin_db::SnapshotMana
     }
 }
 
-/// Execute a migration against a snapshot-backed KinDB and verify that the
-/// migrated repository has persisted semantic state before returning success.
-pub fn execute_migration_persisted(plan: &MigrationPlan) -> Result<MigrationResult> {
-    let _span = tracing::info_span!(
-        "kin.migrate.execute_persisted",
-        source = %plan.source.display(),
-        target = %plan.target.display(),
-        strategy = ?plan.strategy,
-        files = plan.source_files.len()
-    )
-    .entered();
-    let start = Instant::now();
+fn attach_staged_kin(control_root: &Path, publish_root: &Path) -> Result<()> {
+    let staged_kin = control_root.join(".kin");
+    let destination = publish_root.join(".kin");
+    std::fs::rename(&staged_kin, &destination)
+        .map_err(|error| MigrateError::io(&destination, error))
+}
 
-    let kin_dir = plan.target.join(".kin");
-    if kin_dir.exists() {
+fn publish_in_place(control_root: &Path, target: &Path) -> Result<()> {
+    let staged_kin = control_root.join(".kin");
+    let destination = target.join(".kin");
+    if destination.exists() {
         return Err(MigrateError::AlreadyInitialized(
-            plan.target.display().to_string(),
+            target.display().to_string(),
         ));
     }
-
-    {
-        let _span = tracing::info_span!(
-            "kin.migrate.materialize_target_workspace",
-            source = %plan.source.display(),
-            target = %plan.target.display()
-        )
-        .entered();
-        materialize_target_workspace(plan)?;
-    }
-
-    let init_result = {
-        let _span = tracing::info_span!(
-            "kin.migrate.init_repo",
-            target = %plan.target.display()
-        )
-        .entered();
-        init(&plan.target).map_err(|e| MigrateError::Init(e.to_string()))?
-    };
-    let branch_name = {
-        let _span = tracing::info_span!(
-            "kin.migrate.align_default_branch",
-            target = %plan.target.display()
-        )
-        .entered();
-        align_default_branch(
-            &init_result.layout,
-            &init_result.config,
-            init_result.genesis_id,
-            plan,
-        )?
-    };
-    let snapshot_path = init_result.layout.kindb_snapshot_path();
-    let snapshot = {
-        let _span = tracing::info_span!(
-            "kin.migrate.open_snapshot",
-            path = %snapshot_path.display()
-        )
-        .entered();
-        open_snapshot_retrying(&snapshot_path)?
-    };
-    let graph = snapshot.graph();
-
-    let blob_store = {
-        let _span = tracing::info_span!(
-            "kin.migrate.open_blob_store",
-            path = %init_result.layout.objects_dir().display()
-        )
-        .entered();
-        BlobStore::new(init_result.layout.objects_dir())
-            .map_err(|e| MigrateError::Blob(e.to_string()))?
-    };
-    let genesis_id = init_result.genesis_id;
-
-    // Check for an existing checkpoint to support --resume.
-    let checkpoint = read_checkpoint(&plan.target)?;
-    let skip_count = checkpoint.as_ref().map_or(0, |cp| cp.total_processed);
-    if let Some(ref cp) = checkpoint {
-        info!(
-            last_commit = %cp.last_commit,
-            total_processed = cp.total_processed,
-            "resuming migration from checkpoint"
-        );
-    }
-
-    let conversion = {
-        let _span =
-            tracing::info_span!("kin.migrate.convert_plan", files = plan.source_files.len())
-                .entered();
-        convert(plan, genesis_id, &blob_store)?
-    };
-    let (files_indexed, entities_extracted, relations_extracted) = {
-        let _span = tracing::info_span!(
-            "kin.migrate.persist_semantic_index",
-            files = plan.source_files.len()
-        )
-        .entered();
-        persist_semantic_index(plan, &blob_store, graph.as_ref())?
-    };
-
-    let mut commits_processed = skip_count;
-    {
-        let _span = tracing::info_span!(
-            "kin.migrate.persist_changes",
-            changes = conversion.imported_changes.len(),
-            skip = skip_count
-        )
-        .entered();
-        for (i, imported) in conversion.imported_changes.iter().enumerate() {
-            // Skip commits already processed in a previous run.
-            if i < skip_count {
-                continue;
-            }
-
-            graph
-                .create_change(&imported.change)
-                .map_err(|e| MigrateError::Graph(e.to_string()))?;
-
-            commits_processed += 1;
-
-            if should_checkpoint(commits_processed) {
-                let cp = MigrateCheckpoint::new(
-                    imported.change.id.to_string(),
-                    commits_processed,
-                    entities_extracted,
-                    relations_extracted,
-                    files_indexed,
-                );
-                write_checkpoint(&plan.target, &cp)?;
-                info!(
-                    commits_processed,
-                    last_commit = %imported.change.id,
-                    "migration checkpoint written"
-                );
-            }
-        }
-    }
-
-    if let Some(last) = conversion.imported_changes.last() {
-        graph
-            .update_branch_head(&BranchName::new(&branch_name), &last.change.id)
-            .map_err(|e| MigrateError::Graph(e.to_string()))?;
-    }
-
-    // Finalization: build read index before dropping the graph.
-    {
-        let _span = tracing::info_span!(
-            "kin.migrate.build_read_index",
-            path = %snapshot_path.display()
-        )
-        .entered();
-        crate::finalize::build_and_save_kidx(&snapshot_path, &graph)?;
-    }
-
-    {
-        let _span = tracing::info_span!(
-            "kin.migrate.save_snapshot",
-            path = %snapshot_path.display()
-        )
-        .entered();
-        snapshot
-            .save()
-            .map_err(|e| MigrateError::Graph(e.to_string()))?;
-    }
-    drop(graph);
-    drop(snapshot);
-
-    // Migration succeeded — remove the checkpoint file.
-    clear_checkpoint(&plan.target)?;
-
-    {
-        let _span = tracing::info_span!(
-            "kin.migrate.verify_persisted_migration",
-            path = %snapshot_path.display(),
-            branch = %branch_name
-        )
-        .entered();
-        verify_persisted_migration(
-            &snapshot_path,
-            &branch_name,
-            conversion
-                .imported_changes
-                .last()
-                .map(|change| change.change.id),
-            plan.source_files.len(),
-            files_indexed,
-        )?;
-    }
-
-    // Finalization: eject snapshot and registry.
-    {
-        let _span = tracing::info_span!(
-            "kin.migrate.ensure_eject_snapshot",
-            target = %plan.target.display()
-        )
-        .entered();
-        crate::finalize::ensure_eject_snapshot(&plan.target, &init_result.layout.root())?;
-    }
-    crate::finalize::update_registry(&plan.target, entities_extracted)?;
-
-    let elapsed = start.elapsed();
-    Ok(MigrationResult {
-        kin_root: plan.target.display().to_string(),
-        strategy: plan.strategy,
-        commits_imported: conversion.imported_changes.len(),
-        files_indexed,
-        entities_extracted,
-        relations_extracted,
-        genesis_id: genesis_id.to_string(),
-        default_branch: Some(branch_name),
-        duration_ms: elapsed.as_millis() as u64,
-        completed_at: Utc::now(),
-    })
+    std::fs::rename(&staged_kin, &destination)
+        .map_err(|error| MigrateError::io(&destination, error))
 }
 
-/// Convenience: scan + plan + execute in one call.
-pub fn migrate_repo<G: GraphStore>(
-    source: &std::path::Path,
-    strategy: MigrationStrategy,
-    graph: &G,
-) -> Result<MigrationResult> {
-    let scan = scan_repo(source)?;
-    let plan = plan_migration(&scan, strategy, None);
-    execute_migration(&plan, graph)
-}
-
-fn persist_semantic_index<G: GraphStore>(
-    plan: &MigrationPlan,
-    blob_store: &BlobStore,
-    graph: &G,
-) -> Result<(usize, usize, usize)> {
-    let workspace_root = materialized_workspace_root(plan);
-    let mut files_indexed = 0usize;
-    let mut entities_extracted = 0usize;
-    let mut relations_extracted = 0usize;
-    let mut file_parse_data: Vec<kin_index::linker::FileParseDataWithTests> = Vec::new();
-    let mut parse_completeness_by_file = kin_index::FileParseCompletenessMap::new();
-
-    let indexed_files = if proof_profile_requested()? {
-        index_planned_files_serial(plan, blob_store, &workspace_root)?
-    } else {
-        index_planned_files_parallel(plan, blob_store, &workspace_root)?
-    };
-
-    let mut all_entities: Vec<kin_model::Entity> = Vec::new();
-    let mut all_relations: Vec<kin_model::Relation> = Vec::new();
-    for indexed in indexed_files {
-        let entity_count = indexed.indexed_file.entities.len();
-        let relation_count = indexed.indexed_file.relations.len();
-        let parse_completeness = indexed.indexed_file.file_layout.parse_completeness.clone();
-        parse_completeness_by_file
-            .insert(indexed.indexed_file.file_id.0.clone(), parse_completeness);
-        graph
-            .upsert_file_layout(&indexed.indexed_file.file_layout)
-            .map_err(|e| MigrateError::Graph(e.to_string()))?;
-        all_entities.extend(indexed.indexed_file.entities.iter().cloned());
-        all_relations.extend(indexed.indexed_file.relations);
-
-        file_parse_data.push(kin_index::linker::FileParseDataWithTests {
-            file_path: indexed.indexed_file.file_id.0.clone(),
-            entities: indexed.indexed_file.entities,
-            relations: indexed.indexed_file.extracted_relations,
-            imports: indexed.indexed_file.imports,
-            tests: indexed.tests,
-        });
-
-        files_indexed += 1;
-        entities_extracted += entity_count;
-        relations_extracted += relation_count;
+fn publish_distinct_target(publish_root: &Path, target: &Path) -> Result<()> {
+    // Recheck immediately before publication. A concurrent creator must never
+    // be overwritten by a migration that preflighted an empty path earlier.
+    ensure_empty_target(target)?;
+    if target.exists() {
+        std::fs::remove_dir(target).map_err(|error| MigrateError::io(target, error))?;
     }
-
-    graph
-        .upsert_entities_batch(&all_entities)
-        .map_err(|e| MigrateError::Graph(e.to_string()))?;
-    graph
-        .upsert_relations_batch(&all_relations)
-        .map_err(|e| MigrateError::Graph(e.to_string()))?;
-
-    let mut artifact_ids = kin_index::linker::ArtifactIdentityMap::new();
-    for file in &file_parse_data {
-        let file_id = kin_model::FilePathId::new(&file.file_path);
-        let artifact_id = graph
-            .ensure_artifact_id(&file_id)
-            .map_err(|e| MigrateError::Graph(e.to_string()))?;
-        artifact_ids.insert(file.file_path.clone(), artifact_id);
-    }
-
-    // Cross-file relation linking
-    let cross_file_relations = {
-        let _span =
-            tracing::info_span!("kin.migrate.link_cross_file", files = file_parse_data.len())
-                .entered();
-        kin_index::linker::link_cross_file_with_tests_and_completeness(
-            &file_parse_data,
-            &artifact_ids,
-            &parse_completeness_by_file,
-        )
-        .map_err(|e| MigrateError::Index(e.to_string()))?
-    };
-    graph
-        .upsert_relations_batch(&cross_file_relations)
-        .map_err(|e| MigrateError::Graph(e.to_string()))?;
-    relations_extracted += cross_file_relations.len();
-
-    Ok((files_indexed, entities_extracted, relations_extracted))
-}
-
-fn index_planned_file(
-    workspace_root: &Path,
-    rel_path: &Path,
-    blob_store: &BlobStore,
-) -> Result<kin_index::pipeline::IndexedFileWithTests> {
-    let abs_path = workspace_root.join(rel_path);
-    if !abs_path.exists() {
-        return Err(MigrateError::Other(format!(
-            "planned source file missing at execution time: {}",
-            abs_path.display()
-        )));
-    }
-
-    let pipeline = kin_index::IndexPipeline::new();
-    pipeline
-        .index_file_relative_with_tests(&abs_path, blob_store, workspace_root)
-        .map_err(|e| MigrateError::Index(e.to_string()))
-}
-
-fn index_planned_files_serial(
-    plan: &MigrationPlan,
-    blob_store: &BlobStore,
-    workspace_root: &Path,
-) -> Result<Vec<kin_index::pipeline::IndexedFileWithTests>> {
-    plan.source_files
-        .iter()
-        .map(|rel_path| index_planned_file(workspace_root, rel_path, blob_store))
-        .collect()
-}
-
-fn index_planned_files_parallel(
-    plan: &MigrationPlan,
-    blob_store: &BlobStore,
-    workspace_root: &Path,
-) -> Result<Vec<kin_index::pipeline::IndexedFileWithTests>> {
-    with_resource_rayon_pool("persist_semantic_index.index_files", || {
-        plan.source_files
-            .par_iter()
-            .map(|rel_path| index_planned_file(workspace_root, rel_path, blob_store))
-            .collect::<Result<Vec<_>>>()
-    })
-}
-
-fn align_default_branch(
-    layout: &KinLayout,
-    config: &KinConfig,
-    genesis_id: kin_model::SemanticChangeId,
-    plan: &MigrationPlan,
-) -> Result<String> {
-    let branch_name = plan
-        .branch
-        .clone()
-        .unwrap_or_else(|| config.default_branch.clone());
-
-    if branch_name == config.default_branch {
-        return Ok(branch_name);
-    }
-
-    let snapshot = open_snapshot_retrying(layout.kindb_snapshot_path())?;
-    let graph = snapshot.graph();
-    let new_branch = Branch {
-        name: BranchName::new(&branch_name),
-        head: genesis_id,
-    };
-    graph
-        .create_branch(&new_branch)
-        .map_err(|e| MigrateError::Graph(e.to_string()))?;
-    graph
-        .delete_branch(&BranchName::new(&config.default_branch))
-        .map_err(|e| MigrateError::Graph(e.to_string()))?;
-    snapshot
-        .save()
-        .map_err(|e| MigrateError::Graph(e.to_string()))?;
-    drop(graph);
-    drop(snapshot);
-
-    let mut updated = config.clone();
-    updated.default_branch = branch_name.clone();
-    updated
-        .save(&layout.config_path())
-        .map_err(|e| MigrateError::Init(e.to_string()))?;
-    std::fs::write(layout.head_path(), format!("{branch_name}\n"))
-        .map_err(|e| MigrateError::Init(e.to_string()))?;
-
-    Ok(branch_name)
-}
-
-fn verify_persisted_migration(
-    snapshot_path: &std::path::Path,
-    branch_name: &str,
-    expected_head: Option<kin_model::SemanticChangeId>,
-    planned_source_files: usize,
-    files_indexed: usize,
-) -> Result<()> {
-    let snapshot = open_snapshot_retrying(snapshot_path)?;
-    let graph = snapshot.graph();
-
-    let branch = graph
-        .get_branch(&BranchName::new(branch_name))
-        .map_err(|e| MigrateError::Graph(e.to_string()))?
-        .ok_or_else(|| {
-            MigrateError::Graph(format!(
-                "migration smoke check failed: branch '{branch_name}' missing from persisted snapshot"
-            ))
-        })?;
-
-    if let Some(head) = expected_head {
-        if branch.head != head {
-            return Err(MigrateError::Graph(format!(
-                "migration smoke check failed: branch '{branch_name}' head {} != expected {}",
-                branch.head, head
-            )));
-        }
-        let stored = graph
-            .get_change(&head)
-            .map_err(|e| MigrateError::Graph(e.to_string()))?;
-        if stored.is_none() {
-            return Err(MigrateError::Graph(format!(
-                "migration smoke check failed: imported head change {} missing from persisted snapshot",
-                head
-            )));
-        }
-    }
-
-    if planned_source_files > 0 && files_indexed == 0 {
-        return Err(MigrateError::Graph(format!(
-            "migration smoke check failed: planned {} source files but indexed none",
-            planned_source_files
-        )));
-    }
-
-    if planned_source_files > 0 && graph.entity_count() == 0 {
-        return Err(MigrateError::Graph(
-            "migration smoke check failed: planned source files but persisted snapshot has no entities"
-                .to_string(),
-        ));
-    }
-
-    Ok(())
-}
-
-fn materialized_workspace_root(plan: &MigrationPlan) -> &Path {
-    if plan.source == plan.target {
-        &plan.source
-    } else {
-        &plan.target
-    }
-}
-
-fn materialize_target_workspace(plan: &MigrationPlan) -> Result<()> {
-    if plan.source == plan.target {
-        return Ok(());
-    }
-
-    if plan.target.starts_with(&plan.source) || plan.source.starts_with(&plan.target) {
-        return Err(MigrateError::Other(format!(
-            "distinct-target migration requires non-nested paths: source={} target={}",
-            plan.source.display(),
-            plan.target.display()
-        )));
-    }
-
-    if plan.target.exists() {
-        let mut entries =
-            std::fs::read_dir(&plan.target).map_err(|e| MigrateError::io(&plan.target, e))?;
-        if entries
-            .next()
-            .transpose()
-            .map_err(|e| MigrateError::io(&plan.target, e))?
-            .is_some()
-        {
-            return Err(MigrateError::Other(format!(
-                "distinct-target migration requires an empty target directory: {}",
-                plan.target.display()
-            )));
-        }
-    } else {
-        std::fs::create_dir_all(&plan.target).map_err(|e| MigrateError::io(&plan.target, e))?;
-    }
-
-    copy_workspace_tree(&plan.source, &plan.target)
-}
-
-fn copy_workspace_tree(source_root: &Path, target_root: &Path) -> Result<()> {
-    for entry in std::fs::read_dir(source_root).map_err(|e| MigrateError::io(source_root, e))? {
-        let entry = entry.map_err(|e| MigrateError::io(source_root, e))?;
-        let file_name = entry.file_name();
-        if file_name == ".git" || file_name == ".kin" {
-            continue;
-        }
-
-        let source_path = entry.path();
-        let target_path = target_root.join(&file_name);
-        copy_workspace_entry(&source_path, &target_path)?;
-    }
-
-    Ok(())
-}
-
-fn copy_workspace_entry(source_path: &Path, target_path: &Path) -> Result<()> {
-    let file_type = std::fs::symlink_metadata(source_path)
-        .map_err(|e| MigrateError::io(source_path, e))?
-        .file_type();
-
-    if file_type.is_dir() {
-        std::fs::create_dir_all(target_path).map_err(|e| MigrateError::io(target_path, e))?;
-        for entry in std::fs::read_dir(source_path).map_err(|e| MigrateError::io(source_path, e))? {
-            let entry = entry.map_err(|e| MigrateError::io(source_path, e))?;
-            let child_name = entry.file_name();
-            if child_name == ".git" || child_name == ".kin" {
-                continue;
-            }
-            copy_workspace_entry(&entry.path(), &target_path.join(child_name))?;
-        }
-        return Ok(());
-    }
-
-    if file_type.is_symlink() {
-        return copy_workspace_symlink(source_path, target_path);
-    }
-
-    if let Some(parent) = target_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| MigrateError::io(parent, e))?;
-    }
-    std::fs::copy(source_path, target_path).map_err(|e| MigrateError::io(source_path, e))?;
-    Ok(())
-}
-
-#[cfg(unix)]
-fn copy_workspace_symlink(source_path: &Path, target_path: &Path) -> Result<()> {
-    use std::os::unix::fs::symlink;
-
-    if let Some(parent) = target_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| MigrateError::io(parent, e))?;
-    }
-    let link_target =
-        std::fs::read_link(source_path).map_err(|e| MigrateError::io(source_path, e))?;
-    symlink(&link_target, target_path).map_err(|e| MigrateError::io(target_path, e))?;
-    Ok(())
-}
-
-#[cfg(windows)]
-fn copy_workspace_symlink(source_path: &Path, target_path: &Path) -> Result<()> {
-    use std::os::windows::fs::{symlink_dir, symlink_file};
-
-    if let Some(parent) = target_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| MigrateError::io(parent, e))?;
-    }
-    let link_target =
-        std::fs::read_link(source_path).map_err(|e| MigrateError::io(source_path, e))?;
-    let metadata = std::fs::metadata(source_path).map_err(|e| MigrateError::io(source_path, e))?;
-    if metadata.is_dir() {
-        symlink_dir(&link_target, target_path).map_err(|e| MigrateError::io(target_path, e))?;
-    } else {
-        symlink_file(&link_target, target_path).map_err(|e| MigrateError::io(target_path, e))?;
-    }
-    Ok(())
-}
-
-#[cfg(not(any(unix, windows)))]
-fn copy_workspace_symlink(source_path: &Path, _target_path: &Path) -> Result<()> {
-    Err(MigrateError::Other(format!(
-        "distinct-target migration does not support symlinks on this platform: {}",
-        source_path.display()
-    )))
+    std::fs::rename(publish_root, target).map_err(|error| MigrateError::io(target, error))
 }
 
 impl MigrationResult {
@@ -845,811 +748,306 @@ impl MigrationResult {
     pub fn summary(&self) -> String {
         use std::fmt::Write;
         let mut out = String::new();
-
         writeln!(out, "=== Kin Migration Complete ===").unwrap();
         writeln!(out, "Repository: {}", self.kin_root).unwrap();
         writeln!(out, "Strategy: {:?}", self.strategy).unwrap();
         writeln!(out, "Commits imported: {}", self.commits_imported).unwrap();
-        writeln!(out, "Files indexed: {}", self.files_indexed).unwrap();
+        writeln!(out, "Files enriched: {}", self.files_indexed).unwrap();
         writeln!(out, "Entities extracted: {}", self.entities_extracted).unwrap();
         writeln!(out, "Relations extracted: {}", self.relations_extracted).unwrap();
         writeln!(out, "Duration: {}ms", self.duration_ms).unwrap();
-        if let Some(ref branch) = self.default_branch {
-            writeln!(out, "Default branch: {}", branch).unwrap();
+        if let Some(branch) = &self.default_branch {
+            writeln!(out, "Default branch: {branch}").unwrap();
         }
-
         out
     }
-}
-
-/// Minimal stub GraphStore for migration tests. Tests in this module validate
-/// error paths (e.g., already-initialized checks) that return before any graph
-/// access, so no methods need real implementations.
-#[cfg(test)]
-struct MockGraphStore;
-
-#[cfg(test)]
-impl kin_model::EntityStore for MockGraphStore {
-    type Error = kin_model::ModelError;
-
-    fn get_entity(
-        &self,
-        _: &kin_model::EntityId,
-    ) -> std::result::Result<Option<kin_model::Entity>, Self::Error> {
-        Ok(None)
-    }
-    fn get_relations(
-        &self,
-        _: &kin_model::EntityId,
-        _: &[kin_model::RelationKind],
-    ) -> std::result::Result<Vec<kin_model::Relation>, Self::Error> {
-        Ok(vec![])
-    }
-    fn get_all_relations_for_entity(
-        &self,
-        _: &kin_model::EntityId,
-    ) -> std::result::Result<Vec<kin_model::Relation>, Self::Error> {
-        Ok(vec![])
-    }
-    fn get_downstream_impact(
-        &self,
-        _: &kin_model::EntityId,
-        _: u32,
-    ) -> std::result::Result<Vec<kin_model::Entity>, Self::Error> {
-        Ok(vec![])
-    }
-    fn get_dependency_neighborhood(
-        &self,
-        _: &kin_model::EntityId,
-        _: u32,
-    ) -> std::result::Result<kin_model::SubGraph, Self::Error> {
-        Ok(Default::default())
-    }
-    fn expand_neighborhood(
-        &self,
-        _: &[kin_model::EntityId],
-        _: &[kin_model::RelationKind],
-        _: u32,
-    ) -> std::result::Result<kin_model::SubGraph, Self::Error> {
-        Ok(Default::default())
-    }
-    fn find_dead_code(&self) -> std::result::Result<Vec<kin_model::Entity>, Self::Error> {
-        Ok(vec![])
-    }
-    fn has_incoming_relation_kinds(
-        &self,
-        _: &kin_model::EntityId,
-        _: &[kin_model::RelationKind],
-        _: bool,
-    ) -> std::result::Result<bool, Self::Error> {
-        Ok(false)
-    }
-    fn query_entities(
-        &self,
-        _: &kin_model::EntityFilter,
-    ) -> std::result::Result<Vec<kin_model::Entity>, Self::Error> {
-        Ok(vec![])
-    }
-    fn list_all_entities(&self) -> std::result::Result<Vec<kin_model::Entity>, Self::Error> {
-        Ok(vec![])
-    }
-    fn upsert_entity(&self, _: &kin_model::Entity) -> std::result::Result<(), Self::Error> {
-        Ok(())
-    }
-    fn upsert_relation(&self, _: &kin_model::Relation) -> std::result::Result<(), Self::Error> {
-        Ok(())
-    }
-    fn remove_entity(&self, _: &kin_model::EntityId) -> std::result::Result<(), Self::Error> {
-        Ok(())
-    }
-    fn remove_relation(&self, _: &kin_model::RelationId) -> std::result::Result<(), Self::Error> {
-        Ok(())
-    }
-    fn upsert_shallow_file(
-        &self,
-        _: &kin_model::ShallowTrackedFile,
-    ) -> std::result::Result<(), Self::Error> {
-        Ok(())
-    }
-    fn list_shallow_files(
-        &self,
-    ) -> std::result::Result<Vec<kin_model::ShallowTrackedFile>, Self::Error> {
-        Ok(vec![])
-    }
-    fn upsert_structured_artifact(
-        &self,
-        _: &kin_model::StructuredArtifact,
-    ) -> std::result::Result<(), Self::Error> {
-        Ok(())
-    }
-    fn list_structured_artifacts(
-        &self,
-    ) -> std::result::Result<Vec<kin_model::StructuredArtifact>, Self::Error> {
-        Ok(vec![])
-    }
-    fn delete_structured_artifact(
-        &self,
-        _: &kin_model::FilePathId,
-    ) -> std::result::Result<(), Self::Error> {
-        Ok(())
-    }
-    fn upsert_opaque_artifact(
-        &self,
-        _: &kin_model::OpaqueArtifact,
-    ) -> std::result::Result<(), Self::Error> {
-        Ok(())
-    }
-    fn list_opaque_artifacts(
-        &self,
-    ) -> std::result::Result<Vec<kin_model::OpaqueArtifact>, Self::Error> {
-        Ok(vec![])
-    }
-    fn delete_opaque_artifact(
-        &self,
-        _: &kin_model::FilePathId,
-    ) -> std::result::Result<(), Self::Error> {
-        Ok(())
-    }
-    fn upsert_file_layout(
-        &self,
-        _: &kin_model::FileLayout,
-    ) -> std::result::Result<(), Self::Error> {
-        Ok(())
-    }
-    fn get_file_layout(
-        &self,
-        _: &kin_model::FilePathId,
-    ) -> std::result::Result<Option<kin_model::FileLayout>, Self::Error> {
-        Ok(None)
-    }
-    fn list_file_layouts(&self) -> std::result::Result<Vec<kin_model::FileLayout>, Self::Error> {
-        Ok(vec![])
-    }
-    fn delete_file_layout(
-        &self,
-        _: &kin_model::FilePathId,
-    ) -> std::result::Result<(), Self::Error> {
-        Ok(())
-    }
-    fn traverse(
-        &self,
-        _: &kin_model::GraphNodeId,
-        _: &[kin_model::RelationKind],
-        _: u32,
-    ) -> std::result::Result<kin_model::SubGraph, Self::Error> {
-        Ok(Default::default())
-    }
-    fn get_shallow_file(
-        &self,
-        _: &kin_model::FilePathId,
-    ) -> std::result::Result<Option<kin_model::ShallowTrackedFile>, Self::Error> {
-        Ok(None)
-    }
-    fn get_structured_artifact(
-        &self,
-        _: &kin_model::FilePathId,
-    ) -> std::result::Result<Option<kin_model::StructuredArtifact>, Self::Error> {
-        Ok(None)
-    }
-    fn get_opaque_artifact(
-        &self,
-        _: &kin_model::FilePathId,
-    ) -> std::result::Result<Option<kin_model::OpaqueArtifact>, Self::Error> {
-        Ok(None)
-    }
-    fn get_file_hash(
-        &self,
-        _: &kin_model::FilePathId,
-    ) -> std::result::Result<Option<kin_model::Hash256>, Self::Error> {
-        Ok(None)
-    }
-}
-
-#[cfg(test)]
-impl kin_model::ChangeStore for MockGraphStore {
-    type Error = kin_model::ModelError;
-
-    fn get_entity_history(
-        &self,
-        _: &kin_model::EntityId,
-    ) -> std::result::Result<Vec<kin_model::SemanticChange>, Self::Error> {
-        Ok(vec![])
-    }
-    fn find_merge_bases(
-        &self,
-        _: &kin_model::SemanticChangeId,
-        _: &kin_model::SemanticChangeId,
-    ) -> std::result::Result<Vec<kin_model::SemanticChangeId>, Self::Error> {
-        Ok(vec![])
-    }
-    fn create_change(&self, _: &kin_model::SemanticChange) -> std::result::Result<(), Self::Error> {
-        Ok(())
-    }
-    fn get_change(
-        &self,
-        _: &kin_model::SemanticChangeId,
-    ) -> std::result::Result<Option<kin_model::SemanticChange>, Self::Error> {
-        Ok(None)
-    }
-    fn get_changes_since(
-        &self,
-        _: &kin_model::SemanticChangeId,
-        _: &kin_model::SemanticChangeId,
-    ) -> std::result::Result<Vec<kin_model::SemanticChange>, Self::Error> {
-        Ok(vec![])
-    }
-    fn get_branch(
-        &self,
-        _: &kin_model::BranchName,
-    ) -> std::result::Result<Option<kin_model::Branch>, Self::Error> {
-        Ok(None)
-    }
-    fn create_branch(&self, _: &kin_model::Branch) -> std::result::Result<(), Self::Error> {
-        Ok(())
-    }
-    fn update_branch_head(
-        &self,
-        _: &kin_model::BranchName,
-        _: &kin_model::SemanticChangeId,
-    ) -> std::result::Result<(), Self::Error> {
-        Ok(())
-    }
-    fn delete_branch(&self, _: &kin_model::BranchName) -> std::result::Result<(), Self::Error> {
-        Ok(())
-    }
-    fn list_branches(&self) -> std::result::Result<Vec<kin_model::Branch>, Self::Error> {
-        Ok(vec![])
-    }
-}
-
-#[cfg(test)]
-impl kin_model::WorkStore for MockGraphStore {
-    type Error = kin_model::ModelError;
-
-    fn create_work_item(&self, _: &kin_model::WorkItem) -> std::result::Result<(), Self::Error> {
-        Ok(())
-    }
-    fn get_work_item(
-        &self,
-        _: &kin_model::WorkId,
-    ) -> std::result::Result<Option<kin_model::WorkItem>, Self::Error> {
-        Ok(None)
-    }
-    fn list_work_items(
-        &self,
-        _: &kin_model::WorkFilter,
-    ) -> std::result::Result<Vec<kin_model::WorkItem>, Self::Error> {
-        Ok(vec![])
-    }
-    fn update_work_status(
-        &self,
-        _: &kin_model::WorkId,
-        _: kin_model::WorkStatus,
-    ) -> std::result::Result<(), Self::Error> {
-        Ok(())
-    }
-    fn delete_work_item(&self, _: &kin_model::WorkId) -> std::result::Result<(), Self::Error> {
-        Ok(())
-    }
-    fn create_annotation(&self, _: &kin_model::Annotation) -> std::result::Result<(), Self::Error> {
-        Ok(())
-    }
-    fn get_annotation(
-        &self,
-        _: &kin_model::AnnotationId,
-    ) -> std::result::Result<Option<kin_model::Annotation>, Self::Error> {
-        Ok(None)
-    }
-    fn list_annotations(
-        &self,
-        _: &kin_model::AnnotationFilter,
-    ) -> std::result::Result<Vec<kin_model::Annotation>, Self::Error> {
-        Ok(vec![])
-    }
-    fn update_annotation_staleness(
-        &self,
-        _: &kin_model::AnnotationId,
-        _: kin_model::StalenessState,
-    ) -> std::result::Result<(), Self::Error> {
-        Ok(())
-    }
-    fn delete_annotation(
-        &self,
-        _: &kin_model::AnnotationId,
-    ) -> std::result::Result<(), Self::Error> {
-        Ok(())
-    }
-    fn create_work_link(&self, _: &kin_model::WorkLink) -> std::result::Result<(), Self::Error> {
-        Ok(())
-    }
-    fn delete_work_link(&self, _: &kin_model::WorkLink) -> std::result::Result<(), Self::Error> {
-        Ok(())
-    }
-    fn get_work_for_scope(
-        &self,
-        _: &kin_model::WorkScope,
-    ) -> std::result::Result<Vec<kin_model::WorkItem>, Self::Error> {
-        Ok(vec![])
-    }
-    fn get_annotations_for_scope(
-        &self,
-        _: &kin_model::WorkScope,
-    ) -> std::result::Result<Vec<kin_model::Annotation>, Self::Error> {
-        Ok(vec![])
-    }
-    fn get_child_work_items(
-        &self,
-        _: &kin_model::WorkId,
-    ) -> std::result::Result<Vec<kin_model::WorkItem>, Self::Error> {
-        Ok(vec![])
-    }
-    fn get_parent_work_items(
-        &self,
-        _: &kin_model::WorkId,
-    ) -> std::result::Result<Vec<kin_model::WorkItem>, Self::Error> {
-        Ok(vec![])
-    }
-    fn get_blockers(
-        &self,
-        _: &kin_model::WorkId,
-    ) -> std::result::Result<Vec<kin_model::WorkItem>, Self::Error> {
-        Ok(vec![])
-    }
-    fn get_blocked_work_items(
-        &self,
-        _: &kin_model::WorkId,
-    ) -> std::result::Result<Vec<kin_model::WorkItem>, Self::Error> {
-        Ok(vec![])
-    }
-    fn get_implementors(
-        &self,
-        _: &kin_model::WorkId,
-    ) -> std::result::Result<Vec<kin_model::WorkScope>, Self::Error> {
-        Ok(vec![])
-    }
-    fn get_annotations_for_work_item(
-        &self,
-        _: &kin_model::WorkId,
-    ) -> std::result::Result<Vec<kin_model::Annotation>, Self::Error> {
-        Ok(vec![])
-    }
-}
-
-#[cfg(test)]
-impl kin_model::VerificationStore for MockGraphStore {
-    type Error = kin_model::ModelError;
-
-    fn create_test_case(
-        &self,
-        _: &kin_model::verification::TestCase,
-    ) -> std::result::Result<(), Self::Error> {
-        Ok(())
-    }
-    fn get_test_case(
-        &self,
-        _: &kin_model::verification::TestId,
-    ) -> std::result::Result<Option<kin_model::verification::TestCase>, Self::Error> {
-        Ok(None)
-    }
-    fn get_tests_for_entity(
-        &self,
-        _: &kin_model::EntityId,
-    ) -> std::result::Result<Vec<kin_model::verification::TestCase>, Self::Error> {
-        Ok(vec![])
-    }
-    fn delete_test_case(
-        &self,
-        _: &kin_model::verification::TestId,
-    ) -> std::result::Result<(), Self::Error> {
-        Ok(())
-    }
-    fn create_assertion(
-        &self,
-        _: &kin_model::verification::Assertion,
-    ) -> std::result::Result<(), Self::Error> {
-        Ok(())
-    }
-    fn get_assertion(
-        &self,
-        _: &kin_model::verification::AssertionId,
-    ) -> std::result::Result<Option<kin_model::verification::Assertion>, Self::Error> {
-        Ok(None)
-    }
-    fn get_coverage_summary(
-        &self,
-    ) -> std::result::Result<kin_model::verification::CoverageSummary, Self::Error> {
-        Ok(kin_model::verification::CoverageSummary {
-            total_entities: 0,
-            covered_entities: 0,
-            coverage_ratio: 0.0,
-            missing_proof: vec![],
-        })
-    }
-    fn create_verification_run(
-        &self,
-        _: &kin_model::verification::VerificationRun,
-    ) -> std::result::Result<(), Self::Error> {
-        Ok(())
-    }
-    fn get_verification_run(
-        &self,
-        _: &kin_model::verification::VerificationRunId,
-    ) -> std::result::Result<Option<kin_model::verification::VerificationRun>, Self::Error> {
-        Ok(None)
-    }
-    fn list_runs_for_test(
-        &self,
-        _: &kin_model::verification::TestId,
-    ) -> std::result::Result<Vec<kin_model::verification::VerificationRun>, Self::Error> {
-        Ok(vec![])
-    }
-    fn create_test_covers_entity(
-        &self,
-        _: &kin_model::verification::TestId,
-        _: &kin_model::EntityId,
-    ) -> std::result::Result<(), Self::Error> {
-        Ok(())
-    }
-    fn create_test_covers_contract(
-        &self,
-        _: &kin_model::verification::TestId,
-        _: &kin_model::ContractId,
-    ) -> std::result::Result<(), Self::Error> {
-        Ok(())
-    }
-    fn create_test_verifies_work(
-        &self,
-        _: &kin_model::verification::TestId,
-        _: &kin_model::WorkId,
-    ) -> std::result::Result<(), Self::Error> {
-        Ok(())
-    }
-    fn get_tests_covering_contract(
-        &self,
-        _: &kin_model::ContractId,
-    ) -> std::result::Result<Vec<kin_model::verification::TestCase>, Self::Error> {
-        Ok(vec![])
-    }
-    fn get_tests_verifying_work(
-        &self,
-        _: &kin_model::WorkId,
-    ) -> std::result::Result<Vec<kin_model::verification::TestCase>, Self::Error> {
-        Ok(vec![])
-    }
-    fn create_mock_hint(
-        &self,
-        _: &kin_model::verification::MockHint,
-    ) -> std::result::Result<(), Self::Error> {
-        Ok(())
-    }
-    fn get_mock_hints_for_test(
-        &self,
-        _: &kin_model::verification::TestId,
-    ) -> std::result::Result<Vec<kin_model::verification::MockHint>, Self::Error> {
-        Ok(vec![])
-    }
-    fn link_run_proves_entity(
-        &self,
-        _: &kin_model::verification::VerificationRunId,
-        _: &kin_model::EntityId,
-    ) -> std::result::Result<(), Self::Error> {
-        Ok(())
-    }
-    fn link_run_proves_work(
-        &self,
-        _: &kin_model::verification::VerificationRunId,
-        _: &kin_model::WorkId,
-    ) -> std::result::Result<(), Self::Error> {
-        Ok(())
-    }
-    fn list_runs_proving_entity(
-        &self,
-        _: &kin_model::EntityId,
-    ) -> std::result::Result<Vec<kin_model::verification::VerificationRun>, Self::Error> {
-        Ok(vec![])
-    }
-    fn list_runs_proving_work(
-        &self,
-        _: &kin_model::WorkId,
-    ) -> std::result::Result<Vec<kin_model::verification::VerificationRun>, Self::Error> {
-        Ok(vec![])
-    }
-    fn create_contract(
-        &self,
-        _: &kin_model::contract::Contract,
-    ) -> std::result::Result<(), Self::Error> {
-        Ok(())
-    }
-    fn get_contract(
-        &self,
-        _: &kin_model::ids::ContractId,
-    ) -> std::result::Result<Option<kin_model::contract::Contract>, Self::Error> {
-        Ok(None)
-    }
-    fn list_contracts(
-        &self,
-    ) -> std::result::Result<Vec<kin_model::contract::Contract>, Self::Error> {
-        Ok(vec![])
-    }
-    fn get_contract_coverage_summary(
-        &self,
-    ) -> std::result::Result<kin_model::verification::ContractCoverageSummary, Self::Error> {
-        Ok(kin_model::verification::ContractCoverageSummary {
-            total_contracts: 0,
-            covered_contracts: 0,
-            coverage_ratio: 0.0,
-            uncovered_contract_ids: vec![],
-        })
-    }
-}
-
-#[cfg(test)]
-impl kin_model::ProvenanceStore for MockGraphStore {
-    type Error = kin_model::ModelError;
-
-    fn create_actor(
-        &self,
-        _: &kin_model::provenance::Actor,
-    ) -> std::result::Result<(), Self::Error> {
-        Ok(())
-    }
-    fn get_actor(
-        &self,
-        _: &kin_model::provenance::ActorId,
-    ) -> std::result::Result<Option<kin_model::provenance::Actor>, Self::Error> {
-        Ok(None)
-    }
-    fn list_actors(&self) -> std::result::Result<Vec<kin_model::provenance::Actor>, Self::Error> {
-        Ok(vec![])
-    }
-    fn create_delegation(
-        &self,
-        _: &kin_model::provenance::Delegation,
-    ) -> std::result::Result<(), Self::Error> {
-        Ok(())
-    }
-    fn get_delegations_for_actor(
-        &self,
-        _: &kin_model::provenance::ActorId,
-    ) -> std::result::Result<Vec<kin_model::provenance::Delegation>, Self::Error> {
-        Ok(vec![])
-    }
-    fn create_approval(
-        &self,
-        _: &kin_model::provenance::Approval,
-    ) -> std::result::Result<(), Self::Error> {
-        Ok(())
-    }
-    fn get_approvals_for_change(
-        &self,
-        _: &kin_model::SemanticChangeId,
-    ) -> std::result::Result<Vec<kin_model::provenance::Approval>, Self::Error> {
-        Ok(vec![])
-    }
-    fn record_audit_event(
-        &self,
-        _: &kin_model::provenance::AuditEvent,
-    ) -> std::result::Result<(), Self::Error> {
-        Ok(())
-    }
-    fn query_audit_events(
-        &self,
-        _: Option<&kin_model::provenance::ActorId>,
-        _: usize,
-    ) -> std::result::Result<Vec<kin_model::provenance::AuditEvent>, Self::Error> {
-        Ok(vec![])
-    }
-}
-
-#[cfg(test)]
-impl kin_model::ReviewStore for MockGraphStore {
-    type Error = kin_model::ModelError;
-
-    fn create_review(&self, _: &kin_model::Review) -> std::result::Result<(), Self::Error> {
-        Ok(())
-    }
-    fn get_review(
-        &self,
-        _: &kin_model::ReviewId,
-    ) -> std::result::Result<Option<kin_model::Review>, Self::Error> {
-        Ok(None)
-    }
-    fn list_reviews(
-        &self,
-        _: &kin_model::ReviewFilter,
-    ) -> std::result::Result<Vec<kin_model::Review>, Self::Error> {
-        Ok(vec![])
-    }
-    fn update_review_state(
-        &self,
-        _: &kin_model::ReviewId,
-        _: kin_model::ReviewDecisionState,
-    ) -> std::result::Result<(), Self::Error> {
-        Ok(())
-    }
-    fn delete_review(&self, _: &kin_model::ReviewId) -> std::result::Result<(), Self::Error> {
-        Ok(())
-    }
-    fn add_review_decision(
-        &self,
-        _: &kin_model::ReviewId,
-        _: &kin_model::ReviewDecision,
-    ) -> std::result::Result<(), Self::Error> {
-        Ok(())
-    }
-    fn get_review_decisions(
-        &self,
-        _: &kin_model::ReviewId,
-    ) -> std::result::Result<Vec<kin_model::ReviewDecision>, Self::Error> {
-        Ok(vec![])
-    }
-    fn add_review_note(&self, _: &kin_model::ReviewNote) -> std::result::Result<(), Self::Error> {
-        Ok(())
-    }
-    fn get_review_notes(
-        &self,
-        _: &kin_model::ReviewId,
-    ) -> std::result::Result<Vec<kin_model::ReviewNote>, Self::Error> {
-        Ok(vec![])
-    }
-    fn delete_review_note(
-        &self,
-        _: &kin_model::ReviewNoteId,
-    ) -> std::result::Result<(), Self::Error> {
-        Ok(())
-    }
-    fn create_review_discussion(
-        &self,
-        _: &kin_model::ReviewDiscussion,
-    ) -> std::result::Result<(), Self::Error> {
-        Ok(())
-    }
-    fn get_review_discussions(
-        &self,
-        _: &kin_model::ReviewId,
-    ) -> std::result::Result<Vec<kin_model::ReviewDiscussion>, Self::Error> {
-        Ok(vec![])
-    }
-    fn add_discussion_comment(
-        &self,
-        _: &kin_model::ReviewDiscussionId,
-        _: &kin_model::ReviewComment,
-    ) -> std::result::Result<(), Self::Error> {
-        Ok(())
-    }
-    fn set_discussion_state(
-        &self,
-        _: &kin_model::ReviewDiscussionId,
-        _: kin_model::ReviewDiscussionState,
-    ) -> std::result::Result<(), Self::Error> {
-        Ok(())
-    }
-    fn assign_reviewer(
-        &self,
-        _: &kin_model::ReviewAssignment,
-    ) -> std::result::Result<(), Self::Error> {
-        Ok(())
-    }
-    fn get_review_assignments(
-        &self,
-        _: &kin_model::ReviewId,
-    ) -> std::result::Result<Vec<kin_model::ReviewAssignment>, Self::Error> {
-        Ok(vec![])
-    }
-    fn remove_reviewer(
-        &self,
-        _: &kin_model::ReviewId,
-        _: &str,
-    ) -> std::result::Result<(), Self::Error> {
-        Ok(())
-    }
-}
-
-#[cfg(test)]
-impl kin_model::SessionStore for MockGraphStore {
-    type Error = kin_model::ModelError;
-
-    fn upsert_session(
-        &self,
-        _: &kin_model::session::AgentSession,
-    ) -> std::result::Result<(), Self::Error> {
-        Ok(())
-    }
-    fn get_session(
-        &self,
-        _: &kin_model::SessionId,
-    ) -> std::result::Result<Option<kin_model::session::AgentSession>, Self::Error> {
-        Ok(None)
-    }
-    fn delete_session(&self, _: &kin_model::SessionId) -> std::result::Result<(), Self::Error> {
-        Ok(())
-    }
-    fn list_sessions(
-        &self,
-    ) -> std::result::Result<Vec<kin_model::session::AgentSession>, Self::Error> {
-        Ok(vec![])
-    }
-    fn update_heartbeat(
-        &self,
-        _: &kin_model::SessionId,
-        _: &kin_model::timestamp::Timestamp,
-    ) -> std::result::Result<(), Self::Error> {
-        Ok(())
-    }
-    fn register_intent(
-        &self,
-        _: &kin_model::session::Intent,
-    ) -> std::result::Result<(), Self::Error> {
-        Ok(())
-    }
-    fn get_intent(
-        &self,
-        _: &kin_model::IntentId,
-    ) -> std::result::Result<Option<kin_model::session::Intent>, Self::Error> {
-        Ok(None)
-    }
-    fn delete_intent(&self, _: &kin_model::IntentId) -> std::result::Result<(), Self::Error> {
-        Ok(())
-    }
-    fn list_intents_for_session(
-        &self,
-        _: &kin_model::SessionId,
-    ) -> std::result::Result<Vec<kin_model::session::Intent>, Self::Error> {
-        Ok(vec![])
-    }
-    fn list_all_intents(
-        &self,
-    ) -> std::result::Result<Vec<kin_model::session::Intent>, Self::Error> {
-        Ok(vec![])
-    }
-}
-
-#[cfg(test)]
-impl kin_model::GraphStore for MockGraphStore {
-    type Error = kin_model::ModelError;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn init_git_repo_with_file(root: &Path, branch: &str, rel_path: &str, contents: &str) -> bool {
-        if let Some(parent) = Path::new(rel_path).parent() {
-            std::fs::create_dir_all(root.join(parent)).unwrap();
-        }
-        std::fs::write(root.join(rel_path), contents).unwrap();
+    use std::ffi::OsString;
+    use std::sync::{Mutex, MutexGuard};
 
-        let git_init = std::process::Command::new("git")
-            .args(["init", "-b", branch])
-            .current_dir(root)
-            .output();
-        match git_init {
-            Ok(output) if output.status.success() => {}
-            _ => return false,
+    static MIGRATION_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct RegistryIsolation {
+        _lock: MutexGuard<'static, ()>,
+        previous: Option<OsString>,
+    }
+
+    impl RegistryIsolation {
+        fn new(path: &Path) -> Self {
+            let lock = MIGRATION_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let previous = std::env::var_os("KIN_REGISTRY_PATH");
+            std::env::set_var("KIN_REGISTRY_PATH", path);
+            Self {
+                _lock: lock,
+                previous,
+            }
         }
-        let _ = std::process::Command::new("git")
-            .args(["config", "user.email", "test@test.com"])
+    }
+
+    impl Drop for RegistryIsolation {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var("KIN_REGISTRY_PATH", value),
+                None => std::env::remove_var("KIN_REGISTRY_PATH"),
+            }
+        }
+    }
+
+    fn git(root: &Path, args: &[&str]) -> bool {
+        Command::new("git")
+            .args(args)
             .current_dir(root)
-            .output();
-        let _ = std::process::Command::new("git")
-            .args(["config", "user.name", "Test"])
-            .current_dir(root)
-            .output();
-        let _ = std::process::Command::new("git")
-            .args(["add", "."])
-            .current_dir(root)
-            .output();
-        let commit = std::process::Command::new("git")
-            .args(["commit", "-m", "initial"])
-            .env("GIT_AUTHOR_DATE", "1000000000 +0000")
-            .env("GIT_COMMITTER_DATE", "1000000000 +0000")
-            .current_dir(root)
-            .output();
-        matches!(commit, Ok(output) if output.status.success())
+            .output()
+            .is_ok_and(|output| output.status.success())
+    }
+
+    fn init_git(root: &Path) -> bool {
+        git(root, &["init", "-b", "main"])
+            && git(root, &["config", "user.email", "kin-test@example.com"])
+            && git(root, &["config", "user.name", "Kin Test"])
+    }
+
+    fn commit_all(root: &Path, message: &str) -> bool {
+        git(root, &["add", "-A"]) && git(root, &["commit", "-m", message])
+    }
+
+    fn plan(source: &Path, target: Option<PathBuf>, strategy: MigrationStrategy) -> MigrationPlan {
+        let scan = crate::scan_repo(source).unwrap();
+        crate::plan_migration(&scan, strategy, target)
+    }
+
+    fn open_published_graph(
+        root: &Path,
+    ) -> (
+        kin_db::SnapshotManager,
+        std::sync::Arc<kin_db::InMemoryGraph>,
+    ) {
+        let layout = KinLayout::new(root.join(".kin"));
+        let snapshot = open_snapshot_retrying(layout.kindb_snapshot_path()).unwrap();
+        let graph = snapshot.graph();
+        (snapshot, graph)
     }
 
     #[test]
-    fn migration_result_serializes() {
+    fn unrelated_compose_lock_binary_and_mixed_languages_share_one_exact_tree() {
+        let workspace = tempfile::tempdir().unwrap();
+        let source = workspace.path().join("source");
+        let target = workspace.path().join("target");
+        std::fs::create_dir(&source).unwrap();
+        if !init_git(&source) {
+            return;
+        }
+        std::fs::create_dir(source.join("src")).unwrap();
+        std::fs::write(
+            source.join("compose.yaml"),
+            "services:\n  api:\n    image: example/api\n",
+        )
+        .unwrap();
+        std::fs::write(source.join("Cargo.lock"), "# exact lock bytes\n").unwrap();
+        std::fs::write(source.join("asset.bin"), [0, 1, 2, 0xff]).unwrap();
+        std::fs::write(source.join("notes.txt"), "unrelated but tracked\n").unwrap();
+        std::fs::write(
+            source.join("src/lib.rs"),
+            "pub fn rust_value() -> u8 { 7 }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            source.join("src/value.py"),
+            "def python_value():\n    return 7\n",
+        )
+        .unwrap();
+        assert!(commit_all(&source, "initial"));
+
+        let _registry = RegistryIsolation::new(&workspace.path().join("registry.toml"));
+        let result = execute_migration_persisted(&plan(
+            &source,
+            Some(target.clone()),
+            MigrationStrategy::Snapshot,
+        ))
+        .unwrap();
+        assert_eq!(result.commits_imported, 1);
+        assert_eq!(result.files_indexed, 6);
+        assert!(result.entities_extracted >= 2);
+
+        let (_snapshot, graph) = open_published_graph(&target);
+        let branch = graph.get_branch(&BranchName::new("main")).unwrap().unwrap();
+        let tree = graph.resolve_tree_at(&branch.head).unwrap();
+        assert_eq!(tree.len(), 6);
+        assert_eq!(graph.list_structured_artifacts().unwrap().len(), 1);
+        assert_eq!(graph.list_opaque_artifacts().unwrap().len(), 3);
+        let languages: HashSet<_> = graph
+            .list_all_entities()
+            .unwrap()
+            .into_iter()
+            .map(|entity| entity.language)
+            .collect();
+        assert!(languages.contains(&kin_model::LanguageId::Rust));
+        assert!(languages.contains(&kin_model::LanguageId::Python));
+        assert_eq!(
+            std::fs::read(target.join("asset.bin")).unwrap(),
+            [0, 1, 2, 0xff]
+        );
+    }
+
+    #[test]
+    fn dirty_or_untracked_in_place_source_is_refused_before_publication() {
+        let workspace = tempfile::tempdir().unwrap();
+        let source = workspace.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        if !init_git(&source) {
+            return;
+        }
+        std::fs::write(source.join("tracked.txt"), "committed\n").unwrap();
+        assert!(commit_all(&source, "initial"));
+        std::fs::write(source.join("untracked.txt"), "not admitted\n").unwrap();
+
+        let error = execute_migration_persisted(&plan(&source, None, MigrationStrategy::Snapshot))
+            .unwrap_err();
+        assert!(error.to_string().contains("no untracked files"));
+        assert!(!source.join(".kin").exists());
+    }
+
+    #[test]
+    fn snapshot_and_full_are_the_only_history_boundaries() {
+        let workspace = tempfile::tempdir().unwrap();
+        let source = workspace.path().join("source");
+        let snapshot_target = workspace.path().join("snapshot-target");
+        let full_target = workspace.path().join("full-target");
+        std::fs::create_dir(&source).unwrap();
+        if !init_git(&source) {
+            return;
+        }
+        std::fs::write(source.join("state.txt"), "one\n").unwrap();
+        assert!(commit_all(&source, "one"));
+        std::fs::write(source.join("state.txt"), "two\n").unwrap();
+        assert!(commit_all(&source, "two"));
+
+        let _registry = RegistryIsolation::new(&workspace.path().join("registry.toml"));
+        let snapshot = execute_migration_persisted(&plan(
+            &source,
+            Some(snapshot_target),
+            MigrationStrategy::Snapshot,
+        ))
+        .unwrap();
+        let full =
+            execute_migration_persisted(&plan(&source, Some(full_target), MigrationStrategy::Full))
+                .unwrap();
+        assert_eq!(snapshot.commits_imported, 1);
+        assert_eq!(full.commits_imported, 2);
+    }
+
+    #[test]
+    fn missing_resolved_blob_fails_loud_before_enrichment() {
+        let dir = tempfile::tempdir().unwrap();
+        let blobs = BlobStore::new(dir.path().join("objects")).unwrap();
+        let missing = kin_model::Hash256::from_bytes([0x5a; 32]);
+        let tree = ResolvedTree::from_artifacts([kin_model::ResolvedArtifact::new(
+            kin_model::ArtifactId::new(),
+            RepoPath::from_utf8("missing.bin").unwrap(),
+            TreeEntry::blob(missing, false),
+        )])
+        .unwrap();
+        let error = prepare_head_enrichment(&tree, &blobs).unwrap_err();
+        assert!(error.to_string().contains("unavailable blob"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn distinct_target_preserves_non_utf8_path_executable_and_symlink() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let workspace = tempfile::tempdir().unwrap();
+        let source = workspace.path().join("source");
+        let target = workspace.path().join("target");
+        std::fs::create_dir(&source).unwrap();
+        if !init_git(&source) {
+            return;
+        }
+        let script = source.join("run.sh");
+        std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+        symlink("run.sh", source.join("run-link")).unwrap();
+        let raw_name = OsString::from_vec(b"opaque-\xff.bin".to_vec());
+        std::fs::write(source.join(&raw_name), [0, 0xff, 3]).unwrap();
+        assert!(commit_all(&source, "exact entries"));
+
+        let _registry = RegistryIsolation::new(&workspace.path().join("registry.toml"));
+        execute_migration_persisted(&plan(
+            &source,
+            Some(target.clone()),
+            MigrationStrategy::Snapshot,
+        ))
+        .unwrap();
+
+        assert_eq!(std::fs::read(target.join(&raw_name)).unwrap(), [0, 0xff, 3]);
+        assert_eq!(
+            std::fs::read_link(target.join("run-link"))
+                .unwrap()
+                .as_os_str()
+                .as_bytes(),
+            b"run.sh"
+        );
+        assert_ne!(
+            std::fs::metadata(target.join("run.sh"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o111,
+            0
+        );
+    }
+
+    #[test]
+    fn distinct_target_gitlink_fails_without_publishing_partial_repo() {
+        let workspace = tempfile::tempdir().unwrap();
+        let source = workspace.path().join("source");
+        let target = workspace.path().join("target");
+        std::fs::create_dir(&source).unwrap();
+        if !init_git(&source) {
+            return;
+        }
+        std::fs::write(source.join("seed.txt"), "seed\n").unwrap();
+        assert!(commit_all(&source, "seed"));
+        let oid = String::from_utf8(git_output(&source, &["rev-parse", "HEAD"]).unwrap())
+            .unwrap()
+            .trim()
+            .to_string();
+        assert!(git(
+            &source,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                "160000",
+                &oid,
+                "vendor/sub"
+            ]
+        ));
+        assert!(git(&source, &["commit", "-m", "gitlink"]));
+
+        let _registry = RegistryIsolation::new(&workspace.path().join("registry.toml"));
+        let error = execute_migration_persisted(&plan(
+            &source,
+            Some(target.clone()),
+            MigrationStrategy::Snapshot,
+        ))
+        .unwrap_err();
+        assert!(error.to_string().contains("cannot materialize gitlink"));
+        assert!(!target.join(".kin").exists());
+    }
+
+    #[test]
+    fn migration_result_summary_names_enrichment_not_membership() {
         let result = MigrationResult {
             kin_root: "/project".into(),
             strategy: MigrationStrategy::Snapshot,
@@ -1662,396 +1060,8 @@ mod tests {
             duration_ms: 500,
             completed_at: Utc::now(),
         };
-        let json = serde_json::to_string(&result).unwrap();
-        let parsed: MigrationResult = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.commits_imported, 1);
-        assert_eq!(parsed.strategy, MigrationStrategy::Snapshot);
-    }
-
-    #[test]
-    fn migration_result_summary() {
-        let result = MigrationResult {
-            kin_root: "/project".into(),
-            strategy: MigrationStrategy::Full,
-            commits_imported: 50,
-            files_indexed: 10,
-            entities_extracted: 100,
-            relations_extracted: 30,
-            genesis_id: "def456".into(),
-            default_branch: Some("main".into()),
-            duration_ms: 2000,
-            completed_at: Utc::now(),
-        };
         let summary = result.summary();
-        assert!(summary.contains("Migration Complete"));
-        assert!(summary.contains("Deep"));
-        assert!(summary.contains("50"));
-        assert!(summary.contains("100"));
-    }
-
-    #[test]
-    fn already_initialized_fails() {
-        let dir = tempfile::tempdir().unwrap();
-        // Create .kin dir to simulate already initialized.
-        std::fs::create_dir(dir.path().join(".kin")).unwrap();
-
-        let plan = MigrationPlan {
-            source: dir.path().to_path_buf(),
-            target: dir.path().to_path_buf(),
-            strategy: MigrationStrategy::Snapshot,
-            branch: None,
-            source_files: vec![],
-        };
-
-        // Use a mock graph store.
-        let graph = MockGraphStore;
-        let err = execute_migration(&plan, &graph).unwrap_err();
-        assert!(matches!(err, MigrateError::AlreadyInitialized(_)));
-    }
-
-    #[test]
-    fn persisted_migration_preserves_source_default_branch() {
-        let source = tempfile::tempdir().unwrap();
-        if !init_git_repo_with_file(
-            source.path(),
-            "master",
-            "src/lib.rs",
-            "pub fn migrated() -> &'static str { \"ok\" }\n",
-        ) {
-            return;
-        }
-
-        let plan = MigrationPlan {
-            source: source.path().to_path_buf(),
-            target: source.path().to_path_buf(),
-            strategy: MigrationStrategy::Snapshot,
-            branch: Some("master".into()),
-            source_files: vec![std::path::PathBuf::from("src/lib.rs")],
-        };
-
-        let result = execute_migration_persisted(&plan).unwrap();
-        assert_eq!(result.default_branch.as_deref(), Some("master"));
-
-        let layout = kin_core::KinLayout::new(source.path().join(".kin"));
-        let config = kin_core::KinConfig::load(&layout.config_path()).unwrap();
-        assert_eq!(config.default_branch, "master");
-        assert_eq!(
-            std::fs::read_to_string(layout.head_path()).unwrap().trim(),
-            "master"
-        );
-
-        let snapshot = open_snapshot_retrying(layout.kindb_snapshot_path()).unwrap();
-        let graph = snapshot.graph();
-        let branch = graph.get_branch(&BranchName::new("master")).unwrap();
-        assert!(branch.is_some());
-        assert!(graph.entity_count() > 0);
-    }
-
-    #[test]
-    fn persisted_migration_materializes_distinct_target_workspace() {
-        let source = tempfile::tempdir().unwrap();
-        if !init_git_repo_with_file(
-            source.path(),
-            "master",
-            "src/lib.rs",
-            "pub fn migrated() -> &'static str { \"ok\" }\n",
-        ) {
-            return;
-        }
-
-        let target_root = tempfile::tempdir().unwrap();
-        let target = target_root.path().join("kin-target");
-
-        let plan = MigrationPlan {
-            source: source.path().to_path_buf(),
-            target: target.clone(),
-            strategy: MigrationStrategy::Snapshot,
-            branch: Some("master".into()),
-            source_files: vec![std::path::PathBuf::from("src/lib.rs")],
-        };
-
-        let result = execute_migration_persisted(&plan).unwrap();
-        assert_eq!(result.default_branch.as_deref(), Some("master"));
-        assert_eq!(
-            std::fs::read_to_string(target.join("src/lib.rs")).unwrap(),
-            "pub fn migrated() -> &'static str { \"ok\" }\n"
-        );
-        assert!(!target.join(".git").exists());
-        assert!(target.join(".kin").exists());
-
-        let layout = kin_core::KinLayout::new(target.join(".kin"));
-        let snapshot = open_snapshot_retrying(layout.kindb_snapshot_path()).unwrap();
-        let graph = snapshot.graph();
-        assert!(graph.entity_count() > 0);
-    }
-
-    #[test]
-    fn persisted_migration_fails_when_planned_file_is_missing_at_execution_time() {
-        let source = tempfile::tempdir().unwrap();
-        if !init_git_repo_with_file(
-            source.path(),
-            "master",
-            "src/lib.rs",
-            "pub fn migrated() -> &'static str { \"ok\" }\n",
-        ) {
-            return;
-        }
-        std::fs::remove_file(source.path().join("src/lib.rs")).unwrap();
-
-        let target_root = tempfile::tempdir().unwrap();
-        let target = target_root.path().join("kin-target");
-
-        let plan = MigrationPlan {
-            source: source.path().to_path_buf(),
-            target,
-            strategy: MigrationStrategy::Snapshot,
-            branch: Some("master".into()),
-            source_files: vec![std::path::PathBuf::from("src/lib.rs")],
-        };
-
-        let err = execute_migration_persisted(&plan).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("planned source file missing at execution time"));
-    }
-
-    #[test]
-    fn persisted_migration_writes_kidx() {
-        let source = tempfile::tempdir().unwrap();
-        if !init_git_repo_with_file(
-            source.path(),
-            "main",
-            "src/lib.rs",
-            "pub fn hello() -> &'static str { \"world\" }\n",
-        ) {
-            return;
-        }
-
-        let plan = MigrationPlan {
-            source: source.path().to_path_buf(),
-            target: source.path().to_path_buf(),
-            strategy: MigrationStrategy::Snapshot,
-            branch: Some("main".into()),
-            source_files: vec![std::path::PathBuf::from("src/lib.rs")],
-        };
-
-        execute_migration_persisted(&plan).unwrap();
-
-        let layout = kin_core::KinLayout::new(source.path().join(".kin"));
-        let kidx_path = layout.kindb_snapshot_path().with_extension("kidx");
-        assert!(
-            kidx_path.exists(),
-            ".kidx read index should exist after migration"
-        );
-    }
-
-    #[test]
-    fn persisted_migration_creates_eject_snapshot() {
-        let source = tempfile::tempdir().unwrap();
-        if !init_git_repo_with_file(
-            source.path(),
-            "main",
-            "src/lib.rs",
-            "pub fn hello() -> &'static str { \"world\" }\n",
-        ) {
-            return;
-        }
-
-        let plan = MigrationPlan {
-            source: source.path().to_path_buf(),
-            target: source.path().to_path_buf(),
-            strategy: MigrationStrategy::Snapshot,
-            branch: Some("main".into()),
-            source_files: vec![std::path::PathBuf::from("src/lib.rs")],
-        };
-
-        execute_migration_persisted(&plan).unwrap();
-
-        let snapshot_dir = source.path().join(".kin/snapshot");
-        assert!(
-            snapshot_dir.exists(),
-            "eject snapshot directory should exist"
-        );
-        let manifest = snapshot_dir.join("manifest.json");
-        assert!(manifest.exists(), "snapshot manifest should exist");
-        let manifest_json: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(manifest).unwrap()).unwrap();
-        assert!(manifest_json["file_count"].as_u64().unwrap() > 0);
-    }
-
-    fn init_git_repo_with_files(root: &Path, branch: &str, files: &[(&str, &str)]) -> bool {
-        for (rel_path, contents) in files {
-            if let Some(parent) = Path::new(rel_path).parent() {
-                std::fs::create_dir_all(root.join(parent)).unwrap();
-            }
-            std::fs::write(root.join(rel_path), contents).unwrap();
-        }
-
-        let git_init = std::process::Command::new("git")
-            .args(["init", "-b", branch])
-            .current_dir(root)
-            .output();
-        match git_init {
-            Ok(output) if output.status.success() => {}
-            _ => return false,
-        }
-        let _ = std::process::Command::new("git")
-            .args(["config", "user.email", "test@test.com"])
-            .current_dir(root)
-            .output();
-        let _ = std::process::Command::new("git")
-            .args(["config", "user.name", "Test"])
-            .current_dir(root)
-            .output();
-        let _ = std::process::Command::new("git")
-            .args(["add", "."])
-            .current_dir(root)
-            .output();
-        let commit = std::process::Command::new("git")
-            .args(["commit", "-m", "initial"])
-            .env("GIT_AUTHOR_DATE", "1000000100 +0000")
-            .env("GIT_COMMITTER_DATE", "1000000100 +0000")
-            .current_dir(root)
-            .output();
-        matches!(commit, Ok(output) if output.status.success())
-    }
-
-    const DETERMINISM_FIXTURE: &[(&str, &str)] = &[
-        (
-            "src/lib.rs",
-            "pub mod helper;\n\npub fn entry() -> i32 {\n    helper::value() + 1\n}\n\npub struct Widget {\n    pub id: u32,\n}\n\nimpl Widget {\n    pub fn new(id: u32) -> Self {\n        Self { id }\n    }\n}\n",
-        ),
-        (
-            "src/helper.rs",
-            "pub fn value() -> i32 {\n    41\n}\n\npub fn doubled() -> i32 {\n    value() * 2\n}\n",
-        ),
-    ];
-
-    /// Canonicalize the persisted semantic graph into a stable string plus the
-    /// content-addressed Merkle root, for byte-identity comparison.
-    ///
-    /// Every entity field that carries semantic truth is included. Metadata is
-    /// serialized in sorted-key order so `HashMap` iteration order cannot perturb
-    /// the projection. The kin-db `recompute_root_hash` is the canonical,
-    /// order-independent graph root (it sorts entity and subgraph hashes), unlike
-    /// the continuously-maintained live root which is history-sensitive.
-    fn canonical_graph_fingerprint(snapshot_path: &Path) -> (String, [u8; 32]) {
-        use kin_model::EntityStore;
-
-        let snapshot = open_snapshot_retrying(snapshot_path).unwrap();
-        let graph = snapshot.graph();
-
-        let mut entities = graph.list_all_entities().unwrap();
-        entities.sort_by(|a, b| a.id.cmp(&b.id));
-
-        let mut lines: Vec<String> = Vec::new();
-        for e in &entities {
-            let mut meta: Vec<(String, String)> = e
-                .metadata
-                .extra
-                .iter()
-                .map(|(k, v)| (k.clone(), v.to_string()))
-                .collect();
-            meta.sort();
-            lines.push(format!(
-                "ENT id={:?} kind={:?} name={} lang={:?} sig={} vis={:?} role={:?} file={:?} span={:?} fp_ast={} fp_sig={} fp_beh={} doc={:?} created_in={:?} lineage={:?} superseded={:?} meta={:?}",
-                e.id, e.kind, e.name, e.language, e.signature, e.visibility, e.role,
-                e.file_origin, e.span,
-                e.fingerprint.ast_hash, e.fingerprint.signature_hash, e.fingerprint.behavior_hash,
-                e.doc_summary, e.created_in, e.lineage_parent, e.superseded_by, meta
-            ));
-        }
-
-        let mut rel_lines: Vec<String> = entities
-            .iter()
-            .flat_map(|e| graph.get_all_relations_for_entity(&e.id).unwrap())
-            .map(|r| format!("{r:?}"))
-            .collect();
-        rel_lines.sort();
-        rel_lines.dedup();
-
-        lines.sort();
-        lines.extend(rel_lines);
-        let root = graph.recompute_root_hash();
-        (lines.join("\n"), root)
-    }
-
-    /// Determinism gate: a migration's persisted graph must be byte-identical
-    /// across repeated runs.
-    ///
-    /// Source files are parsed exactly once during migration — only the persist
-    /// pass (`persist_semantic_index`) parses them, and it is the sole writer of
-    /// entities and relations to the graph. This gate locks that the persisted
-    /// graph is fully determined by that single pass and nothing perturbs it
-    /// between runs.
-    ///
-    /// This gate migrates the same fixture twice into the same fixed path
-    /// (re-importing from scratch each time) and asserts the persisted graph is
-    /// byte-identical across both runs — identical content-addressed root hash and
-    /// identical entity/relation projection — and that the reported counts are
-    /// both correct and stable. Holding the source path fixed is required because
-    /// entity IDs and file-surface-context metadata are derived from the absolute
-    /// source path; a fresh random tempdir per run would perturb those fields
-    /// independently of any parsing change.
-    #[test]
-    fn migrate_persisted_graph_is_byte_identical_across_runs() {
-        let workspace = tempfile::tempdir().unwrap();
-        let root = workspace.path().join("repo");
-
-        let migrate_once = || -> (MigrationResult, String, [u8; 32]) {
-            let _ = std::fs::remove_dir_all(root.join(".git"));
-            let _ = std::fs::remove_dir_all(root.join(".kin"));
-            std::fs::create_dir_all(&root).unwrap();
-            assert!(
-                init_git_repo_with_files(&root, "main", DETERMINISM_FIXTURE),
-                "git fixture setup must succeed"
-            );
-
-            let plan = MigrationPlan {
-                source: root.clone(),
-                target: root.clone(),
-                strategy: MigrationStrategy::Snapshot,
-                branch: Some("main".into()),
-                source_files: vec![
-                    std::path::PathBuf::from("src/lib.rs"),
-                    std::path::PathBuf::from("src/helper.rs"),
-                ],
-            };
-
-            let result = execute_migration_persisted(&plan).unwrap();
-            let layout = kin_core::KinLayout::new(root.join(".kin"));
-            let (dump, hash) = canonical_graph_fingerprint(&layout.kindb_snapshot_path());
-            (result, dump, hash)
-        };
-
-        let (result_a, dump_a, hash_a) = migrate_once();
-        let (result_b, dump_b, hash_b) = migrate_once();
-
-        // Reported counts are correct for the fixture (six entities: module
-        // `helper`, fns `entry`/`value`/`doubled`, struct `Widget`, method
-        // `Widget::new`; seven relations: two `Contains`, three `Calls`, and
-        // one file-level parse-coverage certificate per source file. The
-        // module-qualified `helper::value()` call resolves through the
-        // qualified-path linker stage alongside the two bare calls.
-        assert_eq!(result_a.files_indexed, 2, "files_indexed");
-        assert_eq!(result_a.entities_extracted, 6, "entities_extracted");
-        assert_eq!(result_a.relations_extracted, 7, "relations_extracted");
-
-        // Counts are stable run-to-run.
-        assert_eq!(result_a.files_indexed, result_b.files_indexed);
-        assert_eq!(result_a.entities_extracted, result_b.entities_extracted);
-        assert_eq!(result_a.relations_extracted, result_b.relations_extracted);
-
-        // The persisted graph is byte-identical across runs: same content-addressed
-        // root hash and same full entity/relation projection.
-        assert_eq!(
-            hash_a, hash_b,
-            "persisted graph root hash diverged across identical migrations"
-        );
-        pretty_assertions::assert_eq!(
-            dump_a,
-            dump_b,
-            "persisted entity/relation set diverged across identical migrations"
-        );
+        assert!(summary.contains("Files enriched: 5"));
+        assert!(!summary.contains("Source files"));
     }
 }

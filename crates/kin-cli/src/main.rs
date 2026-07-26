@@ -700,16 +700,16 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// Run schema migrations
+    /// Migrate an existing Git repository into graph-owned Kin truth
     Migrate {
         /// Source repository path (defaults to current directory)
         source: Option<String>,
+        /// Distinct destination (defaults to an in-place migration)
+        #[arg(long)]
+        target: Option<PathBuf>,
         /// Git history boundary: `snapshot` (exact HEAD tree) or `full` (all reachable history)
         #[arg(long, default_value = "snapshot", value_parser = ["snapshot", "full"])]
         history: String,
-        /// Resume an interrupted migration from the last checkpoint
-        #[arg(long)]
-        resume: bool,
     },
     /// Inspect and bound the on-disk embedding cache
     Cache {
@@ -2638,9 +2638,9 @@ fn main() -> Result<()> {
                 Command::Bench { args } => commands::bench::bench_proxy(&args),
                 Command::Migrate {
                     source,
+                    target,
                     history,
-                    resume,
-                } => commands::migrate::run(source, history, resume).await,
+                } => commands::migrate::run(source, target, history).await,
                 Command::Cache { action } => match action {
                     CacheAction::Status { json } => commands::cache::status(json).await,
                     CacheAction::Gc {

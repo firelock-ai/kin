@@ -29,8 +29,6 @@ pub struct MigrationPlan {
     pub strategy: MigrationStrategy,
     /// Branch to import (None = HEAD / default branch).
     pub branch: Option<String>,
-    /// Source files to index for entity extraction.
-    pub source_files: Vec<PathBuf>,
 }
 
 /// Plan a migration based on scan results and user preferences.
@@ -46,7 +44,6 @@ pub fn plan_migration(
         target: target_dir,
         strategy,
         branch: scan.default_branch.clone(),
-        source_files: scan.source_files.clone(),
     }
 }
 
@@ -63,7 +60,6 @@ impl MigrationPlan {
         if let Some(ref branch) = self.branch {
             writeln!(out, "  Branch: {}", branch).unwrap();
         }
-        writeln!(out, "  Source files: {}", self.source_files.len()).unwrap();
         out
     }
 }
@@ -76,9 +72,6 @@ mod tests {
         RepoScan {
             root: PathBuf::from("/project"),
             default_branch: Some("main".into()),
-            commit_count: 100,
-            branches: vec!["main".into()],
-            source_files: vec![PathBuf::from("src/lib.rs"), PathBuf::from("src/main.rs")],
         }
     }
 
@@ -89,7 +82,6 @@ mod tests {
         assert_eq!(plan.strategy, MigrationStrategy::Snapshot);
         assert_eq!(plan.source, PathBuf::from("/project"));
         assert_eq!(plan.target, PathBuf::from("/project"));
-        assert_eq!(plan.source_files.len(), 2);
     }
 
     #[test]
@@ -115,7 +107,7 @@ mod tests {
         let plan = plan_migration(&scan, MigrationStrategy::Full, None);
         let desc = plan.describe();
         assert!(desc.contains("Full"));
-        assert!(desc.contains("Source files: 2"));
+        assert!(!desc.contains("Source files"));
     }
 
     #[test]

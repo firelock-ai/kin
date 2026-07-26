@@ -1,11 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use std::path::Path;
-
 use kin_blobs::BlobStore;
 use kin_git::{import_git_history_with_blobs, GitImportMode, ImportOptions, ImportedChange};
-use kin_index::IndexPipeline;
 use kin_model::SemanticChangeId;
 use tracing::info;
 
@@ -24,11 +21,9 @@ pub struct ConversionResult {
 /// This phase imports Git history as SemanticChange objects (via kin-git),
 /// storing file contents in the blob store (via kin-blobs) as it goes.
 ///
-/// Source-file entity/relation extraction is performed once, downstream, by the
-/// executor's persist pass (`persist_semantic_index`), which is the sole writer
-/// of entities and relations to the graph. Counting them here would re-parse
-/// every source file a second time for reporting figures the executor derives
-/// from the persist pass anyway, so this phase no longer indexes source files.
+/// Semantic enrichment is intentionally downstream of this exact import. The
+/// executor resolves the admitted head tree and reads its bytes back from the
+/// blob store; no workspace file participates in enrichment authority.
 pub fn convert(
     plan: &MigrationPlan,
     genesis_id: SemanticChangeId,
@@ -38,8 +33,7 @@ pub fn convert(
         "kin.migrate.convert",
         source = %plan.source.display(),
         target = %plan.target.display(),
-        strategy = ?plan.strategy,
-        files = plan.source_files.len()
+        strategy = ?plan.strategy
     )
     .entered();
     // Import Git history.
@@ -71,21 +65,6 @@ pub fn convert(
     Ok(ConversionResult {
         imported_changes: imported,
     })
-}
-
-/// Index a single file and store results in the graph.
-///
-/// Convenience wrapper for re-indexing individual files after migration.
-pub fn index_single_file<G: kin_model::GraphStore>(
-    path: &Path,
-    blob_store: &BlobStore,
-    graph: &G,
-) -> Result<()> {
-    let pipeline = IndexPipeline::new();
-    pipeline
-        .index_and_store(path, blob_store, graph)
-        .map_err(|e| MigrateError::Index(e.to_string()))?;
-    Ok(())
 }
 
 #[cfg(test)]

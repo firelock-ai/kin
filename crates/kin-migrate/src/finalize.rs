@@ -3,14 +3,16 @@
 
 //! Shared onboarding finalization steps.
 //!
-//! Both `kin init` and `kin migrate` call these functions after the graph
-//! has been populated with entities and relations. They guarantee that
-//! every onboarded repo ends up with:
+//! `kin init` and `kin migrate` share only the finalization operations that
+//! preserve graph authority:
 //!
 //! 1. A persisted `.kidx` read index for fast CLI queries.
-//! 2. A snapshot directory suitable for `kin eject`.
-//! 3. A registry entry in `~/.kin/registry.toml`.
-//! 4. A best-effort LSP cold-sweep trigger.
+//! 2. A registry entry in `~/.kin/registry.toml`.
+//! 3. A best-effort LSP cold-sweep trigger.
+//!
+//! The file snapshot helper remains an explicit `kin init` compatibility
+//! surface. Migration does not call it: imported tree deltas and blob objects
+//! are the exact eject/materialization authority.
 
 use std::fs;
 use std::path::Path;
@@ -51,10 +53,13 @@ pub fn build_and_save_kidx(snapshot_path: &Path, graph: &kin_db::InMemoryGraph) 
 
 /// Create or verify the eject snapshot directory inside `.kin/`.
 ///
-/// `kin eject` restores the project to its pre-Kin state by copying files
-/// back from `.kin/snapshot/`. If the snapshot directory already exists
-/// (e.g. from `kin init`), this is a no-op. When called from `kin migrate`
-/// on an in-place repo, it creates the snapshot from the current working tree.
+/// `kin eject` restores a file-first project to its pre-Kin state by copying
+/// files back from `.kin/snapshot/`. If the snapshot directory already exists,
+/// this is a no-op.
+///
+/// This helper is for explicit file-first initialization compatibility.
+/// Graph-authoritative migration must materialize from its resolved tree and
+/// blob store instead of creating a second raw-worktree authority.
 pub fn ensure_eject_snapshot(repo_root: &Path, kin_root: &Path) -> Result<()> {
     let snapshot_dir = kin_root.join("snapshot");
     if snapshot_dir.exists() {
