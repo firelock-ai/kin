@@ -1057,18 +1057,20 @@ mod tests {
         SemanticFingerprint, SourceSpan, Timestamp, TreeDelta, Visibility,
     };
 
-    fn change(
-        id: SemanticChangeId,
+    fn create_fixture_change(
+        graph: &InMemoryGraph,
         parents: Vec<SemanticChangeId>,
+        message: impl Into<String>,
+        entity_deltas: Vec<EntityDelta>,
         tree_deltas: Vec<TreeDelta>,
-    ) -> SemanticChange {
-        SemanticChange {
-            id,
+    ) -> SemanticChangeId {
+        let mut change = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
             parents,
             timestamp: Timestamp::now(),
             author: AuthorId::new("test"),
-            message: format!("change {}", id),
-            entity_deltas: vec![],
+            message: message.into(),
+            entity_deltas,
             relation_deltas: vec![],
             tree_deltas,
             projected_files: vec![],
@@ -1076,7 +1078,11 @@ mod tests {
             evidence: vec![],
             risk_summary: None,
             authored_on: None,
-        }
+        };
+        change.id = crate::compute_semantic_change_id(&change).unwrap();
+        let id = change.id;
+        graph.create_change(&change).unwrap();
+        id
     }
 
     fn artifact_id(value: u128) -> ArtifactId {
@@ -1111,34 +1117,29 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let blob_store = BlobStore::new(temp.path().join("objects")).unwrap();
 
-        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x11; 32]));
-        graph
-            .create_change(&change(genesis_id, vec![], vec![]))
-            .unwrap();
+        let genesis_id = create_fixture_change(&graph, vec![], "genesis", vec![], vec![]);
 
         let readme_v1 = blob_store.write(b"Authentication guide for v1").unwrap();
         let cargo_v1 = blob_store.write(b"[package]\nname = \"kin\"\n").unwrap();
-        let add_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x12; 32]));
-        graph
-            .create_change(&change(
-                add_id,
-                vec![genesis_id],
-                vec![
-                    added(0x101, "README.md", readme_v1),
-                    added(0x102, "Cargo.toml", cargo_v1),
-                ],
-            ))
-            .unwrap();
+        let add_id = create_fixture_change(
+            &graph,
+            vec![genesis_id],
+            "add historical tracked files",
+            vec![],
+            vec![
+                added(0x101, "README.md", readme_v1),
+                added(0x102, "Cargo.toml", cargo_v1),
+            ],
+        );
 
         let readme_v2 = blob_store.write(b"Deployment guide for v2").unwrap();
-        let head_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x13; 32]));
-        graph
-            .create_change(&change(
-                head_id,
-                vec![add_id],
-                vec![modified(0x101, "README.md", readme_v1, readme_v2)],
-            ))
-            .unwrap();
+        let _head_id = create_fixture_change(
+            &graph,
+            vec![add_id],
+            "update readme",
+            vec![],
+            vec![modified(0x101, "README.md", readme_v1, readme_v2)],
+        );
 
         let historical = build_graph_at_ref(&graph, &blob_store, &add_id).unwrap();
 
@@ -1168,10 +1169,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let blob_store = BlobStore::new(temp.path().join("objects")).unwrap();
 
-        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x14; 32]));
-        graph
-            .create_change(&change(genesis_id, vec![], vec![]))
-            .unwrap();
+        let genesis_id = create_fixture_change(&graph, vec![], "genesis", vec![], vec![]);
 
         let source_hash = blob_store
             .write(
@@ -1179,24 +1177,13 @@ mod tests {
             )
             .unwrap();
         let main_entity = test_entity("main", "src/main.c");
-        let add_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x15; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: add_id,
-                parents: vec![genesis_id],
-                timestamp: Timestamp::now(),
-                author: AuthorId::new("test"),
-                message: "add main".to_string(),
-                entity_deltas: vec![EntityDelta::Added(main_entity)],
-                relation_deltas: vec![],
-                tree_deltas: vec![added(0x103, "src/main.c", source_hash)],
-                projected_files: vec![],
-                spec_link: None,
-                evidence: vec![],
-                risk_summary: None,
-                authored_on: None,
-            })
-            .unwrap();
+        let add_id = create_fixture_change(
+            &graph,
+            vec![genesis_id],
+            "add main",
+            vec![EntityDelta::Added(main_entity)],
+            vec![added(0x103, "src/main.c", source_hash)],
+        );
 
         let historical = build_graph_at_ref(&graph, &blob_store, &add_id).unwrap();
 
@@ -1222,45 +1209,30 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let blob_store = BlobStore::new(temp.path().join("objects")).unwrap();
 
-        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x21; 32]));
-        graph
-            .create_change(&change(genesis_id, vec![], vec![]))
-            .unwrap();
+        let genesis_id = create_fixture_change(&graph, vec![], "genesis", vec![], vec![]);
 
         let current_hash = blob_store
             .write(b"def processor():\n    return 'processor'\n")
             .unwrap();
-        let auto_parse_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x22; 32]));
         let processor = test_entity("processor", "src/lib.py");
-        graph
-            .create_change(&SemanticChange {
-                id: auto_parse_id,
-                parents: vec![genesis_id],
-                timestamp: Timestamp::now(),
-                author: AuthorId::new("test"),
-                message: "auto-parse".to_string(),
-                entity_deltas: vec![EntityDelta::Added(processor.clone())],
-                relation_deltas: vec![],
-                tree_deltas: vec![added(0x104, "src/lib.py", current_hash)],
-                projected_files: vec![],
-                spec_link: None,
-                evidence: vec![],
-                risk_summary: None,
-                authored_on: None,
-            })
-            .unwrap();
+        let auto_parse_id = create_fixture_change(
+            &graph,
+            vec![genesis_id],
+            "auto-parse",
+            vec![EntityDelta::Added(processor.clone())],
+            vec![added(0x104, "src/lib.py", current_hash)],
+        );
 
         let historical_hash = blob_store
             .write(b"def handler():\n    return 'handler'\n")
             .unwrap();
-        let historical_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x23; 32]));
-        graph
-            .create_change(&change(
-                historical_id,
-                vec![auto_parse_id],
-                vec![modified(0x104, "src/lib.py", current_hash, historical_hash)],
-            ))
-            .unwrap();
+        let historical_id = create_fixture_change(
+            &graph,
+            vec![auto_parse_id],
+            "replace historical source",
+            vec![],
+            vec![modified(0x104, "src/lib.py", current_hash, historical_hash)],
+        );
 
         let historical = build_graph_at_ref(&graph, &blob_store, &historical_id).unwrap();
         let entities = historical.list_all_entities().unwrap();
@@ -1295,22 +1267,18 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let blob_store = BlobStore::new(temp.path().join("objects")).unwrap();
 
-        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x31; 32]));
-        graph
-            .create_change(&change(genesis_id, vec![], vec![]))
-            .unwrap();
+        let genesis_id = create_fixture_change(&graph, vec![], "genesis", vec![], vec![]);
 
         let historical_hash = blob_store
             .write(b"def handler():\n    return 'handler'\n")
             .unwrap();
-        let historical_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x32; 32]));
-        graph
-            .create_change(&change(
-                historical_id,
-                vec![genesis_id],
-                vec![added(0x105, "src/lib.py", historical_hash)],
-            ))
-            .unwrap();
+        let historical_id = create_fixture_change(
+            &graph,
+            vec![genesis_id],
+            "add artifact-only history",
+            vec![],
+            vec![added(0x105, "src/lib.py", historical_hash)],
+        );
 
         let historical = build_graph_at_ref(&graph, &blob_store, &historical_id).unwrap();
         let entities = historical.list_all_entities().unwrap();
@@ -1338,15 +1306,11 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let blob_store = BlobStore::new(temp.path().join("objects")).unwrap();
 
-        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x39; 32]));
-        graph
-            .create_change(&change(genesis_id, vec![], vec![]))
-            .unwrap();
+        let genesis_id = create_fixture_change(&graph, vec![], "genesis", vec![], vec![]);
 
         let source_hash = blob_store
             .write(b"def processor():\n    return 'processor'\n")
             .unwrap();
-        let head_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x3a; 32]));
         let mut aliased = test_entity("processor", "lib.py");
         aliased.file_origin = Some(FilePathId::new("lib.py"));
         aliased.span = Some(SourceSpan {
@@ -1358,23 +1322,13 @@ mod tests {
             end_line: 1,
             end_col: 14,
         });
-        graph
-            .create_change(&SemanticChange {
-                id: head_id,
-                parents: vec![genesis_id],
-                timestamp: Timestamp::now(),
-                author: AuthorId::new("test"),
-                message: "aliased historical file".to_string(),
-                entity_deltas: vec![EntityDelta::Added(aliased.clone())],
-                relation_deltas: vec![],
-                tree_deltas: vec![added(0x106, "src/lib.py", source_hash)],
-                projected_files: vec![],
-                spec_link: None,
-                evidence: vec![],
-                risk_summary: None,
-                authored_on: None,
-            })
-            .unwrap();
+        let head_id = create_fixture_change(
+            &graph,
+            vec![genesis_id],
+            "aliased historical file",
+            vec![EntityDelta::Added(aliased.clone())],
+            vec![added(0x106, "src/lib.py", source_hash)],
+        );
 
         let historical = build_graph_at_ref(&graph, &blob_store, &head_id).unwrap();
         let processor = historical
@@ -1401,15 +1355,11 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let blob_store = BlobStore::new(temp.path().join("objects")).unwrap();
 
-        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x3b; 32]));
-        graph
-            .create_change(&change(genesis_id, vec![], vec![]))
-            .unwrap();
+        let genesis_id = create_fixture_change(&graph, vec![], "genesis", vec![], vec![]);
 
         let source_hash = blob_store
             .write(b"def processor():\n    return 'processor'\n")
             .unwrap();
-        let head_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x3c; 32]));
         let mut aliased = test_entity("processor", "src/lib.py");
         aliased.file_origin = Some(FilePathId::new("src/lib.py"));
         aliased.span = Some(SourceSpan {
@@ -1421,23 +1371,13 @@ mod tests {
             end_line: 1,
             end_col: 14,
         });
-        graph
-            .create_change(&SemanticChange {
-                id: head_id,
-                parents: vec![genesis_id],
-                timestamp: Timestamp::now(),
-                author: AuthorId::new("test"),
-                message: "suffix-aliased historical file".to_string(),
-                entity_deltas: vec![EntityDelta::Added(aliased.clone())],
-                relation_deltas: vec![],
-                tree_deltas: vec![added(0x107, "project/src/lib.py", source_hash)],
-                projected_files: vec![],
-                spec_link: None,
-                evidence: vec![],
-                risk_summary: None,
-                authored_on: None,
-            })
-            .unwrap();
+        let head_id = create_fixture_change(
+            &graph,
+            vec![genesis_id],
+            "suffix-aliased historical file",
+            vec![EntityDelta::Added(aliased.clone())],
+            vec![added(0x107, "project/src/lib.py", source_hash)],
+        );
 
         let historical = build_graph_at_ref(&graph, &blob_store, &head_id).unwrap();
         let processor = historical
@@ -1459,10 +1399,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let blob_store = BlobStore::new(temp.path().join("objects")).unwrap();
 
-        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x41; 32]));
-        graph
-            .create_change(&change(genesis_id, vec![], vec![]))
-            .unwrap();
+        let genesis_id = create_fixture_change(&graph, vec![], "genesis", vec![], vec![]);
 
         let historical_source = format!(
             "{}\n\
@@ -1472,25 +1409,14 @@ def uri_encoder(value):\n    return value.replace(' ', '%20')\n",
             "# preserved historical context\n".repeat(64)
         );
         let historical_hash = blob_store.write(historical_source.as_bytes()).unwrap();
-        let sparse_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x42; 32]));
         let processor = test_entity("processor", "src/lib.py");
-        graph
-            .create_change(&SemanticChange {
-                id: sparse_id,
-                parents: vec![genesis_id],
-                timestamp: Timestamp::now(),
-                author: AuthorId::new("test"),
-                message: "sparse imported history".to_string(),
-                entity_deltas: vec![EntityDelta::Added(processor.clone())],
-                relation_deltas: vec![],
-                tree_deltas: vec![added(0x108, "src/lib.py", historical_hash)],
-                projected_files: vec![],
-                spec_link: None,
-                evidence: vec![],
-                risk_summary: None,
-                authored_on: None,
-            })
-            .unwrap();
+        let sparse_id = create_fixture_change(
+            &graph,
+            vec![genesis_id],
+            "sparse imported history",
+            vec![EntityDelta::Added(processor.clone())],
+            vec![added(0x108, "src/lib.py", historical_hash)],
+        );
 
         let historical = build_graph_at_ref(&graph, &blob_store, &sparse_id).unwrap();
         let entities = historical.list_all_entities().unwrap();
@@ -1556,20 +1482,18 @@ def uri_encoder(value):\n    return value.replace(' ', '%20')\n",
     #[test]
     fn collect_changes_at_ref_handles_deep_linear_history_iteratively() {
         let graph = InMemoryGraph::new();
-        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x61; 32]));
-        graph
-            .create_change(&change(genesis_id, vec![], vec![]))
-            .unwrap();
+        let genesis_id = create_fixture_change(&graph, vec![], "genesis", vec![], vec![]);
 
         let mut previous = genesis_id;
         let mut head = genesis_id;
         for idx in 0..3_000u16 {
-            let mut bytes = [0u8; 32];
-            bytes[..2].copy_from_slice(&(idx + 1).to_be_bytes());
-            let id = SemanticChangeId::from_hash(Hash256::from_bytes(bytes));
-            graph
-                .create_change(&change(id, vec![previous], vec![]))
-                .unwrap();
+            let id = create_fixture_change(
+                &graph,
+                vec![previous],
+                format!("deep history {idx}"),
+                vec![],
+                vec![],
+            );
             previous = id;
             head = id;
         }
@@ -1584,17 +1508,23 @@ def uri_encoder(value):\n    return value.replace(' ', '%20')\n",
     fn collect_changes_at_ref_rejects_an_incomplete_history() {
         let graph = InMemoryGraph::new();
         let missing_ancestor = SemanticChangeId::from_hash(Hash256::from_bytes([0x77; 32]));
-        let boundary = SemanticChangeId::from_hash(Hash256::from_bytes([0x78; 32]));
-        let head = SemanticChangeId::from_hash(Hash256::from_bytes([0x79; 32]));
 
         // `missing_ancestor` is deliberately never inserted, so `boundary`'s
         // parent edge dangles exactly as a pre-fix truncated import would leave it.
-        graph
-            .create_change(&change(boundary, vec![missing_ancestor], vec![]))
-            .unwrap();
-        graph
-            .create_change(&change(head, vec![boundary], vec![]))
-            .unwrap();
+        let boundary = create_fixture_change(
+            &graph,
+            vec![missing_ancestor],
+            "truncated history boundary",
+            vec![],
+            vec![],
+        );
+        let head = create_fixture_change(
+            &graph,
+            vec![boundary],
+            "head above truncated history",
+            vec![],
+            vec![],
+        );
 
         let error = collect_changes_at_ref(&graph, &head).unwrap_err();
         assert!(
@@ -1645,28 +1575,17 @@ def uri_encoder(value):\n    return value.replace(' ', '%20')\n",
         let temp = tempfile::tempdir().unwrap();
         let blob_store = BlobStore::new(temp.path().join("objects")).unwrap();
         let source_hash = blob_store.write(b"int addReporter(void);").unwrap();
-        let change_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x81; 32]));
         let mut amalgamated = test_entity("addReporter", "single_include/catch.hpp");
         amalgamated.role = EntityRole::Source;
         let amalgamated_id = amalgamated.id;
 
-        graph
-            .create_change(&SemanticChange {
-                id: change_id,
-                parents: vec![],
-                timestamp: Timestamp::now(),
-                author: AuthorId::new("test"),
-                message: "persist exact role".to_string(),
-                entity_deltas: vec![EntityDelta::Added(amalgamated)],
-                relation_deltas: vec![],
-                tree_deltas: vec![added(0x109, "single_include/catch.hpp", source_hash)],
-                projected_files: vec![],
-                spec_link: None,
-                evidence: vec![],
-                risk_summary: None,
-                authored_on: None,
-            })
-            .unwrap();
+        let change_id = create_fixture_change(
+            &graph,
+            vec![],
+            "persist exact role",
+            vec![EntityDelta::Added(amalgamated)],
+            vec![added(0x109, "single_include/catch.hpp", source_hash)],
+        );
 
         let historical = build_graph_at_ref(&graph, &blob_store, &change_id).unwrap();
         let entity = historical.get_entity(&amalgamated_id).unwrap().unwrap();
@@ -1818,10 +1737,7 @@ def uri_encoder(value):\n    return value.replace(' ', '%20')\n",
         let temp = tempfile::tempdir().unwrap();
         let blob_store = BlobStore::new(temp.path().join("objects")).unwrap();
 
-        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0xc0; 32]));
-        graph
-            .create_change(&change(genesis_id, vec![], vec![]))
-            .unwrap();
+        let genesis_id = create_fixture_change(&graph, vec![], "genesis", vec![], vec![]);
 
         // Stage 1: create `victim` and add a sparse source file.
         let stale_source = format!(
@@ -1832,26 +1748,17 @@ def uri_encoder(value):\n    return value\n",
             "# preserved historical context\n".repeat(64)
         );
         let stale_hash = blob_store.write(stale_source.as_bytes()).unwrap();
-        let create_id = SemanticChangeId::from_hash(Hash256::from_bytes([0xc1; 32]));
         let mut victim = test_entity("victim", "src/lib.py");
-        victim.created_in = Some(create_id);
-        graph
-            .create_change(&SemanticChange {
-                id: create_id,
-                parents: vec![genesis_id],
-                timestamp: Timestamp::now(),
-                author: AuthorId::new("test"),
-                message: "create victim".to_string(),
-                entity_deltas: vec![EntityDelta::Added(victim.clone())],
-                relation_deltas: vec![],
-                tree_deltas: vec![added(0x10a, "src/lib.py", stale_hash)],
-                projected_files: vec![],
-                spec_link: None,
-                evidence: vec![],
-                risk_summary: None,
-                authored_on: None,
-            })
-            .unwrap();
+        // `created_in` participates in change identity, so use a real reachable
+        // ancestor rather than manufacturing a self-referential change ID.
+        victim.created_in = Some(genesis_id);
+        let create_id = create_fixture_change(
+            &graph,
+            vec![genesis_id],
+            "create victim",
+            vec![EntityDelta::Added(victim.clone())],
+            vec![added(0x10a, "src/lib.py", stale_hash)],
+        );
 
         // Stage 2: remove `victim` AND modify the source. This is the ref
         // we'll reconstruct: the source file no longer contains `victim`,
@@ -1864,24 +1771,13 @@ def uri_encoder(value):\n    return value\n",
             "# preserved historical context\n".repeat(64)
         );
         let new_hash = blob_store.write(new_source.as_bytes()).unwrap();
-        let ref_id = SemanticChangeId::from_hash(Hash256::from_bytes([0xc2; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: ref_id,
-                parents: vec![create_id],
-                timestamp: Timestamp::now(),
-                author: AuthorId::new("test"),
-                message: "remove victim, update source".to_string(),
-                entity_deltas: vec![EntityDelta::Removed(victim.id)],
-                relation_deltas: vec![],
-                tree_deltas: vec![modified(0x10a, "src/lib.py", stale_hash, new_hash)],
-                projected_files: vec![],
-                spec_link: None,
-                evidence: vec![],
-                risk_summary: None,
-                authored_on: None,
-            })
-            .unwrap();
+        let ref_id = create_fixture_change(
+            &graph,
+            vec![create_id],
+            "remove victim, update source",
+            vec![EntityDelta::Removed(victim.id)],
+            vec![modified(0x10a, "src/lib.py", stale_hash, new_hash)],
+        );
 
         let historical = build_graph_at_ref(&graph, &blob_store, &ref_id).unwrap();
         let entities = historical.list_all_entities().unwrap();
@@ -1905,15 +1801,11 @@ def uri_encoder(value):\n    return value\n",
         let temp = tempfile::tempdir().unwrap();
         let blob_store = BlobStore::new(temp.path().join("objects")).unwrap();
 
-        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0xd1; 32]));
-        graph
-            .create_change(&change(genesis_id, vec![], vec![]))
-            .unwrap();
+        let genesis_id = create_fixture_change(&graph, vec![], "genesis", vec![], vec![]);
 
         let mod_a = blob_store.write(b"def alpha():\n    return 'a'\n").unwrap();
         let mod_b = blob_store.write(b"def beta():\n    return 'b'\n").unwrap();
 
-        let head_id = SemanticChangeId::from_hash(Hash256::from_bytes([0xd2; 32]));
         let mut entity_a = test_entity("alpha", "crates/a/src/mod.rs");
         entity_a.file_origin = Some(FilePathId::new("crates/a/src/mod.rs"));
         entity_a.span = Some(SourceSpan {
@@ -1926,26 +1818,16 @@ def uri_encoder(value):\n    return value\n",
             end_col: 14,
         });
 
-        graph
-            .create_change(&SemanticChange {
-                id: head_id,
-                parents: vec![genesis_id],
-                timestamp: Timestamp::now(),
-                author: AuthorId::new("test"),
-                message: "collision".to_string(),
-                entity_deltas: vec![EntityDelta::Added(entity_a.clone())],
-                relation_deltas: vec![],
-                tree_deltas: vec![
-                    added(0x10b, "crates/a/src/mod.rs", mod_a),
-                    added(0x10c, "crates/b/src/mod.rs", mod_b),
-                ],
-                projected_files: vec![],
-                spec_link: None,
-                evidence: vec![],
-                risk_summary: None,
-                authored_on: None,
-            })
-            .unwrap();
+        let head_id = create_fixture_change(
+            &graph,
+            vec![genesis_id],
+            "collision",
+            vec![EntityDelta::Added(entity_a.clone())],
+            vec![
+                added(0x10b, "crates/a/src/mod.rs", mod_a),
+                added(0x10c, "crates/b/src/mod.rs", mod_b),
+            ],
+        );
 
         let historical = build_graph_at_ref(&graph, &blob_store, &head_id).unwrap();
         let alpha = historical
@@ -1967,33 +1849,31 @@ def uri_encoder(value):\n    return value\n",
         let temp = tempfile::tempdir().unwrap();
         let blob_store = BlobStore::new(temp.path().join("objects")).unwrap();
         let resolver_blob = blob_store.write(b"exact bytes").unwrap();
-        let create_id = SemanticChangeId::from_hash(Hash256::from_bytes([0xe2; 32]));
-        let rename_id = SemanticChangeId::from_hash(Hash256::from_bytes([0xe3; 32]));
         let stable_id = ArtifactId(uuid::Uuid::from_u128(0xe1));
         let old = located("old/path/file.rs", resolver_blob);
         let new = located("new/path/file.rs", resolver_blob);
 
-        graph
-            .create_change(&change(
-                create_id,
-                vec![],
-                vec![TreeDelta::Added {
-                    artifact_id: stable_id,
-                    new: old.clone(),
-                }],
-            ))
-            .unwrap();
-        graph
-            .create_change(&change(
-                rename_id,
-                vec![create_id],
-                vec![TreeDelta::Updated {
-                    artifact_id: stable_id,
-                    old,
-                    new: new.clone(),
-                }],
-            ))
-            .unwrap();
+        let create_id = create_fixture_change(
+            &graph,
+            vec![],
+            "create exact artifact",
+            vec![],
+            vec![TreeDelta::Added {
+                artifact_id: stable_id,
+                new: old.clone(),
+            }],
+        );
+        let rename_id = create_fixture_change(
+            &graph,
+            vec![create_id],
+            "rename exact artifact",
+            vec![],
+            vec![TreeDelta::Updated {
+                artifact_id: stable_id,
+                old,
+                new: new.clone(),
+            }],
+        );
 
         let historical = build_graph_at_ref(&graph, &blob_store, &rename_id).unwrap();
         assert_eq!(historical.artifact_id_at_path(&new.path), Some(stable_id));
@@ -2035,30 +1915,23 @@ def uri_encoder(value):\n    return value\n",
         let blob_id = ArtifactId(uuid::Uuid::from_u128(0x91));
         let gitlink_id = ArtifactId(uuid::Uuid::from_u128(0x92));
         let git_target = GitObjectId::sha1([0x93; 20]);
-        let head = SemanticChangeId::from_hash(Hash256::from_bytes([0x94; 32]));
 
-        graph
-            .create_change(&change(
-                head,
-                vec![],
-                vec![
-                    TreeDelta::Added {
-                        artifact_id: blob_id,
-                        new: LocatedEntry::new(
-                            byte_path.clone(),
-                            TreeEntry::blob(blob_hash, false),
-                        ),
-                    },
-                    TreeDelta::Added {
-                        artifact_id: gitlink_id,
-                        new: LocatedEntry::new(
-                            gitlink_path.clone(),
-                            TreeEntry::gitlink(git_target),
-                        ),
-                    },
-                ],
-            ))
-            .unwrap();
+        let head = create_fixture_change(
+            &graph,
+            vec![],
+            "add byte path and gitlink",
+            vec![],
+            vec![
+                TreeDelta::Added {
+                    artifact_id: blob_id,
+                    new: LocatedEntry::new(byte_path.clone(), TreeEntry::blob(blob_hash, false)),
+                },
+                TreeDelta::Added {
+                    artifact_id: gitlink_id,
+                    new: LocatedEntry::new(gitlink_path.clone(), TreeEntry::gitlink(git_target)),
+                },
+            ],
+        );
 
         let historical = build_graph_at_ref(&graph, &blob_store, &head).unwrap();
         let byte_artifact = historical.resolved_artifact(&blob_id).unwrap();
@@ -2085,35 +1958,33 @@ def uri_encoder(value):\n    return value\n",
         let path = RepoPath::from_utf8("config/runtime.bin").unwrap();
         let old = LocatedEntry::new(path.clone(), TreeEntry::blob(old_hash, false));
         let new = LocatedEntry::new(path.clone(), TreeEntry::blob(new_hash, false));
-        let create = SemanticChangeId::from_hash(Hash256::from_bytes([0xa3; 32]));
-        let replace = SemanticChangeId::from_hash(Hash256::from_bytes([0xa4; 32]));
 
-        graph
-            .create_change(&change(
-                create,
-                vec![],
-                vec![TreeDelta::Added {
+        let create = create_fixture_change(
+            &graph,
+            vec![],
+            "create original path identity",
+            vec![],
+            vec![TreeDelta::Added {
+                artifact_id: old_id,
+                new: old.clone(),
+            }],
+        );
+        let replace = create_fixture_change(
+            &graph,
+            vec![create],
+            "replace path identity",
+            vec![],
+            vec![
+                TreeDelta::Removed {
                     artifact_id: old_id,
-                    new: old.clone(),
-                }],
-            ))
-            .unwrap();
-        graph
-            .create_change(&change(
-                replace,
-                vec![create],
-                vec![
-                    TreeDelta::Removed {
-                        artifact_id: old_id,
-                        old,
-                    },
-                    TreeDelta::Added {
-                        artifact_id: new_id,
-                        new,
-                    },
-                ],
-            ))
-            .unwrap();
+                    old,
+                },
+                TreeDelta::Added {
+                    artifact_id: new_id,
+                    new,
+                },
+            ],
+        );
 
         let historical = build_graph_at_ref(&graph, &blob_store, &replace).unwrap();
         assert_eq!(historical.artifact_id_at_path(&path), Some(new_id));
@@ -2144,54 +2015,50 @@ def uri_encoder(value):\n    return value\n",
         let artifact_id = ArtifactId(uuid::Uuid::from_u128(0xb1));
         let path = RepoPath::from_utf8("compose.yaml").unwrap();
         let state = |hash| LocatedEntry::new(path.clone(), TreeEntry::blob(hash, false));
-        let base = SemanticChangeId::from_hash(Hash256::from_bytes([0xb2; 32]));
-        let first = SemanticChangeId::from_hash(Hash256::from_bytes([0xb3; 32]));
-        let second = SemanticChangeId::from_hash(Hash256::from_bytes([0xb4; 32]));
-        let merge = SemanticChangeId::from_hash(Hash256::from_bytes([0xb5; 32]));
 
-        graph
-            .create_change(&change(
-                base,
-                vec![],
-                vec![TreeDelta::Added {
-                    artifact_id,
-                    new: state(base_hash),
-                }],
-            ))
-            .unwrap();
-        graph
-            .create_change(&change(
-                first,
-                vec![base],
-                vec![TreeDelta::Updated {
-                    artifact_id,
-                    old: state(base_hash),
-                    new: state(first_hash),
-                }],
-            ))
-            .unwrap();
-        graph
-            .create_change(&change(
-                second,
-                vec![base],
-                vec![TreeDelta::Updated {
-                    artifact_id,
-                    old: state(base_hash),
-                    new: state(second_hash),
-                }],
-            ))
-            .unwrap();
-        graph
-            .create_change(&change(
-                merge,
-                vec![first, second],
-                vec![TreeDelta::Updated {
-                    artifact_id,
-                    old: state(first_hash),
-                    new: state(merged_hash),
-                }],
-            ))
-            .unwrap();
+        let base = create_fixture_change(
+            &graph,
+            vec![],
+            "base compose state",
+            vec![],
+            vec![TreeDelta::Added {
+                artifact_id,
+                new: state(base_hash),
+            }],
+        );
+        let first = create_fixture_change(
+            &graph,
+            vec![base],
+            "first-parent compose state",
+            vec![],
+            vec![TreeDelta::Updated {
+                artifact_id,
+                old: state(base_hash),
+                new: state(first_hash),
+            }],
+        );
+        let second = create_fixture_change(
+            &graph,
+            vec![base],
+            "second-parent compose state",
+            vec![],
+            vec![TreeDelta::Updated {
+                artifact_id,
+                old: state(base_hash),
+                new: state(second_hash),
+            }],
+        );
+        let merge = create_fixture_change(
+            &graph,
+            vec![first, second],
+            "merge compose state",
+            vec![],
+            vec![TreeDelta::Updated {
+                artifact_id,
+                old: state(first_hash),
+                new: state(merged_hash),
+            }],
+        );
 
         let historical = build_graph_at_ref(&graph, &blob_store, &merge).unwrap();
         assert_eq!(
