@@ -25,10 +25,13 @@ pub struct FileWatcher {
 }
 
 impl FileWatcher {
-    /// Start watching a directory for changes to files with the given extensions.
-    pub fn new(root: &Path, extensions: Vec<String>) -> Result<Self> {
+    /// Start watching every tracked source entry under a repository root.
+    ///
+    /// Parser support is enrichment, not admission. The watcher must therefore
+    /// report Compose/config files, lockfiles, unsupported languages, binaries,
+    /// and symlinks just as reliably as parser-backed source files.
+    pub fn new(root: &Path) -> Result<Self> {
         let (tx, rx) = mpsc::channel();
-        let exts = extensions.clone();
         let root = root.to_path_buf();
         let event_root = root.clone();
 
@@ -36,7 +39,7 @@ impl FileWatcher {
             notify::recommended_watcher(move |res: std::result::Result<Event, notify::Error>| {
                 match res {
                     Ok(event) => {
-                        let events = classify_event(&event, &exts, &event_root);
+                        let events = classify_event(&event, &event_root);
                         for fe in events {
                             if tx.send(fe).is_err() {
                                 return;
@@ -82,7 +85,7 @@ impl FileWatcher {
     }
 }
 
-fn classify_event(event: &Event, extensions: &[String], root: &Path) -> Vec<FileEvent> {
+fn classify_event(event: &Event, root: &Path) -> Vec<FileEvent> {
     let mut file_events = Vec::new();
 
     let relevant_paths: Vec<&PathBuf> = event
@@ -95,10 +98,13 @@ fn classify_event(event: &Event, extensions: &[String], root: &Path) -> Vec<File
             if !crate::should_index_repo_relative_path(rel_path) {
                 return false;
             }
-            p.extension()
-                .and_then(|e| e.to_str())
-                .map(|ext| extensions.iter().any(|e| e == ext))
-                .unwrap_or(false)
+            // A removed path no longer has metadata to inspect. Notify emits
+            // file-level removal paths for recursive watches, so retain it and
+            // let exact-tree reconciliation decide whether it was tracked.
+            matches!(event.kind, EventKind::Remove(_))
+                || std::fs::symlink_metadata(p)
+                    .map(|metadata| metadata.is_file() || metadata.file_type().is_symlink())
+                    .unwrap_or(false)
         })
         .collect();
 
@@ -125,60 +131,46 @@ fn classify_event(event: &Event, extensions: &[String], root: &Path) -> Vec<File
     file_events
 }
 
-/// Collect all supported file extensions from the adapter registry.
-pub fn supported_extensions() -> Vec<String> {
-    let registry = kin_parser::AdapterRegistry::new();
-    let mut exts = Vec::new();
-    for lang in registry.supported_languages() {
-        if let Some(adapter) = registry.get_by_language(lang) {
-            for ext in adapter.file_extensions() {
-                exts.push(ext.to_string());
-            }
-        }
-    }
-    exts
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn supported_extensions_includes_common_types() {
-        let exts = supported_extensions();
-        assert!(exts.contains(&"ts".to_string()));
-        assert!(exts.contains(&"js".to_string()));
-        assert!(exts.contains(&"py".to_string()));
-        assert!(exts.contains(&"go".to_string()));
-        assert!(exts.contains(&"java".to_string()));
-        assert!(exts.contains(&"rs".to_string()));
-    }
-
-    #[test]
-    fn classify_ignores_non_matching_extensions() {
+    fn classify_detects_unsupported_and_extensionless_files() {
+        let root = tempfile::tempdir().unwrap();
+        let readme = root.path().join("README");
+        let compose = root.path().join("compose.yml");
+        let lockfile = root.path().join("package-lock.json");
+        std::fs::write(&readme, "hello").unwrap();
+        std::fs::write(&compose, "services: {}").unwrap();
+        std::fs::write(&lockfile, "{}").unwrap();
         let event = Event {
             kind: EventKind::Modify(notify::event::ModifyKind::Data(
                 notify::event::DataChange::Content,
             )),
-            paths: vec![PathBuf::from("/tmp/readme.txt")],
+            paths: vec![readme, compose, lockfile],
             attrs: Default::default(),
         };
-        let extensions = vec!["rs".to_string(), "ts".to_string()];
-        let result = classify_event(&event, &extensions, Path::new("/tmp"));
-        assert!(result.is_empty());
+        let result = classify_event(&event, root.path());
+        assert_eq!(result.len(), 3);
+        assert!(result
+            .iter()
+            .all(|event| matches!(event, FileEvent::Changed(_))));
     }
 
     #[test]
     fn classify_detects_source_file_change() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("main.rs");
+        std::fs::write(&path, "fn main() {}").unwrap();
         let event = Event {
             kind: EventKind::Modify(notify::event::ModifyKind::Data(
                 notify::event::DataChange::Content,
             )),
-            paths: vec![PathBuf::from("/tmp/main.rs")],
+            paths: vec![path],
             attrs: Default::default(),
         };
-        let extensions = vec!["rs".to_string()];
-        let result = classify_event(&event, &extensions, Path::new("/tmp"));
+        let result = classify_event(&event, root.path());
         assert_eq!(result.len(), 1);
         assert!(matches!(result[0], FileEvent::Changed(_)));
     }
@@ -190,23 +182,26 @@ mod tests {
             paths: vec![PathBuf::from("/tmp/old.py")],
             attrs: Default::default(),
         };
-        let extensions = vec!["py".to_string()];
-        let result = classify_event(&event, &extensions, Path::new("/tmp"));
+        let result = classify_event(&event, Path::new("/tmp"));
         assert_eq!(result.len(), 1);
         assert!(matches!(result[0], FileEvent::Removed(_)));
     }
 
     #[test]
-    fn classify_ignores_skipped_dir_paths() {
+    fn classify_includes_generated_directory_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let generated = root.path().join("out/generated.rs");
+        std::fs::create_dir_all(generated.parent().unwrap()).unwrap();
+        std::fs::write(&generated, "pub const GENERATED: bool = true;").unwrap();
         let event = Event {
             kind: EventKind::Modify(notify::event::ModifyKind::Data(
                 notify::event::DataChange::Content,
             )),
-            paths: vec![PathBuf::from("/tmp/out/generated.rs")],
+            paths: vec![generated],
             attrs: Default::default(),
         };
-        let extensions = vec!["rs".to_string()];
-        let result = classify_event(&event, &extensions, Path::new("/tmp"));
-        assert!(result.is_empty());
+        let result = classify_event(&event, root.path());
+        assert_eq!(result.len(), 1);
+        assert!(matches!(result[0], FileEvent::Changed(_)));
     }
 }

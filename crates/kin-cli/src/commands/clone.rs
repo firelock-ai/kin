@@ -205,9 +205,8 @@ pub async fn run(url: String, path: Option<String>) -> Result<()> {
         kin_migrate::scan_repo(&target).map_err(|e| anyhow::anyhow!("scan failed: {}", e))?;
     let plan = kin_migrate::plan_migration(
         &scan,
-        kin_migrate::strategy::MigrationStrategy::Shallow,
+        kin_migrate::strategy::MigrationStrategy::Snapshot,
         None,
-        0,
     );
     let result = kin_migrate::execute_migration_persisted(&plan)
         .map_err(|e| anyhow::anyhow!("migration failed: {}", e))?;

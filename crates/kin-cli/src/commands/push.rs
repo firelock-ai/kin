@@ -118,7 +118,7 @@ pub async fn run(remote_name: Option<String>) -> Result<()> {
     if plan.remote.transport == kin_core::RemoteTransportKind::GitExport {
         let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
             .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-        let export_target = crate::commands::git::sync_export_path(&layout);
+        let export_target = crate::commands::git::transport_export_path(&layout);
         crate::commands::git::ensure_transport_repo(
             &export_target,
             Some(layout.working_dir()),
@@ -289,7 +289,7 @@ mod tests {
             message: format!("change {byte}"),
             entity_deltas: vec![],
             relation_deltas: vec![],
-            artifact_deltas: vec![],
+            tree_deltas: vec![],
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],

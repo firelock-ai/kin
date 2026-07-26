@@ -39,8 +39,8 @@ pub trait TrafficChecker: Send + Sync {
 
 /// Check whether a mutation to the given entity is blocked by active intents.
 ///
-/// This is the core pre-write collision check called before any overlay
-/// mutation or file-save mutation in the reconciler.
+/// This is the core pre-write collision check called before any repository
+/// transaction or file-save mutation in the reconciler.
 ///
 /// Rules (from PLAN_P2 Section 4.7):
 /// - Hard-locked by another session -> reject with HardCollision

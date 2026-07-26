@@ -3179,7 +3179,6 @@ dependencies = [
  "chrono",
  "flate2",
  "fs2",
- "gix",
  "hex",
  "http-body",
  "kin-blobs",
@@ -3583,13 +3582,11 @@ name = "kin-runtime"
 version = "0.3.6"
 dependencies = [
  "chrono",
- "hex",
  "kin-blobs",
  "kin-model",
  "pretty_assertions",
  "serde",
  "serde_json",
- "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.18",
  "tracing",

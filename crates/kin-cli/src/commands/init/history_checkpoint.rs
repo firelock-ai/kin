@@ -57,7 +57,7 @@ const DEFAULT_BYTE_CAP: u64 = 2 * 1024 * 1024 * 1024;
 const STORE_LOCK_FILE: &str = ".store.lock";
 static TEMP_NONCE: AtomicU64 = AtomicU64::new(0);
 
-pub(super) const BASE_LINK_MESSAGE: &str = "kin import: base-link (window base universe)";
+pub(super) const BASE_LINK_MESSAGE: &str = "kin history: base-link (window base universe)";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -412,7 +412,7 @@ struct HistoryIdentityEntry<'a> {
     change_id: SemanticChangeId,
     parents: &'a [SemanticChangeId],
     message: &'a str,
-    artifact_deltas: &'a [kin_model::ArtifactDelta],
+    tree_deltas: &'a [kin_model::TreeDelta],
 }
 
 fn canonicalize_json_value(value: &mut serde_json::Value) {
@@ -506,7 +506,7 @@ fn history_prefix_digests(
     imported: &[kin_git::ImportedChange],
     order: &[usize],
 ) -> Result<Vec<String>> {
-    let mut current = Sha256::digest(b"kin-history-hydration-prefix-v2\0").to_vec();
+    let mut current = Sha256::digest(b"kin-history-hydration-prefix-v3\0").to_vec();
     let mut output = Vec::with_capacity(order.len() + 1);
     output.push(hex::encode(&current));
     for index in order {
@@ -516,10 +516,10 @@ fn history_prefix_digests(
             change_id: entry.change.id,
             parents: &entry.change.parents,
             message: &entry.change.message,
-            artifact_deltas: &entry.change.artifact_deltas,
+            tree_deltas: &entry.change.tree_deltas,
         };
         let mut hasher = Sha256::new();
-        hasher.update(b"kin-history-hydration-prefix-step-v2\0");
+        hasher.update(b"kin-history-hydration-prefix-step-v3\0");
         hasher.update(&current);
         hasher.update(canonical_json_bytes(&identity)?);
         current = hasher.finalize().to_vec();

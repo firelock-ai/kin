@@ -52,8 +52,8 @@ enum Command {
         /// Skip LSP enrichment (faster init, tree-sitter only)
         #[arg(long, default_value_t = false)]
         no_lsp: bool,
-        /// Git history import depth for detected Git repositories: `off`, `recent`, or `full`
-        #[arg(long, default_value = "recent", value_parser = ["off", "recent", "full"])]
+        /// Git import boundary: `off`, `snapshot` (exact HEAD tree), or `full` (all reachable history)
+        #[arg(long, default_value = "snapshot", value_parser = ["off", "snapshot", "full"])]
         git_history: String,
     },
     /// Show working copy status
@@ -92,30 +92,19 @@ enum Command {
         /// Head change ID
         head: Option<String>,
     },
-    /// ⚠ WARNING: Remove Kin metadata from this repository.
+    /// Verify the graph-derived working tree and detach Kin from this repository.
     ///
-    /// By default (safe): stops the daemon and removes .kin/ graph + metadata.
-    /// Working files are left exactly as they are.
-    ///
-    /// With --revert-files (DESTRUCTIVE): additionally overwrites every working
-    /// file with the pre-init snapshot copy, destroying any uncommitted changes.
-    /// Requires typing "revert" to confirm unless --yes is also given.
-    /// A backup of current files is created before any mutation.
-    ///
-    /// Eject never touches .git: Kin only restores files it snapshotted at init,
-    /// and Git history is left intact. After eject the directory is a plain Git
-    /// repository again.
+    /// Eject never restores initialization-time files. It requires every
+    /// graph-owned artifact and blob to match the current projection, stops the
+    /// repository daemon, rechecks persisted graph truth, and atomically moves
+    /// `.kin/` to a recoverable sibling archive. Working files are not rewritten.
     Eject {
-        /// DESTRUCTIVE: overwrite working files with the pre-init snapshot and
-        /// delete the Kin graph. Requires typing "revert" to confirm (or --yes).
-        #[arg(long)]
-        revert_files: bool,
-        /// Skip typed confirmation for --revert-files (for non-interactive use).
+        /// Skip the typed "eject" confirmation.
         #[arg(long)]
         yes: bool,
-        /// Deprecated: use --yes. Kept for compatibility; has no effect without --revert-files.
-        #[arg(long, hide = true)]
-        force: bool,
+        /// Permanently delete the detached metadata archive after the atomic move.
+        #[arg(long, requires = "yes")]
+        purge_metadata: bool,
     },
     /// Show downstream impact of an entity
     Impact {
@@ -517,11 +506,6 @@ enum Command {
         #[arg(long = "ref", value_name = "REF")]
         reference: Option<String>,
     },
-    /// Manage workspaces
-    Workspace {
-        #[command(subcommand)]
-        action: WorkspaceAction,
-    },
     /// MCP server commands
     Mcp {
         #[command(subcommand)]
@@ -569,11 +553,6 @@ enum Command {
         /// Target directory (defaults to repo name)
         path: Option<String>,
     },
-    /// Import a repository (git URL or local path) into Kin
-    Import {
-        /// Repository URL (https/git) or local path
-        url: String,
-    },
     /// Restore a file from a specific change
     Checkout {
         /// File path to restore
@@ -588,11 +567,13 @@ enum Command {
         action: VerifyAction,
     },
     /// Run a command in a graph-backed session workspace
-    #[command(visible_alias = "run")]
     Exec {
         /// Command to run (put kin flags before it: `kin exec --keep -- npm test`)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         command: Vec<String>,
+        /// Interpret the command through the platform shell instead of preserving argv boundaries
+        #[arg(long)]
+        shell: bool,
         /// Keep the session workspace after the run and defer reconcile
         #[arg(long)]
         keep: bool,
@@ -703,31 +684,21 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// Run schema migrations
+    /// Migrate an existing Git repository into graph-owned Kin truth
     Migrate {
         /// Source repository path (defaults to current directory)
         source: Option<String>,
-        /// Migration depth: shallow (HEAD only) or deep (full history)
-        #[arg(short, long, default_value = "shallow")]
-        depth: String,
-        /// Resume an interrupted migration from the last checkpoint
+        /// Distinct destination (defaults to an in-place migration)
         #[arg(long)]
-        resume: bool,
+        target: Option<PathBuf>,
+        /// Git history boundary: `snapshot` (exact HEAD tree) or `full` (all reachable history)
+        #[arg(long, default_value = "snapshot", value_parser = ["snapshot", "full"])]
+        history: String,
     },
     /// Inspect and bound the on-disk embedding cache
     Cache {
         #[command(subcommand)]
         action: CacheAction,
-    },
-    /// Reclaim space from the global ~/.kin warm-start cache
-    Gc {
-        /// Report what would be reclaimed without deleting anything
-        #[arg(long)]
-        dry_run: bool,
-        /// Reclaim cache bundles older than this many days (default 14).
-        /// The active (current) bundle of each repo is always preserved.
-        #[arg(long, value_name = "DAYS")]
-        max_age_days: Option<u64>,
     },
     /// Inspect and validate the semantic graph
     Graph {
@@ -779,7 +750,7 @@ enum Command {
     },
     /// Launch an editor in a materialized session workspace
     Open {
-        /// Editor to launch: code, cursor, or any editor command
+        /// Editor to launch: code or cursor
         editor: String,
         /// In native mode, block filesystem discovery commands and require Kin discovery
         #[arg(long)]
@@ -787,9 +758,6 @@ enum Command {
         /// In native mode, block both filesystem discovery and direct file reads
         #[arg(long, conflicts_with = "restrict_discovery")]
         restrict_filesystem: bool,
-        /// Wait for the editor to exit, then reconcile and clean up automatically
-        #[arg(long)]
-        wait: bool,
     },
     /// Launch an assistant with Kin guidance injected
     With {
@@ -1096,33 +1064,6 @@ enum GraphAction {
     Status,
     /// Structural integrity validation
     Validate,
-    /// Recover missing atomic graph authority from explicitly verified graph artifacts
-    RecoverAuthority {
-        /// Explicit repository root containing `.kin/`
-        #[arg(long, value_name = "PATH")]
-        repo: PathBuf,
-        /// Exact legacy head generation expected before recovery
-        #[arg(long)]
-        expected_head_generation: u64,
-        /// Exact SHA-256 of the legacy `graph.kndb` input
-        #[arg(long, value_name = "SHA256")]
-        expected_snapshot_sha256: String,
-        /// Exact recovered graph Merkle root expected after replay
-        #[arg(long, value_name = "HEX")]
-        expected_root: String,
-        /// Expected legacy delta identity, repeated as `GENERATION=SHA256`
-        #[arg(long, value_name = "GENERATION=SHA256")]
-        expected_delta: Vec<String>,
-        /// Canonical repository UUID; always required and checked against any manifest
-        #[arg(long, value_name = "UUID")]
-        repo_id: String,
-        /// Confirm every daemon, VFS, and legacy graph writer for this repo is quiesced
-        #[arg(long, default_value_t = false)]
-        confirm_quiesced: bool,
-        /// Output machine-readable JSON
-        #[arg(long, default_value_t = false)]
-        json: bool,
-    },
     /// Look up an entity by name and show its relations
     Inspect {
         /// Entity name or UUID to inspect
@@ -1188,18 +1129,6 @@ enum GitAction {
         /// Target directory
         #[arg(short, long)]
         output: Option<String>,
-        /// Allow exporting directly into the checked-out Git working repository
-        #[arg(long, default_value_t = false)]
-        in_place: bool,
-    },
-    /// Import from Git history (deprecated: use `kin init` or `kin migrate` instead)
-    #[command(hide = true)]
-    Import {
-        /// Git repository path
-        path: Option<String>,
-    },
-    /// Sync with Git remote
-    Sync {
         /// Allow exporting directly into the checked-out Git working repository
         #[arg(long, default_value_t = false)]
         in_place: bool,
@@ -1484,34 +1413,6 @@ enum StashAction {
     Pop,
     /// List stash entries
     List,
-}
-
-#[derive(Subcommand)]
-enum WorkspaceAction {
-    /// List workspaces
-    List,
-    /// Create a new workspace
-    Create {
-        /// Workspace name
-        name: String,
-    },
-    /// Switch to a workspace
-    Switch {
-        /// Workspace name
-        name: String,
-    },
-    /// Delete a workspace
-    Delete {
-        /// Workspace name
-        name: String,
-    },
-    /// Rename a workspace
-    Rename {
-        /// Current workspace name
-        old_name: String,
-        /// New workspace name
-        new_name: String,
-    },
 }
 
 #[derive(Subcommand)]
@@ -2030,10 +1931,9 @@ fn main() -> Result<()> {
                 },
                 Command::Diff { base, head } => commands::diff::run(base, head).await,
                 Command::Eject {
-                    revert_files,
                     yes,
-                    force,
-                } => commands::eject::run(revert_files, yes || force).await,
+                    purge_metadata,
+                } => commands::eject::run(yes, purge_metadata).await,
                 Command::Impact {
                     entity,
                     depth,
@@ -2514,15 +2414,6 @@ fn main() -> Result<()> {
                 Command::Blame { entity, reference } => {
                     commands::blame::run(entity, reference).await
                 }
-                Command::Workspace { action } => match action {
-                    WorkspaceAction::List => commands::workspace::list().await,
-                    WorkspaceAction::Create { name } => commands::workspace::create(name).await,
-                    WorkspaceAction::Switch { name } => commands::workspace::switch(name).await,
-                    WorkspaceAction::Delete { name } => commands::workspace::delete(name).await,
-                    WorkspaceAction::Rename { old_name, new_name } => {
-                        commands::workspace::rename(old_name, new_name).await
-                    }
-                },
                 Command::Mcp { action } => match action {
                     McpAction::Start { global, repo } => commands::mcp::start(global, repo).await,
                 },
@@ -2579,7 +2470,6 @@ fn main() -> Result<()> {
                 Command::Push { remote } => commands::push::run(remote).await,
                 Command::Pull { remote } => commands::pull::run(remote).await,
                 Command::Clone { url, path } => commands::clone::run(url, path).await,
-                Command::Import { url } => commands::import::run(url).await,
                 Command::Checkout { path, change } => commands::checkout::run(path, change).await,
                 Command::Verify { action } => match action {
                     VerifyAction::Entity { entity } => commands::verify::run(entity).await,
@@ -2599,11 +2489,12 @@ fn main() -> Result<()> {
                 },
                 Command::Exec {
                     command,
+                    shell,
                     keep,
                     discard,
                     strategy,
                     scope,
-                } => commands::exec::run_full(command, keep, discard, strategy, scope).await,
+                } => commands::exec::run_full(command, shell, keep, discard, strategy, scope).await,
                 Command::Telemetry { action } => match action {
                     TelemetryAction::Status => commands::telemetry::run_status().await,
                     TelemetryAction::Consent => commands::telemetry::run_consent().await,
@@ -2707,9 +2598,9 @@ fn main() -> Result<()> {
                 Command::Bench { args } => commands::bench::bench_proxy(&args),
                 Command::Migrate {
                     source,
-                    depth,
-                    resume,
-                } => commands::migrate::run(source, depth, resume).await,
+                    target,
+                    history,
+                } => commands::migrate::run(source, target, history).await,
                 Command::Cache { action } => match action {
                     CacheAction::Status { json } => commands::cache::status(json).await,
                     CacheAction::Gc {
@@ -2718,37 +2609,9 @@ fn main() -> Result<()> {
                         prune_stale_schema,
                     } => commands::cache::gc(dry_run, budget_gb, prune_stale_schema).await,
                 },
-                Command::Gc {
-                    dry_run,
-                    max_age_days,
-                } => commands::gc::run(dry_run, max_age_days).await,
                 Command::Graph { action } => match action {
                     GraphAction::Status => commands::graph::status().await,
                     GraphAction::Validate => commands::graph::validate().await,
-                    GraphAction::RecoverAuthority {
-                        repo,
-                        expected_head_generation,
-                        expected_snapshot_sha256,
-                        expected_root,
-                        expected_delta,
-                        repo_id,
-                        confirm_quiesced,
-                        json,
-                    } => {
-                        commands::graph_recover::recover_authority(
-                            commands::graph_recover::RecoverAuthorityOptions {
-                                repo,
-                                expected_head_generation,
-                                expected_snapshot_sha256,
-                                expected_root,
-                                expected_deltas: expected_delta,
-                                repo_id,
-                                confirm_quiesced,
-                                json,
-                            },
-                        )
-                        .await
-                    }
                     GraphAction::Inspect { name, json } => {
                         commands::graph::inspect(name, json).await
                     }
@@ -2762,8 +2625,6 @@ fn main() -> Result<()> {
                     GitAction::Export { output, in_place } => {
                         commands::git::export(output, in_place).await
                     }
-                    GitAction::Import { path } => commands::git::import(path).await,
-                    GitAction::Sync { in_place } => commands::git::sync(in_place).await,
                 },
                 Command::Intent { action } => match action {
                     IntentAction::List => commands::intent::list().await,
@@ -2858,10 +2719,7 @@ fn main() -> Result<()> {
                     editor,
                     restrict_discovery,
                     restrict_filesystem,
-                    wait,
-                } => {
-                    commands::open::run(editor, restrict_discovery, restrict_filesystem, wait).await
-                }
+                } => commands::open::run(editor, restrict_discovery, restrict_filesystem).await,
                 Command::Reconcile { session, cleanup } => {
                     commands::reconcile::run(session, cleanup).await
                 }
@@ -3090,6 +2948,67 @@ mod tests {
     }
 
     #[test]
+    fn workspace_is_not_a_cli_surface() {
+        on_cli_test_stack(|| {
+            for args in [
+                vec!["kin", "workspace"],
+                vec!["kin", "workspace", "list"],
+                vec!["kin", "workspace", "create", "demo"],
+                vec!["kin", "workspace", "switch", "demo"],
+                vec!["kin", "workspace", "delete", "demo"],
+                vec!["kin", "workspace", "rename", "demo", "renamed"],
+            ] {
+                assert!(
+                    Cli::try_parse_from(args).is_err(),
+                    "the descriptor-only workspace command must not be parseable"
+                );
+            }
+
+            let mut command = Cli::command();
+            let help = command.render_long_help().to_string();
+            for supported in [
+                "Run a command in a graph-backed session workspace",
+                "Launch an editor in a materialized session workspace",
+                "Open an interactive shell in a materialized session workspace",
+            ] {
+                assert!(
+                    help.contains(supported),
+                    "supported graph-backed session surface missing from help: {supported}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn git_interop_exposes_only_exact_export() {
+        on_cli_test_stack(|| {
+            for args in [
+                &["kin", "import", "https://example.com/repo.git"][..],
+                &["kin", "git", "import"][..],
+                &["kin", "git", "sync"][..],
+                &["kin", "git", "sync", "--in-place"][..],
+            ] {
+                assert!(
+                    Cli::try_parse_from(args).is_err(),
+                    "removed Git compatibility command must not be parseable: {args:?}"
+                );
+            }
+
+            let cli = Cli::try_parse_from(["kin", "git", "export", "--in-place"])
+                .expect("exact Git export remains the explicit interoperability surface");
+            assert!(matches!(
+                cli.command,
+                Command::Git {
+                    action: GitAction::Export {
+                        output: None,
+                        in_place: true
+                    }
+                }
+            ));
+        });
+    }
+
+    #[test]
     fn update_release_expectation_tuple_is_complete_and_works_with_check_only() {
         on_cli_test_stack(|| {
             let digest = "a".repeat(64);
@@ -3169,6 +3088,52 @@ mod tests {
                 "--ack-restart",
             ])
             .is_err());
+        });
+    }
+
+    #[test]
+    fn exec_shell_mode_is_explicit_and_direct_mode_preserves_cli_parts() {
+        on_cli_test_stack(|| {
+            let direct = Cli::try_parse_from([
+                "kin",
+                "exec",
+                "--",
+                "printf",
+                "value with spaces",
+                "literal;semicolon",
+            ])
+            .unwrap();
+            match direct.command {
+                Command::Exec { command, shell, .. } => {
+                    assert!(!shell);
+                    assert_eq!(
+                        command,
+                        vec!["printf", "value with spaces", "literal;semicolon"]
+                    );
+                }
+                _ => panic!("expected exec command"),
+            }
+
+            let shell = Cli::try_parse_from([
+                "kin",
+                "exec",
+                "--shell",
+                "--",
+                "printf '%s' \"$KIN_REPO_ID\"",
+            ])
+            .unwrap();
+            match shell.command {
+                Command::Exec { command, shell, .. } => {
+                    assert!(shell);
+                    assert_eq!(command, vec!["printf '%s' \"$KIN_REPO_ID\""]);
+                }
+                _ => panic!("expected exec command"),
+            }
+
+            assert!(
+                Cli::try_parse_from(["kin", "run", "--", "true"]).is_err(),
+                "the pre-release `run` compatibility alias must not remain"
+            );
         });
     }
 }

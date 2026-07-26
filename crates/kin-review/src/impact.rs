@@ -5,7 +5,7 @@ use std::collections::{BTreeSet, HashSet};
 
 use kin_model::entity::{Entity, EntityRole};
 use kin_model::graph::GraphStore;
-use kin_model::ids::{EntityId, SemanticChangeId};
+use kin_model::ids::{EntityId, RepoPath, SemanticChangeId};
 use kin_model::provenance::{Actor, ActorId, ActorKind, Approval, ApprovalDecision, AuditEvent};
 use kin_model::relation::{GraphNodeId, Relation, RelationKind};
 use kin_model::work::{Annotation, StalenessState, WorkItem, WorkScope};
@@ -102,8 +102,10 @@ impl<G: GraphStore> ImpactGraph for LiveGraph<'_, G> {
         }
 
         for file in source_files {
-            let file_id = kin_model::FilePathId::new(&file);
-            let Some(artifact_id) = self.0.artifact_id_for_path(&file_id) else {
+            let Ok(path) = RepoPath::from_utf8(file.clone()) else {
+                return Ok(false);
+            };
+            let Some(artifact_id) = self.0.artifact_id_at_path(&path) else {
                 return Ok(false);
             };
             let artifact = GraphNodeId::Artifact(artifact_id);
@@ -548,10 +550,8 @@ pub fn analyze_impact_at<I: ImpactGraph>(
                         contract_consumers.push(entity);
                     }
                 }
-                RelationKind::Tests => {
-                    if seen_tests.insert(affected_id) {
-                        tests.push(entity);
-                    }
+                RelationKind::Tests if seen_tests.insert(affected_id) => {
+                    tests.push(entity);
                 }
                 _ => {}
             }
@@ -723,7 +723,29 @@ mod tests {
         Visibility,
     };
     use kin_model::ids::*;
-    use kin_model::EntityStore;
+    use kin_model::{
+        ArtifactId, EntityStore, LocatedEntry, TransactionDelta, TreeDelta, TreeEntry,
+    };
+
+    fn admit_test_artifact(graph: &kin_db::InMemoryGraph, path: &str) -> ArtifactId {
+        let path = RepoPath::from_utf8(path).expect("valid test repository path");
+        let artifact_id = ArtifactId::new();
+        graph
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: Vec::new(),
+                relation_deltas: Vec::new(),
+                tree_deltas: vec![TreeDelta::Added {
+                    artifact_id,
+                    new: LocatedEntry::new(
+                        path,
+                        TreeEntry::blob(Hash256::from_bytes([0x5a; 32]), false),
+                    ),
+                }],
+                admission_policy_delta: None,
+            })
+            .expect("test artifact admission");
+        artifact_id
+    }
 
     fn test_entity(name: &str) -> Entity {
         Entity {
@@ -888,13 +910,18 @@ mod tests {
             relations: Vec::new(),
             imports: Vec::new(),
         }];
-        let mut coverage =
-            kin_index::link_cross_file_with_completeness(&complete_files, &completeness);
+        let artifact_ids = kin_index::linker::ArtifactIdentityMap::from([(
+            "src/lib.py".to_string(),
+            admit_test_artifact(&graph, "src/lib.py"),
+        )]);
+        let mut coverage = kin_index::link_cross_file_with_completeness(
+            &complete_files,
+            &artifact_ids,
+            &completeness,
+        )
+        .expect("graph-owned artifact identity must satisfy coverage linking");
         let mut extraction_incomplete = coverage[0].clone();
         extraction_incomplete.id = RelationId::from_bytes([0xee; 16]);
-        extraction_incomplete.dst = GraphNodeId::Artifact(kin_model::ArtifactId::seed_from_path(
-            "kin-internal://test/extraction-incomplete/src/lib.py",
-        ));
         extraction_incomplete.evidence = vec![RelationEvidence {
             source_path: Some("src/lib.py".to_string()),
             parser_rule: Some(kin_index::CALL_SHAPE_EXTRACTION_COVERAGE_INCOMPLETE_V1.to_string()),
