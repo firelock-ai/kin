@@ -43,14 +43,14 @@ pub use ref_graph::GraphAtRef;
 pub use release_gate::{
     entities_touched_by_change, passing_proof_coverage, security_findings,
     source_bound_release_proof_coverage, source_bound_release_proof_coverage_for_entities,
-    unapproved_agent_changes, unapproved_changes, SecurityFinding, SecurityFindingCounts,
-    SecuritySeverity, UnapprovedAgentChange, UnapprovedChange,
+    unapproved_changes, SecurityFinding, SecurityFindingCounts, SecuritySeverity, UnapprovedChange,
 };
 pub use review::{Review, SemanticReview};
 pub use risk::assess_risk;
 pub use shadow::{
     build_shadow_report, build_shadow_report_at, build_shadow_report_base_off_ancestry,
-    derive_shadow_policy, format_shadow_report, ShadowChangedEntity, ShadowEvidenceGap,
+    derive_shadow_policy, format_shadow_report, ShadowArtifactActivity, ShadowArtifactAspect,
+    ShadowArtifactChange, ShadowArtifactOperation, ShadowChangedEntity, ShadowEvidenceGap,
     ShadowGateReport, ShadowGateVerdict, ShadowPolicyFinding, ShadowPolicyResult, ShadowRequest,
     SHADOW_ENFORCEMENT_REPORT_ONLY, SHADOW_GATE_REPORT_SCHEMA_VERSION,
 };

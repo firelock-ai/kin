@@ -23,6 +23,7 @@ const schemaFiles = {
   intent: 'intent.schema.json',
   intentConflict: 'intent-conflict.schema.json',
   trafficReport: 'traffic-report.schema.json',
+  mcpArtifactReadInput: 'mcp-artifact-read-input.schema.json',
   shadowGateReport: 'shadow-gate-report.schema.json'
 };
 
@@ -57,7 +58,7 @@ export async function validateContract(name, payload) {
     throw new Error(`Unknown schema: ${name}`);
   }
 
-  validateAgainstSchema(schema, payload, schemas, '$', errors);
+  validateAgainstSchema(schema, payload, schemas, '$', errors, schema);
   return {
     ok: errors.length === 0,
     errors
@@ -71,15 +72,69 @@ export async function assertContract(name, payload) {
   }
 }
 
-function validateAgainstSchema(schema, value, schemas, pointer, errors) {
+function validateAgainstSchema(schema, value, schemas, pointer, errors, rootSchema) {
   if (schema.$ref) {
+    if (schema.$ref.startsWith('#/')) {
+      const resolved = resolveLocalRef(rootSchema, schema.$ref);
+      if (!resolved) {
+        errors.push(`${pointer}: unresolved schema ref ${schema.$ref}`);
+        return;
+      }
+      validateAgainstSchema(resolved, value, schemas, pointer, errors, rootSchema);
+      return;
+    }
     const schemaName = schemaIdMap[schema.$ref];
     if (!schemaName || !schemas[schemaName]) {
       errors.push(`${pointer}: unresolved schema ref ${schema.$ref}`);
       return;
     }
-    validateAgainstSchema(schemas[schemaName], value, schemas, pointer, errors);
+    validateAgainstSchema(
+      schemas[schemaName],
+      value,
+      schemas,
+      pointer,
+      errors,
+      schemas[schemaName]
+    );
     return;
+  }
+
+  if (schema.oneOf) {
+    const candidates = schema.oneOf.filter(candidate => {
+      const candidateErrors = [];
+      validateAgainstSchema(
+        candidate,
+        value,
+        schemas,
+        pointer,
+        candidateErrors,
+        rootSchema
+      );
+      return candidateErrors.length === 0;
+    });
+    if (candidates.length !== 1) {
+      errors.push(`${pointer}: expected exactly one matching schema`);
+    }
+    return;
+  }
+
+  if (schema.anyOf) {
+    const matched = schema.anyOf.some(candidate => {
+      const candidateErrors = [];
+      validateAgainstSchema(
+        candidate,
+        value,
+        schemas,
+        pointer,
+        candidateErrors,
+        rootSchema
+      );
+      return candidateErrors.length === 0;
+    });
+    if (!matched) {
+      errors.push(`${pointer}: expected at least one matching schema`);
+      return;
+    }
   }
 
   if (schema.type !== undefined && !matchesType(schema.type, value)) {
@@ -87,8 +142,25 @@ function validateAgainstSchema(schema, value, schemas, pointer, errors) {
     return;
   }
 
+  if ('const' in schema && value !== schema.const) {
+    errors.push(`${pointer}: expected constant ${JSON.stringify(schema.const)}`);
+  }
+
   if (schema.enum && !schema.enum.includes(value)) {
     errors.push(`${pointer}: expected one of ${schema.enum.join(', ')}`);
+  }
+
+  if (schema.pattern && typeof value === 'string' && !new RegExp(schema.pattern).test(value)) {
+    errors.push(`${pointer}: did not match ${schema.pattern}`);
+  }
+
+  if (typeof value === 'number') {
+    if (schema.minimum !== undefined && value < schema.minimum) {
+      errors.push(`${pointer}: expected value >= ${schema.minimum}`);
+    }
+    if (schema.maximum !== undefined && value > schema.maximum) {
+      errors.push(`${pointer}: expected value <= ${schema.maximum}`);
+    }
   }
 
   if (schema.required && isPlainObject(value)) {
@@ -102,7 +174,14 @@ function validateAgainstSchema(schema, value, schemas, pointer, errors) {
   if (schema.type === 'object' && isPlainObject(value) && schema.properties) {
     for (const [key, propertySchema] of Object.entries(schema.properties)) {
       if (key in value) {
-        validateAgainstSchema(propertySchema, value[key], schemas, `${pointer}.${key}`, errors);
+        validateAgainstSchema(
+          propertySchema,
+          value[key],
+          schemas,
+          `${pointer}.${key}`,
+          errors,
+          rootSchema
+        );
       }
     }
 
@@ -116,10 +195,37 @@ function validateAgainstSchema(schema, value, schemas, pointer, errors) {
   }
 
   if (schema.type === 'array' && Array.isArray(value) && schema.items) {
+    if (schema.minItems !== undefined && value.length < schema.minItems) {
+      errors.push(`${pointer}: expected at least ${schema.minItems} item(s)`);
+    }
+    if (schema.maxItems !== undefined && value.length > schema.maxItems) {
+      errors.push(`${pointer}: expected at most ${schema.maxItems} item(s)`);
+    }
+    if (schema.uniqueItems) {
+      const encoded = value.map(item => JSON.stringify(item));
+      if (new Set(encoded).size !== encoded.length) {
+        errors.push(`${pointer}: expected unique items`);
+      }
+    }
     value.forEach((item, index) => {
-      validateAgainstSchema(schema.items, item, schemas, `${pointer}[${index}]`, errors);
+      validateAgainstSchema(
+        schema.items,
+        item,
+        schemas,
+        `${pointer}[${index}]`,
+        errors,
+        rootSchema
+      );
     });
   }
+}
+
+function resolveLocalRef(rootSchema, ref) {
+  return ref
+    .slice(2)
+    .split('/')
+    .map(segment => segment.replaceAll('~1', '/').replaceAll('~0', '~'))
+    .reduce((current, segment) => current?.[segment], rootSchema);
 }
 
 function matchesType(expected, value) {

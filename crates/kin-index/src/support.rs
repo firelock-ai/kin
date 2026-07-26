@@ -12,7 +12,6 @@ use std::path::Path;
 use rayon::prelude::*;
 
 use crate::classifier::{FileClassification, FileClassifier};
-use crate::error::IndexError;
 use kin_model::ArtifactKind;
 
 /// Aggregated coverage report over a directory tree.
@@ -277,45 +276,15 @@ fn sorted_map(map: &HashMap<String, usize>) -> Vec<(&String, &usize)> {
     entries
 }
 
-/// Collect all files from a directory, skipping hidden dirs and common
-/// non-source directories (same logic as `collect_all_files` in kin-cli commit).
+/// Collect every admitted repository file. Parser support, hidden names, and
+/// generated/vendor directory names do not affect membership.
 fn collect_all_files(root: &Path) -> crate::Result<Vec<std::path::PathBuf>> {
-    let mut files = Vec::new();
-    collect_files_recursive(root, &mut files)?;
-    Ok(files)
-}
-
-fn collect_files_recursive(dir: &Path, files: &mut Vec<std::path::PathBuf>) -> crate::Result<()> {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(e) => return Err(IndexError::io(dir.display().to_string(), e)),
-    };
-
-    for entry in entries {
-        let entry = entry.map_err(|e| IndexError::io(dir.display().to_string(), e))?;
-        let path = entry.path();
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-
-        // Skip hidden directories and files starting with '.'
-        if name_str.starts_with('.') {
-            continue;
-        }
-
-        if path.is_dir() {
-            if matches!(
-                name_str.as_ref(),
-                "node_modules" | "target" | "build" | "dist" | "__pycache__" | "vendor"
-            ) {
-                continue;
-            }
-            collect_files_recursive(&path, files)?;
-        } else if path.is_file() {
-            files.push(path);
-        }
-    }
-
-    Ok(())
+    let ignore = crate::RepositoryIgnore::load(root)?;
+    let scan = crate::scan_repository(root, &ignore, std::iter::empty())?;
+    Ok(scan
+        .entries()
+        .map(|entry| entry.host_path.clone())
+        .collect())
 }
 
 #[cfg(test)]
@@ -425,13 +394,15 @@ mod tests {
     }
 
     #[test]
-    fn coverage_report_skips_hidden_and_excluded_dirs() {
+    fn coverage_report_includes_every_non_control_directory() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
 
         fs::write(root.join("visible.rs"), "fn f() {}").unwrap();
 
-        // Hidden dir
+        // Dot-directories, dependency trees, and generated outputs are exact
+        // repository members even when their content gets only shallow/opaque
+        // semantic enrichment.
         let hidden = root.join(".hidden");
         fs::create_dir(&hidden).unwrap();
         fs::write(hidden.join("secret.rs"), "fn s() {}").unwrap();
@@ -447,8 +418,8 @@ mod tests {
         fs::write(target.join("built.rs"), "fn b() {}").unwrap();
 
         let report = compute_coverage_report(root).unwrap();
-        assert_eq!(report.total_files, 1);
-        assert_eq!(report.entity_source_count, 1);
+        assert_eq!(report.total_files, 4);
+        assert_eq!(report.entity_source_count, 4);
     }
 
     #[test]

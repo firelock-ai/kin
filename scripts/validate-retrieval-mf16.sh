@@ -51,7 +51,7 @@ plan "      export KIN_BIN=$KIN_SRC/target/release/kin"
 plan "      export PATH=$KIN_SRC/target/release:\$PATH   # daemon resolution"
 plan ""
 plan "[2/5] environment pins (both arms identical except KIN_PROFILE):"
-plan "      export KIN_BENCH_EMBED=1 KIN_BENCH_BUILD_TIMEOUT=14400 KIN_INIT_WARM_CACHE=0"
+plan "      export KIN_BENCH_EMBED=1 KIN_BENCH_BUILD_TIMEOUT=14400"
 plan "      unset KIN_MCP_TOOL_PROFILE KIN_AGENT_DUMP DYLD_INSERT_LIBRARIES LD_PRELOAD"
 plan "      unset any ambient KIN_LOCATE_* / KIN_SEMLOC_* overrides (rerun-gate will assert)"
 plan ""
@@ -88,7 +88,7 @@ mkdir -p "$OUTPUT_DIR"
 
 IDS="$(jq -r '[.tasks[].instance_id] | join(",")' "$MF16_TASKS")"
 export PATH="$KIN_SRC/target/release:$PATH"
-export KIN_BENCH_EMBED=1 KIN_BENCH_BUILD_TIMEOUT=14400 KIN_INIT_WARM_CACHE=0
+export KIN_BENCH_EMBED=1 KIN_BENCH_BUILD_TIMEOUT=14400
 export CONTEXTBENCH_OFFICIAL_ROOT="$CBO"
 unset KIN_MCP_TOOL_PROFILE KIN_AGENT_DUMP DYLD_INSERT_LIBRARIES LD_PRELOAD || true
 

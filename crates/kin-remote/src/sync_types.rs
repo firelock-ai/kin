@@ -72,7 +72,8 @@ pub struct FieldDiff {
 pub struct SemanticDelta {
     pub entity_id: String,
     pub before_hash: Option<String>,
-    pub after_hash: String,
+    /// Absent when the entity is removed.
+    pub after_hash: Option<String>,
     pub change_set: Vec<FieldDiff>,
     pub timestamp: DateTime<Utc>,
     pub actor_id: String,
@@ -101,7 +102,8 @@ pub struct LocalMutation {
     pub mutation_id: Uuid,
     pub change_set: Vec<FieldDiff>,
     pub base_hash: Option<String>,
-    pub new_hash: String,
+    /// Absent when the mutation removes the entity.
+    pub new_hash: Option<String>,
     pub timestamp: DateTime<Utc>,
 }
 
@@ -112,7 +114,8 @@ pub struct LocalMutation {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PushConflict {
     pub entity_id: String,
-    pub local_hash: String,
+    /// Absent when the local mutation removes the entity.
+    pub local_hash: Option<String>,
     pub remote_hash: String,
     pub remote_actor_id: String,
 }

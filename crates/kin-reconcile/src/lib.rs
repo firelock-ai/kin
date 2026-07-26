@@ -3,11 +3,14 @@
 
 //! Kubernetes-style reconciliation loop for Kin.
 //!
-//! Keeps the working directory files and the working copy overlay in sync.
+//! Derives exact semantic transaction deltas from filesystem input and projects
+//! committed semantic transactions back to filesystem views.
 //!
 //! Two reconciliation directions:
-//! - **File -> Overlay:** detect file edits, parse, update WorkingCopy overlay
-//! - **Overlay -> File:** detect overlay mutations, re-project affected files
+//! - **File -> Transaction:** detect file edits, parse, return one validated
+//!   [`kin_model::TransactionDelta`]
+//! - **Transaction -> File:** project committed entity modifications into a
+//!   filesystem view
 //!
 //! Enforces Last Known Good (LKG) semantics: broken ASTs do not corrupt
 //! the graph. The LKG fingerprint, signature, and relations are retained
@@ -25,6 +28,5 @@ pub use collision::{
 pub use error::{ReconcileError, Result};
 pub use lkg::LkgStore;
 pub use reconciler::{
-    apply_overlay_to_graph, MergePreview, ReconcileOutcome, Reconciler, SemanticDelta,
-    SemanticDeltaKind,
+    MergePreview, ReconcileOutcome, ReconcileResult, Reconciler, SemanticDelta, SemanticDeltaKind,
 };

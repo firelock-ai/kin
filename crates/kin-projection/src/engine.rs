@@ -6,7 +6,10 @@ use std::path::{Path, PathBuf};
 
 use kin_blobs::BlobStore;
 use kin_model::preset::{FormattingPolicy, ProjectionMode};
-use kin_model::{EntityId, FileLayout, FilePathId, GraphStore, SourceRegion};
+use kin_model::{
+    EntityId, FileLayout, FilePathId, GraphStore, RepoPath, ResolvedTree, SemanticChangeId,
+    SourceRegion, TreeEntry,
+};
 use tracing::{debug, warn};
 
 use crate::error::{ProjectionError, Result};
@@ -26,11 +29,32 @@ impl ProjectionState {
         Self::default()
     }
 
-    /// Rebuild projection state from persisted graph truth only.
+    /// Rebuild semantic-layout projection state at one explicit graph ref.
     ///
-    /// This loads each persisted `FileLayout` and its blob-backed base file
-    /// content from the graph snapshot, without consulting the working tree.
-    pub fn from_graph<G>(graph: &G, blob_store: &BlobStore) -> Result<Self>
+    /// The ref is mandatory: there is no implicit "current working tree"
+    /// authority. Unsupported-language and non-source artifacts remain present
+    /// in the resolved tree but do not need a `FileLayout`.
+    pub fn from_graph_at<G>(
+        graph: &G,
+        blob_store: &BlobStore,
+        head: &SemanticChangeId,
+    ) -> Result<Self>
+    where
+        G: GraphStore,
+    {
+        let tree = graph
+            .resolve_tree_at(head)
+            .map_err(|err| ProjectionError::Graph(err.to_string()))?;
+        Self::from_resolved_tree(graph, blob_store, &tree)
+    }
+
+    /// Rebuild semantic-layout projection state from an already resolved exact
+    /// repository tree.
+    pub fn from_resolved_tree<G>(
+        graph: &G,
+        blob_store: &BlobStore,
+        tree: &ResolvedTree,
+    ) -> Result<Self>
     where
         G: GraphStore,
     {
@@ -40,22 +64,38 @@ impl ProjectionState {
             .map_err(|err| ProjectionError::Graph(err.to_string()))?;
 
         for layout in layouts {
-            let Some(file_hash) = graph
-                .get_file_hash(&layout.file_id)
-                .map_err(|err| ProjectionError::Graph(err.to_string()))?
-            else {
-                return Err(ProjectionError::BaseContentUnavailable {
-                    file_id: layout.file_id.to_string(),
-                    reason: "missing persisted file hash".to_string(),
-                });
-            };
-
-            let content = blob_store.read(&file_hash).map_err(|err| {
+            let path = RepoPath::from_utf8(layout.file_id.0.clone()).map_err(|error| {
                 ProjectionError::BaseContentUnavailable {
                     file_id: layout.file_id.to_string(),
-                    reason: format!("failed to read blob-backed file content: {err}"),
+                    reason: format!("invalid repository path in persisted layout: {error}"),
                 }
             })?;
+            // FileLayout is optional enrichment, not membership authority.
+            // A global/current layout may legitimately be absent at an older
+            // ref, so unrelated layouts are filtered rather than allowed to
+            // block exact tree projection.
+            let Some(artifact) = tree.artifact_at_path(&path) else {
+                continue;
+            };
+
+            let TreeEntry::Blob { hash, .. } = artifact.entry else {
+                let entry_kind = match artifact.entry {
+                    TreeEntry::Blob { .. } => unreachable!(),
+                    TreeEntry::Symlink { .. } => "symlink",
+                    TreeEntry::Gitlink { .. } => "gitlink",
+                };
+                return Err(ProjectionError::LayoutEntryUnsupported {
+                    file_id: layout.file_id.to_string(),
+                    entry_kind,
+                });
+            };
+            let content =
+                blob_store
+                    .read(&hash)
+                    .map_err(|err| ProjectionError::BaseContentUnavailable {
+                        file_id: layout.file_id.to_string(),
+                        reason: format!("failed to read blob-backed file content: {err}"),
+                    })?;
             state.register_file(layout, content);
         }
 
@@ -589,14 +629,28 @@ mod tests {
     }
 
     #[test]
-    fn projection_state_rebuilds_from_graph_truth_without_worktree_files() {
+    fn projection_state_rebuilds_from_resolved_graph_truth_without_worktree_files() {
         let graph = InMemoryGraph::new();
         let blob_dir = tempfile::tempdir().unwrap();
         let blob_store = BlobStore::new(blob_dir.path().to_path_buf()).unwrap();
         let file_id = FilePathId::new("src/main.rs");
         let content = b"fn main() { println!(\"graph truth\"); }\n".to_vec();
         let hash = blob_store.write(&content).unwrap();
-        graph.set_file_hash(&file_id.0, hash.0);
+        let artifact_id = kin_model::ArtifactId::new();
+        let repo_path = kin_model::RepoPath::from_utf8(file_id.0.clone()).unwrap();
+        graph
+            .apply_transaction_delta(&kin_model::TransactionDelta {
+                entity_deltas: vec![],
+                relation_deltas: vec![],
+                tree_deltas: vec![kin_model::TreeDelta::Added {
+                    artifact_id,
+                    new: kin_model::LocatedEntry::new(
+                        repo_path.clone(),
+                        kin_model::TreeEntry::blob(hash, false),
+                    ),
+                }],
+            })
+            .unwrap();
         graph
             .upsert_file_layout(&FileLayout {
                 file_id: file_id.clone(),
@@ -608,19 +662,39 @@ mod tests {
                 regions: vec![],
             })
             .unwrap();
+        let tree = kin_model::ResolvedTree::from_artifacts([kin_model::ResolvedArtifact::new(
+            artifact_id,
+            repo_path,
+            kin_model::TreeEntry::blob(hash, false),
+        )])
+        .unwrap();
 
-        let state = ProjectionState::from_graph(&graph, &blob_store).unwrap();
+        let state = ProjectionState::from_resolved_tree(&graph, &blob_store, &tree).unwrap();
 
         assert_eq!(state.file_ids(), vec![&file_id]);
         assert_eq!(state.get_content(&file_id), Some(content.as_slice()));
     }
 
     #[test]
-    fn projection_state_from_graph_errors_when_file_hash_missing() {
+    fn projection_state_filters_global_layout_absent_from_older_ref_tree() {
         let graph = InMemoryGraph::new();
         let blob_dir = tempfile::tempdir().unwrap();
         let blob_store = BlobStore::new(blob_dir.path().to_path_buf()).unwrap();
         let file_id = FilePathId::new("src/missing.rs");
+        let hash = blob_store.write(b"current only").unwrap();
+        graph
+            .apply_transaction_delta(&kin_model::TransactionDelta {
+                entity_deltas: vec![],
+                relation_deltas: vec![],
+                tree_deltas: vec![kin_model::TreeDelta::Added {
+                    artifact_id: kin_model::ArtifactId::new(),
+                    new: kin_model::LocatedEntry::new(
+                        kin_model::RepoPath::from_utf8(file_id.0.clone()).unwrap(),
+                        kin_model::TreeEntry::blob(hash, false),
+                    ),
+                }],
+            })
+            .unwrap();
         graph
             .upsert_file_layout(&FileLayout {
                 file_id: file_id.clone(),
@@ -633,11 +707,14 @@ mod tests {
             })
             .unwrap();
 
-        let err = ProjectionState::from_graph(&graph, &blob_store).unwrap_err();
-        assert!(matches!(
-            err,
-            ProjectionError::BaseContentUnavailable { file_id: missing, .. } if missing == file_id.to_string()
-        ));
+        let state = ProjectionState::from_resolved_tree(
+            &graph,
+            &blob_store,
+            &kin_model::ResolvedTree::default(),
+        )
+        .unwrap();
+
+        assert!(state.file_ids().is_empty());
     }
 
     #[test]

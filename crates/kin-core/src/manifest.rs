@@ -35,6 +35,12 @@ pub struct KinManifest {
     /// Unique repository identifier (UUID v4).
     pub repo_id: String,
 
+    /// Unique identity of this local materialized workspace (UUID v4).
+    ///
+    /// This is deliberately distinct from `repo_id`: two clones share
+    /// repository truth but must never share local workspace/session authority.
+    pub workspace_id: String,
+
     /// Timestamp of repository creation.
     pub created_at: String,
 }
@@ -123,6 +129,7 @@ impl KinManifest {
             languages: Vec::new(),
             adapters: Vec::new(),
             repo_id: uuid::Uuid::new_v4().to_string(),
+            workspace_id: uuid::Uuid::new_v4().to_string(),
             created_at: chrono::Utc::now().to_rfc3339(),
         }
     }
@@ -203,6 +210,8 @@ mod tests {
         let manifest = KinManifest::new();
         assert_eq!(manifest.kin_version, env!("CARGO_PKG_VERSION"));
         assert!(!manifest.repo_id.is_empty());
+        assert!(!manifest.workspace_id.is_empty());
+        assert_ne!(manifest.repo_id, manifest.workspace_id);
         assert!(!manifest.created_at.is_empty());
     }
 
@@ -217,6 +226,7 @@ mod tests {
         let loaded = KinManifest::load(&path).unwrap();
         assert_eq!(loaded.kin_version, manifest.kin_version);
         assert_eq!(loaded.repo_id, manifest.repo_id);
+        assert_eq!(loaded.workspace_id, manifest.workspace_id);
     }
 
     #[test]
@@ -225,6 +235,7 @@ mod tests {
         let json = serde_json::to_string(&manifest).unwrap();
         let parsed: KinManifest = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.repo_id, manifest.repo_id);
+        assert_eq!(parsed.workspace_id, manifest.workspace_id);
     }
 
     #[test]

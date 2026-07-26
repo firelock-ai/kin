@@ -26,8 +26,8 @@ fn bench_meta_json_reports_cache_key_dimensions() {
 
     let payload: Value =
         serde_json::from_slice(&output.stdout).expect("bench-meta stdout should be valid json");
-    assert_eq!(payload["schema"], "kin.bench-meta.v1");
-    assert!(payload["init_pipeline_epoch"].is_string());
+    assert_eq!(payload["schema"], "kin.bench-meta.v2");
+    assert!(payload["graph_build_pipeline_epoch"].is_string());
     assert!(payload["parser_schema_epoch"].is_string());
     assert!(payload["layout_schema_version"].is_u64());
     assert!(payload["graph_snapshot_version"].is_u64());
@@ -138,7 +138,8 @@ fn bench_meta_prepared_state_json_reports_repo_specific_cache_keys() {
     let prepared = payload["prepared_manifest"]
         .as_object()
         .expect("prepared_manifest object");
-    assert_eq!(prepared["schema"], "kin.prepared-state.v1");
+    assert_eq!(prepared["schema"], "kin.prepared-state.v2");
+    assert!(prepared["graph_build_pipeline_epoch"].is_string());
     assert!(prepared["cache_key"].is_string());
     assert!(prepared["repo_base_key"].is_string());
     assert!(prepared["repo_identity"]

@@ -6,8 +6,8 @@ use std::collections::HashMap;
 use kin_model::{
     relation::RelationKind, Annotation, AnnotationEntry, ArtifactContextEntry, ArtifactContextKind,
     ArtifactId, ContextEntry, ContextPack, ContextPlan, Entity, EntityFilter, EntityId, EntityKind,
-    EntityRole, FilePathId, GraphNodeId, GraphStore, IntentSummary, ProjectionLevel, RetrievalKey,
-    TokenBudget, TrafficEntry, TrafficProximity, WorkItem, WorkItemEntry, WorkScope,
+    EntityRole, FilePathId, GraphNodeId, GraphStore, IntentSummary, ProjectionLevel, RepoPath,
+    RetrievalKey, TokenBudget, TrafficEntry, TrafficProximity, WorkItem, WorkItemEntry, WorkScope,
 };
 use rayon::prelude::*;
 use tracing::debug;
@@ -844,17 +844,9 @@ where
             .get_shallow_file(file_id)
             .map_err(|e| ContextError::Graph(e.to_string()))?
         {
+            let artifact_id = require_admitted_artifact_id(graph, &file.file_id)?;
             entries.push(ArtifactContextEntry {
-                retrieval_key: RetrievalKey::Artifact(
-                    graph
-                        .artifact_id_for_path(&file.file_id)
-                        .unwrap_or_else(|| {
-                            // Fallback only for stores without an artifact index
-                            // (e.g. mocks) or untracked paths; production graph
-                            // returns the graph-assigned id above.
-                            ArtifactId::seed_from_path(file.file_id.0.as_str())
-                        }),
-                ),
+                retrieval_key: RetrievalKey::Artifact(artifact_id),
                 file_path: file.file_id.clone(),
                 kind: ArtifactContextKind::ShallowFile,
                 content: kin_db::embed::format_shallow_text(&file),
@@ -865,12 +857,9 @@ where
             .get_structured_artifact(file_id)
             .map_err(|e| ContextError::Graph(e.to_string()))?
         {
+            let artifact_id = require_admitted_artifact_id(graph, &artifact.file_id)?;
             entries.push(ArtifactContextEntry {
-                retrieval_key: RetrievalKey::Artifact(
-                    graph
-                        .artifact_id_for_path(&artifact.file_id)
-                        .unwrap_or_else(|| ArtifactId::seed_from_path(artifact.file_id.0.as_str())),
-                ),
+                retrieval_key: RetrievalKey::Artifact(artifact_id),
                 file_path: artifact.file_id.clone(),
                 kind: ArtifactContextKind::StructuredArtifact(artifact.kind),
                 content: kin_db::embed::format_artifact_text(&artifact),
@@ -881,12 +870,9 @@ where
             .get_opaque_artifact(file_id)
             .map_err(|e| ContextError::Graph(e.to_string()))?
         {
+            let artifact_id = require_admitted_artifact_id(graph, &artifact.file_id)?;
             entries.push(ArtifactContextEntry {
-                retrieval_key: RetrievalKey::Artifact(
-                    graph
-                        .artifact_id_for_path(&artifact.file_id)
-                        .unwrap_or_else(|| ArtifactId::seed_from_path(artifact.file_id.0.as_str())),
-                ),
+                retrieval_key: RetrievalKey::Artifact(artifact_id),
                 file_path: artifact.file_id.clone(),
                 kind: ArtifactContextKind::OpaqueArtifact,
                 content: kin_db::embed::format_opaque_text(&artifact),
@@ -911,6 +897,24 @@ where
     }
 
     Ok(())
+}
+
+fn require_admitted_artifact_id<G>(graph: &G, file_id: &FilePathId) -> Result<ArtifactId>
+where
+    G: GraphStore,
+{
+    let path = RepoPath::from_utf8(file_id.0.clone()).map_err(|error| {
+        ContextError::Other(format!(
+            "graph gap: artifact path {} is not a valid repository path: {error}",
+            file_id.0
+        ))
+    })?;
+    graph.artifact_id_at_path(&path).ok_or_else(|| {
+        ContextError::Other(format!(
+            "graph gap: no admitted artifact identity for {}",
+            file_id.0
+        ))
+    })
 }
 
 fn artifact_kind_rank(kind: ArtifactContextKind) -> u8 {
@@ -1091,11 +1095,32 @@ fn normalize_entity_name(name: &str) -> String {
 }
 
 #[cfg(test)]
-// Test fixtures build artifact RetrievalKeys by path; in-test graph-assigned ids
-// are path-derived, so the deprecated path constructor is the correct fixture tool.
 mod tests {
     use super::*;
     use kin_model::*;
+
+    fn admit_test_artifact(
+        store: &kin_db::InMemoryGraph,
+        file_id: &FilePathId,
+        hash: Hash256,
+    ) -> ArtifactId {
+        let path = RepoPath::from_utf8(file_id.0.clone()).expect("valid test repository path");
+        if let Some(artifact_id) = store.artifact_id_at_path(&path) {
+            return artifact_id;
+        }
+        let artifact_id = ArtifactId::new();
+        store
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: Vec::new(),
+                relation_deltas: Vec::new(),
+                tree_deltas: vec![TreeDelta::Added {
+                    artifact_id,
+                    new: LocatedEntry::new(path, TreeEntry::blob(hash, false)),
+                }],
+            })
+            .expect("test fixture admission must use the repository tree transaction");
+        artifact_id
+    }
 
     fn make_entity(name: &str, kind: EntityKind) -> Entity {
         Entity {
@@ -1445,6 +1470,9 @@ mod tests {
 
         let makefile = FilePathId::new("Makefile");
         let package_manifest = FilePathId::new("package.json");
+        let makefile_artifact_id =
+            admit_test_artifact(&store, &makefile, Hash256::from_bytes([3; 32]));
+        admit_test_artifact(&store, &package_manifest, Hash256::from_bytes([4; 32]));
 
         store
             .upsert_shallow_file(&ShallowTrackedFile {
@@ -1485,7 +1513,7 @@ mod tests {
 
         let plan = ContextPlan {
             seeds: vec![ContextPlanSeed {
-                retrieval_key: RetrievalKey::Artifact(ArtifactId::seed_from_file_id(&makefile)),
+                retrieval_key: RetrievalKey::Artifact(makefile_artifact_id),
                 file_path: Some(makefile.clone()),
                 score: 3.0,
                 lexical: true,
@@ -1544,6 +1572,11 @@ mod tests {
         let store = kin_db::InMemoryGraph::new();
         let focal = make_file_entity("handler", EntityKind::Function, "src/main.rs");
         store.upsert_entity(&focal).unwrap();
+        admit_test_artifact(
+            &store,
+            &FilePathId::new("src/main.rs"),
+            Hash256::from_bytes([5; 32]),
+        );
         store
             .upsert_shallow_file(&ShallowTrackedFile {
                 file_id: FilePathId::new("src/main.rs"),
@@ -1594,7 +1627,7 @@ mod tests {
             &ContextOptions::default(),
             &ContextPlan {
                 seeds: vec![ContextPlanSeed {
-                    retrieval_key: RetrievalKey::Artifact(ArtifactId::seed_from_path("Makefile")),
+                    retrieval_key: RetrievalKey::Artifact(ArtifactId::new()),
                     file_path: None,
                     score: 1.0,
                     lexical: true,
@@ -1615,6 +1648,8 @@ mod tests {
         store.upsert_entity(&focal).unwrap();
 
         let makefile = FilePathId::new("Makefile");
+        let makefile_artifact_id =
+            admit_test_artifact(&store, &makefile, Hash256::from_bytes([6; 32]));
         store
             .upsert_shallow_file(&ShallowTrackedFile {
                 file_id: makefile.clone(),
@@ -1639,7 +1674,7 @@ mod tests {
 
         let plan = ContextPlan {
             seeds: vec![ContextPlanSeed {
-                retrieval_key: RetrievalKey::Artifact(ArtifactId::seed_from_file_id(&makefile)),
+                retrieval_key: RetrievalKey::Artifact(makefile_artifact_id),
                 file_path: Some(makefile),
                 score: 1.0,
                 lexical: true,
@@ -1668,6 +1703,62 @@ mod tests {
             .annotations
             .iter()
             .all(|entry| !entry.content.contains("Keep this target cached")));
+    }
+
+    #[test]
+    fn supporting_artifact_without_tree_identity_is_an_explicit_graph_gap() {
+        let store = kin_db::InMemoryGraph::new();
+        let focal = make_file_entity("handler", EntityKind::Function, "src/main.rs");
+        store.upsert_entity(&focal).unwrap();
+
+        let makefile = FilePathId::new("Makefile");
+        let hash = Hash256::from_bytes([0x6a; 32]);
+        let artifact_id = admit_test_artifact(&store, &makefile, hash);
+        store
+            .upsert_shallow_file(&ShallowTrackedFile {
+                file_id: makefile.clone(),
+                language_hint: "make".to_string(),
+                declaration_count: 1,
+                import_count: 0,
+                syntax_hash: hash,
+                signature_hash: None,
+                declaration_names: vec!["build".to_string()],
+                import_paths: vec![],
+            })
+            .unwrap();
+        store
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: Vec::new(),
+                relation_deltas: Vec::new(),
+                tree_deltas: vec![TreeDelta::Removed {
+                    artifact_id,
+                    old: LocatedEntry::new(
+                        RepoPath::from_utf8("Makefile").unwrap(),
+                        TreeEntry::blob(hash, false),
+                    ),
+                }],
+            })
+            .unwrap();
+
+        let error = build_context_pack_from_plan(
+            &store,
+            &focal.id,
+            &ContextOptions::default(),
+            &ContextPlan {
+                seeds: vec![ContextPlanSeed {
+                    retrieval_key: RetrievalKey::Artifact(artifact_id),
+                    file_path: Some(makefile),
+                    score: 1.0,
+                    lexical: true,
+                    semantic: false,
+                }],
+            },
+        )
+        .expect_err("missing tree identity must not be fabricated from the path");
+
+        assert!(
+            matches!(error, ContextError::Other(message) if message.contains("graph gap: no admitted artifact identity for Makefile"))
+        );
     }
 
     // ── Token budget enforcement tests ──────────────────────────────────

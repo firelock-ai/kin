@@ -193,7 +193,7 @@ impl KinRegistry {
     pub fn load_from(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
         #[cfg(unix)]
         {
-            return load_from_unix(path);
+            load_from_unix(path)
         }
         #[cfg(not(unix))]
         {
@@ -222,7 +222,7 @@ impl KinRegistry {
     pub fn save_to(&self, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(unix)]
         {
-            return save_to_unix(self, path);
+            save_to_unix(self, path)
         }
         #[cfg(not(unix))]
         {
@@ -257,7 +257,7 @@ impl KinRegistry {
     ) -> Result<T, Box<dyn std::error::Error>> {
         #[cfg(unix)]
         {
-            return update_at_unix(path, mutate);
+            update_at_unix(path, mutate)
         }
         #[cfg(not(unix))]
         {
@@ -401,7 +401,7 @@ pub fn inspect_registry_authority() -> RegistryAuthorityReport {
 pub fn inspect_registry_authority_at(path: &Path) -> RegistryAuthorityReport {
     #[cfg(unix)]
     {
-        return inspect_registry_authority_at_unix(path);
+        inspect_registry_authority_at_unix(path)
     }
     #[cfg(not(unix))]
     {
@@ -512,7 +512,7 @@ pub fn repair_registry_authority_permissions_at(
 ) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
     #[cfg(unix)]
     {
-        return repair_registry_authority_permissions_at_unix(path);
+        repair_registry_authority_permissions_at_unix(path)
     }
     #[cfg(not(unix))]
     {
@@ -538,7 +538,7 @@ pub fn initialize_registry_authority_at(
 ) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
     #[cfg(unix)]
     {
-        return initialize_registry_authority_at_unix(path);
+        initialize_registry_authority_at_unix(path)
     }
     #[cfg(not(unix))]
     {

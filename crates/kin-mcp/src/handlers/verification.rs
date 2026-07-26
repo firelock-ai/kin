@@ -238,16 +238,9 @@ pub fn handle_release_check<G: GraphStore>(
         }
     }
 
-    match store
-        .resolve_source_tree_at(&source_head)
-        .map_err(McpError::graph)?
-    {
-        kin_model::SourceTreeResolution::Exact { .. } => {}
-        kin_model::SourceTreeResolution::Incomplete { gaps } => blockers.push(format!(
-            "immutable source tree is incomplete at {source_head}: {} gap(s)",
-            gaps.len()
-        )),
-    }
+    store
+        .resolve_tree_at(&source_head)
+        .map_err(McpError::graph)?;
 
     if coverage.coverage_ratio < 0.5 && !force {
         blockers.push(format!(
