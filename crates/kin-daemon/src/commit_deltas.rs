@@ -10,11 +10,8 @@
 //!
 //! ## Algorithm
 //!
-//! 1. Walk the change DAG from genesis to `branch_head` via
-//!    `get_changes_since`, reconstructing the committed entity map,
-//!    relation set, and file tree.
-//! 2. Read current state from the live graph (`list_all_entities`,
-//!    `get_all_relations_for_entity`, `resolved_tree`).
+//! 1. Resolve the exact repository-authority parent state.
+//! 2. Take one coherent snapshot of the live admitted graph workspace.
 //! 3. Diff current vs committed to produce typed `EntityDelta`,
 //!    `RelationDelta`, and `TreeDelta` slices.
 //!
@@ -23,13 +20,13 @@
 //! already reflects the current working state — diffing against the DAG
 //! baseline captures exactly what changed since the last commit.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::BTreeMap;
 
-use kin_db::InMemoryGraph;
+use kin_db::{GraphSnapshot, InMemoryGraph};
 use kin_model::{
-    relation::GraphNodeId, ArtifactId, ChangeStore, Entity, EntityDelta, EntityId, EntityStore,
-    FilePathId, Hash256, LocatedEntry, RelationDelta, RelationId, RepoPath, ResolvedTree,
-    SemanticChangeId, TreeDelta, TreeEntry,
+    graph::ResolvedGraphState, ArtifactId, ChangeStore, EntityDelta, EntityStore, FilePathId,
+    Hash256, LocatedEntry, RelationDelta, RepoPath, ResolvedTree, SemanticChangeId, TreeDelta,
+    TreeEntry,
 };
 
 use crate::error::{DaemonError, Result};
@@ -53,111 +50,104 @@ pub fn compute_deltas_vs_last_commit(
     graph: &InMemoryGraph,
     branch_head: &SemanticChangeId,
 ) -> Result<CommitDeltas> {
-    // ── Reconstruct the committed baseline from the change DAG ───────────
-    let genesis = kin_core::build_genesis_change();
-    let committed_changes = graph
-        .get_changes_since(&genesis.id, branch_head)
+    let committed = graph
+        .resolve_graph_at(branch_head)
         .map_err(DaemonError::Graph)?;
+    compute_deltas_from_resolved_state(graph, committed)
+}
 
-    // entity_id → Entity (state at last commit)
-    let mut committed_entities: HashMap<EntityId, Entity> = HashMap::new();
-    let committed_tree = graph
-        .resolve_tree_at(branch_head)
-        .map_err(DaemonError::Graph)?;
-    // relation IDs present at last commit
-    let mut committed_relation_ids: HashSet<RelationId> = HashSet::new();
-
-    for change in &committed_changes {
-        for delta in &change.entity_deltas {
-            match delta {
-                EntityDelta::Added(entity) => {
-                    committed_entities.insert(entity.id, entity.clone());
-                }
-                EntityDelta::Modified { new, .. } => {
-                    committed_entities.insert(new.id, new.clone());
-                }
-                EntityDelta::Removed(id) => {
-                    committed_entities.remove(id);
-                }
-            }
+/// Diff the live admitted graph against one repository-v6 authority lease.
+///
+/// The baseline comes exclusively from the persisted semantic history. The
+/// live side is the already-admitted graph workspace; no checkout is read and
+/// no artifact identity is inferred here. `None` is an unborn repository and
+/// therefore has an exact empty baseline.
+pub fn compute_deltas_vs_repository_authority(
+    graph: &InMemoryGraph,
+    authority_snapshot: &GraphSnapshot,
+    parent: Option<&SemanticChangeId>,
+) -> Result<CommitDeltas> {
+    let committed = match parent {
+        Some(parent) => {
+            let mut snapshot = authority_snapshot.clone();
+            snapshot.repository_authority = None;
+            InMemoryGraph::from_snapshot(snapshot)
+                .map_err(DaemonError::Graph)?
+                .resolve_graph_at(parent)
+                .map_err(DaemonError::Graph)?
         }
-        for delta in &change.relation_deltas {
-            match delta {
-                RelationDelta::Added(rel) => {
-                    committed_relation_ids.insert(rel.id);
-                }
-                RelationDelta::Removed(id) => {
-                    committed_relation_ids.remove(id);
-                }
-            }
-        }
-    }
+        None => ResolvedGraphState {
+            entities: Default::default(),
+            relations: Default::default(),
+            entity_revisions: Default::default(),
+            tree: ResolvedTree::default(),
+            entity_tombstones: Default::default(),
+            relation_tombstones: Default::default(),
+        },
+    };
+    compute_deltas_from_resolved_state(graph, committed)
+}
 
-    // ── Current entity state from live graph ─────────────────────────────
-    let current_entities = graph.list_all_entities().map_err(DaemonError::Graph)?;
+fn compute_deltas_from_resolved_state(
+    graph: &InMemoryGraph,
+    committed: ResolvedGraphState,
+) -> Result<CommitDeltas> {
+    // One coherent live snapshot keeps entity, relation, and exact-tree deltas
+    // on the same graph generation.
+    let current = graph.to_snapshot();
 
-    // ── Entity deltas ─────────────────────────────────────────────────────
     let mut entity_deltas = Vec::new();
-    let mut current_entity_ids: HashSet<EntityId> = HashSet::with_capacity(current_entities.len());
-
-    for entity in &current_entities {
-        current_entity_ids.insert(entity.id);
-        match committed_entities.get(&entity.id) {
+    for entity in current.entities.values() {
+        match committed.entities.get(&entity.id) {
             None => {
-                // Not in last commit → Added
-                entity_deltas.push(EntityDelta::Added(entity.clone()));
+                entity_deltas.push(EntityDelta::Added {
+                    new: entity.clone(),
+                });
             }
             Some(committed) if kin_index::entity_semantics_changed(committed, entity) => {
-                // Fingerprint changed → Modified (old from DAG, new from graph)
                 entity_deltas.push(EntityDelta::Modified {
                     old: committed.clone(),
                     new: entity.clone(),
                 });
             }
-            _ => {} // Unchanged
+            _ => {}
         }
     }
-
-    // Entities in committed baseline but absent from live graph → Removed
-    for id in committed_entities.keys() {
-        if !current_entity_ids.contains(id) {
-            entity_deltas.push(EntityDelta::Removed(*id));
+    for (entity_id, entity) in &committed.entities {
+        if !current.entities.contains_key(entity_id) {
+            entity_deltas.push(EntityDelta::Removed {
+                old: entity.clone(),
+            });
         }
     }
+    entity_deltas.sort_by_key(EntityDelta::target_id);
 
-    // ── Relation deltas ───────────────────────────────────────────────────
     let mut relation_deltas = Vec::new();
-    let mut current_relation_ids: HashSet<RelationId> = HashSet::new();
-
-    for entity in &current_entities {
-        let relations = graph
-            .get_all_relations_for_entity(&entity.id)
-            .map_err(DaemonError::Graph)?;
-        for rel in relations {
-            // Only track outgoing relations to avoid double-counting.
-            if rel.src == GraphNodeId::Entity(entity.id)
-                && current_relation_ids.insert(rel.id)
-                && !committed_relation_ids.contains(&rel.id)
-            {
-                relation_deltas.push(RelationDelta::Added(rel));
+    for relation in current.relations.values() {
+        match committed.relations.get(&relation.id) {
+            None => relation_deltas.push(RelationDelta::Added {
+                new: relation.clone(),
+            }),
+            Some(old) if old != relation => {
+                relation_deltas.push(RelationDelta::Modified {
+                    old: old.clone(),
+                    new: relation.clone(),
+                });
             }
+            _ => {}
         }
     }
-
-    // Relations in committed baseline but absent from live graph → Removed
-    for id in &committed_relation_ids {
-        if !current_relation_ids.contains(id) {
-            relation_deltas.push(RelationDelta::Removed(*id));
+    for (relation_id, relation) in &committed.relations {
+        if !current.relations.contains_key(relation_id) {
+            relation_deltas.push(RelationDelta::Removed {
+                old: relation.clone(),
+            });
         }
     }
+    relation_deltas.sort_by_key(RelationDelta::target_id);
 
-    // ── Exact repository-tree deltas ─────────────────────────────────────
-    // Filesystem observation and identity allocation happen only during
-    // serialized admission. Commit publication never scans or re-infers
-    // identity: it corrects the committed DAG tree to the already-authoritative
-    // live graph tree.
-    let expected_tree = graph.resolved_tree();
-    let tree_deltas = kin_core::exact_tree_correction(&committed_tree, &expected_tree)?;
+    let expected_tree = current.resolved_tree;
+    let tree_deltas = kin_core::exact_tree_correction(&committed.tree, &expected_tree)?;
 
     Ok(CommitDeltas {
         entity_deltas,
@@ -377,6 +367,7 @@ mod tests {
     ) -> SemanticChangeId {
         let mut change = kin_model::SemanticChange {
             id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+            origin: kin_model::ChangeOrigin::Native,
             parents: vec![*parent],
             author: AuthorId::new("test".to_string()),
             message: "test commit".to_string(),
@@ -384,11 +375,11 @@ mod tests {
             entity_deltas,
             relation_deltas,
             tree_deltas,
+            admission_policy_delta: None,
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],
             risk_summary: None,
-            authored_on: None,
         };
         change.id = kin_core::compute_semantic_change_id(&change).unwrap();
         let change_id = change.id;
@@ -406,6 +397,7 @@ mod tests {
                 entity_deltas: Vec::new(),
                 relation_deltas: Vec::new(),
                 tree_deltas: correction,
+                admission_policy_delta: None,
             })
             .expect("publish committed tree as live test authority");
         change_id
@@ -444,6 +436,7 @@ mod tests {
             entity_deltas: Vec::new(),
             relation_deltas: Vec::new(),
             tree_deltas,
+            admission_policy_delta: None,
         })?;
         Ok(())
     }
@@ -480,7 +473,10 @@ mod tests {
             "expected one entity Added delta"
         );
         assert!(
-            matches!(&deltas.entity_deltas[0], EntityDelta::Added(e) if e.id == entity.id),
+            matches!(
+                &deltas.entity_deltas[0],
+                EntityDelta::Added { new } if new.id == entity.id
+            ),
             "delta must be Added for the new entity"
         );
         assert!(deltas.relation_deltas.is_empty());
@@ -507,7 +503,9 @@ mod tests {
         // Record a commit that contains this entity.
         let head = record_commit(
             &graph,
-            vec![EntityDelta::Added(entity.clone())],
+            vec![EntityDelta::Added {
+                new: entity.clone(),
+            }],
             vec![],
             vec![],
             &genesis.id,
@@ -544,7 +542,9 @@ mod tests {
         graph.upsert_entity(&old_entity).unwrap();
         let head = record_commit(
             &graph,
-            vec![EntityDelta::Added(old_entity.clone())],
+            vec![EntityDelta::Added {
+                new: old_entity.clone(),
+            }],
             vec![],
             vec![],
             &genesis.id,
@@ -586,7 +586,9 @@ mod tests {
         graph.upsert_entity(&entity).unwrap();
         let head = record_commit(
             &graph,
-            vec![EntityDelta::Added(entity.clone())],
+            vec![EntityDelta::Added {
+                new: entity.clone(),
+            }],
             vec![],
             vec![],
             &genesis.id,
@@ -600,7 +602,10 @@ mod tests {
 
         assert_eq!(deltas.entity_deltas.len(), 1);
         assert!(
-            matches!(&deltas.entity_deltas[0], EntityDelta::Removed(id) if *id == entity.id),
+            matches!(
+                &deltas.entity_deltas[0],
+                EntityDelta::Removed { old } if old.id == entity.id
+            ),
             "expected Removed delta for the deleted entity"
         );
     }
@@ -1234,7 +1239,9 @@ mod tests {
         // First commit: record the current state.
         let head1 = record_commit(
             &graph,
-            vec![EntityDelta::Added(entity.clone())],
+            vec![EntityDelta::Added {
+                new: entity.clone(),
+            }],
             vec![],
             vec![TreeDelta::Added {
                 artifact_id: ArtifactId::new(),
