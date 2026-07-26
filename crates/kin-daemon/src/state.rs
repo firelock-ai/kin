@@ -798,8 +798,8 @@ pub struct DaemonState {
     /// Current reconciliation status (RECON_IDLE or RECON_PROCESSING).
     pub reconciliation_status: AtomicU8,
     /// Pluggable storage backend for snapshot persistence.
-    /// `None` = legacy file-based path (via SnapshotManager).
-    /// `Some` = StorageBackend (LocalFile for CLI, GCS for cloud).
+    /// `None` = local repository-v6 authority.
+    /// `Some` = hosted StorageBackend (GCS or an isolated backend fixture).
     pub storage_backend: Option<Box<dyn StorageBackend>>,
     /// Frozen startup policy for deployments whose graph backend is the only
     /// write authority. When true, no filesystem/session/VFS compatibility
@@ -870,12 +870,11 @@ pub struct DaemonState {
     /// worker so they cannot drain queues and mutate the vector index
     /// concurrently.
     pub embedding_work: Mutex<()>,
-    /// Serializes the entire snapshot/index/vector save sequence so the
+    /// Serializes derived-index and hosted snapshot persistence so the
     /// persistence loop, idle-shutdown flush, and embedding worker can never
-    /// interleave saves. Holding this across the kndb + kidx writes (and the
-    /// embed worker's kvec write) keeps the on-disk trio from tearing when two
-    /// writers fire at once. Held only for the synchronous save critical
-    /// section — never across an `.await` or another lock.
+    /// interleave writes. Local repository-v6 authority is committed before
+    /// entering this derived finalization path. Held only for the synchronous
+    /// critical section — never across an `.await` or another lock.
     pub persist_lock: Mutex<()>,
     /// When the last successful background save completed.
     pub last_save: std::sync::Mutex<Instant>,
@@ -1459,9 +1458,9 @@ impl DaemonState {
 
     /// Open with a pluggable storage backend (GCS, local files, etc.).
     ///
-    /// Loads the graph from `backend.load_snapshot(repo_id)` instead of
-    /// the local `.kin/kindb/graph.kndb` file. Used in cloud deployments
-    /// where graph snapshots live in GCS.
+    /// Loads hosted graph authority from `backend.load_snapshot(repo_id)`.
+    /// Local repositories use repository-v6 through [`Self::open`]; this path
+    /// is reserved for cloud deployments whose snapshots live in GCS.
     pub fn open_with_backend(
         layout: KinLayout,
         backend: Box<dyn StorageBackend>,
@@ -2811,10 +2810,10 @@ impl DaemonState {
         self.save_snapshot_impl(SnapshotSaveMode::Incremental, None)
     }
 
-    /// Save graph authority and publish `event` only after the generation that
-    /// contains the caller's mutation has finalized. Queueing happens while
-    /// holding `persist_lock`, so an older in-flight generation cannot consume
-    /// this event before the caller's batch is detached and committed.
+    /// Finalize durable authority and publish `event` only after the generation
+    /// containing the caller's mutation has finalized. Local repository-v6
+    /// mutations are already committed; hosted backends commit here. Queueing
+    /// under `persist_lock` keeps older finalization from consuming the event.
     pub(crate) fn save_snapshot_with_event(&self, event: DaemonEvent) -> Result<()> {
         self.save_snapshot_impl(SnapshotSaveMode::Incremental, Some(event))
     }
@@ -2836,13 +2835,13 @@ impl DaemonState {
         self.save_snapshot_impl(SnapshotSaveMode::Retry, Some(event))
     }
 
-    /// Whether derived embedding progress can be committed through the local
-    /// `SnapshotManager` authority path.
+    /// Whether derived embedding progress may be checkpointed in a local
+    /// vector sidecar.
     ///
     /// A configured `StorageBackend` owns a distinct generation cursor (GCS in
     /// hosted deployments). Until that backend has an explicit vector-sidecar
-    /// persistence contract, writing local embed progress with its generation is
-    /// unsafe and must fail loud rather than fabricate a durable checkpoint.
+    /// persistence contract, writing a local sidecar against its remote graph
+    /// generation is unsafe and must fail loud.
     pub(crate) fn can_persist_embed_progress_locally(&self) -> bool {
         self.storage_backend.is_none()
     }
@@ -3065,6 +3064,34 @@ impl DaemonState {
         self.filesystem_reconcile_disabled.load(Ordering::Relaxed)
     }
 
+    /// Advance this process's repository-authority cursor after a successful
+    /// local repository-v6 compare-and-swap.
+    ///
+    /// The repository transaction is already durable at this point. Derived
+    /// query indexes and the cross-process generation marker are finalized by
+    /// the normal serialized persistence pass; a crash before then is healed
+    /// from repository authority during the next open.
+    pub(crate) fn record_repository_authority_commit(&self, generation: u64) -> Result<()> {
+        if self.storage_backend.is_some() {
+            return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
+                "local repository-v6 generation cannot be installed on a storage-backend daemon"
+                    .to_string(),
+            )));
+        }
+        let previous = self.snapshot_generation.load(Ordering::SeqCst);
+        if generation <= previous {
+            return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
+                format!(
+                    "repository authority generation must advance beyond {previous}, got {generation}"
+                ),
+            )));
+        }
+        self.snapshot_generation.store(generation, Ordering::SeqCst);
+        self.post_commit_finalization_pending
+            .store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
     #[cfg(any(feature = "embeddings", feature = "vector"))]
     fn reject_remote_backend_embed_persistence(&self, operation: &str) -> Result<()> {
         if self.can_persist_embed_progress_locally() {
@@ -3073,7 +3100,7 @@ impl DaemonState {
         let generation = self.snapshot_generation.load(Ordering::SeqCst);
         Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
             format!(
-                "{operation} skipped: storage-backend graph authority is at generation {generation}, and no backend vector-sidecar persistence contract exists; refusing to write a local SnapshotManager checkpoint against remote authority"
+                "{operation} skipped: storage-backend graph authority is at generation {generation}, and no backend vector-sidecar persistence contract exists; refusing a local derived checkpoint against remote authority"
             ),
         )))
     }
@@ -3200,27 +3227,42 @@ impl DaemonState {
                 self.graph.flush_text_index().map_err(DaemonError::from)?;
                 expected_gen
             }
-        } else if force_full {
-            let (_, generation) = kin_db::SnapshotManager::save_graph_with_expected_generation(
-                self.layout.kindb_snapshot_path(),
-                self.graph.as_ref(),
-                expected_gen,
-            )
-            .map_err(DaemonError::from)?;
-            committed = true;
-            generation
         } else {
-            let generation = kin_db::SnapshotManager::save_graph_delta(
-                self.layout.kindb_snapshot_path(),
-                self.graph.as_ref(),
-                expected_gen,
-            )
-            .map_err(DaemonError::from)?;
-            committed = generation.is_some();
-            generation.unwrap_or(expected_gen)
+            // Local repository-v6 transactions are the only authority commit.
+            // Exact tree admission and explicit commit publication move that
+            // authority before mutating this derived runtime graph. Detach the
+            // current derived batch, prove its exact tree matches the persisted
+            // workspace at this generation, then acknowledge it after flushing
+            // query text. Never recreate graph.kndb as a second local truth.
+            let persistence_attempt = self
+                .graph
+                .begin_delta_persistence(expected_gen)
+                .map(|(_, epoch)| GraphPersistenceAttempt::new(self.graph.as_ref(), epoch));
+            let authority_graph = self.load_committed_authority_graph(expected_gen)?;
+            let authority_tree = authority_graph.resolved_tree();
+            let live_tree = self.graph.resolved_tree();
+            if live_tree != authority_tree {
+                return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
+                    format!(
+                        "refusing to acknowledge derived graph state at repository generation {expected_gen}: live exact tree does not match workspace authority"
+                    ),
+                )));
+            }
+            self.graph.flush_text_index().map_err(DaemonError::from)?;
+            if let Some(attempt) = persistence_attempt {
+                attempt.complete();
+            }
+            self.graph.clear_full_snapshot_required();
+            expected_gen
         };
 
-        self.snapshot_generation.store(new_gen, Ordering::SeqCst);
+        // Backend saves advance their own authority here. Local authority was
+        // already advanced by the repository-v6 transaction and recorded by
+        // `record_repository_authority_commit`; never overwrite a newer local
+        // receipt that may arrive while derived-index I/O is finishing.
+        if self.storage_backend.is_some() {
+            self.snapshot_generation.store(new_gen, Ordering::SeqCst);
+        }
 
         if committed {
             self.post_commit_finalization_pending
@@ -3249,19 +3291,10 @@ impl DaemonState {
     /// Incremental per-batch embed-progress flush for the background
     /// embed worker.
     ///
-    /// Persists this batch's vectors — plus any concurrent graph delta from LSP
-    /// enrichment that kept the graph dirty during embed — via
-    /// `SnapshotManager::flush_embed_progress`, which appends only the delta and
-    /// the vector sidecar and NEVER re-serializes the whole (~1 GB) graph. The
-    /// old worker leaned on the periodic full `save_snapshot` to land the graph
-    /// side, which is O(graph) per tick and is what wedged the daemon at scale.
-    ///
-    /// Mirrors `save_snapshot_impl`'s persist-lock + generation-cursor + marker
-    /// discipline so the two persistence paths compose safely (the shared
-    /// `persist_lock` serializes them and keeps `snapshot_generation` consistent).
-    /// Returns the persisted resume `pending` count — derived from graph-vs-index
-    /// truth, so it survives a crash/reopen and reaches zero only at full
-    /// coverage.
+    /// Persists only the derived vector sidecar. Repository-v6 remains the sole
+    /// graph/workspace authority; concurrent semantic or tree changes stay
+    /// pending for the normal authority-aware persistence path rather than
+    /// recreating a local graph.kndb checkpoint.
     #[cfg(feature = "embeddings")]
     pub fn flush_embed_progress(&self) -> Result<usize> {
         self.reject_remote_backend_embed_persistence("embed progress persistence")?;
@@ -3269,29 +3302,26 @@ impl DaemonState {
             .persist_lock
             .lock()
             .map_err(|_| DaemonError::Io(std::io::Error::other("persist lock poisoned")))?;
-        let base_gen = self.snapshot_generation.load(Ordering::SeqCst);
+        let generation = self.snapshot_generation.load(Ordering::SeqCst);
+        let authority_graph = self.load_committed_authority_graph(generation)?;
+        if self.graph.resolved_tree() != authority_graph.resolved_tree() {
+            return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
+                format!(
+                    "refusing vector checkpoint at repository generation {generation}: live exact tree does not match workspace authority"
+                ),
+            )));
+        }
         let embedder_identity = kin_buildinfo::sha_with_dirty(kin_buildinfo::get());
-        let outcome = kin_db::SnapshotManager::flush_embed_progress(
+        kin_db::SnapshotManager::save_vector_index_for_graph(
             self.layout.kindb_snapshot_path(),
             self.graph.as_ref(),
-            base_gen,
             Some(embedder_identity.as_str()),
         )
         .map_err(DaemonError::from)?;
-        // The graph moved (a delta was appended) only when `generation` is Some;
-        // advance the cursor + publish the marker so CLI/MCP reload, exactly as
-        // save_snapshot_impl does. A vectors-only batch leaves the graph at
-        // `base_gen`, so the cursor stays put.
-        if let Some(generation) = outcome.generation {
-            self.snapshot_generation.store(generation, Ordering::SeqCst);
-            self.post_commit_finalization_pending
-                .store(true, Ordering::SeqCst);
-        }
         if self.post_commit_finalization_pending.load(Ordering::SeqCst) {
-            let generation = self.snapshot_generation.load(Ordering::SeqCst);
             self.finalize_committed_generation(generation)?;
         }
-        Ok(outcome.status.pending)
+        Ok(self.graph.embedding_status().pending)
     }
 
     #[cfg(not(feature = "embeddings"))]
@@ -3445,10 +3475,36 @@ impl DaemonState {
                 }
             }
         } else {
-            let snapshot =
-                kin_db::SnapshotManager::open_read_only(self.layout.kindb_snapshot_path())
-                    .map_err(DaemonError::from)?;
-            let observed_generation = snapshot.generation();
+            let manifest = kin_core::manifest::KinManifest::load(&self.layout.manifest_path())
+                .map_err(DaemonError::from)?;
+            if manifest.repo_id != self.cached_repo_id {
+                return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
+                    format!(
+                        "manifest repository {} does not match daemon authority {}",
+                        manifest.repo_id, self.cached_repo_id
+                    ),
+                )));
+            }
+            let repository_id =
+                RepositoryId::new(self.cached_repo_id.clone()).map_err(|error| {
+                    DaemonError::Graph(kin_db::KinDbError::StorageError(format!(
+                        "invalid daemon repository identity: {error}"
+                    )))
+                })?;
+            let workspace_uuid =
+                uuid::Uuid::parse_str(&manifest.workspace_id).map_err(|error| {
+                    DaemonError::Graph(kin_db::KinDbError::StorageError(format!(
+                        "invalid manifest workspace identity: {error}"
+                    )))
+                })?;
+            let workspace_id = WorkspaceId::from_uuid(workspace_uuid);
+            let authority = RepositoryAuthorityManager::open(
+                repository_id,
+                Arc::new(LocalFileBackend::new(self.layout.kindb_dir())),
+            )
+            .map_err(DaemonError::from)?;
+            let lease = authority.read_authority();
+            let observed_generation = lease.roots().generation;
             if observed_generation != generation {
                 return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
                     format!(
@@ -3457,7 +3513,16 @@ impl DaemonState {
                     ),
                 )));
             }
-            snapshot.graph()
+            let snapshot = lease
+                .workspace_graph_snapshot(&workspace_id)
+                .map_err(DaemonError::from)?
+                .ok_or_else(|| {
+                    DaemonError::Graph(kin_db::KinDbError::StorageError(format!(
+                        "repository {} authority has no manifest workspace {} during read-index finalization",
+                        self.cached_repo_id, workspace_id
+                    )))
+                })?;
+            Arc::new(kin_db::InMemoryGraph::from_snapshot(snapshot).map_err(DaemonError::from)?)
         };
         Ok(authority_graph)
     }
@@ -3481,15 +3546,9 @@ impl DaemonState {
 
     /// Write the durable authority head to `.kin/kindb/head-generation`.
     ///
-    /// KinDB owns `.kin/kindb/generation` as the generation of its legacy
-    /// `graph.kndb` compatibility projection. A delta commit advances graph
-    /// authority without advancing that projection, so using the legacy path
-    /// as the daemon freshness marker makes the next authority read look like
-    /// a mixed-version legacy writer and correctly fail closed.
-    ///
-    /// CLI and MCP processes read this file before queries and compare it
-    /// to their loaded generation. If different, they know the daemon has
-    /// committed a newer snapshot and should reload.
+    /// CLI and MCP processes compare this derived notification marker to their
+    /// loaded repository-v6 generation. A mismatch means repository authority
+    /// moved and the reader must acquire a new exact lease before answering.
     fn write_generation_marker(&self, generation: u64) -> Result<()> {
         use std::io::Write;
 
@@ -3851,7 +3910,7 @@ mod tests {
     use kin_model::{
         ArtifactId, ChangeOrigin, Entity, EntityKind, EntityMetadata, FileLayout, FilePathId,
         FingerprintAlgorithm, Hash256, ImportSection, LanguageId, LocatedEntry, ParseCompleteness,
-        RepoPath, SemanticFingerprint, TreeDelta, Visibility,
+        RepoPath, ResolvedArtifact, ResolvedTree, SemanticFingerprint, TreeDelta, Visibility,
     };
     use kin_reconcile::ReconcileOutcome;
     use serde_json::json;
@@ -5488,223 +5547,126 @@ mod tests {
     }
 
     #[test]
-    fn default_local_save_restart_save_recovers_authority_generation() {
+    fn local_derived_save_never_creates_a_second_graph_authority() {
         let repo_dir = tempfile::tempdir().unwrap();
         let init = kin_core::init(repo_dir.path()).unwrap();
         let layout = init.layout;
+        let state = DaemonState::open(layout.clone()).unwrap();
+        let repository_generation = state.snapshot_generation.load(Ordering::SeqCst);
 
-        let first = DaemonState::open(layout.clone()).unwrap();
-        let initial_generation = first.snapshot_generation.load(Ordering::SeqCst);
-        first
+        state
             .graph
-            .upsert_entity(&test_entity("first_local", "src/first.rs"))
+            .upsert_entity(&test_entity("derived_only", "src/derived.rs"))
             .unwrap();
-        first.save_snapshot().unwrap();
-        assert_eq!(
-            first.snapshot_generation.load(Ordering::SeqCst),
-            initial_generation + 1
-        );
-        drop(first);
+        state.save_snapshot().unwrap();
 
-        let second = DaemonState::open(layout.clone()).unwrap();
         assert_eq!(
-            second.snapshot_generation.load(Ordering::SeqCst),
-            initial_generation + 1
+            state.snapshot_generation.load(Ordering::SeqCst),
+            repository_generation
         );
-        second
-            .graph
-            .upsert_entity(&test_entity("second_local", "src/second.rs"))
-            .unwrap();
-        second.save_snapshot().unwrap();
-        assert_eq!(
-            second.snapshot_generation.load(Ordering::SeqCst),
-            initial_generation + 2
-        );
-        drop(second);
-
-        let reopened = DaemonState::open(layout.clone()).unwrap();
-        assert_eq!(
-            reopened.snapshot_generation.load(Ordering::SeqCst),
-            initial_generation + 2
+        assert!(!state.graph.has_unpersisted_changes());
+        assert!(
+            !layout.kindb_snapshot_path().exists(),
+            "local derived persistence must never recreate graph.kndb authority"
         );
         assert_eq!(
-            DaemonState::read_generation_marker(&layout),
-            initial_generation + 2
-        );
-        let names: HashSet<_> = reopened
-            .graph
-            .list_all_entities()
+            RepositoryAuthorityManager::open(
+                init.repository_id,
+                Arc::new(LocalFileBackend::new(layout.kindb_dir())),
+            )
             .unwrap()
-            .into_iter()
-            .map(|entity| entity.name)
-            .collect();
-        assert_eq!(names.len(), 2);
-        assert!(names.contains("first_local"));
-        assert!(names.contains("second_local"));
+            .read_authority()
+            .roots()
+            .generation,
+            repository_generation
+        );
     }
 
     #[test]
-    fn default_local_force_full_rejects_stale_daemon_generation() {
+    fn local_derived_save_rejects_an_unadmitted_exact_tree() {
         let repo_dir = tempfile::tempdir().unwrap();
         let init = kin_core::init(repo_dir.path()).unwrap();
         let layout = init.layout;
-        let snapshot_path = layout.kindb_snapshot_path();
         let state = DaemonState::open(layout.clone()).unwrap();
-        let stale_generation = state.snapshot_generation.load(Ordering::SeqCst);
-
-        let external = kin_db::InMemoryGraph::new();
-        let external_entity = test_entity("external_writer", "src/external.rs");
-        external.upsert_entity(&external_entity).unwrap();
-        let (_, external_generation) =
-            kin_db::SnapshotManager::save_graph_with_expected_generation(
-                &snapshot_path,
-                &external,
-                stale_generation,
-            )
+        let body_hash = Hash256::from_bytes(state.blobs.write(b"services: {}\n").unwrap().0);
+        state
+            .graph
+            .apply_transaction_delta(&kin_model::TransactionDelta {
+                tree_deltas: vec![TreeDelta::Added {
+                    artifact_id: ArtifactId::new(),
+                    new: LocatedEntry::new(
+                        RepoPath::from_utf8("compose.yaml").unwrap(),
+                        TreeEntry::blob(body_hash, false),
+                    ),
+                }],
+                ..kin_model::TransactionDelta::default()
+            })
             .unwrap();
-        assert_eq!(external_generation, stale_generation + 1);
 
-        let stale_entity = test_entity("stale_daemon", "src/stale.rs");
-        state.graph.upsert_entity(&stale_entity).unwrap();
         let error = state
-            .save_snapshot_full()
-            .expect_err("stale full daemon writer must lose the generation CAS");
-        assert!(error.to_string().contains(&format!(
-            "expected {stale_generation}, found {external_generation}"
-        )));
+            .save_snapshot()
+            .expect_err("derived persistence cannot admit file truth implicitly");
+        assert!(error
+            .to_string()
+            .contains("live exact tree does not match workspace authority"));
+        assert!(state.graph.has_unpersisted_changes());
+        assert!(!layout.kindb_snapshot_path().exists());
+    }
+
+    #[test]
+    fn local_repository_receipt_finalizes_without_graph_kndb() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let layout = init.layout;
+        let state = DaemonState::open(layout.clone()).unwrap();
+        let body_hash = Hash256::from_bytes(state.blobs.write(b"services: {}\n").unwrap().0);
+        let artifact = ResolvedArtifact::new(
+            ArtifactId::new(),
+            RepoPath::from_utf8("compose.yaml").unwrap(),
+            TreeEntry::blob(body_hash, false),
+        );
+        let desired = ResolvedTree::from_artifacts([artifact.clone()]).unwrap();
+        let admission = crate::repository_commit::publish_workspace_tree(
+            &layout,
+            state.blobs.as_ref(),
+            &desired,
+            kin_model::OperationId::new(),
+            kin_model::AuthorId::new("dogfood"),
+        )
+        .unwrap()
+        .unwrap();
+        state
+            .record_repository_authority_commit(admission.receipt.generation)
+            .unwrap();
+        state
+            .graph
+            .apply_transaction_delta(&kin_model::TransactionDelta {
+                tree_deltas: vec![TreeDelta::Added {
+                    artifact_id: artifact.artifact_id,
+                    new: artifact.located_entry(),
+                }],
+                ..kin_model::TransactionDelta::default()
+            })
+            .unwrap();
+        state.save_snapshot().unwrap();
+
         assert_eq!(
             state.snapshot_generation.load(Ordering::SeqCst),
-            stale_generation,
-            "failed stale save must not advance its in-memory cursor"
+            admission.receipt.generation
         );
+        assert_eq!(
+            DaemonState::read_generation_marker(&layout),
+            admission.receipt.generation
+        );
+        assert!(!layout.kindb_snapshot_path().exists());
         drop(state);
 
         let reopened = DaemonState::open(layout).unwrap();
+        assert_eq!(reopened.graph.resolved_tree(), desired);
         assert_eq!(
             reopened.snapshot_generation.load(Ordering::SeqCst),
-            external_generation
+            admission.receipt.generation
         );
-        assert!(reopened
-            .graph
-            .get_entity(&external_entity.id)
-            .unwrap()
-            .is_some());
-        assert!(reopened
-            .graph
-            .get_entity(&stale_entity.id)
-            .unwrap()
-            .is_none());
-    }
-
-    #[test]
-    fn default_local_reopen_heals_crash_between_authority_commit_and_finalization() {
-        let repo_dir = tempfile::tempdir().unwrap();
-        let init = kin_core::init(repo_dir.path()).unwrap();
-        let layout = init.layout;
-        let snapshot_path = layout.kindb_snapshot_path();
-        let index_path = snapshot_path.with_extension("kidx");
-
-        let state = DaemonState::open(layout.clone()).unwrap();
-        let base_generation = state.snapshot_generation.load(Ordering::SeqCst);
-        let entity = test_entity("authority_only", "src/authority.rs");
-        state.graph.upsert_entity(&entity).unwrap();
-
-        // Commit graph authority directly, then simulate process death before
-        // DaemonState can publish either its marker or read index. Removing the
-        // canonical compatibility projection additionally proves discovery and
-        // reopen follow the atomic authority sidecar.
-        let (_, generation) = kin_db::SnapshotManager::save_graph_with_generation(
-            &snapshot_path,
-            state.graph.as_ref(),
-        )
-        .unwrap();
-        assert_eq!(generation, base_generation + 1);
-        assert_eq!(
-            DaemonState::read_generation_marker(&layout),
-            base_generation
-        );
-        assert_eq!(
-            kin_db::ReadIndex::load(&index_path).unwrap().entity_count,
-            0
-        );
-        drop(state);
-        std::fs::remove_file(&snapshot_path).unwrap();
-
-        let reopened = DaemonState::open(layout.clone())
-            .expect("validated local authority must heal derived artifacts before serving");
-        assert_eq!(
-            reopened.snapshot_generation.load(Ordering::SeqCst),
-            base_generation + 1
-        );
-        assert_eq!(
-            DaemonState::read_generation_marker(&layout),
-            base_generation + 1
-        );
-        assert_eq!(
-            kin_db::ReadIndex::load(&index_path).unwrap().entity_count,
-            1
-        );
-        assert_eq!(
-            reopened.graph.get_entity(&entity.id).unwrap().unwrap().name,
-            "authority_only"
-        );
-    }
-
-    #[test]
-    fn default_local_finalization_rejects_newer_external_authority() {
-        let repo_dir = tempfile::tempdir().unwrap();
-        let init = kin_core::init(repo_dir.path()).unwrap();
-        let layout = init.layout;
-        let snapshot_path = layout.kindb_snapshot_path();
-        let index_path = snapshot_path.with_extension("kidx");
-
-        let state = DaemonState::open(layout.clone()).unwrap();
-        state
-            .graph
-            .upsert_entity(&test_entity("daemon_generation", "src/daemon.rs"))
-            .unwrap();
-        state.save_snapshot().unwrap();
-        let daemon_generation = state.snapshot_generation.load(Ordering::SeqCst);
-        let daemon_index_count = kin_db::ReadIndex::load(&index_path).unwrap().entity_count;
-
-        let external_graph = {
-            let snapshot = kin_db::SnapshotManager::open_read_only(&snapshot_path).unwrap();
-            snapshot.graph()
-        };
-        external_graph
-            .upsert_entity(&test_entity("external_generation", "src/external.rs"))
-            .unwrap();
-        let (_, external_generation) =
-            kin_db::SnapshotManager::save_graph_with_expected_generation(
-                &snapshot_path,
-                external_graph.as_ref(),
-                daemon_generation,
-            )
-            .unwrap();
-        assert_eq!(external_generation, daemon_generation + 1);
-
-        state
-            .post_commit_finalization_pending
-            .store(true, Ordering::SeqCst);
-        let error = state
-            .finalize_committed_generation(daemon_generation)
-            .expect_err("derived artifacts must not mix two authority generations");
-        assert!(error.to_string().contains(&format!(
-            "expected generation {daemon_generation}, recovered {external_generation}"
-        )));
-        assert_eq!(
-            DaemonState::read_generation_marker(&layout),
-            daemon_generation,
-            "a failed stale finalization must not publish the newer authority under the old cursor"
-        );
-        assert_eq!(
-            kin_db::ReadIndex::load(&index_path).unwrap().entity_count,
-            daemon_index_count,
-            "a failed stale finalization must preserve the last coherent canonical index"
-        );
-        assert!(state
-            .post_commit_finalization_pending
-            .load(Ordering::SeqCst));
     }
 
     #[test]
@@ -6047,8 +6009,6 @@ mod tests {
         let layout = init.layout;
         let index_path = layout.kindb_snapshot_path().with_extension("kidx");
         std::fs::write(&index_path, b"stale canonical index").unwrap();
-        let legacy_generation = layout.kindb_dir().join("generation");
-        std::fs::write(&legacy_generation, "0").unwrap();
         let state = test_state(layout.clone(), repo_dir.path());
 
         state.finalize_loaded_locate_generation(7).unwrap();
@@ -6058,64 +6018,6 @@ mod tests {
             "a partial locate graph must never replace or retain a canonical full read index"
         );
         assert_eq!(DaemonState::read_generation_marker(&layout), 7);
-        assert_eq!(
-            std::fs::read_to_string(legacy_generation).unwrap(),
-            "0",
-            "locate-only freshness must not mutate KinDB's legacy projection marker"
-        );
-    }
-
-    #[test]
-    fn sequential_saves_leave_consistent_kndb_kidx_pair() {
-        let repo_dir = tempfile::tempdir().unwrap();
-        let init = kin_core::init(repo_dir.path()).unwrap();
-        let layout = init.layout;
-        let kndb_path = layout.kindb_snapshot_path();
-        let kidx_path = kndb_path.with_extension("kidx");
-        let legacy_projection_generation = layout.kindb_dir().join("generation");
-        std::fs::write(&legacy_projection_generation, "0").unwrap();
-        let state = test_state(layout.clone(), repo_dir.path());
-        state
-            .graph
-            .upsert_entity(&test_entity("paired_fn", "src/lib.rs"))
-            .unwrap();
-
-        // Two back-to-back saves (as the persist loop + flush would issue) must
-        // each leave both halves of the on-disk pair present and reloadable —
-        // no torn kndb without its kidx, and no kidx without its kndb.
-        state.save_snapshot().unwrap();
-        assert_eq!(
-            std::fs::read_to_string(&legacy_projection_generation)
-                .unwrap()
-                .trim(),
-            "0"
-        );
-        state.save_snapshot().unwrap();
-
-        assert_eq!(
-            DaemonState::read_generation_marker(&layout),
-            2,
-            "the daemon freshness marker must follow the durable authority head"
-        );
-        assert_eq!(
-            std::fs::read_to_string(&legacy_projection_generation)
-                .unwrap()
-                .trim(),
-            "0",
-            "a delta must not mislabel the legacy full-snapshot projection as current"
-        );
-
-        assert!(kndb_path.exists(), "graph.kndb must exist after save");
-        assert!(kidx_path.exists(), "graph.kidx must exist after save");
-
-        // The kndb must reload as a valid snapshot exposing the saved entity.
-        let mgr = kin_db::SnapshotManager::open(&kndb_path).unwrap();
-        let reloaded = mgr.graph();
-        let entities = reloaded.list_all_entities().unwrap();
-        assert!(
-            entities.iter().any(|e| e.name == "paired_fn"),
-            "reloaded snapshot must contain the saved entity"
-        );
     }
 
     #[test]
@@ -6169,12 +6071,7 @@ mod tests {
 
     #[cfg(feature = "embeddings")]
     #[test]
-    fn flush_embed_progress_persists_snapshot_and_reports_pending() {
-        // The incremental flush persists the snapshot (full bundle on
-        // the first write) and returns the persisted resume count. With no
-        // embedder run the lone entity stays unembedded, so `pending` reflects it
-        // — proving the flush composes the graph-delta + sidecar write and reads
-        // coverage from persisted graph-vs-index truth.
+    fn flush_embed_progress_persists_only_vector_sidecar_and_reports_pending() {
         let repo_dir = tempfile::tempdir().unwrap();
         let init = kin_core::init(repo_dir.path()).unwrap();
         let state = Arc::new(test_state(init.layout, repo_dir.path()));
@@ -6186,8 +6083,16 @@ mod tests {
 
         let pending = state.flush_embed_progress().expect("flush must succeed");
         assert!(
-            state.layout.kindb_snapshot_path().exists(),
-            "flush must persist the snapshot bundle"
+            !state.layout.kindb_snapshot_path().exists(),
+            "vector progress must not recreate graph.kndb authority"
+        );
+        assert!(
+            state
+                .layout
+                .kindb_snapshot_path()
+                .with_extension("kvec")
+                .exists(),
+            "flush must persist the derived vector sidecar"
         );
         assert!(
             pending >= 1,
@@ -6221,16 +6126,9 @@ mod tests {
             .expect("seed remote authority at the local authority generation");
         state.graph.queue_missing_for_embedding();
 
-        let local_before = kin_db::SnapshotManager::open_read_only(snapshot_path.as_path())
-            .expect("kin init creates a local authority fixture");
-        let local_generation_before = local_before.generation();
-        let local_entities_before = local_before.graph().entity_count();
-        drop(local_before);
-        assert_eq!(
-            state.snapshot_generation.load(Ordering::SeqCst),
-            local_generation_before,
-            "the fixture must align generations so an unguarded local flush would mutate"
-        );
+        let vector_path = snapshot_path.with_extension("kvec");
+        let vector_before = std::fs::read(&vector_path).ok();
+        let generation_before = state.snapshot_generation.load(Ordering::SeqCst);
         let error = state
             .flush_embed_progress()
             .expect_err("remote authority must reject local embed checkpoints");
@@ -6240,17 +6138,15 @@ mod tests {
             "{message}"
         );
         assert!(
-            message.contains("refusing to write a local SnapshotManager checkpoint"),
+            message.contains("refusing a local derived checkpoint"),
             "{message}"
         );
         assert_eq!(
             state.snapshot_generation.load(Ordering::SeqCst),
-            local_generation_before
+            generation_before
         );
-        let local_after = kin_db::SnapshotManager::open_read_only(snapshot_path.as_path())
-            .expect("guard must preserve local authority");
-        assert_eq!(local_after.generation(), local_generation_before);
-        assert_eq!(local_after.graph().entity_count(), local_entities_before);
+        assert!(!snapshot_path.exists());
+        assert_eq!(std::fs::read(vector_path).ok(), vector_before);
     }
 
     #[test]
