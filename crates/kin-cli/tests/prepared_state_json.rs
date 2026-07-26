@@ -180,7 +180,7 @@ fn prepared_state_publish_and_materialize_preserve_indexed_state() {
         .output()
         .expect("run kin init");
     let init_payload = parse_json_output(&init, "kin init --json");
-    assert_eq!(init_payload["schema"], "kin.init-result.v2");
+    assert_eq!(init_payload["schema"], "kin.init-result.v3");
 
     seed_local_vectors(&repo1.join(".kin/kindb/graph.kndb"));
 

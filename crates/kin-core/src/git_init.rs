@@ -95,6 +95,7 @@ fn init_from_git_with_hooks(
 
     let workspace_seed = admitted.workspace_seed.clone();
     let workspace_policy = admitted.workspace_policy().clone();
+    let workspace_base_change_id = admitted.workspace_base_change_id();
     let mut transaction = admitted
         .into_generation_zero_repository_transaction(
             &capture_store,
@@ -117,7 +118,7 @@ fn init_from_git_with_hooks(
         .map_err(|error| KinError::Other(format!("invalid Git bootstrap transaction: {error}")))?;
     prepared.commit_repository_bootstrap(&transaction)?;
 
-    let result = publish_repository_layout_linearized(prepared, |publication| {
+    let mut result = publish_repository_layout_linearized(prepared, |publication| {
         before_final_source_proof();
         let final_proof =
             preflight_git_migration(&source, &snapshot, &semantic_plan, &capture_store)
@@ -147,6 +148,12 @@ fn init_from_git_with_hooks(
         }
         Ok(())
     })?;
+    // Exact Git refs intentionally retain external-object targets, so the
+    // generic bootstrap helper cannot infer the semantic identity of a peeled
+    // HEAD from `WorkspaceMutation::new_base_target`. The admitted plan already
+    // proved that alias while validating the complete history; preserve it in
+    // the initialization receipt instead of reporting an absent initial change.
+    result.authority.initial_change_id = workspace_base_change_id;
 
     info!(
         path = %source.display(),
@@ -966,6 +973,7 @@ mod tests {
         let result = init_from_git(&source).unwrap();
 
         assert_eq!(result.authority.receipt.generation, 1);
+        assert!(result.authority.initial_change_id.is_some());
         assert!(!result.authority.workspace.is_dirty());
         assert!(source.join(".kin").is_dir());
         assert_no_staging_directories(root.path());

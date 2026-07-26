@@ -2459,9 +2459,8 @@ async fn graph_mutations(
     Ok(Json(serde_json::json!({"status": "ok"})))
 }
 
-/// POST /commands/status — render CLI status from daemon-owned graph state.
+/// POST /commands/status — render one coherent repository-v6 authority lease.
 async fn command_status(
-    headers: axum::http::HeaderMap,
     State(state): State<Arc<DaemonState>>,
     Json(request): Json<kin_cli::commands::status::CommandStatusRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
@@ -2475,10 +2474,7 @@ async fn command_status(
         ));
     }
 
-    let session_id = extract_session_id_from_headers(&headers)?;
-    let graph = resolve_session_graph(&state, session_id.as_ref()).await;
-    let summary = kin_cli::commands::status::build_status_summary(&state.layout, graph.as_ref())
-        .map_err(internal_error)?;
+    let report = kin_cli::commands::status::inspect(&state.layout).map_err(internal_error)?;
     let daemon_build = kin_buildinfo::get();
     let build = kin_cli::commands::status::BuildStatus {
         cli_sha: request
@@ -2493,12 +2489,9 @@ async fn command_status(
         daemon_source_known: daemon_build.source_known,
         daemon_dependency_provenance: daemon_build.dependency_provenance.to_string(),
     };
-    let response = kin_cli::commands::status::build_command_status_response(
-        summary,
-        request.json,
-        Some(build),
-    )
-    .map_err(internal_error)?;
+    let response =
+        kin_cli::commands::status::build_command_status_response(report, request.json, Some(build))
+            .map_err(internal_error)?;
     Ok(Json(response))
 }
 
@@ -15211,19 +15204,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn command_status_endpoint_uses_live_graph() {
-        let state = test_state();
-        let entity = test_entity("handler", "src/lib.py");
-        state.graph.upsert_entity(&entity).unwrap();
-        let branch_name = BranchName::new("main");
-        state
-            .graph
-            .create_branch(&Branch {
-                name: branch_name.clone(),
-                head: kin_core::build_genesis_change().id,
-            })
-            .unwrap();
-        kin_core::write_current_branch(&state.layout, &branch_name).unwrap();
+    async fn command_status_endpoint_uses_repository_authority() {
+        install_test_registry_override();
+        let dir = std::env::temp_dir().join(format!("kin-daemon-status-state-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let initialized = kin_core::init(&dir).unwrap();
+        let state = Arc::new(DaemonState::open(initialized.layout).unwrap());
         state
             .is_initialized
             .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -15250,8 +15236,14 @@ mod tests {
         );
         let result: kin_cli::commands::status::CommandStatusResponse =
             serde_json::from_slice(&body).unwrap();
-        assert_eq!(result.summary.entities, 1);
-        assert!(result.text.contains("Entities: 1"));
+        assert_eq!(
+            result.report.schema,
+            kin_cli::commands::status::STATUS_SCHEMA
+        );
+        assert_eq!(result.report.repository.generation, 1);
+        assert_eq!(result.report.workspace.artifact_count, 0);
+        assert!(result.report.repository.source_cas_verified);
+        assert!(result.text.contains("Kin repository-v6 status"));
     }
 
     #[tokio::test]
