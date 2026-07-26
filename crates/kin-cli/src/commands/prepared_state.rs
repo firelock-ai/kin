@@ -198,9 +198,18 @@ fn require_complete_prepared_embeddings(kin_dir: &Path) -> Result<()> {
     let snapshot = kin_db::SnapshotManager::open_read_only(&graph_path)
         .with_context(|| format!("open prepared graph {}", graph_path.display()))?;
     let graph = snapshot.graph();
-    graph
-        .load_vector_index(&vector_path)
-        .with_context(|| format!("load prepared vector index {}", vector_path.display()))?;
+    let loaded = kin_db::SnapshotManager::load_vector_index_into_graph_if_valid(
+        graph.as_ref(),
+        &graph_path,
+        None,
+    )
+    .with_context(|| format!("validate prepared vector index {}", vector_path.display()))?;
+    if !loaded {
+        bail!(
+            "prepared vector index {} is missing or incompatible with its graph/model metadata",
+            vector_path.display()
+        );
+    }
     let status = graph.embedding_status();
     if status.indexed != status.total || status.pending != 0 {
         bail!(

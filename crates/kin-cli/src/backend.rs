@@ -220,28 +220,41 @@ async fn open_snapshot_daemon_first_with_mode(
     Ok(snap)
 }
 
-/// Load the persisted HNSW vector index into the graph if available.
-/// Non-fatal: if the file doesn't exist or fails to load, semantic search
-/// gracefully returns empty results.
+/// Load the persisted HNSW vector index only when its sidecar metadata proves
+/// that the model and graph root match this daemon bootstrap.
+///
+/// Non-fatal: absence or incompatibility leaves semantic search without an ANN
+/// index. The unchecked loader is intentionally unavailable outside KinDB
+/// tests because accepting a stale sidecar would return silently-wrong
+/// neighbors.
 #[cfg(feature = "vector")]
 fn load_vector_index_if_exists(snap: &kin_db::SnapshotManager, layout: &kin_core::KinLayout) {
     let _span = tracing::info_span!(
         "kindb.load_vector_index_if_exists",
-        path = %vector_index_path(layout).display()
+        path = %kindb_snapshot_path(layout).display()
     )
     .entered();
-    let path = vector_index_path(layout);
-    if path.exists() {
-        let graph = snap.graph();
-        match graph.load_vector_index(&path) {
-            Ok(count) => {
-                if count > 0 {
-                    tracing::debug!(count, path = %path.display(), "loaded vector index from disk");
-                }
-            }
-            Err(e) => {
-                tracing::debug!(error = %e, "failed to load vector index (non-fatal)");
-            }
+    let snapshot_path = kindb_snapshot_path(layout);
+    let graph = snap.graph();
+    match kin_db::SnapshotManager::load_vector_index_into_graph_if_valid(
+        graph.as_ref(),
+        &snapshot_path,
+        None,
+    ) {
+        Ok(true) => {
+            tracing::debug!(
+                path = %vector_index_path(layout).display(),
+                "loaded validated vector index from disk"
+            );
+        }
+        Ok(false) => {
+            tracing::debug!(
+                path = %vector_index_path(layout).display(),
+                "no compatible vector index available"
+            );
+        }
+        Err(error) => {
+            tracing::debug!(%error, "failed to validate vector index (non-fatal)");
         }
     }
 }
