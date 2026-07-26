@@ -13,7 +13,7 @@ use crate::{
     DefaultRefMutation, EffectiveAdmissionPolicyStamp, ExternalChangeAlias, ExternalObjectKind,
     ExternalObjectRecord, FrozenLocalOverlayDelta, GitObjectId, Hash256, ModelError, OperationId,
     RefMutation, RefName, RefTarget, RepositoryId, RepositoryRef, ResolvedTree, Result,
-    SemanticChange, SemanticChangeId, TreeDelta, WorkspaceHead, WorkspaceId,
+    SemanticChange, SemanticChangeId, SharedAdmissionPolicy, TreeDelta, WorkspaceHead, WorkspaceId,
 };
 
 pub const REPOSITORY_TRANSACTION_SCHEMA_VERSION: u32 = 1;
@@ -113,6 +113,11 @@ pub struct WorkspaceState {
     /// Exact graph-owned working tree, including uncommitted state.
     pub tree: ResolvedTree,
     pub tree_hash: Hash256,
+    /// Complete shared matcher policy active for this exact workspace tree.
+    ///
+    /// This may be newer than committed history when a dirty workspace edits
+    /// `.gitignore` or `.kinignore`.
+    pub shared_admission_policy: SharedAdmissionPolicy,
     pub admission_policy: EffectiveAdmissionPolicyStamp,
 }
 
@@ -128,6 +133,7 @@ impl WorkspaceState {
         base_target: Option<RefTarget>,
         base_tree_hash: Option<Hash256>,
         tree: ResolvedTree,
+        shared_admission_policy: SharedAdmissionPolicy,
         admission_policy: EffectiveAdmissionPolicyStamp,
     ) -> Result<Self> {
         let tree_hash = compute_resolved_tree_hash(&tree)?;
@@ -140,6 +146,7 @@ impl WorkspaceState {
             base_tree_hash,
             tree,
             tree_hash,
+            shared_admission_policy,
             admission_policy,
         };
         state.validate()?;
@@ -147,6 +154,13 @@ impl WorkspaceState {
     }
 
     pub fn validate(&self) -> Result<()> {
+        self.shared_admission_policy.validate()?;
+        if self.shared_admission_policy.stamp() != self.admission_policy.shared {
+            return Err(ModelError::InvalidOperation(format!(
+                "workspace {} shared admission policy does not match its effective policy stamp",
+                self.workspace_id
+            )));
+        }
         if self.base_target.is_some() != self.base_tree_hash.is_some() {
             return Err(ModelError::InvalidOperation(
                 "workspace base target and base tree must both be present or absent".to_string(),
@@ -225,6 +239,12 @@ pub struct WorkspaceMutation {
     pub new_base_tree_hash: Option<Hash256>,
     pub tree_deltas: Vec<TreeDelta>,
     pub new_tree_hash: Hash256,
+    /// Complete shared policy active for the resulting workspace tree.
+    ///
+    /// A dirty or unborn workspace may contain a new `.gitignore` before any
+    /// semantic change records that policy. Persisting only its stamp would
+    /// leave storage unable to reproduce or validate the matcher inputs.
+    pub new_shared_admission_policy: SharedAdmissionPolicy,
     pub new_admission_policy: EffectiveAdmissionPolicyStamp,
 }
 
@@ -234,6 +254,7 @@ impl WorkspaceMutation {
         repository_id: &RepositoryId,
         current: Option<&WorkspaceState>,
     ) -> Result<WorkspaceState> {
+        self.validate_shape()?;
         let (current_tree, expected_next_generation) = match (&self.expected, current) {
             (WorkspaceExpectation::MustNotExist, None) => (ResolvedTree::default(), 0),
             (WorkspaceExpectation::MustNotExist, Some(_)) => {
@@ -315,11 +336,20 @@ impl WorkspaceMutation {
             self.new_base_target.clone(),
             self.new_base_tree_hash,
             tree,
+            self.new_shared_admission_policy.clone(),
             self.new_admission_policy,
         )
     }
 
     fn validate_shape(&self) -> Result<()> {
+        self.new_shared_admission_policy.validate()?;
+        if self.new_shared_admission_policy.stamp() != self.new_admission_policy.shared {
+            return Err(ModelError::InvalidOperation(format!(
+                "workspace {} shared admission policy does not match its effective policy stamp",
+                self.workspace_id
+            )));
+        }
+
         let expected_tree = match &self.expected {
             WorkspaceExpectation::MustNotExist => {
                 if self.new_generation != 0 {
@@ -915,8 +945,9 @@ fn hash_serialized(domain: &[u8], value: &impl Serialize) -> Result<Hash256> {
 mod tests {
     use super::*;
     use crate::{
-        AdmissionPolicyStamp, ArtifactId, FrozenLocalOverlay, LocalOverlayHash, LocalOverlayStamp,
-        LocatedEntry, RefExpectation, RefUpdatePolicy, RepoPath, SharedAdmissionPolicy, TreeEntry,
+        AdmissionPolicyStamp, AdmissionRuleSource, AdmissionRuleSourceKind, ArtifactId,
+        FrozenLocalOverlay, LocalOverlayHash, LocalOverlayStamp, LocatedEntry, RefExpectation,
+        RefUpdatePolicy, RepoPath, SharedAdmissionPolicy, TreeEntry,
         ADMISSION_POLICY_SEMANTICS_VERSION,
     };
     use uuid::Uuid;
@@ -943,10 +974,15 @@ mod tests {
 
     fn admission_policy(
         workspace_id: WorkspaceId,
-    ) -> (EffectiveAdmissionPolicyStamp, FrozenLocalOverlayDelta) {
+    ) -> (
+        SharedAdmissionPolicy,
+        EffectiveAdmissionPolicyStamp,
+        FrozenLocalOverlayDelta,
+    ) {
         let shared = SharedAdmissionPolicy::empty(0);
         let local = FrozenLocalOverlay::new(workspace_id, 0, Vec::new()).unwrap();
         (
+            shared.clone(),
             EffectiveAdmissionPolicyStamp {
                 shared: shared.stamp(),
                 local: local.stamp(),
@@ -972,6 +1008,7 @@ mod tests {
 
     fn create_workspace_mutation(
         workspace_id: WorkspaceId,
+        shared_policy: SharedAdmissionPolicy,
         policy: EffectiveAdmissionPolicyStamp,
         deltas: Vec<TreeDelta>,
     ) -> WorkspaceMutation {
@@ -987,6 +1024,7 @@ mod tests {
             new_base_tree_hash: None,
             tree_deltas: deltas,
             new_tree_hash: compute_resolved_tree_hash(&tree).unwrap(),
+            new_shared_admission_policy: shared_policy,
             new_admission_policy: policy,
         }
     }
@@ -994,9 +1032,10 @@ mod tests {
     fn workspace_transaction() -> RepositoryTransaction {
         let repository_id = RepositoryId::new("repo").unwrap();
         let workspace_id = WorkspaceId::from_uuid(Uuid::from_u128(9));
-        let (policy, local_overlay_delta) = admission_policy(workspace_id);
+        let (shared_policy, policy, local_overlay_delta) = admission_policy(workspace_id);
         let mutation = create_workspace_mutation(
             workspace_id,
+            shared_policy,
             policy,
             vec![
                 add_artifact(
@@ -1072,12 +1111,111 @@ mod tests {
     }
 
     #[test]
+    fn unborn_dirty_ignore_policy_is_authoritative_without_fake_history() {
+        let mut transaction = workspace_transaction();
+        let ignore_hash = Hash256::from_bytes([0x66; 32]);
+        let shared_policy = SharedAdmissionPolicy::new(
+            0,
+            vec![AdmissionRuleSource {
+                kind: AdmissionRuleSourceKind::GitIgnore,
+                path: RepoPath::from_utf8(".gitignore").unwrap(),
+                base_directory: None,
+                body_hash: ignore_hash,
+                body_len: 8,
+                precedence: 0,
+            }],
+            Vec::new(),
+        )
+        .unwrap();
+        let workspace = transaction.workspace_mutation.as_mut().unwrap();
+        workspace.tree_deltas.push(add_artifact(
+            ArtifactId(Uuid::from_u128(13)),
+            b".gitignore".to_vec(),
+            0x66,
+            false,
+        ));
+        let candidate = ResolvedTree::default()
+            .apply(&workspace.tree_deltas)
+            .unwrap();
+        workspace.new_tree_hash = compute_resolved_tree_hash(&candidate).unwrap();
+        workspace.new_shared_admission_policy = shared_policy.clone();
+        workspace.new_admission_policy.shared = shared_policy.stamp();
+
+        let token = transaction.admission_scan_token.as_mut().unwrap();
+        token.observed_tree_hash = workspace.new_tree_hash;
+        token.shared_policy = shared_policy.stamp();
+
+        assert!(transaction.changes.is_empty());
+        assert!(workspace.new_base_target.is_none());
+        assert_ne!(
+            shared_policy.stamp(),
+            SharedAdmissionPolicy::empty(0).stamp()
+        );
+        transaction.validate().unwrap();
+
+        let mut mismatched = transaction;
+        mismatched
+            .workspace_mutation
+            .as_mut()
+            .unwrap()
+            .new_shared_admission_policy = SharedAdmissionPolicy::empty(0);
+        let error = mismatched.validate().unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("shared admission policy does not match its effective policy stamp"));
+    }
+
+    #[test]
+    fn workspace_shared_policy_is_bound_by_transaction_and_operation_identities() {
+        let original = workspace_transaction();
+        original.validate().unwrap();
+        let original_hash = original.transaction_hash().unwrap();
+
+        let mut updated = original.clone();
+        let shared_policy = SharedAdmissionPolicy::empty(1);
+        let workspace = updated.workspace_mutation.as_mut().unwrap();
+        workspace.new_shared_admission_policy = shared_policy.clone();
+        workspace.new_admission_policy.shared = shared_policy.stamp();
+        updated.admission_scan_token.as_mut().unwrap().shared_policy = shared_policy.stamp();
+        updated.validate().unwrap();
+        assert_ne!(updated.transaction_hash().unwrap(), original_hash);
+
+        let mut roots_after = roots();
+        roots_after.generation = 8;
+        let operation = RepositoryOperationRecord {
+            operation_id: original.operation_id,
+            repository_id: original.repository_id.clone(),
+            transaction_hash: original_hash,
+            actor: original.actor.clone(),
+            committed_at: crate::Timestamp::from(
+                chrono::DateTime::parse_from_rfc3339("2026-01-02T03:04:05Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+            ),
+            ref_mutations: Vec::new(),
+            default_ref_mutation: None,
+            workspace_mutation: original.workspace_mutation,
+            local_overlay_delta: None,
+            roots_before: roots(),
+            roots_after,
+        };
+        let operation_identity = operation.identity_hash().unwrap();
+        let mut updated_operation = operation;
+        updated_operation.workspace_mutation = updated.workspace_mutation;
+        assert_ne!(
+            updated_operation.identity_hash().unwrap(),
+            operation_identity
+        );
+    }
+
+    #[test]
     fn unborn_workspace_persists_arbitrary_files_then_commits_without_losing_tree() {
         let repository_id = RepositoryId::new("repo").unwrap();
         let workspace_id = WorkspaceId::from_uuid(Uuid::from_u128(21));
-        let (policy, _) = admission_policy(workspace_id);
+        let (shared_policy, policy, _) = admission_policy(workspace_id);
         let create = create_workspace_mutation(
             workspace_id,
+            shared_policy.clone(),
             policy,
             vec![
                 add_artifact(
@@ -1096,6 +1234,7 @@ mod tests {
         );
         let dirty = create.validate_against(&repository_id, None).unwrap();
         assert!(dirty.is_dirty());
+        assert_eq!(dirty.shared_admission_policy, shared_policy);
         assert!(dirty
             .tree
             .artifact_at_path(&RepoPath::from_bytes(b"infra/compose-\xfe.yaml".to_vec()).unwrap())
@@ -1118,6 +1257,7 @@ mod tests {
             new_base_tree_hash: Some(dirty.tree_hash),
             tree_deltas: Vec::new(),
             new_tree_hash: dirty.tree_hash,
+            new_shared_admission_policy: shared_policy,
             new_admission_policy: dirty.admission_policy,
         };
         let clean = commit
@@ -1132,10 +1272,11 @@ mod tests {
     fn workspace_mutation_rejects_stale_head_tree_or_generation() {
         let repository_id = RepositoryId::new("repo").unwrap();
         let workspace_id = WorkspaceId::from_uuid(Uuid::from_u128(31));
-        let (policy, _) = admission_policy(workspace_id);
-        let current = create_workspace_mutation(workspace_id, policy, Vec::new())
-            .validate_against(&repository_id, None)
-            .unwrap();
+        let (shared_policy, policy, _) = admission_policy(workspace_id);
+        let current =
+            create_workspace_mutation(workspace_id, shared_policy.clone(), policy, Vec::new())
+                .validate_against(&repository_id, None)
+                .unwrap();
         let stale = WorkspaceMutation {
             workspace_id,
             expected: WorkspaceExpectation::MustEqual {
@@ -1158,6 +1299,7 @@ mod tests {
             new_base_tree_hash: Some(current.tree_hash),
             tree_deltas: Vec::new(),
             new_tree_hash: current.tree_hash,
+            new_shared_admission_policy: shared_policy,
             new_admission_policy: current.admission_policy,
         };
         assert!(matches!(
@@ -1170,7 +1312,7 @@ mod tests {
     fn detached_workspace_preserves_exact_external_tag_target() {
         let repository_id = RepositoryId::new("repo").unwrap();
         let workspace_id = WorkspaceId::from_uuid(Uuid::from_u128(35));
-        let (policy, _) = admission_policy(workspace_id);
+        let (shared_policy, policy, _) = admission_policy(workspace_id);
         let tree = ResolvedTree::default();
         let tree_hash = compute_resolved_tree_hash(&tree).unwrap();
         let target = RefTarget::external_object(crate::ExternalObjectId::new(
@@ -1187,6 +1329,7 @@ mod tests {
             Some(target.clone()),
             Some(tree_hash),
             tree,
+            shared_policy,
             policy,
         )
         .unwrap();
@@ -1198,6 +1341,9 @@ mod tests {
             serde_json::from_slice::<WorkspaceState>(&encoded).unwrap(),
             state
         );
+        let mut mismatched = state;
+        mismatched.shared_admission_policy = SharedAdmissionPolicy::empty(1);
+        assert!(mismatched.validate().is_err());
     }
 
     #[test]
