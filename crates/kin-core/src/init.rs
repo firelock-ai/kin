@@ -1103,7 +1103,8 @@ fn graph_error(error: impl std::fmt::Display) -> KinError {
 mod tests {
     use super::*;
     use kin_model::{
-        compute_semantic_change_id, ChangeOrigin, Hash256, RefTarget, Timestamp, WorkspaceHead,
+        compute_semantic_change_id, ChangeOrigin, GitExternalAuthority, GitExternalAuthorityDelta,
+        GitObjectBodyLoader, GitObjectFormat, Hash256, RefTarget, Timestamp, WorkspaceHead,
     };
     use sha2::{Digest, Sha256};
 
@@ -1334,6 +1335,59 @@ mod tests {
                 .generation,
             0
         );
+    }
+
+    #[test]
+    fn git_bootstrap_uses_raw_symbolic_head_instead_of_native_config_default() {
+        struct EmptyBodyLoader;
+        impl GitObjectBodyLoader for EmptyBodyLoader {
+            type Error = &'static str;
+
+            fn load_body(
+                &mut self,
+                _body_hash: &Hash256,
+            ) -> std::result::Result<Option<Vec<u8>>, Self::Error> {
+                Ok(None)
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let (prepared, mut transaction) = prepare_unborn(directory.path(), "git-default-ref");
+        let git_default = RefName::branch(b"future").unwrap();
+        let git_head = WorkspaceHead::Symbolic {
+            target: git_default.clone(),
+        };
+        let authority = GitExternalAuthority::from_raw_parts(
+            prepared.repository_id().clone(),
+            GitObjectFormat::Sha1,
+            Vec::new(),
+            GitRawTarget::Symbolic {
+                target: git_default.clone(),
+            },
+            Vec::new(),
+            &mut EmptyBodyLoader,
+        )
+        .unwrap();
+        transaction.git_authority_delta = Some(GitExternalAuthorityDelta::initialize(authority));
+        transaction.default_ref_mutation = Some(DefaultRefMutation {
+            expected: DefaultRefExpectation::MustBeUnset,
+            new_default: Some(git_default),
+        });
+        transaction.workspace_mutation.as_mut().unwrap().new_head = git_head.clone();
+        transaction
+            .admission_scan_token
+            .as_mut()
+            .unwrap()
+            .workspace_head = git_head;
+
+        validate_bootstrap_transaction(
+            &transaction,
+            prepared.repository_id(),
+            prepared.workspace_id(),
+            prepared.default_ref(),
+            prepared.initial_roots(),
+        )
+        .unwrap();
     }
 
     #[test]
