@@ -45,8 +45,24 @@ fn main() {
             serde_json::to_string_pretty(&schema_for!(kin_model::TreeEntry)).unwrap(),
         ),
         (
-            "TreeEntryKind",
-            serde_json::to_string_pretty(&schema_for!(kin_model::TreeEntryKind)).unwrap(),
+            "RepoPath",
+            serde_json::to_string_pretty(&schema_for!(kin_model::RepoPath)).unwrap(),
+        ),
+        (
+            "GitObjectId",
+            serde_json::to_string_pretty(&schema_for!(kin_model::GitObjectId)).unwrap(),
+        ),
+        (
+            "LocatedEntry",
+            serde_json::to_string_pretty(&schema_for!(kin_model::LocatedEntry)).unwrap(),
+        ),
+        (
+            "ResolvedArtifact",
+            serde_json::to_string_pretty(&schema_for!(kin_model::ResolvedArtifact)).unwrap(),
+        ),
+        (
+            "ResolvedTree",
+            serde_json::to_string_pretty(&schema_for!(kin_model::ResolvedTree)).unwrap(),
         ),
         (
             "TreeDelta",
