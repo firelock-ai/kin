@@ -420,6 +420,7 @@ mod tests {
     use kin_model::ids::*;
     use kin_model::relation::{GraphNodeId, RelationOrigin};
     use kin_model::timestamp::Timestamp;
+    use kin_model::ArtifactId;
 
     fn admit_test_artifact(graph: &InMemoryGraph, path: &str) -> ArtifactId {
         let path = RepoPath::from_utf8(path).expect("valid test repository path");

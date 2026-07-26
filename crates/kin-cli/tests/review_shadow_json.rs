@@ -212,8 +212,8 @@ fn shadow_report_end_to_end_change_in_report_out() {
 
     let report = run_shadow_json(repo, &base, &head);
 
-    // Contract identity: report-only shadow payload, v1.
-    assert_eq!(report["schema_version"], 1);
+    // Contract identity: report-only shadow payload with exact artifact trees.
+    assert_eq!(report["schema_version"], 2);
     assert_eq!(report["mode"], "shadow");
     assert_eq!(report["policy"]["enforcement"], "report_only");
 
@@ -360,7 +360,7 @@ fn shadow_report_head_caret_resolves_from_a_fresh_init() {
 
     let report = run_shadow_json(repo, "HEAD^", "HEAD");
 
-    assert_eq!(report["schema_version"], 1);
+    assert_eq!(report["schema_version"], 2);
     assert_eq!(report["mode"], "shadow");
     assert!(!report["input"]["resolved_base"]
         .as_str()
