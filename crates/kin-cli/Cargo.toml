@@ -37,6 +37,7 @@ kin-reconcile = { workspace = true }
 kin-git = { workspace = true }
 kin-context = { workspace = true }
 kin-semantic-contracts = { workspace = true }
+kin-notify = { workspace = true }
 kin-review = { workspace = true }
 kin-migrate = { workspace = true }
 kin-runtime = { workspace = true }

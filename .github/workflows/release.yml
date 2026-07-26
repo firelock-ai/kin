@@ -563,6 +563,23 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
 
+      # KinNotifier.app carries Kin's notification identity. macOS derives a
+      # notification's sender name, icon, and grouping from the posting
+      # process's bundle, so without this the CLI's notifications are credited
+      # to Script Editor. macOS-only: there is no bundle concept elsewhere.
+      - name: Build and assemble KinNotifier.app (macOS)
+        if: ${{ runner.os == 'macOS' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked --release --target "$TARGET" -p kin-notifier-macos
+          crates/kin-notifier-macos/bundle.sh \
+            "target/${TARGET}/release/KinNotifier" \
+            "target/${TARGET}/release" \
+            "${GITHUB_REF_NAME#v}"
+        env:
+          TARGET: ${{ matrix.target }}
+
       - name: Build kin-vfs (native)
         if: ${{ !matrix.cross && !matrix.skip_vector }}
         working-directory: kin-vfs
@@ -748,6 +765,14 @@ jobs:
               --sign "$MACOS_DEVELOPER_ID" "$f"
             codesign --verify --strict --verbose=2 "$f"
           done
+          # The bundle signs as a unit: codesign seals Info.plist and Resources
+          # alongside the executable, which is what makes the identity
+          # tamper-evident rather than just a name in a plist.
+          APP="target/${TARGET}/release/KinNotifier.app"
+          test -d "$APP"
+          codesign --force --options runtime --timestamp \
+            --sign "$MACOS_DEVELOPER_ID" "$APP"
+          codesign --verify --strict --deep --verbose=2 "$APP"
         env:
           MACOS_DEVELOPER_ID: ${{ secrets.MACOS_DEVELOPER_ID }}
           TARGET: ${{ matrix.target }}
@@ -772,6 +797,10 @@ jobs:
             [ -f "$f" ] && FILES+=("$f")
           done
           zip -j "$NOTARIZE_ZIP" "${FILES[@]}"
+          # The .app goes in with its directory structure intact (-j would
+          # flatten the bundle into loose files and destroy it). Notary needs
+          # the bundle whole in order to issue a staplable ticket for it.
+          ( cd "target/${TARGET}/release" && zip -qr "$OLDPWD/$NOTARIZE_ZIP" KinNotifier.app )
         env:
           TARGET: ${{ matrix.target }}
           SHIM_NAME: ${{ matrix.shim_name }}
@@ -788,16 +817,19 @@ jobs:
             --password "$APPLE_APP_SPECIFIC_PASSWORD" \
             --team-id "$APPLE_TEAM_ID" \
             --wait --timeout 30m
-          # NOTE: a bare CLI binary (and a .tar.gz) cannot be stapled — `xcrun
-          # stapler` only supports .app bundles, .dmg, .pkg, and .xip. The
-          # notarization ticket is stored on Apple's servers and validated
-          # online by Gatekeeper on first run. If a .dmg/.pkg installer is added
-          # later, run `xcrun stapler staple <installer>` here.
+          # A bare CLI binary (and a .tar.gz) cannot be stapled: `xcrun stapler`
+          # supports only .app bundles, .dmg, .pkg, and .xip. Those binaries
+          # therefore rely on Apple's servers being reachable for Gatekeeper's
+          # online check. KinNotifier.app IS a bundle, so its ticket is stapled
+          # into it below and verifies offline.
+          xcrun stapler staple "target/${TARGET}/release/KinNotifier.app"
+          xcrun stapler validate "target/${TARGET}/release/KinNotifier.app"
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           ARTIFACT: ${{ matrix.artifact }}
+          TARGET: ${{ matrix.target }}
 
       # Linux backend: hand the signed zip to the notarize_linux job, which
       # submits it to Apple Notary via rcodesign on a (10x cheaper) Linux runner.
@@ -824,6 +856,11 @@ jobs:
           # gnu triple (the shim is libc-specific) and elsewhere equals TARGET.
           cp "kin-vfs/target/${VFS_TARGET}/release/kin-vfs" "$ARTIFACT/"
           cp "kin-vfs/target/${VFS_TARGET}/release/${SHIM_NAME}" "$ARTIFACT/"
+          # KinNotifier.app is macOS-only and is copied whole: -R preserves the
+          # bundle structure and the stapled notarization ticket inside it.
+          if [ -d "target/${TARGET}/release/KinNotifier.app" ]; then
+            cp -R "target/${TARGET}/release/KinNotifier.app" "$ARTIFACT/"
+          fi
           tar czf "${ARTIFACT}.tar.gz" "$ARTIFACT"
           # All supported Unix surfaces are mandatory release contents.
           for required in kin kin-daemon kin-vfs "$SHIM_NAME"; do
@@ -832,6 +869,15 @@ jobs:
               exit 1
             fi
           done
+          # The notifier is mandatory on macOS. Without it the CLI still runs
+          # but every notification is credited to Script Editor, which is a
+          # silent downgrade rather than a visible failure — so assert it.
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            if ! tar tzf "${ARTIFACT}.tar.gz" | grep -q "KinNotifier.app/Contents/MacOS/KinNotifier$"; then
+              echo "::error::KinNotifier.app missing from ${ARTIFACT}.tar.gz"
+              exit 1
+            fi
+          fi
           shasum -a 256 "${ARTIFACT}.tar.gz" > "${ARTIFACT}.tar.gz.sha256"
         env:
           TARGET: ${{ matrix.target }}

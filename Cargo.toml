@@ -18,6 +18,8 @@ members = [
     "crates/kin-migrate",
     "crates/kin-runtime",
     "crates/kin-buildinfo",
+    "crates/kin-notify",
+    "crates/kin-notifier-macos",
     "crates/kin-cli",
     "crates/kin-daemon",
     "crates/kin-mcp",
@@ -134,6 +136,7 @@ kin-review = { path = "crates/kin-review" }
 kin-migrate = { path = "crates/kin-migrate" }
 kin-runtime = { path = "crates/kin-runtime" }
 kin-buildinfo = { path = "crates/kin-buildinfo" }
+kin-notify = { path = "crates/kin-notify" }
 kin-cli = { path = "crates/kin-cli", default-features = false }
 kin-daemon = { path = "crates/kin-daemon" }
 kin-mcp = { path = "crates/kin-mcp" }

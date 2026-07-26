@@ -184,6 +184,32 @@
       "allow_match": [
         "dot_git.is_dir()"
       ]
+    },
+    {
+      "file": "crates/kin-notify/src/lib.rs",
+      "reason": "IO Boundary: notification delivery and its own suppression state; answers no semantic query and never reads repository content",
+      "owner": "kin-notify",
+      "expiration": "2026-12-31"
+    },
+    {
+      "file": "crates/kin-notifier-macos/src/macos.rs",
+      "reason": "False positive: no filesystem access; std::process:: matches are an ExitCode import, a PID used for notification request uniqueness, and process exit",
+      "owner": "kin-notify",
+      "expiration": "2026-12-31",
+      "allow_match": [
+        "use std::process::ExitCode;",
+        "std::process::id()",
+        "std::process::exit(0);"
+      ]
+    },
+    {
+      "file": "crates/kin-notifier-macos/src/main.rs",
+      "reason": "False positive: no filesystem access; the std::process:: match is an ExitCode import for the platform dispatch stub",
+      "owner": "kin-notify",
+      "expiration": "2026-12-31",
+      "allow_match": [
+        "use std::process::ExitCode;"
+      ]
     }
   ]
 }

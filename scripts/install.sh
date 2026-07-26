@@ -231,7 +231,30 @@ for lib in libkin_vfs_shim.so libkin_vfs_shim.dylib; do
     fi
 done
 
+# Move the notification bundle if the archive carries it (macOS only). macOS
+# reads a notification's sender name, icon, and grouping from the posting
+# process's bundle; without this, Kin's notifications are credited to Script
+# Editor. Replaced whole rather than merged so a stale executable can never be
+# left inside a newer bundle.
+HAVE_NOTIFIER=0
+if [ -d "$EXTRACT_DIR/KinNotifier.app" ]; then
+    rm -rf "$KIN_LIB/KinNotifier.app"
+    mv "$EXTRACT_DIR/KinNotifier.app" "$KIN_LIB/KinNotifier.app"
+    chmod +x "$KIN_LIB/KinNotifier.app/Contents/MacOS/KinNotifier" 2>/dev/null || true
+    HAVE_NOTIFIER=1
+fi
+
 ok "Binaries installed (kin, kin-daemon)"
+
+if [ "$HAVE_NOTIFIER" = "1" ]; then
+    # Registering with LaunchServices is what lets the notification daemon
+    # validate the bundle; an unregistered app is refused outright. Authorization
+    # itself is NOT requested here: an unanswered prompt is recorded as a
+    # permanent denial, so it must be raised interactively by `kin setup`.
+    LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+    [ -x "$LSREGISTER" ] && "$LSREGISTER" -f "$KIN_LIB/KinNotifier.app" >/dev/null 2>&1 || true
+    ok "Notification identity installed (KinNotifier.app)"
+fi
 
 if [ "$HAVE_VFS" = "1" ] && [ "$HAVE_SHIM" = "1" ]; then
     # The release archive can contain a projection built for a different libc
