@@ -143,6 +143,10 @@ pub fn materialize_session_source_tree<'a>(
             "session projection base metadata must not be empty".to_string(),
         ));
     }
+    let entries: Vec<_> = entries.into_iter().collect();
+    for (path, entry, body) in &entries {
+        validate_source_content_identity(path, *entry, body)?;
+    }
     let entries = validated_source_entries(entries)?;
     project_validated_session_source_tree(root, &entries, base_metadata)
 }
@@ -477,6 +481,25 @@ fn validate_source_entry_components<'a>(
         )));
     }
     Ok(components)
+}
+
+fn validate_source_content_identity(
+    file_id: &RepoPath,
+    entry: TreeEntry,
+    content: &[u8],
+) -> Result<()> {
+    let Some(expected) = entry.blob_identity() else {
+        return Err(KinError::Other(format!(
+            "gitlink {file_id} is repository history, not a repository-owned source blob"
+        )));
+    };
+    let observed = Hash256::from_bytes(kin_blobs::digest_bytes(content));
+    if observed != expected {
+        return Err(KinError::Other(format!(
+            "exact source bytes for {file_id} hash to {observed}, not tree identity {expected}"
+        )));
+    }
+    Ok(())
 }
 
 fn projection_path(path: &RepoPath) -> Result<&str> {
@@ -3094,7 +3117,7 @@ impl ProjectionRoot {
             let name = entry.file_name();
             let relative = relative_directory.join(&name);
             if relative_directory.as_os_str().is_empty()
-                && name.as_os_str() == self.projection_control_name.as_os_str()
+                && projection_control_names_match(&name, &self.projection_control_name)
             {
                 all_children_removed = false;
                 continue;
@@ -5573,6 +5596,16 @@ fn projection_path_key(path: &Path) -> Vec<OsString> {
         .collect()
 }
 
+#[cfg(any(unix, windows))]
+fn projection_control_names_match(left: &std::ffi::OsStr, right: &std::ffi::OsStr) -> bool {
+    match (left.to_str(), right.to_str()) {
+        (Some(left), Some(right)) => {
+            projection_component_comparison_key(left) == projection_component_comparison_key(right)
+        }
+        _ => left == right,
+    }
+}
+
 fn is_reserved_source_component(component: &str) -> bool {
     if component.eq_ignore_ascii_case(".git")
         || component.eq_ignore_ascii_case(".kin")
@@ -5843,6 +5876,8 @@ mod tests {
         let compose = repo_path("compose.yaml");
         let executable = repo_path("bin/run");
         let metadata = br#"{"schema":1,"tree":"exact"}"#;
+        let compose_body = b"services:\n  app:\n    image: kin\n";
+        let executable_body = b"#!/bin/sh\nexit 0\n";
 
         let count = materialize_session_source_tree(
             root.path(),
@@ -5850,13 +5885,19 @@ mod tests {
             [
                 (
                     &compose,
-                    TreeEntry::blob(Hash256::from_bytes([0x41; 32]), false),
-                    b"services:\n  app:\n    image: kin\n".as_slice(),
+                    TreeEntry::blob(
+                        Hash256::from_bytes(kin_blobs::digest_bytes(compose_body)),
+                        false,
+                    ),
+                    compose_body.as_slice(),
                 ),
                 (
                     &executable,
-                    TreeEntry::blob(Hash256::from_bytes([0x42; 32]), true),
-                    b"#!/bin/sh\nexit 0\n".as_slice(),
+                    TreeEntry::blob(
+                        Hash256::from_bytes(kin_blobs::digest_bytes(executable_body)),
+                        true,
+                    ),
+                    executable_body.as_slice(),
                 ),
             ],
         )
@@ -5897,6 +5938,8 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let target = repo_path("config/app.toml");
         let link = repo_path("current-config");
+        let target_body = b"enabled = true\n";
+        let link_body = b"config/app.toml";
 
         materialize_session_source_tree(
             root.path(),
@@ -5904,13 +5947,16 @@ mod tests {
             [
                 (
                     &target,
-                    TreeEntry::blob(Hash256::from_bytes([0x51; 32]), false),
-                    b"enabled = true\n".as_slice(),
+                    TreeEntry::blob(
+                        Hash256::from_bytes(kin_blobs::digest_bytes(target_body)),
+                        false,
+                    ),
+                    target_body.as_slice(),
                 ),
                 (
                     &link,
-                    TreeEntry::symlink(Hash256::from_bytes([0x52; 32])),
-                    b"config/app.toml".as_slice(),
+                    TreeEntry::symlink(Hash256::from_bytes(kin_blobs::digest_bytes(link_body))),
+                    link_body.as_slice(),
                 ),
             ],
         )
@@ -5919,6 +5965,61 @@ mod tests {
         assert_eq!(
             std::fs::read_link(root.path().join("current-config")).unwrap(),
             PathBuf::from("config/app.toml")
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn session_projection_rejects_mislabeled_source_bytes_before_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        let path = repo_path("compose.yaml");
+        let error = materialize_session_source_tree(
+            root.path(),
+            br#"{"schema":1}"#,
+            [(
+                &path,
+                TreeEntry::blob(Hash256::from_bytes([0x61; 32]), false),
+                b"services: {}\n".as_slice(),
+            )],
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("not tree identity"), "{error}");
+        assert!(
+            !root.path().join(".kin-session").exists(),
+            "hash mismatch must fail before creating session control state"
+        );
+        assert!(
+            !root.path().join("compose.yaml").exists(),
+            "hash mismatch must fail before materializing source bytes"
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn session_projection_preserves_casefolded_control_aliases() {
+        let root = tempfile::tempdir().unwrap();
+        let alias = root.path().join(".KIN-SESSION");
+        std::fs::create_dir(&alias).unwrap();
+        std::fs::write(alias.join("keep"), b"control alias").unwrap();
+        let path = repo_path("compose.yaml");
+        let body = b"services: {}\n";
+
+        materialize_session_source_tree(
+            root.path(),
+            br#"{"schema":1}"#,
+            [(
+                &path,
+                TreeEntry::blob(Hash256::from_bytes(kin_blobs::digest_bytes(body)), false),
+                body.as_slice(),
+            )],
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read(alias.join("keep")).unwrap(),
+            b"control alias",
+            "control aliases must never be planned as unrelated removable content"
         );
     }
 

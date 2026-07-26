@@ -2550,7 +2550,7 @@ async fn command_rename(
     Ok(Json(response))
 }
 
-/// POST /commands/session-workspace — materialize graph-owned files for sessions.
+/// POST /commands/session-workspace — materialize repository-authority files for sessions.
 async fn command_session_workspace(
     State(state): State<Arc<DaemonState>>,
     Json(request): Json<kin_cli::commands::session_workspace::SessionWorkspaceRequest>,
@@ -2567,7 +2567,6 @@ async fn command_session_workspace(
 
     let response = kin_cli::commands::session_workspace::materialize_session_workspace(
         &state.layout,
-        state.graph.as_ref(),
         &request,
     )
     .map_err(internal_error)?;
@@ -9911,6 +9910,7 @@ mod tests {
         // staged entity to the canonical state.graph (commit is a mutating tool, so
         // it routes there rather than a session's read-only scoped view).
         let state = test_state();
+        install_repository_file(&state, "src/lib.rs", b"fn committed_fn() {}\n");
         state
             .is_initialized
             .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -10402,17 +10402,14 @@ mod tests {
         // body are restored intact.
         install_test_registry_override();
         let dir = std::env::temp_dir().join(format!("kin-daemon-tx-restart-{}", Uuid::new_v4()));
-        let kin_dir = dir.join(".kin");
-        std::fs::create_dir_all(kin_dir.join("objects")).unwrap();
-        std::fs::create_dir_all(kin_dir.join("working")).unwrap();
-        kin_core::manifest::KinManifest::new()
-            .save(&kin_core::KinLayout::new(kin_dir.clone()).manifest_path())
-            .unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        let layout = kin_core::init(&dir)
+            .expect("restart fixture must initialize repository-v6 authority")
+            .layout;
 
         let tx_id;
         {
-            let state =
-                Arc::new(DaemonState::open(kin_core::KinLayout::new(kin_dir.clone())).unwrap());
+            let state = Arc::new(DaemonState::open(layout.clone()).unwrap());
             let registry = kin_mcp::SessionRegistry::new();
             let tx = registry
                 .begin_transaction("sess-restart", "file:src/lib.rs")
@@ -10430,7 +10427,7 @@ mod tests {
         } // state dropped — models daemon shutdown.
 
         // Re-open on the SAME layout — models the restart.
-        let restarted = Arc::new(DaemonState::open(kin_core::KinLayout::new(kin_dir)).unwrap());
+        let restarted = Arc::new(DaemonState::open(layout).unwrap());
         let store = restarted
             .mcp_transactions
             .lock()

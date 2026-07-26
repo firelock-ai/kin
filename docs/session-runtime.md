@@ -3,7 +3,9 @@
 > **Current development status:** repository-v6 exact session materialization is
 > implemented at the daemon boundary, including non-code/binary artifacts,
 > executable bits, symlinks, exact source-CAS reads, scoped artifact selection,
-> and an immutable three-way-reconcile base. The public `kin exec`, `kin shell`,
+> and a durable three-way-reconcile base record. The base is not yet sealed
+> against session-local edits, so reconcile consumption remains fail-closed
+> until it revalidates the record against repository authority. The public `kin exec`, `kin shell`,
 > `kin with --session`, `kin open`, and `kin reconcile` commands remain
 > fail-closed open gates. Docker and Compose are therefore represented and
 > materializable, but are **not yet claimed as end-to-end dogfood-ready through
