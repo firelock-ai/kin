@@ -13,11 +13,11 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use kin_db::{LocalFileBackend, RepositoryAuthorityManager};
+use kin_db::{LocalFileBackend, RepositoryAuthorityManager, RepositoryAuthorityState};
 use kin_model::{
     compute_resolved_tree_hash, GraphStore, Hash256, OperationId, RepoPath,
     RepositoryCommitOutcome, RepositoryCommitReceipt, RepositoryId, RepositoryTransaction,
-    ResolvedTree, SemanticChangeId, TreeEntry, WorkspaceExpectation,
+    ResolvedTree, RootBundle, SemanticChangeId, TreeEntry, WorkspaceExpectation, WorkspaceId,
 };
 
 use crate::{KinError, Result};
@@ -62,6 +62,11 @@ const MAX_RECONCILIATION_ACTIONS: usize = 100_000;
 const MAX_RECONCILIATION_ACTION_RECORD_BYTES: u64 = 256 * 1024;
 #[cfg(any(unix, windows))]
 const MAX_RECONCILIATION_ACTION_LOG_BYTES: u64 = 64 * 1024 * 1024;
+const CHECKOUT_PROJECTION_RECEIPT_SCHEMA: u32 = 1;
+#[cfg(any(unix, windows))]
+const CHECKOUT_PROJECTION_RECEIPT_PREFIX: &str = "checkout-receipt-";
+#[cfg(any(unix, windows))]
+const MAX_CHECKOUT_PROJECTION_RECEIPT_BYTES: u64 = 256 * 1024;
 
 /// Resolve the exact repository tree at one semantic change.
 pub fn resolve_change_tree<G: GraphStore>(
@@ -71,6 +76,154 @@ pub fn resolve_change_tree<G: GraphStore>(
     graph
         .resolve_tree_at(change_id)
         .map_err(|error| KinError::Graph(error.to_string()))
+}
+
+/// Local, authenticated identity of one projection-only checkout repair.
+///
+/// This receipt is deliberately not repository-replicated truth. It records
+/// that the derived filesystem projection was restored while the named
+/// repository roots and workspace generation/tree were frozen.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CheckoutProjectionReceipt {
+    pub schema: u32,
+    pub repository_id: RepositoryId,
+    pub workspace_id: WorkspaceId,
+    pub operation_id: OperationId,
+    pub authority_roots: RootBundle,
+    pub workspace_generation: u64,
+    pub workspace_tree_hash: Hash256,
+    pub selected: RepoPath,
+    pub projection_digest: Hash256,
+    pub completed: bool,
+}
+
+impl CheckoutProjectionReceipt {
+    /// Construct the caller-stable identity before any namespace mutation.
+    pub fn new(
+        repository_id: RepositoryId,
+        workspace_id: WorkspaceId,
+        operation_id: OperationId,
+        authority_roots: RootBundle,
+        workspace_generation: u64,
+        workspace_tree_hash: Hash256,
+        selected: RepoPath,
+    ) -> Result<Self> {
+        let projection_digest = checkout_projection_digest(
+            &repository_id,
+            workspace_id,
+            operation_id,
+            &authority_roots,
+            workspace_generation,
+            workspace_tree_hash,
+            &selected,
+        )?;
+        Ok(Self {
+            schema: CHECKOUT_PROJECTION_RECEIPT_SCHEMA,
+            repository_id,
+            workspace_id,
+            operation_id,
+            authority_roots,
+            workspace_generation,
+            workspace_tree_hash,
+            selected,
+            projection_digest,
+            completed: true,
+        })
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.schema != CHECKOUT_PROJECTION_RECEIPT_SCHEMA || !self.completed {
+            return Err(KinError::Other(
+                "checkout projection receipt is incomplete or has an unsupported schema"
+                    .to_string(),
+            ));
+        }
+        let expected = checkout_projection_digest(
+            &self.repository_id,
+            self.workspace_id,
+            self.operation_id,
+            &self.authority_roots,
+            self.workspace_generation,
+            self.workspace_tree_hash,
+            &self.selected,
+        )?;
+        if self.projection_digest != expected {
+            return Err(KinError::Other(
+                "checkout projection receipt digest does not match its bound request".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn checkout_projection_digest(
+    repository_id: &RepositoryId,
+    workspace_id: WorkspaceId,
+    operation_id: OperationId,
+    authority_roots: &RootBundle,
+    workspace_generation: u64,
+    workspace_tree_hash: Hash256,
+    selected: &RepoPath,
+) -> Result<Hash256> {
+    #[derive(serde::Serialize)]
+    struct Identity<'a> {
+        schema: &'static str,
+        repository_id: &'a RepositoryId,
+        workspace_id: WorkspaceId,
+        operation_id: OperationId,
+        authority_roots: &'a RootBundle,
+        workspace_generation: u64,
+        workspace_tree_hash: Hash256,
+        selected: &'a RepoPath,
+    }
+    let encoded = serde_json::to_vec(&Identity {
+        schema: "kin.checkout-projection-receipt.v1",
+        repository_id,
+        workspace_id,
+        operation_id,
+        authority_roots,
+        workspace_generation,
+        workspace_tree_hash,
+        selected,
+    })
+    .map_err(|error| KinError::Other(format!("encode checkout projection identity: {error}")))?;
+    Ok(Hash256::from_bytes(kin_blobs::digest_bytes(&encoded)))
+}
+
+fn validate_checkout_projection_workspace(
+    authority: &RepositoryAuthorityState,
+    receipt: &CheckoutProjectionReceipt,
+) -> Result<()> {
+    receipt.validate()?;
+    if authority.roots() != &receipt.authority_roots
+        || authority.metadata().repository_id != receipt.repository_id
+    {
+        return Err(KinError::Other(format!(
+            "checkout projection authority moved from repository {} generation {}",
+            receipt.repository_id, receipt.authority_roots.generation
+        )));
+    }
+    let workspace = authority
+        .metadata()
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.workspace_id == receipt.workspace_id)
+        .ok_or_else(|| {
+            KinError::Other(format!(
+                "checkout projection workspace {} is absent",
+                receipt.workspace_id
+            ))
+        })?;
+    if workspace.generation != receipt.workspace_generation
+        || workspace.tree_hash != receipt.workspace_tree_hash
+    {
+        return Err(KinError::Other(format!(
+            "checkout projection workspace {} moved from generation/tree {}:{}",
+            receipt.workspace_id, receipt.workspace_generation, receipt.workspace_tree_hash
+        )));
+    }
+    Ok(())
 }
 
 /// Preserve control-plane and generated dependency/build directories during
@@ -278,6 +431,7 @@ pub fn reconcile_source_tree_and_commit_repository_transaction<'a, 'b>(
         || {},
         || {},
         Some(marker),
+        None,
         || commit_repository_transaction_exact(authority, transaction),
     )
     .map(|(_, receipt)| (materialized_count, receipt))
@@ -320,7 +474,182 @@ pub fn transition_repository_workspace_tree_and_commit_repository_transaction(
         || {},
         || {},
         || {},
+        None,
     )
+}
+
+/// Restore one exact repository path or component-aware subtree while
+/// publishing only its repository-v6 workspace mutation.
+///
+/// This is deliberately narrower than a branch transition. Filesystem drift
+/// at selected materialized members is overwritten transactionally, while
+/// unselected paths are neither validated nor mutated. The complete workspace
+/// tree still participates in the repository compare-and-swap, so selected
+/// graph-only members (Gitlinks and host-unrepresentable paths) remain exact
+/// authority even when this host cannot materialize them.
+pub fn checkout_repository_workspace_subtree_and_commit_repository_transaction(
+    root: &Path,
+    selected: &RepoPath,
+    previous_tree: &ResolvedTree,
+    target_tree: &ResolvedTree,
+    authority: &RepositoryAuthorityManager<LocalFileBackend>,
+    transaction: RepositoryTransaction,
+) -> Result<(usize, RepositoryCommitReceipt)> {
+    checkout_repository_workspace_subtree_and_commit_with_hooks(
+        root,
+        selected,
+        previous_tree,
+        target_tree,
+        authority,
+        transaction,
+        || {},
+        || {},
+        || {},
+    )
+}
+
+/// Test seam for exact selected-path namespace and authority races.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn checkout_repository_workspace_subtree_and_commit_with_hooks(
+    root: &Path,
+    selected: &RepoPath,
+    previous_tree: &ResolvedTree,
+    target_tree: &ResolvedTree,
+    authority: &RepositoryAuthorityManager<LocalFileBackend>,
+    transaction: RepositoryTransaction,
+    after_read_only_preflight: impl FnOnce(),
+    after_identity_revalidation: impl FnOnce(),
+    after_projection_mutation: impl FnOnce(),
+) -> Result<(usize, RepositoryCommitReceipt)> {
+    validate_checkout_repository_transaction(selected, previous_tree, target_tree, &transaction)?;
+    transition_repository_workspace_tree_and_commit_with_hooks(
+        root,
+        previous_tree,
+        target_tree,
+        authority,
+        transaction,
+        after_read_only_preflight,
+        after_identity_revalidation,
+        after_projection_mutation,
+        Some(selected),
+    )
+}
+
+/// Repair a selected derived projection when repository workspace authority
+/// already names the exact desired tree.
+///
+/// The repository authority is frozen only after the retained projection lock
+/// is held. A local authenticated receipt, not a fake repository mutation,
+/// becomes the WAL commit marker. This keeps graph truth unchanged while
+/// making crash recovery and caller-stable retries explicit.
+pub fn repair_repository_workspace_subtree_projection(
+    root: &Path,
+    tree: &ResolvedTree,
+    authority: &RepositoryAuthorityManager<LocalFileBackend>,
+    receipt: CheckoutProjectionReceipt,
+) -> Result<(usize, CheckoutProjectionReceipt)> {
+    repair_repository_workspace_subtree_projection_with_hooks(
+        root,
+        tree,
+        authority,
+        receipt,
+        || {},
+        || {},
+        || {},
+    )
+}
+
+/// Test seam for projection-only checkout races and rollback.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn repair_repository_workspace_subtree_projection_with_hooks(
+    root: &Path,
+    tree: &ResolvedTree,
+    authority: &RepositoryAuthorityManager<LocalFileBackend>,
+    receipt: CheckoutProjectionReceipt,
+    after_read_only_preflight: impl FnOnce(),
+    after_identity_revalidation: impl FnOnce(),
+    after_projection_mutation: impl FnOnce(),
+) -> Result<(usize, CheckoutProjectionReceipt)> {
+    receipt.validate()?;
+    let tree_hash =
+        compute_resolved_tree_hash(tree).map_err(|error| KinError::Other(error.to_string()))?;
+    if tree_hash != receipt.workspace_tree_hash {
+        return Err(KinError::Other(format!(
+            "checkout projection receipt names tree {}, but repair received {}",
+            receipt.workspace_tree_hash, tree_hash
+        )));
+    }
+    let owned = load_repository_projection_entries(authority, tree, "checkout workspace")?;
+    let entries = validated_source_entries(
+        owned
+            .iter()
+            .map(|entry| (&entry.path, entry.kind, entry.content.as_slice())),
+    )?;
+    validate_repository_projection_entries_match_tree("checkout", tree, &entries)?;
+    let committed = receipt.clone();
+    project_reconciled_source_tree_and_commit(
+        root,
+        &entries,
+        &entries,
+        &should_preserve_checkout_path,
+        ReconciledProjectionOptions {
+            open_mode: ProjectionOpenMode::ExistingFrozen,
+            graph_only_transition: Some(GraphOnlyWorkspaceTransition {
+                previous_tree: tree,
+                target_tree: tree,
+                scope: Some(&receipt.selected),
+            }),
+            checkout_scope: Some(&receipt.selected),
+            checkout_projection_authority: Some(CheckoutProjectionAuthority {
+                authority,
+                receipt: &receipt,
+            }),
+        },
+        after_read_only_preflight,
+        after_identity_revalidation,
+        after_projection_mutation,
+        None,
+        Some(receipt.clone()),
+        move || ProjectionAuthorityCommit::Committed(committed),
+    )
+}
+
+/// Recover any retained selected-checkout WAL and read its authenticated local
+/// receipt. Merely opening this boundary never creates projection control
+/// state.
+pub fn recover_checkout_projection_receipt(
+    root: &Path,
+    operation_id: OperationId,
+) -> Result<Option<CheckoutProjectionReceipt>> {
+    #[cfg(any(unix, windows))]
+    {
+        let freeze = ExactProjectionFreeze::acquire_existing_for_transition(root)?;
+        freeze
+            .projection
+            .load_checkout_projection_receipt(operation_id)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (root, operation_id);
+        Err(unsupported_safe_projection_error())
+    }
+}
+
+/// Recover any authenticated repository workspace projection transaction
+/// without starting a new mutation.
+pub fn recover_repository_workspace_projection(root: &Path) -> Result<()> {
+    #[cfg(any(unix, windows))]
+    {
+        let freeze = ExactProjectionFreeze::acquire_existing_for_transition(root)?;
+        freeze.revalidate_namespace()
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = root;
+        Err(unsupported_safe_projection_error())
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -333,6 +662,7 @@ fn transition_repository_workspace_tree_and_commit_with_hooks(
     after_read_only_preflight: impl FnOnce(),
     after_identity_revalidation: impl FnOnce(),
     after_projection_mutation: impl FnOnce(),
+    checkout_scope: Option<&RepoPath>,
 ) -> Result<(usize, RepositoryCommitReceipt)> {
     let previous_owned =
         load_repository_projection_entries(authority, previous_tree, "previous workspace")?;
@@ -356,7 +686,12 @@ fn transition_repository_workspace_tree_and_commit_with_hooks(
         &transaction,
         GraphOnlyTransitionPolicy::AllowExactMetadataTransition,
     )?;
-    let materialized_count = entries.len();
+    let materialized_count = checkout_scope.map_or(entries.len(), |scope| {
+        entries
+            .iter()
+            .filter(|entry| repository_path_is_same_or_descendant(entry.file_id, scope))
+            .count()
+    });
     let marker = ReconciliationAuthorityCommit {
         repository_id: transaction.repository_id.clone(),
         operation_id: transaction.operation_id,
@@ -374,15 +709,86 @@ fn transition_repository_workspace_tree_and_commit_with_hooks(
             graph_only_transition: Some(GraphOnlyWorkspaceTransition {
                 previous_tree,
                 target_tree,
+                scope: checkout_scope,
             }),
+            checkout_scope,
+            checkout_projection_authority: None,
         },
         after_read_only_preflight,
         after_identity_revalidation,
         after_projection_mutation,
         Some(marker),
+        None,
         || commit_repository_transaction_exact(authority, transaction),
     )
     .map(|(_, receipt)| (materialized_count, receipt))
+}
+
+fn validate_checkout_repository_transaction(
+    selected: &RepoPath,
+    previous_tree: &ResolvedTree,
+    target_tree: &ResolvedTree,
+    transaction: &RepositoryTransaction,
+) -> Result<()> {
+    if !transaction.external_objects.is_empty()
+        || transaction.git_authority_delta.is_some()
+        || !transaction.changes.is_empty()
+        || !transaction.aliases.is_empty()
+        || !transaction.ref_mutations.is_empty()
+        || transaction.default_ref_mutation.is_some()
+        || transaction.local_overlay_delta.is_some()
+    {
+        return Err(KinError::Other(
+            "exact checkout transaction must mutate only one repository workspace".to_string(),
+        ));
+    }
+    let mutation = transaction.workspace_mutation.as_ref().ok_or_else(|| {
+        KinError::Other("exact checkout transaction requires one workspace mutation".to_string())
+    })?;
+    let WorkspaceExpectation::MustEqual {
+        head,
+        base_target,
+        base_tree_hash,
+        admission_policy,
+        ..
+    } = &mutation.expected
+    else {
+        return Err(KinError::Other(
+            "exact checkout requires an existing workspace compare-and-swap".to_string(),
+        ));
+    };
+    if mutation.new_head != *head
+        || mutation.new_base_target != *base_target
+        || mutation.new_base_tree_hash != *base_tree_hash
+        || mutation.new_admission_policy != *admission_policy
+    {
+        return Err(KinError::Other(
+            "exact checkout must leave workspace head, base, and admission policy unchanged"
+                .to_string(),
+        ));
+    }
+
+    for artifact in previous_tree.artifacts_by_path() {
+        if !repository_path_is_same_or_descendant(&artifact.path, selected)
+            && target_tree.get(&artifact.artifact_id) != Some(artifact)
+        {
+            return Err(KinError::Other(format!(
+                "exact checkout changed unselected repository member {}",
+                artifact.path
+            )));
+        }
+    }
+    for artifact in target_tree.artifacts_by_path() {
+        if !repository_path_is_same_or_descendant(&artifact.path, selected)
+            && previous_tree.get(&artifact.artifact_id) != Some(artifact)
+        {
+            return Err(KinError::Other(format!(
+                "exact checkout added or moved unselected repository member {}",
+                artifact.path
+            )));
+        }
+    }
+    Ok(())
 }
 
 struct OwnedProjectionSourceEntry {
@@ -2613,6 +3019,16 @@ fn repository_commit_error_is_definitely_prepublication(error: &kin_db::KinDbErr
             | kin_db::KinDbError::IndexError(_)
             | kin_db::KinDbError::ConcurrentAccessError(_)
             | kin_db::KinDbError::SliceConversionError(_)
+    ) || matches!(
+        error,
+        // LocalFileBackend currently exposes its compare-and-swap miss
+        // through StorageError. The backend has read a
+        // different generation and returns before publishing candidate bytes,
+        // so this one exact storage outcome is determinate and the projection
+        // WAL must roll back. Other storage failures remain indeterminate.
+        kin_db::KinDbError::StorageError(message)
+            if message.starts_with("generation mismatch for repo ")
+                && message.ends_with("(another writer committed since last load)")
     )
 }
 
@@ -3114,6 +3530,7 @@ fn project_reconciled_source_tree(
         after_identity_revalidation,
         || {},
         None,
+        None,
         || ProjectionAuthorityCommit::Committed(()),
     )
     .map(|(count, ())| count)
@@ -3129,12 +3546,15 @@ enum ProjectionOpenMode {
 struct GraphOnlyWorkspaceTransition<'a> {
     previous_tree: &'a ResolvedTree,
     target_tree: &'a ResolvedTree,
+    scope: Option<&'a RepoPath>,
 }
 
 #[derive(Clone, Copy)]
 struct ReconciledProjectionOptions<'a> {
     open_mode: ProjectionOpenMode,
     graph_only_transition: Option<GraphOnlyWorkspaceTransition<'a>>,
+    checkout_scope: Option<&'a RepoPath>,
+    checkout_projection_authority: Option<CheckoutProjectionAuthority<'a>>,
 }
 
 impl Default for ReconciledProjectionOptions<'_> {
@@ -3142,8 +3562,16 @@ impl Default for ReconciledProjectionOptions<'_> {
         Self {
             open_mode: ProjectionOpenMode::CreateOrOpen,
             graph_only_transition: None,
+            checkout_scope: None,
+            checkout_projection_authority: None,
         }
     }
+}
+
+#[derive(Clone, Copy)]
+struct CheckoutProjectionAuthority<'a> {
+    authority: &'a RepositoryAuthorityManager<LocalFileBackend>,
+    receipt: &'a CheckoutProjectionReceipt,
 }
 
 #[cfg(any(unix, windows))]
@@ -3162,11 +3590,26 @@ struct VerifiedGraphOnlyState {
 }
 
 #[cfg(any(unix, windows))]
+enum PreviousProjectionState {
+    Exact {
+        identity: TrackedEntryIdentity,
+    },
+    CheckoutAbsent,
+    CheckoutObject {
+        relative: PathBuf,
+        kind: ExistingObjectKind,
+        identity: TrackedEntryIdentity,
+        state: TrackedObjectState,
+    },
+}
+
+#[cfg(any(unix, windows))]
 impl GraphOnlyWorkspaceTransitionVerification {
     fn verify(
         projection: &ProjectionRoot,
         previous_tree: &ResolvedTree,
         target_tree: &ResolvedTree,
+        scope: Option<&RepoPath>,
     ) -> Result<Self> {
         validate_projection_proof_paths(
             previous_tree
@@ -3185,6 +3628,11 @@ impl GraphOnlyWorkspaceTransitionVerification {
         let mut must_create_directories = HashSet::new();
 
         for artifact in previous_tree.artifacts_by_path() {
+            if scope
+                .is_some_and(|scope| !repository_path_is_same_or_descendant(&artifact.path, scope))
+            {
+                continue;
+            }
             let disposition = source_projection_disposition(&artifact.path, artifact.entry)?;
             if disposition == SourceProjectionDisposition::Materialized {
                 continue;
@@ -3225,6 +3673,11 @@ impl GraphOnlyWorkspaceTransitionVerification {
         }
 
         for artifact in target_tree.artifacts_by_path() {
+            if scope
+                .is_some_and(|scope| !repository_path_is_same_or_descendant(&artifact.path, scope))
+            {
+                continue;
+            }
             let disposition = source_projection_disposition(&artifact.path, artifact.entry)?;
             if disposition == SourceProjectionDisposition::Materialized {
                 continue;
@@ -3351,14 +3804,16 @@ fn tree_has_related_repository_path(tree: &ResolvedTree, path: &RepoPath) -> boo
 }
 
 fn repository_paths_are_related(left: &RepoPath, right: &RepoPath) -> bool {
-    fn is_same_or_descendant(path: &[u8], ancestor: &[u8]) -> bool {
-        path == ancestor
-            || path
-                .strip_prefix(ancestor)
-                .is_some_and(|suffix| suffix.starts_with(b"/"))
-    }
-    is_same_or_descendant(left.as_bytes(), right.as_bytes())
-        || is_same_or_descendant(right.as_bytes(), left.as_bytes())
+    repository_path_is_same_or_descendant(left, right)
+        || repository_path_is_same_or_descendant(right, left)
+}
+
+fn repository_path_is_same_or_descendant(path: &RepoPath, ancestor: &RepoPath) -> bool {
+    path == ancestor
+        || path
+            .as_bytes()
+            .strip_prefix(ancestor.as_bytes())
+            .is_some_and(|suffix| suffix.starts_with(b"/"))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3372,6 +3827,7 @@ fn project_reconciled_source_tree_and_commit<T>(
     after_identity_revalidation: impl FnOnce(),
     after_projection_mutation: impl FnOnce(),
     authority_commit: Option<ReconciliationAuthorityCommit>,
+    checkout_projection_commit: Option<CheckoutProjectionReceipt>,
     commit: impl FnOnce() -> ProjectionAuthorityCommit<T>,
 ) -> Result<(usize, T)> {
     #[cfg(any(unix, windows))]
@@ -3391,6 +3847,49 @@ fn project_reconciled_source_tree_and_commit<T>(
             .map(|freeze| &freeze.projection)
             .or(opened.as_ref())
             .expect("one projection authority is open");
+        let checkout_scope = options.checkout_scope;
+        let _checkout_authority_freeze = options
+            .checkout_projection_authority
+            .map(|binding| {
+                let frozen = binding
+                    .authority
+                    .freeze_current_authority(&binding.receipt.authority_roots)
+                    .map_err(|error| {
+                        KinError::Other(format!(
+                            "freeze checkout projection authority at generation {}: {error}",
+                            binding.receipt.authority_roots.generation
+                        ))
+                    })?;
+                validate_checkout_projection_workspace(frozen.authority(), binding.receipt)?;
+                Ok::<_, KinError>(frozen)
+            })
+            .transpose()?;
+        if let Some(expected) = &checkout_projection_commit {
+            if let Some(installed) =
+                projection.load_checkout_projection_receipt(expected.operation_id)?
+            {
+                if installed != *expected {
+                    return Err(KinError::Other(format!(
+                        "checkout operation {} was already completed for a different projection request",
+                        expected.operation_id
+                    )));
+                }
+                return commit().into_result().map(|committed| (0, committed));
+            }
+        }
+        if checkout_scope.is_some() {
+            if let Some(marker) = &authority_commit {
+                if projection
+                    .load_checkout_projection_receipt(marker.operation_id)?
+                    .is_some()
+                {
+                    return Err(KinError::Other(format!(
+                        "repository operation {} was already consumed by a projection-only checkout",
+                        marker.operation_id
+                    )));
+                }
+            }
+        }
         let graph_only_verification = options
             .graph_only_transition
             .map(|transition| {
@@ -3398,10 +3897,15 @@ fn project_reconciled_source_tree_and_commit<T>(
                     projection,
                     transition.previous_tree,
                     transition.target_tree,
+                    transition.scope,
                 )
             })
             .transpose()?;
-        let requires_complete_target_revalidation = authority_commit.is_some();
+        let requires_target_revalidation =
+            authority_commit.is_some() || checkout_projection_commit.is_some();
+        let is_selected = |path: &RepoPath| {
+            checkout_scope.is_some_and(|scope| repository_path_is_same_or_descendant(path, scope))
+        };
         let previous =
             TrackedPathClassifier::new(previous_entries.iter().map(|entry| entry.file_id))?;
         let target = TrackedPathClassifier::new(entries.iter().map(|entry| entry.file_id))?;
@@ -3414,9 +3918,12 @@ fn project_reconciled_source_tree_and_commit<T>(
         let affected_previous: Vec<_> = previous_entries
             .iter()
             .filter(|previous_entry| {
-                target_by_path
-                    .get(previous_entry.file_id)
-                    .is_none_or(|target_entry| !source_entries_match(previous_entry, target_entry))
+                is_selected(previous_entry.file_id)
+                    || target_by_path
+                        .get(previous_entry.file_id)
+                        .is_none_or(|target_entry| {
+                            !source_entries_match(previous_entry, target_entry)
+                        })
             })
             .collect();
         let mut removed_file_ids = Vec::new();
@@ -3432,11 +3939,12 @@ fn project_reconciled_source_tree_and_commit<T>(
             .iter()
             .copied()
             .filter(|target_entry| {
-                previous_by_path
-                    .get(target_entry.file_id)
-                    .is_none_or(|previous_entry| {
-                        !source_entries_match(previous_entry, target_entry)
-                    })
+                is_selected(target_entry.file_id)
+                    || previous_by_path
+                        .get(target_entry.file_id)
+                        .is_none_or(|previous_entry| {
+                            !source_entries_match(previous_entry, target_entry)
+                        })
             })
             .collect();
 
@@ -3449,10 +3957,14 @@ fn project_reconciled_source_tree_and_commit<T>(
         // path. Otherwise an unchanged-but-locally-edited file could survive
         // while the workspace transaction declares the exact target tree
         // clean, making the physical projection lie about graph authority.
-        let preflight_previous = if authority_commit.is_some() {
+        let preflight_previous = if authority_commit.is_some() && checkout_scope.is_none() {
             previous_entries.iter().collect::<Vec<_>>()
         } else {
-            affected_previous.clone()
+            affected_previous
+                .iter()
+                .copied()
+                .filter(|entry| !is_selected(entry.file_id))
+                .collect::<Vec<_>>()
         };
         let preflight_identities =
             projection.validate_tracked_entries_unchanged(&preflight_previous)?;
@@ -3461,15 +3973,25 @@ fn project_reconciled_source_tree_and_commit<T>(
             .zip(&preflight_identities)
             .map(|(entry, identity)| (entry.file_id, *identity))
             .collect::<HashMap<_, _>>();
-        let previous_identities = affected_previous
+        let previous_states = affected_previous
             .iter()
             .map(|entry| {
-                identity_by_path
-                    .get(entry.file_id)
-                    .copied()
-                    .expect("affected entry was included in exact-source preflight")
+                if is_selected(entry.file_id) {
+                    projection.inspect_checkout_previous_entry(entry.file_id)
+                } else {
+                    identity_by_path
+                        .get(entry.file_id)
+                        .copied()
+                        .map(|identity| PreviousProjectionState::Exact { identity })
+                        .ok_or_else(|| {
+                            KinError::Other(format!(
+                                "affected exact-source path {} was omitted from preflight",
+                                entry.file_id
+                            ))
+                        })
+                }
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>>>()?;
         projection.validate_reconciliation_targets(&entries_to_materialize, &previous, &removed)?;
 
         let mut files_to_delete = Vec::with_capacity(removed_file_ids.len());
@@ -3568,6 +4090,11 @@ fn project_reconciled_source_tree_and_commit<T>(
         }
         projection
             .revalidate_tracked_entries_unchanged(&preflight_previous, &preflight_identities)?;
+        for (entry, state) in affected_previous.iter().zip(&previous_states) {
+            if is_selected(entry.file_id) {
+                projection.revalidate_checkout_previous_entry(entry.file_id, state)?;
+            }
+        }
         for (relative, expected_identity) in &directory_identities {
             let actual = projection.relative_directory_identity(relative)?;
             if actual != Some(*expected_identity) {
@@ -3586,8 +4113,10 @@ fn project_reconciled_source_tree_and_commit<T>(
         // Stage every target object before the first destructive namespace
         // operation. The transaction directory is retained until either all
         // publications succeed or every displaced old object is restored.
-        let mut transaction =
-            projection.create_reconciliation_transaction_with_authority_commit(authority_commit)?;
+        let mut transaction = projection.create_reconciliation_transaction_with_commit_markers(
+            authority_commit,
+            checkout_projection_commit.clone(),
+        )?;
         let staged = match projection
             .stage_reconciliation_entries(&transaction.directory, &entries_to_materialize)
         {
@@ -3605,13 +4134,16 @@ fn project_reconciled_source_tree_and_commit<T>(
             .iter()
             .map(|staged| (staged.entry.file_id, staged.identity))
             .collect::<HashMap<_, _>>();
-        let target_entry_refs = if requires_complete_target_revalidation {
-            entries.iter().collect::<Vec<_>>()
+        let target_entry_refs = if requires_target_revalidation {
+            entries
+                .iter()
+                .filter(|entry| checkout_scope.is_none() || is_selected(entry.file_id))
+                .collect::<Vec<_>>()
         } else {
             Vec::new()
         };
-        let target_identities = if requires_complete_target_revalidation {
-            entries
+        let target_identities = if requires_target_revalidation {
+            target_entry_refs
                 .iter()
                 .map(|entry| {
                     previous_by_path
@@ -3653,17 +4185,34 @@ fn project_reconciled_source_tree_and_commit<T>(
             .unwrap_or(&empty_must_create_directories);
 
         let mutation_result: Result<()> = (|| {
-            for (name_index, (entry, identity)) in affected_previous
-                .iter()
-                .zip(&previous_identities)
-                .enumerate()
+            for (name_index, (entry, state)) in
+                affected_previous.iter().zip(&previous_states).enumerate()
             {
-                projection.displace_previous_entry(
-                    &mut transaction,
-                    **entry,
-                    *identity,
-                    name_index,
-                )?;
+                match state {
+                    PreviousProjectionState::Exact { identity } => projection
+                        .displace_previous_entry(
+                            &mut transaction,
+                            **entry,
+                            *identity,
+                            name_index,
+                        )?,
+                    PreviousProjectionState::CheckoutAbsent => {}
+                    PreviousProjectionState::CheckoutObject {
+                        relative,
+                        kind,
+                        identity,
+                        state,
+                    } => projection.back_up_existing_object(
+                        &mut transaction,
+                        &PlannedExistingObject {
+                            relative: relative.clone(),
+                            kind: *kind,
+                            identity: *identity,
+                            state: *state,
+                        },
+                        name_index,
+                    )?,
+                }
             }
 
             for relative in &directories_to_replace {
@@ -3696,7 +4245,7 @@ fn project_reconciled_source_tree_and_commit<T>(
                 }
             }
             after_projection_mutation();
-            if requires_complete_target_revalidation {
+            if requires_target_revalidation {
                 projection
                     .revalidate_tracked_entries_unchanged(&target_entry_refs, &target_identities)?;
             }
@@ -3755,11 +4304,23 @@ fn project_reconciled_source_tree_and_commit<T>(
             }
         };
 
+        if let Some(receipt) = &checkout_projection_commit {
+            if let Err(error) = projection.persist_checkout_projection_receipt(receipt) {
+                let installed =
+                    projection.load_checkout_projection_receipt(receipt.operation_id)?;
+                if installed.as_ref() != Some(receipt) {
+                    return Err(KinError::Other(format!(
+                        "{error}; exact projection and authenticated recovery WAL were retained because local checkout receipt publication is uncertain"
+                    )));
+                }
+            }
+        }
+
         projection
             .cleanup_reconciliation_transaction(transaction)
             .map_err(|error| {
                 KinError::Other(format!(
-                    "repository authority committed but exact-source transaction cleanup failed; \
+                    "exact projection commit marker was installed but transaction cleanup failed; \
                      recovery will finalize the committed projection: {error}"
                 ))
             })?;
@@ -3778,6 +4339,7 @@ fn project_reconciled_source_tree_and_commit<T>(
             after_identity_revalidation,
             after_projection_mutation,
             authority_commit,
+            checkout_projection_commit,
             commit,
         );
         Err(unsupported_safe_projection_error())
@@ -3940,6 +4502,8 @@ struct ReconciliationManifest {
     control_identity: TrackedEntryIdentity,
     transaction_identity: TrackedEntryIdentity,
     authority_commit: Option<ReconciliationAuthorityCommit>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    checkout_projection_commit: Option<CheckoutProjectionReceipt>,
     state: ReconciliationTransactionState,
     actions: Vec<ReconciliationRecoveryAction>,
 }
@@ -3972,6 +4536,14 @@ struct AuthenticatedReconciliationAction {
     sequence: u64,
     previous_authentication: Vec<u8>,
     action: ReconciliationRecoveryAction,
+    authentication: Vec<u8>,
+}
+
+#[cfg(any(unix, windows))]
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct AuthenticatedCheckoutProjectionReceipt {
+    receipt: CheckoutProjectionReceipt,
     authentication: Vec<u8>,
 }
 
@@ -5956,13 +6528,20 @@ impl ProjectionRoot {
     }
 
     fn create_reconciliation_transaction(&self) -> Result<ReconciliationTransaction> {
-        self.create_reconciliation_transaction_with_authority_commit(None)
+        self.create_reconciliation_transaction_with_commit_markers(None, None)
     }
 
-    fn create_reconciliation_transaction_with_authority_commit(
+    fn create_reconciliation_transaction_with_commit_markers(
         &self,
         authority_commit: Option<ReconciliationAuthorityCommit>,
+        checkout_projection_commit: Option<CheckoutProjectionReceipt>,
     ) -> Result<ReconciliationTransaction> {
+        if authority_commit.is_some() && checkout_projection_commit.is_some() {
+            return Err(KinError::Other(
+                "one projection WAL cannot mix repository and local checkout commit markers"
+                    .to_string(),
+            ));
+        }
         self.revalidate_projection_lock()?;
         for _ in 0..8 {
             let id = uuid::Uuid::new_v4().to_string();
@@ -6000,6 +6579,7 @@ impl ProjectionRoot {
                             control_identity: self.control_identity,
                             transaction_identity: identity,
                             authority_commit: authority_commit.clone(),
+                            checkout_projection_commit: checkout_projection_commit.clone(),
                             state: ReconciliationTransactionState::Pending,
                             actions: Vec::new(),
                         },
@@ -6213,6 +6793,227 @@ impl ProjectionRoot {
             )));
         }
         Ok(true)
+    }
+
+    fn checkout_projection_receipt_name(operation_id: OperationId) -> OsString {
+        OsString::from(format!(
+            "{CHECKOUT_PROJECTION_RECEIPT_PREFIX}{}.json",
+            operation_id
+        ))
+    }
+
+    fn authenticate_checkout_projection_receipt(
+        &self,
+        receipt: &CheckoutProjectionReceipt,
+    ) -> Result<Vec<u8>> {
+        receipt.validate()?;
+        let encoded = serde_json::to_vec(receipt).map_err(|error| {
+            KinError::Other(format!("encode checkout projection receipt: {error}"))
+        })?;
+        let mut authenticated = b"kin.checkout-projection-receipt.v1\0".to_vec();
+        authenticated.extend_from_slice(&encoded);
+        Ok(reconciliation_hmac(&self.authority_key, &authenticated).to_vec())
+    }
+
+    fn load_checkout_projection_receipt(
+        &self,
+        operation_id: OperationId,
+    ) -> Result<Option<CheckoutProjectionReceipt>> {
+        let name = Self::checkout_projection_receipt_name(operation_id);
+        let display = self.reconciliation_control_path().join(&name);
+        let file = match open_reconciliation_control_file(&self.control, &name) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(KinError::io(&display, error)),
+        };
+        let metadata = file
+            .metadata()
+            .map_err(|error| KinError::io(&display, error))?;
+        if metadata.len() > MAX_CHECKOUT_PROJECTION_RECEIPT_BYTES {
+            return Err(KinError::Other(format!(
+                "checkout projection receipt {} exceeds {} KiB",
+                display.display(),
+                MAX_CHECKOUT_PROJECTION_RECEIPT_BYTES / 1024
+            )));
+        }
+        let mut bytes = Vec::new();
+        file.take(MAX_CHECKOUT_PROJECTION_RECEIPT_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| KinError::io(&display, error))?;
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_CHECKOUT_PROJECTION_RECEIPT_BYTES {
+            return Err(KinError::Other(format!(
+                "checkout projection receipt {} exceeds its read bound",
+                display.display()
+            )));
+        }
+        let authenticated: AuthenticatedCheckoutProjectionReceipt = serde_json::from_slice(&bytes)
+            .map_err(|error| {
+                KinError::Other(format!(
+                    "decode checkout projection receipt {}: {error}",
+                    display.display()
+                ))
+            })?;
+        if authenticated.receipt.operation_id != operation_id {
+            return Err(KinError::Other(format!(
+                "checkout projection receipt {} has the wrong operation identity",
+                display.display()
+            )));
+        }
+        let expected = self.authenticate_checkout_projection_receipt(&authenticated.receipt)?;
+        let valid = authenticated.authentication.len() == expected.len()
+            && authenticated
+                .authentication
+                .iter()
+                .zip(&expected)
+                .fold(0_u8, |difference, (actual, expected)| {
+                    difference | (*actual ^ *expected)
+                })
+                == 0;
+        if !valid {
+            return Err(KinError::Other(format!(
+                "checkout projection receipt {} failed authentication",
+                display.display()
+            )));
+        }
+        Ok(Some(authenticated.receipt))
+    }
+
+    fn persist_checkout_projection_receipt(
+        &self,
+        receipt: &CheckoutProjectionReceipt,
+    ) -> Result<()> {
+        receipt.validate()?;
+        if let Some(existing) = self.load_checkout_projection_receipt(receipt.operation_id)? {
+            if existing == *receipt {
+                return Ok(());
+            }
+            return Err(KinError::Other(format!(
+                "checkout operation {} already has a different projection receipt",
+                receipt.operation_id
+            )));
+        }
+        let authenticated = AuthenticatedCheckoutProjectionReceipt {
+            receipt: receipt.clone(),
+            authentication: self.authenticate_checkout_projection_receipt(receipt)?,
+        };
+        let bytes = serde_json::to_vec(&authenticated).map_err(|error| {
+            KinError::Other(format!(
+                "encode authenticated checkout projection receipt: {error}"
+            ))
+        })?;
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_CHECKOUT_PROJECTION_RECEIPT_BYTES {
+            return Err(KinError::Other(format!(
+                "checkout projection receipt exceeds {} KiB",
+                MAX_CHECKOUT_PROJECTION_RECEIPT_BYTES / 1024
+            )));
+        }
+        let name = Self::checkout_projection_receipt_name(receipt.operation_id);
+        let display = self.reconciliation_control_path().join(&name);
+        let temporary = OsString::from(format!(".checkout-receipt-{}.tmp", uuid::Uuid::new_v4()));
+        let mut options = cap_std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        let mut file = self
+            .control
+            .open_with(&temporary, &options)
+            .map_err(|error| KinError::io(&display, error))?;
+        #[cfg(unix)]
+        rustix::fs::fchmod(&file, rustix::fs::Mode::from_raw_mode(0o600))
+            .map_err(|error| KinError::io(&display, error.into()))?;
+        if let Err(error) = file
+            .write_all(&bytes)
+            .and_then(|()| file.sync_all())
+            .map_err(|error| KinError::io(&display, error))
+        {
+            drop(file);
+            let _ = self.control.remove_file(&temporary);
+            return Err(error);
+        }
+        if let Err(error) = self.control.hard_link(&temporary, &self.control, &name) {
+            drop(file);
+            let _ = self.control.remove_file(&temporary);
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                let existing = self
+                    .load_checkout_projection_receipt(receipt.operation_id)?
+                    .ok_or_else(|| {
+                        KinError::Other(format!(
+                            "checkout receipt {} appeared and disappeared during publication",
+                            display.display()
+                        ))
+                    })?;
+                if existing == *receipt {
+                    return Ok(());
+                }
+            }
+            return Err(KinError::io(&display, error));
+        }
+        drop(file);
+        sync_directory_capability(&self.control, &display)?;
+        self.control
+            .remove_file(&temporary)
+            .map_err(|error| KinError::io(&display, error))?;
+        sync_directory_capability(&self.control, &display)?;
+        let installed = self
+            .load_checkout_projection_receipt(receipt.operation_id)?
+            .ok_or_else(|| {
+                KinError::Other(format!(
+                    "checkout projection receipt {} disappeared after publication",
+                    display.display()
+                ))
+            })?;
+        if installed != *receipt {
+            return Err(KinError::Other(format!(
+                "checkout projection receipt {} changed after publication",
+                display.display()
+            )));
+        }
+        Ok(())
+    }
+
+    fn checkout_projection_commit_is_installed(
+        &self,
+        marker: &CheckoutProjectionReceipt,
+    ) -> Result<bool> {
+        let Some(installed) = self.load_checkout_projection_receipt(marker.operation_id)? else {
+            return Ok(false);
+        };
+        if installed != *marker {
+            return Err(KinError::Other(format!(
+                "checkout operation {} exists with a different projection identity during recovery",
+                marker.operation_id
+            )));
+        }
+        self.validate_checkout_projection_authority(marker)?;
+        Ok(true)
+    }
+
+    fn validate_checkout_projection_authority(
+        &self,
+        marker: &CheckoutProjectionReceipt,
+    ) -> Result<()> {
+        let authority_kindb = self.repository_authority_kindb.as_ref().ok_or_else(|| {
+            KinError::Other(format!(
+                "session projection recovery at {} unexpectedly contains a checkout authority marker",
+                self.display_root.display()
+            ))
+        })?;
+        let manager = RepositoryAuthorityManager::open(
+            marker.repository_id.clone(),
+            Arc::new(LocalFileBackend::new(authority_kindb)),
+        )
+        .map_err(|error| {
+            KinError::Other(format!(
+                "open repository authority while validating checkout projection: {error}"
+            ))
+        })?;
+        let frozen = manager
+            .freeze_current_authority(&marker.authority_roots)
+            .map_err(|error| {
+                KinError::Other(format!(
+                    "freeze checkout projection authority at generation {}: {error}",
+                    marker.authority_roots.generation
+                ))
+            })?;
+        validate_checkout_projection_workspace(frozen.authority(), marker)
     }
 
     fn authenticate_reconciliation_manifest(
@@ -6651,6 +7452,7 @@ impl ProjectionRoot {
                             control_identity: self.control_identity,
                             transaction_identity: identity,
                             authority_commit: None,
+                            checkout_projection_commit: None,
                             state: ReconciliationTransactionState::Pending,
                             actions: Vec::new(),
                         },
@@ -6696,7 +7498,11 @@ impl ProjectionRoot {
                 Some(marker) => self.repository_authority_commit_is_installed(marker)?,
                 None => false,
             };
-            if authority_committed {
+            let checkout_committed = match &manifest.checkout_projection_commit {
+                Some(marker) => self.checkout_projection_commit_is_installed(marker)?,
+                None => false,
+            };
+            if authority_committed || checkout_committed {
                 let transaction = ReconciliationTransaction {
                     name,
                     directory,
@@ -7874,6 +8680,154 @@ impl ProjectionRoot {
             .iter()
             .map(|entry| self.validate_tracked_entry_unchanged(entry))
             .collect()
+    }
+
+    fn inspect_checkout_previous_entry(
+        &self,
+        file_id: &RepoPath,
+    ) -> Result<PreviousProjectionState> {
+        let path = projection_path(file_id)?;
+        let components = validate_source_path(path)?;
+        let mut parent = self.clone_root()?;
+        let mut relative = PathBuf::new();
+        for component in &components[..components.len() - 1] {
+            relative.push(component);
+            match parent.symlink_metadata(component) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(PreviousProjectionState::CheckoutAbsent);
+                }
+                Err(error) => {
+                    return Err(KinError::io(self.display_root.join(&relative), error));
+                }
+                Ok(metadata) if metadata.is_dir() && !metadata_is_reparse(&metadata) => {
+                    parent = self.open_existing_directory(
+                        &parent,
+                        std::ffi::OsStr::new(*component),
+                        &relative,
+                    )?;
+                }
+                Ok(_) => {
+                    return Err(KinError::Other(format!(
+                        "selected checkout path {} is blocked by a non-directory working-copy ancestor {}; select that ancestor explicitly",
+                        file_id,
+                        self.display_root.join(&relative).display()
+                    )));
+                }
+            }
+        }
+
+        relative.push(components[components.len() - 1]);
+        let name = std::ffi::OsStr::new(components[components.len() - 1]);
+        let metadata = match parent.symlink_metadata(name) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(PreviousProjectionState::CheckoutAbsent);
+            }
+            Err(error) => return Err(KinError::io(self.display_root.join(&relative), error)),
+            Ok(metadata) => metadata,
+        };
+        if metadata.is_dir() && !metadata_is_reparse(&metadata) {
+            return Err(KinError::Other(format!(
+                "selected tracked checkout path {} became a real directory; refusing to remove possibly untracked descendants",
+                self.display_root.join(&relative).display()
+            )));
+        }
+        let kind = if metadata_is_reparse(&metadata) {
+            ExistingObjectKind::Symlink
+        } else if metadata.is_file() {
+            ExistingObjectKind::File
+        } else {
+            return Err(KinError::Other(format!(
+                "selected checkout path {} has an unsupported working-copy object kind",
+                self.display_root.join(&relative).display()
+            )));
+        };
+        let (identity, state) = self.inspect_named_existing_object(
+            &parent,
+            name,
+            kind,
+            &self.display_root.join(&relative),
+        )?;
+        Ok(PreviousProjectionState::CheckoutObject {
+            relative,
+            kind,
+            identity,
+            state,
+        })
+    }
+
+    fn revalidate_checkout_previous_entry(
+        &self,
+        file_id: &RepoPath,
+        expected: &PreviousProjectionState,
+    ) -> Result<()> {
+        match expected {
+            PreviousProjectionState::Exact { .. } => Err(KinError::Other(
+                "selected checkout path was paired with an exact-only preflight".to_string(),
+            )),
+            PreviousProjectionState::CheckoutAbsent => {
+                let path = projection_path(file_id)?;
+                let components = validate_source_path(path)?;
+                let mut parent = self.clone_root()?;
+                let mut relative = PathBuf::new();
+                for component in &components[..components.len() - 1] {
+                    relative.push(component);
+                    match parent.symlink_metadata(component) {
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                        Err(error) => {
+                            return Err(KinError::io(self.display_root.join(&relative), error));
+                        }
+                        Ok(metadata) if metadata.is_dir() && !metadata_is_reparse(&metadata) => {
+                            parent = self.open_existing_directory(
+                                &parent,
+                                std::ffi::OsStr::new(*component),
+                                &relative,
+                            )?;
+                        }
+                        Ok(_) => {
+                            return Err(KinError::Other(format!(
+                                "working-copy ancestor {} appeared after selected checkout preflight",
+                                self.display_root.join(&relative).display()
+                            )));
+                        }
+                    }
+                }
+                let name = std::ffi::OsStr::new(components[components.len() - 1]);
+                match parent.symlink_metadata(name) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    Err(error) => Err(KinError::io(self.display_root.join(path), error)),
+                    Ok(_) => Err(KinError::Other(format!(
+                        "working-copy path {} appeared after selected checkout preflight",
+                        self.display_root.join(path).display()
+                    ))),
+                }
+            }
+            PreviousProjectionState::CheckoutObject {
+                relative,
+                kind,
+                identity,
+                state,
+            } => {
+                let path = relative.to_str().ok_or_else(|| {
+                    KinError::Other(format!("selected checkout path is not UTF-8: {relative:?}"))
+                })?;
+                let components = validate_source_path(path)?;
+                let parent = self.open_existing_parent(&components)?;
+                let name = std::ffi::OsStr::new(components[components.len() - 1]);
+                let (actual_identity, actual_state) = self.inspect_named_existing_object(
+                    &parent,
+                    name,
+                    *kind,
+                    &self.display_root.join(relative),
+                )?;
+                if actual_identity != *identity || actual_state != *state {
+                    return Err(KinError::Other(format!(
+                        "selected working-copy path {} changed after exact checkout preflight",
+                        self.display_root.join(relative).display()
+                    )));
+                }
+                Ok(())
+            }
+        }
     }
 
     fn revalidate_tracked_entries_unchanged(
@@ -10593,6 +11547,20 @@ mod tests {
         .unwrap()
     }
 
+    #[test]
+    fn local_generation_cas_miss_is_definitely_prepublication() {
+        let conflict = kin_db::KinDbError::StorageError(
+            "generation mismatch for repo repository: expected 7, found 8 (another writer committed since last load)"
+                .to_string(),
+        );
+        assert!(repository_commit_error_is_definitely_prepublication(
+            &conflict
+        ));
+        assert!(!repository_commit_error_is_definitely_prepublication(
+            &kin_db::KinDbError::StorageError("disk synchronization failed".to_string())
+        ));
+    }
+
     #[cfg(unix)]
     enum ExistingGitFixture {
         None,
@@ -10927,11 +11895,15 @@ mod tests {
                     graph_only_transition: Some(GraphOnlyWorkspaceTransition {
                         previous_tree: previous,
                         target_tree: target,
+                        scope: None,
                     }),
+                    checkout_scope: None,
+                    checkout_projection_authority: None,
                 },
                 || {},
                 || {},
                 || {},
+                None,
                 None,
                 || ProjectionAuthorityCommit::Committed(()),
             )
@@ -10969,11 +11941,15 @@ mod tests {
                     graph_only_transition: Some(GraphOnlyWorkspaceTransition {
                         previous_tree: previous,
                         target_tree: target,
+                        scope: None,
                     }),
+                    checkout_scope: None,
+                    checkout_projection_authority: None,
                 },
                 || {},
                 || {},
                 || {},
+                None,
                 None,
                 || ProjectionAuthorityCommit::Committed(()),
             )
@@ -11008,7 +11984,10 @@ mod tests {
                 graph_only_transition: Some(GraphOnlyWorkspaceTransition {
                     previous_tree: &empty,
                     target_tree: &target,
+                    scope: None,
                 }),
+                checkout_scope: None,
+                checkout_projection_authority: None,
             },
             || {
                 std::fs::create_dir(root.path().join("vendor")).unwrap();
@@ -11016,6 +11995,7 @@ mod tests {
             },
             || {},
             || {},
+            None,
             None,
             || {
                 committed.set(true);
@@ -11050,7 +12030,7 @@ mod tests {
         let target_path = repo_path("vendor/runtime/src/lib.rs");
         let target = exact_tree(&target_path, exact_blob(b"target\n", false));
         let verification =
-            GraphOnlyWorkspaceTransitionVerification::verify(&projection, &previous, &target)
+            GraphOnlyWorkspaceTransitionVerification::verify(&projection, &previous, &target, None)
                 .unwrap();
         assert!(verification
             .must_create_directories
@@ -11100,7 +12080,7 @@ mod tests {
         let target_path = repo_path("vendor/runtime/src/lib.rs");
         let target = exact_tree(&target_path, exact_blob(b"target\n", false));
         let verification =
-            GraphOnlyWorkspaceTransitionVerification::verify(&projection, &previous, &target)
+            GraphOnlyWorkspaceTransitionVerification::verify(&projection, &previous, &target, None)
                 .unwrap();
         let mut transaction = projection.create_reconciliation_transaction().unwrap();
         let transaction_path = projection
@@ -11745,6 +12725,7 @@ mod tests {
             || {},
             || {},
             None,
+            None,
             || {
                 ProjectionAuthorityCommit::<()>::DefinitelyNotCommitted(KinError::Other(
                     "injected repository authority conflict".to_string(),
@@ -11805,7 +12786,10 @@ mod tests {
                 graph_only_transition: Some(GraphOnlyWorkspaceTransition {
                     previous_tree: &previous_tree,
                     target_tree: &target_tree,
+                    scope: None,
                 }),
+                checkout_scope: None,
+                checkout_projection_authority: None,
             },
             || {},
             || {},
@@ -11813,6 +12797,7 @@ mod tests {
                 std::fs::write(root.path().join("compose.yaml"), b"raced target bytes\n").unwrap();
             },
             Some(marker),
+            None,
             || {
                 committed.set(true);
                 ProjectionAuthorityCommit::Committed(())
@@ -11866,12 +12851,16 @@ mod tests {
                 graph_only_transition: Some(GraphOnlyWorkspaceTransition {
                     previous_tree: &previous_tree,
                     target_tree: &target_tree,
+                    scope: None,
                 }),
+                checkout_scope: None,
+                checkout_projection_authority: None,
             },
             || {},
             || {},
             || {},
             Some(marker),
+            None,
             || {
                 ProjectionAuthorityCommit::<()>::Indeterminate(KinError::Other(
                     "injected indeterminate authority outcome".to_string(),
@@ -11961,6 +12950,7 @@ mod tests {
                 || {},
                 || {},
                 Some(marker),
+                None,
                 || {
                     manager.commit_repository_transaction(transaction).unwrap();
                     panic!("simulated process crash after authority commit");
