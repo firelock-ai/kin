@@ -2983,6 +2983,14 @@ async fn command_checkout(
         &request,
     )
     .map_err(internal_error)?;
+    if response.mutated {
+        state.mark_dirty();
+        state.bump_version();
+        state.emit_event(DaemonEvent::GraphRootChanged {
+            old_root_hash: None,
+            new_root_hash: "checkout-state".to_string(),
+        });
+    }
     Ok(Json(response))
 }
 
