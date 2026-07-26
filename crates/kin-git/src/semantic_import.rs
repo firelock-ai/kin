@@ -121,6 +121,7 @@ impl SemanticGitImportPlan {
             external_objects: self.external_objects,
             changes: self.changes,
             aliases: self.aliases,
+            git_authority_delta: None,
             ref_mutations: self.ref_mutations,
             default_ref_mutation: self.default_ref_mutation,
             workspace_mutation: None,
