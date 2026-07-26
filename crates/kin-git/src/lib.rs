@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-//! Legacy Git adapter for Kin — import/export/sync.
+//! Git migration and projection adapter for Kin.
 //!
-//! This crate is **optional**. Kin is a sovereign VCS and does not require
-//! Git for any internal operation. This adapter provides:
+//! Kin is graph-native and does not use Git as an authority path. This optional
+//! boundary imports exact Git repository state and projects Kin history back to
+//! Git for migration and coexistence.
 //!
 //! - **Import**: Read Git history via gitoxide and create SemanticChange objects
 //! - **Export**: Translate SemanticChange DAG into Git commits/trees
-//! - **Sync**: Bidirectional periodic sync for teams transitioning from Git
+//! - **Co-change enrichment**: Mine non-authoritative historical signals
 
 pub mod cochange;
 pub mod error;
@@ -21,8 +22,6 @@ pub use error::{GitError, Result};
 pub use export::{export_changes, export_to_git, ExportOptions, ExportResult};
 pub use genesis::is_genesis_change;
 pub use import::{
-    anchor_imported_history_at_base_link, base_link_change_id_from_git_oid_hex,
-    expand_git_commit_prefix, import_git_history, import_git_history_to_commit_with_blobs,
-    import_git_history_with_blobs, is_ancestor_commit, semantic_change_id_from_git_oid_hex,
-    GitOidPrefixExpansion, ImportOptions, ImportedChange,
+    import_git_history, import_git_history_to_commit_with_blobs, import_git_history_with_blobs,
+    semantic_change_id_from_git_oid_hex, GitImportMode, ImportOptions, ImportedChange,
 };

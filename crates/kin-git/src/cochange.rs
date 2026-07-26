@@ -132,7 +132,7 @@ where
                     .into_commit();
                 let files = commit_file_deltas(&local, &commit)?
                     .into_iter()
-                    .map(|d| d.path)
+                    .filter_map(|delta| delta.path.as_utf8().map(str::to_owned))
                     .collect::<BTreeSet<_>>();
                 Ok(files)
             })
@@ -149,7 +149,13 @@ fn changed_files_from_change(change: &SemanticChange) -> BTreeSet<String> {
     change
         .tree_deltas
         .iter()
-        .map(|delta| delta.file_id().0.clone())
+        .filter_map(|delta| {
+            delta
+                .new_state()
+                .or_else(|| delta.old_state())
+                .and_then(|state| state.path.as_utf8())
+                .map(str::to_owned)
+        })
         .collect()
 }
 
@@ -405,9 +411,9 @@ fn cochange_relation_id(src: EntityId, dst: EntityId) -> RelationId {
 mod tests {
     use super::*;
     use kin_model::{
-        EntityKind, EntityMetadata, EntityRole, FingerprintAlgorithm, GraphNodeId, Hash256,
-        LanguageId, SemanticFingerprint, SourceSpan, TreeDelta, TreeEntry, TreeEntryKind,
-        Visibility,
+        ArtifactId, EntityKind, EntityMetadata, EntityRole, FingerprintAlgorithm, GraphNodeId,
+        Hash256, LanguageId, LocatedEntry, RepoPath, SemanticFingerprint, SourceSpan, TreeDelta,
+        TreeEntry, Visibility,
     };
     use std::process::Command;
 
@@ -416,10 +422,17 @@ mod tests {
         old_hash_byte: u8,
         new_hash_byte: u8,
     ) -> TreeDelta {
-        TreeDelta::Modified {
-            file_id: FilePathId::new(path.into()),
-            old_entry: TreeEntry::regular(Hash256::from_bytes([old_hash_byte; 32]), false),
-            new_entry: TreeEntry::regular(Hash256::from_bytes([new_hash_byte; 32]), false),
+        let path = RepoPath::from_utf8(path.into()).unwrap();
+        TreeDelta::Updated {
+            artifact_id: ArtifactId::new(),
+            old: LocatedEntry::new(
+                path.clone(),
+                TreeEntry::blob(Hash256::from_bytes([old_hash_byte; 32]), false),
+            ),
+            new: LocatedEntry::new(
+                path,
+                TreeEntry::blob(Hash256::from_bytes([new_hash_byte; 32]), false),
+            ),
         }
     }
 
@@ -708,13 +721,16 @@ mod tests {
                 entity_deltas: vec![],
                 relation_deltas: vec![],
                 tree_deltas: vec![
-                    TreeDelta::Modified {
-                        file_id: FilePathId::new("src/a.rs"),
-                        old_entry: TreeEntry::regular(Hash256::from_bytes([1; 32]), false),
-                        new_entry: TreeEntry {
-                            blob_hash: Hash256::from_bytes([1; 32]),
-                            kind: TreeEntryKind::Regular { executable: true },
-                        },
+                    TreeDelta::Updated {
+                        artifact_id: ArtifactId::new(),
+                        old: LocatedEntry::new(
+                            RepoPath::from_utf8("src/a.rs").unwrap(),
+                            TreeEntry::blob(Hash256::from_bytes([1; 32]), false),
+                        ),
+                        new: LocatedEntry::new(
+                            RepoPath::from_utf8("src/a.rs").unwrap(),
+                            TreeEntry::blob(Hash256::from_bytes([1; 32]), true),
+                        ),
                     },
                     modified_regular_delta("src/c.rs", 0, 1),
                 ],
