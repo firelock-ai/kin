@@ -6,7 +6,7 @@ use std::process::Command;
 #[cfg(test)]
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use kin_core::{KinConfig, KinLayout, RemoteHostKind, RemoteRefConfig, RemoteTransportKind};
 use kin_model::provenance::ApprovalDecision;
 use kin_model::{ProvenanceStore, SessionCapabilities, SessionLease, SessionTransport};
@@ -300,6 +300,11 @@ pub(crate) fn upsert_remote_config(
     entry: RemoteRefConfig,
     make_default: bool,
 ) -> Result<()> {
+    // Config is part of the repository namespace handed to exact eject. Share
+    // the projection lock so a writer that began before detach cannot mutate
+    // the archived config or bind a replacement `.kin` epoch after waiting.
+    let projection_freeze = kin_core::ExactProjectionFreeze::acquire_existing(layout.working_dir())
+        .context("freeze the existing repository projection before updating remote config")?;
     let config_path = layout.config_path();
     let mut config = KinConfig::load_or_default(&config_path)?;
     if let Some(existing) = config
@@ -317,7 +322,9 @@ pub(crate) fn upsert_remote_config(
         config.remote.default = Some(entry.name.clone());
     }
 
-    Ok(config.save(&config_path)?)
+    config.save(&config_path)?;
+    drop(projection_freeze);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -871,10 +878,94 @@ mod tests {
     use super::{
         ensure_git_remote, evaluate_push_plan, explicit_native_remote_target, format_push_decision,
         map_to_remote_ref, native_remote_endpoint, resolve_native_remote_bearer_token_with,
-        resolve_native_remote_target, NativeRemoteTarget, PushPlanContext,
+        resolve_native_remote_target, upsert_remote_config, NativeRemoteTarget, PushPlanContext,
     };
-    use kin_core::{RemoteHostKind, RemoteRefConfig, RemoteTransportKind};
+    use kin_core::{KinConfig, RemoteHostKind, RemoteRefConfig, RemoteTransportKind};
     use std::process::Command;
+
+    fn test_remote(name: &str) -> RemoteRefConfig {
+        RemoteRefConfig {
+            name: name.to_string(),
+            host: RemoteHostKind::KinLab,
+            transport: RemoteTransportKind::NativeKin,
+            url: Some(format!("kinlab://test/{name}")),
+            publish_review_state: true,
+            publish_proofs: true,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn blocked_remote_writer_cannot_bind_a_replacement_kin_epoch() {
+        let outer = tempfile::tempdir().unwrap();
+        let repository = outer.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        let initialized = kin_core::init(&repository).unwrap();
+        let layout = initialized.layout.clone();
+        let freeze = kin_core::ExactProjectionFreeze::acquire_existing(&repository).unwrap();
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let writer_layout = layout.clone();
+        let writer = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            finished_tx
+                .send(upsert_remote_config(
+                    &writer_layout,
+                    test_remote("stale-writer"),
+                    true,
+                ))
+                .unwrap();
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        assert!(
+            finished_rx
+                .recv_timeout(std::time::Duration::from_millis(500))
+                .is_err(),
+            "remote config writer must wait behind the held projection freeze"
+        );
+
+        let detached = outer.path().join("detached-kin");
+        std::fs::rename(layout.root(), &detached).unwrap();
+        let replacement = kin_core::init(&repository).unwrap();
+        let replacement_config_before = std::fs::read(replacement.layout.config_path()).unwrap();
+        let detached_config_before = std::fs::read(detached.join("config.toml")).unwrap();
+
+        drop(freeze);
+        let error = finished_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("blocked remote writer must wake after projection freeze release")
+            .expect_err("stale remote writer must reject the replacement Kin epoch");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("replaced")
+                || rendered.contains("changed identity")
+                || rendered.contains("unavailable"),
+            "unexpected stale remote-writer error: {rendered}"
+        );
+        writer.join().unwrap();
+
+        assert_eq!(
+            std::fs::read(replacement.layout.config_path()).unwrap(),
+            replacement_config_before,
+            "stale writer must not mutate replacement repository config"
+        );
+        assert_eq!(
+            std::fs::read(detached.join("config.toml")).unwrap(),
+            detached_config_before,
+            "stale writer must not mutate detached repository config"
+        );
+        assert!(
+            KinConfig::load(&replacement.layout.config_path())
+                .unwrap()
+                .remote
+                .refs
+                .is_empty(),
+            "replacement repository must not inherit the stale remote update"
+        );
+    }
 
     #[test]
     fn maps_config_remote_to_runtime_remote() {
