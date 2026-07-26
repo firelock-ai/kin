@@ -232,7 +232,7 @@ mod sync_tests {
         SemanticDelta {
             entity_id: entity_id.to_owned(),
             before_hash: before.map(|s| s.to_owned()),
-            after_hash: after.to_owned(),
+            after_hash: Some(after.to_owned()),
             change_set: vec![FieldDiff {
                 field: "name".into(),
                 old_value: Some("old".into()),
@@ -253,7 +253,7 @@ mod sync_tests {
                 new_value: Some("new".into()),
             }],
             base_hash: base.map(|s| s.to_owned()),
-            new_hash: new_hash.to_owned(),
+            new_hash: Some(new_hash.to_owned()),
             timestamp: Utc::now(),
         }
     }
@@ -297,7 +297,7 @@ mod sync_tests {
 
         let delta = puller.pull_delta("entity:1").unwrap();
         assert_eq!(delta.entity_id, "entity:1");
-        assert_eq!(delta.after_hash, "hash-b");
+        assert_eq!(delta.after_hash.as_deref(), Some("hash-b"));
 
         // 3. Mark entity as fresh after applying
         channel.stale_tracker_mut().mark_fresh("entity:1");

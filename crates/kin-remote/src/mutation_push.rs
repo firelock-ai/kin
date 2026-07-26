@@ -123,7 +123,7 @@ impl MutationPusher for InMemoryMutationPusher {
             Ok(PushResult::Accepted {
                 new_remote_head: mutations
                     .last()
-                    .map(|m| m.new_hash.clone())
+                    .and_then(|mutation| mutation.new_hash.clone())
                     .unwrap_or_default(),
                 accepted_count: accepted,
             })
