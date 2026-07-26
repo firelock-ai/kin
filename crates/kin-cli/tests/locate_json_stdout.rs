@@ -528,7 +528,7 @@ fn locate_ref_hydrates_missing_imported_git_history_on_demand() {
 
 /// Full-history import admits every reachable Git change into graph authority.
 /// Ref-scoped locate must resolve both the tip and the root without consulting
-/// Git or fabricating a truncated-history boundary.
+/// Git or fabricating missing ancestry.
 #[test]
 #[serial]
 fn locate_ref_resolves_tip_and_root_after_full_history_init() {

@@ -142,14 +142,14 @@ kin init
 kin init path/to/project
 ```
 
-In a detected Git repository, `kin init` bootstraps the current tree as semantic truth and
-imports recent Git history by default. Git stays in place; Kin adds the semantic graph and
-agent/runtime surfaces beside it.
+In a detected Git repository, `kin init` imports the exact current tree into
+graph-owned truth by default. Git stays in place as an explicit interoperability
+boundary; Kin runtime queries do not fall back to it.
 
 *Flags:*
-- `--git-history <off|recent|full>`: how much Git history to import into the graph on init
-  (default: `recent`, a deterministic HEAD-connected window of at most 50 commits;
-  `full` imports complete reachable ancestry).
+- `--git-history <off|snapshot|full>`: the Git import boundary
+  (default: `snapshot`, one exact HEAD tree with no ancestry claim; `full`
+  imports complete reachable ancestry and exact parent edges).
 - `--force`: initialize even if a `.git/` directory is already present.
 - `--no-lsp`: skip LSP enrichment (faster, tree-sitter-only init).
 
@@ -481,6 +481,6 @@ touches nothing rather than half-restoring.
 
 **What eject never touches: `.git`.** Kin snapshots your *working tree* at init
 (excluding `.git`, `.kin*`, and ignored paths) and restores those files only. It
-never reads, rewrites, or restores Git history — your commit history is owned by
-Git the entire time. After eject, the directory is a plain Git repository with
-its history intact; `git log`, `git status`, and `git fsck` all work unchanged.
+never rewrites or restores the source Git repository. After eject, that
+interoperability repository and its original history remain intact; `git log`,
+`git status`, and `git fsck` work unchanged.

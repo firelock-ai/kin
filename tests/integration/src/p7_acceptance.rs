@@ -271,7 +271,7 @@ fn brownfield_snapshot_migration() {
             // so we only assert on source files here.
             assert!(!scan.source_files.is_empty(), "should find source files");
 
-            // Plan a shallow migration to a separate target directory.
+            // Plan an exact snapshot migration to a separate target directory.
             let target = tempfile::tempdir().unwrap();
             let plan = kin_migrate::plan_migration(
                 &scan,
@@ -322,7 +322,7 @@ fn brownfield_snapshot_migration() {
 }
 
 // -----------------------------------------------------------------------
-// 11b. Brownfield: mixed-language repo -> shallow migrate -> keep docs/config
+// 11b. Brownfield: mixed-language repo -> snapshot migrate -> keep docs/config
 // -----------------------------------------------------------------------
 
 #[test]
