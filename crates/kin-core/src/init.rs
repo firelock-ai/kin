@@ -7,7 +7,6 @@ use kin_blobs::BlobStore;
 use kin_model::{
     AuthorId, Branch, BranchName, Hash256, SemanticChange, SemanticChangeId, Timestamp,
 };
-use sha2::{Digest, Sha256};
 use tracing::info;
 
 use crate::config::KinConfig;
@@ -29,18 +28,12 @@ pub struct InitResult {
 /// Every Kin repo starts with this change. It eliminates `Option<SemanticChangeId>`
 /// sprawl throughout the codebase.
 pub fn build_genesis_change() -> SemanticChange {
-    // Deterministic content hash for the genesis change.
-    let mut hasher = Sha256::new();
-    hasher.update(b"kin-genesis-v1");
-    let result = hasher.finalize();
-    let mut bytes = [0u8; 32];
-    bytes.copy_from_slice(&result);
-    let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes(bytes));
-
-    SemanticChange {
-        id: genesis_id,
+    let mut genesis = SemanticChange {
+        // Identity is assigned from the complete payload below. A fixed
+        // timestamp makes the synthetic root identical in every repository.
+        id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
         parents: vec![], // Genesis has zero parents.
-        timestamp: Timestamp::now(),
+        timestamp: Timestamp::from(chrono::DateTime::UNIX_EPOCH),
         author: AuthorId::new("kin"),
         message: "kin init".to_string(),
         entity_deltas: vec![],
@@ -51,7 +44,10 @@ pub fn build_genesis_change() -> SemanticChange {
         evidence: vec![],
         risk_summary: None,
         authored_on: Some(BranchName::new("main")),
-    }
+    };
+    genesis.id = kin_model::compute_semantic_change_id(&genesis)
+        .expect("the fixed genesis payload must have a canonical identity");
+    genesis
 }
 
 /// Initialize a new Kin repository at `working_dir`.
@@ -163,7 +159,11 @@ mod tests {
     fn genesis_change_is_deterministic() {
         let g1 = build_genesis_change();
         let g2 = build_genesis_change();
-        assert_eq!(g1.id, g2.id);
+        assert_eq!(
+            serde_json::to_value(&g1).unwrap(),
+            serde_json::to_value(&g2).unwrap()
+        );
+        kin_model::validate_semantic_change_id(&g1).unwrap();
         assert!(g1.parents.is_empty());
         assert_eq!(g1.message, "kin init");
     }
