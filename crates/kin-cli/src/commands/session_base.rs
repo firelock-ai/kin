@@ -1,53 +1,38 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-//! Base-version tracking for session workspaces.
+//! Exact base tracking for session workspaces.
 //!
-//! When a session workspace is materialized from graph truth, Kin records the
-//! state it started from: the graph head it was projected from and the exact
-//! [`kin_model::TreeEntry`] for every path materialized into it. Reconcile reads
-//! this recorded base to replay only the workspace's own change-set instead of
-//! force-syncing whole-tree state, so a workspace reconciled after the source
-//! has advanced never reverts intervening source changes. Content, executable
-//! mode, and symbolic-link identity all participate in that comparison.
-//!
-//! The manifest is stored under a reserved `.kin-session/` directory inside
-//! the workspace. Exact tree snapshots exclude that control-plane directory
-//! directly; language and enrichment filters never participate in the
-//! decision.
+//! The manifest stores only the immutable graph head that was materialized.
+//! Reconcile resolves identity-bearing base truth from that head; it never
+//! serializes a second path-keyed authority copy into the workspace.
 
 use std::collections::BTreeMap;
 #[cfg(any(unix, windows))]
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 #[cfg(any(unix, windows))]
 use cap_fs_ext::DirExt;
-use kin_model::{SemanticChangeId, TreeEntry, TreeEntryKind};
+use kin_model::{Hash256, RepoPath, SemanticChangeId, TreeEntry};
 use serde::{Deserialize, Serialize};
 
-/// Workspace-relative directory that holds Kin's session-runtime metadata.
 const META_DIR: &str = ".kin-session";
-/// File (within [`META_DIR`]) that records the workspace's base state.
 const BASE_FILE: &str = "reconcile-base.json";
 
-/// Recorded starting point of a session workspace.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionBase {
-    /// Graph head (branch head change id) the workspace was projected from.
+    /// Immutable graph head projected into this workspace.
     pub base_head: SemanticChangeId,
-    /// Repo-relative path -> exact graph entry for every materialized path.
-    pub tree: BTreeMap<String, TreeEntry>,
 }
 
-/// Path to the base manifest for a session workspace.
 fn base_manifest_path(session_dir: &Path) -> PathBuf {
     session_dir.join(META_DIR).join(BASE_FILE)
 }
 
-/// Read one exact filesystem entry without following symbolic links.
+/// Read one exact host entry without following symbolic links.
 pub(crate) fn read_disk_entry(path: &Path) -> Result<Option<(TreeEntry, Vec<u8>)>> {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -57,9 +42,9 @@ pub(crate) fn read_disk_entry(path: &Path) -> Result<Option<(TreeEntry, Vec<u8>)
         }
     };
 
-    let (content, kind) = if metadata.file_type().is_symlink() {
+    let (content, entry) = if metadata.file_type().is_symlink() {
         let target = std::fs::read_link(path)
-            .map_err(|error| anyhow::anyhow!("read symbolic link {}: {}", path.display(), error))?;
+            .with_context(|| format!("read symbolic link {}", path.display()))?;
         #[cfg(unix)]
         let content = {
             use std::os::unix::ffi::OsStrExt;
@@ -76,8 +61,10 @@ pub(crate) fn read_disk_entry(path: &Path) -> Result<Option<(TreeEntry, Vec<u8>)
             })?
             .as_bytes()
             .to_vec();
-        (content, TreeEntryKind::Symlink)
-    } else if metadata.is_file() {
+        let hash = Hash256::from_bytes(kin_blobs::digest(&content).0);
+        (content, TreeEntry::symlink(hash))
+    } else if metadata.file_type().is_file() {
+        let content = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
         #[cfg(unix)]
         let executable = {
             use std::os::unix::fs::PermissionsExt;
@@ -85,11 +72,8 @@ pub(crate) fn read_disk_entry(path: &Path) -> Result<Option<(TreeEntry, Vec<u8>)
         };
         #[cfg(not(unix))]
         let executable = false;
-        (
-            std::fs::read(path)
-                .map_err(|error| anyhow::anyhow!("read {}: {}", path.display(), error))?,
-            TreeEntryKind::Regular { executable },
-        )
+        let hash = Hash256::from_bytes(kin_blobs::digest(&content).0);
+        (content, TreeEntry::blob(hash, executable))
     } else {
         anyhow::bail!(
             "session tree contains an unsupported filesystem object at {}",
@@ -97,123 +81,66 @@ pub(crate) fn read_disk_entry(path: &Path) -> Result<Option<(TreeEntry, Vec<u8>)
         );
     };
 
-    Ok(Some((
-        TreeEntry {
-            blob_hash: kin_blobs::digest(&content),
-            kind,
-        },
-        content,
-    )))
+    Ok(Some((entry, content)))
 }
 
-/// Snapshot every repository entry under `root` into exact tree semantics.
+/// Complete byte-exact observation of a session workspace.
 ///
-/// Only Kin's own control-plane paths are excluded. Language support and
-/// enrichment policy never decide whether a repository path participates in
-/// version-control truth.
-pub fn snapshot_dir(root: &Path) -> Result<BTreeMap<String, TreeEntry>> {
+/// This is an explicit reconcile input boundary, not a semantic query path.
+/// It admits every regular file and symlink independent of language support
+/// while excluding only Kin/Git control metadata.
+pub fn snapshot_dir(root: &Path) -> Result<BTreeMap<RepoPath, TreeEntry>> {
+    let scan = kin_index::scan_repository(
+        root,
+        &kin_index::RepositoryIgnore::default(),
+        std::iter::empty(),
+    )
+    .map_err(kin_index::IndexError::from)?;
     let mut tree = BTreeMap::new();
-    snapshot_dir_recursive(root, root, &mut tree)?;
+    for scanned in scan.entries() {
+        let content = kin_index::read_verified_scanned_entry(scanned)
+            .with_context(|| format!("re-read session entry {}", scanned.repo_path))?;
+        let hash = Hash256::from_bytes(kin_blobs::digest(&content).0);
+        anyhow::ensure!(
+            hash.0 == scanned.content_hash,
+            "session entry changed after complete scan: {}",
+            scanned.repo_path
+        );
+        let entry = match scanned.kind {
+            kin_index::ScannedEntryKind::Regular { executable } => {
+                TreeEntry::blob(hash, executable)
+            }
+            kin_index::ScannedEntryKind::Symlink => TreeEntry::symlink(hash),
+        };
+        tree.insert(scanned.repo_path.clone(), entry);
+    }
     Ok(tree)
 }
 
-fn snapshot_dir_recursive(
-    directory: &Path,
-    root: &Path,
-    tree: &mut BTreeMap<String, TreeEntry>,
-) -> Result<()> {
-    let entries = std::fs::read_dir(directory)
-        .map_err(|error| anyhow::anyhow!("read directory {}: {}", directory.display(), error))?;
-    for entry in entries {
-        let entry = entry.map_err(|error| {
-            anyhow::anyhow!("read directory {}: {}", directory.display(), error)
-        })?;
-        let name = entry.file_name();
-        let name_text = name.to_str().ok_or_else(|| {
-            anyhow::anyhow!(
-                "session tree path is not valid UTF-8 under {}",
-                directory.display()
-            )
-        })?;
-        if (directory == root && name_text == super::session_process::SESSION_CONTEXT_FILE)
-            || matches!(name_text, META_DIR | ".kin" | ".git" | ".git-export")
-        {
-            continue;
-        }
-
-        let path = entry.path();
-        let file_type = entry
-            .file_type()
-            .map_err(|error| anyhow::anyhow!("inspect {}: {}", path.display(), error))?;
-        if file_type.is_dir() {
-            snapshot_dir_recursive(&path, root, tree)?;
-            continue;
-        }
-
-        let relative = path.strip_prefix(root).map_err(|_| {
-            anyhow::anyhow!("session path escaped snapshot root: {}", path.display())
-        })?;
-        let relative = relative.to_str().ok_or_else(|| {
-            anyhow::anyhow!("session tree path is not valid UTF-8: {}", path.display())
-        })?;
-        let relative = relative.replace(std::path::MAIN_SEPARATOR, "/");
-        let (entry, _) = read_disk_entry(&path)?.ok_or_else(|| {
-            anyhow::anyhow!(
-                "session tree entry disappeared during snapshot: {}",
-                path.display()
-            )
-        })?;
-        tree.insert(relative, entry);
-    }
-    Ok(())
-}
-
-/// Persist a base manifest into a session workspace.
 pub fn write_base(session_dir: &Path, base: &SessionBase) -> Result<()> {
     let path = base_manifest_path(session_dir);
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| {
-            anyhow::anyhow!(
-                "failed to create session metadata directory {}: {}",
-                parent.display(),
-                e
-            )
-        })?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create session metadata directory {}", parent.display()))?;
     }
-    let json = serde_json::to_vec_pretty(base)
-        .map_err(|e| anyhow::anyhow!("failed to serialize session base: {}", e))?;
+    let json = serde_json::to_vec_pretty(base).context("serialize session base")?;
     std::fs::write(&path, json)
-        .map_err(|e| anyhow::anyhow!("failed to write session base {}: {}", path.display(), e))?;
+        .with_context(|| format!("write session base {}", path.display()))?;
     Ok(())
 }
 
-/// Load the required exact base for a session workspace.
 pub(crate) fn load_base(session_dir: &Path) -> Result<SessionBase> {
     let path = base_manifest_path(session_dir);
-    let bytes = std::fs::read(&path)
-        .map_err(|e| anyhow::anyhow!("failed to read session base {}: {}", path.display(), e))?;
-    serde_json::from_slice(&bytes)
-        .map_err(|e| anyhow::anyhow!("failed to parse session base {}: {}", path.display(), e))
+    let bytes =
+        std::fs::read(&path).with_context(|| format!("read session base {}", path.display()))?;
+    serde_json::from_slice(&bytes).with_context(|| format!("parse session base {}", path.display()))
 }
 
-/// Record the base state of a freshly materialized session workspace.
-///
-/// Immediately after materialization the workspace is byte-identical to the
-/// graph truth it was projected from, so hashing the workspace itself captures
-/// the correct base.
 pub fn record_materialized_base(session_dir: &Path, base_head: SemanticChangeId) -> Result<()> {
-    let tree = snapshot_dir(session_dir)?;
-    write_base(session_dir, &SessionBase { base_head, tree })
+    write_base(session_dir, &SessionBase { base_head })
 }
 
 #[cfg(any(unix, windows))]
-/// Persist the graph-authoritative base supplied by the materializer through
-/// the retained session-directory capability.
-///
-/// The caller must derive `base.tree` from the preflighted graph tree. This
-/// function deliberately does not discover files from the live workspace,
-/// where a concurrent insertion or mutation could otherwise be mistaken for
-/// graph truth.
 pub fn record_preflighted_graph_base_in_dir(
     session_dir: &cap_std::fs::Dir,
     base: &SessionBase,
@@ -230,24 +157,15 @@ pub fn record_preflighted_graph_base_in_dir(
             error
         )
     })?;
-    let json = serde_json::to_vec_pretty(base)
-        .map_err(|error| anyhow::anyhow!("failed to serialize session base: {}", error))?;
+    let json = serde_json::to_vec_pretty(base).context("serialize session base")?;
     let mut options = cap_std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     let mut base_file = metadata_dir
         .open_with(BASE_FILE, &options)
-        .map_err(|error| {
-            anyhow::anyhow!(
-                "failed to create capability-rooted session base manifest: {}",
-                error
-            )
-        })?;
-    base_file.write_all(&json).map_err(|error| {
-        anyhow::anyhow!(
-            "failed to write capability-rooted session base manifest: {}",
-            error
-        )
-    })?;
+        .context("create capability-rooted session base manifest")?;
+    base_file
+        .write_all(&json)
+        .context("write capability-rooted session base manifest")?;
     Ok(())
 }
 
@@ -256,102 +174,81 @@ mod tests {
     use super::*;
 
     #[test]
-    fn snapshot_tracks_heterogeneous_repository_entries_exactly() {
+    fn snapshot_tracks_heterogeneous_entries_and_non_utf8_paths_exactly() {
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path();
         std::fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
         std::fs::create_dir_all(root.join("assets")).unwrap();
         std::fs::create_dir_all(root.join(".kin/private")).unwrap();
         std::fs::create_dir_all(root.join(".git/hooks")).unwrap();
-        std::fs::create_dir_all(root.join(".git-export/cache")).unwrap();
         std::fs::create_dir_all(root.join(".kin-session")).unwrap();
-
-        std::fs::write(
-            root.join("docker-compose.yml"),
-            b"services:\n  app:\n    image: alpine\n",
-        )
-        .unwrap();
+        std::fs::write(root.join("compose.yaml"), b"services: {}\n").unwrap();
         std::fs::write(root.join("node_modules/pkg/index.unknown"), b"\0\xffopaque").unwrap();
         std::fs::write(root.join("assets/model.bin"), [0, 1, 2, 255]).unwrap();
         std::fs::write(root.join(".kin/private/state"), b"control").unwrap();
         std::fs::write(root.join(".git/HEAD"), b"control").unwrap();
-        std::fs::write(root.join(".git-export/cache/state"), b"control").unwrap();
         std::fs::write(root.join(".kin-session/reconcile-base.json"), b"control").unwrap();
 
         #[cfg(unix)]
         {
+            use std::os::unix::ffi::OsStrExt;
             use std::os::unix::fs::{symlink, PermissionsExt};
 
             let executable = root.join("run-tool");
             std::fs::write(&executable, b"#!/bin/sh\nexit 0\n").unwrap();
             std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
-            symlink("docker-compose.yml", root.join("compose-current")).unwrap();
+            symlink("compose.yaml", root.join("compose-current")).unwrap();
+            let raw = std::ffi::OsStr::from_bytes(b"opaque-\xff");
+            std::fs::write(root.join(raw), b"non-utf8 path").unwrap();
         }
 
         let tree = snapshot_dir(root).unwrap();
-
+        let compose = RepoPath::from_utf8("compose.yaml").unwrap();
         assert_eq!(
-            tree.get("docker-compose.yml"),
-            Some(&TreeEntry::regular(
-                kin_blobs::digest(b"services:\n  app:\n    image: alpine\n"),
+            tree.get(&compose),
+            Some(&TreeEntry::blob(
+                Hash256::from_bytes(kin_blobs::digest(b"services: {}\n").0),
                 false,
             ))
         );
-        assert_eq!(
-            tree.get("node_modules/pkg/index.unknown"),
-            Some(&TreeEntry::regular(
-                kin_blobs::digest(b"\0\xffopaque"),
-                false,
-            ))
-        );
-        assert_eq!(
-            tree.get("assets/model.bin"),
-            Some(&TreeEntry::regular(
-                kin_blobs::digest(&[0, 1, 2, 255]),
-                false,
-            ))
-        );
-        assert!(!tree.keys().any(|path| {
-            path.starts_with(".kin/")
-                || path.starts_with(".git/")
-                || path.starts_with(".git-export/")
-                || path.starts_with(".kin-session/")
-        }));
+        assert!(tree
+            .keys()
+            .all(|path| !kin_index::is_repository_control_path(path)));
 
         #[cfg(unix)]
         {
-            assert_eq!(
-                tree.get("run-tool"),
-                Some(&TreeEntry::regular(
-                    kin_blobs::digest(b"#!/bin/sh\nexit 0\n"),
-                    true,
-                ))
-            );
-            assert_eq!(
-                tree.get("compose-current"),
-                Some(&TreeEntry::symlink(kin_blobs::digest(
-                    b"docker-compose.yml"
-                )))
-            );
+            assert!(tree.contains_key(&RepoPath::from_bytes(b"opaque-\xff".to_vec()).unwrap()));
+            assert!(matches!(
+                tree.get(&RepoPath::from_utf8("run-tool").unwrap()),
+                Some(TreeEntry::Blob {
+                    executable: true,
+                    ..
+                })
+            ));
+            assert!(matches!(
+                tree.get(&RepoPath::from_utf8("compose-current").unwrap()),
+                Some(TreeEntry::Symlink { .. })
+            ));
         }
     }
 
     #[test]
-    fn load_base_rejects_missing_and_legacy_manifests() {
+    fn manifest_records_only_graph_head_and_rejects_legacy_tree_copies() {
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path();
-        assert!(load_base(root).is_err());
+        let base_head = SemanticChangeId::from_hash(Hash256::from_bytes([0x42; 32]));
+        write_base(root, &SessionBase { base_head }).unwrap();
 
-        std::fs::create_dir_all(root.join(META_DIR)).unwrap();
+        let json = std::fs::read_to_string(base_manifest_path(root)).unwrap();
+        assert!(json.contains("base_head"));
+        assert!(!json.contains("\"tree\""));
+        assert_eq!(load_base(root).unwrap().base_head, base_head);
+
         std::fs::write(
             base_manifest_path(root),
-            br#"{"base_head":null,"files":{"README.md":"legacy"}}"#,
+            format!(r#"{{"base_head":"{base_head}","tree":{{}}}}"#),
         )
         .unwrap();
-        let error = load_base(root).unwrap_err().to_string();
-        assert!(
-            error.contains("failed to parse session base"),
-            "unexpected error: {error}"
-        );
+        assert!(load_base(root).is_err());
     }
 }
