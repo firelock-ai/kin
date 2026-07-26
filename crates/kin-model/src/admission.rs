@@ -6,9 +6,12 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::cmp::Ordering;
 use std::collections::BTreeSet;
 
-use crate::{AuthorId, Hash256, ModelError, RepoPath, Result, WorkspaceId};
+use crate::{
+    AuthorId, Hash256, ModelError, RepoPath, ResolvedTree, Result, TreeEntry, WorkspaceId,
+};
 
 pub const ADMISSION_POLICY_SEMANTICS_VERSION: u32 = 2;
 
@@ -146,6 +149,65 @@ impl SharedAdmissionPolicy {
         }
     }
 
+    /// Derive the complete shared policy from one exact graph-owned tree.
+    ///
+    /// The caller resolves source-body lengths through immutable CAS
+    /// authority. This method never reads a checkout and never accepts a
+    /// caller-provided matcher verdict. Symlinks and Gitlinks named like rule
+    /// files remain ordinary tree artifacts; only blob entries contribute
+    /// policy sources.
+    pub fn derive_from_tree(
+        first_parent: Option<&Self>,
+        tree: &ResolvedTree,
+        mut source_body_len: impl FnMut(Hash256) -> Result<u64>,
+    ) -> Result<(Self, Option<AdmissionPolicyDelta>)> {
+        let mut sources = Vec::new();
+        for artifact in tree.artifacts() {
+            let Some((base_directory, kind)) = shared_rule_source_path(&artifact.path)? else {
+                continue;
+            };
+            let TreeEntry::Blob { hash, .. } = artifact.entry else {
+                continue;
+            };
+            sources.push(AdmissionRuleSource {
+                kind,
+                path: artifact.path.clone(),
+                base_directory,
+                body_hash: hash,
+                body_len: source_body_len(hash)?,
+                precedence: 0,
+            });
+        }
+
+        sources.sort_by(compare_rule_sources);
+        for (index, source) in sources.iter_mut().enumerate() {
+            source.precedence = u32::try_from(index).map_err(|_| {
+                ModelError::InvalidOperation(
+                    "shared admission source count exceeds u32".to_string(),
+                )
+            })?;
+        }
+
+        let Some(old) = first_parent else {
+            let policy = Self::new(0, sources, Vec::new())?;
+            let delta = AdmissionPolicyDelta::initialize(policy.clone());
+            delta.validate()?;
+            return Ok((policy, Some(delta)));
+        };
+
+        if old.sources == sources {
+            return Ok((old.clone(), None));
+        }
+
+        let generation = old.generation.checked_add(1).ok_or_else(|| {
+            ModelError::InvalidOperation("shared admission-policy generation exhausted".to_string())
+        })?;
+        let policy = Self::new(generation, sources, old.sensitive_allowances.clone())?;
+        let delta = AdmissionPolicyDelta::update(old.clone(), policy.clone());
+        delta.validate()?;
+        Ok((policy, Some(delta)))
+    }
+
     pub fn validate(&self) -> Result<()> {
         self.validate_structure()?;
         let computed = self.compute_hash()?;
@@ -210,6 +272,58 @@ impl SharedAdmissionPolicy {
             sensitive_allowances: &self.sensitive_allowances,
         };
         hash_json(b"kin-shared-admission-policy-v1\0", &identity).map(AdmissionPolicyHash)
+    }
+}
+
+fn shared_rule_source_path(
+    path: &RepoPath,
+) -> Result<Option<(Option<RepoPath>, AdmissionRuleSourceKind)>> {
+    let bytes = path.as_bytes();
+    let (base, name) = match bytes.iter().rposition(|byte| *byte == b'/') {
+        Some(separator) => (Some(&bytes[..separator]), &bytes[separator + 1..]),
+        None => (None, bytes),
+    };
+    let kind = match name {
+        b".gitignore" => AdmissionRuleSourceKind::GitIgnore,
+        b".kinignore" => AdmissionRuleSourceKind::KinIgnore,
+        _ => return Ok(None),
+    };
+    let base_directory = base
+        .map(RepoPath::from_bytes)
+        .transpose()
+        .map_err(|error| {
+            ModelError::InvalidOperation(format!(
+                "invalid shared admission source base for {path}: {error}"
+            ))
+        })?;
+    Ok(Some((base_directory, kind)))
+}
+
+fn compare_rule_sources(left: &AdmissionRuleSource, right: &AdmissionRuleSource) -> Ordering {
+    rule_source_depth(left)
+        .cmp(&rule_source_depth(right))
+        .then_with(|| rule_source_base(left).cmp(rule_source_base(right)))
+        .then_with(|| rule_source_kind_rank(left.kind).cmp(&rule_source_kind_rank(right.kind)))
+        .then_with(|| left.path.as_bytes().cmp(right.path.as_bytes()))
+}
+
+fn rule_source_depth(source: &AdmissionRuleSource) -> usize {
+    source.base_directory.as_ref().map_or(0, |base| {
+        1 + base.as_bytes().iter().filter(|byte| **byte == b'/').count()
+    })
+}
+
+fn rule_source_base(source: &AdmissionRuleSource) -> &[u8] {
+    source
+        .base_directory
+        .as_ref()
+        .map_or(&[], RepoPath::as_bytes)
+}
+
+const fn rule_source_kind_rank(kind: AdmissionRuleSourceKind) -> u8 {
+    match kind {
+        AdmissionRuleSourceKind::GitIgnore => 0,
+        AdmissionRuleSourceKind::KinIgnore => 1,
     }
 }
 
@@ -534,6 +648,7 @@ fn sort_canonical<T: Serialize + Clone>(values: &mut [T]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{ArtifactId, ResolvedArtifact};
 
     fn allowance(hash: u8, kind: SensitiveArtifactKind) -> SensitiveArtifactAllowance {
         SensitiveArtifactAllowance {
@@ -602,6 +717,115 @@ mod tests {
         )
         .unwrap();
         assert_ne!(left.hash, right.hash);
+    }
+
+    #[test]
+    fn shared_policy_is_derived_from_exact_tree_sources_in_canonical_order() {
+        let root_hash = Hash256::from_bytes([0x33; 32]);
+        let nested_git_hash = Hash256::from_bytes([0x34; 32]);
+        let nested_kin_hash = Hash256::from_bytes([0x35; 32]);
+        let ignored_symlink_hash = Hash256::from_bytes([0x36; 32]);
+        let tree = ResolvedTree::from_artifacts([
+            ResolvedArtifact::new(
+                ArtifactId::new(),
+                RepoPath::from_utf8("src/.kinignore").unwrap(),
+                TreeEntry::blob(nested_kin_hash, false),
+            ),
+            ResolvedArtifact::new(
+                ArtifactId::new(),
+                RepoPath::from_utf8(".gitignore").unwrap(),
+                TreeEntry::blob(root_hash, false),
+            ),
+            ResolvedArtifact::new(
+                ArtifactId::new(),
+                RepoPath::from_utf8("src/.gitignore").unwrap(),
+                TreeEntry::blob(nested_git_hash, false),
+            ),
+            ResolvedArtifact::new(
+                ArtifactId::new(),
+                RepoPath::from_utf8("vendor/.gitignore").unwrap(),
+                TreeEntry::symlink(ignored_symlink_hash),
+            ),
+        ])
+        .unwrap();
+
+        let (policy, delta) =
+            SharedAdmissionPolicy::derive_from_tree(None, &tree, |hash| match hash {
+                value if value == root_hash => Ok(11),
+                value if value == nested_git_hash => Ok(12),
+                value if value == nested_kin_hash => Ok(13),
+                other => panic!("unexpected source hash {other}"),
+            })
+            .unwrap();
+
+        assert_eq!(policy.generation, 0);
+        assert_eq!(
+            policy
+                .sources
+                .iter()
+                .map(|source| source.path.as_bytes())
+                .collect::<Vec<_>>(),
+            vec![
+                b".gitignore".as_slice(),
+                b"src/.gitignore".as_slice(),
+                b"src/.kinignore".as_slice(),
+            ]
+        );
+        assert_eq!(
+            policy
+                .sources
+                .iter()
+                .map(|source| source.precedence)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(
+            delta,
+            Some(AdmissionPolicyDelta::initialize(policy.clone()))
+        );
+    }
+
+    #[test]
+    fn shared_policy_transition_preserves_allowances_and_skips_noops() {
+        let old_hash = Hash256::from_bytes([0x37; 32]);
+        let old_tree = ResolvedTree::from_artifacts([ResolvedArtifact::new(
+            ArtifactId::new(),
+            RepoPath::from_utf8(".gitignore").unwrap(),
+            TreeEntry::blob(old_hash, false),
+        )])
+        .unwrap();
+        let (mut old, _) =
+            SharedAdmissionPolicy::derive_from_tree(None, &old_tree, |_| Ok(4)).unwrap();
+        old = SharedAdmissionPolicy::new(
+            old.generation,
+            old.sources,
+            vec![allowance(
+                0x38,
+                SensitiveArtifactKind::Blob { executable: false },
+            )],
+        )
+        .unwrap();
+
+        let (same, no_delta) =
+            SharedAdmissionPolicy::derive_from_tree(Some(&old), &old_tree, |_| Ok(4)).unwrap();
+        assert_eq!(same, old);
+        assert_eq!(no_delta, None);
+
+        let new_hash = Hash256::from_bytes([0x39; 32]);
+        let changed_tree = ResolvedTree::from_artifacts([ResolvedArtifact::new(
+            ArtifactId::new(),
+            RepoPath::from_utf8(".gitignore").unwrap(),
+            TreeEntry::blob(new_hash, false),
+        )])
+        .unwrap();
+        let (changed, delta) =
+            SharedAdmissionPolicy::derive_from_tree(Some(&old), &changed_tree, |_| Ok(7)).unwrap();
+        assert_eq!(changed.generation, old.generation + 1);
+        assert_eq!(changed.sensitive_allowances, old.sensitive_allowances);
+        assert_eq!(
+            delta,
+            Some(AdmissionPolicyDelta::update(old, changed.clone()))
+        );
     }
 
     #[test]
