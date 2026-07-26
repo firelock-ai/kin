@@ -68,13 +68,17 @@ mod tests {
 
     #[test]
     fn working_copy_carries_exact_tree_deltas() {
-        let entry = crate::TreeEntry::regular(Hash256::from_bytes([0x71; 32]), false);
+        let artifact_id = crate::ArtifactId::new();
+        let entry = crate::TreeEntry::blob(Hash256::from_bytes([0x71; 32]), false);
         let working_copy = WorkingCopy {
             base_change: SemanticChangeId::from_hash(Hash256::from_bytes([0x72; 32])),
             uncommitted_mutations: GraphOverlay {
                 tree_deltas: vec![TreeDelta::Added {
-                    file_id: FilePathId::new("compose.yaml"),
-                    new_entry: entry,
+                    artifact_id,
+                    new: crate::LocatedEntry::new(
+                        crate::RepoPath::from_utf8("compose.yaml").unwrap(),
+                        entry,
+                    ),
                 }],
                 ..GraphOverlay::default()
             },
@@ -83,7 +87,9 @@ mod tests {
         let encoded = serde_json::to_string(&working_copy).unwrap();
         let decoded: WorkingCopy = serde_json::from_str(&encoded).unwrap();
         assert_eq!(
-            decoded.uncommitted_mutations.tree_deltas[0].new_entry(),
+            decoded.uncommitted_mutations.tree_deltas[0]
+                .new()
+                .map(|located| located.entry),
             Some(entry)
         );
     }

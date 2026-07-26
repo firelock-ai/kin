@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use schemars::{gen::SchemaGenerator, schema::Schema, JsonSchema};
+use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 use uuid::Uuid;
 
@@ -150,6 +150,192 @@ impl FilePathId {
 impl fmt::Display for FilePathId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
+    }
+}
+
+/// A byte-exact path to one leaf in a repository tree.
+///
+/// Repository paths use `/` as their separator and preserve their original
+/// bytes. UTF-8 is a presentation property, never an authority requirement.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct RepoPath(Vec<u8>);
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RepoPathError {
+    #[error("repository path must not be empty")]
+    Empty,
+    #[error("repository path must be relative")]
+    Absolute,
+    #[error("repository path must not contain NUL")]
+    Nul,
+    #[error("repository path must not contain empty components")]
+    EmptyComponent,
+    #[error("repository path must not contain '.' or '..' components")]
+    DotComponent,
+    #[error("repository path hex encoding is not canonical lowercase hex")]
+    NonCanonicalHex,
+    #[error("repository path hex encoding is invalid: {0}")]
+    InvalidHex(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct RepoPathWire {
+    bytes_hex: String,
+}
+
+impl RepoPath {
+    pub fn from_bytes(bytes: impl Into<Vec<u8>>) -> Result<Self, RepoPathError> {
+        let bytes = bytes.into();
+        Self::validate(&bytes)?;
+        Ok(Self(bytes))
+    }
+
+    pub fn from_utf8(path: impl Into<String>) -> Result<Self, RepoPathError> {
+        Self::from_bytes(path.into().into_bytes())
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.0
+    }
+
+    pub fn as_utf8(&self) -> Option<&str> {
+        std::str::from_utf8(&self.0).ok()
+    }
+
+    fn validate(bytes: &[u8]) -> Result<(), RepoPathError> {
+        if bytes.is_empty() {
+            return Err(RepoPathError::Empty);
+        }
+        if bytes[0] == b'/' {
+            return Err(RepoPathError::Absolute);
+        }
+        if bytes.contains(&0) {
+            return Err(RepoPathError::Nul);
+        }
+        for component in bytes.split(|byte| *byte == b'/') {
+            if component.is_empty() {
+                return Err(RepoPathError::EmptyComponent);
+            }
+            if component == b"." || component == b".." {
+                return Err(RepoPathError::DotComponent);
+            }
+        }
+        Ok(())
+    }
+
+    fn wire(&self) -> RepoPathWire {
+        RepoPathWire {
+            bytes_hex: hex::encode(&self.0),
+        }
+    }
+}
+
+impl TryFrom<&str> for RepoPath {
+    type Error = RepoPathError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Self::from_utf8(value)
+    }
+}
+
+impl TryFrom<&[u8]> for RepoPath {
+    type Error = RepoPathError;
+
+    fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
+        Self::from_bytes(value.to_vec())
+    }
+}
+
+impl fmt::Display for RepoPath {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(path) = self.as_utf8() {
+            return formatter.write_str(path);
+        }
+        for byte in &self.0 {
+            match byte {
+                b'\\' => formatter.write_str("\\\\")?,
+                0x20..=0x7e => write!(formatter, "{}", char::from(*byte))?,
+                _ => write!(formatter, "\\x{byte:02x}")?,
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Serialize for RepoPath {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.wire().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for RepoPath {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = RepoPathWire::deserialize(deserializer)?;
+        let bytes = hex::decode(&wire.bytes_hex)
+            .map_err(|error| D::Error::custom(RepoPathError::InvalidHex(error.to_string())))?;
+        if hex::encode(&bytes) != wire.bytes_hex {
+            return Err(D::Error::custom(RepoPathError::NonCanonicalHex));
+        }
+        Self::from_bytes(bytes).map_err(D::Error::custom)
+    }
+}
+
+impl JsonSchema for RepoPath {
+    fn schema_name() -> String {
+        "RepoPath".to_string()
+    }
+
+    fn json_schema(generator: &mut SchemaGenerator) -> Schema {
+        RepoPathWire::json_schema(generator)
+    }
+}
+
+/// Exact Git object identity stored by a gitlink tree entry.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(
+    tag = "algorithm",
+    content = "bytes",
+    rename_all = "lowercase",
+    deny_unknown_fields
+)]
+pub enum GitObjectId {
+    Sha1([u8; 20]),
+    Sha256([u8; 32]),
+}
+
+impl GitObjectId {
+    pub const fn sha1(bytes: [u8; 20]) -> Self {
+        Self::Sha1(bytes)
+    }
+
+    pub const fn sha256(bytes: [u8; 32]) -> Self {
+        Self::Sha256(bytes)
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        match self {
+            Self::Sha1(bytes) => bytes,
+            Self::Sha256(bytes) => bytes,
+        }
+    }
+}
+
+impl fmt::Display for GitObjectId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&hex::encode(self.as_bytes()))
     }
 }
 
@@ -472,5 +658,62 @@ mod tests {
         let printed = revision_id.to_string();
         let parsed = Hash256::from_hex(&printed).unwrap();
         assert_eq!(revision_id, ArtifactRevisionId::from_hash(parsed));
+    }
+
+    #[test]
+    fn repo_path_preserves_non_utf8_bytes_in_one_canonical_encoding() {
+        let path = RepoPath::from_bytes(b"assets/icon-\xff.png".to_vec()).unwrap();
+        let value = serde_json::to_value(&path).unwrap();
+
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "bytes_hex": "6173736574732f69636f6e2dff2e706e67"
+            })
+        );
+        assert_eq!(serde_json::from_value::<RepoPath>(value).unwrap(), path);
+        assert_eq!(path.to_string(), "assets/icon-\\xff.png");
+        assert!(path.as_utf8().is_none());
+    }
+
+    #[test]
+    fn repo_path_rejects_noncanonical_and_structurally_unsafe_forms() {
+        for path in [
+            b"".as_slice(),
+            b"/root",
+            b"a//b",
+            b"a/./b",
+            b"a/../b",
+            b"a\0b",
+        ] {
+            assert!(RepoPath::from_bytes(path.to_vec()).is_err());
+        }
+
+        assert!(serde_json::from_value::<RepoPath>(serde_json::json!({
+            "bytes_hex": "524541444D452E6D64"
+        }))
+        .is_err());
+        assert!(serde_json::from_value::<RepoPath>(serde_json::json!({
+            "encoding": "utf8",
+            "value": "README.md"
+        }))
+        .is_err());
+
+        let allowed =
+            RepoPath::from_bytes(b"control\\name/.git~1/\x01".to_vec()).expect("structural path");
+        assert_eq!(allowed.as_bytes(), b"control\\name/.git~1/\x01");
+    }
+
+    #[test]
+    fn git_object_id_roundtrips_with_exact_algorithm_and_width() {
+        let sha1 = GitObjectId::sha1([0x11; 20]);
+        let sha256 = GitObjectId::sha256([0x22; 32]);
+
+        for object_id in [sha1, sha256] {
+            let encoded = serde_json::to_vec(&object_id).unwrap();
+            let decoded: GitObjectId = serde_json::from_slice(&encoded).unwrap();
+            assert_eq!(decoded, object_id);
+            assert_eq!(object_id.to_string().len(), object_id.as_bytes().len() * 2);
+        }
     }
 }

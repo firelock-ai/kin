@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 use crate::{
     ArtifactRevisionId, Entity, EntityId, EntityRevisionId, FilePathId, Relation, RelationId,
-    RelationRevisionId, SemanticChangeId, TreeEntry, TreeEntryKind,
+    RelationRevisionId, SemanticChangeId, TreeEntry,
 };
 
 /// Immutable entity state introduced by a semantic change.
@@ -164,11 +164,33 @@ impl ArtifactRevisionId {
         let mut hasher = Sha256::new();
         hasher.update(file_id.0.as_bytes());
         hasher.update(change_id.0.as_bytes());
-        hasher.update(entry.blob_hash.as_bytes());
-        match entry.kind {
-            TreeEntryKind::Regular { executable: false } => hasher.update([0]),
-            TreeEntryKind::Regular { executable: true } => hasher.update([1]),
-            TreeEntryKind::Symlink => hasher.update([2]),
+        match entry {
+            TreeEntry::Blob {
+                hash,
+                executable: false,
+            } => {
+                hasher.update([0]);
+                hasher.update(hash.as_bytes());
+            }
+            TreeEntry::Blob {
+                hash,
+                executable: true,
+            } => {
+                hasher.update([1]);
+                hasher.update(hash.as_bytes());
+            }
+            TreeEntry::Symlink { target_blob } => {
+                hasher.update([2]);
+                hasher.update(target_blob.as_bytes());
+            }
+            TreeEntry::Gitlink { target } => {
+                hasher.update([3]);
+                hasher.update([match target {
+                    crate::GitObjectId::Sha1(_) => 1,
+                    crate::GitObjectId::Sha256(_) => 2,
+                }]);
+                hasher.update(target.as_bytes());
+            }
         }
         Self::from_hash(kin_blobs::Hash256::from_bytes(hasher.finalize().into()))
     }
@@ -288,8 +310,8 @@ mod tests {
         let file_id = FilePathId::new("bin/run");
         let change = SemanticChangeId::from_hash(Hash256::from_bytes([0x51; 32]));
         let blob_hash = Hash256::from_bytes([0x52; 32]);
-        let regular = TreeEntry::regular(blob_hash, false);
-        let executable = TreeEntry::regular(blob_hash, true);
+        let regular = TreeEntry::blob(blob_hash, false);
+        let executable = TreeEntry::blob(blob_hash, true);
 
         let regular_id = ArtifactRevisionId::for_artifact_change(&file_id, &change, &regular);
         let executable_id = ArtifactRevisionId::for_artifact_change(&file_id, &change, &executable);

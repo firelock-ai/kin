@@ -2,10 +2,12 @@
 // Copyright 2026 Firelock, LLC
 
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::entity::Entity;
 use crate::ids::*;
+use crate::retrieval::ArtifactId;
 use crate::review::RiskSummary;
 use crate::timestamp::Timestamp;
 
@@ -57,82 +59,102 @@ pub struct TransactionDelta {
     pub tree_deltas: Vec<TreeDelta>,
 }
 
-/// Exact Git-relevant kind of a repository tree entry.
+/// Exact materialization of one leaf in the repository tree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-pub enum TreeEntryKind {
-    Regular { executable: bool },
-    Symlink,
-}
-
-/// Content identity and exact mode for one repository tree entry.
-///
-/// Symlink entries store the link target bytes as the referenced blob.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct TreeEntry {
-    pub blob_hash: Hash256,
-    pub kind: TreeEntryKind,
+pub enum TreeEntry {
+    Blob {
+        hash: Hash256,
+        executable: bool,
+    },
+    /// The referenced blob contains the byte-exact link target.
+    Symlink {
+        target_blob: Hash256,
+    },
+    /// A Git submodule pointer. The target need not exist in this repository's
+    /// object database.
+    Gitlink {
+        target: GitObjectId,
+    },
 }
 
 impl TreeEntry {
-    pub const fn regular(blob_hash: Hash256, executable: bool) -> Self {
-        Self {
-            blob_hash,
-            kind: TreeEntryKind::Regular { executable },
-        }
+    pub const fn blob(hash: Hash256, executable: bool) -> Self {
+        Self::Blob { hash, executable }
     }
 
-    pub const fn symlink(blob_hash: Hash256) -> Self {
-        Self {
-            blob_hash,
-            kind: TreeEntryKind::Symlink,
+    pub const fn symlink(target_blob: Hash256) -> Self {
+        Self::Symlink { target_blob }
+    }
+
+    pub const fn gitlink(target: GitObjectId) -> Self {
+        Self::Gitlink { target }
+    }
+
+    pub const fn blob_identity(&self) -> Option<Hash256> {
+        match self {
+            Self::Blob { hash, .. } => Some(*hash),
+            Self::Symlink { target_blob } => Some(*target_blob),
+            Self::Gitlink { .. } => None,
         }
     }
 }
 
-/// Exact transition for one path in the repository tree.
+/// One artifact's exact location and materialization at a repository ref.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LocatedEntry {
+    pub path: RepoPath,
+    pub entry: TreeEntry,
+}
+
+impl LocatedEntry {
+    pub const fn new(path: RepoPath, entry: TreeEntry) -> Self {
+        Self { path, entry }
+    }
+}
+
+/// Exact transition for one stable artifact identity in the repository tree.
 ///
-/// Each variant carries every entry needed to describe the transition. This
-/// makes mode-unknown entries, missing hashes, and `None -> None` deltas
-/// unrepresentable.
+/// `Updated` covers content edits, mode changes, moves, and move-plus-edit.
+/// Paths are locations only; identity is always carried by `artifact_id`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TreeDelta {
     Added {
-        file_id: FilePathId,
-        new_entry: TreeEntry,
+        artifact_id: ArtifactId,
+        new: LocatedEntry,
     },
-    Modified {
-        file_id: FilePathId,
-        old_entry: TreeEntry,
-        new_entry: TreeEntry,
+    Updated {
+        artifact_id: ArtifactId,
+        old: LocatedEntry,
+        new: LocatedEntry,
     },
     Removed {
-        file_id: FilePathId,
-        old_entry: TreeEntry,
+        artifact_id: ArtifactId,
+        old: LocatedEntry,
     },
 }
 
 impl TreeDelta {
-    pub fn file_id(&self) -> &FilePathId {
+    pub const fn artifact_id(&self) -> ArtifactId {
         match self {
-            Self::Added { file_id, .. }
-            | Self::Modified { file_id, .. }
-            | Self::Removed { file_id, .. } => file_id,
+            Self::Added { artifact_id, .. }
+            | Self::Updated { artifact_id, .. }
+            | Self::Removed { artifact_id, .. } => *artifact_id,
         }
     }
 
-    pub const fn old_entry(&self) -> Option<TreeEntry> {
+    pub const fn old(&self) -> Option<&LocatedEntry> {
         match self {
             Self::Added { .. } => None,
-            Self::Modified { old_entry, .. } | Self::Removed { old_entry, .. } => Some(*old_entry),
+            Self::Updated { old, .. } | Self::Removed { old, .. } => Some(old),
         }
     }
 
-    pub const fn new_entry(&self) -> Option<TreeEntry> {
+    pub const fn new(&self) -> Option<&LocatedEntry> {
         match self {
-            Self::Added { new_entry, .. } | Self::Modified { new_entry, .. } => Some(*new_entry),
+            Self::Added { new, .. } | Self::Updated { new, .. } => Some(new),
             Self::Removed { .. } => None,
         }
     }
@@ -141,8 +163,8 @@ impl TreeDelta {
         matches!(self, Self::Added { .. })
     }
 
-    pub const fn is_modified(&self) -> bool {
-        matches!(self, Self::Modified { .. })
+    pub const fn is_updated(&self) -> bool {
+        matches!(self, Self::Updated { .. })
     }
 
     pub const fn is_removed(&self) -> bool {
@@ -150,101 +172,487 @@ impl TreeDelta {
     }
 }
 
+/// One active artifact in a resolved repository tree.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ResolvedArtifact {
+    pub artifact_id: ArtifactId,
+    pub path: RepoPath,
+    pub entry: TreeEntry,
+}
+
+impl ResolvedArtifact {
+    pub const fn new(artifact_id: ArtifactId, path: RepoPath, entry: TreeEntry) -> Self {
+        Self {
+            artifact_id,
+            path,
+            entry,
+        }
+    }
+
+    pub fn located_entry(&self) -> LocatedEntry {
+        LocatedEntry::new(self.path.clone(), self.entry)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum TreeStateError {
+    #[error("artifact {artifact_id:?} occurs more than once in the resolved tree")]
+    DuplicateArtifact { artifact_id: ArtifactId },
+    #[error("repository path {path} occurs more than once in the resolved tree")]
+    DuplicatePath { path: RepoPath },
+    #[error("tree transaction contains more than one delta for artifact {artifact_id:?}")]
+    DuplicateDelta { artifact_id: ArtifactId },
+    #[error("artifact {artifact_id:?} already exists in the parent tree")]
+    ArtifactAlreadyExists { artifact_id: ArtifactId },
+    #[error("artifact {artifact_id:?} does not exist in the parent tree")]
+    ArtifactMissing { artifact_id: ArtifactId },
+    #[error("artifact {artifact_id:?} parent state does not match the delta's old location")]
+    OldStateMismatch { artifact_id: ArtifactId },
+    #[error("artifact {artifact_id:?} update is a no-op")]
+    NoopUpdate { artifact_id: ArtifactId },
+    #[error("repository path {path} remains occupied after applying the transaction")]
+    PathOccupied { path: RepoPath },
+}
+
+/// Exact active repository state with mutually validated identity and path
+/// indexes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResolvedTree {
+    by_id: BTreeMap<ArtifactId, ResolvedArtifact>,
+    by_path: BTreeMap<RepoPath, ArtifactId>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ResolvedTreeWire {
+    artifacts: Vec<ResolvedArtifact>,
+}
+
+impl ResolvedTree {
+    pub fn from_artifacts(
+        artifacts: impl IntoIterator<Item = ResolvedArtifact>,
+    ) -> Result<Self, TreeStateError> {
+        let mut tree = Self::default();
+        for artifact in artifacts {
+            if tree.by_id.contains_key(&artifact.artifact_id) {
+                return Err(TreeStateError::DuplicateArtifact {
+                    artifact_id: artifact.artifact_id,
+                });
+            }
+            if tree.by_path.contains_key(&artifact.path) {
+                return Err(TreeStateError::DuplicatePath {
+                    path: artifact.path,
+                });
+            }
+            tree.by_path
+                .insert(artifact.path.clone(), artifact.artifact_id);
+            tree.by_id.insert(artifact.artifact_id, artifact);
+        }
+        Ok(tree)
+    }
+
+    pub fn get(&self, artifact_id: &ArtifactId) -> Option<&ResolvedArtifact> {
+        self.by_id.get(artifact_id)
+    }
+
+    pub fn artifact_id_at_path(&self, path: &RepoPath) -> Option<ArtifactId> {
+        self.by_path.get(path).copied()
+    }
+
+    pub fn artifact_at_path(&self, path: &RepoPath) -> Option<&ResolvedArtifact> {
+        self.artifact_id_at_path(path)
+            .and_then(|artifact_id| self.by_id.get(&artifact_id))
+    }
+
+    pub fn artifacts(
+        &self,
+    ) -> impl ExactSizeIterator<Item = &ResolvedArtifact> + DoubleEndedIterator {
+        self.by_id.values()
+    }
+
+    pub fn artifacts_by_path(
+        &self,
+    ) -> impl ExactSizeIterator<Item = &ResolvedArtifact> + DoubleEndedIterator {
+        self.by_path
+            .values()
+            .map(|artifact_id| &self.by_id[artifact_id])
+    }
+
+    pub fn into_artifacts(
+        self,
+    ) -> impl ExactSizeIterator<Item = ResolvedArtifact> + DoubleEndedIterator {
+        self.by_id.into_values()
+    }
+
+    pub fn len(&self) -> usize {
+        self.by_id.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.by_id.is_empty()
+    }
+
+    /// Validate all old sides against the same parent state, then apply every
+    /// removal before every insertion. This makes swaps and rename cycles
+    /// atomic instead of order-dependent.
+    pub fn apply(&self, deltas: &[TreeDelta]) -> Result<Self, TreeStateError> {
+        let mut touched = BTreeSet::new();
+        for delta in deltas {
+            let artifact_id = delta.artifact_id();
+            if !touched.insert(artifact_id) {
+                return Err(TreeStateError::DuplicateDelta { artifact_id });
+            }
+            match delta {
+                TreeDelta::Added { .. } => {
+                    if self.by_id.contains_key(&artifact_id) {
+                        return Err(TreeStateError::ArtifactAlreadyExists { artifact_id });
+                    }
+                }
+                TreeDelta::Updated { old, new, .. } => {
+                    let Some(current) = self.by_id.get(&artifact_id) else {
+                        return Err(TreeStateError::ArtifactMissing { artifact_id });
+                    };
+                    if current.path != old.path || current.entry != old.entry {
+                        return Err(TreeStateError::OldStateMismatch { artifact_id });
+                    }
+                    if old == new {
+                        return Err(TreeStateError::NoopUpdate { artifact_id });
+                    }
+                }
+                TreeDelta::Removed { old, .. } => {
+                    let Some(current) = self.by_id.get(&artifact_id) else {
+                        return Err(TreeStateError::ArtifactMissing { artifact_id });
+                    };
+                    if current.path != old.path || current.entry != old.entry {
+                        return Err(TreeStateError::OldStateMismatch { artifact_id });
+                    }
+                }
+            }
+        }
+
+        let mut next = self.clone();
+        for delta in deltas {
+            if let Some(old) = delta.old() {
+                next.by_path.remove(&old.path);
+                next.by_id.remove(&delta.artifact_id());
+            }
+        }
+        for delta in deltas {
+            let Some(new) = delta.new() else {
+                continue;
+            };
+            let artifact_id = delta.artifact_id();
+            if next.by_path.contains_key(&new.path) {
+                return Err(TreeStateError::PathOccupied {
+                    path: new.path.clone(),
+                });
+            }
+            if next.by_id.contains_key(&artifact_id) {
+                return Err(TreeStateError::ArtifactAlreadyExists { artifact_id });
+            }
+            let artifact = ResolvedArtifact::new(artifact_id, new.path.clone(), new.entry);
+            next.by_path.insert(new.path.clone(), artifact_id);
+            next.by_id.insert(artifact_id, artifact);
+        }
+        Ok(next)
+    }
+}
+
+impl Serialize for ResolvedTree {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        ResolvedTreeWire {
+            artifacts: self.by_id.values().cloned().collect(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ResolvedTree {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = ResolvedTreeWire::deserialize(deserializer)?;
+        Self::from_artifacts(wire.artifacts).map_err(D::Error::custom)
+    }
+}
+
+impl JsonSchema for ResolvedTree {
+    fn schema_name() -> String {
+        "ResolvedTree".to_string()
+    }
+
+    fn json_schema(generator: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
+        ResolvedTreeWire::json_schema(generator)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn tree_entry_constructors_preserve_exact_kind() {
-        let regular = TreeEntry::regular(Hash256::from_bytes([0x11; 32]), false);
-        let executable = TreeEntry::regular(Hash256::from_bytes([0x22; 32]), true);
-        let symlink = TreeEntry::symlink(Hash256::from_bytes([0x33; 32]));
+    fn path(value: &str) -> RepoPath {
+        RepoPath::from_utf8(value).unwrap()
+    }
 
-        assert_eq!(regular.kind, TreeEntryKind::Regular { executable: false });
-        assert_eq!(executable.kind, TreeEntryKind::Regular { executable: true });
-        assert_eq!(symlink.kind, TreeEntryKind::Symlink);
+    fn blob(byte: u8, executable: bool) -> TreeEntry {
+        TreeEntry::blob(Hash256::from_bytes([byte; 32]), executable)
+    }
+
+    fn artifact(artifact_id: ArtifactId, path_value: &str, entry: TreeEntry) -> ResolvedArtifact {
+        ResolvedArtifact::new(artifact_id, path(path_value), entry)
+    }
+
+    #[test]
+    fn tree_entry_constructors_preserve_exact_materialization() {
+        let regular = blob(0x11, false);
+        let executable = blob(0x22, true);
+        let symlink = TreeEntry::symlink(Hash256::from_bytes([0x33; 32]));
+        let gitlink = TreeEntry::gitlink(GitObjectId::sha1([0x44; 20]));
+
+        assert!(matches!(
+            regular,
+            TreeEntry::Blob {
+                executable: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            executable,
+            TreeEntry::Blob {
+                executable: true,
+                ..
+            }
+        ));
+        assert!(matches!(symlink, TreeEntry::Symlink { .. }));
+        assert!(matches!(gitlink, TreeEntry::Gitlink { .. }));
+        assert_eq!(gitlink.blob_identity(), None);
     }
 
     #[test]
     fn tree_delta_roundtrip_preserves_complete_transition() {
-        let old_entry = TreeEntry::regular(Hash256::from_bytes([0x44; 32]), false);
+        let artifact_id = ArtifactId::new();
+        let old_entry = blob(0x44, false);
         let new_entry = TreeEntry::symlink(Hash256::from_bytes([0x55; 32]));
-        let delta = TreeDelta::Modified {
-            file_id: FilePathId::new("compose.yaml"),
-            old_entry,
-            new_entry,
+        let delta = TreeDelta::Updated {
+            artifact_id,
+            old: LocatedEntry::new(path("compose.yaml"), old_entry),
+            new: LocatedEntry::new(path("deploy/compose.yaml"), new_entry),
         };
 
         let json = serde_json::to_string(&delta).unwrap();
         let parsed: TreeDelta = serde_json::from_str(&json).unwrap();
 
         assert_eq!(parsed, delta);
-        assert_eq!(parsed.file_id(), &FilePathId::new("compose.yaml"));
-        assert_eq!(parsed.old_entry(), Some(old_entry));
-        assert_eq!(parsed.new_entry(), Some(new_entry));
-        assert!(parsed.is_modified());
+        assert_eq!(parsed.artifact_id(), artifact_id);
+        assert_eq!(parsed.old().unwrap().entry, old_entry);
+        assert_eq!(parsed.new().unwrap().entry, new_entry);
+        assert!(parsed.is_updated());
     }
 
     #[test]
-    fn tree_delta_variants_expose_only_valid_sides() {
-        let entry = TreeEntry::regular(Hash256::from_bytes([0x66; 32]), false);
-        let added = TreeDelta::Added {
-            file_id: FilePathId::new("Dockerfile"),
-            new_entry: entry,
-        };
-        let removed = TreeDelta::Removed {
-            file_id: FilePathId::new("Dockerfile"),
-            old_entry: entry,
-        };
-
-        assert_eq!(added.old_entry(), None);
-        assert_eq!(added.new_entry(), Some(entry));
-        assert!(added.is_added());
-        assert_eq!(removed.old_entry(), Some(entry));
-        assert_eq!(removed.new_entry(), None);
-        assert!(removed.is_removed());
-    }
-
-    #[test]
-    fn incomplete_tree_delta_payloads_are_rejected() {
+    fn legacy_tree_payloads_are_rejected() {
         let entry = serde_json::json!({
             "blob_hash": Hash256::from_bytes([0x77; 32]),
             "kind": { "type": "regular", "executable": false }
         });
-        let missing_old_entry = serde_json::json!({
+        let legacy = serde_json::json!({
             "operation": "modified",
-            "file_id": "compose.yaml",
-            "new_entry": entry
-        });
-        let invalid_added_with_old_entry = serde_json::json!({
-            "operation": "added",
             "file_id": "compose.yaml",
             "old_entry": entry,
             "new_entry": entry
         });
-
-        assert!(serde_json::from_value::<TreeDelta>(missing_old_entry).is_err());
-        assert!(serde_json::from_value::<TreeDelta>(invalid_added_with_old_entry).is_err());
+        assert!(serde_json::from_value::<TreeDelta>(legacy).is_err());
     }
 
     #[test]
-    fn transaction_delta_requires_tree_mutations_to_be_explicit() {
-        let legacy_payload = serde_json::json!({
-            "entity_deltas": [],
-            "relation_deltas": []
-        });
-        assert!(serde_json::from_value::<TransactionDelta>(legacy_payload).is_err());
-
-        let delta = TransactionDelta {
-            entity_deltas: Vec::new(),
-            relation_deltas: Vec::new(),
-            tree_deltas: vec![TreeDelta::Added {
-                file_id: FilePathId::new("Makefile"),
-                new_entry: TreeEntry::regular(Hash256::from_bytes([0x88; 32]), false),
-            }],
+    fn tree_delta_variants_expose_only_valid_sides() {
+        let artifact_id = ArtifactId::new();
+        let entry = blob(0x66, false);
+        let added = TreeDelta::Added {
+            artifact_id,
+            new: LocatedEntry::new(path("Dockerfile"), entry),
         };
-        let encoded = serde_json::to_vec(&delta).unwrap();
-        let decoded: TransactionDelta = serde_json::from_slice(&encoded).unwrap();
-        assert_eq!(decoded.tree_deltas, delta.tree_deltas);
+        let removed = TreeDelta::Removed {
+            artifact_id,
+            old: LocatedEntry::new(path("Dockerfile"), entry),
+        };
+
+        assert_eq!(added.old(), None);
+        assert_eq!(added.new().unwrap().entry, entry);
+        assert!(added.is_added());
+        assert_eq!(removed.old().unwrap().entry, entry);
+        assert_eq!(removed.new(), None);
+        assert!(removed.is_removed());
+    }
+
+    #[test]
+    fn resolved_tree_rejects_duplicate_identity_and_path() {
+        let first = ArtifactId::new();
+        let second = ArtifactId::new();
+        let entry = blob(0x10, false);
+
+        assert!(matches!(
+            ResolvedTree::from_artifacts([
+                artifact(first, "a", entry),
+                artifact(first, "b", entry)
+            ]),
+            Err(TreeStateError::DuplicateArtifact { .. })
+        ));
+        assert!(matches!(
+            ResolvedTree::from_artifacts([
+                artifact(first, "a", entry),
+                artifact(second, "a", entry)
+            ]),
+            Err(TreeStateError::DuplicatePath { .. })
+        ));
+    }
+
+    #[test]
+    fn resolved_tree_iteration_is_deterministic_by_identity_or_path() {
+        let first = ArtifactId(uuid::Uuid::from_u128(1));
+        let second = ArtifactId(uuid::Uuid::from_u128(2));
+        let tree = ResolvedTree::from_artifacts([
+            artifact(second, "a", blob(0x20, false)),
+            artifact(first, "z", blob(0x10, false)),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            tree.artifacts()
+                .map(|artifact| artifact.artifact_id)
+                .collect::<Vec<_>>(),
+            vec![first, second]
+        );
+        assert_eq!(
+            tree.artifacts_by_path()
+                .map(|artifact| artifact.path.clone())
+                .collect::<Vec<_>>(),
+            vec![path("a"), path("z")]
+        );
+        assert_eq!(
+            tree.into_artifacts()
+                .map(|artifact| artifact.artifact_id)
+                .collect::<Vec<_>>(),
+            vec![first, second]
+        );
+    }
+
+    #[test]
+    fn resolved_tree_applies_modify_chmod_move_and_move_edit() {
+        let artifact_id = ArtifactId::new();
+        let v1 = LocatedEntry::new(path("src/app"), blob(0x11, false));
+        let tree = ResolvedTree::default()
+            .apply(&[TreeDelta::Added {
+                artifact_id,
+                new: v1.clone(),
+            }])
+            .unwrap();
+        let v2 = LocatedEntry::new(path("src/app"), blob(0x22, true));
+        let tree = tree
+            .apply(&[TreeDelta::Updated {
+                artifact_id,
+                old: v1,
+                new: v2.clone(),
+            }])
+            .unwrap();
+        let v3 = LocatedEntry::new(path("bin/app"), blob(0x33, true));
+        let tree = tree
+            .apply(&[TreeDelta::Updated {
+                artifact_id,
+                old: v2,
+                new: v3.clone(),
+            }])
+            .unwrap();
+
+        assert_eq!(tree.get(&artifact_id).unwrap().path, path("bin/app"));
+        assert_eq!(tree.get(&artifact_id).unwrap().entry, v3.entry);
+    }
+
+    #[test]
+    fn path_reuse_can_replace_identity_atomically() {
+        let old_id = ArtifactId::new();
+        let new_id = ArtifactId::new();
+        let old = LocatedEntry::new(path("README.md"), blob(0x40, false));
+        let tree = ResolvedTree::from_artifacts([ResolvedArtifact::new(
+            old_id,
+            old.path.clone(),
+            old.entry,
+        )])
+        .unwrap();
+        let new = LocatedEntry::new(path("README.md"), blob(0x41, false));
+        let tree = tree
+            .apply(&[
+                TreeDelta::Removed {
+                    artifact_id: old_id,
+                    old,
+                },
+                TreeDelta::Added {
+                    artifact_id: new_id,
+                    new,
+                },
+            ])
+            .unwrap();
+
+        assert_eq!(tree.artifact_id_at_path(&path("README.md")), Some(new_id));
+        assert!(tree.get(&old_id).is_none());
+    }
+
+    #[test]
+    fn swaps_and_rename_cycles_are_atomic() {
+        let a = ArtifactId::new();
+        let b = ArtifactId::new();
+        let c = ArtifactId::new();
+        let a_old = LocatedEntry::new(path("a"), blob(0x51, false));
+        let b_old = LocatedEntry::new(path("b"), blob(0x52, false));
+        let c_old = LocatedEntry::new(path("c"), blob(0x53, false));
+        let tree = ResolvedTree::from_artifacts([
+            ResolvedArtifact::new(a, a_old.path.clone(), a_old.entry),
+            ResolvedArtifact::new(b, b_old.path.clone(), b_old.entry),
+            ResolvedArtifact::new(c, c_old.path.clone(), c_old.entry),
+        ])
+        .unwrap();
+        let tree = tree
+            .apply(&[
+                TreeDelta::Updated {
+                    artifact_id: a,
+                    old: a_old,
+                    new: LocatedEntry::new(path("b"), blob(0x51, false)),
+                },
+                TreeDelta::Updated {
+                    artifact_id: b,
+                    old: b_old,
+                    new: LocatedEntry::new(path("c"), blob(0x52, false)),
+                },
+                TreeDelta::Updated {
+                    artifact_id: c,
+                    old: c_old,
+                    new: LocatedEntry::new(path("a"), blob(0x53, false)),
+                },
+            ])
+            .unwrap();
+
+        assert_eq!(tree.artifact_id_at_path(&path("a")), Some(c));
+        assert_eq!(tree.artifact_id_at_path(&path("b")), Some(a));
+        assert_eq!(tree.artifact_id_at_path(&path("c")), Some(b));
+    }
+
+    #[test]
+    fn resolved_tree_serde_revalidates_indexes() {
+        let id = ArtifactId::new();
+        let tree = ResolvedTree::from_artifacts([artifact(id, "compose.yaml", blob(0x61, false))])
+            .unwrap();
+        let encoded = serde_json::to_vec(&tree).unwrap();
+        let decoded: ResolvedTree = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, tree);
+
+        let mut value = serde_json::to_value(&tree).unwrap();
+        let duplicate = value["artifacts"][0].clone();
+        value["artifacts"].as_array_mut().unwrap().push(duplicate);
+        assert!(serde_json::from_value::<ResolvedTree>(value).is_err());
     }
 }

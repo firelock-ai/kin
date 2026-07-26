@@ -36,8 +36,8 @@ pub mod work;
 // Re-export all public types at crate root for convenience.
 pub use branch::{Branch, GraphOverlay, MergeState, WorkingCopy};
 pub use change::{
-    EntityDelta, RelationDelta, SemanticChange, TransactionDelta, TreeDelta, TreeEntry,
-    TreeEntryKind,
+    EntityDelta, LocatedEntry, RelationDelta, ResolvedArtifact, ResolvedTree, SemanticChange,
+    TransactionDelta, TreeDelta, TreeEntry, TreeStateError,
 };
 pub use conflict::{ConflictKind, ConflictObject};
 pub use context::{
@@ -62,8 +62,8 @@ pub use graph::{
 };
 pub use ids::{
     ArtifactRevisionId, AuthorId, BranchId, BranchName, ConflictId, ContractId, EntityId,
-    EntityRevisionId, EvidenceId, FilePathId, Hash256, IntentId, LanguageId, RelationId,
-    RelationRevisionId, SemanticChangeId, SessionId, SpecId,
+    EntityRevisionId, EvidenceId, FilePathId, GitObjectId, Hash256, IntentId, LanguageId,
+    RelationId, RelationRevisionId, RepoPath, RepoPathError, SemanticChangeId, SessionId, SpecId,
 };
 pub use layout::{
     ArtifactKind, FileLayout, ImportItem, ImportSection, OpaqueArtifact, ParseCompleteness,
