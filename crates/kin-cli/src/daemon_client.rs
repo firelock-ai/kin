@@ -179,17 +179,6 @@ pub struct DaemonEntitiesResponse {
     pub entities: Vec<DaemonEntityEntry>,
 }
 
-/// Response from `GET /status`.
-#[derive(Debug, Deserialize)]
-pub struct DaemonStatusResponse {
-    pub base_change: String,
-    pub entity_adds: usize,
-    pub entity_mods: usize,
-    pub entity_removes: usize,
-    pub relation_adds: usize,
-    pub relation_removes: usize,
-}
-
 /// Response from scope endpoints.
 #[derive(Debug, Deserialize)]
 pub struct ScopeResponse {
@@ -440,22 +429,6 @@ impl DaemonClient {
             &divergences,
             is_transient_bool_env("KIN_STRICT_BEHAVIOR_ENV"),
         )
-    }
-
-    /// Get the working copy status from the daemon.
-    pub async fn status(&self) -> anyhow::Result<DaemonStatusResponse> {
-        let resp = self
-            .send(
-                self.client.get(format!("{}/status", self.base_url)),
-                "send daemon status request",
-            )
-            .await?;
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("daemon error (HTTP {}): {}", status, body);
-        }
-        Ok(resp.json().await?)
     }
 
     /// Search entities via the multi-repo API.
