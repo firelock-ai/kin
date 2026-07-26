@@ -49,6 +49,7 @@ impl TreePlan {
     fn from_resolved(tree: &ResolvedTree) -> Result<Self> {
         let mut by_path = BTreeMap::new();
         for artifact in tree.artifacts_by_path() {
+            validate_not_repository_control_path(&artifact.path)?;
             // Validate host representability before any staging directory or
             // filesystem object is created. The graph remains byte-exact even
             // when this particular projection host cannot express a path.
@@ -75,6 +76,34 @@ impl TreePlan {
     fn len(&self) -> usize {
         self.by_path.len()
     }
+}
+
+fn is_repository_control_component(component: &[u8]) -> bool {
+    component.eq_ignore_ascii_case(b".kin")
+        || component.eq_ignore_ascii_case(b".git")
+        || component.eq_ignore_ascii_case(b".git-export")
+        || component.eq_ignore_ascii_case(b".kin-session")
+        || component.eq_ignore_ascii_case(b".kin-session.json")
+        || component.eq_ignore_ascii_case(b".kin-shadow")
+        || component
+            .get(..b".kin-reconcile-".len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b".kin-reconcile-"))
+        || component
+            .get(..b".kin-checkout-".len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b".kin-checkout-"))
+}
+
+fn validate_not_repository_control_path(path: &RepoPath) -> Result<()> {
+    if path
+        .as_bytes()
+        .split(|byte| *byte == b'/')
+        .any(is_repository_control_component)
+    {
+        return Err(ProjectionError::Other(format!(
+            "graph repository path {path} names reserved Kin/Git control metadata"
+        )));
+    }
+    Ok(())
 }
 
 /// Materialize a graph-owned repository tree into an absent or empty root.
@@ -1002,6 +1031,28 @@ mod tests {
             ProjectionError::UnsupportedGitlink { path: failed, target: oid }
                 if failed == path("vendor/lib") && oid == target
         ));
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn reserved_repository_control_path_fails_before_projection() {
+        let (_blob_dir, blobs) = blob_store();
+        let hash = blobs.write(b"must not become control metadata").unwrap();
+        let tree = tree([artifact(
+            path("vendor/.KiN/private/state"),
+            TreeEntry::blob(hash, false),
+        )]);
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("checkout");
+
+        let error = materialize_resolved_tree(&root, &tree, &blobs).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("reserved Kin/Git control metadata"),
+            "{error}"
+        );
         assert!(!root.exists());
     }
 

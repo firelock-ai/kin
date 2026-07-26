@@ -75,11 +75,29 @@ pub fn plan_observed_tree_deltas(
             (new_by_path.get(&old.path) == Some(&old.entry)).then_some(*artifact_id)
         })
         .collect::<Vec<_>>();
+    let mut retained = Vec::with_capacity(unchanged.len());
     for artifact_id in unchanged {
         let old = old_by_id
             .remove(&artifact_id)
             .expect("unchanged artifact came from old tree");
         new_by_path.remove(&old.path);
+        retained.push((artifact_id, old));
+    }
+
+    // A path-stable exact entry plus another observed copy of the same entry is
+    // not enough evidence to decide whether the original artifact stayed put
+    // and was copied, or moved while an identical replacement took its old
+    // path. Stable identity must not depend on that unobservable intent.
+    if let Some((artifact_id, old, duplicate)) = retained.iter().find_map(|(artifact_id, old)| {
+        new_by_path
+            .iter()
+            .find_map(|(path, entry)| (entry == &old.entry).then_some((*artifact_id, old, path)))
+    }) {
+        return Err(KinError::Other(format!(
+            "identity-underdetermined repository transition for artifact {artifact_id:?} at {}: \
+             the same exact entry also appears at {}; use an explicit identity-bearing copy/move",
+            old.path, duplicate
+        )));
     }
 
     let unique_moves = old_by_id
@@ -152,6 +170,24 @@ pub fn plan_observed_tree_deltas(
             old,
             new: LocatedEntry::new(path, new_entry),
         });
+    }
+
+    if !old_by_id.is_empty() && !new_by_path.is_empty() {
+        let removed = old_by_id
+            .values()
+            .map(|old| old.path.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let added = new_by_path
+            .keys()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(KinError::Other(format!(
+            "identity-underdetermined repository transition: unmatched removals [{removed}] and \
+             additions [{added}] may be move-plus-edit operations; use explicit identity-bearing \
+             add/remove/move commands"
+        )));
     }
 
     deltas.extend(
@@ -260,5 +296,43 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("ambiguous repository identity"));
+    }
+
+    #[test]
+    fn observation_fails_closed_on_move_plus_edit() {
+        let id = ArtifactId::new();
+        let previous = resolved(vec![(
+            id,
+            RepoPath::from_utf8("old").unwrap(),
+            TreeEntry::blob(Hash256::from_bytes([0x61; 32]), false),
+        )]);
+
+        let error = plan_observed_tree_deltas(
+            &previous,
+            BTreeMap::from([(
+                RepoPath::from_utf8("new").unwrap(),
+                TreeEntry::blob(Hash256::from_bytes([0x62; 32]), false),
+            )]),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("identity-underdetermined"));
+        assert_eq!(previous.get(&id).unwrap().path.as_utf8(), Some("old"));
+    }
+
+    #[test]
+    fn observation_fails_closed_on_identical_move_and_path_replacement() {
+        let id = ArtifactId::new();
+        let entry = TreeEntry::blob(Hash256::from_bytes([0x71; 32]), false);
+        let old = RepoPath::from_utf8("old").unwrap();
+        let previous = resolved(vec![(id, old.clone(), entry)]);
+
+        let error = plan_observed_tree_deltas(
+            &previous,
+            BTreeMap::from([(old, entry), (RepoPath::from_utf8("new").unwrap(), entry)]),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("identity-underdetermined"));
     }
 }
