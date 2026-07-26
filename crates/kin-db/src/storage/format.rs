@@ -146,7 +146,7 @@ pub(crate) struct LocateGraphSnapshot {
 
 impl GraphSnapshot {
     /// Current format version.
-    pub const CURRENT_VERSION: u32 = 11;
+    pub const CURRENT_VERSION: u32 = 12;
 
     /// The only on-disk format version this pre-release binary accepts.
     pub const MIN_SUPPORTED_VERSION: u32 = Self::CURRENT_VERSION;
@@ -393,9 +393,9 @@ impl GraphSnapshot {
 
     /// Deserialize a snapshot from bytes (with header validation).
     ///
-    /// The pre-release v11 format removes graph-local branch authority in
-    /// preparation for one repository transaction envelope. Earlier snapshots
-    /// fail closed and must be rebuilt.
+    /// The pre-release v12 format persists complete base-relative semantic
+    /// workspace overlays alongside exact trees. Earlier snapshots fail closed
+    /// because tree-only dirty workspace authority cannot be reconstructed.
     pub fn from_bytes(data: &[u8]) -> Result<Self, crate::error::KinDbError> {
         Self::from_bytes_with_persisted_root_hash(data).map(|(snapshot, _)| snapshot)
     }
@@ -479,9 +479,9 @@ impl GraphSnapshot {
 
         match version {
             Self::CURRENT_VERSION => {
-                let checksum_end = Self::require_checksum_slot(data, body_len, "v11")?;
+                let checksum_end = Self::require_checksum_slot(data, body_len, "v12")?;
                 let body_checksum = if verify_checksum {
-                    Some(Self::verify_checksum(data, body_len, "v11")?)
+                    Some(Self::verify_checksum(data, body_len, "v12")?)
                 } else {
                     None
                 };
@@ -1689,7 +1689,7 @@ mod tests {
 
         snap.version = 1;
         let error = snap.to_bytes().unwrap_err();
-        assert!(error.to_string().contains("exactly v11"));
+        assert!(error.to_string().contains("exactly v12"));
     }
 
     #[test]
@@ -1950,14 +1950,12 @@ mod tests {
         ));
     }
 
-    /// A snapshot written by an older Kin (schema predating the supported
-    /// range) must fail fast with an explicit, actionable error naming the
-    /// version gap and remediation — never a panic/crash during load.
+    /// A v11 snapshot can persist an exact dirty workspace tree without its
+    /// semantic overlay. It must never masquerade as current authority.
     #[test]
-    fn old_schema_snapshot_fails_fast_with_actionable_error() {
-        // Build a well-formed KNDB frame whose format version predates the
-        // minimum supported version (stand-in for a pre-versioning 0.1.x graph).
-        let stale_version = GraphSnapshot::MIN_SUPPORTED_VERSION - 1;
+    fn v11_tree_only_workspace_snapshot_fails_fast_with_actionable_error() {
+        let stale_version = 11u32;
+        assert_eq!(GraphSnapshot::MIN_SUPPORTED_VERSION, 12);
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&GraphSnapshot::MAGIC);
         bytes.extend_from_slice(&stale_version.to_le_bytes());
@@ -1986,8 +1984,10 @@ mod tests {
             "missing supported-range wording: {msg}"
         );
         assert!(
-            msg.contains("reinitialize") && msg.contains("exact file modes"),
-            "missing exact-tree remediation: {msg}"
+            msg.contains("reinitialize")
+                && msg.contains("workspace semantics")
+                && msg.contains("file modes"),
+            "missing exact-workspace remediation: {msg}"
         );
     }
 

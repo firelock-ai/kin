@@ -738,7 +738,7 @@ mod tests {
         DefaultRefMutation, EffectiveAdmissionPolicyStamp, FrozenLocalOverlay,
         FrozenLocalOverlayDelta, OperationId, RefName, RepositoryId, RepositoryTransaction,
         ResolvedTree, SharedAdmissionPolicy, WorkspaceExpectation, WorkspaceHead, WorkspaceId,
-        WorkspaceMutation, REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+        WorkspaceMutation, WorkspaceSemanticDelta, REPOSITORY_TRANSACTION_SCHEMA_VERSION,
     };
     use object_store::memory::InMemory;
     use object_store::{
@@ -993,6 +993,7 @@ mod tests {
             new_base_tree_hash: None,
             tree_deltas: Vec::new(),
             new_tree_hash: tree_hash,
+            semantic_delta: WorkspaceSemanticDelta::default(),
             new_shared_admission_policy: shared,
             new_admission_policy: policy,
         };

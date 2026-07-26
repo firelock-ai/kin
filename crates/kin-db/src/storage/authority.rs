@@ -63,6 +63,22 @@ pub enum PersistOutcome {
     Indeterminate(KinDbError),
 }
 
+/// Classified persistence result that retains an authority capability on
+/// durable success.
+///
+/// The retained value must keep the backend's mutation exclusion alive until
+/// it is dropped. This lets a caller publish the exact in-memory successor
+/// while the same backend commit lock is still held, without a release and
+/// reacquire window.
+pub(crate) enum RetainedPersistOutcome<R> {
+    /// The exact candidate is durable and `retained` still excludes writers.
+    Committed { retained: R },
+    /// The backend proved that the candidate was not committed.
+    NotCommitted(KinDbError),
+    /// The backend cannot prove whether the candidate was committed.
+    Indeterminate(KinDbError),
+}
+
 /// A coherent read lease for one published authority generation.
 ///
 /// The lease owns an `Arc`, so a writer can publish a later generation without
@@ -198,6 +214,83 @@ where
                     }
                     PersistOutcome::NotCommitted(error) => Err(error),
                     PersistOutcome::Indeterminate(error) => {
+                        writer.pending = Some(next);
+                        Err(error)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Commit one complete successor and return a retained backend authority
+    /// capability without releasing it between durability and publication.
+    ///
+    /// `persist_and_retain` must use the same exclusion capability for the
+    /// durable compare-and-swap and the returned value. On idempotent replay,
+    /// `retain_current` must acquire and revalidate a capability for the exact
+    /// currently published state. Both callbacks run while the single
+    /// in-process writer permit is held.
+    pub(crate) fn commit_and_retain<O, R>(
+        &self,
+        prepare: impl FnOnce(&S) -> Result<AuthorityCommitDecision<S, O>, KinDbError>,
+        retain_current: impl FnOnce(&P, &S) -> Result<R, KinDbError>,
+        persist_and_retain: impl FnOnce(&P, Generation, &S) -> RetainedPersistOutcome<R>,
+    ) -> Result<(O, R), KinDbError> {
+        let mut writer = self.writer.lock();
+        let mut current = Arc::clone(&self.current.read());
+
+        // Resolve an earlier indeterminate candidate before preparing any
+        // later successor. A resolved operation may become the idempotent
+        // replay handled below, where its exact installed state is frozen.
+        if let Some(pending) = writer.pending.as_ref().map(Arc::clone) {
+            let expected_generation = current.generation();
+            match self
+                .persistence
+                .reconcile(expected_generation, pending.as_ref())
+            {
+                PersistOutcome::Committed => {
+                    *self.current.write() = Arc::clone(&pending);
+                    writer.pending = None;
+                    current = pending;
+                }
+                PersistOutcome::NotCommitted(error) => {
+                    writer.pending = None;
+                    return Err(error);
+                }
+                PersistOutcome::Indeterminate(error) => return Err(error),
+            }
+        }
+
+        match prepare(current.as_ref())? {
+            AuthorityCommitDecision::IdempotentReplay { output } => {
+                let retained = retain_current(&self.persistence, current.as_ref())?;
+                Ok((output, retained))
+            }
+            AuthorityCommitDecision::Publish { next, output } => {
+                let expected_generation = current.generation();
+                let required_generation = expected_generation.checked_add(1).ok_or_else(|| {
+                    KinDbError::StorageError(format!(
+                        "repository authority generation exhausted at {expected_generation}"
+                    ))
+                })?;
+                if next.generation() != required_generation {
+                    return Err(KinDbError::ConcurrentAccessError(format!(
+                        "repository authority successor must be generation {required_generation}, found {}",
+                        next.generation()
+                    )));
+                }
+
+                // Allocate before durability. `retained` remains alive across
+                // the infallible pointer publication and is returned to the
+                // caller still holding the backend exclusion capability.
+                let next = Arc::new(next);
+                match persist_and_retain(&self.persistence, expected_generation, next.as_ref()) {
+                    RetainedPersistOutcome::Committed { retained } => {
+                        *self.current.write() = next;
+                        Ok((output, retained))
+                    }
+                    RetainedPersistOutcome::NotCommitted(error) => Err(error),
+                    RetainedPersistOutcome::Indeterminate(error) => {
                         writer.pending = Some(next);
                         Err(error)
                     }

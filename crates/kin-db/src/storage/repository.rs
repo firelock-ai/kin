@@ -18,16 +18,16 @@ use parking_lot::Mutex;
 
 use kin_model::{
     ArtifactId, AuthorId, AuthorityRoot, ChangeStore, DefaultRefExpectation, DefaultRefMutation,
-    ExternalChangeAlias, ExternalObjectId, ExternalObjectKind, ExternalObjectRecord,
-    FrozenLocalOverlay, GitExternalAuthority, GitObjectBodyLoader, GitObjectDependencyKind,
-    GitObjectId, GitTreeEntryMode, Hash256, LocalAdmissionRuleSourceKind, ModelError, OperationId,
-    RefExpectation, RefMutation, RefName, RefTarget, RefUpdatePolicy, RepoPath,
-    RepositoryAuthorityStore, RepositoryCommitOutcome, RepositoryCommitReceipt, RepositoryId,
-    RepositoryOperationRecord, RepositoryRef, RepositoryRefState, RepositoryTransaction,
-    ResolvedArtifact, ResolvedTree, RootBundle, SemanticChangeId, SensitiveArtifactKind,
-    SharedAdmissionPolicy, Timestamp, TreeEntry, WorkspaceHead, WorkspaceId,
-    WorkspaceSnapshotBinding, WorkspaceState, WorkspaceTreeArtifact, WorkspaceTreeSnapshot,
-    REPOSITORY_ROOT_SCHEMA_VERSION,
+    EntityDelta, EntityStore, ExternalChangeAlias, ExternalObjectId, ExternalObjectKind,
+    ExternalObjectRecord, FrozenLocalOverlay, GitExternalAuthority, GitObjectBodyLoader,
+    GitObjectDependencyKind, GitObjectId, GitTreeEntryMode, Hash256, LocalAdmissionRuleSourceKind,
+    ModelError, OperationId, RefExpectation, RefMutation, RefName, RefTarget, RefUpdatePolicy,
+    RelationDelta, RepoPath, RepositoryAuthorityStore, RepositoryCommitOutcome,
+    RepositoryCommitReceipt, RepositoryId, RepositoryOperationRecord, RepositoryRef,
+    RepositoryRefState, RepositoryTransaction, ResolvedArtifact, ResolvedTree, RootBundle,
+    SemanticChangeId, SensitiveArtifactKind, SharedAdmissionPolicy, Timestamp, TreeDelta,
+    TreeEntry, WorkspaceHead, WorkspaceId, WorkspaceSemanticOverlay, WorkspaceSnapshotBinding,
+    WorkspaceState, WorkspaceTreeArtifact, WorkspaceTreeSnapshot, REPOSITORY_ROOT_SCHEMA_VERSION,
 };
 
 use crate::admission::{
@@ -38,7 +38,7 @@ use crate::engine::InMemoryGraph;
 use crate::error::KinDbError;
 use crate::storage::authority::{
     AuthorityCommitDecision, AuthorityPublication, AuthorityReadLease, DurableAuthorityPersistence,
-    PersistOutcome, VersionedAuthorityState,
+    PersistOutcome, RetainedPersistOutcome, VersionedAuthorityState,
 };
 use crate::storage::backend::{
     load_recovered_snapshot, validate_source_blob_size, verify_source_blob_digest, Generation,
@@ -48,7 +48,7 @@ use crate::storage::backend::{
 use crate::storage::format::GraphSnapshot;
 
 /// Persisted repository-envelope schema.
-pub const REPOSITORY_AUTHORITY_SCHEMA_VERSION: u32 = 2;
+pub const REPOSITORY_AUTHORITY_SCHEMA_VERSION: u32 = 3;
 
 /// Shared admission policy resolved at one exact semantic change.
 ///
@@ -66,7 +66,7 @@ pub struct ChangeAdmissionPolicy {
 ///
 /// Every vector with set semantics is kept in canonical sorted order.
 /// `operation_log` alone is append-ordered.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PersistedRepositoryAuthority {
     pub schema_version: u32,
@@ -364,11 +364,12 @@ impl RepositoryAuthorityState {
     /// this exact authority generation.
     ///
     /// Repository-v6 authority deliberately persists immutable semantic
-    /// history and exact per-workspace trees without a global "current" graph:
-    /// divergent refs and dirty workspaces make such a cache ambiguous. This
-    /// method resolves the workspace base from this coherent read lease, then
-    /// overlays the workspace's exact graph-owned tree. The result has no
-    /// repository authority envelope and is safe to hand to
+    /// history plus exact per-workspace trees and semantic overlays without a
+    /// global "current" graph: divergent refs and dirty workspaces make such a
+    /// cache ambiguous. This method resolves the workspace base from this
+    /// coherent read lease, then atomically applies its cumulative semantic
+    /// overlay and exact graph-owned tree. The result has no repository
+    /// authority envelope and is safe to hand to
     /// [`InMemoryGraph`] for daemon, MCP, editor, benchmark, or VFS reads.
     ///
     /// Unsupported languages, configuration, binary artifacts, symlinks, and
@@ -387,51 +388,7 @@ impl RepositoryAuthorityState {
             return Ok(None);
         };
 
-        let mut snapshot = self.snapshot().clone();
-        snapshot.repository_authority = None;
-
-        if let Some(target) = workspace.base_target.as_ref() {
-            let change_id = self.resolve_target_change_id(target)?;
-            let expected_root_hash = crate::storage::merkle::compute_graph_root_hash(&snapshot);
-            let history = InMemoryGraph::from_snapshot_without_text_index_with_root_hash(
-                snapshot.clone(),
-                expected_root_hash,
-            )?;
-            let resolved = history.resolve_graph_at(&change_id)?;
-            snapshot.entities = resolved.entities;
-            snapshot.relations = resolved.relations;
-            snapshot.entity_revisions = resolved.entity_revisions;
-        }
-
-        // Workspace tree authority is independent of its base target: dirty
-        // and unborn workspaces must retain every exact artifact even before a
-        // semantic parser can enrich it.
-        snapshot.resolved_tree = workspace.tree.clone();
-
-        // Persisted adjacency is a derived acceleration structure. Rebuild it
-        // from the resolved relation set so callers that inspect the snapshot
-        // directly receive the same coherent view as InMemoryGraph callers.
-        snapshot.outgoing.clear();
-        snapshot.incoming.clear();
-        for relation in snapshot.relations.values() {
-            if let Some(source) = relation.src.as_entity() {
-                snapshot
-                    .outgoing
-                    .entry(source)
-                    .or_default()
-                    .push(relation.id);
-            }
-            if let Some(target) = relation.dst.as_entity() {
-                snapshot
-                    .incoming
-                    .entry(target)
-                    .or_default()
-                    .push(relation.id);
-            }
-        }
-
-        snapshot.validate_storage_admission()?;
-        Ok(Some(snapshot))
+        materialize_workspace_graph_snapshot(self.snapshot(), self.metadata(), workspace).map(Some)
     }
 }
 
@@ -499,6 +456,36 @@ impl<B: StorageBackend + ?Sized> RepositorySnapshotPersistence<B> {
             self.backend
                 .save_snapshot_classified(self.repository_id.as_str(), bytes, *cursor);
         Self::record_save_outcome(cursor, outcome)
+    }
+}
+
+impl RepositorySnapshotPersistence<LocalFileBackend> {
+    fn persist_and_freeze(
+        &self,
+        next: &RepositoryAuthorityState,
+    ) -> RetainedPersistOutcome<LocalAuthorityFreezeLock> {
+        let bytes = match next.snapshot.to_bytes() {
+            Ok(bytes) => bytes,
+            Err(error) => return RetainedPersistOutcome::NotCommitted(error),
+        };
+        let mut cursor = self.backend_cursor.lock();
+        match self
+            .backend
+            .save_snapshot_and_freeze(self.repository_id.as_str(), &bytes, *cursor)
+        {
+            Ok((committed_cursor, retained)) if committed_cursor != *cursor => {
+                *cursor = committed_cursor;
+                RetainedPersistOutcome::Committed { retained }
+            }
+            Ok((committed_cursor, _)) => RetainedPersistOutcome::Indeterminate(storage(format!(
+                "snapshot backend acknowledged authority without advancing its CAS cursor from {}",
+                committed_cursor.backend_generation()
+            ))),
+            Err(error @ KinDbError::SnapshotPersistenceIndeterminate(_)) => {
+                RetainedPersistOutcome::Indeterminate(error)
+            }
+            Err(error) => RetainedPersistOutcome::NotCommitted(error),
+        }
     }
 }
 
@@ -578,7 +565,7 @@ impl<B: StorageBackend + ?Sized + 'static> DurableAuthorityPersistence<Repositor
 
 /// Durable graph-first repository authority.
 ///
-/// This is the only public mutation surface for an authority-bearing v11
+/// This is the only public mutation surface for an authority-bearing v12
 /// snapshot. Mutable `InMemoryGraph` remains available for derived query
 /// preparation and legacy non-authority graphs, but is never stored inside
 /// this publication cell.
@@ -724,7 +711,7 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
                 .as_ref()
                 .ok_or_else(|| {
                     storage(format!(
-                        "repository {} snapshot has no v11 authority envelope",
+                        "repository {} snapshot has no v12 authority envelope",
                         repository_id
                     ))
                 })?;
@@ -892,53 +879,65 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
         let backend = Arc::clone(&self.backend);
 
         self.publication.commit(|current| {
-            let metadata = current.metadata();
-            if transaction.repository_id != repository_id {
-                return Err(ModelError::InvalidOperation(format!(
-                    "transaction repository {} does not match authority repository {}",
-                    transaction.repository_id, repository_id
-                ))
-                .into());
-            }
-
-            if let Some(receipt) = metadata
-                .receipts
-                .iter()
-                .find(|receipt| receipt.operation_id == transaction.operation_id)
-            {
-                if receipt.transaction_hash != transaction_hash {
-                    return Err(ModelError::Conflict(format!(
-                        "operation {} was already committed with a different transaction hash",
-                        transaction.operation_id
-                    ))
-                    .into());
-                }
-                let mut replay = receipt.clone();
-                replay.outcome = RepositoryCommitOutcome::IdempotentReplay;
-                return Ok(AuthorityCommitDecision::IdempotentReplay { output: replay });
-            }
-
-            if transaction.expected_generation != current.generation()
-                || transaction.expected_roots != *current.roots()
-            {
-                return Err(ModelError::Conflict(format!(
-                    "repository {} authority moved from expected generation/root bundle",
-                    repository_id
-                ))
-                .into());
-            }
-
-            let (next, receipt) =
-                prepare_successor(current, &transaction, transaction_hash, backend.as_ref())?;
-            Ok(AuthorityCommitDecision::Publish {
-                next,
-                output: receipt,
-            })
+            prepare_repository_commit_decision(
+                current,
+                &transaction,
+                transaction_hash,
+                &repository_id,
+                backend.as_ref(),
+            )
         })
     }
 }
 
 impl RepositoryAuthorityManager<LocalFileBackend> {
+    /// Commit one complete local repository transaction and return a freeze
+    /// that still holds the exact backend lock used for its durable CAS.
+    ///
+    /// A successful new commit has no release/reacquire window: the local
+    /// authority record is installed, the immutable in-memory successor is
+    /// published, and the guard is returned while the same OS lock remains
+    /// held. An idempotent replay acquires the lock and reloads the exact
+    /// current authority before returning its guard.
+    pub fn commit_repository_transaction_and_freeze(
+        &self,
+        transaction: RepositoryTransaction,
+    ) -> Result<(RepositoryCommitReceipt, LocalRepositoryAuthorityFreeze), KinDbError> {
+        transaction.validate()?;
+        let transaction_hash = transaction.transaction_hash()?;
+        let repository_id = self.repository_id.clone();
+        let backend = Arc::clone(&self.backend);
+
+        self.publication.commit_and_retain(
+            |current| {
+                prepare_repository_commit_decision(
+                    current,
+                    &transaction,
+                    transaction_hash,
+                    &repository_id,
+                    backend.as_ref(),
+                )
+            },
+            |_, current| self.freeze_exact_state(current),
+            |persistence, _, next| match persistence.persist_and_freeze(next) {
+                RetainedPersistOutcome::Committed { retained } => {
+                    RetainedPersistOutcome::Committed {
+                        retained: LocalRepositoryAuthorityFreeze {
+                            state: next.clone(),
+                            _lock: retained,
+                        },
+                    }
+                }
+                RetainedPersistOutcome::NotCommitted(error) => {
+                    RetainedPersistOutcome::NotCommitted(error)
+                }
+                RetainedPersistOutcome::Indeterminate(error) => {
+                    RetainedPersistOutcome::Indeterminate(error)
+                }
+            },
+        )
+    }
+
     /// Freeze one expected local authority generation for a namespace
     /// transition.
     ///
@@ -953,22 +952,28 @@ impl RepositoryAuthorityManager<LocalFileBackend> {
         &self,
         expected_roots: &RootBundle,
     ) -> Result<LocalRepositoryAuthorityFreeze, KinDbError> {
-        let published_roots = self.read_authority().roots().clone();
-        if &published_roots != expected_roots {
+        let published = self.read_authority();
+        if published.roots() != expected_roots {
             return Err(ModelError::Conflict(format!(
                 "repository {} published authority moved from the expected root bundle before local freeze",
                 self.repository_id
             ))
             .into());
         }
+        self.freeze_exact_state(&published)
+    }
 
+    fn freeze_exact_state(
+        &self,
+        expected: &RepositoryAuthorityState,
+    ) -> Result<LocalRepositoryAuthorityFreeze, KinDbError> {
         let locked = self
             .backend
             .freeze_existing_authority(self.repository_id.as_str())?;
         let snapshot = GraphSnapshot::from_bytes(&locked.authority().snapshot_bytes)?;
         let metadata = snapshot.repository_authority.as_ref().ok_or_else(|| {
             storage(format!(
-                "repository {} frozen snapshot has no v11 authority envelope",
+                "repository {} frozen snapshot has no v12 authority envelope",
                 self.repository_id
             ))
         })?;
@@ -988,7 +993,7 @@ impl RepositoryAuthorityManager<LocalFileBackend> {
         validate_all_authority_bodies(&body_backend, &self.repository_id, &snapshot)?;
 
         let state = RepositoryAuthorityState::from_validated_snapshot(snapshot);
-        if state.roots() != expected_roots || state.roots() != &published_roots {
+        if state.roots() != expected.roots() {
             return Err(ModelError::Conflict(format!(
                 "repository {} persisted authority moved from the expected root bundle while local freeze was acquired",
                 self.repository_id
@@ -1098,6 +1103,57 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
             .into())
         }
     }
+}
+
+fn prepare_repository_commit_decision<B: StorageBackend + ?Sized>(
+    current: &RepositoryAuthorityState,
+    transaction: &RepositoryTransaction,
+    transaction_hash: Hash256,
+    repository_id: &RepositoryId,
+    backend: &B,
+) -> Result<AuthorityCommitDecision<RepositoryAuthorityState, RepositoryCommitReceipt>, KinDbError>
+{
+    let metadata = current.metadata();
+    if &transaction.repository_id != repository_id {
+        return Err(ModelError::InvalidOperation(format!(
+            "transaction repository {} does not match authority repository {}",
+            transaction.repository_id, repository_id
+        ))
+        .into());
+    }
+
+    if let Some(receipt) = metadata
+        .receipts
+        .iter()
+        .find(|receipt| receipt.operation_id == transaction.operation_id)
+    {
+        if receipt.transaction_hash != transaction_hash {
+            return Err(ModelError::Conflict(format!(
+                "operation {} was already committed with a different transaction hash",
+                transaction.operation_id
+            ))
+            .into());
+        }
+        let mut replay = receipt.clone();
+        replay.outcome = RepositoryCommitOutcome::IdempotentReplay;
+        return Ok(AuthorityCommitDecision::IdempotentReplay { output: replay });
+    }
+
+    if transaction.expected_generation != current.generation()
+        || transaction.expected_roots != *current.roots()
+    {
+        return Err(ModelError::Conflict(format!(
+            "repository {} authority moved from expected generation/root bundle",
+            repository_id
+        ))
+        .into());
+    }
+
+    let (next, receipt) = prepare_successor(current, transaction, transaction_hash, backend)?;
+    Ok(AuthorityCommitDecision::Publish {
+        next,
+        output: receipt,
+    })
 }
 
 fn prepare_successor<B: StorageBackend + ?Sized>(
@@ -1931,11 +1987,31 @@ fn apply_workspace<B: StorageBackend + ?Sized>(
         .cloned()
         .map(|workspace| (workspace.workspace_id, workspace))
         .collect();
+    let current = workspaces.get(&mutation.workspace_id);
+    let current_graph = match current {
+        Some(workspace) => materialize_workspace_graph_snapshot(snapshot, metadata, workspace)?,
+        None => resolve_workspace_base_graph_snapshot(snapshot, metadata, None)?,
+    };
+    let mut incremental_delta = mutation.semantic_delta.transaction_delta();
+    incremental_delta.tree_deltas = mutation.tree_deltas.clone();
+    let desired_graph = InMemoryGraph::from_snapshot(current_graph)?;
+    desired_graph.apply_transaction_delta(&incremental_delta)?;
+    let desired = desired_graph.to_snapshot();
+
+    let next_base = resolve_workspace_base_graph_snapshot(
+        snapshot,
+        metadata,
+        mutation.new_base_target.as_ref(),
+    )?;
+    let derived_semantic_overlay = derive_workspace_semantic_overlay(&next_base, &desired)?;
     let next = mutation.validate_against(
         &transaction.repository_id,
-        workspaces.get(&mutation.workspace_id),
+        current,
+        derived_semantic_overlay,
     )?;
     validate_workspace_state(snapshot, metadata, &next)?;
+    let rematerialized = materialize_workspace_graph_snapshot(snapshot, metadata, &next)?;
+    validate_exact_workspace_graph(&desired, &rematerialized, &next)?;
     validate_workspace_symbolic_head_at_mutation(metadata, &next)?;
     validate_shared_policy_bodies(
         backend,
@@ -2604,6 +2680,204 @@ fn is_ancestor(
     Ok(false)
 }
 
+/// Resolve one complete workspace graph strictly from repository authority.
+///
+/// Immutable history supplies the base graph, the persisted semantic overlay
+/// supplies uncommitted entity/relation state, and the independently
+/// authoritative workspace tree supplies every repository member. Applying
+/// all three as one `TransactionDelta` preserves the graph engine's atomic
+/// validation: an entity can never be restored onto an absent artifact and a
+/// relation can never point at a missing entity.
+fn materialize_workspace_graph_snapshot(
+    authority_snapshot: &GraphSnapshot,
+    metadata: &PersistedRepositoryAuthority,
+    workspace: &WorkspaceState,
+) -> Result<GraphSnapshot, KinDbError> {
+    let base = resolve_workspace_base_graph_snapshot(
+        authority_snapshot,
+        metadata,
+        workspace.base_target.as_ref(),
+    )?;
+    let base_tree = base.resolved_tree.clone();
+    let mut delta = workspace.semantic_overlay.transaction_delta();
+    delta.tree_deltas = exact_tree_transition(&base_tree, &workspace.tree);
+    let graph = InMemoryGraph::from_snapshot(base)?;
+    graph.apply_transaction_delta(&delta)?;
+    let materialized = graph.to_snapshot();
+    if materialized.resolved_tree != workspace.tree {
+        return Err(storage(format!(
+            "workspace {} semantic overlay did not resolve its exact persisted tree",
+            workspace.workspace_id
+        )));
+    }
+    materialized.validate_storage_admission()?;
+    Ok(materialized)
+}
+
+fn resolve_workspace_base_graph_snapshot(
+    authority_snapshot: &GraphSnapshot,
+    metadata: &PersistedRepositoryAuthority,
+    base_target: Option<&RefTarget>,
+) -> Result<GraphSnapshot, KinDbError> {
+    let mut base = authority_snapshot.clone();
+    base.repository_authority = None;
+
+    if let Some(target) = base_target {
+        let change_id = target_change_id(metadata, target)?;
+        let expected_root_hash = crate::storage::merkle::compute_graph_root_hash(&base);
+        let history = InMemoryGraph::from_snapshot_without_text_index_with_root_hash(
+            base.clone(),
+            expected_root_hash,
+        )?;
+        let resolved = history.resolve_graph_at(&change_id)?;
+        base.entities = resolved.entities;
+        base.relations = resolved.relations;
+        base.entity_revisions = resolved.entity_revisions;
+        base.resolved_tree = resolved.tree;
+    } else {
+        base.entities.clear();
+        base.relations.clear();
+        base.entity_revisions.clear();
+        base.resolved_tree = ResolvedTree::default();
+    }
+    rebuild_snapshot_adjacency(&mut base);
+    base.validate_storage_admission()?;
+    Ok(base)
+}
+
+fn derive_workspace_semantic_overlay(
+    base: &GraphSnapshot,
+    desired: &GraphSnapshot,
+) -> Result<WorkspaceSemanticOverlay, KinDbError> {
+    let entity_deltas = base
+        .entities
+        .keys()
+        .chain(desired.entities.keys())
+        .copied()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter_map(|entity_id| {
+            match (
+                base.entities.get(&entity_id),
+                desired.entities.get(&entity_id),
+            ) {
+                (None, Some(new)) => Some(EntityDelta::Added { new: new.clone() }),
+                (Some(old), Some(new)) if old != new => Some(EntityDelta::Modified {
+                    old: old.clone(),
+                    new: new.clone(),
+                }),
+                (Some(old), None) => Some(EntityDelta::Removed { old: old.clone() }),
+                (Some(_), Some(_)) | (None, None) => None,
+            }
+        })
+        .collect();
+    let relation_deltas = base
+        .relations
+        .keys()
+        .chain(desired.relations.keys())
+        .copied()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter_map(|relation_id| {
+            match (
+                base.relations.get(&relation_id),
+                desired.relations.get(&relation_id),
+            ) {
+                (None, Some(new)) => Some(RelationDelta::Added { new: new.clone() }),
+                (Some(old), Some(new)) if old != new => Some(RelationDelta::Modified {
+                    old: old.clone(),
+                    new: new.clone(),
+                }),
+                (Some(old), None) => Some(RelationDelta::Removed { old: old.clone() }),
+                (Some(_), Some(_)) | (None, None) => None,
+            }
+        })
+        .collect();
+    WorkspaceSemanticOverlay::new(entity_deltas, relation_deltas).map_err(Into::into)
+}
+
+fn validate_exact_workspace_graph(
+    desired: &GraphSnapshot,
+    rematerialized: &GraphSnapshot,
+    workspace: &WorkspaceState,
+) -> Result<(), KinDbError> {
+    if desired.entities != rematerialized.entities {
+        return Err(storage(format!(
+            "workspace {} cumulative semantic overlay did not reproduce the desired entities",
+            workspace.workspace_id
+        )));
+    }
+    if desired.relations != rematerialized.relations {
+        return Err(storage(format!(
+            "workspace {} cumulative semantic overlay did not reproduce the desired relations",
+            workspace.workspace_id
+        )));
+    }
+    if desired.resolved_tree != rematerialized.resolved_tree
+        || rematerialized.resolved_tree != workspace.tree
+    {
+        return Err(storage(format!(
+            "workspace {} cumulative semantic overlay did not reproduce the desired exact tree",
+            workspace.workspace_id
+        )));
+    }
+    Ok(())
+}
+
+fn exact_tree_transition(base: &ResolvedTree, desired: &ResolvedTree) -> Vec<TreeDelta> {
+    base.artifacts()
+        .map(|artifact| artifact.artifact_id)
+        .chain(desired.artifacts().map(|artifact| artifact.artifact_id))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter_map(
+            |artifact_id| match (base.get(&artifact_id), desired.get(&artifact_id)) {
+                (None, Some(new)) => Some(TreeDelta::Added {
+                    artifact_id,
+                    new: new.located_entry(),
+                }),
+                (Some(old), Some(new)) if old != new => Some(TreeDelta::Updated {
+                    artifact_id,
+                    old: old.located_entry(),
+                    new: new.located_entry(),
+                }),
+                (Some(old), None) => Some(TreeDelta::Removed {
+                    artifact_id,
+                    old: old.located_entry(),
+                }),
+                (Some(_), Some(_)) | (None, None) => None,
+            },
+        )
+        .collect()
+}
+
+fn rebuild_snapshot_adjacency(snapshot: &mut GraphSnapshot) {
+    snapshot.outgoing.clear();
+    snapshot.incoming.clear();
+    for relation in snapshot.relations.values() {
+        if let Some(source) = relation.src.as_entity() {
+            snapshot
+                .outgoing
+                .entry(source)
+                .or_default()
+                .push(relation.id);
+        }
+        if let Some(target) = relation.dst.as_entity() {
+            snapshot
+                .incoming
+                .entry(target)
+                .or_default()
+                .push(relation.id);
+        }
+    }
+    for relations in snapshot.outgoing.values_mut() {
+        relations.sort_unstable();
+    }
+    for relations in snapshot.incoming.values_mut() {
+        relations.sort_unstable();
+    }
+}
+
 fn validate_workspace_authority(
     snapshot: &GraphSnapshot,
     metadata: &PersistedRepositoryAuthority,
@@ -2622,6 +2896,7 @@ fn validate_workspace_state(
     metadata: &PersistedRepositoryAuthority,
     workspace: &WorkspaceState,
 ) -> Result<(), KinDbError> {
+    workspace.validate()?;
     validate_workspace_head(snapshot, metadata, &workspace.head)?;
     // `base_target` is the exact baseline this workspace tree was last
     // materialized against. A symbolic ref may advance independently after
@@ -2639,7 +2914,7 @@ fn validate_workspace_state(
             ))
             .into());
         }
-        if workspace.tree_hash == expected_tree {
+        if workspace.tree_hash == expected_tree && workspace.semantic_overlay.is_empty() {
             let change_id = target_change_id(metadata, base)?;
             let resolved_policy = metadata
                 .admission_policies
@@ -2692,6 +2967,7 @@ fn validate_workspace_state(
         ))
         .into());
     }
+    materialize_workspace_graph_snapshot(snapshot, metadata, workspace)?;
     Ok(())
 }
 
@@ -3340,7 +3616,7 @@ fn local_state_root(
         .iter()
         .map(RepositoryOperationRecord::identity_hash)
         .collect::<kin_model::Result<Vec<_>>>()?;
-    let mut root = DomainRoot::new(b"kin-repository-local-root-v1\0");
+    let mut root = DomainRoot::new(b"kin-repository-local-root-v2\0");
     root.unordered("sessions", &snapshot.sessions.iter().collect::<Vec<_>>())?;
     root.unordered("intents", &snapshot.intents.iter().collect::<Vec<_>>())?;
     root.unordered("downstream_warnings", &snapshot.downstream_warnings)?;
@@ -3457,9 +3733,10 @@ mod tests {
         ChangeOrigin, DefaultRefMutation, EffectiveAdmissionPolicyStamp, Entity, EntityDelta,
         EntityId, EntityKind, EntityMetadata, EntityRole, FilePathId, FingerprintAlgorithm,
         FrozenLocalOverlayDelta, GitExternalAuthorityDelta, GitObjectFormat, GitRawRef,
-        GitRawTarget, LanguageId, LocatedEntry, RefMutation, RepoPath, ResolvedTree,
-        SemanticChange, SemanticFingerprint, SensitiveArtifactAllowance, SensitiveArtifactKind,
-        TreeDelta, Visibility, WorkspaceExpectation, WorkspaceMutation,
+        GitRawTarget, GraphNodeId, LanguageId, LocatedEntry, RefMutation, Relation, RelationDelta,
+        RelationId, RelationKind, RelationOrigin, RepoPath, ResolvedTree, SemanticChange,
+        SemanticFingerprint, SensitiveArtifactAllowance, SensitiveArtifactKind, TreeDelta,
+        Visibility, WorkspaceExpectation, WorkspaceMutation, WorkspaceSemanticDelta,
         REPOSITORY_TRANSACTION_SCHEMA_VERSION,
     };
     use parking_lot::Mutex;
@@ -3620,11 +3897,43 @@ mod tests {
     }
 
     fn repository_id() -> RepositoryId {
-        RepositoryId::new("authority-v11-test").unwrap()
+        RepositoryId::new("authority-v12-test").unwrap()
     }
 
     fn digest(body: &[u8]) -> Hash256 {
         Hash256::from_bytes(Sha256::digest(body).into())
+    }
+
+    fn semantic_test_entity(
+        path: &str,
+        name: &str,
+        language: LanguageId,
+        fingerprint_byte: u8,
+    ) -> Entity {
+        Entity {
+            id: EntityId::from_content(path, name, "function", 1),
+            kind: EntityKind::Function,
+            name: name.to_string(),
+            language,
+            fingerprint: SemanticFingerprint {
+                algorithm: FingerprintAlgorithm::V1TreeSitter,
+                ast_hash: Hash256::from_bytes([fingerprint_byte; 32]),
+                signature_hash: Hash256::from_bytes([fingerprint_byte.wrapping_add(1); 32]),
+                behavior_hash: Hash256::from_bytes([fingerprint_byte.wrapping_add(2); 32]),
+                equivalence_hash: Hash256::from_bytes([fingerprint_byte.wrapping_add(3); 32]),
+                stability_score: 1.0,
+            },
+            file_origin: Some(FilePathId::new(path)),
+            span: None,
+            signature: format!("fn {name}()"),
+            visibility: Visibility::Public,
+            role: EntityRole::Source,
+            doc_summary: None,
+            metadata: EntityMetadata::default(),
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        }
     }
 
     #[derive(Clone, Default)]
@@ -3717,6 +4026,38 @@ mod tests {
             workspace_mutation: None,
             local_overlay_delta: None,
         }
+    }
+
+    fn semantic_workspace_transaction<B: StorageBackend + ?Sized + 'static>(
+        manager: &RepositoryAuthorityManager<B>,
+        operation: u128,
+        semantic_delta: WorkspaceSemanticDelta,
+    ) -> RepositoryTransaction {
+        let current = manager.read_authority().metadata().workspaces[0].clone();
+        let mutation = WorkspaceMutation {
+            workspace_id: current.workspace_id,
+            expected: WorkspaceExpectation::MustEqual {
+                generation: current.generation,
+                head: current.head.clone(),
+                base_target: current.base_target.clone(),
+                base_tree_hash: current.base_tree_hash,
+                tree_hash: current.tree_hash,
+                semantic_overlay_hash: current.semantic_overlay_hash,
+                admission_policy: current.admission_policy,
+            },
+            new_generation: current.generation + 1,
+            new_head: current.head,
+            new_base_target: current.base_target,
+            new_base_tree_hash: current.base_tree_hash,
+            tree_deltas: Vec::new(),
+            new_tree_hash: current.tree_hash,
+            semantic_delta,
+            new_shared_admission_policy: current.shared_admission_policy,
+            new_admission_policy: current.admission_policy,
+        };
+        let mut transaction = transaction_shell(manager, operation);
+        transaction.workspace_mutation = Some(mutation);
+        transaction
     }
 
     fn arbitrary_repository_transaction<B: StorageBackend + ?Sized + 'static>(
@@ -3816,6 +4157,7 @@ mod tests {
             new_base_tree_hash: Some(tree_hash),
             tree_deltas,
             new_tree_hash: tree_hash,
+            semantic_delta: WorkspaceSemanticDelta::default(),
             new_shared_admission_policy: shared,
             new_admission_policy: policy,
         };
@@ -3947,6 +4289,7 @@ mod tests {
             new_base_tree_hash: None,
             tree_deltas: Vec::new(),
             new_tree_hash: empty_tree_hash,
+            semantic_delta: WorkspaceSemanticDelta::default(),
             new_shared_admission_policy: shared,
             new_admission_policy: policy,
         };
@@ -4332,6 +4675,7 @@ mod tests {
             new_base_tree_hash: Some(tree_hash),
             tree_deltas: workspace_deltas,
             new_tree_hash: tree_hash,
+            semantic_delta: WorkspaceSemanticDelta::default(),
             new_shared_admission_policy: shared,
             new_admission_policy: policy,
         });
@@ -4443,6 +4787,7 @@ mod tests {
             new_base_tree_hash: Some(tree_hash),
             tree_deltas: workspace_deltas,
             new_tree_hash: tree_hash,
+            semantic_delta: WorkspaceSemanticDelta::default(),
             new_shared_admission_policy: shared,
             new_admission_policy: policy,
         });
@@ -4733,6 +5078,7 @@ mod tests {
                 base_target: current.base_target.clone(),
                 base_tree_hash: current.base_tree_hash,
                 tree_hash: current.tree_hash,
+                semantic_overlay_hash: current.semantic_overlay_hash,
                 admission_policy: current.admission_policy,
             },
             new_generation: current.generation + 1,
@@ -4741,6 +5087,7 @@ mod tests {
             new_base_tree_hash: current.base_tree_hash,
             tree_deltas: vec![delta],
             new_tree_hash: compute_resolved_tree_hash(&next_tree).unwrap(),
+            semantic_delta: WorkspaceSemanticDelta::default(),
             new_shared_admission_policy: current.shared_admission_policy,
             new_admission_policy: current.admission_policy,
         };
@@ -5386,6 +5733,36 @@ mod tests {
     }
 
     #[test]
+    fn repository_open_rejects_v11_tree_only_workspace_authority() {
+        let backend = Arc::new(MemoryBackend::default());
+        let manager = initial_manager(Arc::clone(&backend));
+        manager
+            .commit_repository_transaction(arbitrary_repository_transaction(&manager))
+            .unwrap();
+        drop(manager);
+
+        let mut persisted = backend.snapshot.lock();
+        let (bytes, _) = persisted
+            .as_mut()
+            .expect("authority snapshot was persisted");
+        bytes[4..8].copy_from_slice(&11u32.to_le_bytes());
+        drop(persisted);
+
+        let error = match RepositoryAuthorityManager::open(repository_id(), Arc::clone(&backend)) {
+            Ok(_) => panic!("v11 tree-only workspace authority must not reopen"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            KinDbError::IncompatibleSnapshotVersion { found: 11, .. }
+        ));
+        assert!(
+            error.to_string().contains("workspace semantics"),
+            "unexpected v11 authority rejection: {error}"
+        );
+    }
+
+    #[test]
     fn workspace_graph_snapshot_resolves_base_semantics_and_exact_arbitrary_tree() {
         let backend = Arc::new(MemoryBackend::default());
         let manager = initial_manager(Arc::clone(&backend));
@@ -5423,11 +5800,15 @@ mod tests {
         change.id = compute_semantic_change_id(change).unwrap();
         let change_id = change.id;
         transaction.ref_mutations[0].new_target = Some(RefTarget::change(change_id));
-        transaction
-            .workspace_mutation
-            .as_mut()
-            .unwrap()
-            .new_base_target = Some(RefTarget::change(change_id));
+        let workspace_mutation = transaction.workspace_mutation.as_mut().unwrap();
+        workspace_mutation.new_base_target = Some(RefTarget::change(change_id));
+        workspace_mutation.semantic_delta = WorkspaceSemanticDelta::new(
+            vec![EntityDelta::Added {
+                new: entity.clone(),
+            }],
+            Vec::new(),
+        )
+        .unwrap();
 
         manager.commit_repository_transaction(transaction).unwrap();
         let authority = manager.read_authority();
@@ -5470,6 +5851,308 @@ mod tests {
             .expect("workspace survives reopen");
         assert_eq!(reopened_prepared.entities.get(&entity_id), Some(&entity));
         assert_eq!(reopened_prepared.resolved_tree, workspace.tree);
+    }
+
+    #[test]
+    fn same_tree_polyglot_semantics_and_cross_language_relation_survive_reopen() {
+        let backend = Arc::new(MemoryBackend::default());
+        let manager = initial_manager(Arc::clone(&backend));
+        let base_rust = semantic_test_entity("src/lib.rs", "kin", LanguageId::Rust, 0x30);
+        let mut initial = arbitrary_repository_transaction(&manager);
+        let change = initial.changes.first_mut().unwrap();
+        change.entity_deltas.push(EntityDelta::Added {
+            new: base_rust.clone(),
+        });
+        change.id = SemanticChangeId::from_hash(Hash256::from_bytes([0; 32]));
+        change.id = compute_semantic_change_id(change).unwrap();
+        let base_target = RefTarget::change(change.id);
+        initial.ref_mutations[0].new_target = Some(base_target.clone());
+        let initial_workspace = initial.workspace_mutation.as_mut().unwrap();
+        initial_workspace.new_base_target = Some(base_target);
+        initial_workspace.semantic_delta = WorkspaceSemanticDelta::new(
+            vec![EntityDelta::Added {
+                new: base_rust.clone(),
+            }],
+            Vec::new(),
+        )
+        .unwrap();
+        manager.commit_repository_transaction(initial).unwrap();
+
+        let rust = semantic_test_entity("src/lib.rs", "kin", LanguageId::Rust, 0x31);
+        assert_eq!(rust.id, base_rust.id);
+        let python = semantic_test_entity("tools/check.py", "check_kin", LanguageId::Python, 0x41);
+        let relation = Relation {
+            id: RelationId::from_content(&rust.id.to_string(), &python.id.to_string(), "calls"),
+            kind: RelationKind::Calls,
+            src: GraphNodeId::Entity(rust.id),
+            dst: GraphNodeId::Entity(python.id),
+            confidence: 1.0,
+            origin: RelationOrigin::Manual,
+            created_in: None,
+            import_source: Some("tools.check".to_string()),
+            evidence: Vec::new(),
+        };
+        let semantic_delta = WorkspaceSemanticDelta::new(
+            vec![
+                EntityDelta::Modified {
+                    old: base_rust,
+                    new: rust.clone(),
+                },
+                EntityDelta::Added {
+                    new: python.clone(),
+                },
+            ],
+            vec![RelationDelta::Added {
+                new: relation.clone(),
+            }],
+        )
+        .unwrap();
+        let roots_before = manager.read_authority().roots().clone();
+        let tree_before = manager.read_authority().metadata().workspaces[0]
+            .tree
+            .clone();
+        assert_eq!(tree_before.len(), 6);
+        for path in [
+            "compose.yaml",
+            "src/lib.rs",
+            "tools/check.py",
+            "unsupported/module.zig",
+            "compose-current",
+        ] {
+            assert!(
+                tree_before
+                    .artifact_at_path(&RepoPath::from_utf8(path).unwrap())
+                    .is_some(),
+                "polyglot exact-tree fixture is missing {path}"
+            );
+        }
+        assert!(tree_before
+            .artifact_at_path(&RepoPath::from_bytes(b"assets/data-\xff.bin".to_vec()).unwrap())
+            .is_some());
+
+        let receipt = manager
+            .commit_repository_transaction(semantic_workspace_transaction(
+                &manager,
+                0x5e01,
+                semantic_delta,
+            ))
+            .unwrap();
+
+        assert!(
+            roots_before.has_same_replicated_truth(&receipt.roots_after),
+            "same-tree workspace semantics must remain local authority"
+        );
+        assert_ne!(roots_before.local_state, receipt.roots_after.local_state);
+        let workspace = manager.read_authority().metadata().workspaces[0].clone();
+        assert_eq!(workspace.tree, tree_before);
+        assert!(!workspace.semantic_overlay.is_empty());
+
+        let prepared = manager
+            .workspace_graph_snapshot(&repository_id(), &workspace.workspace_id)
+            .unwrap()
+            .expect("semantic workspace exists");
+        assert_eq!(prepared.entities.get(&rust.id), Some(&rust));
+        assert_eq!(prepared.entities.get(&python.id), Some(&python));
+        assert_eq!(prepared.relations.get(&relation.id), Some(&relation));
+        assert_eq!(prepared.resolved_tree, tree_before);
+
+        let reopened =
+            RepositoryAuthorityManager::open(repository_id(), Arc::clone(&backend)).unwrap();
+        let reopened_prepared = reopened
+            .workspace_graph_snapshot(&repository_id(), &workspace.workspace_id)
+            .unwrap()
+            .expect("semantic workspace survives reopen");
+        assert_eq!(reopened_prepared.entities.get(&rust.id), Some(&rust));
+        assert_eq!(reopened_prepared.entities.get(&python.id), Some(&python));
+        assert_eq!(
+            reopened_prepared.relations.get(&relation.id),
+            Some(&relation)
+        );
+        assert_eq!(reopened_prepared.resolved_tree, tree_before);
+    }
+
+    #[test]
+    fn advancing_the_base_rederives_a_clean_semantic_overlay_and_survives_reopen() {
+        let backend = Arc::new(MemoryBackend::default());
+        let manager = initial_manager(Arc::clone(&backend));
+        let base_rust = semantic_test_entity("src/lib.rs", "kin", LanguageId::Rust, 0x61);
+        let mut initial = arbitrary_repository_transaction(&manager);
+        let base_change = initial.changes.first_mut().unwrap();
+        base_change.entity_deltas.push(EntityDelta::Added {
+            new: base_rust.clone(),
+        });
+        base_change.id = SemanticChangeId::from_hash(Hash256::from_bytes([0; 32]));
+        base_change.id = compute_semantic_change_id(base_change).unwrap();
+        let base_change_id = base_change.id;
+        let base_target = RefTarget::change(base_change_id);
+        initial.ref_mutations[0].new_target = Some(base_target.clone());
+        let initial_workspace = initial.workspace_mutation.as_mut().unwrap();
+        initial_workspace.new_base_target = Some(base_target.clone());
+        initial_workspace.semantic_delta = WorkspaceSemanticDelta::new(
+            vec![EntityDelta::Added {
+                new: base_rust.clone(),
+            }],
+            Vec::new(),
+        )
+        .unwrap();
+        manager.commit_repository_transaction(initial).unwrap();
+
+        let current = manager.read_authority().metadata().workspaces[0].clone();
+        assert!(current.semantic_overlay.is_empty());
+        let tree_before = current.tree.clone();
+        let next_rust = semantic_test_entity("src/lib.rs", "kin", LanguageId::Rust, 0x62);
+        assert_eq!(next_rust.id, base_rust.id);
+        let mut next_change = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+            origin: ChangeOrigin::Native,
+            parents: vec![base_change_id],
+            timestamp: Timestamp(
+                chrono::DateTime::parse_from_rfc3339("2026-07-26T12:01:00Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+            ),
+            author: AuthorId::new("authority-test"),
+            message: "advance the exact semantic base".to_string(),
+            entity_deltas: vec![EntityDelta::Modified {
+                old: base_rust.clone(),
+                new: next_rust.clone(),
+            }],
+            relation_deltas: Vec::new(),
+            tree_deltas: Vec::new(),
+            admission_policy_delta: None,
+            projected_files: Vec::new(),
+            spec_link: None,
+            evidence: Vec::new(),
+            risk_summary: None,
+        };
+        next_change.id = compute_semantic_change_id(&next_change).unwrap();
+        let next_target = RefTarget::change(next_change.id);
+        let main = RefName::branch(b"main").unwrap();
+        let mutation = WorkspaceMutation {
+            workspace_id: current.workspace_id,
+            expected: WorkspaceExpectation::MustEqual {
+                generation: current.generation,
+                head: current.head.clone(),
+                base_target: current.base_target.clone(),
+                base_tree_hash: current.base_tree_hash,
+                tree_hash: current.tree_hash,
+                semantic_overlay_hash: current.semantic_overlay_hash,
+                admission_policy: current.admission_policy,
+            },
+            new_generation: current.generation + 1,
+            new_head: current.head,
+            new_base_target: Some(next_target.clone()),
+            new_base_tree_hash: current.base_tree_hash,
+            tree_deltas: Vec::new(),
+            new_tree_hash: current.tree_hash,
+            semantic_delta: WorkspaceSemanticDelta::new(
+                vec![EntityDelta::Modified {
+                    old: base_rust,
+                    new: next_rust.clone(),
+                }],
+                Vec::new(),
+            )
+            .unwrap(),
+            new_shared_admission_policy: current.shared_admission_policy,
+            new_admission_policy: current.admission_policy,
+        };
+        let mut transaction = transaction_shell(&manager, 0x5e02);
+        transaction.changes.push(next_change);
+        transaction.ref_mutations.push(RefMutation {
+            name: main,
+            expected: RefExpectation::MustEqual {
+                target: base_target,
+            },
+            new_target: Some(next_target.clone()),
+            policy: RefUpdatePolicy::FastForwardOnly,
+        });
+        transaction.workspace_mutation = Some(mutation);
+        manager.commit_repository_transaction(transaction).unwrap();
+
+        let advanced = manager.read_authority().metadata().workspaces[0].clone();
+        assert_eq!(advanced.base_target, Some(next_target));
+        assert_eq!(advanced.tree, tree_before);
+        assert!(advanced.semantic_overlay.is_empty());
+        assert!(!advanced.is_dirty());
+        let prepared = manager
+            .workspace_graph_snapshot(&repository_id(), &advanced.workspace_id)
+            .unwrap()
+            .expect("advanced workspace exists");
+        assert_eq!(prepared.entities.get(&next_rust.id), Some(&next_rust));
+        assert_eq!(prepared.resolved_tree, tree_before);
+
+        let reopened =
+            RepositoryAuthorityManager::open(repository_id(), Arc::clone(&backend)).unwrap();
+        let reopened_prepared = reopened
+            .workspace_graph_snapshot(&repository_id(), &advanced.workspace_id)
+            .unwrap()
+            .expect("advanced workspace survives reopen");
+        assert_eq!(
+            reopened_prepared.entities.get(&next_rust.id),
+            Some(&next_rust)
+        );
+        assert_eq!(reopened_prepared.resolved_tree, tree_before);
+    }
+
+    #[test]
+    fn workspace_semantic_mutation_rejects_a_stale_old_entity_payload() {
+        let backend = Arc::new(MemoryBackend::default());
+        let manager = initial_manager(Arc::clone(&backend));
+        manager
+            .commit_repository_transaction(arbitrary_repository_transaction(&manager))
+            .unwrap();
+
+        let entity = semantic_test_entity("src/lib.rs", "kin", LanguageId::Rust, 0x51);
+        manager
+            .commit_repository_transaction(semantic_workspace_transaction(
+                &manager,
+                0x5e10,
+                WorkspaceSemanticDelta::new(
+                    vec![EntityDelta::Added {
+                        new: entity.clone(),
+                    }],
+                    Vec::new(),
+                )
+                .unwrap(),
+            ))
+            .unwrap();
+
+        let generation_before = manager.read_authority().generation();
+        let workspace_before = manager.read_authority().metadata().workspaces[0].clone();
+        let mut stale = entity.clone();
+        stale.signature = "fn stale_kin()".to_string();
+        let mut replacement = entity.clone();
+        replacement.signature = "fn replacement_kin()".to_string();
+        let transaction = semantic_workspace_transaction(
+            &manager,
+            0x5e11,
+            WorkspaceSemanticDelta::new(
+                vec![EntityDelta::Modified {
+                    old: stale,
+                    new: replacement,
+                }],
+                Vec::new(),
+            )
+            .unwrap(),
+        );
+
+        let error = manager
+            .commit_repository_transaction(transaction)
+            .expect_err("a stale semantic old payload must not acquire authority");
+        assert!(
+            error.to_string().contains("stale old payload for entity"),
+            "unexpected stale-semantic error: {error}"
+        );
+        assert_eq!(manager.read_authority().generation(), generation_before);
+        assert_eq!(
+            manager.read_authority().metadata().workspaces[0],
+            workspace_before
+        );
+        let prepared = manager
+            .workspace_graph_snapshot(&repository_id(), &workspace_before.workspace_id)
+            .unwrap()
+            .expect("previous workspace remains authoritative");
+        assert_eq!(prepared.entities.get(&entity.id), Some(&entity));
     }
 
     #[test]
@@ -5651,6 +6334,7 @@ mod tests {
                 base_target: current.base_target.clone(),
                 base_tree_hash: current.base_tree_hash,
                 tree_hash: current.tree_hash,
+                semantic_overlay_hash: current.semantic_overlay_hash,
                 admission_policy: current.admission_policy,
             },
             new_generation: current.generation + 1,
@@ -5659,6 +6343,7 @@ mod tests {
             new_base_tree_hash: current.base_tree_hash,
             tree_deltas: vec![delta],
             new_tree_hash: compute_resolved_tree_hash(&next_tree).unwrap(),
+            semantic_delta: WorkspaceSemanticDelta::default(),
             new_shared_admission_policy: next_policy,
             new_admission_policy: next_effective,
         };
@@ -5831,6 +6516,7 @@ mod tests {
                 base_target: before_workspace.base_target.clone(),
                 base_tree_hash: before_workspace.base_tree_hash,
                 tree_hash: before_workspace.tree_hash,
+                semantic_overlay_hash: before_workspace.semantic_overlay_hash,
                 admission_policy: before_workspace.admission_policy,
             },
             new_generation: before_workspace.generation + 1,
@@ -5839,6 +6525,7 @@ mod tests {
             new_base_tree_hash: before_workspace.base_tree_hash,
             tree_deltas: vec![tree_delta],
             new_tree_hash: next_tree_hash,
+            semantic_delta: WorkspaceSemanticDelta::default(),
             new_shared_admission_policy: before_workspace.shared_admission_policy.clone(),
             new_admission_policy: before_workspace.admission_policy,
         };
@@ -6063,6 +6750,7 @@ mod tests {
                 base_target: current.base_target.clone(),
                 base_tree_hash: current.base_tree_hash,
                 tree_hash: current.tree_hash,
+                semantic_overlay_hash: current.semantic_overlay_hash,
                 admission_policy: current.admission_policy,
             },
             new_generation: current.generation + 1,
@@ -6071,6 +6759,7 @@ mod tests {
             new_base_tree_hash: current.base_tree_hash,
             tree_deltas: vec![tree_delta],
             new_tree_hash: tree_hash,
+            semantic_delta: WorkspaceSemanticDelta::default(),
             new_shared_admission_policy: dirty_policy.clone(),
             new_admission_policy: effective,
         };
@@ -6640,6 +7329,143 @@ mod tests {
         )
         .unwrap();
         assert_eq!(reopened.read_authority().generation(), 2);
+    }
+
+    #[test]
+    fn local_commit_returns_successor_freeze_without_releasing_writer_lock() {
+        let directory = TempDir::new().unwrap();
+        let backend = Arc::new(LocalFileBackend::new(directory.path()));
+        let manager =
+            RepositoryAuthorityManager::open(repository_id(), Arc::clone(&backend)).unwrap();
+        manager
+            .commit_repository_transaction(arbitrary_repository_transaction(&manager))
+            .unwrap();
+
+        let competing = RepositoryAuthorityManager::open(
+            repository_id(),
+            Arc::new(LocalFileBackend::new(directory.path())),
+        )
+        .unwrap();
+        let successor = unborn_workspace_transaction(&manager, 0x5410, 0x5411, b"successor");
+        let stale_competitor =
+            unborn_workspace_transaction(&competing, 0x5412, 0x5413, b"competitor");
+
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let finished_rx = Arc::new(std::sync::Mutex::new(finished_rx));
+        let writer = std::thread::spawn(move || {
+            release_rx.recv().unwrap();
+            started_tx.send(()).unwrap();
+            finished_tx
+                .send(competing.commit_repository_transaction(stale_competitor))
+                .unwrap();
+        });
+        let hook_finished_rx = Arc::clone(&finished_rx);
+        backend.set_snapshot_before_authority_commit_hook(move || {
+            release_tx.send(()).unwrap();
+            started_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
+            assert!(
+                hook_finished_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_millis(200))
+                    .is_err(),
+                "the competing writer must wait behind the commit-point lock"
+            );
+        });
+
+        let (receipt, freeze) = manager
+            .commit_repository_transaction_and_freeze(successor)
+            .expect("local commit must return its still-held successor lock");
+        assert_eq!(receipt.generation, 2);
+        assert_eq!(freeze.roots(), &receipt.roots_after);
+        assert_eq!(freeze.authority().roots(), &receipt.roots_after);
+        assert!(
+            finished_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_millis(200))
+                .is_err(),
+            "the successor freeze must retain the commit-point lock"
+        );
+
+        drop(freeze);
+        let error = finished_rx
+            .lock()
+            .unwrap()
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("the blocked writer must resume after freeze release")
+            .expect_err("the blocked stale writer must lose successor CAS");
+        assert!(
+            error.to_string().contains("generation mismatch"),
+            "unexpected stale-writer error: {error}"
+        );
+        writer.join().unwrap();
+
+        let reopened = RepositoryAuthorityManager::open(
+            repository_id(),
+            Arc::new(LocalFileBackend::new(directory.path())),
+        )
+        .unwrap();
+        assert_eq!(reopened.read_authority().generation(), receipt.generation);
+        assert_eq!(reopened.read_authority().roots(), &receipt.roots_after);
+    }
+
+    #[test]
+    fn local_idempotent_commit_replay_returns_exact_held_freeze() {
+        let directory = TempDir::new().unwrap();
+        let backend = Arc::new(LocalFileBackend::new(directory.path()));
+        let manager =
+            RepositoryAuthorityManager::open(repository_id(), Arc::clone(&backend)).unwrap();
+        let transaction = arbitrary_repository_transaction(&manager);
+        let (receipt, initial_freeze) = manager
+            .commit_repository_transaction_and_freeze(transaction.clone())
+            .expect("initial local commit must return its successor freeze");
+        drop(initial_freeze);
+
+        let competing = RepositoryAuthorityManager::open(
+            repository_id(),
+            Arc::new(LocalFileBackend::new(directory.path())),
+        )
+        .unwrap();
+        let competing_transaction =
+            unborn_workspace_transaction(&competing, 0x5420, 0x5421, b"after-replay");
+        let (replay, replay_freeze) = manager
+            .commit_repository_transaction_and_freeze(transaction)
+            .expect("idempotent replay must freeze the exact installed successor");
+        assert_eq!(replay.operation_id, receipt.operation_id);
+        assert_eq!(replay.roots_after, receipt.roots_after);
+        assert_eq!(replay.outcome, RepositoryCommitOutcome::IdempotentReplay);
+        assert_eq!(replay_freeze.roots(), &receipt.roots_after);
+        assert_eq!(replay_freeze.authority().roots(), &receipt.roots_after);
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            finished_tx
+                .send(competing.commit_repository_transaction(competing_transaction))
+                .unwrap();
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        assert!(
+            finished_rx
+                .recv_timeout(std::time::Duration::from_millis(200))
+                .is_err(),
+            "an idempotent replay freeze must retain the installed authority lock"
+        );
+
+        drop(replay_freeze);
+        finished_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("the competing writer must resume after replay freeze release")
+            .expect("the competing writer must commit against the unchanged replayed parent");
+        writer.join().unwrap();
     }
 
     #[cfg(unix)]
