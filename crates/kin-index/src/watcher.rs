@@ -188,15 +188,20 @@ mod tests {
     }
 
     #[test]
-    fn classify_ignores_skipped_dir_paths() {
+    fn classify_includes_generated_directory_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let generated = root.path().join("out/generated.rs");
+        std::fs::create_dir_all(generated.parent().unwrap()).unwrap();
+        std::fs::write(&generated, "pub const GENERATED: bool = true;").unwrap();
         let event = Event {
             kind: EventKind::Modify(notify::event::ModifyKind::Data(
                 notify::event::DataChange::Content,
             )),
-            paths: vec![PathBuf::from("/tmp/out/generated.rs")],
+            paths: vec![generated],
             attrs: Default::default(),
         };
-        let result = classify_event(&event, Path::new("/tmp"));
-        assert!(result.is_empty());
+        let result = classify_event(&event, root.path());
+        assert_eq!(result.len(), 1);
+        assert!(matches!(result[0], FileEvent::Changed(_)));
     }
 }
