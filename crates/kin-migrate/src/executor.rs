@@ -109,9 +109,11 @@ pub fn execute_migration_persisted(plan: &MigrationPlan) -> Result<MigrationResu
             .authority
             .initial_change_id
             .map(|change| change.to_string()),
-        default_branch: initialized
+        default_branch: metadata
+            .ref_state
             .default_ref
-            .as_utf8()
+            .as_ref()
+            .and_then(kin_model::RefName::as_utf8)
             .and_then(|reference| reference.strip_prefix("refs/heads/"))
             .map(str::to_owned),
         authority_generation: initialized.authority.receipt.generation,

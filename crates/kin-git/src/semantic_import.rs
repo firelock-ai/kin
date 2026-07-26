@@ -39,9 +39,13 @@ const GIT_ARTIFACT_NAMESPACE: Uuid = Uuid::from_bytes([
 /// as the graph-owned workspace tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitWorkspaceSeed {
+    /// Material workspace HEAD. Symbolic identity is preserved, while a
+    /// detached annotated-tag target is normalized to its peeled commit.
+    /// Exact raw HEAD identity remains in `GitExternalAuthority`.
     pub head: WorkspaceHead,
-    /// Exact direct external target reached through HEAD's symbolic ref chain.
-    /// `None` denotes an unborn symbolic HEAD.
+    /// Exact material commit target used as the workspace baseline. Annotated
+    /// tags are peeled to the commit here; their raw identity remains in
+    /// `GitExternalAuthority`. `None` denotes an unborn symbolic HEAD.
     pub base_target: Option<RefTarget>,
     /// Commit reached after peeling any annotated tag target.
     pub base_commit_oid: Option<GitObjectId>,
@@ -241,13 +245,19 @@ fn build_semantic_git_import_plan(
         .refs
         .refs
         .iter()
-        .map(|repository_ref| RefMutation {
-            name: repository_ref.name.clone(),
-            expected: RefExpectation::MustNotExist,
-            new_target: Some(repository_ref.target.clone()),
-            policy: RefUpdatePolicy::ForceWithLease,
+        .map(|repository_ref| {
+            Ok(RefMutation {
+                name: repository_ref.name.clone(),
+                expected: RefExpectation::MustNotExist,
+                new_target: Some(material_ref_target(
+                    &repository_ref.target,
+                    &bodies,
+                    hash_kind,
+                )?),
+                policy: RefUpdatePolicy::ForceWithLease,
+            })
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>>>()?;
     for mutation in &ref_mutations {
         mutation.validate()?;
     }
@@ -733,9 +743,19 @@ fn resolve_workspace_seed(
                 context: "resolved HEAD commit tree".to_string(),
             })?;
     let base_tree_hash = compute_resolved_tree_hash(&base_tree)?;
+    let material_target = RefTarget::external_object(ExternalObjectId::new(
+        ExternalObjectKind::Commit,
+        base_commit_oid,
+    ));
+    let workspace_head = match &snapshot.head {
+        WorkspaceHead::Symbolic { .. } => snapshot.head.clone(),
+        WorkspaceHead::Detached { .. } => WorkspaceHead::Detached {
+            target: material_target.clone(),
+        },
+    };
     Ok(GitWorkspaceSeed {
-        head: snapshot.head.clone(),
-        base_target: Some(base_target),
+        head: workspace_head,
+        base_target: Some(material_target),
         base_commit_oid: Some(base_commit_oid),
         base_tree,
         base_tree_hash: Some(base_tree_hash),
@@ -774,6 +794,43 @@ fn peel_to_commit(
     bodies: &BTreeMap<ExternalObjectId, Vec<u8>>,
     hash_kind: gix::hash::Kind,
 ) -> Result<GitObjectId> {
+    let current = peel_annotated_tags(start, bodies, hash_kind)?;
+    match current.kind {
+        ExternalObjectKind::Commit => Ok(current.oid),
+        ExternalObjectKind::Tree | ExternalObjectKind::Blob => {
+            Err(GitError::InvalidSnapshot(format!(
+                "HEAD target {} is a {:?}, not a commit-ish object",
+                current.oid, current.kind
+            )))
+        }
+        ExternalObjectKind::Tag => unreachable!("annotated tags are peeled completely"),
+    }
+}
+
+fn material_ref_target(
+    target: &RefTarget,
+    bodies: &BTreeMap<ExternalObjectId, Vec<u8>>,
+    hash_kind: gix::hash::Kind,
+) -> Result<RefTarget> {
+    let RefTarget::ExternalObject { object } = target else {
+        return Ok(target.clone());
+    };
+    if object.kind != ExternalObjectKind::Tag {
+        return Ok(target.clone());
+    }
+    let peeled = peel_annotated_tags(*object, bodies, hash_kind)?;
+    Ok(if peeled.kind == ExternalObjectKind::Commit {
+        RefTarget::external_object(peeled)
+    } else {
+        target.clone()
+    })
+}
+
+fn peel_annotated_tags(
+    start: ExternalObjectId,
+    bodies: &BTreeMap<ExternalObjectId, Vec<u8>>,
+    hash_kind: gix::hash::Kind,
+) -> Result<ExternalObjectId> {
     let mut current = start;
     let mut visited = BTreeSet::new();
     loop {
@@ -784,27 +841,26 @@ fn peel_to_commit(
             )));
         }
         match current.kind {
-            ExternalObjectKind::Commit => return Ok(current.oid),
+            ExternalObjectKind::Commit | ExternalObjectKind::Tree | ExternalObjectKind::Blob => {
+                return Ok(current)
+            }
             ExternalObjectKind::Tag => {
                 let body = bodies
                     .get(&current)
                     .ok_or_else(|| GitError::MissingObject {
                         oid: current.oid.to_string(),
-                        context: "peeling HEAD tag".to_string(),
+                        context: "peeling annotated tag".to_string(),
                     })?;
                 let tag = gix::objs::TagRef::from_bytes(body, hash_kind).map_err(|error| {
-                    GitError::InvalidSnapshot(format!("decode HEAD tag {}: {error}", current.oid))
+                    GitError::InvalidSnapshot(format!(
+                        "decode annotated tag {}: {error}",
+                        current.oid
+                    ))
                 })?;
                 current = ExternalObjectId::new(
                     external_kind(tag.target_kind),
                     git_object_id(tag.target())?,
                 );
-            }
-            ExternalObjectKind::Tree | ExternalObjectKind::Blob => {
-                return Err(GitError::InvalidSnapshot(format!(
-                    "HEAD target {} is a {:?}, not a commit-ish object",
-                    current.oid, current.kind
-                )))
             }
         }
     }
@@ -1310,6 +1366,18 @@ mod tests {
                             ..
                         }
                     }
+                )
+        }));
+        assert!(second.ref_mutations.iter().any(|mutation| {
+            mutation.name.as_bytes() == b"refs/tags/release-octo"
+                && matches!(
+                    mutation.new_target.as_ref(),
+                    Some(RefTarget::ExternalObject {
+                        object: ExternalObjectId {
+                            kind: ExternalObjectKind::Commit,
+                            oid,
+                        }
+                    }) if *oid == fixture.merge
                 )
         }));
         assert_eq!(second.workspace_seed.head, snapshot.head);

@@ -35,8 +35,9 @@ pub use assistant_sync::{
     SyncMode, SyncResult,
 };
 pub use config::{
-    ExecutionPolicyConfig, ExternalToolExecutionPolicy, KinConfig, RemoteConfig, RemoteHostKind,
-    RemoteRefConfig, RemoteTransportKind, WorldConfig, WorldPreset,
+    ExecutionPolicyConfig, ExternalToolExecutionPolicy, GitBranchTrackingConfig,
+    GitCoexistenceConfig, GitPushDefault, GitRemoteTransportConfig, KinConfig, RemoteConfig,
+    RemoteHostKind, RemoteRefConfig, RemoteTransportKind, WorldConfig, WorldPreset,
 };
 pub use error::{KinError, Result};
 pub use exact_tree::{
@@ -49,7 +50,8 @@ pub use hooks::{
 };
 pub use init::{
     init, initialize_repository_authority, prepare_repository_layout_at, publish_repository_layout,
-    publish_repository_layout_after_check, InitResult, PreparedRepositoryInit, RepositoryBootstrap,
+    publish_repository_layout_linearized, InitResult, PreparedRepositoryInit, PublishedRepository,
+    RepositoryBootstrap, RepositoryPublication,
 };
 pub use layout::KinLayout;
 pub use manifest::KinManifest;
