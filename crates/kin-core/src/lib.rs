@@ -62,7 +62,8 @@ pub use tree::{
     replace_source_tree, resolve_change_tree, should_preserve_checkout_path,
     validate_portable_source_paths, validate_portable_source_symlink, validate_source_entry,
     validate_source_paths, validate_source_tree, ExactProjectionDetachTarget,
-    ExactProjectionFreeze, ExactProjectionVerification,
+    ExactProjectionEjectOutcome, ExactProjectionFreeze, ExactProjectionGitStage,
+    ExactProjectionVerification,
 };
 
 pub use diff::{compute_semantic_change_id, content_identity_from_deltas, whoami};
