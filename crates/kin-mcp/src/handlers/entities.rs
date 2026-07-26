@@ -193,8 +193,9 @@ pub fn handle_get_entity_source<G: GraphStore>(
 
     match store.get_entity(&entity_id).map_err(McpError::graph)? {
         Some(entity) => {
-            let body = read_entity_source_excerpt_detailed(store, &entity, 10_000, 1_000_000)
-                .ok_or_else(|| McpError::Context("entity source body unavailable".into()))?;
+            let exact_source =
+                read_entity_source_excerpt_detailed(store, &entity, 10_000, 1_000_000)?
+                    .ok_or_else(|| McpError::Context("entity source body unavailable".into()))?;
             let is_stale = LAST_READ_STALE.with(|f| f.get());
             let source = LAST_READ_SOURCE.with(|f| f.get());
             let span = entity.span.as_ref();
@@ -208,7 +209,11 @@ pub fn handle_get_entity_source<G: GraphStore>(
                 "start_line": span.map(|s| s.start_line),
                 "end_line": span.map(|s| s.end_line),
                 "signature": entity.signature,
-                "body": body,
+                "body": exact_source.body,
+                "source_change_id": exact_source.source_change_id,
+                "artifact_id": exact_source.artifact_id,
+                "artifact_path": exact_source.path,
+                "artifact_entry": exact_source.entry,
                 "stale": is_stale,
                 "source": source,
             });
@@ -468,7 +473,7 @@ fn resolve_entity_source_generic<G: GraphStore>(store: &G, id: &str) -> Resolved
                 DEFAULT_SOURCE_MAX_LINES,
                 DEFAULT_SOURCE_MAX_BYTES,
             ) {
-                Some(body) => ResolvedEntitySource::Found(EntitySourceRow {
+                Ok(Some(source)) => ResolvedEntitySource::Found(EntitySourceRow {
                     id: entity.id.to_string(),
                     name: entity.name.clone(),
                     kind: format!("{:?}", entity.kind),
@@ -485,11 +490,15 @@ fn resolve_entity_source_generic<G: GraphStore>(store: &G, id: &str) -> Resolved
                         .unwrap_or(0),
                     end_line: entity.span.as_ref().map(|span| span.end_line).unwrap_or(0),
                     signature: entity.signature.clone(),
-                    body,
+                    body: source.body,
                 }),
-                None => ResolvedEntitySource::NoSource {
+                Ok(None) => ResolvedEntitySource::NoSource {
                     id: entity.id.to_string(),
                     message: "entity source body unavailable".to_string(),
+                },
+                Err(error) => ResolvedEntitySource::NoSource {
+                    id: entity.id.to_string(),
+                    message: error.to_string(),
                 },
             }
         }
@@ -579,14 +588,17 @@ pub fn handle_get_context_pack<G: GraphStore>(
     let focal_entity = store.get_entity(&entity_id).map_err(McpError::graph)?;
 
     let focal_json = if let (Some(entry), Some(entity)) = (focal_entry, &focal_entity) {
-        focal_context_json(store, entry, entity, compact)
+        focal_context_json(store, entry, entity, compact)?
     } else {
         serde_json::json!(null)
     };
 
-    let project_dep = |entry: &kin_model::context::ContextEntry| -> serde_json::Value {
+    let project_dep = |entry: &kin_model::context::ContextEntry| -> Result<serde_json::Value> {
         // Look up the entity for structured fields.
-        if let Ok(Some(e)) = store.get_entity(&entry.entity_id) {
+        if let Some(e) = store
+            .get_entity(&entry.entity_id)
+            .map_err(McpError::graph)?
+        {
             let mut obj = serde_json::json!({
                 "id": e.id,
                 "name": e.name,
@@ -604,19 +616,21 @@ pub fn handle_get_context_pack<G: GraphStore>(
                     &e,
                     MCP_SOURCE_MAX_LINES,
                     MCP_SOURCE_MAX_CHARS,
-                );
+                )?;
                 let is_stale = LAST_READ_STALE.with(|f| f.get());
                 let source = LAST_READ_SOURCE.with(|f| f.get());
                 obj["stale"] = serde_json::json!(is_stale);
                 obj["source"] = serde_json::json!(source);
-                obj["body"] = serde_json::json!(body.unwrap_or_else(|| entry.content.clone()));
+                obj["body"] = serde_json::json!(body
+                    .map(|source| source.body)
+                    .unwrap_or_else(|| entry.content.clone()));
             }
-            obj
+            Ok(obj)
         } else {
-            serde_json::json!({
+            Ok(serde_json::json!({
                 "id": entry.entity_id.to_string(),
                 "content": entry.content,
-            })
+            }))
         }
     };
 
@@ -624,8 +638,12 @@ pub fn handle_get_context_pack<G: GraphStore>(
         .dependency_signatures
         .iter()
         .map(&project_dep)
-        .collect();
-    let transitive: Vec<_> = pack.transitive_deps.iter().map(&project_dep).collect();
+        .collect::<Result<Vec<_>>>()?;
+    let transitive: Vec<_> = pack
+        .transitive_deps
+        .iter()
+        .map(&project_dep)
+        .collect::<Result<Vec<_>>>()?;
 
     let mut result = serde_json::json!({
         "focal_entity": focal_json,
@@ -638,11 +656,19 @@ pub fn handle_get_context_pack<G: GraphStore>(
         if !transitive.is_empty() {
             result["transitive_deps"] = serde_json::json!(transitive);
         }
-        let tests: Vec<_> = pack.tests.iter().map(&project_dep).collect();
+        let tests: Vec<_> = pack
+            .tests
+            .iter()
+            .map(&project_dep)
+            .collect::<Result<Vec<_>>>()?;
         if !tests.is_empty() {
             result["tests"] = serde_json::json!(tests);
         }
-        let contracts: Vec<_> = pack.contracts.iter().map(&project_dep).collect();
+        let contracts: Vec<_> = pack
+            .contracts
+            .iter()
+            .map(&project_dep)
+            .collect::<Result<Vec<_>>>()?;
         if !contracts.is_empty() {
             result["contracts"] = serde_json::json!(contracts);
         }
@@ -1625,7 +1651,7 @@ pub fn handle_explore_codebase<G: GraphStore>(
 
                         let outgoing_calls =
                             outgoing_related_entities(store, &step.id, &[RelationKind::Calls])?;
-                        let step_body = trace_body(store, step);
+                        let step_body = trace_body(store, step)?;
                         let constants = trace_constants_for_step(store, step, &step_body)?;
 
                         if !push_with_budget(
@@ -1685,11 +1711,12 @@ pub fn handle_explore_codebase<G: GraphStore>(
                                     output.push_str("  ... (truncated)\n");
                                     break;
                                 }
+                                let constant_body = trace_body(store, constant)?;
                                 if !push_indented_body(
                                     &mut output,
                                     &mut tokens_used,
                                     token_budget,
-                                    &trace_body(store, constant),
+                                    &constant_body,
                                 ) {
                                     output.push_str("       ... [truncated]\n");
                                     break;
