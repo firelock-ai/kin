@@ -3087,7 +3087,7 @@ impl InMemoryGraph {
     /// Capture one full-snapshot persistence batch together with both the
     /// entity/relation Merkle root and the exact authority digest used to bind
     /// retrieval sidecars.
-    pub(crate) fn begin_snapshot_persistence_with_retrieval_hash(
+    pub fn begin_snapshot_persistence_with_retrieval_hash(
         &self,
         precomputed_hash: Option<crate::storage::merkle::MerkleHash>,
     ) -> Result<
