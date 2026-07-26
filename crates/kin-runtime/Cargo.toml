@@ -10,6 +10,7 @@ description = "Graph-backed session execution, validation, and evidence capture 
 repository.workspace = true
 
 [dependencies]
+kin-core = { workspace = true }
 kin-model = { workspace = true }
 kin-blobs = { workspace = true }
 thiserror = { workspace = true }
