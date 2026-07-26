@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.6] - 2026-07-26
+
+### Added
+
+- Locate ranking uses deterministic query-token to path-segment affinity:
+  adjacent query tokens matching consecutive path segments (`release list`
+  against `pkg/cmd/release/list/list.go`) take a bounded, order-sensitive
+  boost, and isolated segment matches take a much smaller capped one. This
+  discriminates command-verb siblings that the semantic channels rank as
+  near-neighbors. Pure lexical over already-ranked paths: no graph,
+  filesystem, or network reads. `KIN_LOCATE_PATH_AFFINITY=0` disables.
+
 ## [0.3.5] - 2026-07-26
 
 ### Fixed
