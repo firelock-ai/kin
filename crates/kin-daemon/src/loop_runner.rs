@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -143,6 +143,13 @@ struct FacetCleanup {
     changed: bool,
 }
 
+#[derive(Debug)]
+struct ExactTreeAdmission {
+    deltas: Vec<TreeDelta>,
+    changed_paths: BTreeSet<RepoPath>,
+    semantic_events: Vec<FileEvent>,
+}
+
 fn repo_path(path: &Path, working_dir: &Path) -> Result<Option<RepoPath>> {
     let relative = path.strip_prefix(working_dir).map_err(|error| {
         DaemonError::Io(std::io::Error::new(
@@ -210,12 +217,88 @@ fn is_within_graph_only_member(state: &DaemonState, path: &RepoPath) -> bool {
         })
 }
 
-fn scanned_tree_entry(entry: &kin_index::ScannedRepositoryEntry) -> TreeEntry {
-    let hash = Hash256::from_bytes(entry.content_hash);
-    match entry.kind {
-        kin_index::ScannedEntryKind::Regular { executable } => TreeEntry::blob(hash, executable),
-        kin_index::ScannedEntryKind::Symlink => TreeEntry::symlink(hash),
+fn exact_tree_admission(state: &DaemonState) -> Result<ExactTreeAdmission> {
+    let working_dir = state.layout.working_dir();
+    let previous = state.graph.resolved_tree();
+    let tracked_paths = previous
+        .artifacts_by_path()
+        .map(|artifact| artifact.path.clone())
+        .collect::<Vec<_>>();
+    let graph_only_paths = previous
+        .artifacts_by_path()
+        .filter(|artifact| matches!(artifact.entry, TreeEntry::Gitlink { .. }))
+        .map(|artifact| artifact.path.clone())
+        .collect::<Vec<_>>();
+    let ignore =
+        kin_index::RepositoryIgnore::load(working_dir).map_err(kin_index::IndexError::from)?;
+    let scan = kin_index::scan_repository_preserving_graph_only(
+        working_dir,
+        &ignore,
+        tracked_paths.iter(),
+        graph_only_paths.iter(),
+    )
+    .map_err(kin_index::IndexError::from)?;
+    let mut observed =
+        crate::commit_deltas::observed_tree_from_complete_scan(&state.blobs, &scan, &previous)?;
+    let mut deltas = kin_core::plan_observed_tree_deltas(&previous, observed.clone())?;
+
+    let removed_count = deltas
+        .iter()
+        .filter(|delta| matches!(delta, TreeDelta::Removed { .. }))
+        .count() as u64;
+    let allow_mass_deletion = std::env::var("KIN_ALLOW_MASS_DELETION")
+        .ok()
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "on"))
+        .unwrap_or(false);
+    if should_block_mass_deletion(removed_count, previous.len() as u64, allow_mass_deletion) {
+        state.mass_deletion_blocked.store(true, Ordering::Relaxed);
+        warn!(
+            total_graph_files = previous.len(),
+            removed_count,
+            "refusing filesystem-sync removals: they would wipe >75% of graph-known artifacts. Set KIN_ALLOW_MASS_DELETION=1 to confirm an intentional mass deletion"
+        );
+        for delta in &deltas {
+            if let TreeDelta::Removed { old, .. } = delta {
+                observed.insert(old.path.clone(), old.entry);
+            }
+        }
+        deltas = kin_core::plan_observed_tree_deltas(&previous, observed)?;
+    } else {
+        state.mass_deletion_blocked.store(false, Ordering::Relaxed);
     }
+
+    let mut changed_paths = BTreeSet::new();
+    let mut semantic_events = Vec::new();
+    for delta in &deltas {
+        if let Some(old) = delta.old_state() {
+            changed_paths.insert(old.path.clone());
+            if delta.new_state().is_none_or(|new| new.path != old.path) {
+                if let Ok(path) = kin_index::host_path_from_repo_path(working_dir, &old.path) {
+                    semantic_events.push(FileEvent::Removed(path));
+                }
+            }
+        }
+        if let Some(new) = delta.new_state() {
+            changed_paths.insert(new.path.clone());
+            if let Ok(path) = kin_index::host_path_from_repo_path(working_dir, &new.path) {
+                semantic_events.push(FileEvent::Changed(path));
+            }
+        }
+    }
+
+    if !deltas.is_empty() {
+        state.graph.apply_transaction_delta(&TransactionDelta {
+            entity_deltas: Vec::new(),
+            relation_deltas: Vec::new(),
+            tree_deltas: deltas.clone(),
+        })?;
+    }
+
+    Ok(ExactTreeAdmission {
+        deltas,
+        changed_paths,
+        semantic_events: dedup_file_events(semantic_events),
+    })
 }
 
 fn planned_tree_delta(
@@ -263,7 +346,11 @@ fn apply_tree_delta(state: &DaemonState, delta: Option<TreeDelta>) -> Result<boo
 /// A removal notification is reclassified as a change when the directory
 /// entry exists again (including a dangling symlink); a change notification is
 /// reclassified as a removal when the entry disappeared before processing.
-fn admit_file_event(state: &DaemonState, event: &FileEvent) -> Result<AdmittedFileEvent> {
+fn admit_file_event_with_exact_tree(
+    state: &DaemonState,
+    event: &FileEvent,
+    admitted_paths: Option<&BTreeSet<RepoPath>>,
+) -> Result<AdmittedFileEvent> {
     let path = match event {
         FileEvent::Changed(path) | FileEvent::Removed(path) => path,
     };
@@ -279,7 +366,8 @@ fn admit_file_event(state: &DaemonState, event: &FileEvent) -> Result<AdmittedFi
         return Ok(AdmittedFileEvent::Ignored);
     }
     let file_id = semantic_file_id(&repo_path);
-    let tracked = state.graph.artifact_id_at_path(&repo_path).is_some();
+    let tracked = state.graph.artifact_id_at_path(&repo_path).is_some()
+        || admitted_paths.is_some_and(|paths| paths.contains(&repo_path));
     let ignore =
         kin_index::RepositoryIgnore::load(working_dir).map_err(kin_index::IndexError::from)?;
     if !tracked && ignore.matches(&repo_path) {
@@ -289,8 +377,13 @@ fn admit_file_event(state: &DaemonState, event: &FileEvent) -> Result<AdmittedFi
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let tree_delta = planned_tree_delta(state, repo_path.clone(), None);
-            let tree_changed = tree_delta.is_some();
+            let tree_delta = admitted_paths
+                .is_none()
+                .then(|| planned_tree_delta(state, repo_path.clone(), None))
+                .flatten();
+            let tree_changed = admitted_paths
+                .map(|paths| paths.contains(&repo_path))
+                .unwrap_or_else(|| tree_delta.is_some());
             return Ok(AdmittedFileEvent::Removed {
                 repo_path,
                 file_id,
@@ -343,10 +436,13 @@ fn admit_file_event(state: &DaemonState, event: &FileEvent) -> Result<AdmittedFi
         )));
     };
 
-    let tree_changed = apply_tree_delta(
-        state,
-        planned_tree_delta(state, repo_path.clone(), Some(entry)),
-    )?;
+    let tree_changed = match admitted_paths {
+        Some(paths) => paths.contains(&repo_path),
+        None => apply_tree_delta(
+            state,
+            planned_tree_delta(state, repo_path.clone(), Some(entry)),
+        )?,
+    };
 
     if is_symlink {
         Ok(AdmittedFileEvent::Symlink {
@@ -365,6 +461,10 @@ fn admit_file_event(state: &DaemonState, event: &FileEvent) -> Result<AdmittedFi
             tree_changed,
         })
     }
+}
+
+fn admit_file_event(state: &DaemonState, event: &FileEvent) -> Result<AdmittedFileEvent> {
+    admit_file_event_with_exact_tree(state, event, None)
 }
 
 fn clear_incompatible_facets(
@@ -417,15 +517,18 @@ fn finalize_tree_removal(
     state: &DaemonState,
     file_id: Option<&FilePathId>,
     tree_delta: Option<TreeDelta>,
+    tree_changed: bool,
 ) -> Result<FacetCleanup> {
-    if tree_delta.is_none() {
+    if !tree_changed {
         return Ok(FacetCleanup::default());
     }
     let cleanup = match file_id {
         Some(file_id) => clear_incompatible_facets(state, file_id, EnrichmentFacet::None)?,
         None => FacetCleanup::default(),
     };
-    apply_tree_delta(state, tree_delta)?;
+    if tree_delta.is_some() {
+        apply_tree_delta(state, tree_delta)?;
+    }
     Ok(cleanup)
 }
 
@@ -672,8 +775,11 @@ pub async fn run_loop(
 
         // Process only the configured prefix. `take_file_event_batch` removes that prefix
         // and leaves every later event in `pending_events` for the next loop iteration.
-        let batch = take_file_event_batch(&mut pending_events, base_batch_size);
-        debug!(count = batch.len(), "processing file events (after dedup)");
+        let watcher_batch = take_file_event_batch(&mut pending_events, base_batch_size);
+        debug!(
+            count = watcher_batch.len(),
+            "processing file events (after dedup)"
+        );
 
         // Acquire write locks for reconciliation.
         let mut reconciler = state.reconciler.write().await;
@@ -684,8 +790,43 @@ pub async fn run_loop(
         let mut lsp_changed: Vec<(PathBuf, Vec<kin_model::EntityId>)> = Vec::new();
         let graph_mutation = state.begin_graph_authority_mutation();
 
+        // One complete observation produces one exact tree transaction. This
+        // coalesces remove/create watcher pairs (including pairs split across
+        // notify batches) before either path can lose its ArtifactId.
+        let exact_admission = match exact_tree_admission(&state) {
+            Ok(admission) => admission,
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    "complete exact-tree admission failed; retaining graph truth and retrying watcher paths"
+                );
+                retry_queue.extend(watcher_batch.iter().map(|event| match event {
+                    FileEvent::Changed(path) | FileEvent::Removed(path) => path.clone(),
+                }));
+                drop(graph_mutation);
+                drop(working_copy);
+                drop(reconciler);
+                state
+                    .reconciliation_status
+                    .store(RECON_IDLE, Ordering::Relaxed);
+                tokio::time::sleep(interval).await;
+                continue;
+            }
+        };
+        if !exact_admission.deltas.is_empty() {
+            graph_changed = true;
+            state.bump_version();
+        }
+        let mut batch = watcher_batch;
+        batch.extend(exact_admission.semantic_events.iter().cloned());
+        let batch = dedup_file_events(batch);
+
         for event in &batch {
-            let admitted = match admit_file_event(&state, event) {
+            let admitted = match admit_file_event_with_exact_tree(
+                &state,
+                event,
+                Some(&exact_admission.changed_paths),
+            ) {
                 Ok(admitted) => admitted,
                 Err(error) => {
                     warn!(error = %error, "failed to admit exact repository-tree entry");
@@ -697,9 +838,8 @@ pub async fn run_loop(
             }
 
             let tree_changed = admitted.tree_changed();
-            // Changed entries are admitted before optional semantic enrichment.
-            // Removals remain pending until every enrichment facet is cleared,
-            // so do not mark the graph dirty unless finalization succeeds.
+            // Exact tree changes were admitted atomically for the whole batch
+            // before optional semantic enrichment.
             if tree_changed && !matches!(&admitted, AdmittedFileEvent::Removed { .. }) {
                 graph_changed = true;
             }
@@ -842,7 +982,8 @@ pub async fn run_loop(
                     if !tree_changed {
                         continue;
                     }
-                    match finalize_tree_removal(&state, file_id.as_ref(), tree_delta) {
+                    match finalize_tree_removal(&state, file_id.as_ref(), tree_delta, tree_changed)
+                    {
                         Ok(cleanup) => {
                             if let Some(file_id) = &file_id {
                                 projection_changed.remove(file_id.clone());
@@ -1336,6 +1477,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn complete_sync_preserves_identity_for_rename_with_path_reuse() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        let old_path = repo.path().join("compose.yaml");
+        let destination = repo.path().join("deploy/compose.yaml");
+        let original = b"services:\n  api:\n    image: original\n";
+        let replacement = b"services:\n  worker:\n    image: replacement\n";
+        std::fs::write(&old_path, original).unwrap();
+
+        sync_filesystem_with_graph(&state).await.unwrap();
+        let original_id = state
+            .graph
+            .resolved_tree()
+            .artifact_id_at_path(&test_repo_path("compose.yaml"))
+            .expect("initial artifact identity");
+
+        std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        std::fs::rename(&old_path, &destination).unwrap();
+        std::fs::write(&old_path, replacement).unwrap();
+        sync_filesystem_with_graph(&state).await.unwrap();
+
+        let tree = state.graph.resolved_tree();
+        assert_eq!(
+            tree.artifact_id_at_path(&test_repo_path("deploy/compose.yaml")),
+            Some(original_id),
+            "the moved artifact must retain identity"
+        );
+        let replacement_id = tree
+            .artifact_id_at_path(&test_repo_path("compose.yaml"))
+            .expect("replacement artifact identity");
+        assert_ne!(
+            replacement_id, original_id,
+            "path reuse must create a distinct artifact"
+        );
+        assert_eq!(
+            read_tree_entry_bytes(
+                &state,
+                tree.get(&original_id).expect("moved artifact").entry
+            ),
+            original
+        );
+        assert_eq!(
+            read_tree_entry_bytes(
+                &state,
+                tree.get(&replacement_id)
+                    .expect("replacement artifact")
+                    .entry
+            ),
+            replacement
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_sync_retains_graph_truth_when_move_identity_is_ambiguous() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        let old_path = repo.path().join("asset.bin");
+        let bytes = b"\0opaque duplicate bytes";
+        std::fs::write(&old_path, bytes).unwrap();
+        sync_filesystem_with_graph(&state).await.unwrap();
+        let before = state.graph.resolved_tree();
+
+        std::fs::write(repo.path().join("copy-a.bin"), bytes).unwrap();
+        std::fs::write(repo.path().join("copy-b.bin"), bytes).unwrap();
+        std::fs::remove_file(old_path).unwrap();
+        let error = sync_filesystem_with_graph(&state)
+            .await
+            .expect_err("ambiguous identity must fail before graph mutation");
+
+        assert!(error.to_string().contains("ambiguous repository identity"));
+        assert_eq!(
+            state.graph.resolved_tree(),
+            before,
+            "failed exact admission must retain the complete parent tree"
+        );
+    }
+
+    #[tokio::test]
     async fn binary_reclassification_clears_source_facets_but_keeps_tree_truth() {
         let repo = tempfile::tempdir().unwrap();
         let state = open_test_state(&repo);
@@ -1652,103 +1871,35 @@ pub async fn sync_filesystem_with_graph(state: &DaemonState) -> Result<()> {
         return Ok(());
     }
 
-    // 1. Snapshot graph-owned exact tree truth, then perform one complete
-    // byte-exact scan. Passing graph paths to ignore evaluation ensures an
-    // explicit rule never hides an already tracked artifact.
-    let files_in_graph = state.graph.resolved_tree();
-    let tracked_paths = files_in_graph
-        .artifacts_by_path()
-        .map(|artifact| artifact.path.clone())
-        .collect::<Vec<_>>();
-    let graph_only_paths = files_in_graph
-        .artifacts_by_path()
-        .filter(|artifact| matches!(artifact.entry, TreeEntry::Gitlink { .. }))
-        .map(|artifact| artifact.path.clone())
-        .collect::<Vec<_>>();
-    let ignore =
-        kin_index::RepositoryIgnore::load(working_dir).map_err(kin_index::IndexError::from)?;
-    let scan = kin_index::scan_repository_preserving_graph_only(
-        working_dir,
-        &ignore,
-        tracked_paths.iter(),
-        graph_only_paths.iter(),
-    )
-    .map_err(kin_index::IndexError::from)?;
-
-    let mut events = Vec::new();
-
-    // 2. Only CompleteRepositoryScan can authorize inferred removals.
-    let removed_events = scan
-        .missing_tracked_paths(tracked_paths.iter())
-        .into_iter()
-        .map(|path| {
-            kin_index::host_path_from_repo_path(working_dir, &path)
-                .map(FileEvent::Removed)
-                .map_err(DaemonError::Io)
-        })
-        .collect::<Result<Vec<_>>>()?;
-
-    // Mass-deletion anti-wipe guard: a transient empty/incomplete checkout (or a
-    // mid-clone/unmount) makes this sync read every tracked file as "deleted",
-    // which would wipe the graph on the next reconcile. Refuse a tick whose
-    // deletions would collapse the file set past the SAME anti-wipe threshold the
-    // shutdown guard uses (>75% gone, baseline ≥ 16) — kept consistent via the
-    // shared `graph_collapse_is_wipe` predicate. Added/modified files still apply;
-    // only the suspicious bulk removals are withheld. An operator can confirm a
-    // genuine mass deletion with KIN_ALLOW_MASS_DELETION=1.
-    let total_graph_files = files_in_graph.len() as u64;
-    let allow_mass_deletion = std::env::var("KIN_ALLOW_MASS_DELETION")
-        .ok()
-        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "on"))
-        .unwrap_or(false);
-    if should_block_mass_deletion(
-        removed_events.len() as u64,
-        total_graph_files,
-        allow_mass_deletion,
-    ) {
-        state.mass_deletion_blocked.store(true, Ordering::Relaxed);
-        warn!(
-            total_graph_files,
-            removed_count = removed_events.len(),
-            "refusing filesystem-sync deletions: they would wipe >75% of graph-known files (likely a transient empty/incomplete checkout). Set KIN_ALLOW_MASS_DELETION=1 to confirm an intentional mass deletion"
-        );
-    } else {
-        state.mass_deletion_blocked.store(false, Ordering::Relaxed);
-        events.extend(removed_events);
-    }
-
-    // 3. Find added/modified files: paths absent from graph truth or whose
-    // exact content/kind/mode entry differs.
-    for entry in scan.entries() {
-        let disk_entry = scanned_tree_entry(entry);
-        if files_in_graph
-            .artifact_at_path(&entry.repo_path)
-            .map(|artifact| artifact.entry)
-            != Some(disk_entry)
-        {
-            events.push(FileEvent::Changed(entry.host_path.clone()));
-        }
-    }
-
-    if events.is_empty() {
+    let graph_mutation = state.begin_graph_authority_mutation();
+    let exact_admission = exact_tree_admission(state)?;
+    if exact_admission.deltas.is_empty() {
+        drop(graph_mutation);
         return Ok(());
     }
+    let events = exact_admission.semantic_events;
 
     info!(
         count = events.len(),
-        "found outstanding filesystem changes to sync on daemon tick/startup"
+        artifacts = exact_admission.deltas.len(),
+        "admitted one complete exact-tree transition on daemon tick/startup"
     );
 
-    // 4. Reconcile changes
+    // Optional semantic enrichment follows exact admission. Parser support
+    // never controls repository membership.
     let mut reconciler = state.reconciler.write().await;
     let mut working_copy = state.working_copy.write().await;
-    let mut graph_changed = false;
+    let mut graph_changed = true;
     let mut projection_changed = ProjectionChangedSet::default();
-    let graph_mutation = state.begin_graph_authority_mutation();
     let enrichment_pipeline = IndexPipeline::new();
+    state.bump_version();
 
     for event in events {
-        let admitted = match admit_file_event(state, &event) {
+        let admitted = match admit_file_event_with_exact_tree(
+            state,
+            &event,
+            Some(&exact_admission.changed_paths),
+        ) {
             Ok(admitted) => admitted,
             Err(error) => {
                 warn!(error = %error, "failed to admit exact repository-tree entry during sync");
@@ -1759,8 +1910,7 @@ pub async fn sync_filesystem_with_graph(state: &DaemonState) -> Result<()> {
             continue;
         }
         let tree_changed = admitted.tree_changed();
-        // `Removed` carries a planned delta. Only a successful
-        // `finalize_tree_removal` below turns that plan into graph mutation.
+        // The complete exact-tree transaction is already graph authority.
         if tree_changed && !matches!(&admitted, AdmittedFileEvent::Removed { .. }) {
             graph_changed = true;
         }
@@ -1873,7 +2023,7 @@ pub async fn sync_filesystem_with_graph(state: &DaemonState) -> Result<()> {
                 if !tree_changed {
                     continue;
                 }
-                match finalize_tree_removal(state, file_id.as_ref(), tree_delta) {
+                match finalize_tree_removal(state, file_id.as_ref(), tree_delta, tree_changed) {
                     Ok(cleanup) => {
                         if let Some(file_id) = &file_id {
                             projection_changed.remove(file_id.clone());

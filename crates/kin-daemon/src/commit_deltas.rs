@@ -23,7 +23,7 @@
 //! already reflects the current working state — diffing against the DAG
 //! baseline captures exactly what changed since the last commit.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use kin_db::InMemoryGraph;
 use kin_model::{
@@ -186,7 +186,24 @@ fn compute_tree_deltas(
         graph_only_paths.iter(),
     )
     .map_err(kin_index::IndexError::from)?;
-    let mut tree_deltas = Vec::new();
+    let observed = observed_tree_from_complete_scan(blobs, &scan, &committed_tree)?;
+    kin_core::plan_observed_tree_deltas(&committed_tree, observed).map_err(DaemonError::Core)
+}
+
+/// Turn one complete host scan into exact graph entries.
+///
+/// Graph-only entries (currently Gitlinks) are copied from the parent tree:
+/// their host checkout is neither membership evidence nor an identity source.
+pub(crate) fn observed_tree_from_complete_scan(
+    blobs: &kin_blobs::BlobStore,
+    scan: &kin_index::CompleteRepositoryScan,
+    previous: &ResolvedTree,
+) -> Result<BTreeMap<RepoPath, TreeEntry>> {
+    let mut observed = previous
+        .artifacts_by_path()
+        .filter(|artifact| matches!(artifact.entry, TreeEntry::Gitlink { .. }))
+        .map(|artifact| (artifact.path.clone(), artifact.entry))
+        .collect::<BTreeMap<_, _>>();
 
     for scanned in scan.entries() {
         let content = read_scanned_entry(scanned)?;
@@ -197,7 +214,7 @@ fn compute_tree_deltas(
                 scanned.repo_path
             ))));
         }
-        let new_entry = match scanned.kind {
+        let entry = match scanned.kind {
             kin_index::ScannedEntryKind::Regular { executable } => {
                 TreeEntry::blob(Hash256::from_bytes(blob_digest.0), executable)
             }
@@ -205,44 +222,10 @@ fn compute_tree_deltas(
                 TreeEntry::symlink(Hash256::from_bytes(blob_digest.0))
             }
         };
-
-        match committed_tree.artifact_at_path(&scanned.repo_path) {
-            Some(old) if old.entry == new_entry => {}
-            Some(old) => tree_deltas.push(TreeDelta::Updated {
-                artifact_id: old.artifact_id,
-                old: old.located_entry(),
-                new: LocatedEntry::new(scanned.repo_path.clone(), new_entry),
-            }),
-            None => tree_deltas.push(TreeDelta::Added {
-                artifact_id: ArtifactId::new(),
-                new: LocatedEntry::new(scanned.repo_path.clone(), new_entry),
-            }),
-        }
+        observed.insert(scanned.repo_path.clone(), entry);
     }
 
-    // Only the complete scan object can authorize inferred removals.
-    for path in scan.missing_tracked_paths(tracked_paths.iter()) {
-        let old = committed_tree
-            .artifact_at_path(&path)
-            .expect("missing tracked path came from committed tree");
-        tree_deltas.push(TreeDelta::Removed {
-            artifact_id: old.artifact_id,
-            old: old.located_entry(),
-        });
-    }
-
-    tree_deltas.sort_by(|left, right| {
-        let left = left
-            .new_state()
-            .or_else(|| left.old_state())
-            .expect("tree delta has one side");
-        let right = right
-            .new_state()
-            .or_else(|| right.old_state())
-            .expect("tree delta has one side");
-        left.path.cmp(&right.path)
-    });
-    Ok(tree_deltas)
+    Ok(observed)
 }
 
 fn read_scanned_entry(scanned: &kin_index::ScannedRepositoryEntry) -> Result<Vec<u8>> {
@@ -257,7 +240,7 @@ mod tests {
 
     use kin_blobs::BlobStore;
     use kin_model::{
-        AuthorId, EntityKind, EntityMetadata, FingerprintAlgorithm, LanguageId,
+        AuthorId, EntityKind, EntityMetadata, FingerprintAlgorithm, LanguageId, ResolvedArtifact,
         SemanticFingerprint, Timestamp, Visibility,
     };
 
@@ -271,6 +254,112 @@ mod tests {
             std::iter::empty()
         )
         .is_err());
+    }
+
+    fn resolved_tree(artifacts: Vec<(ArtifactId, RepoPath, TreeEntry)>) -> ResolvedTree {
+        ResolvedTree::from_artifacts(
+            artifacts
+                .into_iter()
+                .map(|(artifact_id, path, entry)| ResolvedArtifact::new(artifact_id, path, entry)),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn exact_tree_planner_preserves_artifact_identity_across_a_unique_move() {
+        let artifact_id = ArtifactId::new();
+        let entry = TreeEntry::blob(Hash256::from_bytes([0x11; 32]), false);
+        let old_path = RepoPath::from_utf8("src/old.rs").unwrap();
+        let new_path = RepoPath::from_utf8("src/new.rs").unwrap();
+        let previous = resolved_tree(vec![(artifact_id, old_path.clone(), entry)]);
+
+        let deltas = kin_core::plan_observed_tree_deltas(
+            &previous,
+            BTreeMap::from([(new_path.clone(), entry)]),
+        )
+        .unwrap();
+
+        assert_eq!(
+            deltas,
+            vec![TreeDelta::Updated {
+                artifact_id,
+                old: LocatedEntry::new(old_path, entry),
+                new: LocatedEntry::new(new_path.clone(), entry),
+            }]
+        );
+        let next = previous.apply(&deltas).unwrap();
+        assert_eq!(next.get(&artifact_id).unwrap().path, new_path);
+    }
+
+    #[test]
+    fn exact_tree_planner_handles_move_plus_path_reuse_atomically() {
+        let moved_id = ArtifactId::new();
+        let moved_entry = TreeEntry::blob(Hash256::from_bytes([0x22; 32]), false);
+        let replacement_entry = TreeEntry::blob(Hash256::from_bytes([0x33; 32]), true);
+        let reused_path = RepoPath::from_utf8("compose.yaml").unwrap();
+        let destination = RepoPath::from_utf8("deploy/compose.yaml").unwrap();
+        let previous = resolved_tree(vec![(moved_id, reused_path.clone(), moved_entry)]);
+
+        let deltas = kin_core::plan_observed_tree_deltas(
+            &previous,
+            BTreeMap::from([
+                (reused_path.clone(), replacement_entry),
+                (destination.clone(), moved_entry),
+            ]),
+        )
+        .unwrap();
+        let next = previous.apply(&deltas).unwrap();
+
+        assert_eq!(next.get(&moved_id).unwrap().path, destination);
+        let replacement = next.artifact_at_path(&reused_path).unwrap();
+        assert_ne!(replacement.artifact_id, moved_id);
+        assert_eq!(replacement.entry, replacement_entry);
+    }
+
+    #[test]
+    fn exact_tree_planner_supports_swaps_and_non_utf8_paths() {
+        let left_id = ArtifactId::new();
+        let right_id = ArtifactId::new();
+        let left_entry = TreeEntry::blob(Hash256::from_bytes([0x44; 32]), false);
+        let right_entry = TreeEntry::symlink(Hash256::from_bytes([0x55; 32]));
+        let left_path = RepoPath::from_bytes(b"left-\xff".to_vec()).unwrap();
+        let right_path = RepoPath::from_utf8("right-link").unwrap();
+        let previous = resolved_tree(vec![
+            (left_id, left_path.clone(), left_entry),
+            (right_id, right_path.clone(), right_entry),
+        ]);
+
+        let deltas = kin_core::plan_observed_tree_deltas(
+            &previous,
+            BTreeMap::from([
+                (left_path.clone(), right_entry),
+                (right_path.clone(), left_entry),
+            ]),
+        )
+        .unwrap();
+        let next = previous.apply(&deltas).unwrap();
+
+        assert_eq!(next.get(&left_id).unwrap().path, right_path);
+        assert_eq!(next.get(&right_id).unwrap().path, left_path);
+    }
+
+    #[test]
+    fn exact_tree_planner_fails_closed_on_duplicate_move_candidates() {
+        let artifact_id = ArtifactId::new();
+        let entry = TreeEntry::blob(Hash256::from_bytes([0x66; 32]), false);
+        let previous = resolved_tree(vec![(
+            artifact_id,
+            RepoPath::from_utf8("old").unwrap(),
+            entry,
+        )]);
+        let observed = BTreeMap::from([
+            (RepoPath::from_utf8("copy-a").unwrap(), entry),
+            (RepoPath::from_utf8("copy-b").unwrap(), entry),
+        ]);
+
+        let error = kin_core::plan_observed_tree_deltas(&previous, observed)
+            .expect_err("ambiguous move identity must never be guessed");
+        assert!(error.to_string().contains("ambiguous repository identity"));
     }
 
     fn make_entity(name: &str, file_path: &str, ast_hash: [u8; 32]) -> kin_model::entity::Entity {

@@ -3,7 +3,7 @@
 
 use anyhow::{Context, Result};
 use kin_model::{
-    Entity, EntityFilter, EntityId, FilePathId, GraphNodeId, GraphStore, RelationKind, SourceSpan,
+    Entity, EntityFilter, EntityId, GraphNodeId, GraphStore, RelationKind, RepoPath, SourceSpan,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -172,7 +172,7 @@ pub fn build_rename_response(
 
 fn build_rename_plan(
     layout: &kin_core::KinLayout,
-    graph: &impl GraphStore,
+    graph: &kin_db::InMemoryGraph,
     target: &Entity,
     new_name: &str,
 ) -> Result<RenamePlanJson> {
@@ -385,9 +385,9 @@ fn resolve_target(
     Ok(matches.into_iter().next())
 }
 
-fn add_span_edits<G: GraphStore>(
+fn add_span_edits(
     layout: &kin_core::KinLayout,
-    reader: &mut GraphSourceReader<'_, G>,
+    reader: &mut GraphSourceReader,
     rel_path: &str,
     start_byte: usize,
     end_byte: usize,
@@ -419,9 +419,9 @@ fn add_span_edits<G: GraphStore>(
     Ok(())
 }
 
-fn add_first_span_edit<G: GraphStore>(
+fn add_first_span_edit(
     layout: &kin_core::KinLayout,
-    reader: &mut GraphSourceReader<'_, G>,
+    reader: &mut GraphSourceReader,
     rel_path: &str,
     start_byte: usize,
     end_byte: usize,
@@ -502,18 +502,16 @@ struct GraphContentGap(String);
 /// the file and read from the content-addressed blob store, which verifies the
 /// bytes against that address on read. A file the graph cannot supply is
 /// reported as a gap; it is never filled in from disk.
-struct GraphSourceReader<'a, G: GraphStore> {
-    layout: &'a kin_core::KinLayout,
-    graph: &'a G,
+struct GraphSourceReader {
+    tree: kin_model::ResolvedTree,
     blobs: kin_blobs::BlobStore,
     contents: HashMap<String, Result<String, String>>,
 }
 
-impl<'a, G: GraphStore> GraphSourceReader<'a, G> {
-    fn new(layout: &'a kin_core::KinLayout, graph: &'a G) -> Result<Self> {
+impl GraphSourceReader {
+    fn new(layout: &kin_core::KinLayout, graph: &kin_db::InMemoryGraph) -> Result<Self> {
         Ok(Self {
-            layout,
-            graph,
+            tree: graph.resolved_tree(),
             blobs: kin_blobs::BlobStore::new(layout.objects_dir()).context(
                 "graph blob store is unavailable; rename cannot read graph-owned source",
             )?,
@@ -534,9 +532,15 @@ impl<'a, G: GraphStore> GraphSourceReader<'a, G> {
     }
 
     fn resolve(&self, rel_path: &str) -> Result<String> {
-        let file_id = FilePathId::new(rel_path);
-        let entry = self.recorded_entry(&file_id)?;
-        let blob_hash = kin_blobs::Hash256(*entry.blob_hash.as_bytes());
+        let path = RepoPath::from_utf8(rel_path.to_string())
+            .with_context(|| format!("entity file origin '{rel_path}' is not a valid RepoPath"))?;
+        let entry = self.recorded_entry(&path)?;
+        let hash = entry.blob_identity().ok_or_else(|| {
+            anyhow::anyhow!(
+                "graph entry for '{rel_path}' is a Gitlink, not renameable source content"
+            )
+        })?;
+        let blob_hash = kin_blobs::Hash256(hash.0);
         let bytes = self.blobs.read(&blob_hash).with_context(|| {
             format!("graph blob for file '{rel_path}' is unavailable (hash {blob_hash})")
         })?;
@@ -545,38 +549,20 @@ impl<'a, G: GraphStore> GraphSourceReader<'a, G> {
         })
     }
 
-    /// The exact graph-owned tree entry for `file_id`, preferring working-tree
-    /// truth and falling back to the committed tree at the current branch head.
-    /// Both are graph reads; neither consults the filesystem.
-    fn recorded_entry(&self, file_id: &FilePathId) -> Result<kin_model::TreeEntry> {
-        if let Some(entry) = self.graph.get_tree_entry(file_id)? {
-            return Ok(entry);
-        }
-
-        let branch_name = kin_core::read_current_branch(self.layout)?;
-        let branch = match self.graph.get_branch(&branch_name)? {
-            Some(branch) => branch,
-            None => self
-                .graph
-                .list_branches()?
-                .into_iter()
-                .next()
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "graph records no tree entry for file '{}' and no branch is available to resolve one",
-                        file_id.0
-                    )
-                })?,
-        };
-        let genesis = kin_core::build_genesis_change();
-        let tree = kin_core::build_file_tree(self.graph, &genesis.id, &branch.head)?;
-        tree.get(file_id).copied().ok_or_else(|| {
-            anyhow::anyhow!(
-                "file '{}' is not in the graph file tree at branch '{}'",
-                file_id.0,
-                branch.name
-            )
-        })
+    /// Resolve source from one exact snapshot of the live graph tree.
+    ///
+    /// This includes graph-admitted uncommitted edits while guaranteeing every
+    /// coordinate in one plan is measured against one immutable tree snapshot.
+    fn recorded_entry(&self, path: &RepoPath) -> Result<kin_model::TreeEntry> {
+        self.tree
+            .artifact_at_path(path)
+            .map(|artifact| artifact.entry)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "file '{}' is not in the exact live graph tree used for this rename plan",
+                    path
+                )
+            })
     }
 }
 
@@ -834,11 +820,11 @@ mod tests {
     use super::{build_rename_response, RenameRequest};
     use kin_db::InMemoryGraph;
     use kin_model::{
-        AuthorId, Branch, BranchName, ChangeStore, Entity, EntityId, EntityKind, EntityMetadata,
-        EntityRole, EntityStore, FilePathId, FingerprintAlgorithm, GraphNodeId, Hash256,
-        LanguageId, Relation, RelationId, RelationKind, RelationOrigin, SemanticChange,
-        SemanticChangeId, SemanticFingerprint, SourceSpan, Timestamp, TreeDelta, TreeEntry,
-        Visibility,
+        ArtifactId, AuthorId, Branch, BranchName, ChangeStore, Entity, EntityId, EntityKind,
+        EntityMetadata, EntityRole, EntityStore, FilePathId, FingerprintAlgorithm, GraphNodeId,
+        Hash256, LanguageId, LocatedEntry, Relation, RelationId, RelationKind, RelationOrigin,
+        RepoPath, SemanticChange, SemanticChangeId, SemanticFingerprint, SourceSpan, Timestamp,
+        TransactionDelta, TreeDelta, TreeEntry, Visibility,
     };
 
     struct Fixture {
@@ -871,14 +857,18 @@ mod tests {
             let hash = blobs.write(content.as_bytes()).unwrap();
             let file_id = FilePathId::new(*path);
             tree_deltas.push(TreeDelta::Added {
-                file_id: file_id.clone(),
-                new_entry: TreeEntry::regular(Hash256::from_bytes(hash.0), false),
+                artifact_id: ArtifactId::new(),
+                new: LocatedEntry::new(
+                    RepoPath::from_utf8(*path).unwrap(),
+                    TreeEntry::blob(Hash256::from_bytes(hash.0), false),
+                ),
             });
             projected_files.push(file_id);
         }
 
         let branch_name = BranchName::new("main");
         let change_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x42; 32]));
+        let live_tree_deltas = tree_deltas.clone();
         graph
             .create_change(&SemanticChange {
                 id: change_id,
@@ -894,6 +884,13 @@ mod tests {
                 evidence: vec![],
                 risk_summary: None,
                 authored_on: Some(branch_name.clone()),
+            })
+            .unwrap();
+        graph
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: Vec::new(),
+                relation_deltas: Vec::new(),
+                tree_deltas: live_tree_deltas,
             })
             .unwrap();
         graph
