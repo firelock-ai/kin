@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{btree_map::Entry as MapEntry, BTreeMap, HashMap, HashSet};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
@@ -10,7 +10,8 @@ use gix::objs::tree::{Entry, EntryKind, EntryMode};
 use gix::objs::{Commit, Tree};
 use kin_blobs::BlobStore;
 use kin_model::{
-    BranchName, GraphStore, SemanticChange, SemanticChangeId, TreeDelta, TreeEntryKind,
+    BranchName, GitObjectId, GraphStore, RepoPath, ResolvedTree, SemanticChange, SemanticChangeId,
+    TreeEntry,
 };
 use tracing::{debug, info};
 
@@ -128,38 +129,60 @@ pub fn export_changes(
 
     let mut commits_exported = 0usize;
     let commits_skipped = 0usize;
-    // Track one immutable file state per semantic change. A single cumulative
-    // map contaminates sibling branches: exporting sibling B after sibling A
-    // would incorrectly include A-only files in B's Git tree.
-    let mut file_states: HashMap<SemanticChangeId, BTreeMap<String, SourceFileState>> =
-        HashMap::new();
-    let mut last_commit_id: Option<gix::ObjectId> = existing_head;
+    // Track one exact first-parent tree per semantic change. Secondary parents
+    // contribute ancestry and lineage, never an implicit state union.
+    let mut tree_states = HashMap::<SemanticChangeId, ResolvedTree>::new();
+    let input_ids = changes
+        .iter()
+        .map(|change| change.id)
+        .collect::<HashSet<_>>();
+    let genesis_ids = changes
+        .iter()
+        .filter(|change| is_genesis_change(change))
+        .map(|change| change.id)
+        .collect::<HashSet<_>>();
 
     for change in changes {
         // Skip genesis changes.
         if is_genesis_change(change) {
+            tree_states.insert(change.id, ResolvedTree::default());
             debug!("skipping genesis change in export");
             continue;
         }
 
-        // Reconstruct this change from its own parent states. Parent order is
-        // deterministic; later parents fill/replace paths before the change's
-        // own deltas apply. Exact imported merges carry a full correction.
-        let mut file_state = BTreeMap::new();
-        for parent in &change.parents {
-            if let Some(parent_state) = file_states.get(parent) {
-                for (path, source) in parent_state {
-                    file_state.insert(path.clone(), source.clone());
-                }
+        let parent_tree = match change.parents.first() {
+            Some(parent) if tree_states.contains_key(parent) => tree_states[parent].clone(),
+            // `export_to_git` asks the graph for changes *since* genesis, so
+            // the first real change can carry an external genesis parent.
+            Some(parent) if !input_ids.contains(parent) && tree_states.is_empty() => {
+                ResolvedTree::default()
             }
-        }
-        apply_tree_deltas(change, blob_store, &mut file_state)?;
+            None if tree_states.is_empty() => ResolvedTree::default(),
+            Some(parent) => {
+                return Err(GitError::Graph(format!(
+                    "first parent {parent} was not resolved before change {}",
+                    change.id
+                )));
+            }
+            None => {
+                return Err(GitError::Graph(format!(
+                    "non-genesis change {} has no parent",
+                    change.id
+                )));
+            }
+        };
+        let tree_state = parent_tree.apply(&change.tree_deltas).map_err(|error| {
+            GitError::Graph(format!(
+                "invalid repository tree transaction in change {}: {error}",
+                change.id
+            ))
+        })?;
 
         // Build the Git tree from the current file state.
-        let tree_id = build_tree(&git_repo, &file_state)?;
+        let tree_id = build_tree(&git_repo, blob_store, &tree_state)?;
 
         // Resolve parent commit IDs from the SemanticChange parent chain.
-        let parents = resolve_parents(change, &change_to_commit, last_commit_id);
+        let parents = resolve_parents(change, &change_to_commit, &input_ids, &genesis_ids)?;
 
         // Create the commit object.
         let commit_id = create_commit(&git_repo, change, tree_id, &parents)?;
@@ -173,14 +196,17 @@ pub fn export_changes(
         );
 
         change_to_commit.insert(change.id, commit_id);
-        file_states.insert(change.id, file_state);
-        last_commit_id = Some(commit_id);
+        tree_states.insert(change.id, tree_state);
         commits_exported += 1;
     }
 
     // Update the branch ref to point to the latest commit.
     let mut branches_updated = 0;
-    if let Some(head_id) = last_commit_id {
+    if let Some(head_id) = changes
+        .iter()
+        .rev()
+        .find_map(|change| change_to_commit.get(&change.id).copied())
+    {
         update_branch_ref(&git_repo, branch_name, existing_head, head_id)?;
         branches_updated = 1;
     }
@@ -200,197 +226,155 @@ pub fn export_changes(
     })
 }
 
-/// Apply exact repository-tree deltas from a change to the cumulative file state.
-fn apply_tree_deltas(
-    change: &SemanticChange,
-    blob_store: &BlobStore,
-    file_state: &mut BTreeMap<String, SourceFileState>,
-) -> Result<()> {
-    for delta in &change.tree_deltas {
-        let (file_id, entry) = match delta {
-            TreeDelta::Removed { file_id, .. } => {
-                file_state.remove(&file_id.0);
-                continue;
-            }
-            TreeDelta::Added { file_id, new_entry }
-            | TreeDelta::Modified {
-                file_id, new_entry, ..
-            } => (file_id, new_entry),
-        };
-        let content = blob_store
-            .read(&kin_blobs::Hash256(entry.blob_hash.0))
-            .map_err(|error| {
-                GitError::Other(format!(
-                    "cannot export exact tree blob {} for {} in change {}: {error}",
-                    entry.blob_hash, file_id, change.id
-                ))
-            })?;
-        file_state.insert(
-            file_id.0.clone(),
-            SourceFileState {
-                content,
-                kind: entry.kind,
-            },
-        );
-    }
-    Ok(())
-}
-
-/// Build a Git tree object from a flat map of file paths to contents.
-///
-/// Handles nested directory structures by creating intermediate tree objects.
+/// Build one exact Git tree from graph-owned repository state.
 fn build_tree(
     repo: &gix::Repository,
-    file_state: &BTreeMap<String, SourceFileState>,
+    blob_store: &BlobStore,
+    tree_state: &ResolvedTree,
 ) -> Result<gix::ObjectId> {
-    if file_state.is_empty() {
-        // Return the well-known empty tree hash.
-        return Ok(gix::ObjectId::empty_tree(gix::hash::Kind::Sha1));
+    let mut root = TreeNode::default();
+    for artifact in tree_state.artifacts_by_path() {
+        let leaf = materialize_leaf(repo, blob_store, &artifact.path, artifact.entry)?;
+        insert_leaf(&mut root, &artifact.path, leaf)?;
     }
-
-    // Build a nested map: directory -> entries.
-    // We process paths to create intermediate trees bottom-up.
-    let mut dir_entries: BTreeMap<String, Vec<(String, DirEntry)>> = BTreeMap::new();
-
-    // First pass: write all blobs and record them with their directory.
-    for (path, source) in file_state {
-        let blob_id = repo
-            .write_blob(&source.content)
-            .map_err(|e| GitError::Git(e.to_string()))?
-            .detach();
-
-        let (dir, filename) = split_path(path);
-        dir_entries.entry(dir).or_default().push((
-            filename,
-            DirEntry::Source {
-                id: blob_id,
-                kind: source.kind,
-            },
-        ));
-    }
-
-    // Build trees bottom-up: process deepest directories first.
-    // Collect all directory paths and sort by depth (deepest first).
-    let mut all_dirs: Vec<String> = dir_entries.keys().cloned().collect();
-
-    // Also find all intermediate directories that may not have direct files.
-    let mut intermediate_dirs: Vec<String> = Vec::new();
-    for dir in &all_dirs {
-        let mut current = dir.as_str();
-        while let Some(pos) = current.rfind('/') {
-            let parent = &current[..pos];
-            if !all_dirs.contains(&parent.to_string())
-                && !intermediate_dirs.contains(&parent.to_string())
-            {
-                intermediate_dirs.push(parent.to_string());
-            }
-            current = parent;
-        }
-        // Root directory
-        if !current.is_empty()
-            && !all_dirs.contains(&String::new())
-            && !intermediate_dirs.contains(&String::new())
-        {
-            intermediate_dirs.push(String::new());
-        }
-    }
-    all_dirs.extend(intermediate_dirs);
-    // Sort by depth descending so we process deepest dirs first.
-    all_dirs.sort_by(|a, b| {
-        let depth_a = if a.is_empty() {
-            0
-        } else {
-            a.matches('/').count() + 1
-        };
-        let depth_b = if b.is_empty() {
-            0
-        } else {
-            b.matches('/').count() + 1
-        };
-        depth_b.cmp(&depth_a)
-    });
-    all_dirs.dedup();
-
-    // Map from directory path -> tree ObjectId once written.
-    let mut tree_ids: HashMap<String, gix::ObjectId> = HashMap::new();
-
-    for dir in &all_dirs {
-        let mut entries: Vec<Entry> = Vec::new();
-
-        // Add file (blob) entries in this directory.
-        if let Some(file_entries) = dir_entries.get(dir) {
-            for (name, entry) in file_entries {
-                match entry {
-                    DirEntry::Source { id, kind } => {
-                        entries.push(Entry {
-                            mode: EntryMode::from(match kind {
-                                TreeEntryKind::Regular { executable: false } => EntryKind::Blob,
-                                TreeEntryKind::Regular { executable: true } => {
-                                    EntryKind::BlobExecutable
-                                }
-                                TreeEntryKind::Symlink => EntryKind::Link,
-                            }),
-                            filename: name.clone().into(),
-                            oid: *id,
-                        });
-                    }
-                }
-            }
-        }
-
-        // Add subdirectory (tree) entries that are direct children of this dir.
-        for (subdir, sub_tree_id) in &tree_ids {
-            let (parent, dirname) = split_path(subdir);
-            if parent == *dir {
-                entries.push(Entry {
-                    mode: EntryMode::from(EntryKind::Tree),
-                    filename: dirname.into(),
-                    oid: *sub_tree_id,
-                });
-            }
-        }
-
-        // Sort entries by filename (Git requires sorted entries).
-        entries.sort();
-
-        let tree = Tree { entries };
-        let tree_id = repo
-            .write_object(&tree)
-            .map_err(|e| GitError::Git(e.to_string()))?
-            .detach();
-
-        tree_ids.insert(dir.clone(), tree_id);
-    }
-
-    // The root tree is at the empty string key.
-    tree_ids
-        .get("")
-        .copied()
-        .ok_or_else(|| GitError::Other("failed to build root tree".to_string()))
+    write_tree_node(repo, &root)
 }
 
-#[derive(Debug, Clone)]
-struct SourceFileState {
-    content: Vec<u8>,
-    kind: TreeEntryKind,
+#[derive(Debug, Default)]
+struct TreeNode {
+    children: BTreeMap<Vec<u8>, TreeNodeEntry>,
 }
 
 #[derive(Debug)]
-enum DirEntry {
-    Source {
-        id: gix::ObjectId,
-        kind: TreeEntryKind,
-    },
+enum TreeNodeEntry {
+    Directory(TreeNode),
+    Leaf { id: gix::ObjectId, kind: EntryKind },
 }
 
-/// Split a path into (directory, filename).
-/// "src/main.rs" -> ("src", "main.rs")
-/// "README.md" -> ("", "README.md")
-fn split_path(path: &str) -> (String, String) {
-    match path.rfind('/') {
-        Some(pos) => (path[..pos].to_string(), path[pos + 1..].to_string()),
-        None => (String::new(), path.to_string()),
+fn materialize_leaf(
+    repo: &gix::Repository,
+    blob_store: &BlobStore,
+    path: &RepoPath,
+    entry: TreeEntry,
+) -> Result<TreeNodeEntry> {
+    let (id, kind) = match entry {
+        TreeEntry::Blob { hash, executable } => {
+            let content = blob_store
+                .read(&kin_blobs::Hash256(hash.0))
+                .map_err(|error| {
+                    GitError::Other(format!(
+                        "cannot export exact tree blob {hash} for {path}: {error}"
+                    ))
+                })?;
+            let id = repo
+                .write_blob(&content)
+                .map_err(|error| GitError::Git(error.to_string()))?
+                .detach();
+            (
+                id,
+                if executable {
+                    EntryKind::BlobExecutable
+                } else {
+                    EntryKind::Blob
+                },
+            )
+        }
+        TreeEntry::Symlink { target_blob } => {
+            let target = blob_store
+                .read(&kin_blobs::Hash256(target_blob.0))
+                .map_err(|error| {
+                    GitError::Other(format!(
+                        "cannot export symlink target blob {target_blob} for {path}: {error}"
+                    ))
+                })?;
+            (
+                repo.write_blob(&target)
+                    .map_err(|error| GitError::Git(error.to_string()))?
+                    .detach(),
+                EntryKind::Link,
+            )
+        }
+        TreeEntry::Gitlink { target } => (gitlink_oid(repo, target)?, EntryKind::Commit),
+    };
+    Ok(TreeNodeEntry::Leaf { id, kind })
+}
+
+fn gitlink_oid(repo: &gix::Repository, target: GitObjectId) -> Result<gix::ObjectId> {
+    match target {
+        GitObjectId::Sha1(bytes) if repo.object_hash() == gix::hash::Kind::Sha1 => {
+            Ok(bytes.into())
+        }
+        GitObjectId::Sha1(_) => Err(GitError::Other(
+            "cannot export a SHA-1 gitlink into a non-SHA-1 Git repository".to_string(),
+        )),
+        GitObjectId::Sha256(_) => Err(GitError::Other(
+            "this gitoxide build cannot write SHA-256 Git object databases; refusing to alter the gitlink identity"
+                .to_string(),
+        )),
     }
+}
+
+fn insert_leaf(root: &mut TreeNode, path: &RepoPath, leaf: TreeNodeEntry) -> Result<()> {
+    let components = path
+        .as_bytes()
+        .split(|byte| *byte == b'/')
+        .collect::<Vec<_>>();
+    insert_components(root, &components, leaf, path)
+}
+
+fn insert_components(
+    node: &mut TreeNode,
+    components: &[&[u8]],
+    leaf: TreeNodeEntry,
+    full_path: &RepoPath,
+) -> Result<()> {
+    let (component, remaining) = components
+        .split_first()
+        .expect("RepoPath always has at least one component");
+    if remaining.is_empty() {
+        return match node.children.entry(component.to_vec()) {
+            MapEntry::Vacant(slot) => {
+                slot.insert(leaf);
+                Ok(())
+            }
+            MapEntry::Occupied(_) => Err(GitError::Other(format!(
+                "duplicate Git export path {full_path}"
+            ))),
+        };
+    }
+    let child = match node.children.entry(component.to_vec()) {
+        MapEntry::Vacant(slot) => slot.insert(TreeNodeEntry::Directory(TreeNode::default())),
+        MapEntry::Occupied(slot) => slot.into_mut(),
+    };
+    match child {
+        TreeNodeEntry::Directory(directory) => {
+            insert_components(directory, remaining, leaf, full_path)
+        }
+        TreeNodeEntry::Leaf { .. } => Err(GitError::Other(format!(
+            "Git export path {full_path} collides with a file parent"
+        ))),
+    }
+}
+
+fn write_tree_node(repo: &gix::Repository, node: &TreeNode) -> Result<gix::ObjectId> {
+    let mut entries = Vec::with_capacity(node.children.len());
+    for (name, child) in &node.children {
+        let (oid, kind) = match child {
+            TreeNodeEntry::Directory(directory) => {
+                (write_tree_node(repo, directory)?, EntryKind::Tree)
+            }
+            TreeNodeEntry::Leaf { id, kind } => (*id, *kind),
+        };
+        entries.push(Entry {
+            mode: EntryMode::from(kind),
+            filename: name.clone().into(),
+            oid,
+        });
+    }
+    entries.sort();
+    repo.write_object(&Tree { entries })
+        .map(|id| id.detach())
+        .map_err(|error| GitError::Git(error.to_string()))
 }
 
 /// Create a Git commit object from a SemanticChange.
@@ -451,25 +435,22 @@ fn parse_author(author: &str) -> (String, String) {
 fn resolve_parents(
     change: &SemanticChange,
     change_to_commit: &HashMap<SemanticChangeId, gix::ObjectId>,
-    last_commit_id: Option<gix::ObjectId>,
-) -> Vec<gix::ObjectId> {
+    input_ids: &HashSet<SemanticChangeId>,
+    genesis_ids: &HashSet<SemanticChangeId>,
+) -> Result<Vec<gix::ObjectId>> {
     let mut parents = Vec::new();
 
     for parent_id in &change.parents {
         if let Some(git_id) = change_to_commit.get(parent_id) {
             parents.push(*git_id);
+        } else if input_ids.contains(parent_id) && !genesis_ids.contains(parent_id) {
+            return Err(GitError::Graph(format!(
+                "parent {parent_id} was not exported before child {}",
+                change.id
+            )));
         }
     }
-
-    // If we couldn't resolve any parents but have a last_commit_id (incremental),
-    // use that as the parent to maintain continuity.
-    if parents.is_empty() {
-        if let Some(last) = last_commit_id {
-            parents.push(last);
-        }
-    }
-
-    parents
+    Ok(parents)
 }
 
 fn validated_branch_ref_name(branch_name: &BranchName) -> Result<gix::refs::FullName> {
@@ -640,6 +621,7 @@ mod tests {
     use super::*;
     use gix::refs::{transaction::PreviousValue, Target};
     use kin_model::*;
+    use sha2::Digest as _;
     use std::collections::HashMap;
     use std::sync::{mpsc, Mutex};
     use std::thread;
@@ -697,25 +679,38 @@ mod tests {
         Hash256::from_bytes(blob_hash.0)
     }
 
+    fn test_artifact_id(label: &str) -> ArtifactId {
+        let digest = sha2::Sha256::digest(label.as_bytes());
+        let mut bytes = [0u8; 16];
+        bytes.copy_from_slice(&digest[..16]);
+        bytes[6] = (bytes[6] & 0x0f) | 0x40;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        ArtifactId(uuid::Uuid::from_bytes(bytes))
+    }
+
+    fn test_path(path: &str) -> RepoPath {
+        RepoPath::from_utf8(path).unwrap()
+    }
+
     fn added_tree_entry(path: &str, new_entry: TreeEntry) -> TreeDelta {
         TreeDelta::Added {
-            file_id: FilePathId::new(path),
-            new_entry,
+            artifact_id: test_artifact_id(path),
+            new: LocatedEntry::new(test_path(path), new_entry),
         }
     }
 
     fn modified_tree_entry(path: &str, old_entry: TreeEntry, new_entry: TreeEntry) -> TreeDelta {
-        TreeDelta::Modified {
-            file_id: FilePathId::new(path),
-            old_entry,
-            new_entry,
+        TreeDelta::Updated {
+            artifact_id: test_artifact_id(path),
+            old: LocatedEntry::new(test_path(path), old_entry),
+            new: LocatedEntry::new(test_path(path), new_entry),
         }
     }
 
     fn removed_tree_entry(path: &str, old_entry: TreeEntry) -> TreeDelta {
         TreeDelta::Removed {
-            file_id: FilePathId::new(path),
-            old_entry,
+            artifact_id: test_artifact_id(path),
+            old: LocatedEntry::new(test_path(path), old_entry),
         }
     }
 
@@ -887,9 +882,9 @@ mod tests {
         }
         fn ensure_artifact_id(
             &self,
-            path: &kin_model::FilePathId,
+            _: &kin_model::FilePathId,
         ) -> std::result::Result<kin_model::ArtifactId, Self::Error> {
-            Ok(kin_model::ArtifactId::seed_from_file_id(path))
+            Ok(kin_model::ArtifactId::new())
         }
         fn upsert_file_layout(
             &self,
@@ -1604,10 +1599,7 @@ mod tests {
             1,
             vec![genesis.id],
             "add greeting",
-            vec![added_tree_entry(
-                "hello.txt",
-                TreeEntry::regular(hash, false),
-            )],
+            vec![added_tree_entry("hello.txt", TreeEntry::blob(hash, false))],
         );
 
         let branch_name = BranchName::new("main");
@@ -1650,8 +1642,8 @@ mod tests {
             vec![genesis.id],
             "add exact source modes",
             vec![
-                added_tree_entry("plain.txt", TreeEntry::regular(regular_hash, false)),
-                added_tree_entry("run.sh", TreeEntry::regular(executable_hash, true)),
+                added_tree_entry("plain.txt", TreeEntry::blob(regular_hash, false)),
+                added_tree_entry("run.sh", TreeEntry::blob(executable_hash, true)),
                 added_tree_entry("plain-link", TreeEntry::symlink(symlink_hash)),
             ],
         );
@@ -1662,13 +1654,13 @@ mod tests {
             vec![
                 modified_tree_entry(
                     "plain.txt",
-                    TreeEntry::regular(regular_hash, false),
-                    TreeEntry::regular(regular_hash, true),
+                    TreeEntry::blob(regular_hash, false),
+                    TreeEntry::blob(regular_hash, true),
                 ),
                 modified_tree_entry(
                     "run.sh",
-                    TreeEntry::regular(executable_hash, true),
-                    TreeEntry::regular(executable_hash, false),
+                    TreeEntry::blob(executable_hash, true),
+                    TreeEntry::blob(executable_hash, false),
                 ),
             ],
         );
@@ -1706,6 +1698,98 @@ mod tests {
     }
 
     #[test]
+    fn export_preserves_gitlink_identity_without_blob_lookup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let blob_store = make_blob_store(tmp.path());
+        let genesis = make_genesis();
+        let target = [0x11; 20];
+        let change = make_change(
+            1,
+            vec![genesis.id],
+            "add gitlink",
+            vec![added_tree_entry(
+                "module",
+                TreeEntry::gitlink(GitObjectId::sha1(target)),
+            )],
+        );
+        let git_path = tmp.path().join("repo.git");
+        export_changes(
+            &blob_store,
+            &[genesis, change],
+            &BranchName::new("main"),
+            &git_path,
+        )
+        .unwrap();
+
+        let repo = gix::open(&git_path).unwrap();
+        let head = repo
+            .find_reference("refs/heads/main")
+            .unwrap()
+            .id()
+            .detach();
+        let entry = repo
+            .find_commit(head)
+            .unwrap()
+            .tree()
+            .unwrap()
+            .lookup_entry_by_path("module")
+            .unwrap()
+            .unwrap();
+        assert_eq!(entry.mode().kind(), EntryKind::Commit);
+        assert_eq!(entry.object_id(), gix::ObjectId::from(target));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn export_preserves_non_utf8_repository_path_bytes() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let blob_store = make_blob_store(tmp.path());
+        let genesis = make_genesis();
+        let hash = store_blob(&blob_store, b"\x00\xffopaque");
+        let raw_path = b"assets/icon-\xff.bin".to_vec();
+        let change = make_change(
+            1,
+            vec![genesis.id],
+            "add byte path",
+            vec![TreeDelta::Added {
+                artifact_id: ArtifactId::new(),
+                new: LocatedEntry::new(
+                    RepoPath::from_bytes(raw_path.clone()).unwrap(),
+                    TreeEntry::blob(hash, false),
+                ),
+            }],
+        );
+        let git_path = tmp.path().join("repo.git");
+        export_changes(
+            &blob_store,
+            &[genesis, change],
+            &BranchName::new("main"),
+            &git_path,
+        )
+        .unwrap();
+
+        let repo = gix::open(&git_path).unwrap();
+        let head = repo
+            .find_reference("refs/heads/main")
+            .unwrap()
+            .id()
+            .detach();
+        let lookup = PathBuf::from("assets").join(OsString::from_vec(b"icon-\xff.bin".to_vec()));
+        let entry = repo
+            .find_commit(head)
+            .unwrap()
+            .tree()
+            .unwrap()
+            .lookup_entry_by_path(lookup)
+            .unwrap()
+            .unwrap();
+        assert_eq!(entry.object().unwrap().data, b"\x00\xffopaque");
+    }
+
+    #[test]
     fn export_multi_change_chain() {
         let tmp = tempfile::tempdir().unwrap();
         let blob_store = make_blob_store(tmp.path());
@@ -1716,10 +1800,7 @@ mod tests {
             1,
             vec![genesis.id],
             "initial file",
-            vec![added_tree_entry(
-                "file.txt",
-                TreeEntry::regular(hash1, false),
-            )],
+            vec![added_tree_entry("file.txt", TreeEntry::blob(hash1, false))],
         );
 
         let hash2 = store_blob(&blob_store, b"version 2\n");
@@ -1729,8 +1810,8 @@ mod tests {
             "update file",
             vec![modified_tree_entry(
                 "file.txt",
-                TreeEntry::regular(hash1, false),
-                TreeEntry::regular(hash2, false),
+                TreeEntry::blob(hash1, false),
+                TreeEntry::blob(hash2, false),
             )],
         );
 
@@ -1741,7 +1822,7 @@ mod tests {
             "add another file",
             vec![added_tree_entry(
                 "src/lib.rs",
-                TreeEntry::regular(hash3, false),
+                TreeEntry::blob(hash3, false),
             )],
         );
 
@@ -1803,10 +1884,7 @@ mod tests {
             1,
             vec![genesis.id],
             "feature work",
-            vec![added_tree_entry(
-                "feature.rs",
-                TreeEntry::regular(hash, false),
-            )],
+            vec![added_tree_entry("feature.rs", TreeEntry::blob(hash, false))],
         );
 
         let branch_name = BranchName::new("develop");
@@ -2107,10 +2185,7 @@ mod tests {
             1,
             vec![genesis.id],
             "first commit",
-            vec![added_tree_entry(
-                "file.txt",
-                TreeEntry::regular(hash1, false),
-            )],
+            vec![added_tree_entry("file.txt", TreeEntry::blob(hash1, false))],
         );
 
         let graph1 = MockGraph::with_branch_and_changes(
@@ -2131,8 +2206,8 @@ mod tests {
             "second commit",
             vec![modified_tree_entry(
                 "file.txt",
-                TreeEntry::regular(hash1, false),
-                TreeEntry::regular(hash2, false),
+                TreeEntry::blob(hash1, false),
+                TreeEntry::blob(hash2, false),
             )],
         );
 
@@ -2175,20 +2250,14 @@ mod tests {
             1,
             vec![genesis.id],
             "add file",
-            vec![added_tree_entry(
-                "temp.txt",
-                TreeEntry::regular(hash, false),
-            )],
+            vec![added_tree_entry("temp.txt", TreeEntry::blob(hash, false))],
         );
 
         let change2 = make_change(
             2,
             vec![change1.id],
             "remove file",
-            vec![removed_tree_entry(
-                "temp.txt",
-                TreeEntry::regular(hash, false),
-            )],
+            vec![removed_tree_entry("temp.txt", TreeEntry::blob(hash, false))],
         );
 
         let branch_name = BranchName::new("main");
@@ -2234,9 +2303,9 @@ mod tests {
             vec![genesis.id],
             "add nested files",
             vec![
-                added_tree_entry("src/lib/mod.rs", TreeEntry::regular(hash1, false)),
-                added_tree_entry("src/main.rs", TreeEntry::regular(hash2, false)),
-                added_tree_entry("README.md", TreeEntry::regular(hash3, false)),
+                added_tree_entry("src/lib/mod.rs", TreeEntry::blob(hash1, false)),
+                added_tree_entry("src/main.rs", TreeEntry::blob(hash2, false)),
+                added_tree_entry("README.md", TreeEntry::blob(hash3, false)),
             ],
         );
 
@@ -2284,12 +2353,5 @@ mod tests {
         let (name, email) = parse_author("just-a-name");
         assert_eq!(name, "just-a-name");
         assert_eq!(email, "unknown@kin");
-    }
-
-    #[test]
-    fn split_path_works() {
-        assert_eq!(split_path("a/b/c.txt"), ("a/b".into(), "c.txt".into()));
-        assert_eq!(split_path("file.txt"), ("".into(), "file.txt".into()));
-        assert_eq!(split_path("src/main.rs"), ("src".into(), "main.rs".into()));
     }
 }
