@@ -12,15 +12,74 @@ test('all schemas load', async () => {
   assert.ok(schemas.kinCommandResult);
   assert.ok(schemas.scmSnapshot);
   assert.ok(schemas.scmResourceGroups);
+  assert.ok(schemas.mcpArtifactReadInput);
   assert.ok(schemas.shadowGateReport);
+});
+
+test('exact MCP artifact reads accept lossless paths and reject lossy selectors', async () => {
+  const sourceChangeId = 'a'.repeat(64);
+  const artifactId = '3fa85f64-5717-4562-b3fc-2c963f66afa6';
+  const nonUtf8Path = { bytes_hex: '6173736574732fff7061796c6f61642e62696e' };
+
+  assert.equal(
+    (await validateContract('mcpArtifactReadInput', {
+      artifact_id: artifactId,
+      source_change_id: sourceChangeId
+    })).ok,
+    true
+  );
+  assert.equal(
+    (await validateContract('mcpArtifactReadInput', {
+      path: nonUtf8Path,
+      source_change_id: sourceChangeId
+    })).ok,
+    true
+  );
+  assert.equal(
+    (await validateContract('mcpArtifactReadInput', {
+      artifact_id: artifactId,
+      path: nonUtf8Path,
+      source_change_id: sourceChangeId
+    })).ok,
+    true,
+    'callers may bind both identity and location for an exact coherence check'
+  );
+
+  assert.equal(
+    (await validateContract('mcpArtifactReadInput', {
+      path: { display: 'assets/�payload.bin' }
+    })).ok,
+    false
+  );
+  assert.equal(
+    (await validateContract('mcpArtifactReadInput', {
+      path: { bytes_hex: 'FF' }
+    })).ok,
+    false
+  );
+  assert.equal(
+    (await validateContract('mcpArtifactReadInput', {
+      source_change_id: sourceChangeId
+    })).ok,
+    false
+  );
+  assert.equal(
+    (await validateContract('mcpArtifactReadInput', {
+      artifact_id: artifactId,
+      fallback_path: 'assets/payload.bin'
+    })).ok,
+    false
+  );
 });
 
 test('shadow gate report contract accepts the kin review shadow payload shape', async () => {
   // Canonical shape emitted by `kin review shadow --json` (kin-review::shadow).
   // The live payload is asserted against the same required fields by the
   // review_shadow_json integration test in the kin workspace.
+  const oldHash = Array(32).fill(17);
+  const newHash = Array(32).fill(34);
   const report = {
-    schema_version: 1,
+    schema_version: 2,
     mode: 'shadow',
     input: {
       base_ref: 'main',
@@ -40,6 +99,39 @@ test('shadow gate report contract accepts the kin review shadow payload shape', 
         end_line: 12,
         signature_changed: true,
         visibility_changed: false
+      }
+    ],
+    changed_artifacts: [
+      {
+        artifact_id: '3fa85f64-5717-4562-b3fc-2c963f66afa9',
+        operation: 'updated',
+        old: {
+          path: { bytes_hex: '636f6e6669672f706f6c6963792e79616d6c' },
+          entry: { type: 'blob', hash: oldHash, executable: false }
+        },
+        new: {
+          path: { bytes_hex: '6465706c6f792f706f6c6963792e79616d6c' },
+          entry: { type: 'blob', hash: newHash, executable: false }
+        },
+        aspects: ['renamed', 'blob_content_changed']
+      }
+    ],
+    artifact_activity: [
+      {
+        change_id: 'b'.repeat(64),
+        transition: {
+          artifact_id: '3fa85f64-5717-4562-b3fc-2c963f66afa9',
+          operation: 'updated',
+          old: {
+            path: { bytes_hex: '636f6e6669672f706f6c6963792e79616d6c' },
+            entry: { type: 'blob', hash: oldHash, executable: false }
+          },
+          new: {
+            path: { bytes_hex: '6465706c6f792f706f6c6963792e79616d6c' },
+            entry: { type: 'blob', hash: newHash, executable: false }
+          },
+          aspects: ['renamed', 'blob_content_changed']
+        }
       }
     ],
     blast_radius: {
@@ -67,7 +159,7 @@ test('shadow gate report contract accepts the kin review shadow payload shape', 
       total_affected: 2,
       cross_repo: {
         status: 'not_evaluated',
-        detail: 'cross-repo federation is not evaluated by shadow report v1',
+        detail: 'cross-repo federation is not evaluated by shadow report v2',
         nodes: []
       }
     },
@@ -104,7 +196,7 @@ test('shadow gate report contract accepts the kin review shadow payload shape', 
       {
         kind: 'cross_repo_not_evaluated',
         subject: 'blast_radius.cross_repo',
-        detail: 'cross-repo federation is not evaluated by shadow report v1'
+        detail: 'cross-repo federation is not evaluated by shadow report v2'
       }
     ],
     audit: {
@@ -128,4 +220,18 @@ test('shadow gate report contract accepts the kin review shadow payload shape', 
   enforcing.policy.enforcement = 'blocking';
   const rejected = await validateContract('shadowGateReport', enforcing);
   assert.equal(rejected.ok, false);
+
+  // Exact repository paths are canonical lowercase hex, never lossy strings.
+  const lossyPath = structuredClone(report);
+  lossyPath.changed_artifacts[0].new.path = { display: 'deploy/policy.yaml' };
+  assert.equal((await validateContract('shadowGateReport', lossyPath)).ok, false);
+
+  const nonCanonicalPath = structuredClone(report);
+  nonCanonicalPath.changed_artifacts[0].new.path.bytes_hex = 'FF';
+  assert.equal((await validateContract('shadowGateReport', nonCanonicalPath)).ok, false);
+
+  // Entry variants and fixed-width object identities must be exact.
+  const malformedHash = structuredClone(report);
+  malformedHash.changed_artifacts[0].new.entry.hash.pop();
+  assert.equal((await validateContract('shadowGateReport', malformedHash)).ok, false);
 });

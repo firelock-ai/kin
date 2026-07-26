@@ -102,13 +102,13 @@ kin status
 kin overview
 ```
 
-In an existing Git repository, `kin init` imports recent history by default and
-indexes the checked-out tree into `.kin/`. `kin status` starts or reuses the
-repository daemon and reports graph and embedding state. The graph is the answer
-authority for Kin queries; a missing or unavailable graph is reported instead of
-being hidden behind raw file search. Initial indexing time scales with repository
-size; the command sequence itself is the short path, not a fixed performance
-promise for every codebase.
+In an existing Git repository, `kin init` imports an exact HEAD snapshot by
+default and indexes the checked-out tree into `.kin/`. `kin status` starts or
+reuses the repository daemon and reports graph and embedding state. The graph is
+the answer authority for Kin queries; a missing or unavailable graph is reported
+instead of being hidden behind raw file search. Initial indexing time scales with
+repository size; the command sequence itself is the short path, not a fixed
+performance promise for every codebase.
 
 ### 3. Ask the graph a real question
 
@@ -148,21 +148,25 @@ act on.
 
 ## How Kin relates to Git
 
-Kin coexists with Git. It does not rewrite Git history, branches, or remotes.
+Kin is designed to replace Git as the repository authority. During brownfield
+adoption, Git remains an explicit import/export interoperability boundary; it
+never answers Kin runtime queries or repairs missing graph truth.
 
-- `kin init --git-history off|recent|full` controls bootstrap history import;
-  `recent` is the default for an existing Git repository.
-- `kin migrate` is the explicit deep-history migration path.
-- Git remains the interoperability and transport boundary while Kin owns the
-  semantic graph used by Kin commands.
-- `kin eject` removes `.kin/` graph state and leaves working files and `.git`
-  untouched.
-- `kin eject --revert-files` is a separate, destructive option that restores
-  the pre-init file snapshot after explicit confirmation. It still never
-  modifies `.git`.
+- `kin init --git-history off|snapshot|full` controls bootstrap import;
+  `snapshot` is the default and admits one exact HEAD tree without claiming
+  ancestry.
+- `kin migrate --history full` imports complete reachable Git history and exact
+  parent edges. Kin deliberately has no partial-history mode.
+- After import, Kin's graph owns repository identity, tree state, history, refs,
+  and semantic relations. Filesystem and Git views are projections.
+- `kin eject` first proves that the checked-out branch, graph blobs, and working
+  projection agree exactly. It then stops the daemon and atomically moves
+  `.kin/` to a recoverable archive outside the repository, leaving working
+  files and `.git` untouched. `--purge-metadata --yes` permanently removes that
+  archive after the same verification.
 
-This lets a team evaluate Kin inside an existing repository without giving up
-its Git remote, history, editor, compiler, or build system.
+This lets a team migrate an existing repository without giving up its editor,
+compiler, build system, or Git interoperability while Kin becomes authoritative.
 
 ## Platform and maturity
 

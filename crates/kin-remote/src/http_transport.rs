@@ -351,7 +351,7 @@ mod tests {
             mutation_id: uuid::Uuid::new_v4(),
             change_set: vec![],
             base_hash: None,
-            new_hash: "hash-new".to_owned(),
+            new_hash: Some("hash-new".to_owned()),
             timestamp: chrono::Utc::now(),
         };
 

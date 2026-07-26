@@ -3,6 +3,51 @@
 
 use thiserror::Error;
 
+/// One other Git worktree registered against the source object database.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegisteredGitWorktreeFact {
+    pub kind: RegisteredGitWorktreeKind,
+    pub id: Option<Vec<u8>>,
+    pub path: std::path::PathBuf,
+    pub locked: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegisteredGitWorktreeKind {
+    Main,
+    Linked,
+}
+
+/// A local hook surface intentionally not imported or executed by Kin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalGitHookFact {
+    pub name: Vec<u8>,
+    pub kind: LocalGitHookKind,
+    pub executable: bool,
+    pub byte_len: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalGitHookKind {
+    File,
+    Symlink,
+    Directory,
+    Other,
+}
+
+/// Presence-only description of a configured external checkout filter.
+///
+/// Command values are deliberately omitted so credentials or executable
+/// configuration cannot leak into Kin authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitCheckoutFilterFact {
+    pub name: Vec<u8>,
+    pub clean_present: bool,
+    pub smudge_present: bool,
+    pub process_present: bool,
+    pub required_present: bool,
+}
+
 /// Errors from the kin-git adapter.
 #[derive(Debug, Error)]
 pub enum GitError {
@@ -23,6 +68,46 @@ pub enum GitError {
 
     #[error("no commits in repository")]
     EmptyRepository,
+
+    #[error("shallow Git repositories cannot be imported losslessly")]
+    ShallowRepository,
+
+    #[error("Git object {oid} is missing while traversing {context}")]
+    MissingObject { oid: String, context: String },
+
+    #[error("Git object {oid} is corrupt: {reason}")]
+    CorruptObject { oid: String, reason: String },
+
+    #[error("lossless Git snapshot is invalid: {0}")]
+    InvalidSnapshot(String),
+
+    #[error("Git migration preflight failed: {0}")]
+    MigrationPreflight(String),
+
+    #[error(
+        "Git migration source has {count} other registered worktree(s); single-workspace import must account for each workspace"
+    )]
+    AdditionalWorktrees {
+        count: usize,
+        worktrees: Vec<RegisteredGitWorktreeFact>,
+    },
+
+    #[error(
+        "Git migration source has local compatibility blockers ({hook_count} hook(s), custom hooks path: {custom_hooks_path}, {filter_count} checkout filter(s))"
+    )]
+    LocalCompatibilityBlockers {
+        hook_count: usize,
+        custom_hooks_path: bool,
+        filter_count: usize,
+        hooks: Vec<LocalGitHookFact>,
+        filters: Vec<GitCheckoutFilterFact>,
+    },
+
+    #[error("Git object format {0} is not supported for exact rehydration")]
+    UnsupportedObjectFormat(String),
+
+    #[error("Git rehydration destination already exists: {0}")]
+    DestinationExists(String),
 
     #[error("io error: {path}: {source}")]
     Io {

@@ -108,6 +108,14 @@ pub fn format_diff(diff: &SemanticDiff) -> String {
                 RelationChangeKind::Added(rel) => {
                     writeln!(out, "  + {:?}: {} -> {}", rel.kind, rel.src, rel.dst,).unwrap();
                 }
+                RelationChangeKind::Modified { old, new } => {
+                    writeln!(
+                        out,
+                        "  ~ {:?}: {} -> {} (was {:?}: {} -> {})",
+                        new.kind, new.src, new.dst, old.kind, old.src, old.dst,
+                    )
+                    .unwrap();
+                }
                 RelationChangeKind::Removed(id) => {
                     writeln!(out, "  - relation {}", id).unwrap();
                 }

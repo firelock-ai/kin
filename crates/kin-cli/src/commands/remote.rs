@@ -660,9 +660,7 @@ pub(crate) fn render_push_plan(plan: &PushPlanContext, execute_git_export: bool)
                     println!("Action: Git export transport can be prepared with `kin push`.");
                 }
                 kin_remote::PushDecision::SemanticStateRequired => {
-                    println!(
-                        "Action: record Kin state with `kin commit` or `kin git sync` before export."
-                    );
+                    println!("Action: record Kin state with `kin commit` before export.");
                 }
                 kin_remote::PushDecision::ApprovalRequired => {
                     println!("Action: resolve approval gates, then rerun `kin push`.");

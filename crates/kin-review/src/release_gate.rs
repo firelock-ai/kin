@@ -93,13 +93,6 @@ pub fn unapproved_changes<G: GraphStore>(
     Ok(unapproved)
 }
 
-// Compatibility aliases for downstream crates compiled against the pre-0.3
-// symbol names. The policy has always been conservative at this boundary: it
-// applies to every non-root change, regardless of the unauthenticated author
-// display string.
-pub use unapproved_changes as unapproved_agent_changes;
-pub use UnapprovedChange as UnapprovedAgentChange;
-
 /// Compute current, advisory proof coverage for a graph.
 ///
 /// Structural `Test -> Covers -> Entity` links describe intended coverage,
@@ -409,9 +402,9 @@ pub fn entities_touched_by_change(deltas: &[EntityDelta]) -> Vec<EntityId> {
     deltas
         .iter()
         .map(|delta| match delta {
-            EntityDelta::Added(entity) => entity.id,
+            EntityDelta::Added { new: entity } => entity.id,
             EntityDelta::Modified { new, .. } => new.id,
-            EntityDelta::Removed(id) => *id,
+            EntityDelta::Removed { old } => old.id,
         })
         .collect()
 }
@@ -461,22 +454,25 @@ mod tests {
         SemanticChangeId::from_hash(Hash256::from_bytes([byte; 32]))
     }
 
-    fn change(id: u8, parent: Option<u8>, author: &str) -> SemanticChange {
-        SemanticChange {
-            id: change_id(id),
-            parents: parent.map(|p| vec![change_id(p)]).unwrap_or_default(),
+    fn change(fixture_id: u8, parent: Option<SemanticChangeId>, author: &str) -> SemanticChange {
+        let mut change = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+            parents: parent.into_iter().collect(),
             timestamp: Timestamp::now(),
             author: AuthorId::new(author),
-            message: format!("change {}", id),
+            message: format!("change {fixture_id}"),
             entity_deltas: vec![],
             relation_deltas: vec![],
-            artifact_deltas: vec![],
+            tree_deltas: vec![],
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],
             risk_summary: None,
-            authored_on: None,
-        }
+            origin: kin_model::ChangeOrigin::Native,
+            admission_policy_delta: None,
+        };
+        change.id = kin_model::compute_semantic_change_id(&change).unwrap();
+        change
     }
 
     fn approval(change: &SemanticChange, decision: ApprovalDecision) -> Approval {
@@ -501,8 +497,10 @@ mod tests {
             .unwrap();
     }
 
-    fn add_root(store: &InMemoryGraph) {
-        store.create_change(&change(0, None, "kin")).unwrap();
+    fn add_root(store: &InMemoryGraph) -> SemanticChangeId {
+        let root = change(0, None, "kin");
+        store.create_change(&root).unwrap();
+        root.id
     }
 
     fn calls(src: &Entity, dst: &Entity) -> Relation {
@@ -524,11 +522,11 @@ mod tests {
     #[test]
     fn agent_change_without_approval_is_flagged() {
         let store = InMemoryGraph::new();
-        add_root(&store);
-        let c = change(1, Some(0), "claude-agent");
+        let root = add_root(&store);
+        let c = change(1, Some(root), "claude-agent");
         store.create_change(&c).unwrap();
 
-        let found = unapproved_agent_changes(&store, &c.id, 50).unwrap();
+        let found = unapproved_changes(&store, &c.id, 50).unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].change_id, c.id);
         assert_eq!(found[0].author, "claude-agent");
@@ -537,41 +535,41 @@ mod tests {
     #[test]
     fn agent_change_with_approval_is_not_flagged() {
         let store = InMemoryGraph::new();
-        add_root(&store);
+        let root = add_root(&store);
         register_approver(&store, ActorKind::Human);
-        let c = change(1, Some(0), "claude-agent");
+        let c = change(1, Some(root), "claude-agent");
         store.create_change(&c).unwrap();
         store
             .create_approval(&approval(&c, ApprovalDecision::Approved))
             .unwrap();
 
-        let found = unapproved_agent_changes(&store, &c.id, 50).unwrap();
+        let found = unapproved_changes(&store, &c.id, 50).unwrap();
         assert!(found.is_empty(), "approved agent change must not block");
     }
 
     #[test]
     fn display_name_cannot_bypass_required_approval() {
         let store = InMemoryGraph::new();
-        add_root(&store);
-        let c = change(1, Some(0), "alice");
+        let root = add_root(&store);
+        let c = change(1, Some(root), "alice");
         store.create_change(&c).unwrap();
 
-        let found = unapproved_agent_changes(&store, &c.id, 50).unwrap();
+        let found = unapproved_changes(&store, &c.id, 50).unwrap();
         assert_eq!(found.len(), 1, "display text must not bypass the gate");
     }
 
     #[test]
     fn assistant_approval_does_not_satisfy_human_gate() {
         let store = InMemoryGraph::new();
-        add_root(&store);
+        let root = add_root(&store);
         register_approver(&store, ActorKind::Assistant);
-        let c = change(1, Some(0), "alice");
+        let c = change(1, Some(root), "alice");
         store.create_change(&c).unwrap();
         store
             .create_approval(&approval(&c, ApprovalDecision::Approved))
             .unwrap();
 
-        let found = unapproved_agent_changes(&store, &c.id, 50).unwrap();
+        let found = unapproved_changes(&store, &c.id, 50).unwrap();
         assert_eq!(found.len(), 1);
     }
 
@@ -579,12 +577,12 @@ mod tests {
     fn rejected_and_conditional_do_not_satisfy_approval() {
         for decision in [ApprovalDecision::Rejected, ApprovalDecision::Conditional] {
             let store = InMemoryGraph::new();
-            add_root(&store);
-            let c = change(1, Some(0), "agent-x");
+            let root = add_root(&store);
+            let c = change(1, Some(root), "agent-x");
             store.create_change(&c).unwrap();
             store.create_approval(&approval(&c, decision)).unwrap();
 
-            let found = unapproved_agent_changes(&store, &c.id, 50).unwrap();
+            let found = unapproved_changes(&store, &c.id, 50).unwrap();
             assert_eq!(
                 found.len(),
                 1,
@@ -601,14 +599,14 @@ mod tests {
         let store = InMemoryGraph::new();
         register_approver(&store, ActorKind::Human);
         let c1 = change(1, None, "agent-a");
-        let c2 = change(2, Some(1), "agent-a");
+        let c2 = change(2, Some(c1.id), "agent-a");
         store.create_change(&c1).unwrap();
         store.create_change(&c2).unwrap();
         store
             .create_approval(&approval(&c1, ApprovalDecision::Approved))
             .unwrap();
 
-        let found = unapproved_agent_changes(&store, &c2.id, 50).unwrap();
+        let found = unapproved_changes(&store, &c2.id, 50).unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].change_id, c2.id);
 
@@ -616,7 +614,7 @@ mod tests {
         store
             .create_approval(&approval(&c2, ApprovalDecision::Approved))
             .unwrap();
-        let found = unapproved_agent_changes(&store, &c2.id, 50).unwrap();
+        let found = unapproved_changes(&store, &c2.id, 50).unwrap();
         assert!(found.is_empty());
     }
 
@@ -626,11 +624,11 @@ mod tests {
         // visits the head, so the older unapproved change is not reported.
         let store = InMemoryGraph::new();
         let c1 = change(1, None, "agent-a");
-        let c2 = change(2, Some(1), "agent-a");
+        let c2 = change(2, Some(c1.id), "agent-a");
         store.create_change(&c1).unwrap();
         store.create_change(&c2).unwrap();
 
-        let found = unapproved_agent_changes(&store, &c2.id, 1).unwrap();
+        let found = unapproved_changes(&store, &c2.id, 1).unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].change_id, c2.id);
     }
@@ -639,7 +637,7 @@ mod tests {
     fn missing_head_change_fails_closed() {
         let store = InMemoryGraph::new();
         let head = change_id(9);
-        let error = unapproved_agent_changes(&store, &head, 50).unwrap_err();
+        let error = unapproved_changes(&store, &head, 50).unwrap_err();
         assert!(matches!(
             error,
             ReviewError::RefStateUnavailable { at, missing }

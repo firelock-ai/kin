@@ -12,7 +12,7 @@ use kin_core::KinLayout;
 use kin_db::StorageBackend;
 use kin_model::{
     ChangeStore, EntityId, EntityStore, FilePathId, GraphOverlay, Hash256, SemanticChange,
-    SemanticChangeId, SourceEntryKind, SourceTreeResolution, WorkingCopy,
+    SemanticChangeId, TreeDelta, TreeEntry, TreeEntryKind, WorkingCopy,
 };
 use kin_projection::ProjectionState;
 use kin_reconcile::Reconciler;
@@ -661,7 +661,7 @@ pub(crate) struct VfsTreeCacheKey {
 #[derive(Debug)]
 pub(crate) struct VfsTreeSnapshot {
     pub key: VfsTreeCacheKey,
-    pub files: Arc<HashMap<FilePathId, Hash256>>,
+    pub files: Arc<HashMap<FilePathId, kin_model::TreeEntry>>,
     pub timestamps: Arc<HashMap<FilePathId, u64>>,
 }
 
@@ -715,25 +715,18 @@ fn exact_source_storage_error(message: impl Into<String>) -> DaemonError {
 
 fn exact_source_objects<'a>(
     changes: impl IntoIterator<Item = &'a SemanticChange>,
-) -> Result<Vec<(Hash256, FilePathId, SemanticChangeId, SourceEntryKind)>> {
+) -> Result<Vec<(Hash256, FilePathId, SemanticChangeId, TreeEntryKind)>> {
     let mut objects = Vec::new();
     for change in changes {
-        for delta in &change.artifact_deltas {
-            if delta.kind.is_removed() {
-                continue;
-            }
-            let Some(kind) = delta.kind.source_entry_kind() else {
-                // Legacy mode-unknown history stays an explicit exact-tree gap;
-                // this object preflight must not normalize it into a mode.
-                continue;
+        for delta in &change.tree_deltas {
+            let (file_id, entry) = match delta {
+                TreeDelta::Added { file_id, new_entry }
+                | TreeDelta::Modified {
+                    file_id, new_entry, ..
+                } => (file_id, new_entry),
+                TreeDelta::Removed { .. } => continue,
             };
-            let hash = delta.new_hash.ok_or_else(|| {
-                exact_source_storage_error(format!(
-                    "exact source delta for {} in change {} has no content identity",
-                    delta.file_id, change.id
-                ))
-            })?;
-            objects.push((hash, delta.file_id.clone(), change.id, kind));
+            objects.push((entry.blob_hash, file_id.clone(), change.id, entry.kind));
         }
     }
     objects.sort_by(|left, right| {
@@ -748,7 +741,7 @@ fn exact_source_objects<'a>(
 
 fn validate_exact_source_bytes(
     file_id: &FilePathId,
-    kind: SourceEntryKind,
+    kind: TreeEntryKind,
     expected: Hash256,
     data: &[u8],
     authority: &str,
@@ -952,9 +945,6 @@ pub struct DaemonState {
     /// Channel for LSP enrichment messages (incremental or sweep).
     /// None if LSP enrichment is disabled (no servers found).
     pub lsp_enrichment_tx: Option<tokio::sync::mpsc::Sender<LspEnrichmentMessage>>,
-    /// Cached SemanticChangeId → Git OID mapping for fast scope switching.
-    /// Built lazily on first `set_scope` call, reused for subsequent calls.
-    pub change_oid_cache: std::sync::RwLock<Option<kin_core::ChangeOidCache>>,
     /// Repo ID resolved once at construction. Cached to avoid re-reading
     /// `.kin/manifest.json` on every snapshot save — under high host
     /// concurrency those reads contend and surface as opaque "Core error"
@@ -996,17 +986,6 @@ pub struct DaemonState {
     pub locate_rankings: Mutex<HashMap<String, CachedLocateRanking>>,
     /// Cached `semantic_locate` result pages keyed by paging-cursor key.
     pub semantic_locate_pages: Mutex<HashMap<String, CachedSemanticPage>>,
-    /// Serializes lazy git-ancestry hydration — the full-history import behind a
-    /// `review`/`history`/`blame`/`locate --ref`/`scope` ref that names an
-    /// unimported Git commit. At most one such import runs at a time: two
-    /// concurrent deep imports roughly double peak memory and can OOM-kill the
-    /// daemon. Concurrent requests for the SAME unimported commit coalesce —
-    /// whoever wins the gate imports it, and later waiters observe it already
-    /// present (the get-or-build guard in `hydrate_imported_git_ref`) and skip
-    /// the re-import. Held across the request `.await` (and moved into the
-    /// `set_scope` blocking task), so it is a tokio mutex behind an `Arc` — not
-    /// the std locks used for the synchronous critical sections above.
-    pub hydration_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// Cached full locate entity-ranking for cursor paging. The daemon caches the
@@ -1410,7 +1389,6 @@ impl DaemonState {
             last_activity_ms: AtomicU64::new(0),
             active_requests: AtomicU64::new(0),
             lsp_enrichment_tx: None,
-            change_oid_cache: std::sync::RwLock::new(None),
             cached_repo_id,
             is_shutdown: AtomicBool::new(false),
             persisted_entity_count: AtomicU64::new(loaded_entity_count as u64),
@@ -1419,7 +1397,6 @@ impl DaemonState {
             mcp_transactions: Mutex::new(HashMap::new()),
             locate_rankings: Mutex::new(HashMap::new()),
             semantic_locate_pages: Mutex::new(HashMap::new()),
-            hydration_gate: Arc::new(tokio::sync::Mutex::new(())),
         };
         // Restore in-flight MCP transactions persisted before a restart
         // so staged-but-uncommitted work is not silently dropped across a daemon
@@ -1474,7 +1451,8 @@ impl DaemonState {
                     let g = kin_db::InMemoryGraph::from_snapshot_with_text_index(
                         recovered.snapshot,
                         text_index_path.clone(),
-                    );
+                    )
+                    .map_err(DaemonError::from)?;
                     info!(
                         repo_id,
                         generation = recovered.generation,
@@ -1580,7 +1558,6 @@ impl DaemonState {
             last_activity_ms: AtomicU64::new(0),
             active_requests: AtomicU64::new(0),
             lsp_enrichment_tx: None,
-            change_oid_cache: std::sync::RwLock::new(None),
             cached_repo_id: repo_id.to_string(),
             is_shutdown: AtomicBool::new(false),
             persisted_entity_count: AtomicU64::new(loaded_entity_count as u64),
@@ -1589,7 +1566,6 @@ impl DaemonState {
             mcp_transactions: Mutex::new(HashMap::new()),
             locate_rankings: Mutex::new(HashMap::new()),
             semantic_locate_pages: Mutex::new(HashMap::new()),
-            hydration_gate: Arc::new(tokio::sync::Mutex::new(())),
         };
 
         // Restore in-flight MCP transactions persisted before a restart.
@@ -2424,10 +2400,13 @@ impl DaemonState {
         {
             Some(recovered) => {
                 let text_index_path = self.layout.text_index_dir();
-                let graph = Arc::new(kin_db::InMemoryGraph::from_snapshot_with_text_index(
-                    recovered.snapshot,
-                    text_index_path,
-                ));
+                let graph = Arc::new(
+                    kin_db::InMemoryGraph::from_snapshot_with_text_index(
+                        recovered.snapshot,
+                        text_index_path,
+                    )
+                    .map_err(DaemonError::from)?,
+                );
                 info!(
                     repo_id,
                     generation = recovered.generation,
@@ -2540,8 +2519,22 @@ impl DaemonState {
                 self.graph
                     .upsert_file_layout(&layout)
                     .map_err(DaemonError::from)?;
-                self.graph
-                    .set_file_hash(&file_id.0, kin_blobs::digest_bytes(content));
+                let entry = self
+                    .graph
+                    .get_tree_entry(file_id)
+                    .map_err(DaemonError::from)?
+                    .ok_or_else(|| {
+                        exact_source_storage_error(format!(
+                            "semantic enrichment for {file_id} preceded exact working-tree admission"
+                        ))
+                    })?;
+                let actual = kin_blobs::digest_bytes(content);
+                if actual != *entry.blob_hash.as_bytes() {
+                    return Err(exact_source_storage_error(format!(
+                        "semantic enrichment bytes for {file_id} do not match graph-owned tree entry {}",
+                        entry.blob_hash
+                    )));
+                }
             }
             kin_reconcile::ReconcileOutcome::FileRemoved { file_id, .. } => {
                 self.graph
@@ -2738,41 +2731,10 @@ impl DaemonState {
         (Arc::clone(&self.graph), RequestGraphAuthority::Head)
     }
 
-    /// Resolve the graph authority for a request that may hydrate a Git ref.
-    ///
-    /// Ref hydration mutates the selected graph even though blame/history are
-    /// query surfaces. Treat an active temporal scope like a write lease:
-    /// prune expired entries and refresh the selected scope under the same
-    /// write lock used to clone its graph. This gives hydration a fresh scope
-    /// lease instead of starting from a nearly-expired one. Callers must still
-    /// re-resolve through this method after waiting on the global hydration
-    /// gate because the session scope may have changed while the request was
-    /// queued.
-    pub(crate) async fn graph_for_ref_hydration_with_authority(
-        &self,
-        session_id: Option<&kin_model::SessionId>,
-    ) -> (Arc<kin_db::InMemoryGraph>, RequestGraphAuthority) {
-        if let Some(session_id) = session_id {
-            let mut scopes = self.session_scopes.write().await;
-            scopes.retain(|_, scope| !scope.is_expired());
-            if let Some(scope) = scopes.get_mut(session_id) {
-                scope.created_at = Instant::now();
-                return (
-                    Arc::clone(&scope.cached_graph),
-                    RequestGraphAuthority::SessionScope,
-                );
-            }
-        }
-
-        (Arc::clone(&self.graph), RequestGraphAuthority::Head)
-    }
-
-    /// Revalidate that the authority selected before ref hydration still owns
-    /// the exact graph that was mutated. Session scopes may expire or be
-    /// replaced while synchronous history import is running; in that case the
-    /// old graph is an orphan and must not be acknowledged as current session
-    /// state. HEAD ownership is stable for the daemon lifetime.
-    pub(crate) async fn ref_hydration_authority_is_current(
+    /// Revalidate that a selected request graph is still owned by the same
+    /// authority. Session scopes may expire or be replaced during a long read;
+    /// HEAD ownership is stable for the daemon lifetime.
+    pub(crate) async fn graph_authority_is_current(
         &self,
         session_id: Option<&kin_model::SessionId>,
         graph: &Arc<kin_db::InMemoryGraph>,
@@ -2901,8 +2863,7 @@ impl DaemonState {
     /// Persist every exact-mode source object referenced by `changes` before
     /// the graph authority that names those objects is committed.
     ///
-    /// Legacy mode-unknown deltas remain explicit graph gaps and are skipped;
-    /// exact deltas fail closed when neither the local content-addressed store
+    /// Exact deltas fail closed when neither the local content-addressed store
     /// nor the backend already has the named bytes. Durable source objects may
     /// safely precede a failed graph CAS because they are immutable and
     /// content-addressed, while committing the graph first would create an
@@ -3021,29 +2982,15 @@ impl DaemonState {
             graph,
             incoming: change,
         };
-        let entries = match prospective
-            .resolve_source_tree_at(&change.id)
-            .map_err(DaemonError::from)?
-        {
-            SourceTreeResolution::Exact { entries } => entries,
-            SourceTreeResolution::Incomplete { gaps } => {
-                let gaps = gaps
-                    .iter()
-                    .map(|gap| format!("{}@{}:{:?}", gap.file_id, gap.change_id, gap.reason))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                return Err(exact_source_storage_error(format!(
-                    "incoming source history at {} is not exact: {gaps}",
-                    change.id
-                )));
-            }
-        };
+        let entries = prospective
+            .resolve_tree_at(&change.id)
+            .map_err(DaemonError::from)?;
         self.preflight_materializable_source_entries(entries, "incoming exact")
     }
 
     fn preflight_materializable_source_entries(
         &self,
-        entries: HashMap<FilePathId, kin_model::ResolvedSourceEntry>,
+        entries: HashMap<FilePathId, TreeEntry>,
         purpose: &str,
     ) -> Result<()> {
         let mut entries: Vec<_> = entries.into_iter().collect();
@@ -3057,16 +3004,16 @@ impl DaemonState {
         )?;
         entries.sort_by(|left, right| {
             left.1
-                .hash
+                .blob_hash
                 .as_bytes()
-                .cmp(right.1.hash.as_bytes())
+                .cmp(right.1.blob_hash.as_bytes())
                 .then_with(|| left.0 .0.cmp(&right.0 .0))
         });
         let mut start = 0;
         while start < entries.len() {
-            let source_hash = entries[start].1.hash;
+            let source_hash = entries[start].1.blob_hash;
             let mut end = start + 1;
-            while end < entries.len() && entries[end].1.hash == source_hash {
+            while end < entries.len() && entries[end].1.blob_hash == source_hash {
                 end += 1;
             }
             let digest = *source_hash.as_bytes();
@@ -3094,7 +3041,13 @@ impl DaemonState {
                 (data, "local")
             };
             for (file_id, source) in &entries[start..end] {
-                validate_exact_source_bytes(file_id, source.kind, source.hash, &data, authority)?;
+                validate_exact_source_bytes(
+                    file_id,
+                    source.kind,
+                    source.blob_hash,
+                    &data,
+                    authority,
+                )?;
             }
             start = end;
         }
@@ -3112,22 +3065,7 @@ impl DaemonState {
         graph: &kin_db::InMemoryGraph,
         head: &SemanticChangeId,
     ) -> Result<()> {
-        let entries = match graph
-            .resolve_source_tree_at(head)
-            .map_err(DaemonError::from)?
-        {
-            SourceTreeResolution::Exact { entries } => entries,
-            SourceTreeResolution::Incomplete { gaps } => {
-                let gaps = gaps
-                    .iter()
-                    .map(|gap| format!("{}@{}:{:?}", gap.file_id, gap.change_id, gap.reason))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                return Err(exact_source_storage_error(format!(
-                    "release source history at {head} is not exact: {gaps}"
-                )));
-            }
-        };
+        let entries = graph.resolve_tree_at(head).map_err(DaemonError::from)?;
 
         self.preflight_materializable_source_entries(entries, &format!("release source at {head}"))
     }
@@ -3502,7 +3440,10 @@ impl DaemonState {
                             ),
                         )));
                     }
-                    Arc::new(kin_db::InMemoryGraph::from_snapshot(recovered.snapshot))
+                    Arc::new(
+                        kin_db::InMemoryGraph::from_snapshot(recovered.snapshot)
+                            .map_err(DaemonError::from)?,
+                    )
                 }
                 None if generation == kin_db::GENERATION_INIT => Arc::clone(&self.graph),
                 None => {
@@ -3601,94 +3542,22 @@ impl DaemonState {
 
     /// Rebuild projection state from the current graph.
     ///
-    /// Primary path: loads each persisted [`FileLayout`] and its blob-backed
-    /// base content from graph truth via [`ProjectionState::from_graph`].
-    ///
-    /// Fallback path: if a file layout exists in the graph but its file hash
-    /// has not yet been persisted (older snapshots from before file hashes were
-    /// always written), `from_graph` returns
-    /// [`ProjectionError::BaseContentUnavailable`].  Rather than hard-failing
-    /// and leaving the daemon unable to serve VFS reads or accept projected
-    /// writes, the fallback iterates layouts individually: files whose hash IS
-    /// present are loaded from blobs (graph-backed); files whose hash is absent
-    /// are loaded from the working-directory copy on disk (migration-debt path).
-    /// Files that are neither in blobs nor on disk are skipped with a warning.
+    /// Loads every persisted [`FileLayout`] and its blob-backed base content
+    /// from graph truth via [`ProjectionState::from_graph`]. Missing entries or
+    /// blobs are authority gaps and fail loudly; runtime projection never
+    /// repairs graph truth from raw filesystem contents.
     ///
     /// Called after graph init, snapshot load, or a write-notify reconcile.
     pub async fn rebuild_projection(&self) -> Result<()> {
         let mut projection = self.projection.write().await;
 
-        // Fast path: all file hashes persisted — build directly from graph truth.
-        match ProjectionState::from_graph(self.graph.as_ref(), self.blobs.as_ref()) {
-            Ok(state) => {
-                let registered = state.file_ids().len();
-                *projection = state;
-                info!(
-                    files = registered,
-                    "rebuilt projection state from persisted graph truth"
-                );
-                return Ok(());
-            }
-            Err(kin_projection::ProjectionError::BaseContentUnavailable { .. }) => {
-                // Fall through to the per-file fallback below.
-            }
-            Err(e) => return Err(DaemonError::from(e)),
-        }
-
-        // Fallback path: some file hashes are absent (older snapshot).
-        // Build the projection file-by-file, reading from disk when blobs lack
-        // the content.  This is migration debt — once all snapshots are on the
-        // current schema (hashes always persisted) this path becomes unreachable.
-        let layouts = self.graph.list_file_layouts().map_err(DaemonError::from)?;
-        let mut new_projection = ProjectionState::new();
-        let mut loaded = 0usize;
-        let mut disk_fallback = 0usize;
-        let mut skipped = 0usize;
-
-        for layout in layouts {
-            let file_id = layout.file_id.clone();
-
-            // Try to load content from blobs (graph-backed, preferred).
-            // InMemoryGraph::get_file_hash takes &str and returns Option<[u8; 32]>.
-            let blob_content = self
-                .graph
-                .get_file_hash(&file_id.0)
-                .and_then(|raw| self.blobs.read(&kin_blobs::Hash256::from_bytes(raw)).ok());
-
-            if let Some(content) = blob_content {
-                new_projection.register_file(layout, content);
-                loaded += 1;
-                continue;
-            }
-
-            // Blob not available: fall back to the on-disk working copy.
-            let file_path = self.layout.working_dir().join(file_id.0.as_str());
-            match std::fs::read(&file_path) {
-                Ok(content) => {
-                    new_projection.register_file(layout, content);
-                    disk_fallback += 1;
-                }
-                Err(e) => {
-                    // File is neither in blobs nor on disk (deleted, not yet
-                    // checked out, etc.) — skip it rather than hard-failing.
-                    warn!(
-                        file = %file_id,
-                        error = %e,
-                        "skipping projection rebuild for file not in blobs or disk \
-                         (migration-debt fallback)"
-                    );
-                    skipped += 1;
-                }
-            }
-        }
-
-        *projection = new_projection;
+        let state = ProjectionState::from_graph(self.graph.as_ref(), self.blobs.as_ref())
+            .map_err(DaemonError::from)?;
+        let registered = state.file_ids().len();
+        *projection = state;
         info!(
-            files = loaded + disk_fallback,
-            graph_backed = loaded,
-            disk_fallback = disk_fallback,
-            skipped = skipped,
-            "rebuilt projection state via per-file fallback (older snapshot without file hashes)"
+            files = registered,
+            "rebuilt projection state from persisted graph truth"
         );
         Ok(())
     }
@@ -3697,8 +3566,8 @@ impl DaemonState {
     ///
     /// This is the warm path after reconcile/VFS writes: removed files are
     /// evicted from the projection cache, and added/modified files are loaded
-    /// from graph-owned layout + blob content. Missing hashes retain the same
-    /// per-file working-tree fallback used by `rebuild_projection`.
+    /// from graph-owned layout + blob content. Missing entries or blobs fail
+    /// loudly instead of being repaired from the filesystem.
     pub async fn refresh_projection(&self, changed: &ProjectionChangedSet) -> Result<()> {
         if changed.is_empty() {
             return Ok(());
@@ -3706,7 +3575,6 @@ impl DaemonState {
 
         let mut projection = self.projection.write().await;
         let mut loaded = 0usize;
-        let mut disk_fallback = 0usize;
         let mut removed = 0usize;
         let mut skipped = 0usize;
 
@@ -3726,39 +3594,31 @@ impl DaemonState {
                 continue;
             };
 
-            let blob_content = self
+            let entry = self
                 .graph
-                .get_file_hash(&file_id.0)
-                .and_then(|raw| self.blobs.read(&kin_blobs::Hash256::from_bytes(raw)).ok());
-
-            if let Some(content) = blob_content {
-                projection.register_file(layout, content);
-                loaded += 1;
-                continue;
-            }
-
-            let file_path = self.layout.working_dir().join(file_id.0.as_str());
-            match std::fs::read(&file_path) {
-                Ok(content) => {
-                    projection.register_file(layout, content);
-                    disk_fallback += 1;
-                }
-                Err(e) => {
-                    projection.remove_file(file_id);
-                    warn!(
-                        file = %file_id,
-                        error = %e,
-                        "skipping projection refresh for file not in blobs or disk"
-                    );
-                    skipped += 1;
-                }
-            }
+                .get_tree_entry(file_id)
+                .map_err(DaemonError::from)?
+                .ok_or_else(|| {
+                    exact_source_storage_error(format!(
+                        "projection refresh for {file_id} has no graph-owned tree entry"
+                    ))
+                })?;
+            let content = self
+                .blobs
+                .read(&kin_blobs::Hash256(*entry.blob_hash.as_bytes()))
+                .map_err(|error| {
+                    exact_source_storage_error(format!(
+                        "projection refresh for {file_id} cannot load graph-owned blob {}: {error}",
+                        entry.blob_hash
+                    ))
+                })?;
+            projection.register_file(layout, content);
+            loaded += 1;
         }
 
         info!(
-            upserted = loaded + disk_fallback,
+            upserted = loaded,
             graph_backed = loaded,
-            disk_fallback,
             removed,
             skipped,
             "refreshed projection state for changed files"
@@ -4263,7 +4123,7 @@ mod tests {
     fn exact_source_change(
         id_byte: u8,
         file_id: &str,
-        kind: kin_model::ArtifactDeltaKind,
+        kind: TreeEntryKind,
         hash: Hash256,
     ) -> kin_model::SemanticChange {
         kin_model::SemanticChange {
@@ -4274,11 +4134,12 @@ mod tests {
             timestamp: kin_model::Timestamp::now(),
             entity_deltas: vec![],
             relation_deltas: vec![],
-            artifact_deltas: vec![kin_model::ArtifactDelta {
+            tree_deltas: vec![TreeDelta::Added {
                 file_id: FilePathId::new(file_id),
-                kind,
-                old_hash: None,
-                new_hash: Some(hash),
+                new_entry: TreeEntry {
+                    blob_hash: hash,
+                    kind,
+                },
             }],
             projected_files: vec![],
             spec_link: None,
@@ -4368,7 +4229,6 @@ mod tests {
             last_activity_ms: AtomicU64::new(0),
             active_requests: AtomicU64::new(0),
             lsp_enrichment_tx: None,
-            change_oid_cache: std::sync::RwLock::new(None),
             cached_repo_id: "test-repo".to_string(),
             is_shutdown: AtomicBool::new(false),
             persisted_entity_count: AtomicU64::new(loaded_entity_count as u64),
@@ -4377,7 +4237,6 @@ mod tests {
             mcp_transactions: Mutex::new(HashMap::new()),
             locate_rankings: Mutex::new(HashMap::new()),
             semantic_locate_pages: Mutex::new(HashMap::new()),
-            hydration_gate: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -5413,7 +5272,7 @@ mod tests {
             timestamp: Timestamp::now(),
             entity_deltas: vec![EntityDelta::Added(entity.clone())],
             relation_deltas: vec![],
-            artifact_deltas: vec![],
+            tree_deltas: vec![],
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],
@@ -5521,8 +5380,7 @@ mod tests {
     fn storage_backend_persists_exact_source_objects_before_full_and_delta_authority() {
         use kin_db::{LocalFileBackend, StorageBackend};
         use kin_model::{
-            ArtifactDelta, ArtifactDeltaKind, AuthorId, Branch, BranchName, ChangeStore,
-            SemanticChange, SemanticChangeId, Timestamp,
+            AuthorId, Branch, BranchName, ChangeStore, SemanticChange, SemanticChangeId, Timestamp,
         };
 
         let repo_dir = tempfile::tempdir().unwrap();
@@ -5550,11 +5408,9 @@ mod tests {
             timestamp: Timestamp::now(),
             entity_deltas: vec![],
             relation_deltas: vec![],
-            artifact_deltas: vec![ArtifactDelta {
+            tree_deltas: vec![TreeDelta::Added {
                 file_id: FilePathId("bin/kin".to_string()),
-                kind: ArtifactDeltaKind::AddedExecutableFile,
-                old_hash: None,
-                new_hash: Some(executable_hash),
+                new_entry: TreeEntry::regular(executable_hash, true),
             }],
             projected_files: vec![],
             spec_link: None,
@@ -5599,11 +5455,9 @@ mod tests {
             timestamp: Timestamp::now(),
             entity_deltas: vec![],
             relation_deltas: vec![],
-            artifact_deltas: vec![ArtifactDelta {
+            tree_deltas: vec![TreeDelta::Added {
                 file_id: FilePathId("current".to_string()),
-                kind: ArtifactDeltaKind::AddedSymlink,
-                old_hash: None,
-                new_hash: Some(target_hash),
+                new_entry: TreeEntry::symlink(target_hash),
             }],
             projected_files: vec![],
             spec_link: None,
@@ -5634,27 +5488,21 @@ mod tests {
             None,
         )
         .unwrap();
-        let exact = reopened.graph.resolve_source_tree_at(&second.id).unwrap();
-        let kin_model::SourceTreeResolution::Exact { entries } = exact else {
-            panic!("persisted exact source history reopened as incomplete")
-        };
+        let entries = reopened.graph.resolve_tree_at(&second.id).unwrap();
         assert_eq!(
             entries[&FilePathId("bin/kin".to_string())].kind,
-            kin_model::SourceEntryKind::File { executable: true }
+            TreeEntryKind::Regular { executable: true }
         );
         assert_eq!(
             entries[&FilePathId("current".to_string())].kind,
-            kin_model::SourceEntryKind::Symlink
+            TreeEntryKind::Symlink
         );
     }
 
     #[test]
     fn exact_source_persistence_and_preflight_load_each_content_hash_once() {
         use kin_db::StorageBackend;
-        use kin_model::{
-            ArtifactDelta, ArtifactDeltaKind, AuthorId, ChangeStore, SemanticChange,
-            SemanticChangeId, Timestamp,
-        };
+        use kin_model::{AuthorId, ChangeStore, SemanticChange, SemanticChangeId, Timestamp};
 
         let repo_dir = tempfile::tempdir().unwrap();
         let init = kin_core::init(repo_dir.path()).unwrap();
@@ -5682,18 +5530,14 @@ mod tests {
             timestamp: Timestamp::now(),
             entity_deltas: vec![],
             relation_deltas: vec![],
-            artifact_deltas: vec![
-                ArtifactDelta {
+            tree_deltas: vec![
+                TreeDelta::Added {
                     file_id: FilePathId("src/first.rs".to_string()),
-                    kind: ArtifactDeltaKind::AddedRegularFile,
-                    old_hash: None,
-                    new_hash: Some(hash),
+                    new_entry: TreeEntry::regular(hash, false),
                 },
-                ArtifactDelta {
+                TreeDelta::Added {
                     file_id: FilePathId("src/second.rs".to_string()),
-                    kind: ArtifactDeltaKind::AddedRegularFile,
-                    old_hash: None,
-                    new_hash: Some(hash),
+                    new_entry: TreeEntry::regular(hash, false),
                 },
             ],
             projected_files: vec![],
@@ -5741,10 +5585,7 @@ mod tests {
     #[test]
     fn storage_backend_rejects_exact_graph_authority_when_source_bytes_are_missing() {
         use kin_db::{LocalFileBackend, StorageBackend};
-        use kin_model::{
-            ArtifactDelta, ArtifactDeltaKind, AuthorId, ChangeStore, SemanticChange,
-            SemanticChangeId, Timestamp,
-        };
+        use kin_model::{AuthorId, ChangeStore, SemanticChange, SemanticChangeId, Timestamp};
 
         let repo_dir = tempfile::tempdir().unwrap();
         let init = kin_core::init(repo_dir.path()).unwrap();
@@ -5768,11 +5609,9 @@ mod tests {
                 timestamp: Timestamp::now(),
                 entity_deltas: vec![],
                 relation_deltas: vec![],
-                artifact_deltas: vec![ArtifactDelta {
+                tree_deltas: vec![TreeDelta::Added {
                     file_id: FilePathId("src/lib.rs".to_string()),
-                    kind: ArtifactDeltaKind::AddedRegularFile,
-                    old_hash: None,
-                    new_hash: Some(missing_hash),
+                    new_entry: TreeEntry::regular(missing_hash, false),
                 }],
                 projected_files: vec![],
                 spec_link: None,
@@ -5798,10 +5637,7 @@ mod tests {
     #[test]
     fn corrupt_backend_exact_source_preflight_preserves_graph_and_generation() {
         use kin_db::{LocalFileBackend, StorageBackend};
-        use kin_model::{
-            ArtifactDelta, ArtifactDeltaKind, AuthorId, ChangeStore, SemanticChange,
-            SemanticChangeId, Timestamp,
-        };
+        use kin_model::{AuthorId, ChangeStore, SemanticChange, SemanticChangeId, Timestamp};
 
         let repo_dir = tempfile::tempdir().unwrap();
         let init = kin_core::init(repo_dir.path()).unwrap();
@@ -5827,11 +5663,9 @@ mod tests {
             timestamp: Timestamp::now(),
             entity_deltas: vec![],
             relation_deltas: vec![],
-            artifact_deltas: vec![ArtifactDelta {
+            tree_deltas: vec![TreeDelta::Added {
                 file_id: FilePathId("src/lib.rs".to_string()),
-                kind: ArtifactDeltaKind::AddedRegularFile,
-                old_hash: None,
-                new_hash: Some(expected_hash),
+                new_entry: TreeEntry::regular(expected_hash, false),
             }],
             projected_files: vec![],
             spec_link: None,
@@ -5863,7 +5697,7 @@ mod tests {
         let change = exact_source_change(
             35,
             "src/lib.rs",
-            kin_model::ArtifactDeltaKind::AddedRegularFile,
+            TreeEntryKind::Regular { executable: false },
             hash,
         );
 
@@ -5890,7 +5724,7 @@ mod tests {
             let change = exact_source_change(
                 if corrupt { 36 } else { 37 },
                 "src/lib.rs",
-                kin_model::ArtifactDeltaKind::AddedRegularFile,
+                TreeEntryKind::Regular { executable: false },
                 hash,
             );
             let root_before = state.graph.compute_root_hash();
@@ -5915,12 +5749,12 @@ mod tests {
         let cases = [
             (
                 ".kin/authority",
-                kin_model::ArtifactDeltaKind::AddedRegularFile,
+                TreeEntryKind::Regular { executable: false },
                 b"must not enter control state".as_slice(),
             ),
             (
                 "src/escape",
-                kin_model::ArtifactDeltaKind::AddedSymlink,
+                TreeEntryKind::Symlink,
                 b"../../outside".as_slice(),
             ),
         ];
@@ -5963,14 +5797,12 @@ mod tests {
         let mut change = exact_source_change(
             40,
             "pkg",
-            kin_model::ArtifactDeltaKind::AddedRegularFile,
+            TreeEntryKind::Regular { executable: false },
             file_hash,
         );
-        change.artifact_deltas.push(kin_model::ArtifactDelta {
+        change.tree_deltas.push(TreeDelta::Added {
             file_id: FilePathId::new("pkg/lib.rs"),
-            kind: kin_model::ArtifactDeltaKind::AddedRegularFile,
-            old_hash: None,
-            new_hash: Some(child_hash),
+            new_entry: TreeEntry::regular(child_hash, false),
         });
         let root_before = state.graph.compute_root_hash();
         let generation_before = state.snapshot_generation.load(Ordering::SeqCst);
@@ -5997,7 +5829,7 @@ mod tests {
         let parent = exact_source_change(
             41,
             "pkg/lib.rs",
-            kin_model::ArtifactDeltaKind::AddedRegularFile,
+            TreeEntryKind::Regular { executable: false },
             child_hash,
         );
         state.graph.create_change(&parent).unwrap();
@@ -6006,7 +5838,7 @@ mod tests {
         let mut incoming = exact_source_change(
             42,
             "pkg",
-            kin_model::ArtifactDeltaKind::AddedRegularFile,
+            TreeEntryKind::Regular { executable: false },
             file_hash,
         );
         incoming.parents = vec![parent.id];
@@ -6030,14 +5862,14 @@ mod tests {
         let left = exact_source_change(
             43,
             "pkg/lib.rs",
-            kin_model::ArtifactDeltaKind::AddedRegularFile,
+            TreeEntryKind::Regular { executable: false },
             child_hash,
         );
         let file_hash = Hash256::from_bytes(state.blobs.write(b"right file bytes").unwrap().0);
         let right = exact_source_change(
             44,
             "pkg",
-            kin_model::ArtifactDeltaKind::AddedRegularFile,
+            TreeEntryKind::Regular { executable: false },
             file_hash,
         );
         state.graph.create_change(&left).unwrap();
@@ -6046,7 +5878,7 @@ mod tests {
         let mut merge = exact_source_change(
             45,
             "merge-marker.txt",
-            kin_model::ArtifactDeltaKind::AddedRegularFile,
+            TreeEntryKind::Regular { executable: false },
             Hash256::from_bytes(state.blobs.write(b"merge marker").unwrap().0),
         );
         merge.parents = vec![left.id, right.id];

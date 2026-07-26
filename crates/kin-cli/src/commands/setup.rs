@@ -22,25 +22,95 @@ const ZSH_HOOK: &str = r#"# SPDX-License-Identifier: Apache-2.0
 #
 # Installed by: kin setup
 
-_kin_vfs_find_workspace() {
+_kin_vfs_disabled() {
+    case "${KIN_VFS_DISABLE:-}" in
+        1|[Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]|[Oo][Nn]) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+_kin_vfs_logical_dir() {
+    local dir="${1:a}"
+    [[ -d "$dir" ]] || return 1
+    printf '%s' "$dir"
+}
+
+_kin_vfs_physical_dir() {
+    local dir="${1:A}"
+    [[ -d "$dir" ]] || return 1
+    printf '%s' "$dir"
+}
+
+_kin_vfs_path_within() {
+    local path="$1"
+    local root="$2"
+    [[ "$path" == "$root" || "$root" == "/" ]] && return 0
+    case "$path" in
+        "$root"/*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+_kin_vfs_scan_path() {
     local dir="$1"
-    while [[ "$dir" != "/" ]]; do
-        if [[ -d "$dir/.kin" ]]; then
+    local boundary="$2"
+    while true; do
+        # A Kin marker is authority only when it is a real local directory.
+        # During a session it may win over a same-directory .git marker only
+        # at the exact validated session root.
+        if [[ -e "$dir/.kin" || -L "$dir/.kin" ]]; then
+            [[ -d "$dir/.kin" && ! -L "$dir/.kin" ]] || return 1
+            if [[ -n "$boundary" && "$dir" != "$boundary" ]]; then
+                return 1
+            fi
             printf '%s' "$dir"
             return 0
         fi
+        # Files, directories, and even broken symlinks are Git boundaries.
+        if [[ -e "$dir/.git" || -L "$dir/.git" ]]; then
+            return 1
+        fi
+        if [[ -n "$boundary" && "$dir" == "$boundary" ]]; then
+            return 1
+        fi
+        [[ "$dir" != "/" ]] || return 1
         dir="${dir:h}"
     done
-    if [[ -d "/.kin" ]]; then
-        printf '%s' "/"
-        return 0
+}
+
+_kin_vfs_find_workspace() {
+    _kin_vfs_disabled && return 1
+
+    local logical physical
+    local session_logical="" session_physical=""
+    local logical_workspace physical_workspace logical_workspace_physical
+    logical="$(_kin_vfs_logical_dir "$1")" || return 1
+    physical="$(_kin_vfs_physical_dir "$1")" || return 1
+
+    if [[ -n "${KIN_SESSION_DIR:-}" ]]; then
+        [[ "$KIN_SESSION_DIR" == /* ]] || return 1
+        session_logical="$(_kin_vfs_logical_dir "$KIN_SESSION_DIR")" || return 1
+        session_physical="$(_kin_vfs_physical_dir "$KIN_SESSION_DIR")" || return 1
+        _kin_vfs_path_within "$logical" "$session_logical" || return 1
+        _kin_vfs_path_within "$physical" "$session_physical" || return 1
     fi
-    return 1
+
+    logical_workspace="$(_kin_vfs_scan_path "$logical" "$session_logical")" || return 1
+    physical_workspace="$(_kin_vfs_scan_path "$physical" "$session_physical")" || return 1
+    logical_workspace_physical="$(_kin_vfs_physical_dir "$logical_workspace")" || return 1
+    [[ "$logical_workspace_physical" == "$physical_workspace" ]] || return 1
+
+    if [[ -n "$session_logical" ]]; then
+        [[ "$logical_workspace" == "$session_logical" ]] || return 1
+        [[ "$physical_workspace" == "$session_physical" ]] || return 1
+    fi
+
+    printf '%s' "$physical_workspace"
 }
 
 _kin_vfs_shim_path() {
     local lib
-    local kin_home="${KIN_HOME:-${KIN_DIR:-$HOME/.kin}}"
+    local kin_home="${KIN_HOME:-$HOME/.kin}"
     local kin_lib="$kin_home/lib"
     case "$(uname -s)" in
         Darwin) lib="$kin_lib/libkin_vfs_shim.dylib" ;;
@@ -81,6 +151,8 @@ _kin_vfs_refresh_preload() {
 _kin_vfs_activate() {
     local ws="$1"
     local sock="$ws/.kin/vfs.sock"
+    unset KIN_VFS_WORKSPACE_ALIASES KIN_VFS_PIPE
+    unset KIN_VFS_CANARY KIN_VFS_INTERPOSE_ACTIVE KIN_VFS_LAST_DIR
     export KIN_VFS_WORKSPACE="$ws"
     export KIN_VFS_SOCK="$sock"
     if [[ ! -S "$sock" ]]; then
@@ -101,25 +173,30 @@ _kin_vfs_activate() {
 }
 
 _kin_vfs_deactivate() {
-    unset KIN_VFS_WORKSPACE KIN_VFS_SOCK
+    unset KIN_VFS_WORKSPACE KIN_VFS_WORKSPACE_ALIASES
+    unset KIN_VFS_SOCK KIN_VFS_PIPE
+    unset KIN_VFS_CANARY KIN_VFS_INTERPOSE_ACTIVE KIN_VFS_LAST_DIR
     _kin_vfs_clear_preload
 }
 
 _kin_vfs_chpwd() {
     local ws
+    if _kin_vfs_disabled; then
+        _kin_vfs_deactivate
+        return
+    fi
     ws="$(_kin_vfs_find_workspace "$PWD")"
     if [[ -n "$ws" ]]; then
-        if [[ "$ws" != "${KIN_VFS_WORKSPACE:-}" ]]; then
+        if [[ "$ws" != "${KIN_VFS_WORKSPACE:-}" ||
+              -n "${KIN_VFS_WORKSPACE_ALIASES:-}" ||
+              "${KIN_VFS_SOCK:-}" != "$ws/.kin/vfs.sock" ||
+              -n "${KIN_VFS_PIPE:-}" ]]; then
             _kin_vfs_activate "$ws"
         else
             _kin_vfs_refresh_preload
         fi
     else
-        if [[ -n "${KIN_VFS_WORKSPACE:-}" ]]; then
-            _kin_vfs_deactivate
-        else
-            _kin_vfs_clear_preload
-        fi
+        _kin_vfs_deactivate
     fi
 }
 
@@ -151,25 +228,104 @@ const BASH_HOOK: &str = r#"# SPDX-License-Identifier: Apache-2.0
 #
 # Installed by: kin setup
 
-_kin_vfs_find_workspace() {
+_kin_vfs_disabled() {
+    case "${KIN_VFS_DISABLE:-}" in
+        1|[Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]|[Oo][Nn]) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+_kin_vfs_logical_dir() {
+    (
+        unset CDPATH
+        builtin cd -L -- "$1" 2>/dev/null || return 1
+        builtin pwd -L
+    )
+}
+
+_kin_vfs_physical_dir() {
+    (
+        unset CDPATH
+        builtin cd -P -- "$1" 2>/dev/null || return 1
+        builtin pwd -P
+    )
+}
+
+_kin_vfs_path_within() {
+    local path="$1"
+    local root="$2"
+    [ "$path" = "$root" ] && return 0
+    [ "$root" = "/" ] && return 0
+    case "$path" in
+        "$root"/*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+_kin_vfs_scan_path() {
     local dir="$1"
-    while [ "$dir" != "/" ]; do
-        if [ -d "$dir/.kin" ]; then
+    local boundary="$2"
+    while :; do
+        # A Kin marker is authority only when it is a real local directory.
+        # During a session it may win over a same-directory .git marker only
+        # at the exact validated session root.
+        if [ -e "$dir/.kin" ] || [ -L "$dir/.kin" ]; then
+            [ -d "$dir/.kin" ] && [ ! -L "$dir/.kin" ] || return 1
+            if [ -n "$boundary" ] && [ "$dir" != "$boundary" ]; then
+                return 1
+            fi
             printf '%s' "$dir"
             return 0
         fi
-        dir="$(dirname "$dir")"
+        # Files, directories, and even broken symlinks are Git boundaries.
+        if [ -e "$dir/.git" ] || [ -L "$dir/.git" ]; then
+            return 1
+        fi
+        if [ -n "$boundary" ] && [ "$dir" = "$boundary" ]; then
+            return 1
+        fi
+        [ "$dir" != "/" ] || return 1
+        dir="${dir%/*}"
+        [ -n "$dir" ] || dir="/"
     done
-    if [ -d "/.kin" ]; then
-        printf '%s' "/"
-        return 0
+}
+
+_kin_vfs_find_workspace() {
+    _kin_vfs_disabled && return 1
+
+    local logical physical
+    local session_logical="" session_physical=""
+    local logical_workspace physical_workspace logical_workspace_physical
+    logical="$(_kin_vfs_logical_dir "$1")" || return 1
+    physical="$(_kin_vfs_physical_dir "$1")" || return 1
+
+    if [ -n "${KIN_SESSION_DIR:-}" ]; then
+        case "$KIN_SESSION_DIR" in
+            /*) ;;
+            *) return 1 ;;
+        esac
+        session_logical="$(_kin_vfs_logical_dir "$KIN_SESSION_DIR")" || return 1
+        session_physical="$(_kin_vfs_physical_dir "$KIN_SESSION_DIR")" || return 1
+        _kin_vfs_path_within "$logical" "$session_logical" || return 1
+        _kin_vfs_path_within "$physical" "$session_physical" || return 1
     fi
-    return 1
+
+    logical_workspace="$(_kin_vfs_scan_path "$logical" "$session_logical")" || return 1
+    physical_workspace="$(_kin_vfs_scan_path "$physical" "$session_physical")" || return 1
+    logical_workspace_physical="$(_kin_vfs_physical_dir "$logical_workspace")" || return 1
+    [ "$logical_workspace_physical" = "$physical_workspace" ] || return 1
+
+    if [ -n "$session_logical" ]; then
+        [ "$logical_workspace" = "$session_logical" ] || return 1
+        [ "$physical_workspace" = "$session_physical" ] || return 1
+    fi
+
+    printf '%s' "$physical_workspace"
 }
 
 _kin_vfs_shim_path() {
     local lib
-    local kin_home="${KIN_HOME:-${KIN_DIR:-$HOME/.kin}}"
+    local kin_home="${KIN_HOME:-$HOME/.kin}"
     local kin_lib="$kin_home/lib"
     case "$(uname -s)" in
         Darwin) lib="$kin_lib/libkin_vfs_shim.dylib" ;;
@@ -209,6 +365,8 @@ _kin_vfs_refresh_preload() {
 _kin_vfs_activate() {
     local ws="$1"
     local sock="$ws/.kin/vfs.sock"
+    unset KIN_VFS_WORKSPACE_ALIASES KIN_VFS_PIPE
+    unset KIN_VFS_CANARY KIN_VFS_INTERPOSE_ACTIVE KIN_VFS_LAST_DIR
     export KIN_VFS_WORKSPACE="$ws"
     export KIN_VFS_SOCK="$sock"
     if [ ! -S "$sock" ]; then
@@ -230,27 +388,31 @@ _kin_vfs_activate() {
 }
 
 _kin_vfs_deactivate() {
-    unset KIN_VFS_WORKSPACE KIN_VFS_SOCK
+    unset KIN_VFS_WORKSPACE KIN_VFS_WORKSPACE_ALIASES
+    unset KIN_VFS_SOCK KIN_VFS_PIPE
+    unset KIN_VFS_CANARY KIN_VFS_INTERPOSE_ACTIVE KIN_VFS_LAST_DIR
     _kin_vfs_clear_preload
 }
 
 _kin_vfs_prompt_command() {
-    if [ "$PWD" = "${_KIN_VFS_LAST_DIR:-}" ]; then return; fi
     _KIN_VFS_LAST_DIR="$PWD"
     local ws
+    if _kin_vfs_disabled; then
+        _kin_vfs_deactivate
+        return
+    fi
     ws="$(_kin_vfs_find_workspace "$PWD")"
     if [ -n "$ws" ]; then
-        if [ "$ws" != "${KIN_VFS_WORKSPACE:-}" ]; then
+        if [ "$ws" != "${KIN_VFS_WORKSPACE:-}" ] ||
+           [ -n "${KIN_VFS_WORKSPACE_ALIASES:-}" ] ||
+           [ "${KIN_VFS_SOCK:-}" != "$ws/.kin/vfs.sock" ] ||
+           [ -n "${KIN_VFS_PIPE:-}" ]; then
             _kin_vfs_activate "$ws"
         else
             _kin_vfs_refresh_preload
         fi
     else
-        if [ -n "${KIN_VFS_WORKSPACE:-}" ]; then
-            _kin_vfs_deactivate
-        else
-            _kin_vfs_clear_preload
-        fi
+        _kin_vfs_deactivate
     fi
 }
 
@@ -286,20 +448,195 @@ const POWERSHELL_HOOK: &str = r#"# SPDX-License-Identifier: Apache-2.0
 
 $script:KinVfsActive = $false
 $script:KinVfsWorkspace = ""
+$script:KinVfsPathComparison = if ([int][System.IO.Path]::DirectorySeparatorChar -eq 92) {
+    [System.StringComparison]::OrdinalIgnoreCase
+} else {
+    [System.StringComparison]::Ordinal
+}
+
+function Test-KinVfsDisabled {
+    if ([string]::IsNullOrWhiteSpace($env:KIN_VFS_DISABLE)) {
+        return $false
+    }
+    return @("1", "true", "yes", "on") -contains $env:KIN_VFS_DISABLE.Trim().ToLowerInvariant()
+}
+
+function Normalize-KinLogicalDirectory {
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not [System.IO.Path]::IsPathRooted($Path)) {
+        return $null
+    }
+    try {
+        $full = [System.IO.Path]::GetFullPath($Path)
+        if (-not [System.IO.Directory]::Exists($full)) {
+            return $null
+        }
+        $root = [System.IO.Path]::GetPathRoot($full)
+        if (-not $full.Equals($root, $script:KinVfsPathComparison)) {
+            $full = $full.TrimEnd([char[]]@([char]47, [char]92))
+        }
+        return $full
+    } catch {
+        return $null
+    }
+}
+
+function Resolve-KinPhysicalDirectory {
+    param([string]$Path)
+    $logical = Normalize-KinLogicalDirectory -Path $Path
+    if (-not $logical) {
+        return $null
+    }
+
+    try {
+        $root = [System.IO.Path]::GetPathRoot($logical)
+        $current = $root
+        $remainder = $logical.Substring($root.Length)
+        $separators = [char[]]@(
+            [System.IO.Path]::DirectorySeparatorChar,
+            [System.IO.Path]::AltDirectorySeparatorChar
+        )
+        $parts = $remainder.Split(
+            $separators,
+            [System.StringSplitOptions]::RemoveEmptyEntries
+        )
+
+        foreach ($part in $parts) {
+            $candidate = [System.IO.Path]::Combine($current, $part)
+            $item = Get-Item -LiteralPath $candidate -Force -ErrorAction Stop
+            if (-not $item.PSIsContainer) {
+                return $null
+            }
+            if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                # ResolveLinkTarget(true) resolves the complete remaining link
+                # chain. Older runtimes without it fail closed on reparse paths.
+                if ($item.PSObject.Methods.Name -notcontains "ResolveLinkTarget") {
+                    return $null
+                }
+                $item = $item.ResolveLinkTarget($true)
+                if (-not $item -or -not $item.PSIsContainer) {
+                    return $null
+                }
+            }
+            $current = [System.IO.Path]::GetFullPath($item.FullName)
+        }
+        return Normalize-KinLogicalDirectory -Path $current
+    } catch {
+        return $null
+    }
+}
+
+function Test-KinPathEqual {
+    param([string]$Left, [string]$Right)
+    return $Left.Equals($Right, $script:KinVfsPathComparison)
+}
+
+function Test-KinPathWithin {
+    param([string]$Path, [string]$Root)
+    if ((Test-KinPathEqual -Left $Path -Right $Root) -or
+        (Test-KinPathEqual -Left $Root -Right ([System.IO.Path]::GetPathRoot($Root)))) {
+        return $true
+    }
+    $prefix = $Root + [System.IO.Path]::DirectorySeparatorChar
+    return $Path.StartsWith($prefix, $script:KinVfsPathComparison)
+}
+
+function Test-KinMarkerExists {
+    param([string]$Path)
+    try {
+        $null = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+        return $true
+    } catch [System.Management.Automation.ItemNotFoundException] {
+        return $false
+    } catch {
+        # An unreadable marker is still an authority boundary.
+        return $true
+    }
+}
+
+function Find-KinWorkspaceOnPath {
+    param([string]$StartDir, [string]$Boundary)
+    $dir = $StartDir
+    while ($dir) {
+        $kinMarker = Join-Path $dir ".kin"
+        if (Test-KinMarkerExists -Path $kinMarker) {
+            try {
+                $kinItem = Get-Item -LiteralPath $kinMarker -Force -ErrorAction Stop
+            } catch {
+                return $null
+            }
+            if (-not $kinItem.PSIsContainer -or
+                (($kinItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0)) {
+                return $null
+            }
+            if ($Boundary -and -not (Test-KinPathEqual -Left $dir -Right $Boundary)) {
+                return $null
+            }
+            return $dir
+        }
+        if (Test-KinMarkerExists -Path (Join-Path $dir ".git")) {
+            return $null
+        }
+        if ($Boundary -and (Test-KinPathEqual -Left $dir -Right $Boundary)) {
+            return $null
+        }
+        $parent = [System.IO.Directory]::GetParent($dir)
+        if (-not $parent) {
+            return $null
+        }
+        $dir = $parent.FullName
+    }
+    return $null
+}
 
 function Find-KinWorkspace {
     param([string]$StartDir)
-    $dir = $StartDir
-    while ($dir -and $dir -ne [System.IO.Path]::GetPathRoot($dir)) {
-        if (Test-Path (Join-Path $dir ".kin")) { return $dir }
-        $dir = Split-Path $dir -Parent
+    if (Test-KinVfsDisabled) {
+        return $null
     }
-    return $null
+
+    $logical = Normalize-KinLogicalDirectory -Path $StartDir
+    $physical = Resolve-KinPhysicalDirectory -Path $StartDir
+    if (-not $logical -or -not $physical) {
+        return $null
+    }
+
+    $sessionLogical = $null
+    $sessionPhysical = $null
+    if (-not [string]::IsNullOrWhiteSpace($env:KIN_SESSION_DIR)) {
+        $sessionLogical = Normalize-KinLogicalDirectory -Path $env:KIN_SESSION_DIR
+        $sessionPhysical = Resolve-KinPhysicalDirectory -Path $env:KIN_SESSION_DIR
+        if (-not $sessionLogical -or -not $sessionPhysical) {
+            return $null
+        }
+        if (-not (Test-KinPathWithin -Path $logical -Root $sessionLogical) -or
+            -not (Test-KinPathWithin -Path $physical -Root $sessionPhysical)) {
+            return $null
+        }
+    }
+
+    $logicalWorkspace = Find-KinWorkspaceOnPath -StartDir $logical -Boundary $sessionLogical
+    $physicalWorkspace = Find-KinWorkspaceOnPath -StartDir $physical -Boundary $sessionPhysical
+    if (-not $logicalWorkspace -or -not $physicalWorkspace) {
+        return $null
+    }
+    $logicalWorkspacePhysical = Resolve-KinPhysicalDirectory -Path $logicalWorkspace
+    if (-not $logicalWorkspacePhysical -or
+        -not (Test-KinPathEqual -Left $logicalWorkspacePhysical -Right $physicalWorkspace)) {
+        return $null
+    }
+    if ($sessionLogical -and
+        (-not (Test-KinPathEqual -Left $logicalWorkspace -Right $sessionLogical) -or
+         -not (Test-KinPathEqual -Left $physicalWorkspace -Right $sessionPhysical))) {
+        return $null
+    }
+    return $physicalWorkspace
 }
 
 function Enable-KinVfs {
     param([string]$Workspace)
     $pipe = "\\.\pipe\kin-vfs-$([System.IO.Path]::GetFileName($Workspace))"
+    Disable-KinVfs
     $daemonCmd = Get-Command "kin-vfs" -ErrorAction SilentlyContinue
     if ($daemonCmd) {
         $pipeExists = [System.IO.Directory]::GetFiles("\\.\pipe\") | Where-Object { $_ -like "*kin-vfs*" }
@@ -321,18 +658,39 @@ function Enable-KinVfs {
 }
 
 function Disable-KinVfs {
-    Remove-Item Env:\KIN_VFS_WORKSPACE -ErrorAction SilentlyContinue
-    Remove-Item Env:\KIN_VFS_PIPE -ErrorAction SilentlyContinue
+    foreach ($name in @(
+        "KIN_VFS_WORKSPACE",
+        "KIN_VFS_WORKSPACE_ALIASES",
+        "KIN_VFS_SOCK",
+        "KIN_VFS_PIPE",
+        "KIN_VFS_CANARY",
+        "KIN_VFS_INTERPOSE_ACTIVE",
+        "KIN_VFS_LAST_DIR",
+        "DYLD_INSERT_LIBRARIES",
+        "LD_PRELOAD"
+    )) {
+        Remove-Item "Env:\$name" -ErrorAction SilentlyContinue
+    }
     $script:KinVfsActive = $false
     $script:KinVfsWorkspace = ""
 }
 
 function Invoke-KinVfsLocationCheck {
+    if (Test-KinVfsDisabled) {
+        Disable-KinVfs
+        return
+    }
     $ws = Find-KinWorkspace -StartDir $PWD.Path
     if ($ws) {
-        if ($script:KinVfsWorkspace -ne $ws) { Enable-KinVfs -Workspace $ws }
+        $expectedPipe = "\\.\pipe\kin-vfs-$([System.IO.Path]::GetFileName($ws))"
+        if (-not (Test-KinPathEqual -Left $script:KinVfsWorkspace -Right $ws) -or
+            $env:KIN_VFS_WORKSPACE_ALIASES -or
+            $env:KIN_VFS_SOCK -or
+            $env:KIN_VFS_PIPE -ne $expectedPipe) {
+            Enable-KinVfs -Workspace $ws
+        }
     } else {
-        if ($script:KinVfsActive) { Disable-KinVfs }
+        Disable-KinVfs
     }
 }
 
@@ -351,21 +709,111 @@ const FISH_HOOK: &str = r#"# SPDX-License-Identifier: Apache-2.0
 
 set -g _KIN_VFS_WORKSPACE ""
 
-function _kin_vfs_find_workspace
-    set -l dir $argv[1]
-    while test "$dir" != "/"
-        if test -d "$dir/.kin"
-            echo $dir
+function _kin_vfs_disabled
+    if not set -q KIN_VFS_DISABLE
+        return 1
+    end
+    switch (string lower -- (string trim -- "$KIN_VFS_DISABLE"))
+        case 1 true yes on
             return 0
-        end
-        set dir (dirname $dir)
     end
     return 1
+end
+
+function _kin_vfs_logical_dir
+    set -l candidate $argv[1]
+    string match -qr '^/' -- "$candidate"; or return 1
+    set -l normalized (path normalize -- "$candidate" 2>/dev/null); or return 1
+    test -d "$normalized"; or return 1
+    printf '%s' "$normalized"
+end
+
+function _kin_vfs_physical_dir
+    set -l candidate $argv[1]
+    string match -qr '^/' -- "$candidate"; or return 1
+    set -l resolved (path resolve -- "$candidate" 2>/dev/null); or return 1
+    test -d "$resolved"; or return 1
+    printf '%s' "$resolved"
+end
+
+function _kin_vfs_path_within
+    set -l candidate $argv[1]
+    set -l root $argv[2]
+    if test "$candidate" = "$root"; or test "$root" = /
+        return 0
+    end
+    set -l prefix "$root/"
+    set -l prefix_length (string length -- "$prefix")
+    test (string sub -s 1 -l "$prefix_length" -- "$candidate") = "$prefix"
+end
+
+function _kin_vfs_scan_path
+    set -l dir $argv[1]
+    set -l boundary $argv[2]
+    while true
+        if test -e "$dir/.kin"; or test -L "$dir/.kin"
+            test -d "$dir/.kin"; and not test -L "$dir/.kin"; or return 1
+            if test -n "$boundary"; and test "$dir" != "$boundary"
+                return 1
+            end
+            printf '%s' "$dir"
+            return 0
+        end
+        if test -e "$dir/.git"; or test -L "$dir/.git"
+            return 1
+        end
+        if test -n "$boundary"; and test "$dir" = "$boundary"
+            return 1
+        end
+        test "$dir" != /; or return 1
+        set dir (path dirname -- "$dir")
+    end
+end
+
+function _kin_vfs_find_workspace
+    _kin_vfs_disabled; and return 1
+
+    set -l logical (_kin_vfs_logical_dir "$argv[1]")
+    test -n "$logical"; or return 1
+    set -l physical (_kin_vfs_physical_dir "$argv[1]")
+    test -n "$physical"; or return 1
+    set -l session_logical ""
+    set -l session_physical ""
+
+    if set -q KIN_SESSION_DIR; and test -n "$KIN_SESSION_DIR"
+        string match -qr '^/' -- "$KIN_SESSION_DIR"; or return 1
+        set session_logical (_kin_vfs_logical_dir "$KIN_SESSION_DIR")
+        test -n "$session_logical"; or return 1
+        set session_physical (_kin_vfs_physical_dir "$KIN_SESSION_DIR")
+        test -n "$session_physical"; or return 1
+        _kin_vfs_path_within "$logical" "$session_logical"; or return 1
+        _kin_vfs_path_within "$physical" "$session_physical"; or return 1
+    end
+
+    set -l logical_workspace (_kin_vfs_scan_path "$logical" "$session_logical")
+    test -n "$logical_workspace"; or return 1
+    set -l physical_workspace (_kin_vfs_scan_path "$physical" "$session_physical")
+    test -n "$physical_workspace"; or return 1
+    set -l logical_workspace_physical (_kin_vfs_physical_dir "$logical_workspace")
+    test -n "$logical_workspace_physical"; or return 1
+    test "$logical_workspace_physical" = "$physical_workspace"; or return 1
+
+    if test -n "$session_logical"
+        test "$logical_workspace" = "$session_logical"; or return 1
+        test "$physical_workspace" = "$session_physical"; or return 1
+    end
+
+    printf '%s' "$physical_workspace"
 end
 
 function _kin_vfs_activate
     set -l ws $argv[1]
     set -l sock "$ws/.kin/vfs.sock"
+    set -e KIN_VFS_WORKSPACE_ALIASES
+    set -e KIN_VFS_PIPE
+    set -e KIN_VFS_CANARY
+    set -e KIN_VFS_INTERPOSE_ACTIVE
+    set -e KIN_VFS_LAST_DIR
     set -gx KIN_VFS_WORKSPACE $ws
     set -gx KIN_VFS_SOCK $sock
 
@@ -386,10 +834,9 @@ function _kin_vfs_activate
         disown
     end
 
+    set -e DYLD_INSERT_LIBRARIES
+    set -e LD_PRELOAD
     set -l kin_home "$HOME/.kin"
-    if set -q KIN_DIR
-        set kin_home $KIN_DIR
-    end
     if set -q KIN_HOME
         set kin_home $KIN_HOME
     end
@@ -411,7 +858,12 @@ end
 
 function _kin_vfs_deactivate
     set -e KIN_VFS_WORKSPACE
+    set -e KIN_VFS_WORKSPACE_ALIASES
     set -e KIN_VFS_SOCK
+    set -e KIN_VFS_PIPE
+    set -e KIN_VFS_CANARY
+    set -e KIN_VFS_INTERPOSE_ACTIVE
+    set -e KIN_VFS_LAST_DIR
     set -e DYLD_INSERT_LIBRARIES
     set -e LD_PRELOAD
     set -g _KIN_VFS_WORKSPACE ""
@@ -425,16 +877,23 @@ function kin --wraps=kin --description 'Run kin without VFS shim'
 end
 
 function _kin_vfs_chpwd --on-variable PWD
-    set -l ws (_kin_vfs_find_workspace $PWD)
+    if _kin_vfs_disabled
+        _kin_vfs_deactivate
+        return
+    end
+
+    set -l ws (_kin_vfs_find_workspace "$PWD")
     if test -n "$ws"
-        if test "$_KIN_VFS_WORKSPACE" != "$ws"
-            _kin_vfs_activate $ws
+        if test "$_KIN_VFS_WORKSPACE" != "$ws"; or \
+           set -q KIN_VFS_WORKSPACE_ALIASES; or \
+           not set -q KIN_VFS_SOCK; or \
+           test "$KIN_VFS_SOCK" != "$ws/.kin/vfs.sock"; or \
+           set -q KIN_VFS_PIPE
+            _kin_vfs_activate "$ws"
             set -g _KIN_VFS_WORKSPACE $ws
         end
     else
-        if test -n "$_KIN_VFS_WORKSPACE"
-            _kin_vfs_deactivate
-        end
+        _kin_vfs_deactivate
     end
 end
 
@@ -1139,7 +1598,7 @@ fn configure_codex() -> Result<PathBuf> {
     let home = home_dir()?;
     let target = home.join(".codex").join("config.toml");
     let cwd = env::current_dir().context("could not determine the current directory")?;
-    let repo_root = kin_core::KinLayout::discover_with_daemon_url(&cwd, None)
+    let repo_root = kin_core::KinLayout::discover(&cwd)
         .and_then(|layout| layout.working_dir().canonicalize().ok())
         .with_context(|| {
             format!(
@@ -1177,7 +1636,7 @@ fn configure_windsurf() -> Result<PathBuf> {
 
 fn current_initialized_setup_repo(client: &str) -> Result<PathBuf> {
     let cwd = env::current_dir().context("could not determine the current directory")?;
-    kin_core::KinLayout::discover_with_daemon_url(&cwd, None)
+    kin_core::KinLayout::discover(&cwd)
         .and_then(|layout| layout.working_dir().canonicalize().ok())
         .and_then(|root| canonical_initialized_repo(&root))
         .with_context(|| {
@@ -11599,14 +12058,266 @@ mod tests {
         assert!(BASH_HOOK.contains("else\n            _kin_vfs_refresh_preload"));
     }
 
+    #[cfg(unix)]
     #[test]
-    fn shell_hooks_respect_custom_kin_home() {
-        let posix_home = r#"${KIN_HOME:-${KIN_DIR:-$HOME/.kin}}"#;
+    fn unix_installed_hooks_enforce_canonical_git_and_session_boundaries() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().join("root with spaces");
+        fs::create_dir(&root_path).unwrap();
+        let root_path = fs::canonicalize(root_path).unwrap();
+        fs::create_dir_all(root_path.join(".kin")).unwrap();
+
+        let nested_git = root_path.join("linked-worktree");
+        let nested_start = nested_git.join("src/deep");
+        fs::create_dir_all(&nested_start).unwrap();
+        fs::write(
+            nested_git.join(".git"),
+            "gitdir: ../repo/.git/worktrees/linked-worktree\n",
+        )
+        .unwrap();
+
+        let nested_kin = root_path.join("kin-workspace");
+        let local_start = nested_kin.join("src/deep");
+        fs::create_dir_all(nested_kin.join(".kin")).unwrap();
+        fs::create_dir_all(nested_kin.join(".git")).unwrap();
+        fs::create_dir_all(&local_start).unwrap();
+
+        let session_plain = root_path.join("runs/session-plain");
+        let session_plain_start = session_plain.join("src/deep");
+        fs::create_dir_all(&session_plain_start).unwrap();
+
+        let session_repo = root_path.join("runs/session-repo");
+        let session_repo_start = session_repo.join("src/deep");
+        fs::create_dir_all(session_repo.join(".kin")).unwrap();
+        fs::create_dir_all(session_repo.join(".git")).unwrap();
+        fs::create_dir_all(&session_repo_start).unwrap();
+        let normalized_session_repo = root_path.join("runs/../runs/session-repo");
+
+        let nested_session = root_path.join("runs/session-with-nested-repo");
+        let nested_session_repo = nested_session.join("nested");
+        let nested_session_start = nested_session_repo.join("src/deep");
+        fs::create_dir_all(nested_session_repo.join(".kin")).unwrap();
+        fs::create_dir_all(&nested_session_start).unwrap();
+
+        let aliased_session_target = root_path.join("runs/session-alias-target");
+        let aliased_session_target_start = aliased_session_target.join("src/deep");
+        fs::create_dir_all(aliased_session_target.join(".kin")).unwrap();
+        fs::create_dir_all(aliased_session_target.join(".git")).unwrap();
+        fs::create_dir_all(&aliased_session_target_start).unwrap();
+        let aliased_session = root_path.join("session-alias");
+        symlink(&aliased_session_target, &aliased_session).unwrap();
+        let aliased_session_start = aliased_session.join("src/deep");
+
+        let escape_link = session_plain.join("escape");
+        symlink(&nested_git, &escape_link).unwrap();
+        let escape_start = escape_link.join("src/deep");
+
+        let physical_git_container = root_path.join("logical-container");
+        fs::create_dir(&physical_git_container).unwrap();
+        let physical_git_link = physical_git_container.join("deep-link");
+        symlink(&nested_start, &physical_git_link).unwrap();
+
+        let symlink_kin_root = root_path.join("symlink-kin-marker");
+        fs::create_dir(&symlink_kin_root).unwrap();
+        symlink(root_path.join(".kin"), symlink_kin_root.join(".kin")).unwrap();
+
+        let hooks = root_path.join("hooks");
+        fs::create_dir(&hooks).unwrap();
+        let probe = r#"
+fail() {
+    printf 'hook assertion failed: %s\n' "$1" >&2
+    exit 1
+}
+expect_none() {
+    if _kin_vfs_find_workspace "$1" >/dev/null; then
+        fail "$2 unexpectedly resolved"
+    fi
+}
+expect_workspace() {
+    local observed
+    observed="$(_kin_vfs_find_workspace "$1")" || fail "$3 did not resolve"
+    [ "$observed" = "$2" ] || fail "$3 resolved $observed instead of $2"
+}
+
+export KIN_VFS_WORKSPACE=/stale/workspace
+export KIN_VFS_WORKSPACE_ALIASES=/stale/alias
+export KIN_VFS_SOCK=/stale/socket
+export KIN_VFS_PIPE=/stale/pipe
+export KIN_VFS_CANARY=stale
+export KIN_VFS_INTERPOSE_ACTIVE=1
+export KIN_VFS_LAST_DIR=/stale/last
+export DYLD_INSERT_LIBRARIES=/stale/preload.dylib
+export LD_PRELOAD=/stale/preload.so
+source "$1" || fail "source"
+
+[ -z "${KIN_VFS_WORKSPACE+x}" ] || fail "disabled hook retained workspace"
+[ -z "${KIN_VFS_WORKSPACE_ALIASES+x}" ] || fail "disabled hook retained aliases"
+[ -z "${KIN_VFS_SOCK+x}" ] || fail "disabled hook retained socket"
+[ -z "${KIN_VFS_PIPE+x}" ] || fail "disabled hook retained pipe"
+[ -z "${KIN_VFS_CANARY+x}" ] || fail "disabled hook retained canary"
+[ -z "${KIN_VFS_INTERPOSE_ACTIVE+x}" ] || fail "disabled hook retained interpose state"
+[ -z "${KIN_VFS_LAST_DIR+x}" ] || fail "disabled hook retained last-dir authority"
+[ -z "${DYLD_INSERT_LIBRARIES+x}" ] || fail "disabled hook retained DYLD preload"
+[ -z "${LD_PRELOAD+x}" ] || fail "disabled hook retained LD preload"
+[ "$KIN_VFS_DISABLE" = 1 ] || fail "hook cleared disable policy"
+expect_none "$TEST_LOCAL_START" "disabled local repo"
+
+unset KIN_VFS_DISABLE
+export KIN_SESSION_DIR="$TEST_SESSION_PLAIN"
+export KIN_VFS_WORKSPACE=/stale/workspace
+export KIN_VFS_WORKSPACE_ALIASES=/stale/alias
+export KIN_VFS_SOCK=/stale/socket
+export KIN_VFS_PIPE=/stale/pipe
+export DYLD_INSERT_LIBRARIES=/stale/preload.dylib
+export LD_PRELOAD=/stale/preload.so
+if type _kin_vfs_prompt_command >/dev/null 2>&1; then
+    _kin_vfs_prompt_command
+else
+    _kin_vfs_chpwd
+fi
+[ -z "${KIN_VFS_WORKSPACE+x}" ] || fail "no-match retained workspace"
+[ -z "${KIN_VFS_WORKSPACE_ALIASES+x}" ] || fail "no-match retained aliases"
+[ -z "${KIN_VFS_SOCK+x}" ] || fail "no-match retained socket"
+[ -z "${KIN_VFS_PIPE+x}" ] || fail "no-match retained pipe"
+[ -z "${DYLD_INSERT_LIBRARIES+x}" ] || fail "no-match retained DYLD preload"
+[ -z "${LD_PRELOAD+x}" ] || fail "no-match retained LD preload"
+
+unset KIN_SESSION_DIR
+expect_none "$TEST_NESTED_GIT_START" "nearer Git boundary"
+expect_none "$TEST_PHYSICAL_GIT_LINK" "physical Git boundary"
+expect_none "$TEST_SYMLINK_KIN" "symlinked Kin marker"
+expect_workspace "$TEST_LOCAL_START" "$TEST_LOCAL_ROOT" "local Kin repo"
+
+export KIN_SESSION_DIR="$TEST_SESSION_PLAIN"
+expect_none "$TEST_SESSION_PLAIN_START" "plain session"
+expect_none "$TEST_LOCAL_START" "cwd outside active session"
+expect_none "$TEST_ESCAPE_START" "session symlink escape"
+
+export KIN_SESSION_DIR=relative/session
+expect_none "$TEST_LOCAL_START" "relative session boundary"
+export KIN_SESSION_DIR="$TEST_MISSING_SESSION"
+expect_none "$TEST_LOCAL_START" "missing session boundary"
+
+export KIN_SESSION_DIR="$TEST_NORMALIZED_SESSION_REPO"
+expect_workspace "$TEST_SESSION_REPO_START" "$TEST_SESSION_REPO" "normalized session root"
+
+export KIN_SESSION_DIR="$TEST_NESTED_SESSION"
+expect_none "$TEST_NESTED_SESSION_START" "nested Kin marker inside session"
+
+export KIN_SESSION_DIR="$TEST_ALIASED_SESSION"
+expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" \
+    "safe lexical session alias"
+"#;
+
+        for (shell, hook_name, hook, flags) in [
+            (
+                "/bin/bash",
+                "kin-vfs.bash",
+                BASH_HOOK,
+                &["--noprofile", "--norc"][..],
+            ),
+            ("/bin/zsh", "kin-vfs.zsh", ZSH_HOOK, &["-f"][..]),
+        ] {
+            if !Path::new(shell).is_file() {
+                continue;
+            }
+            let hook_path = hooks.join(hook_name);
+            fs::write(&hook_path, hook).unwrap();
+            let output = std::process::Command::new(shell)
+                .args(flags)
+                .arg("-c")
+                .arg(probe)
+                .arg("kin-setup-git-boundary-test")
+                .arg(&hook_path)
+                .current_dir(&session_plain_start)
+                .env("PATH", "/usr/bin:/bin")
+                .env("KIN_HOME", root_path.join("kin-home"))
+                .env_remove("KIN_DIR")
+                .env("KIN_SESSION_DIR", &session_plain)
+                .env("KIN_VFS_DISABLE", "1")
+                .env_remove("DYLD_INSERT_LIBRARIES")
+                .env_remove("LD_PRELOAD")
+                .env("TEST_NESTED_GIT_START", &nested_start)
+                .env("TEST_LOCAL_START", &local_start)
+                .env("TEST_LOCAL_ROOT", &nested_kin)
+                .env("TEST_SESSION_PLAIN", &session_plain)
+                .env("TEST_SESSION_PLAIN_START", &session_plain_start)
+                .env("TEST_MISSING_SESSION", root_path.join("missing-session"))
+                .env("TEST_SESSION_REPO", &session_repo)
+                .env("TEST_SESSION_REPO_START", &session_repo_start)
+                .env("TEST_NORMALIZED_SESSION_REPO", &normalized_session_repo)
+                .env("TEST_NESTED_SESSION", &nested_session)
+                .env("TEST_NESTED_SESSION_START", &nested_session_start)
+                .env("TEST_ALIASED_SESSION", &aliased_session)
+                .env("TEST_ALIASED_SESSION_START", &aliased_session_start)
+                .env("TEST_ALIASED_SESSION_PHYSICAL", &aliased_session_target)
+                .env("TEST_ESCAPE_START", &escape_start)
+                .env("TEST_PHYSICAL_GIT_LINK", &physical_git_link)
+                .env("TEST_SYMLINK_KIN", &symlink_kin_root)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{hook_name} crossed a Git or session boundary\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[test]
+    fn every_installed_hook_carries_the_same_fail_closed_boundary_contract() {
+        let cases = [
+            ("bash", BASH_HOOK, "logical_workspace", "physical_workspace"),
+            ("zsh", ZSH_HOOK, "logical_workspace", "physical_workspace"),
+            ("fish", FISH_HOOK, "logical_workspace", "physical_workspace"),
+            (
+                "powershell",
+                POWERSHELL_HOOK,
+                "logicalWorkspace",
+                "physicalWorkspace",
+            ),
+        ];
+
+        for (shell, source, logical_workspace, physical_workspace) in cases {
+            for required in [
+                "KIN_SESSION_DIR",
+                "KIN_VFS_DISABLE",
+                ".git",
+                ".kin",
+                "KIN_VFS_WORKSPACE",
+                "KIN_VFS_WORKSPACE_ALIASES",
+                "KIN_VFS_SOCK",
+                "KIN_VFS_PIPE",
+                "DYLD_INSERT_LIBRARIES",
+                "LD_PRELOAD",
+                logical_workspace,
+                physical_workspace,
+            ] {
+                assert!(
+                    source.contains(required),
+                    "{shell} hook is missing boundary/state contract token {required}"
+                );
+            }
+            assert!(
+                !source.contains("KIN_DIR"),
+                "{shell} hook retained the pre-release KIN_DIR compatibility alias"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_hooks_use_only_the_canonical_kin_home_override() {
+        let posix_home = r#"${KIN_HOME:-$HOME/.kin}"#;
         assert!(ZSH_HOOK.contains(posix_home));
         assert!(BASH_HOOK.contains(posix_home));
-        assert!(FISH_HOOK.contains("if set -q KIN_DIR"));
         assert!(FISH_HOOK.contains("if set -q KIN_HOME"));
         assert!(FISH_HOOK.contains("\"$kin_home/lib/libkin_vfs_shim\""));
+        assert!(!ZSH_HOOK.contains("KIN_DIR"));
+        assert!(!BASH_HOOK.contains("KIN_DIR"));
+        assert!(!FISH_HOOK.contains("KIN_DIR"));
     }
 
     #[test]
@@ -11671,7 +12382,7 @@ mod tests {
         assert!(
             fs::read_to_string(kin_home.join("shell").join("kin-vfs.zsh"))
                 .unwrap()
-                .contains(r#"${KIN_HOME:-${KIN_DIR:-$HOME/.kin}}"#),
+                .contains(r#"${KIN_HOME:-$HOME/.kin}"#),
             "installed hook must resolve the active Kin home"
         );
     }
