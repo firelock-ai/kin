@@ -3179,7 +3179,6 @@ dependencies = [
  "chrono",
  "flate2",
  "fs2",
- "gix",
  "hex",
  "http-body",
  "kin-blobs",

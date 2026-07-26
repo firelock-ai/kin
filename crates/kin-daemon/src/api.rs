@@ -2057,15 +2057,6 @@ async fn session_heartbeat(
     }))
 }
 
-fn open_repo(path: &std::path::Path) -> std::result::Result<gix::Repository, gix::open::Error> {
-    let dot_git = path.join(".git");
-    if dot_git.is_dir() {
-        gix::open(dot_git)
-    } else {
-        gix::open(path)
-    }
-}
-
 fn resolve_scope_build_timeout(raw: Option<&str>) -> Duration {
     let seconds = raw
         .and_then(|raw| raw.parse::<u64>().ok())
@@ -2106,88 +2097,22 @@ async fn set_scope(
     let state_clone = Arc::clone(&state);
     let ref_string = req.ref_string.clone();
     let timeout = scope_build_timeout();
-    // A deep scope base_commit lazily imports its full ancestry; serialize that
-    // against every other daemon hydration so two deep imports never run at once
-    // (roughly 2x peak memory → OOM). Already-imported refs skip the gate and
-    // stay on the fast path. Acquired here (async) and moved into the blocking
-    // task so it is held for the whole import.
-    let hydration_gate = if kin_cli::commands::ref_lookup::git_ref_requires_hydration(
-        state.graph.as_ref(),
-        &ref_string,
-    ) {
-        Some(Arc::clone(&state.hydration_gate).lock_owned().await)
-    } else {
-        None
-    };
-    let graph_mutation = hydration_gate
-        .as_ref()
-        .map(|_| state.begin_graph_authority_mutation());
-    let scope_task = tokio::task::spawn_blocking(
-        move || -> std::result::Result<_, (StatusCode, String)> {
-            let _hydration_gate = hydration_gate;
-            let _graph_mutation = graph_mutation;
-            // Resolve the ref through the locate entry point, which hydrates a
-            // not-yet-imported Git ancestry at artifact-only depth. Scope-for-
-            // retrieval only needs the base_commit's tree state: build_graph_at_ref
-            // below takes the file tree from the imported artifact deltas (or from
-            // the Git tree) and rebuilds the scoped entity set by re-parsing it.
-            // The per-commit semantic replay that depth skips ("Hydrating History:
-            // [n/26747]") re-parses and re-links every ancestor commit — ~10 min on
-            // a deep base_commit — and nothing on this path reads the deltas it
-            // produces; the scoped entity set is ranked with HEAD vectors via
-            // `vector_source`. Callers that do read those deltas — history, blame,
-            // review — resolve through the semantic entry points instead.
-            let resolved =
-            kin_cli::commands::ref_lookup::resolve_ref_importing_git_if_needed_for_locate_with_report(
+    let scope_task =
+        tokio::task::spawn_blocking(move || -> std::result::Result<_, (StatusCode, String)> {
+            // Runtime scope queries are graph/CAS-only. An unimported ref is a
+            // graph gap and must fail instead of silently repairing authority
+            // from a colocated Git checkout.
+            let head = kin_cli::commands::ref_lookup::resolve_ref(
                 state_clone.graph.as_ref(),
                 &state_clone.layout,
                 Some(&ref_string),
             )
             .map_err(|err| (StatusCode::BAD_REQUEST, format!("{:#}", err)))?;
-            if resolved.hydrated_git_history {
-                state_clone.bump_version();
-                state_clone.save_snapshot().map_err(internal_error)?;
-                state_clone.mark_clean();
-            }
-            let head = resolved.head;
-
-            // Build the historical graph at that ref, using cached OID mapping
-            // for fast scope switching without re-walking the commit DAG.
-            let oid_cache: Option<kin_core::ChangeOidCache> = {
-                let needs_build = read_recover(&state_clone.change_oid_cache).is_none();
-                if needs_build {
-                    if let Ok(repo) = open_repo(state_clone.layout.working_dir()) {
-                        match kin_core::build_change_oid_cache(&repo) {
-                            Ok(cache) => {
-                                info!("built change OID cache for fast scope switching");
-                                *write_recover(&state_clone.change_oid_cache) = Some(cache);
-                            }
-                            Err(err) => {
-                                tracing::warn!(error = %err, "failed to build change OID cache, falling back to per-call lookup");
-                            }
-                        }
-                    }
-                }
-                read_recover(&state_clone.change_oid_cache).clone()
-            };
-            let historical = if let Some(git_oid) = ref_string.strip_prefix("git:") {
-                kin_core::build_graph_at_git_ref_with_repo(
-                    state_clone.graph.as_ref(),
-                    state_clone.blobs.as_ref(),
-                    &head,
-                    state_clone.layout.working_dir(),
-                    git_oid,
-                    oid_cache.as_ref(),
-                )
-            } else {
-                kin_core::build_graph_at_ref_with_repo(
-                    state_clone.graph.as_ref(),
-                    state_clone.blobs.as_ref(),
-                    &head,
-                    Some(state_clone.layout.working_dir()),
-                    oid_cache.as_ref(),
-                )
-            }
+            let historical = kin_core::build_graph_at_ref(
+                state_clone.graph.as_ref(),
+                state_clone.blobs.as_ref(),
+                &head,
+            )
             .map_err(internal_error)?;
 
             // Refresh cochange relations from the historical change set so the
@@ -2199,8 +2124,7 @@ async fn set_scope(
             let cached_graph = Arc::new(historical);
 
             Ok((head, cached_graph))
-        },
-    );
+        });
     let (head, cached_graph) = match tokio::time::timeout(timeout, scope_task).await {
         Ok(joined) => joined.map_err(|err| {
             (
@@ -2524,7 +2448,7 @@ async fn graph_commit(
     }
 
     // Release admission already validated the marker parent's complete exact
-    // tree above. The marker has no artifact deltas, so resolving it produces
+    // tree above. The marker has no tree deltas, so resolving it produces
     // that identical tree; reading every source object again here only doubles
     // release latency and peak backend traffic without adding authority.
     if request.release_policy.is_none() {
@@ -10283,9 +10207,9 @@ fn load_exact_source_entries_with(
     })?;
     files.sort_by(|left, right| {
         left.1
-            .hash
+            .blob_hash
             .as_bytes()
-            .cmp(right.1.hash.as_bytes())
+            .cmp(right.1.blob_hash.as_bytes())
             .then_with(|| left.0 .0.cmp(&right.0 .0))
     });
     let mut entries = Vec::with_capacity(files.len());
@@ -10293,9 +10217,9 @@ fn load_exact_source_entries_with(
     let mut remaining_load_bytes = EXACT_SOURCE_MAX_EXPANDED_BYTES as u64;
     let mut start = 0;
     while start < files.len() {
-        let source_hash = files[start].1.hash;
+        let source_hash = files[start].1.blob_hash;
         let mut end = start + 1;
-        while end < files.len() && files[end].1.hash == source_hash {
+        while end < files.len() && files[end].1.blob_hash == source_hash {
             end += 1;
         }
         let digest = *source_hash.as_bytes();
@@ -11346,17 +11270,11 @@ mod tests {
         let tree = HashMap::from([
             (
                 FilePathId::new("src/first.rs"),
-                ResolvedSourceEntry {
-                    hash,
-                    kind: SourceEntryKind::File { executable: false },
-                },
+                TreeEntry::regular(hash, false),
             ),
             (
                 FilePathId::new("src/second.rs"),
-                ResolvedSourceEntry {
-                    hash,
-                    kind: SourceEntryKind::File { executable: true },
-                },
+                TreeEntry::regular(hash, true),
             ),
         ]);
         let mut loads = 0;
@@ -11387,17 +11305,11 @@ mod tests {
         let tree = HashMap::from([
             (
                 FilePathId::new("src/first.rs"),
-                ResolvedSourceEntry {
-                    hash: Hash256::from_bytes(first_digest),
-                    kind: SourceEntryKind::File { executable: false },
-                },
+                TreeEntry::regular(Hash256::from_bytes(first_digest), false),
             ),
             (
                 FilePathId::new("src/second.rs"),
-                ResolvedSourceEntry {
-                    hash: Hash256::from_bytes(second_digest),
-                    kind: SourceEntryKind::File { executable: false },
-                },
+                TreeEntry::regular(Hash256::from_bytes(second_digest), false),
             ),
         ]);
         let mut expected = [
@@ -11842,16 +11754,23 @@ mod tests {
     fn exact_source_delta(
         state: &DaemonState,
         path: &str,
-        kind: ArtifactDeltaKind,
-        old_hash: Option<Hash256>,
+        kind: TreeEntryKind,
+        old_entry: Option<TreeEntry>,
         data: &[u8],
-    ) -> ArtifactDelta {
+    ) -> TreeDelta {
         let blob_hash = state.blobs.write(data).unwrap();
-        ArtifactDelta {
-            file_id: FilePathId::new(path),
+        let file_id = FilePathId::new(path);
+        let new_entry = TreeEntry {
+            blob_hash: Hash256::from_bytes(blob_hash.0),
             kind,
-            old_hash,
-            new_hash: Some(blob_hash),
+        };
+        match old_entry {
+            Some(old_entry) => TreeDelta::Modified {
+                file_id,
+                old_entry,
+                new_entry,
+            },
+            None => TreeDelta::Added { file_id, new_entry },
         }
     }
 
@@ -11860,6 +11779,7 @@ mod tests {
     ) -> (SemanticChangeId, SemanticChangeId) {
         let branch_name = BranchName::new("main");
         let old_readme = state.blobs.write(b"old source\n").unwrap();
+        let old_readme_entry = TreeEntry::regular(Hash256::from_bytes(old_readme.0), false);
         let first_entity = test_entity("first_source_entity", "src/first.rs");
         state.graph.upsert_entity(&first_entity).unwrap();
         let first = SemanticChange {
@@ -11870,27 +11790,19 @@ mod tests {
             message: "first exact source".to_string(),
             entity_deltas: vec![EntityDelta::Added(first_entity)],
             relation_deltas: vec![],
-            artifact_deltas: vec![
-                ArtifactDelta {
+            tree_deltas: vec![
+                TreeDelta::Added {
                     file_id: FilePathId::new("README.md"),
-                    kind: ArtifactDeltaKind::AddedRegularFile,
-                    old_hash: None,
-                    new_hash: Some(old_readme),
+                    new_entry: old_readme_entry,
                 },
                 exact_source_delta(
                     state,
                     "bin/run",
-                    ArtifactDeltaKind::AddedExecutableFile,
+                    TreeEntryKind::Regular { executable: true },
                     None,
                     b"#!/bin/sh\necho old\n",
                 ),
-                exact_source_delta(
-                    state,
-                    "current",
-                    ArtifactDeltaKind::AddedSymlink,
-                    None,
-                    b"bin/run",
-                ),
+                exact_source_delta(state, "current", TreeEntryKind::Symlink, None, b"bin/run"),
             ],
             projected_files: vec![],
             spec_link: None,
@@ -11917,11 +11829,11 @@ mod tests {
             message: "newer exact source".to_string(),
             entity_deltas: vec![EntityDelta::Added(second_entity)],
             relation_deltas: vec![],
-            artifact_deltas: vec![exact_source_delta(
+            tree_deltas: vec![exact_source_delta(
                 state,
                 "README.md",
-                ArtifactDeltaKind::ModifiedRegularFile,
-                Some(old_readme),
+                TreeEntryKind::Regular { executable: false },
+                Some(old_readme_entry),
                 b"new source\n",
             )],
             projected_files: vec![],
@@ -12096,58 +12008,6 @@ mod tests {
             new_evidence.source_manifest_sha256,
             new_manifest.to_str().unwrap()
         );
-    }
-
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn exact_source_archive_fails_closed_on_legacy_mode_gap() {
-        let repo_id = "legacy-source-gap";
-        let state = exact_source_backend_state(repo_id);
-        let content = state.blobs.write(b"local compatibility bytes\n").unwrap();
-        let change = SemanticChange {
-            id: SemanticChangeId::from_hash(Hash256::from_bytes([83; 32])),
-            parents: vec![],
-            timestamp: Timestamp::now(),
-            author: AuthorId::new("human-test"),
-            message: "legacy source".to_string(),
-            entity_deltas: vec![],
-            relation_deltas: vec![],
-            artifact_deltas: vec![ArtifactDelta {
-                file_id: FilePathId::new("legacy.txt"),
-                kind: ArtifactDeltaKind::Added,
-                old_hash: None,
-                new_hash: Some(content),
-            }],
-            projected_files: vec![],
-            spec_link: None,
-            evidence: vec![],
-            risk_summary: None,
-            authored_on: None,
-        };
-        state.graph.create_change(&change).unwrap();
-        state.save_snapshot_full().unwrap();
-        std::fs::write(
-            state.layout.working_dir().join("legacy.txt"),
-            b"filesystem fallback must not be served\n",
-        )
-        .unwrap();
-
-        let response = exact_source_get(
-            router_with_auth(state, Some("exact-source-token".to_string())),
-            format!("/repos/{repo_id}/archive/tar/{}", change.id),
-            true,
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::FAILED_DEPENDENCY);
-        let body = String::from_utf8(
-            axum::body::to_bytes(response.into_body(), 16 * 1024)
-                .await
-                .unwrap()
-                .to_vec(),
-        )
-        .unwrap();
-        assert!(body.contains("exact source history is incomplete"));
-        assert!(body.contains("no fallback was attempted"));
     }
 
     /// Dispatching the prepare must leave the async worker schedulable.
@@ -12756,12 +12616,11 @@ mod tests {
     use axum::routing::get as axum_get;
     use kin_model::{
         Actor, ActorId, ActorKind, AgentSession, AnnotationFilter, Approval, ApprovalDecision,
-        ApprovalId, ArtifactDelta, ArtifactDeltaKind, AuditEventId, AuthorId, Branch, BranchName,
-        Entity, EntityDelta, EntityId, EntityKind, EntityRole, FileLayout, FilePathId,
-        FingerprintAlgorithm, Hash256, IdentityRef, ImportSection, IntentScope, LanguageId,
-        Priority, RelationKind, SemanticChange, SemanticChangeId, SemanticFingerprint,
-        SourceRegion, SourceSpan, TestCase, TestKind, TestRunner, Timestamp, Visibility, WorkItem,
-        WorkKind, WorkScope, WorkStatus, WorkStore,
+        ApprovalId, AuditEventId, AuthorId, Branch, BranchName, Entity, EntityDelta, EntityId,
+        EntityKind, EntityRole, FileLayout, FilePathId, FingerprintAlgorithm, Hash256, IdentityRef,
+        ImportSection, IntentScope, LanguageId, Priority, RelationKind, SemanticChange,
+        SemanticChangeId, SemanticFingerprint, SourceRegion, SourceSpan, TestCase, TestKind,
+        TestRunner, Timestamp, Visibility, WorkItem, WorkKind, WorkScope, WorkStatus, WorkStore,
     };
     use kin_model::{ReviewStore, VerificationStore};
     use kin_registry::Ecosystem;
@@ -13095,7 +12954,7 @@ mod tests {
         parent: SemanticChangeId,
         id_byte: u8,
         file_id: &str,
-        kind: ArtifactDeltaKind,
+        kind: TreeEntryKind,
         hash: Hash256,
     ) -> SemanticChange {
         SemanticChange {
@@ -13106,11 +12965,12 @@ mod tests {
             message: "exact source API fixture".to_string(),
             entity_deltas: vec![],
             relation_deltas: vec![],
-            artifact_deltas: vec![ArtifactDelta {
+            tree_deltas: vec![TreeDelta::Added {
                 file_id: FilePathId::new(file_id),
-                kind,
-                old_hash: None,
-                new_hash: Some(hash),
+                new_entry: TreeEntry {
+                    blob_hash: hash,
+                    kind,
+                },
             }],
             projected_files: vec![FilePathId::new(file_id)],
             spec_link: None,
@@ -13147,7 +13007,7 @@ mod tests {
             genesis.id,
             0xbc,
             "src/shared.rs",
-            ArtifactDeltaKind::AddedRegularFile,
+            TreeEntryKind::Regular { executable: false },
             Hash256::from_bytes(main_blob.0),
         );
         state.graph.create_change(&main).unwrap();
@@ -13160,6 +13020,8 @@ mod tests {
             .unwrap();
 
         let feature_blob = state.blobs.write(b"feature checkout bytes\n").unwrap();
+        let main_entry = TreeEntry::regular(Hash256::from_bytes(main_blob.0), false);
+        let feature_entry = TreeEntry::regular(Hash256::from_bytes(feature_blob.0), false);
         let feature = SemanticChange {
             id: SemanticChangeId::from_hash(Hash256::from_bytes([0xbd; 32])),
             parents: vec![main.id],
@@ -13168,11 +13030,10 @@ mod tests {
             message: "feature checkout fixture".to_string(),
             entity_deltas: vec![],
             relation_deltas: vec![],
-            artifact_deltas: vec![ArtifactDelta {
+            tree_deltas: vec![TreeDelta::Modified {
                 file_id: FilePathId::new("src/shared.rs"),
-                kind: ArtifactDeltaKind::ModifiedRegularFile,
-                old_hash: main.artifact_deltas[0].new_hash,
-                new_hash: Some(Hash256::from_bytes(feature_blob.0)),
+                old_entry: main_entry,
+                new_entry: feature_entry,
             }],
             projected_files: vec![FilePathId::new("src/shared.rs")],
             spec_link: None,
@@ -13612,7 +13473,7 @@ mod tests {
             valid_parent,
             0xb0,
             "src/lib.rs",
-            ArtifactDeltaKind::AddedRegularFile,
+            TreeEntryKind::Regular { executable: false },
             Hash256::from_bytes(valid_blob.0),
         );
         let valid_response = router(Arc::clone(&valid_state))
@@ -13648,20 +13509,24 @@ mod tests {
             let (file_id, kind, hash) = match case {
                 "missing" => (
                     "src/missing.rs",
-                    ArtifactDeltaKind::AddedRegularFile,
+                    TreeEntryKind::Regular { executable: false },
                     Hash256::from_bytes(kin_blobs::digest_bytes(b"missing source")),
                 ),
                 "corrupt" => {
                     let blob = state.blobs.write(b"expected source").unwrap();
                     let hash = Hash256::from_bytes(blob.0);
                     std::fs::write(api_local_object_path(&state, hash), b"corrupt source").unwrap();
-                    ("src/corrupt.rs", ArtifactDeltaKind::AddedRegularFile, hash)
+                    (
+                        "src/corrupt.rs",
+                        TreeEntryKind::Regular { executable: false },
+                        hash,
+                    )
                 }
                 "unsafe_path" => {
                     let blob = state.blobs.write(b"control overwrite").unwrap();
                     (
                         ".kin/authority",
-                        ArtifactDeltaKind::AddedRegularFile,
+                        TreeEntryKind::Regular { executable: false },
                         Hash256::from_bytes(blob.0),
                     )
                 }
@@ -13669,7 +13534,7 @@ mod tests {
                     let blob = state.blobs.write(b"../../outside").unwrap();
                     (
                         "src/escape",
-                        ArtifactDeltaKind::AddedSymlink,
+                        TreeEntryKind::Symlink,
                         Hash256::from_bytes(blob.0),
                     )
                 }
@@ -13727,38 +13592,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn release_admission_rejects_nonexact_or_unmaterializable_source_tree_atomically() {
-        for case in [
-            "legacy_mode",
-            "missing",
-            "corrupt",
-            "unsafe_path",
-            "unsafe_symlink",
-        ] {
+    async fn release_admission_rejects_unmaterializable_source_tree_atomically() {
+        for case in ["missing", "corrupt", "unsafe_path", "unsafe_symlink"] {
             let state = test_state();
             let parent = install_release_test_branch(&state);
             let (file_id, kind, hash) = match case {
-                "legacy_mode" => (
-                    "src/legacy.rs",
-                    ArtifactDeltaKind::Added,
-                    Hash256::from_bytes(kin_blobs::digest_bytes(b"legacy source")),
-                ),
                 "missing" => (
                     "src/missing.rs",
-                    ArtifactDeltaKind::AddedRegularFile,
+                    TreeEntryKind::Regular { executable: false },
                     Hash256::from_bytes(kin_blobs::digest_bytes(b"missing source")),
                 ),
                 "corrupt" => {
                     let blob = state.blobs.write(b"expected release source").unwrap();
                     let hash = Hash256::from_bytes(blob.0);
                     std::fs::write(api_local_object_path(&state, hash), b"corrupt source").unwrap();
-                    ("src/corrupt.rs", ArtifactDeltaKind::AddedRegularFile, hash)
+                    (
+                        "src/corrupt.rs",
+                        TreeEntryKind::Regular { executable: false },
+                        hash,
+                    )
                 }
                 "unsafe_path" => {
                     let blob = state.blobs.write(b"control overwrite").unwrap();
                     (
                         ".kin/release",
-                        ArtifactDeltaKind::AddedRegularFile,
+                        TreeEntryKind::Regular { executable: false },
                         Hash256::from_bytes(blob.0),
                     )
                 }
@@ -13766,7 +13624,7 @@ mod tests {
                     let blob = state.blobs.write(b"../../outside").unwrap();
                     (
                         "src/escape",
-                        ArtifactDeltaKind::AddedSymlink,
+                        TreeEntryKind::Symlink,
                         Hash256::from_bytes(blob.0),
                     )
                 }
@@ -13831,7 +13689,7 @@ mod tests {
             parent,
             0xb4,
             "src/release.rs",
-            ArtifactDeltaKind::AddedRegularFile,
+            TreeEntryKind::Regular { executable: false },
             Hash256::from_bytes(blob.0),
         );
         install_source_test_head(&state, &source);
@@ -13938,14 +13796,12 @@ mod tests {
             parent,
             0xb6,
             "pkg",
-            ArtifactDeltaKind::AddedRegularFile,
+            TreeEntryKind::Regular { executable: false },
             file_hash,
         );
-        source.artifact_deltas.push(ArtifactDelta {
+        source.tree_deltas.push(TreeDelta::Added {
             file_id: FilePathId::new("pkg/lib.rs"),
-            kind: ArtifactDeltaKind::AddedRegularFile,
-            old_hash: None,
-            new_hash: Some(child_hash),
+            new_entry: TreeEntry::regular(child_hash, false),
         });
         install_source_test_head(&state, &source);
         let release = release_test_change(source.id, 0xb7);

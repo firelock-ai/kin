@@ -945,9 +945,6 @@ pub struct DaemonState {
     /// Channel for LSP enrichment messages (incremental or sweep).
     /// None if LSP enrichment is disabled (no servers found).
     pub lsp_enrichment_tx: Option<tokio::sync::mpsc::Sender<LspEnrichmentMessage>>,
-    /// Cached SemanticChangeId → Git OID mapping for fast scope switching.
-    /// Built lazily on first `set_scope` call, reused for subsequent calls.
-    pub change_oid_cache: std::sync::RwLock<Option<kin_core::ChangeOidCache>>,
     /// Repo ID resolved once at construction. Cached to avoid re-reading
     /// `.kin/manifest.json` on every snapshot save — under high host
     /// concurrency those reads contend and surface as opaque "Core error"
@@ -990,14 +987,14 @@ pub struct DaemonState {
     /// Cached `semantic_locate` result pages keyed by paging-cursor key.
     pub semantic_locate_pages: Mutex<HashMap<String, CachedSemanticPage>>,
     /// Serializes lazy git-ancestry hydration — the full-history import behind a
-    /// `review`/`history`/`blame`/`locate --ref`/`scope` ref that names an
+    /// `review`/`history`/`blame`/`locate --ref` ref that names an
     /// unimported Git commit. At most one such import runs at a time: two
     /// concurrent deep imports roughly double peak memory and can OOM-kill the
     /// daemon. Concurrent requests for the SAME unimported commit coalesce —
     /// whoever wins the gate imports it, and later waiters observe it already
     /// present (the get-or-build guard in `hydrate_imported_git_ref`) and skip
     /// the re-import. Held across the request `.await` (and moved into the
-    /// `set_scope` blocking task), so it is a tokio mutex behind an `Arc` — not
+    /// the blocking prepare task), so it is a tokio mutex behind an `Arc` — not
     /// the std locks used for the synchronous critical sections above.
     pub hydration_gate: Arc<tokio::sync::Mutex<()>>,
 }
@@ -1403,7 +1400,6 @@ impl DaemonState {
             last_activity_ms: AtomicU64::new(0),
             active_requests: AtomicU64::new(0),
             lsp_enrichment_tx: None,
-            change_oid_cache: std::sync::RwLock::new(None),
             cached_repo_id,
             is_shutdown: AtomicBool::new(false),
             persisted_entity_count: AtomicU64::new(loaded_entity_count as u64),
@@ -1573,7 +1569,6 @@ impl DaemonState {
             last_activity_ms: AtomicU64::new(0),
             active_requests: AtomicU64::new(0),
             lsp_enrichment_tx: None,
-            change_oid_cache: std::sync::RwLock::new(None),
             cached_repo_id: repo_id.to_string(),
             is_shutdown: AtomicBool::new(false),
             persisted_entity_count: AtomicU64::new(loaded_entity_count as u64),
@@ -4165,7 +4160,7 @@ mod tests {
     fn exact_source_change(
         id_byte: u8,
         file_id: &str,
-        kind: kin_model::ArtifactDeltaKind,
+        kind: TreeEntryKind,
         hash: Hash256,
     ) -> kin_model::SemanticChange {
         kin_model::SemanticChange {
@@ -4176,11 +4171,12 @@ mod tests {
             timestamp: kin_model::Timestamp::now(),
             entity_deltas: vec![],
             relation_deltas: vec![],
-            artifact_deltas: vec![kin_model::ArtifactDelta {
+            tree_deltas: vec![TreeDelta::Added {
                 file_id: FilePathId::new(file_id),
-                kind,
-                old_hash: None,
-                new_hash: Some(hash),
+                new_entry: TreeEntry {
+                    blob_hash: hash,
+                    kind,
+                },
             }],
             projected_files: vec![],
             spec_link: None,
@@ -4270,7 +4266,6 @@ mod tests {
             last_activity_ms: AtomicU64::new(0),
             active_requests: AtomicU64::new(0),
             lsp_enrichment_tx: None,
-            change_oid_cache: std::sync::RwLock::new(None),
             cached_repo_id: "test-repo".to_string(),
             is_shutdown: AtomicBool::new(false),
             persisted_entity_count: AtomicU64::new(loaded_entity_count as u64),
@@ -5423,8 +5418,7 @@ mod tests {
     fn storage_backend_persists_exact_source_objects_before_full_and_delta_authority() {
         use kin_db::{LocalFileBackend, StorageBackend};
         use kin_model::{
-            ArtifactDelta, ArtifactDeltaKind, AuthorId, Branch, BranchName, ChangeStore,
-            SemanticChange, SemanticChangeId, Timestamp,
+            AuthorId, Branch, BranchName, ChangeStore, SemanticChange, SemanticChangeId, Timestamp,
         };
 
         let repo_dir = tempfile::tempdir().unwrap();
@@ -5452,11 +5446,9 @@ mod tests {
             timestamp: Timestamp::now(),
             entity_deltas: vec![],
             relation_deltas: vec![],
-            artifact_deltas: vec![ArtifactDelta {
+            tree_deltas: vec![TreeDelta::Added {
                 file_id: FilePathId("bin/kin".to_string()),
-                kind: ArtifactDeltaKind::AddedExecutableFile,
-                old_hash: None,
-                new_hash: Some(executable_hash),
+                new_entry: TreeEntry::regular(executable_hash, true),
             }],
             projected_files: vec![],
             spec_link: None,
@@ -5501,11 +5493,9 @@ mod tests {
             timestamp: Timestamp::now(),
             entity_deltas: vec![],
             relation_deltas: vec![],
-            artifact_deltas: vec![ArtifactDelta {
+            tree_deltas: vec![TreeDelta::Added {
                 file_id: FilePathId("current".to_string()),
-                kind: ArtifactDeltaKind::AddedSymlink,
-                old_hash: None,
-                new_hash: Some(target_hash),
+                new_entry: TreeEntry::symlink(target_hash),
             }],
             projected_files: vec![],
             spec_link: None,
@@ -5536,27 +5526,21 @@ mod tests {
             None,
         )
         .unwrap();
-        let exact = reopened.graph.resolve_source_tree_at(&second.id).unwrap();
-        let kin_model::SourceTreeResolution::Exact { entries } = exact else {
-            panic!("persisted exact source history reopened as incomplete")
-        };
+        let entries = reopened.graph.resolve_tree_at(&second.id).unwrap();
         assert_eq!(
             entries[&FilePathId("bin/kin".to_string())].kind,
-            kin_model::SourceEntryKind::File { executable: true }
+            TreeEntryKind::Regular { executable: true }
         );
         assert_eq!(
             entries[&FilePathId("current".to_string())].kind,
-            kin_model::SourceEntryKind::Symlink
+            TreeEntryKind::Symlink
         );
     }
 
     #[test]
     fn exact_source_persistence_and_preflight_load_each_content_hash_once() {
         use kin_db::StorageBackend;
-        use kin_model::{
-            ArtifactDelta, ArtifactDeltaKind, AuthorId, ChangeStore, SemanticChange,
-            SemanticChangeId, Timestamp,
-        };
+        use kin_model::{AuthorId, ChangeStore, SemanticChange, SemanticChangeId, Timestamp};
 
         let repo_dir = tempfile::tempdir().unwrap();
         let init = kin_core::init(repo_dir.path()).unwrap();
@@ -5584,18 +5568,14 @@ mod tests {
             timestamp: Timestamp::now(),
             entity_deltas: vec![],
             relation_deltas: vec![],
-            artifact_deltas: vec![
-                ArtifactDelta {
+            tree_deltas: vec![
+                TreeDelta::Added {
                     file_id: FilePathId("src/first.rs".to_string()),
-                    kind: ArtifactDeltaKind::AddedRegularFile,
-                    old_hash: None,
-                    new_hash: Some(hash),
+                    new_entry: TreeEntry::regular(hash, false),
                 },
-                ArtifactDelta {
+                TreeDelta::Added {
                     file_id: FilePathId("src/second.rs".to_string()),
-                    kind: ArtifactDeltaKind::AddedRegularFile,
-                    old_hash: None,
-                    new_hash: Some(hash),
+                    new_entry: TreeEntry::regular(hash, false),
                 },
             ],
             projected_files: vec![],
@@ -5643,10 +5623,7 @@ mod tests {
     #[test]
     fn storage_backend_rejects_exact_graph_authority_when_source_bytes_are_missing() {
         use kin_db::{LocalFileBackend, StorageBackend};
-        use kin_model::{
-            ArtifactDelta, ArtifactDeltaKind, AuthorId, ChangeStore, SemanticChange,
-            SemanticChangeId, Timestamp,
-        };
+        use kin_model::{AuthorId, ChangeStore, SemanticChange, SemanticChangeId, Timestamp};
 
         let repo_dir = tempfile::tempdir().unwrap();
         let init = kin_core::init(repo_dir.path()).unwrap();
@@ -5670,11 +5647,9 @@ mod tests {
                 timestamp: Timestamp::now(),
                 entity_deltas: vec![],
                 relation_deltas: vec![],
-                artifact_deltas: vec![ArtifactDelta {
+                tree_deltas: vec![TreeDelta::Added {
                     file_id: FilePathId("src/lib.rs".to_string()),
-                    kind: ArtifactDeltaKind::AddedRegularFile,
-                    old_hash: None,
-                    new_hash: Some(missing_hash),
+                    new_entry: TreeEntry::regular(missing_hash, false),
                 }],
                 projected_files: vec![],
                 spec_link: None,
@@ -5700,10 +5675,7 @@ mod tests {
     #[test]
     fn corrupt_backend_exact_source_preflight_preserves_graph_and_generation() {
         use kin_db::{LocalFileBackend, StorageBackend};
-        use kin_model::{
-            ArtifactDelta, ArtifactDeltaKind, AuthorId, ChangeStore, SemanticChange,
-            SemanticChangeId, Timestamp,
-        };
+        use kin_model::{AuthorId, ChangeStore, SemanticChange, SemanticChangeId, Timestamp};
 
         let repo_dir = tempfile::tempdir().unwrap();
         let init = kin_core::init(repo_dir.path()).unwrap();
@@ -5729,11 +5701,9 @@ mod tests {
             timestamp: Timestamp::now(),
             entity_deltas: vec![],
             relation_deltas: vec![],
-            artifact_deltas: vec![ArtifactDelta {
+            tree_deltas: vec![TreeDelta::Added {
                 file_id: FilePathId("src/lib.rs".to_string()),
-                kind: ArtifactDeltaKind::AddedRegularFile,
-                old_hash: None,
-                new_hash: Some(expected_hash),
+                new_entry: TreeEntry::regular(expected_hash, false),
             }],
             projected_files: vec![],
             spec_link: None,
@@ -5765,7 +5735,7 @@ mod tests {
         let change = exact_source_change(
             35,
             "src/lib.rs",
-            kin_model::ArtifactDeltaKind::AddedRegularFile,
+            TreeEntryKind::Regular { executable: false },
             hash,
         );
 
@@ -5792,7 +5762,7 @@ mod tests {
             let change = exact_source_change(
                 if corrupt { 36 } else { 37 },
                 "src/lib.rs",
-                kin_model::ArtifactDeltaKind::AddedRegularFile,
+                TreeEntryKind::Regular { executable: false },
                 hash,
             );
             let root_before = state.graph.compute_root_hash();
@@ -5817,12 +5787,12 @@ mod tests {
         let cases = [
             (
                 ".kin/authority",
-                kin_model::ArtifactDeltaKind::AddedRegularFile,
+                TreeEntryKind::Regular { executable: false },
                 b"must not enter control state".as_slice(),
             ),
             (
                 "src/escape",
-                kin_model::ArtifactDeltaKind::AddedSymlink,
+                TreeEntryKind::Symlink,
                 b"../../outside".as_slice(),
             ),
         ];
@@ -5865,14 +5835,12 @@ mod tests {
         let mut change = exact_source_change(
             40,
             "pkg",
-            kin_model::ArtifactDeltaKind::AddedRegularFile,
+            TreeEntryKind::Regular { executable: false },
             file_hash,
         );
-        change.artifact_deltas.push(kin_model::ArtifactDelta {
+        change.tree_deltas.push(TreeDelta::Added {
             file_id: FilePathId::new("pkg/lib.rs"),
-            kind: kin_model::ArtifactDeltaKind::AddedRegularFile,
-            old_hash: None,
-            new_hash: Some(child_hash),
+            new_entry: TreeEntry::regular(child_hash, false),
         });
         let root_before = state.graph.compute_root_hash();
         let generation_before = state.snapshot_generation.load(Ordering::SeqCst);
@@ -5899,7 +5867,7 @@ mod tests {
         let parent = exact_source_change(
             41,
             "pkg/lib.rs",
-            kin_model::ArtifactDeltaKind::AddedRegularFile,
+            TreeEntryKind::Regular { executable: false },
             child_hash,
         );
         state.graph.create_change(&parent).unwrap();
@@ -5908,7 +5876,7 @@ mod tests {
         let mut incoming = exact_source_change(
             42,
             "pkg",
-            kin_model::ArtifactDeltaKind::AddedRegularFile,
+            TreeEntryKind::Regular { executable: false },
             file_hash,
         );
         incoming.parents = vec![parent.id];
@@ -5932,14 +5900,14 @@ mod tests {
         let left = exact_source_change(
             43,
             "pkg/lib.rs",
-            kin_model::ArtifactDeltaKind::AddedRegularFile,
+            TreeEntryKind::Regular { executable: false },
             child_hash,
         );
         let file_hash = Hash256::from_bytes(state.blobs.write(b"right file bytes").unwrap().0);
         let right = exact_source_change(
             44,
             "pkg",
-            kin_model::ArtifactDeltaKind::AddedRegularFile,
+            TreeEntryKind::Regular { executable: false },
             file_hash,
         );
         state.graph.create_change(&left).unwrap();
@@ -5948,7 +5916,7 @@ mod tests {
         let mut merge = exact_source_change(
             45,
             "merge-marker.txt",
-            kin_model::ArtifactDeltaKind::AddedRegularFile,
+            TreeEntryKind::Regular { executable: false },
             Hash256::from_bytes(state.blobs.write(b"merge marker").unwrap().0),
         );
         merge.parents = vec![left.id, right.id];
