@@ -2326,9 +2326,9 @@ async fn command_xref(
     Ok(Json(response))
 }
 
-/// POST /commands/diff — render semantic diffs from daemon-owned graph state.
+/// POST /commands/diff — render exact diffs from repository-v6 authority.
 async fn command_diff(
-    headers: axum::http::HeaderMap,
+    _headers: axum::http::HeaderMap,
     State(state): State<Arc<DaemonState>>,
     Json(request): Json<kin_cli::commands::diff::DiffRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
@@ -2342,9 +2342,7 @@ async fn command_diff(
         ));
     }
 
-    let session_id = extract_session_id_from_headers(&headers)?;
-    let graph = resolve_session_graph(&state, session_id.as_ref()).await;
-    let response = kin_cli::commands::diff::build_diff_response(graph.as_ref(), &request)
+    let response = kin_cli::commands::diff::build_diff_response(&state.layout, &request)
         .map_err(internal_error)?;
     Ok(Json(response))
 }

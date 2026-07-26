@@ -37,7 +37,7 @@ fn capability_json_keeps_the_bounded_dogfood_bar_explicit() {
     assert_eq!(report["schema"], "kin.git-replacement-capabilities.v1");
     assert_eq!(report["substrate"], "repository-v6");
     assert_eq!(report["git_replacement_ready"], false);
-    assert_eq!(report["required_ready"], 7);
+    assert_eq!(report["required_ready"], 8);
     assert_eq!(report["required_total"], 11);
 
     let commands = report["commands"]
@@ -126,5 +126,5 @@ fn top_level_help_marks_open_git_replacement_surfaces() {
     assert!(stdout.contains("capabilities"));
     assert!(stdout.contains("Show coherent repository-v6 workspace status"));
     assert!(stdout.contains("[OPEN GATE] Create an exact semantic and artifact commit"));
-    assert!(stdout.contains("[OPEN GATE] Show exact artifact and semantic changes"));
+    assert!(stdout.contains("Show exact repository-v6 artifact and semantic changes"));
 }

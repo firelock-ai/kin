@@ -82,12 +82,15 @@ enum Command {
         #[command(subcommand)]
         action: BranchAction,
     },
-    /// [OPEN GATE] Show exact artifact and semantic changes between refs
+    /// Show exact repository-v6 artifact and semantic changes
     Diff {
-        /// Base change ID
+        /// Base ref, change ID, Git object ID, HEAD, or ref-hex:<hex>
         base: Option<String>,
-        /// Head change ID
+        /// Head ref, change ID, Git object ID, WORKSPACE, or ref-hex:<hex>
         head: Option<String>,
+        /// Output the exact authority-backed report as JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
     /// [OPEN GATE] Verify the graph-derived projection and detach Kin.
     ///
@@ -1923,7 +1926,7 @@ fn main() -> Result<()> {
                         commands::branch::parse_branch_ref(name.as_deref(), ref_hex.as_deref())?,
                     ),
                 },
-                Command::Diff { .. } => commands::capabilities::require_ready("diff"),
+                Command::Diff { base, head, json } => commands::diff::run(base, head, json),
                 Command::Eject { .. } => commands::capabilities::require_ready("eject"),
                 Command::Impact {
                     entity,
