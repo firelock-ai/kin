@@ -992,10 +992,14 @@ enum BranchAction {
         #[arg(long, value_name = "LOWER_HEX")]
         ref_hex: Option<String>,
     },
-    /// [OPEN GATE] Switch workspace authority and projection atomically
+    /// Switch workspace authority and projection atomically
     Switch {
-        /// Branch name
-        name: String,
+        /// UTF-8 short branch name or fully-qualified refs/heads/... name
+        #[arg(required_unless_present = "ref_hex", conflicts_with = "ref_hex")]
+        name: Option<String>,
+        /// Canonical lowercase hex for a fully-qualified byte-exact branch ref
+        #[arg(long, value_name = "LOWER_HEX")]
+        ref_hex: Option<String>,
     },
 }
 
@@ -1915,9 +1919,9 @@ fn main() -> Result<()> {
                     BranchAction::Delete { name, ref_hex } => commands::branch::delete(
                         commands::branch::parse_branch_ref(name.as_deref(), ref_hex.as_deref())?,
                     ),
-                    BranchAction::Switch { name: _ } => {
-                        commands::capabilities::require_ready("branch switch")
-                    }
+                    BranchAction::Switch { name, ref_hex } => commands::branch::switch(
+                        commands::branch::parse_branch_ref(name.as_deref(), ref_hex.as_deref())?,
+                    ),
                 },
                 Command::Diff { .. } => commands::capabilities::require_ready("diff"),
                 Command::Eject { .. } => commands::capabilities::require_ready("eject"),
