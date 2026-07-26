@@ -2579,12 +2579,12 @@ fn storage(message: String) -> KinDbError {
 mod tests {
     use super::*;
     use kin_model::{
-        compute_resolved_tree_hash, compute_semantic_change_id, AdmissionPolicyDelta,
-        AdmissionRuleSource, AdmissionRuleSourceKind, AdmissionScanToken, ArtifactId, AuthorId,
-        ChangeOrigin, DefaultRefMutation, EffectiveAdmissionPolicyStamp, FrozenLocalOverlayDelta,
-        GitExternalAuthorityDelta, GitObjectFormat, GitRawRef, GitRawTarget, LocatedEntry,
-        RefMutation, RepoPath, ResolvedTree, SemanticChange, TreeDelta, WorkspaceExpectation,
-        WorkspaceMutation, ADMISSION_POLICY_SEMANTICS_VERSION,
+        compute_resolved_tree_hash, compute_semantic_change_id, AdmissionCase,
+        AdmissionPolicyDelta, AdmissionRuleSource, AdmissionRuleSourceKind, AdmissionScanToken,
+        ArtifactId, AuthorId, ChangeOrigin, DefaultRefMutation, EffectiveAdmissionPolicyStamp,
+        FrozenLocalOverlayDelta, GitExternalAuthorityDelta, GitObjectFormat, GitRawRef,
+        GitRawTarget, LocatedEntry, RefMutation, RepoPath, ResolvedTree, SemanticChange, TreeDelta,
+        WorkspaceExpectation, WorkspaceMutation, ADMISSION_POLICY_SEMANTICS_VERSION,
         REPOSITORY_TRANSACTION_SCHEMA_VERSION,
     };
     use parking_lot::Mutex;
@@ -2921,7 +2921,8 @@ mod tests {
         change.id = compute_semantic_change_id(&change).unwrap();
 
         let workspace_id = WorkspaceId::from_uuid(Uuid::from_u128(20));
-        let overlay = FrozenLocalOverlay::new(workspace_id, 0, Vec::new()).unwrap();
+        let overlay =
+            FrozenLocalOverlay::new(workspace_id, 0, AdmissionCase::Sensitive, Vec::new()).unwrap();
         let policy = EffectiveAdmissionPolicyStamp {
             shared: shared.stamp(),
             local: overlay.stamp(),
@@ -2979,7 +2980,8 @@ mod tests {
     ) -> RepositoryTransaction {
         let workspace_id = WorkspaceId::from_uuid(Uuid::from_u128(workspace));
         let shared = SharedAdmissionPolicy::empty(0);
-        let overlay = FrozenLocalOverlay::new(workspace_id, 0, Vec::new()).unwrap();
+        let overlay =
+            FrozenLocalOverlay::new(workspace_id, 0, AdmissionCase::Sensitive, Vec::new()).unwrap();
         let policy = EffectiveAdmissionPolicyStamp {
             shared: shared.stamp(),
             local: overlay.stamp(),
@@ -3267,7 +3269,8 @@ mod tests {
         });
 
         let workspace_id = WorkspaceId::from_uuid(Uuid::from_u128(20));
-        let overlay = FrozenLocalOverlay::new(workspace_id, 0, Vec::new()).unwrap();
+        let overlay =
+            FrozenLocalOverlay::new(workspace_id, 0, AdmissionCase::Sensitive, Vec::new()).unwrap();
         let policy = EffectiveAdmissionPolicyStamp {
             shared: shared.stamp(),
             local: overlay.stamp(),

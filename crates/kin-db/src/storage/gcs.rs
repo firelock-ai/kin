@@ -734,11 +734,11 @@ mod tests {
     use futures_util::stream::BoxStream;
     use futures_util::StreamExt;
     use kin_model::{
-        compute_resolved_tree_hash, AdmissionScanToken, AuthorId, DefaultRefExpectation,
-        DefaultRefMutation, EffectiveAdmissionPolicyStamp, FrozenLocalOverlay,
-        FrozenLocalOverlayDelta, OperationId, RefName, RepositoryId, RepositoryTransaction,
-        ResolvedTree, SharedAdmissionPolicy, WorkspaceExpectation, WorkspaceHead, WorkspaceId,
-        WorkspaceMutation, ADMISSION_POLICY_SEMANTICS_VERSION,
+        compute_resolved_tree_hash, AdmissionCase, AdmissionScanToken, AuthorId,
+        DefaultRefExpectation, DefaultRefMutation, EffectiveAdmissionPolicyStamp,
+        FrozenLocalOverlay, FrozenLocalOverlayDelta, OperationId, RefName, RepositoryId,
+        RepositoryTransaction, ResolvedTree, SharedAdmissionPolicy, WorkspaceExpectation,
+        WorkspaceHead, WorkspaceId, WorkspaceMutation, ADMISSION_POLICY_SEMANTICS_VERSION,
         REPOSITORY_TRANSACTION_SCHEMA_VERSION,
     };
     use object_store::memory::InMemory;
@@ -979,7 +979,8 @@ mod tests {
         };
         let tree_hash = compute_resolved_tree_hash(&ResolvedTree::default()).unwrap();
         let shared = SharedAdmissionPolicy::empty(0);
-        let overlay = FrozenLocalOverlay::new(workspace_id, 0, Vec::new()).unwrap();
+        let overlay =
+            FrozenLocalOverlay::new(workspace_id, 0, AdmissionCase::Sensitive, Vec::new()).unwrap();
         let policy = EffectiveAdmissionPolicyStamp {
             shared: shared.stamp(),
             local: overlay.stamp(),
