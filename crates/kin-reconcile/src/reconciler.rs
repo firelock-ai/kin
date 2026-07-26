@@ -214,20 +214,22 @@ impl Reconciler {
         blob_store: &BlobStore,
         graph: &G,
     ) -> Result<ReconcileResult> {
-        let path = match event {
+        let event_path = match event {
             FileEvent::Changed(path) | FileEvent::Removed(path) => path,
         };
+        let comparable_path = self.comparable_event_path(event_path);
+        let path = comparable_path.as_path();
         if !self.should_track_path(path) {
             debug!(
-                file = %path.display(),
+                file = %event_path.display(),
                 "excluded path reached reconcile; purging any existing graph state"
             );
             return self.reconcile_file_removal(path, graph);
         }
 
         match event {
-            FileEvent::Changed(path) => self.reconcile_file_edit(path, blob_store, graph),
-            FileEvent::Removed(path) => {
+            FileEvent::Changed(_) => self.reconcile_file_edit(path, blob_store, graph),
+            FileEvent::Removed(_) => {
                 // RACE CONDITION HARDENING: Verify the file is still absent
                 // before committing entity removals. Editors that do atomic
                 // saves (write temp → delete old → rename temp) produce a
@@ -243,6 +245,50 @@ impl Reconciler {
                     return self.reconcile_file_edit(path, blob_store, graph);
                 }
                 self.reconcile_file_removal(path, graph)
+            }
+        }
+    }
+
+    /// Return a physical path that can be compared with the canonical
+    /// repository root without dereferencing the event entry itself.
+    ///
+    /// macOS reports temporary-directory events through `/var` even when the
+    /// repository root was opened through its canonical `/private/var` spelling.
+    /// Canonicalizing only the closest existing parent preserves the identity of
+    /// symlinks and removed paths while eliminating that alias. Missing parent
+    /// components are appended lexically after the existing ancestor resolves.
+    fn comparable_event_path(&self, path: &Path) -> PathBuf {
+        if path.strip_prefix(&self.working_dir).is_ok() {
+            return path.to_path_buf();
+        }
+
+        let Some(name) = path.file_name() else {
+            return path.to_path_buf();
+        };
+        let Some(mut ancestor) = path.parent() else {
+            return path.to_path_buf();
+        };
+        let mut missing = Vec::new();
+
+        loop {
+            match ancestor.canonicalize() {
+                Ok(mut canonical) => {
+                    for component in missing.iter().rev() {
+                        canonical.push(component);
+                    }
+                    canonical.push(name);
+                    return canonical;
+                }
+                Err(_) => {
+                    let Some(component) = ancestor.file_name() else {
+                        return path.to_path_buf();
+                    };
+                    missing.push(component.to_os_string());
+                    let Some(parent) = ancestor.parent() else {
+                        return path.to_path_buf();
+                    };
+                    ancestor = parent;
+                }
             }
         }
     }
@@ -270,7 +316,11 @@ impl Reconciler {
     ) -> Result<ReconcileResult> {
         match (event, edit_hint) {
             (FileEvent::Changed(path), Some(hint)) => {
-                self.reconcile_file_edit_incremental(path, blob_store, graph, hint)
+                let comparable_path = self.comparable_event_path(path);
+                if !self.should_track_path(&comparable_path) {
+                    return self.reconcile_file_removal(&comparable_path, graph);
+                }
+                self.reconcile_file_edit_incremental(&comparable_path, blob_store, graph, hint)
             }
             // Delegate to reconcile_file_change which handles the
             // removal-but-file-exists race condition.

@@ -150,6 +150,29 @@ struct ExactTreeAdmission {
 }
 
 fn repo_path(path: &Path, working_dir: &Path) -> Result<Option<RepoPath>> {
+    // `KinLayout` holds a canonical repository root, while macOS file events
+    // can retain the `/var` spelling of the same `/private/var` path. Resolve
+    // only the parent directory so a dangling symlink or removed entry keeps
+    // its own identity instead of being dereferenced (or rejected as missing).
+    let comparable_path;
+    let path = if path.strip_prefix(working_dir).is_ok() {
+        path
+    } else {
+        let parent = path.parent().ok_or_else(|| {
+            DaemonError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("filesystem event has no parent: {}", path.display()),
+            ))
+        })?;
+        let name = path.file_name().ok_or_else(|| {
+            DaemonError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("filesystem event has no entry name: {}", path.display()),
+            ))
+        })?;
+        comparable_path = parent.canonicalize().map_err(DaemonError::Io)?.join(name);
+        comparable_path.as_path()
+    };
     let relative = path.strip_prefix(working_dir).map_err(|error| {
         DaemonError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,

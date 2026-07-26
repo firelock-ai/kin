@@ -564,12 +564,15 @@ mod tests {
         blob_store: &BlobStore,
         file_path: &std::path::Path,
     ) -> ReconcileResult {
-        let relative = file_path
+        let canonical_file = file_path
+            .canonicalize()
+            .expect("test file path must canonicalize");
+        let relative = canonical_file
             .strip_prefix(state.layout.working_dir())
             .expect("test file must be inside the repository");
         let repo_path =
             RepoPath::from_utf8(relative.to_string_lossy().into_owned()).expect("valid test path");
-        let content = std::fs::read(file_path).expect("test file must be readable");
+        let content = std::fs::read(&canonical_file).expect("test file must be readable");
         let hash = blob_store
             .write(&content)
             .map(|hash| Hash256::from_bytes(hash.0))
