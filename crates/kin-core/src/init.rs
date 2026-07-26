@@ -6,14 +6,13 @@ use std::sync::Arc;
 
 use kin_db::{LocalFileBackend, RepositoryAuthorityManager, StorageBackend};
 use kin_model::{
-    compute_resolved_tree_hash, AdmissionPolicyDelta, AdmissionScanToken, AuthorId,
+    compute_resolved_tree_hash, AdmissionCase, AdmissionPolicyDelta, AuthorId,
     DefaultRefExpectation, DefaultRefMutation, EffectiveAdmissionPolicyStamp, FrozenLocalOverlay,
     FrozenLocalOverlayDelta, GitRawTarget, Hash256, OperationId, RefExpectation, RefMutation,
     RefName, RefTarget, RefUpdatePolicy, RepositoryAuthorityStore, RepositoryCommitReceipt,
     RepositoryId, RepositoryTransaction, RootBundle, SemanticChange, SemanticChangeId,
     SharedAdmissionPolicy, WorkspaceExpectation, WorkspaceHead, WorkspaceId, WorkspaceMutation,
-    WorkspaceSnapshotBinding, ADMISSION_POLICY_SEMANTICS_VERSION,
-    REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+    WorkspaceSnapshotBinding, REPOSITORY_TRANSACTION_SCHEMA_VERSION,
 };
 use sha2::{Digest, Sha256};
 use tracing::info;
@@ -236,10 +235,12 @@ pub fn init(working_dir: &Path) -> Result<InitResult> {
     })?;
     let staging_dir = staging_parent.join(format!(".kin.init-{}", uuid::Uuid::new_v4()));
     let mut prepared = prepare_repository_layout_at(&staging_dir, config, manifest)?;
+    let admission_case = detect_admission_case(prepared.layout.root())?;
     let transaction = build_repository_bootstrap_transaction(
         prepared.initial_roots().clone(),
         prepared.repository_id().clone(),
         prepared.workspace_id(),
+        admission_case,
         prepared.default_ref().clone(),
         SharedAdmissionPolicy::empty(0),
         None,
@@ -256,6 +257,29 @@ pub fn init(working_dir: &Path) -> Result<InitResult> {
     );
 
     Ok(result)
+}
+
+fn detect_admission_case(workspace_root: &Path) -> Result<AdmissionCase> {
+    let probe = tempfile::Builder::new()
+        .prefix(".kin-case-probe-a-")
+        .tempfile_in(workspace_root)
+        .map_err(|error| KinError::io(workspace_root, error))?;
+    let name = probe
+        .path()
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .ok_or_else(|| KinError::Other("case probe produced a non-UTF-8 file name".to_string()))?;
+    let folded_name = name.replacen(".kin-case-probe-a-", ".kin-case-probe-A-", 1);
+    if folded_name == name {
+        return Err(KinError::Other(
+            "case probe could not construct a distinct ASCII-folded path".to_string(),
+        ));
+    }
+    match std::fs::symlink_metadata(workspace_root.join(folded_name)) {
+        Ok(_) => Ok(AdmissionCase::FoldAscii),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(AdmissionCase::Sensitive),
+        Err(error) => Err(KinError::io(workspace_root, error)),
+    }
 }
 
 /// Create a complete unpublished repository layout at an explicit staging
@@ -504,6 +528,7 @@ pub fn initialize_repository_authority<B>(
     authority: &RepositoryAuthorityManager<B>,
     repository_id: RepositoryId,
     workspace_id: WorkspaceId,
+    admission_case: AdmissionCase,
     default_ref: RefName,
     shared_policy: SharedAdmissionPolicy,
     initial_change: Option<SemanticChange>,
@@ -517,6 +542,7 @@ where
         initial_roots.clone(),
         repository_id.clone(),
         workspace_id,
+        admission_case,
         default_ref,
         shared_policy,
         initial_change,
@@ -535,6 +561,7 @@ fn build_repository_bootstrap_transaction(
     initial_roots: RootBundle,
     repository_id: RepositoryId,
     workspace_id: WorkspaceId,
+    admission_case: AdmissionCase,
     default_ref: RefName,
     shared_policy: SharedAdmissionPolicy,
     initial_change: Option<SemanticChange>,
@@ -567,8 +594,6 @@ fn build_repository_bootstrap_transaction(
     let tree = kin_model::ResolvedTree::default()
         .apply(&tree_deltas)
         .map_err(|error| KinError::Other(error.to_string()))?;
-    let empty_tree_hash = compute_resolved_tree_hash(&kin_model::ResolvedTree::default())
-        .map_err(|error| KinError::Other(error.to_string()))?;
     let tree_hash =
         compute_resolved_tree_hash(&tree).map_err(|error| KinError::Other(error.to_string()))?;
     let base_target = initial_change_id.map(RefTarget::change);
@@ -576,7 +601,7 @@ fn build_repository_bootstrap_transaction(
     let workspace_head = WorkspaceHead::Symbolic {
         target: default_ref.clone(),
     };
-    let local_overlay = FrozenLocalOverlay::new(workspace_id, 0, Vec::new())
+    let local_overlay = FrozenLocalOverlay::new(workspace_id, 0, admission_case, Vec::new())
         .map_err(|error| KinError::Other(error.to_string()))?;
     let admission_policy = EffectiveAdmissionPolicyStamp {
         shared: shared_policy.stamp(),
@@ -618,17 +643,6 @@ fn build_repository_bootstrap_transaction(
         }),
         workspace_mutation: Some(workspace_mutation),
         local_overlay_delta: Some(FrozenLocalOverlayDelta::initialize(local_overlay)),
-        admission_scan_token: Some(AdmissionScanToken {
-            repository_id: repository_id.clone(),
-            workspace_id,
-            workspace_generation: 0,
-            workspace_head,
-            baseline_tree_hash: empty_tree_hash,
-            observed_tree_hash: tree_hash,
-            matcher_semantics_version: ADMISSION_POLICY_SEMANTICS_VERSION,
-            shared_policy: admission_policy.shared,
-            local_overlay: admission_policy.local,
-        }),
     };
 
     if let Some(change_id) = initial_change_id {
@@ -1123,6 +1137,7 @@ mod tests {
             prepared.initial_roots().clone(),
             prepared.repository_id().clone(),
             prepared.workspace_id(),
+            AdmissionCase::Sensitive,
             prepared.default_ref().clone(),
             SharedAdmissionPolicy::empty(0),
             None,
@@ -1276,6 +1291,7 @@ mod tests {
             prepared.initial_roots().clone(),
             prepared.repository_id().clone(),
             prepared.workspace_id(),
+            AdmissionCase::Sensitive,
             prepared.default_ref().clone(),
             SharedAdmissionPolicy::empty(0),
             None,
@@ -1373,12 +1389,7 @@ mod tests {
             expected: DefaultRefExpectation::MustBeUnset,
             new_default: Some(git_default),
         });
-        transaction.workspace_mutation.as_mut().unwrap().new_head = git_head.clone();
-        transaction
-            .admission_scan_token
-            .as_mut()
-            .unwrap()
-            .workspace_head = git_head;
+        transaction.workspace_mutation.as_mut().unwrap().new_head = git_head;
 
         validate_bootstrap_transaction(
             &transaction,
@@ -1521,6 +1532,7 @@ mod tests {
             &authority,
             repository_id.clone(),
             workspace_id,
+            AdmissionCase::Sensitive,
             default_ref.clone(),
             shared_policy.clone(),
             Some(initial_change.clone()),
