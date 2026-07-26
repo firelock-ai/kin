@@ -1733,6 +1733,7 @@ fn load_exact_body<B: StorageBackend + ?Sized>(
             body_len
         )));
     }
+    verify_source_blob_digest(*digest.as_bytes(), &body, label)?;
     Ok(body)
 }
 
@@ -3394,6 +3395,32 @@ mod tests {
         assert!(
             error.to_string().contains("digest mismatch"),
             "unexpected tamper error: {error}"
+        );
+    }
+
+    #[test]
+    fn exact_length_authority_body_reads_reject_same_length_tampering() {
+        let backend = Arc::new(MemoryBackend::default());
+        let manager = initial_manager(Arc::clone(&backend));
+        let body = b"policy=allow\n";
+        let body_hash = digest(body);
+        manager.save_source_blob(body_hash, body).unwrap();
+        backend
+            .blobs
+            .lock()
+            .insert(*body_hash.as_bytes(), b"policy=block\n".to_vec());
+
+        let error = load_exact_body(
+            backend.as_ref(),
+            &repository_id(),
+            body_hash,
+            body.len() as u64,
+            "shared policy source",
+        )
+        .expect_err("same-length tampering must not satisfy an exact authority read");
+        assert!(
+            error.to_string().contains("digest mismatch"),
+            "unexpected exact-body tamper error: {error}"
         );
     }
 
