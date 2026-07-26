@@ -11239,6 +11239,7 @@ mod tests {
         change.id = kin_core::compute_semantic_change_id(&change).unwrap();
         state.graph.create_change(&change).unwrap();
         state.graph.upsert_entity(&entity).unwrap();
+        let change_ref = format!("change:{}", change.id);
 
         let app = router(state);
         let blame_response = app
@@ -11249,6 +11250,7 @@ mod tests {
                     .body(Body::from(
                         serde_json::json!({
                             "entity": "handler",
+                            "reference": change_ref.as_str(),
                         })
                         .to_string(),
                     ))
@@ -11272,6 +11274,7 @@ mod tests {
                     .body(Body::from(
                         serde_json::json!({
                             "entity": "handler",
+                            "reference": change_ref.as_str(),
                         })
                         .to_string(),
                     ))
@@ -11326,6 +11329,7 @@ mod tests {
         change.id = kin_core::compute_semantic_change_id(&change).unwrap();
         state.graph.create_change(&change).unwrap();
         state.graph.upsert_entity(&entity).unwrap();
+        let change_ref = format!("change:{}", change.id);
 
         // Subscribe before issuing any request so every broadcast is observable.
         let mut events = state.event_tx.subscribe();
@@ -11338,7 +11342,11 @@ mod tests {
                     Request::post(endpoint)
                         .header("content-type", "application/json")
                         .body(Body::from(
-                            serde_json::json!({ "entity": "handler" }).to_string(),
+                            serde_json::json!({
+                                "entity": "handler",
+                                "reference": change_ref.as_str(),
+                            })
+                            .to_string(),
                         ))
                         .unwrap(),
                 )
