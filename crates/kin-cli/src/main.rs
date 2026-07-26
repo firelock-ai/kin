@@ -89,11 +89,10 @@ enum Command {
         /// Head change ID
         head: Option<String>,
     },
-    /// [OPEN GATE] Verify the graph-derived projection and detach Kin.
+    /// Verify graph-derived projection, install exact Git, and detach Kin.
     ///
-    /// The acceptance gate requires every graph-owned artifact and blob to
-    /// match one durable projection generation before metadata can be detached.
-    /// Until that executor lands, this command fails before repository discovery.
+    /// Every graph-owned artifact and blob must match one durable authority
+    /// generation before metadata can be detached.
     Eject {
         /// Skip the typed "eject" confirmation.
         #[arg(long)]
@@ -699,7 +698,7 @@ enum Command {
         #[command(subcommand)]
         action: GraphAction,
     },
-    /// Git interop commands (currently fail-closed pending exact export)
+    /// Exact Git interoperability projections
     Git {
         #[command(subcommand)]
         action: GitAction,
@@ -1132,14 +1131,11 @@ enum CacheAction {
 
 #[derive(Subcommand)]
 enum GitAction {
-    /// [OPEN GATE] Export exact objects, refs, aliases, and source CAS to Git
+    /// Export exact objects, refs, aliases, and source CAS to a new Git repo
     Export {
-        /// Target directory
+        /// New target directory (must be outside the Kin working repository)
         #[arg(short, long)]
-        output: Option<String>,
-        /// Allow exporting directly into the checked-out Git working repository
-        #[arg(long, default_value_t = false)]
-        in_place: bool,
+        output: PathBuf,
     },
 }
 
@@ -1924,7 +1920,10 @@ fn main() -> Result<()> {
                     ),
                 },
                 Command::Diff { .. } => commands::capabilities::require_ready("diff"),
-                Command::Eject { .. } => commands::capabilities::require_ready("eject"),
+                Command::Eject {
+                    yes,
+                    purge_metadata,
+                } => commands::eject::run(yes, purge_metadata).await,
                 Command::Impact {
                     entity,
                     depth,
@@ -2549,7 +2548,9 @@ fn main() -> Result<()> {
                     GraphAction::Body { entity, json } => commands::graph::body(entity, json).await,
                     GraphAction::Viz { port, open } => commands::graph_viz::run(port, open).await,
                 },
-                Command::Git { action: _ } => commands::capabilities::require_ready("git export"),
+                Command::Git { action } => match action {
+                    GitAction::Export { output } => commands::git::export(output),
+                },
                 Command::Intent { action } => match action {
                     IntentAction::List => commands::intent::list().await,
                     IntentAction::Register {
@@ -2891,17 +2892,15 @@ mod tests {
                 );
             }
 
-            let cli = Cli::try_parse_from(["kin", "git", "export", "--in-place"])
+            let cli = Cli::try_parse_from(["kin", "git", "export", "--output", "../export.git"])
                 .expect("exact Git export remains the explicit interoperability surface");
             assert!(matches!(
                 cli.command,
                 Command::Git {
-                    action: GitAction::Export {
-                        output: None,
-                        in_place: true
-                    }
-                }
+                    action: GitAction::Export { output }
+                } if output.as_path() == std::path::Path::new("../export.git")
             ));
+            assert!(Cli::try_parse_from(["kin", "git", "export", "--in-place"]).is_err());
         });
     }
 
