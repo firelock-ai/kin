@@ -37,7 +37,7 @@ fn capability_json_keeps_the_bounded_dogfood_bar_explicit() {
     assert_eq!(report["schema"], "kin.git-replacement-capabilities.v1");
     assert_eq!(report["substrate"], "repository-v6");
     assert_eq!(report["git_replacement_ready"], false);
-    assert_eq!(report["required_ready"], 3);
+    assert_eq!(report["required_ready"], 4);
     assert_eq!(report["required_total"], 11);
 
     let commands = report["commands"]
