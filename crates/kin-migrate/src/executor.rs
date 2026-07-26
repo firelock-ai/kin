@@ -196,6 +196,12 @@ pub fn execute_migration_persisted(plan: &MigrationPlan) -> Result<MigrationResu
         // Close the time-of-check/time-of-use window before making `.kin`
         // visible in the source worktree.
         verify_same_target_source(&effective.plan, Some(&imported_head.git_oid))?;
+        kin_projection::verify_resolved_tree_materialization(
+            &effective.plan.target,
+            &imported_head.tree,
+            &blob_store,
+        )
+        .map_err(|error| MigrateError::Projection(error.to_string()))?;
         publish_in_place(&control_root, &effective.plan.target)?;
     } else {
         let publish_root = transaction.path().join("repository");
@@ -1015,6 +1021,37 @@ mod tests {
         let error = execute_migration_persisted(&plan(&source, None, MigrationStrategy::Snapshot))
             .unwrap_err();
         assert!(error.to_string().contains("no untracked files"));
+        assert!(!source.join(".kin").exists());
+    }
+
+    #[test]
+    fn hidden_in_place_byte_drift_is_refused_before_publication() {
+        let workspace = tempfile::tempdir().unwrap();
+        let source = workspace.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        if !init_git(&source) {
+            return;
+        }
+        std::fs::write(source.join("tracked.txt"), "committed\n").unwrap();
+        assert!(commit_all(&source, "initial"));
+        assert!(git(
+            &source,
+            &["update-index", "--assume-unchanged", "tracked.txt"]
+        ));
+        std::fs::write(source.join("tracked.txt"), "hidden local bytes\n").unwrap();
+        assert!(
+            git_output(
+                &source,
+                &["status", "--porcelain=v1", "-z", "--untracked-files=all"]
+            )
+            .unwrap()
+            .is_empty(),
+            "fixture must prove Git status hides the byte drift"
+        );
+
+        let error = execute_migration_persisted(&plan(&source, None, MigrationStrategy::Snapshot))
+            .unwrap_err();
+        assert!(error.to_string().contains("file bytes changed"));
         assert!(!source.join(".kin").exists());
     }
 

@@ -29,4 +29,7 @@ pub use layout_tracker::{build_layout, entity_at_offset, entity_byte_range, upda
 pub use living_docs::generate_living_docs;
 pub use placement::{decide_placement, generate_file_template, PlacementDecision};
 pub use splice::{apply_splices, reconstruct_file, splice_entity, Splice};
-pub use tree::{materialize_resolved_tree, transition_resolved_tree, TreeProjectionReport};
+pub use tree::{
+    materialize_resolved_tree, transition_resolved_tree, verify_resolved_tree_materialization,
+    TreeProjectionReport,
+};

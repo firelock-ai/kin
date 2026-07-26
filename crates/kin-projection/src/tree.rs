@@ -134,6 +134,27 @@ pub fn materialize_resolved_tree(
     })
 }
 
+/// Verify that every entry in an exact graph tree is represented byte-for-byte
+/// by an existing filesystem projection.
+///
+/// This is intentionally read-only and does not infer repository membership
+/// from the filesystem. Callers remain responsible for rejecting untracked
+/// occupants through their compatibility boundary. Gitlinks fail with the
+/// same typed error as materialization because a repository pointer is not
+/// itself a complete filesystem projection.
+pub fn verify_resolved_tree_materialization(
+    root: &Path,
+    tree: &ResolvedTree,
+    blobs: &BlobStore,
+) -> Result<()> {
+    ensure_projection_root(root)?;
+    let plan = TreePlan::from_resolved(tree)?;
+    for entry in plan.by_path.values() {
+        validate_existing_entry(root, entry, blobs)?;
+    }
+    Ok(())
+}
+
 /// Reconcile an existing working-copy projection from one exact graph tree to
 /// another.
 ///
@@ -918,6 +939,29 @@ mod tests {
                 Path::new("regular.txt")
             );
         }
+    }
+
+    #[test]
+    fn verifies_exact_materialization_and_detects_hidden_byte_drift() {
+        let (_blob_dir, blobs) = blob_store();
+        let content = blobs.write(b"graph bytes\n").unwrap();
+        let tree = tree([artifact(
+            path("tracked.txt"),
+            TreeEntry::blob(content, false),
+        )]);
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("checkout");
+        materialize_resolved_tree(&root, &tree, &blobs).unwrap();
+
+        verify_resolved_tree_materialization(&root, &tree, &blobs).unwrap();
+        fs::write(root.join("tracked.txt"), b"hidden local bytes\n").unwrap();
+        let error = verify_resolved_tree_materialization(&root, &tree, &blobs).unwrap_err();
+        assert!(matches!(
+            error,
+            ProjectionError::LocalModification { path, reason }
+                if path == RepoPath::from_utf8("tracked.txt").unwrap()
+                    && reason == "file bytes changed"
+        ));
     }
 
     #[test]
