@@ -8,21 +8,23 @@
 //! CAS, and one persisted repository-authority lease. History, exact tree,
 //! workspace base, and the named ref advance in one storage compare-and-swap.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use kin_db::{LocalFileBackend, RepositoryAuthorityManager};
 use kin_model::{
     compute_resolved_tree_hash, compute_semantic_change_id, AuthorId, ChangeOrigin,
     EffectiveAdmissionPolicyStamp, Hash256, ModelError, OperationId, RefExpectation, RefMutation,
-    RefName, RefTarget, RefUpdatePolicy, RepositoryCommitReceipt, RepositoryId,
-    RepositoryTransaction, RootBundle, SemanticChange, SemanticChangeId, SharedAdmissionPolicy,
-    Timestamp, WorkspaceExpectation, WorkspaceHead, WorkspaceId, WorkspaceMutation,
-    REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+    RefName, RefTarget, RefUpdatePolicy, RepositoryCommitOutcome, RepositoryCommitReceipt,
+    RepositoryId, RepositoryTransaction, RootBundle, SemanticChange, SemanticChangeId,
+    SharedAdmissionPolicy, Timestamp, WorkspaceExpectation, WorkspaceHead, WorkspaceId,
+    WorkspaceMutation, REPOSITORY_TRANSACTION_SCHEMA_VERSION,
 };
 
 use crate::commit_deltas::compute_deltas_vs_repository_authority;
 use crate::error::{DaemonError, Result};
+
+type ProjectionEntry = (kin_model::RepoPath, kin_model::TreeEntry, Arc<[u8]>);
 
 /// Complete immutable plan for one native repository transaction.
 ///
@@ -74,6 +76,272 @@ pub struct WorkspaceAdmissionResult {
     pub workspace_id: WorkspaceId,
     pub tree_hash: Hash256,
     pub file_count: usize,
+}
+
+/// Immutable session-reconcile plan bound to the authority lease captured when
+/// the disposable session was materialized.
+pub struct SessionWorkspaceAdmissionPlan {
+    pub transaction: RepositoryTransaction,
+    pub previous_tree: kin_model::ResolvedTree,
+    pub target_tree: kin_model::ResolvedTree,
+    pub deltas: Vec<kin_model::TreeDelta>,
+    pub workspace_id: WorkspaceId,
+    source_hashes: Vec<Hash256>,
+    recovered_receipt: Option<RepositoryCommitReceipt>,
+}
+
+#[derive(Debug)]
+pub struct SessionWorkspaceAdmissionResult {
+    pub receipt: RepositoryCommitReceipt,
+    pub workspace_id: WorkspaceId,
+    pub tree_hash: Hash256,
+    pub file_count: usize,
+    pub idempotent_replay: bool,
+}
+
+/// Build one exact session admission against the session's retained roots and
+/// complete source workspace.
+///
+/// Unlike the ambient filesystem synchronizer, this never silently rebases
+/// onto a newer workspace. The only accepted moved-authority state is the
+/// exact durable receipt for this session's caller-stable operation and
+/// transaction hash.
+pub fn plan_session_workspace_admission(
+    layout: &kin_core::KinLayout,
+    blobs: &kin_blobs::BlobStore,
+    base: &kin_cli::commands::session_workspace::SessionWorkspaceBase,
+    desired_tree: &kin_model::ResolvedTree,
+) -> Result<SessionWorkspaceAdmissionPlan> {
+    let (repository_id, workspace_id) = repository_identity(layout)?;
+    if base.repository_id != repository_id
+        || base.source_workspace.repository_id != repository_id
+        || base.source_workspace.workspace_id != workspace_id
+    {
+        return Err(invalid(
+            "session base repository/workspace identity does not match this repository",
+        ));
+    }
+    base.authority_roots.validate()?;
+    base.source_workspace.validate()?;
+    let deltas = kin_core::exact_tree_correction(&base.source_workspace.tree, desired_tree)?;
+    if deltas.is_empty() {
+        return Err(invalid(
+            "session workspace admission planner rejects empty transitions",
+        ));
+    }
+
+    let authority = open_authority(layout, repository_id.clone())?;
+    let mut source_lengths = std::collections::BTreeMap::new();
+    let (shared_policy, _) = SharedAdmissionPolicy::derive_from_tree(
+        Some(&base.source_workspace.shared_admission_policy),
+        desired_tree,
+        |hash| {
+            if let Some(length) = source_lengths.get(&hash) {
+                return Ok(*length);
+            }
+            let blob_hash = kin_blobs::Hash256::from_bytes(*hash.as_bytes());
+            let body = match blobs.read(&blob_hash) {
+                Ok(body) => body,
+                Err(ingestion_error) => authority
+                    .load_source_blob(hash)
+                    .map_err(|error| {
+                        ModelError::InvalidOperation(format!(
+                            "read repository source {hash} while deriving exact session policy: \
+                             {error}"
+                        ))
+                    })?
+                    .ok_or_else(|| {
+                        ModelError::InvalidOperation(format!(
+                            "exact session admission-policy source {hash} is absent from both \
+                             ingestion and repository CAS ({ingestion_error})"
+                        ))
+                    })?,
+            };
+            let length = u64::try_from(body.len()).map_err(|_| {
+                ModelError::InvalidOperation(format!(
+                    "exact session admission-policy source {hash} exceeds u64"
+                ))
+            })?;
+            source_lengths.insert(hash, length);
+            Ok(length)
+        },
+    )?;
+    let tree_hash = compute_resolved_tree_hash(desired_tree)?;
+    let new_generation = base
+        .source_workspace
+        .generation
+        .checked_add(1)
+        .ok_or_else(|| invalid("session workspace generation exhausted"))?;
+    let transaction = RepositoryTransaction {
+        schema_version: REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+        operation_id: base.reconcile_operation_id,
+        repository_id: repository_id.clone(),
+        expected_generation: base.authority_roots.generation,
+        expected_roots: base.authority_roots.clone(),
+        actor: AuthorId::new("kin-session-reconcile"),
+        reason: "admit exact disposable-session observation".to_string(),
+        external_objects: Vec::new(),
+        git_authority_delta: None,
+        changes: Vec::new(),
+        aliases: Vec::new(),
+        ref_mutations: Vec::new(),
+        default_ref_mutation: None,
+        workspace_mutation: Some(WorkspaceMutation {
+            workspace_id,
+            expected: WorkspaceExpectation::MustEqual {
+                generation: base.source_workspace.generation,
+                head: base.source_workspace.head.clone(),
+                base_target: base.source_workspace.base_target.clone(),
+                base_tree_hash: base.source_workspace.base_tree_hash,
+                tree_hash: base.source_workspace.tree_hash,
+                admission_policy: base.source_workspace.admission_policy,
+            },
+            new_generation,
+            new_head: base.source_workspace.head.clone(),
+            new_base_target: base.source_workspace.base_target.clone(),
+            new_base_tree_hash: base.source_workspace.base_tree_hash,
+            tree_deltas: deltas.clone(),
+            new_tree_hash: tree_hash,
+            new_shared_admission_policy: shared_policy.clone(),
+            new_admission_policy: EffectiveAdmissionPolicyStamp {
+                shared: shared_policy.stamp(),
+                local: base.source_workspace.admission_policy.local,
+            },
+        }),
+        local_overlay_delta: None,
+    };
+    transaction.validate()?;
+    let transaction_hash = transaction.transaction_hash()?;
+
+    let mut source_hashes = BTreeSet::new();
+    for delta in &deltas {
+        if let Some(hash) = delta
+            .new_state()
+            .and_then(|located| located.entry.blob_identity())
+        {
+            source_hashes.insert(hash);
+        }
+    }
+    source_hashes.extend(shared_policy.sources.iter().map(|source| source.body_hash));
+
+    let lease = authority.read_authority();
+    let current_workspace = lease
+        .metadata()
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.workspace_id == workspace_id)
+        .ok_or_else(|| {
+            invalid(format!(
+                "repository authority has no workspace {workspace_id}"
+            ))
+        })?;
+    let exact_base_is_current =
+        lease.roots() == &base.authority_roots && current_workspace == &base.source_workspace;
+    let recovered_receipt = if exact_base_is_current {
+        None
+    } else {
+        let receipt = lease
+            .metadata()
+            .receipts
+            .iter()
+            .find(|receipt| receipt.operation_id == base.reconcile_operation_id)
+            .cloned()
+            .ok_or_else(|| {
+                invalid(
+                    "repository authority moved after session materialization; exact reconcile \
+                     does not silently rebase",
+                )
+            })?;
+        receipt.validate()?;
+        if receipt.transaction_hash != transaction_hash || current_workspace.tree != *desired_tree {
+            return Err(invalid(
+                "session operation already names a different authority transition",
+            ));
+        }
+        Some(receipt)
+    };
+    drop(lease);
+
+    Ok(SessionWorkspaceAdmissionPlan {
+        transaction,
+        previous_tree: base.source_workspace.tree.clone(),
+        target_tree: desired_tree.clone(),
+        deltas,
+        workspace_id,
+        source_hashes: source_hashes.into_iter().collect(),
+        recovered_receipt,
+    })
+}
+
+/// Persist session-observed immutable bodies and linearize the exact primary
+/// projection with one workspace-only repository transaction.
+pub fn commit_session_workspace_admission(
+    layout: &kin_core::KinLayout,
+    blobs: &kin_blobs::BlobStore,
+    plan: SessionWorkspaceAdmissionPlan,
+) -> Result<SessionWorkspaceAdmissionResult> {
+    let (repository_id, _) = repository_identity(layout)?;
+    if plan.transaction.repository_id != repository_id {
+        return Err(invalid(format!(
+            "session admission plan belongs to {}, not {}",
+            plan.transaction.repository_id, repository_id
+        )));
+    }
+    let authority = open_authority(layout, repository_id)?;
+    for hash in &plan.source_hashes {
+        let blob_hash = kin_blobs::Hash256::from_bytes(*hash.as_bytes());
+        match blobs.read(&blob_hash) {
+            Ok(body) => authority.save_source_blob(*hash, &body)?,
+            Err(ingestion_error) => {
+                if authority.load_source_blob(*hash)?.is_none() {
+                    return Err(invalid(format!(
+                        "exact session source {hash} is absent from both ingestion and repository \
+                         CAS ({ingestion_error})"
+                    )));
+                }
+            }
+        }
+    }
+
+    let tree_hash = compute_resolved_tree_hash(&plan.target_tree)?;
+    let (receipt, replayed) = if let Some(receipt) = plan.recovered_receipt {
+        // A prior attempt crossed authority. Recovery must prove that the
+        // primary projection is the same exact complete tree before reporting
+        // success; graph-only members use their typed host proof.
+        let freeze = kin_core::ExactProjectionFreeze::acquire_existing(layout.working_dir())?;
+        let verification = freeze.verify_resolved_tree_from_blobs(&plan.target_tree, blobs)?;
+        freeze.revalidate_resolved_tree_from_blobs(&verification, &plan.target_tree, blobs)?;
+        (receipt, true)
+    } else {
+        let mut body_cache = BTreeMap::new();
+        let target_entries =
+            load_projection_entries(&authority, &plan.target_tree, &mut body_cache)?;
+        let previous_entries =
+            load_projection_entries(&authority, &plan.previous_tree, &mut body_cache)?;
+        let (_, receipt) = kin_core::reconcile_source_tree_and_commit_repository_transaction(
+            layout.working_dir(),
+            &plan.previous_tree,
+            &plan.target_tree,
+            previous_entries
+                .iter()
+                .map(|(path, entry, body)| (path, *entry, body.as_ref())),
+            target_entries
+                .iter()
+                .map(|(path, entry, body)| (path, *entry, body.as_ref())),
+            &authority,
+            plan.transaction,
+        )?;
+        let replayed = receipt.outcome == RepositoryCommitOutcome::IdempotentReplay;
+        (receipt, replayed)
+    };
+    receipt.validate()?;
+    Ok(SessionWorkspaceAdmissionResult {
+        receipt,
+        workspace_id: plan.workspace_id,
+        tree_hash,
+        file_count: plan.deltas.len(),
+        idempotent_replay: replayed,
+    })
 }
 
 /// Atomically publish one exact graph-owned workspace tree.
@@ -619,29 +887,31 @@ pub fn commit_native_plan_with_projection(
         authority.save_source_blob(*hash, &body)?;
     }
 
-    let target_entries = load_projection_entries(&authority, &plan.target_tree)?;
+    let mut body_cache = BTreeMap::new();
+    let target_entries = load_projection_entries(&authority, &plan.target_tree, &mut body_cache)?;
     let (projected, receipt) = if plan.previous_tree == plan.target_tree {
         kin_core::verify_unchanged_source_tree_and_commit_repository_transaction(
             layout.working_dir(),
             &plan.target_tree,
             target_entries
                 .iter()
-                .map(|(path, entry, body)| (path, *entry, body.as_slice())),
+                .map(|(path, entry, body)| (path, *entry, body.as_ref())),
             &authority,
             plan.transaction,
         )?
     } else {
-        let previous_entries = load_projection_entries(&authority, &plan.previous_tree)?;
+        let previous_entries =
+            load_projection_entries(&authority, &plan.previous_tree, &mut body_cache)?;
         kin_core::reconcile_source_tree_and_commit_repository_transaction(
             layout.working_dir(),
             &plan.previous_tree,
             &plan.target_tree,
             previous_entries
                 .iter()
-                .map(|(path, entry, body)| (path, *entry, body.as_slice())),
+                .map(|(path, entry, body)| (path, *entry, body.as_ref())),
             target_entries
                 .iter()
-                .map(|(path, entry, body)| (path, *entry, body.as_slice())),
+                .map(|(path, entry, body)| (path, *entry, body.as_ref())),
             &authority,
             plan.transaction,
         )?
@@ -667,7 +937,8 @@ pub fn commit_native_plan_with_projection(
 fn load_projection_entries(
     authority: &RepositoryAuthorityManager<LocalFileBackend>,
     tree: &kin_model::ResolvedTree,
-) -> Result<Vec<(kin_model::RepoPath, kin_model::TreeEntry, Vec<u8>)>> {
+    body_cache: &mut BTreeMap<Hash256, Arc<[u8]>>,
+) -> Result<Vec<ProjectionEntry>> {
     let mut entries = Vec::with_capacity(materializable_artifact_count(tree)?);
     for artifact in tree.artifacts_by_path() {
         if kin_core::source_projection_disposition(&artifact.path, artifact.entry)?
@@ -681,12 +952,21 @@ fn load_projection_entries(
                 artifact.path
             ))
         })?;
-        let body = authority.load_source_blob(hash)?.ok_or_else(|| {
-            invalid(format!(
-                "repository source CAS is missing {} for {}",
-                hash, artifact.path
-            ))
-        })?;
+        let body = if let Some(body) = body_cache.get(&hash) {
+            Arc::clone(body)
+        } else {
+            let body: Arc<[u8]> = authority
+                .load_source_blob(hash)?
+                .ok_or_else(|| {
+                    invalid(format!(
+                        "repository source CAS is missing {} for {}",
+                        hash, artifact.path
+                    ))
+                })?
+                .into();
+            body_cache.insert(hash, Arc::clone(&body));
+            body
+        };
         entries.push((artifact.path.clone(), artifact.entry, body));
     }
     Ok(entries)

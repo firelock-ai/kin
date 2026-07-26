@@ -40,7 +40,7 @@ fn capability_json_keeps_the_bounded_dogfood_bar_explicit() {
     assert_eq!(report["bounded_dogfood_required_ready"], 11);
     assert_eq!(report["bounded_dogfood_required_total"], 11);
     assert_eq!(report["full_git_replacement_ready"], false);
-    assert_eq!(report["ready_commands"], 13);
+    assert_eq!(report["ready_commands"], 14);
     assert_eq!(report["command_total"], 32);
 
     let commands = report["commands"]

@@ -7,8 +7,8 @@ use std::path::{Component, Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
 use kin_model::{
-    compute_resolved_tree_hash, ArtifactId, RepoPath, ResolvedArtifact, ResolvedTree, RootBundle,
-    WorkspaceState,
+    compute_resolved_tree_hash, ArtifactId, OperationId, RepoPath, ResolvedArtifact, ResolvedTree,
+    RootBundle, WorkspaceState,
 };
 use kin_runtime::workspace::{
     MaterializationSourceKind, MaterializeStrategy, MaterializedWorkspace,
@@ -17,7 +17,9 @@ use serde::{Deserialize, Serialize};
 
 use super::repository_authority::ActiveRepositoryAuthority;
 
-const SESSION_WORKSPACE_BASE_SCHEMA: u32 = 1;
+const SESSION_WORKSPACE_BASE_SCHEMA: u32 = 2;
+const MAX_SESSION_MEMBER_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_SESSION_TOTAL_BYTES: u64 = 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionWorkspaceRequest {
@@ -47,6 +49,12 @@ pub struct SessionWorkspaceResponse {
 #[serde(deny_unknown_fields)]
 pub struct SessionWorkspaceBase {
     pub schema: u32,
+    /// One caller-stable authority operation for this disposable session.
+    ///
+    /// A session is reconciled at most once. Repeating the exact observation
+    /// recovers the same repository receipt; changing the session after that
+    /// receipt fails closed and requires a fresh session projection.
+    pub reconcile_operation_id: OperationId,
     pub repository_id: kin_model::RepositoryId,
     pub authority_roots: RootBundle,
     pub source_workspace: WorkspaceState,
@@ -73,6 +81,12 @@ impl SessionWorkspaceBase {
                 self.source_workspace.repository_id
             );
         }
+        if self.scope.is_some() {
+            bail!(
+                "scoped exact-session bases are fail-closed until the selected artifact set is \
+                 authenticated outside the editable session"
+            );
+        }
         if self
             .materialized_artifact_ids
             .windows(2)
@@ -80,13 +94,28 @@ impl SessionWorkspaceBase {
         {
             bail!("session materialized artifact identities are not unique and sorted");
         }
-        if self.scope.is_none()
-            && self.materialized_artifact_ids.len() != self.source_workspace.tree.len()
-        {
-            bail!("full session base does not account for every exact source artifact");
-        }
-        if self.scope.is_some() && self.materialized_artifact_ids.is_empty() {
-            bail!("scoped session base does not name a materialized artifact");
+        let expected_materialized = self
+            .source_workspace
+            .tree
+            .artifacts()
+            .filter_map(|artifact| {
+                match kin_core::source_projection_disposition(&artifact.path, artifact.entry) {
+                    Ok(kin_core::SourceProjectionDisposition::Materialized) => {
+                        Some(Ok(artifact.artifact_id))
+                    }
+                    Ok(
+                        kin_core::SourceProjectionDisposition::GraphOnlyGitlink
+                        | kin_core::SourceProjectionDisposition::GraphOnlyHostUnrepresentable,
+                    ) => None,
+                    Err(error) => Some(Err(anyhow!(error))),
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if self.materialized_artifact_ids != expected_materialized {
+            bail!(
+                "full session base materialized set does not exactly cover every \
+                 host-representable source artifact"
+            );
         }
 
         let selected = self
@@ -102,6 +131,17 @@ impl SessionWorkspaceBase {
                             "session base names artifact {:?} outside its exact source tree",
                             artifact_id
                         )
+                    })
+                    .and_then(|artifact| {
+                        if kin_core::source_projection_disposition(&artifact.path, artifact.entry)?
+                            != kin_core::SourceProjectionDisposition::Materialized
+                        {
+                            bail!(
+                                "session base marks graph-only artifact {} as materialized",
+                                artifact.path
+                            );
+                        }
+                        Ok(artifact)
                     })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -129,6 +169,12 @@ pub fn create_session_workspace_from_authority(
     layout
         .check_version()
         .context("repository layout is not repository-v6 compatible")?;
+    if scope.is_some() {
+        bail!(
+            "scoped exact-session materialization is fail-closed until its selected artifact set \
+             is authenticated outside the editable session; request a full session"
+        );
+    }
     let session_name = validate_session_directory(layout, session_dir)?;
     require_exact_copy_strategy(strategy)?;
 
@@ -140,21 +186,50 @@ pub fn create_session_workspace_from_authority(
     let authority = ActiveRepositoryAuthority::open(layout)?;
     let (source_workspace, authority_roots) = authority.workspace_with_roots()?;
     let selected_tree = select_materialized_tree(&source_workspace.tree, scope)?;
+    let selected_artifacts = selected_tree
+        .into_artifacts()
+        .map(|artifact| {
+            kin_core::source_projection_disposition(&artifact.path, artifact.entry)
+                .map(|disposition| (artifact, disposition))
+        })
+        .collect::<kin_core::Result<Vec<_>>>()?;
+    let selected_tree = ResolvedTree::from_artifacts(selected_artifacts.into_iter().filter_map(
+        |(artifact, disposition)| {
+            (disposition == kin_core::SourceProjectionDisposition::Materialized).then_some(artifact)
+        },
+    ))
+    .map_err(|error| anyhow!("select host-materializable session tree: {error}"))?;
 
     let mut source_bodies = Vec::with_capacity(selected_tree.len());
+    let mut source_body_bytes = 0_u64;
     for artifact in selected_tree.artifacts_by_path() {
         let digest = artifact.entry.blob_identity().ok_or_else(|| {
             anyhow!(
-                "session projection cannot materialize gitlink {:?} at {}; the exact gitlink \
-                 remains represented in repository authority, but recursive repository \
-                 materialization is not implemented",
-                artifact.entry,
+                "host-materializable session artifact {} has no repository source identity",
                 artifact.path
             )
         })?;
         let body = authority
             .load_source_blob(digest)
             .with_context(|| format!("load exact session source for {}", artifact.path))?;
+        let body_len = u64::try_from(body.len())
+            .map_err(|_| anyhow!("session source {} exceeds u64", artifact.path))?;
+        if body_len > MAX_SESSION_MEMBER_BYTES {
+            bail!(
+                "session source {} exceeds the per-member materialization limit of {} bytes",
+                artifact.path,
+                MAX_SESSION_MEMBER_BYTES
+            );
+        }
+        source_body_bytes = source_body_bytes
+            .checked_add(body_len)
+            .ok_or_else(|| anyhow!("session source byte count overflow"))?;
+        if source_body_bytes > MAX_SESSION_TOTAL_BYTES {
+            bail!(
+                "session source exceeds the total materialization limit of {} bytes",
+                MAX_SESSION_TOTAL_BYTES
+            );
+        }
         source_bodies.push((artifact.path.clone(), artifact.entry, body));
     }
 
@@ -171,6 +246,7 @@ pub fn create_session_workspace_from_authority(
         .collect();
     let base = SessionWorkspaceBase {
         schema: SESSION_WORKSPACE_BASE_SCHEMA,
+        reconcile_operation_id: OperationId::new(),
         repository_id: source_workspace.repository_id.clone(),
         authority_roots,
         source_workspace,
