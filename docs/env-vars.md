@@ -3,7 +3,7 @@
 
 # Kin environment variables
 
-This is the authoritative list of supported `KIN_*` environment variables (409 total, 305 correctness-relevant), generated from the central registry in `kin-core`.
+This is the authoritative list of supported `KIN_*` environment variables (413 total, 309 correctness-relevant), generated from the central registry in `kin-core`.
 
 At CLI and daemon startup Kin validates this surface (`KIN_ENV_VALIDATION`, default `warn`):
 
@@ -357,6 +357,10 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_LOCATE_NON_SOURCE_PENALTY` | float>=0 | 0.02 | correctness | locate tuning knob: non source penalty |
 | `KIN_LOCATE_NO_SIGNAL_PENALTY` | float>=0 | 0.001 | correctness | locate tuning knob: no signal penalty |
 | `KIN_LOCATE_PARSED_ORIGIN_WEIGHT` | float>=0 | 1.0 | correctness | locate tuning knob: parsed origin weight |
+| `KIN_LOCATE_PATH_AFFINITY` | bool | true | correctness | locate tuning knob: path affinity |
+| `KIN_LOCATE_PATH_AFFINITY_BIGRAM_BOOST` | float>=0 | 0.35 | correctness | locate tuning knob: path affinity bigram boost |
+| `KIN_LOCATE_PATH_AFFINITY_FACTOR_CAP` | float>=0 | 1.6 | correctness | locate tuning knob: path affinity factor cap |
+| `KIN_LOCATE_PATH_AFFINITY_TOKEN_BOOST` | float>=0 | 0.06 | correctness | locate tuning knob: path affinity token boost |
 | `KIN_LOCATE_PHASE_BUCKET_FOLLOWER_PENALTY` | float>=0 | 0.32 | correctness | locate tuning knob: phase bucket follower penalty |
 | `KIN_LOCATE_PHASE_ENTITY_DISCOVERY_SECS` | seconds bound (0=unbounded) | 20 | correctness | locate phase budget: entity discovery; 0 = unbounded |
 | `KIN_LOCATE_PHASE_ENTITY_RESOLUTION_SECS` | seconds bound (0=unbounded) | 20 | correctness | locate phase budget: entity resolution; 0 = unbounded |
