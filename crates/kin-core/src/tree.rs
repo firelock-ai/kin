@@ -216,7 +216,6 @@ pub fn reconcile_source_tree_and_commit_repository_transaction<'a, 'b>(
     target_tree: &ResolvedTree,
     previous_entries: impl IntoIterator<Item = (&'b RepoPath, TreeEntry, &'b [u8])>,
     entries: impl IntoIterator<Item = (&'a RepoPath, TreeEntry, &'a [u8])>,
-    should_preserve: impl Fn(&Path) -> bool,
     authority: &RepositoryAuthorityManager<LocalFileBackend>,
     transaction: RepositoryTransaction,
 ) -> Result<(usize, RepositoryCommitReceipt)> {
@@ -240,7 +239,7 @@ pub fn reconcile_source_tree_and_commit_repository_transaction<'a, 'b>(
         root,
         &previous_entries,
         &entries,
-        &should_preserve,
+        &should_preserve_checkout_path,
         || {},
         || {},
         Some(marker),
@@ -716,8 +715,32 @@ fn project_reconciled_source_tree_and_commit<T>(
         // path the switch would mutate is still byte/kind-exact, then validate
         // every target collision. No deletion or replacement occurs until all
         // local-edit and untracked-path conflicts have been rejected.
-        let previous_identities =
-            projection.validate_tracked_entries_unchanged(&affected_previous)?;
+        //
+        // A repository-authority transition additionally proves every tracked
+        // path. Otherwise an unchanged-but-locally-edited file could survive
+        // while the workspace transaction declares the exact target tree
+        // clean, making the physical projection lie about graph authority.
+        let preflight_previous = if authority_commit.is_some() {
+            previous_entries.iter().collect::<Vec<_>>()
+        } else {
+            affected_previous.clone()
+        };
+        let preflight_identities =
+            projection.validate_tracked_entries_unchanged(&preflight_previous)?;
+        let identity_by_path = preflight_previous
+            .iter()
+            .zip(&preflight_identities)
+            .map(|(entry, identity)| (entry.file_id, *identity))
+            .collect::<HashMap<_, _>>();
+        let previous_identities = affected_previous
+            .iter()
+            .map(|entry| {
+                identity_by_path
+                    .get(entry.file_id)
+                    .copied()
+                    .expect("affected entry was included in exact-source preflight")
+            })
+            .collect::<Vec<_>>();
         projection.validate_reconciliation_targets(&entries_to_materialize, &previous, &removed)?;
 
         let mut files_to_delete = Vec::with_capacity(removed_file_ids.len());
@@ -809,7 +832,7 @@ fn project_reconciled_source_tree_and_commit<T>(
 
         after_read_only_preflight();
         projection
-            .revalidate_tracked_entries_unchanged(&affected_previous, &previous_identities)?;
+            .revalidate_tracked_entries_unchanged(&preflight_previous, &preflight_identities)?;
         for (relative, expected_identity) in &directory_identities {
             let actual = projection.relative_directory_identity(relative)?;
             if actual != Some(*expected_identity) {
