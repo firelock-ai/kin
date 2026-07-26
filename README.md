@@ -159,11 +159,11 @@ never answers Kin runtime queries or repairs missing graph truth.
   parent edges. Kin deliberately has no partial-history mode.
 - After import, Kin's graph owns repository identity, tree state, history, refs,
   and semantic relations. Filesystem and Git views are projections.
-- `kin eject` removes `.kin/` graph state and leaves working files and `.git`
-  untouched.
-- `kin eject --revert-files` is a separate, destructive option that restores
-  the pre-init file snapshot after explicit confirmation. It still never
-  modifies `.git`.
+- `kin eject` first proves that the checked-out branch, graph blobs, and working
+  projection agree exactly. It then stops the daemon and atomically moves
+  `.kin/` to a recoverable archive outside the repository, leaving working
+  files and `.git` untouched. `--purge-metadata --yes` permanently removes that
+  archive after the same verification.
 
 This lets a team migrate an existing repository without giving up its editor,
 compiler, build system, or Git interoperability while Kin becomes authoritative.

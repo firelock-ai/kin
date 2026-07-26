@@ -456,31 +456,30 @@ normal use. The escape hatches:
 
 ## 10. Removing Kin
 
-Kin is ejectable — there is no data lock-in. There are two modes, and they
-do different things:
+Kin is ejectable — there is no data lock-in. Eject remains graph-first all the
+way through the exit:
 
 ```sh
-kin eject                 # safe default
+kin eject
 ```
 
-Stops the Kin daemon and removes the `.kin/` directory (the graph and all Kin
-metadata). **Your working files are left exactly as they are** — whatever is on
-disk right now stays on disk. This is the everyday "walk away with my files"
-path.
+Kin resolves the current branch from graph history, verifies every referenced
+blob and every projected file byte, kind, and executable mode, then stops the
+daemon and checks the persisted graph again. If anything is missing, locally
+edited, or raced during shutdown, eject refuses before moving metadata.
+
+On success, working files are not rewritten. `.kin/` is atomically moved to a
+recoverable sibling archive outside the repository, so the directory is no
+longer a Kin repository and a Git checkout does not gain untracked Kin
+metadata. The command prints the exact archive path and recovery instruction.
+
+For an intentional, irreversible removal:
 
 ```sh
-kin eject --revert-files  # destructive: restore the pre-init snapshot
+kin eject --yes --purge-metadata
 ```
 
-Additionally overwrites every working file with the copy Kin snapshotted at
-`kin init`, discarding changes made since. It asks you to type `revert` to
-confirm (use `--yes` to skip the prompt in scripts), and it writes a timestamped
-backup of your current files to `.kin-backup-eject-<timestamp>/` first, so
-nothing is lost. If the snapshot is missing or incomplete, eject refuses and
-touches nothing rather than half-restoring.
-
-**What eject never touches: `.git`.** Kin snapshots your *working tree* at init
-(excluding `.git`, `.kin*`, and ignored paths) and restores those files only. It
-never rewrites or restores the source Git repository. After eject, that
-interoperability repository and its original history remain intact; `git log`,
-`git status`, and `git fsck` work unchanged.
+This performs the same graph/projection checks and atomic detach, then deletes
+the detached archive. Kin never restores an initialization-time filesystem
+snapshot and never rewrites `.git`; Git is only an explicit interoperability
+boundary.
