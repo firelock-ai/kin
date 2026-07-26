@@ -37,6 +37,7 @@ pub mod temporal;
 pub mod timestamp;
 pub mod verification;
 pub mod work;
+pub mod workspace_tree;
 
 // Re-export all public types at crate root for convenience.
 pub use admission::{
@@ -135,4 +136,7 @@ pub use work::{
     Annotation, AnnotationFilter, AnnotationId, AnnotationKind, AnnotationTarget, ExternalRef,
     IdentityKind, IdentityRef, Priority, SemanticAnchor, StalenessState, WorkFilter, WorkId,
     WorkItem, WorkKind, WorkLink, WorkScope, WorkStatus,
+};
+pub use workspace_tree::{
+    WorkspaceTreeArtifact, WorkspaceTreeSnapshot, WORKSPACE_TREE_SNAPSHOT_SCHEMA_VERSION,
 };

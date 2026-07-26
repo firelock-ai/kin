@@ -94,6 +94,14 @@ fn main() {
             serde_json::to_string_pretty(&schema_for!(kin_model::WorkspaceMutation)).unwrap(),
         ),
         (
+            "WorkspaceTreeArtifact",
+            serde_json::to_string_pretty(&schema_for!(kin_model::WorkspaceTreeArtifact)).unwrap(),
+        ),
+        (
+            "WorkspaceTreeSnapshot",
+            serde_json::to_string_pretty(&schema_for!(kin_model::WorkspaceTreeSnapshot)).unwrap(),
+        ),
+        (
             "RepositoryTransaction",
             serde_json::to_string_pretty(&schema_for!(kin_model::RepositoryTransaction)).unwrap(),
         ),

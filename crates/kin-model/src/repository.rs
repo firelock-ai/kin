@@ -57,6 +57,21 @@ impl RootBundle {
                 self.version
             )));
         }
+        for (name, root) in [
+            ("history", &self.history),
+            ("ref_state", &self.ref_state),
+            ("ref_log", &self.ref_log),
+            ("collaboration", &self.collaboration),
+            ("replication", &self.replication),
+            ("local_state", &self.local_state),
+        ] {
+            if root.version != REPOSITORY_ROOT_SCHEMA_VERSION {
+                return Err(ModelError::InvalidOperation(format!(
+                    "unsupported {name} authority root version {}",
+                    root.version
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -1020,6 +1035,16 @@ mod tests {
         for changed in variants {
             assert!(!expected.has_same_replicated_truth(&changed));
         }
+    }
+
+    #[test]
+    fn root_bundle_rejects_mixed_partition_schema_versions() {
+        let mut invalid = roots();
+        invalid.replication.version += 1;
+        let error = invalid.validate().unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("unsupported replication authority root version"));
     }
 
     fn admission_policy(
