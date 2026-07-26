@@ -143,7 +143,7 @@ fn generate_snapshot(n: usize, rels_per_entity: usize) -> (GraphSnapshot, Vec<En
         file_layouts: Vec::new(),
         structured_artifacts: Vec::new(),
         opaque_artifacts: Vec::new(),
-        file_hashes: HashMap::new(),
+        working_tree: HashMap::new(),
         sessions: HashMap::new(),
         intents: HashMap::new(),
         downstream_warnings: Vec::new(),

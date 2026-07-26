@@ -1218,15 +1218,17 @@ mod tests {
         std::fs::write(&path, &original_primary).unwrap();
 
         let mut candidate = GraphSnapshot::empty();
-        candidate
-            .file_hashes
-            .insert("candidate.rs".to_string(), [1; 32]);
+        candidate.working_tree.insert(
+            "candidate.rs".to_string(),
+            crate::types::regular_tree_entry(1),
+        );
         write_recovery_candidate_bytes(&path, &candidate.to_bytes().unwrap()).unwrap();
 
         let mut replacement = GraphSnapshot::empty();
-        replacement
-            .file_hashes
-            .insert("replacement.rs".to_string(), [2; 32]);
+        replacement.working_tree.insert(
+            "replacement.rs".to_string(),
+            crate::types::regular_tree_entry(2),
+        );
         let replacement_bytes = replacement.to_bytes().unwrap();
         let tmp_path = recovery_tmp_path(&path);
         let installed_replacement = replacement_bytes.clone();

@@ -704,7 +704,7 @@ pub fn compute_root_hash_generic(
 /// that persist a truth hash should persist [`RepoTruthHash`] instead of a bare
 /// digest so a format upgrade is distinguishable from an actual change in repo
 /// truth.
-pub const REPO_TRUTH_HASH_VERSION: u32 = 2;
+pub const REPO_TRUTH_HASH_VERSION: u32 = 3;
 
 /// Domain separator for the repo-truth digest. Carries the encoding version so
 /// a v1 digest can never be mistaken for a v2 digest of the same snapshot.
@@ -823,7 +823,7 @@ pub fn compute_repo_truth_hash(snapshot: &GraphSnapshot) -> MerkleHash {
         file_layouts,
         structured_artifacts,
         opaque_artifacts,
-        file_hashes,
+        working_tree,
         sessions,
         intents,
         downstream_warnings,
@@ -884,7 +884,7 @@ pub fn compute_repo_truth_hash(snapshot: &GraphSnapshot) -> MerkleHash {
     hash_vec_domain(&mut hasher, "file_layouts", file_layouts);
     hash_vec_domain(&mut hasher, "artifacts_structured", structured_artifacts);
     hash_vec_domain(&mut hasher, "artifacts_opaque", opaque_artifacts);
-    hash_map_domain(&mut hasher, "file_hashes", file_hashes);
+    hash_map_domain(&mut hasher, "working_tree", working_tree);
     hash_map_domain(&mut hasher, "artifact_index", artifact_index);
 
     hash_map_domain(&mut hasher, "sessions", sessions);
@@ -1908,7 +1908,7 @@ mod tests {
             message: message.to_string(),
             entity_deltas,
             relation_deltas: Vec::new(),
-            artifact_deltas: Vec::new(),
+            tree_deltas: Vec::new(),
             projected_files: Vec::new(),
             spec_link: None,
             evidence: Vec::new(),
@@ -2142,6 +2142,32 @@ mod tests {
         assert_eq!(round_tripped, tagged);
     }
 
+    #[test]
+    fn repo_truth_hash_covers_tree_mode_and_symlink_kind() {
+        let hash = Hash256::from_bytes([0x5a; 32]);
+        let mut regular = GraphSnapshot::empty();
+        regular
+            .working_tree
+            .insert("tool".to_string(), TreeEntry::regular(hash, false));
+        let regular_root = compute_repo_truth_hash(&regular);
+
+        let mut executable = regular.clone();
+        executable
+            .working_tree
+            .insert("tool".to_string(), TreeEntry::regular(hash, true));
+        let executable_root = compute_repo_truth_hash(&executable);
+
+        let mut symlink = regular.clone();
+        symlink
+            .working_tree
+            .insert("tool".to_string(), TreeEntry::symlink(hash));
+        let symlink_root = compute_repo_truth_hash(&symlink);
+
+        assert_ne!(regular_root, executable_root);
+        assert_ne!(regular_root, symlink_root);
+        assert_ne!(executable_root, symlink_root);
+    }
+
     fn map_elements_encode<K, V>(map: &HashMap<K, V>) -> bool
     where
         K: serde::Serialize,
@@ -2192,9 +2218,10 @@ mod tests {
                 head: SemanticChangeId::from_hash(Hash256::from_bytes([0x91; 32])),
             },
         );
-        snapshot
-            .file_hashes
-            .insert("src/main.rs".to_string(), [7u8; 32]);
+        snapshot.working_tree.insert(
+            "src/main.rs".to_string(),
+            crate::types::regular_tree_entry(7),
+        );
 
         for (domain, encodes) in [
             ("entities", map_elements_encode(&snapshot.entities)),
@@ -2263,7 +2290,7 @@ mod tests {
                 "artifacts_opaque",
                 vec_elements_encode(&snapshot.opaque_artifacts),
             ),
-            ("file_hashes", map_elements_encode(&snapshot.file_hashes)),
+            ("working_tree", map_elements_encode(&snapshot.working_tree)),
             (
                 "artifact_index",
                 map_elements_encode(&snapshot.artifact_index),

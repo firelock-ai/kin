@@ -693,7 +693,7 @@ fn merge_hot_into_cold(
         cold.opaque_artifacts.extend(hot.opaque_artifacts);
     }
 
-    cold.file_hashes.extend(hot.file_hashes);
+    cold.working_tree.extend(hot.working_tree);
     cold.sessions.extend(hot.sessions);
     cold.intents.extend(hot.intents);
 

@@ -150,7 +150,7 @@ pub struct GraphSnapshotDelta {
     pub structured_artifacts: VecDelta<StructuredArtifact>,
     #[serde(default)]
     pub opaque_artifacts: VecDelta<OpaqueArtifact>,
-    pub file_hashes: CollectionDelta<String, [u8; 32]>,
+    pub working_tree: CollectionDelta<String, TreeEntry>,
     #[serde(default)]
     pub artifact_index: CollectionDelta<FilePathId, ArtifactId>,
 
@@ -167,7 +167,7 @@ impl GraphSnapshotDelta {
     pub const MAGIC: [u8; 4] = *b"KNDD";
 
     /// Current delta format version.
-    pub const CURRENT_VERSION: u32 = 1;
+    pub const CURRENT_VERSION: u32 = 2;
 
     /// Size of the SHA-256 checksum appended to the wire format.
     pub const CHECKSUM_LEN: usize = 32;
@@ -209,7 +209,7 @@ impl GraphSnapshotDelta {
             file_layouts: VecDelta::default(),
             structured_artifacts: VecDelta::default(),
             opaque_artifacts: VecDelta::default(),
-            file_hashes: CollectionDelta::default(),
+            working_tree: CollectionDelta::default(),
             artifact_index: CollectionDelta::default(),
             sessions: CollectionDelta::default(),
             intents: CollectionDelta::default(),
@@ -253,7 +253,7 @@ impl GraphSnapshotDelta {
             && self.file_layouts.is_empty()
             && self.structured_artifacts.is_empty()
             && self.opaque_artifacts.is_empty()
-            && self.file_hashes.is_empty()
+            && self.working_tree.is_empty()
             && self.artifact_index.is_empty()
             && self.sessions.is_empty()
             && self.intents.is_empty()
@@ -278,7 +278,7 @@ impl GraphSnapshotDelta {
             + self.contracts.change_count()
             + self.actors.change_count()
             + self.file_layouts.change_count()
-            + self.file_hashes.change_count()
+            + self.working_tree.change_count()
             + self.artifact_index.change_count()
             + self.sessions.change_count()
             + self.intents.change_count()
@@ -521,7 +521,7 @@ pub fn compute_graph_delta(
         file_layouts: diff_vecs(&old.file_layouts, &new.file_layouts),
         structured_artifacts: diff_vecs(&old.structured_artifacts, &new.structured_artifacts),
         opaque_artifacts: diff_vecs(&old.opaque_artifacts, &new.opaque_artifacts),
-        file_hashes: diff_maps_eq(&old.file_hashes, &new.file_hashes),
+        working_tree: diff_maps_eq(&old.working_tree, &new.working_tree),
         artifact_index: diff_maps(&old.artifact_index, &new.artifact_index),
         sessions: diff_maps(&old.sessions, &new.sessions),
         intents: diff_maps(&old.intents, &new.intents),
@@ -633,7 +633,7 @@ pub fn apply_graph_delta(snapshot: &mut GraphSnapshot, delta: &GraphSnapshotDelt
         &delta.structured_artifacts,
     );
     apply_vec_delta(&mut snapshot.opaque_artifacts, &delta.opaque_artifacts);
-    apply_map_delta(&mut snapshot.file_hashes, &delta.file_hashes);
+    apply_map_delta(&mut snapshot.working_tree, &delta.working_tree);
     apply_map_delta(&mut snapshot.artifact_index, &delta.artifact_index);
 
     // Sessions/intents
@@ -927,27 +927,31 @@ mod tests {
     }
 
     #[test]
-    fn compute_and_apply_file_hash_delta() {
+    fn compute_and_apply_exact_working_tree_delta() {
         let mut old = GraphSnapshot::empty();
         let mut new = GraphSnapshot::empty();
+        let stable = regular_tree_entry(1);
+        let mode_before = TreeEntry::regular(Hash256::from_bytes([2; 32]), false);
+        let mode_after = TreeEntry::regular(Hash256::from_bytes([2; 32]), true);
+        let symlink = TreeEntry::symlink(Hash256::from_bytes([3; 32]));
 
-        old.file_hashes.insert("a.rs".to_string(), [1; 32]);
-        old.file_hashes.insert("b.rs".to_string(), [2; 32]);
+        old.working_tree.insert("a.rs".to_string(), stable);
+        old.working_tree.insert("b.rs".to_string(), mode_before);
 
-        new.file_hashes.insert("a.rs".to_string(), [1; 32]); // unchanged
-        new.file_hashes.insert("b.rs".to_string(), [99; 32]); // modified
-        new.file_hashes.insert("c.rs".to_string(), [3; 32]); // added
+        new.working_tree.insert("a.rs".to_string(), stable);
+        new.working_tree.insert("b.rs".to_string(), mode_after);
+        new.working_tree.insert("link".to_string(), symlink);
 
         let delta = compute_graph_delta(&old, &new, 1);
-        assert_eq!(delta.file_hashes.added.len(), 1);
-        assert_eq!(delta.file_hashes.modified.len(), 1);
-        assert!(delta.file_hashes.removed.is_empty());
+        assert_eq!(delta.working_tree.added.len(), 1);
+        assert_eq!(delta.working_tree.modified.len(), 1);
+        assert!(delta.working_tree.removed.is_empty());
 
         let mut result = old.clone();
         apply_graph_delta(&mut result, &delta);
-        assert_eq!(result.file_hashes.get("a.rs"), Some(&[1; 32]));
-        assert_eq!(result.file_hashes.get("b.rs"), Some(&[99; 32]));
-        assert_eq!(result.file_hashes.get("c.rs"), Some(&[3; 32]));
+        assert_eq!(result.working_tree.get("a.rs"), Some(&stable));
+        assert_eq!(result.working_tree.get("b.rs"), Some(&mode_after));
+        assert_eq!(result.working_tree.get("link"), Some(&symlink));
     }
 
     #[test]
@@ -1043,7 +1047,10 @@ mod tests {
         old.relations.insert(rel_id, relation.clone());
         old.outgoing.insert(id_a, vec![rel_id]);
         old.incoming.insert(id_b, vec![rel_id]);
-        old.file_hashes.insert("src/lib.rs".to_string(), [1; 32]);
+        old.working_tree.insert(
+            "src/lib.rs".to_string(),
+            crate::types::regular_tree_entry(1),
+        );
         old.structured_artifacts.push(StructuredArtifact {
             file_id: FilePathId::new("Makefile"),
             kind: ArtifactKind::Makefile,
@@ -1063,8 +1070,14 @@ mod tests {
         new.relations.insert(rel2_id, relation2);
         new.outgoing.insert(id_a, vec![rel2_id]);
         new.incoming.insert(id_c, vec![rel2_id]);
-        new.file_hashes.insert("src/lib.rs".to_string(), [2; 32]);
-        new.file_hashes.insert("src/new.rs".to_string(), [3; 32]);
+        new.working_tree.insert(
+            "src/lib.rs".to_string(),
+            crate::types::regular_tree_entry(2),
+        );
+        new.working_tree.insert(
+            "src/new.rs".to_string(),
+            crate::types::regular_tree_entry(3),
+        );
         new.structured_artifacts.push(StructuredArtifact {
             file_id: FilePathId::new("Makefile"),
             kind: ArtifactKind::Makefile,
@@ -1094,9 +1107,15 @@ mod tests {
         assert_eq!(result.relations.len(), new.relations.len());
         assert!(result.relations.contains_key(&rel2_id));
         assert!(!result.relations.contains_key(&rel_id));
-        assert_eq!(result.file_hashes.len(), 2);
-        assert_eq!(result.file_hashes.get("src/lib.rs"), Some(&[2; 32]));
-        assert_eq!(result.file_hashes.get("src/new.rs"), Some(&[3; 32]));
+        assert_eq!(result.working_tree.len(), 2);
+        assert_eq!(
+            result.working_tree.get("src/lib.rs"),
+            Some(&regular_tree_entry(2))
+        );
+        assert_eq!(
+            result.working_tree.get("src/new.rs"),
+            Some(&regular_tree_entry(3))
+        );
         assert_eq!(result.structured_artifacts.len(), 1);
         assert_eq!(
             result.structured_artifacts[0].content_hash,

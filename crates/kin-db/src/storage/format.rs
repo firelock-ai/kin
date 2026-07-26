@@ -128,8 +128,9 @@ pub struct GraphSnapshot {
     pub structured_artifacts: Vec<StructuredArtifact>,
     #[serde(default)]
     pub opaque_artifacts: Vec<OpaqueArtifact>,
-    #[serde(default)]
-    pub file_hashes: HashMap<String, [u8; 32]>,
+    /// Exact graph-owned working tree. Every tracked path has a blob identity
+    /// and materialization kind; parser support is not part of admission.
+    pub working_tree: HashMap<String, TreeEntry>,
     #[serde(default)]
     pub sessions: HashMap<SessionId, AgentSession>,
     #[serde(default)]
@@ -300,12 +301,12 @@ impl<'de> Deserialize<'de> for FilteredLocateRelationMap {
 
 impl GraphSnapshot {
     /// Current format version.
-    pub const CURRENT_VERSION: u32 = 8;
+    pub const CURRENT_VERSION: u32 = 9;
 
     /// Oldest on-disk format version this binary can load (directly or via
     /// migration). Snapshots below this predate a schema we no longer read and
     /// must be rebuilt.
-    pub const MIN_SUPPORTED_VERSION: u32 = 1;
+    pub const MIN_SUPPORTED_VERSION: u32 = Self::CURRENT_VERSION;
 
     /// Magic bytes for the file header: "KNDB"
     pub const MAGIC: [u8; 4] = *b"KNDB";
@@ -355,7 +356,7 @@ impl GraphSnapshot {
             file_layouts: Vec::new(),
             structured_artifacts: Vec::new(),
             opaque_artifacts: Vec::new(),
-            file_hashes: HashMap::new(),
+            working_tree: HashMap::new(),
             sessions: HashMap::new(),
             intents: HashMap::new(),
             downstream_warnings: Vec::new(),
@@ -586,8 +587,9 @@ impl GraphSnapshot {
 
     /// Deserialize a snapshot from bytes (with header validation).
     ///
-    /// - v1/v2: no checksum
-    /// - v3+: checksum verified; returns error on mismatch
+    /// The pre-release v9 format is the first format with an exact universal
+    /// repository tree. Earlier hash-only snapshots cannot be upgraded without
+    /// inventing file modes, so they fail closed and must be rebuilt.
     pub fn from_bytes(data: &[u8]) -> Result<Self, crate::error::KinDbError> {
         Self::from_bytes_with_persisted_root_hash(data).map(|(snapshot, _)| snapshot)
     }
@@ -613,30 +615,7 @@ impl GraphSnapshot {
             Self::decode_frame(data, verify_checksum)?
         };
         let snapshot = match frame.version {
-            1 => {
-                let legacy: GraphSnapshotV1 = rmp_serde::from_slice(frame.body).map_err(|e| {
-                    crate::error::KinDbError::StorageError(format!("deserialization failed: {e}"))
-                })?;
-                legacy.into()
-            }
-            2 => rmp_serde::from_slice(frame.body).map_err(|e| {
-                crate::error::KinDbError::StorageError(format!("deserialization failed: {e}"))
-            })?,
-            3 => Self::decode_v3_snapshot(frame.body)?,
-            4 => Self::decode_v4_snapshot(frame.body)?,
-            5 => {
-                let migrated = super::migration::migrate(frame.body, 5, Self::CURRENT_VERSION)?;
-                Self::decode_current_snapshot(&migrated)?
-            }
-            6 => {
-                let migrated = super::migration::migrate(frame.body, 6, Self::CURRENT_VERSION)?;
-                Self::decode_current_snapshot(&migrated)?
-            }
-            7 => {
-                let migrated = super::migration::migrate(frame.body, 7, Self::CURRENT_VERSION)?;
-                Self::decode_current_snapshot(&migrated)?
-            }
-            8 => Self::decode_current_snapshot(frame.body)?,
+            Self::CURRENT_VERSION => Self::decode_current_snapshot(frame.body)?,
             _ => unreachable!("decode_frame validates supported versions"),
         };
 
@@ -693,86 +672,10 @@ impl GraphSnapshot {
         let body = &data[16..body_end];
 
         match version {
-            1 | 2 => Ok(SnapshotFrame {
-                version,
-                body,
-                body_checksum: None,
-                checksum_end: 16 + body_len,
-            }),
-            3 => {
-                let checksum_end = Self::require_checksum_slot(data, body_len, "v3")?;
+            Self::CURRENT_VERSION => {
+                let checksum_end = Self::require_checksum_slot(data, body_len, "v9")?;
                 let body_checksum = if verify_checksum {
-                    Some(Self::verify_checksum(data, body_len, "v3")?)
-                } else {
-                    None
-                };
-                Ok(SnapshotFrame {
-                    version,
-                    body,
-                    body_checksum,
-                    checksum_end,
-                })
-            }
-            4 => {
-                let checksum_end = Self::require_checksum_slot(data, body_len, "v4")?;
-                let body_checksum = if verify_checksum {
-                    Some(Self::verify_checksum(data, body_len, "v4")?)
-                } else {
-                    None
-                };
-                Ok(SnapshotFrame {
-                    version,
-                    body,
-                    body_checksum,
-                    checksum_end,
-                })
-            }
-            5 => {
-                let checksum_end = Self::require_checksum_slot(data, body_len, "v5")?;
-                let body_checksum = if verify_checksum {
-                    Some(Self::verify_checksum(data, body_len, "v5")?)
-                } else {
-                    None
-                };
-                Ok(SnapshotFrame {
-                    version,
-                    body,
-                    body_checksum,
-                    checksum_end,
-                })
-            }
-            6 => {
-                let checksum_end = Self::require_checksum_slot(data, body_len, "v6")?;
-                let body_checksum = if verify_checksum {
-                    Some(Self::verify_checksum(data, body_len, "v6")?)
-                } else {
-                    None
-                };
-                Ok(SnapshotFrame {
-                    version,
-                    body,
-                    body_checksum,
-                    checksum_end,
-                })
-            }
-            7 => {
-                let checksum_end = Self::require_checksum_slot(data, body_len, "v7")?;
-                let body_checksum = if verify_checksum {
-                    Some(Self::verify_checksum(data, body_len, "v7")?)
-                } else {
-                    None
-                };
-                Ok(SnapshotFrame {
-                    version,
-                    body,
-                    body_checksum,
-                    checksum_end,
-                })
-            }
-            8 => {
-                let checksum_end = Self::require_checksum_slot(data, body_len, "v8")?;
-                let body_checksum = if verify_checksum {
-                    Some(Self::verify_checksum(data, body_len, "v8")?)
+                    Some(Self::verify_checksum(data, body_len, "v9")?)
                 } else {
                     None
                 };
@@ -803,34 +706,6 @@ impl GraphSnapshot {
         rmp_serde::from_slice(body).map_err(|e| {
             crate::error::KinDbError::StorageError(format!("deserialization failed: {e}"))
         })
-    }
-
-    fn decode_v3_snapshot(body: &[u8]) -> Result<Self, crate::error::KinDbError> {
-        match Self::decode_current_snapshot(body) {
-            Ok(snapshot) => Ok(snapshot),
-            Err(current_err) => {
-                let legacy: GraphSnapshotV3Legacy = rmp_serde::from_slice(body).map_err(|e| {
-                    crate::error::KinDbError::StorageError(format!(
-                        "deserialization failed: {e}; current-layout decode also failed: {current_err}"
-                    ))
-                })?;
-                Ok(legacy.into())
-            }
-        }
-    }
-
-    fn decode_v4_snapshot(body: &[u8]) -> Result<Self, crate::error::KinDbError> {
-        match Self::decode_current_snapshot(body) {
-            Ok(snapshot) => Ok(snapshot),
-            Err(current_err) => {
-                let legacy: GraphSnapshotV4Legacy = rmp_serde::from_slice(body).map_err(|e| {
-                    crate::error::KinDbError::StorageError(format!(
-                        "deserialization failed: {e}; current-layout decode also failed: {current_err}"
-                    ))
-                })?;
-                Ok(legacy.into())
-            }
-        }
     }
 
     fn verify_checksum(
@@ -980,36 +855,7 @@ impl LocateGraphSnapshot {
             GraphSnapshot::decode_frame(data, verify_checksum)?
         };
         let snapshot = match frame.version {
-            6 => {
-                let migrated =
-                    super::migration::migrate(frame.body, 6, GraphSnapshot::CURRENT_VERSION)?;
-                GraphSnapshot::decode_current_snapshot(&migrated)?.into()
-            }
-            7 => {
-                let migrated =
-                    super::migration::migrate(frame.body, 7, GraphSnapshot::CURRENT_VERSION)?;
-                GraphSnapshot::decode_current_snapshot(&migrated)?.into()
-            }
-            8 => Self::decode_current_snapshot(frame.body)?,
-            1 => {
-                let legacy: GraphSnapshotV1 = rmp_serde::from_slice(frame.body).map_err(|e| {
-                    crate::error::KinDbError::StorageError(format!("deserialization failed: {e}"))
-                })?;
-                GraphSnapshot::from(legacy).into()
-            }
-            2 => {
-                let snapshot: GraphSnapshot = rmp_serde::from_slice(frame.body).map_err(|e| {
-                    crate::error::KinDbError::StorageError(format!("deserialization failed: {e}"))
-                })?;
-                snapshot.into()
-            }
-            3 => GraphSnapshot::decode_v3_snapshot(frame.body)?.into(),
-            4 => GraphSnapshot::decode_v4_snapshot(frame.body)?.into(),
-            5 => {
-                let migrated =
-                    super::migration::migrate(frame.body, 5, GraphSnapshot::CURRENT_VERSION)?;
-                GraphSnapshot::decode_current_snapshot(&migrated)?.into()
-            }
+            GraphSnapshot::CURRENT_VERSION => Self::decode_current_snapshot(frame.body)?,
             _ => unreachable!("decode_frame validates supported versions"),
         };
 
@@ -1129,7 +975,7 @@ impl<'de> Deserialize<'de> for LocateGraphSnapshot {
                     .next_element()?
                     .ok_or_else(|| serde::de::Error::invalid_length(33, &self))?;
 
-                // Everything after opaque_artifacts (file_hashes, sessions,
+                // Everything after opaque_artifacts (working_tree, sessions,
                 // intents, downstream_warnings, entity_revisions, the tombstone
                 // maps, change_order, artifact_index) is drained rather than
                 // read by index. Those trailing fields grow over time and the
@@ -1182,7 +1028,7 @@ pub struct BorrowedGraphSnapshot<'a> {
     pub relations: &'a hashbrown::HashMap<RelationId, Relation>,
     pub outgoing: &'a hashbrown::HashMap<EntityId, Vec<RelationId>>,
     pub incoming: &'a hashbrown::HashMap<EntityId, Vec<RelationId>>,
-    pub file_hashes: &'a hashbrown::HashMap<String, [u8; 32]>,
+    pub working_tree: &'a hashbrown::HashMap<String, TreeEntry>,
     pub shallow_files: &'a hashbrown::HashMap<FilePathId, ShallowTrackedFile>,
     pub file_layouts: &'a hashbrown::HashMap<FilePathId, FileLayout>,
     pub structured_artifacts: &'a hashbrown::HashMap<FilePathId, StructuredArtifact>,
@@ -1305,8 +1151,8 @@ impl<'a> Serialize for BorrowedGraphSnapshot<'a> {
             "opaque_artifacts",
             &HashMapValuesAsSeq(self.opaque_artifacts),
         )?;
-        // 35. file_hashes
-        state.serialize_field("file_hashes", self.file_hashes)?;
+        // 35. working_tree
+        state.serialize_field("working_tree", self.working_tree)?;
         // 36. sessions
         state.serialize_field("sessions", self.sessions)?;
         // 37. intents
@@ -1393,291 +1239,9 @@ fn graph_node_exists(
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct GraphSnapshotV1 {
-    version: u32,
-    entities: HashMap<EntityId, Entity>,
-    relations: HashMap<RelationId, LegacyEntityRelation>,
-    outgoing: HashMap<EntityId, Vec<RelationId>>,
-    incoming: HashMap<EntityId, Vec<RelationId>>,
-    changes: HashMap<SemanticChangeId, SemanticChange>,
-    change_children: HashMap<SemanticChangeId, Vec<SemanticChangeId>>,
-    branches: HashMap<BranchName, Branch>,
-}
-
-impl From<GraphSnapshotV1> for GraphSnapshot {
-    fn from(value: GraphSnapshotV1) -> Self {
-        let mut snapshot = GraphSnapshot::empty();
-        snapshot.entities = value.entities;
-        snapshot.relations = value
-            .relations
-            .into_iter()
-            .map(|(relation_id, relation)| (relation_id, relation.into()))
-            .collect();
-        snapshot.outgoing = value.outgoing;
-        snapshot.incoming = value.incoming;
-        snapshot.changes = value.changes;
-        snapshot.change_children = value.change_children;
-        snapshot.branches = value.branches;
-        snapshot
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct LegacyEntityRelation {
-    pub(crate) id: RelationId,
-    pub(crate) kind: RelationKind,
-    pub(crate) src: EntityId,
-    pub(crate) dst: EntityId,
-    pub(crate) confidence: f32,
-    pub(crate) origin: RelationOrigin,
-    pub(crate) created_in: Option<SemanticChangeId>,
-    #[serde(default)]
-    pub(crate) import_source: Option<String>,
-}
-
-impl From<LegacyEntityRelation> for Relation {
-    fn from(value: LegacyEntityRelation) -> Self {
-        Self {
-            id: value.id,
-            kind: value.kind,
-            src: GraphNodeId::Entity(value.src),
-            dst: GraphNodeId::Entity(value.dst),
-            confidence: value.confidence,
-            origin: value.origin,
-            created_in: value.created_in,
-            import_source: value.import_source,
-            evidence: Vec::new(),
-        }
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct GraphSnapshotV3Legacy {
-    version: u32,
-    entities: HashMap<EntityId, Entity>,
-    relations: HashMap<RelationId, LegacyEntityRelation>,
-    outgoing: HashMap<EntityId, Vec<RelationId>>,
-    incoming: HashMap<EntityId, Vec<RelationId>>,
-    changes: HashMap<SemanticChangeId, SemanticChange>,
-    change_children: HashMap<SemanticChangeId, Vec<SemanticChangeId>>,
-    branches: HashMap<BranchName, Branch>,
-    #[serde(default)]
-    work_items: HashMap<WorkId, WorkItem>,
-    #[serde(default)]
-    annotations: HashMap<AnnotationId, Annotation>,
-    #[serde(default)]
-    work_links: Vec<WorkLink>,
-    #[serde(default)]
-    test_cases: HashMap<TestId, TestCase>,
-    #[serde(default)]
-    assertions: HashMap<AssertionId, Assertion>,
-    #[serde(default)]
-    verification_runs: HashMap<VerificationRunId, VerificationRun>,
-    #[serde(default)]
-    test_covers_entity: Vec<(TestId, EntityId)>,
-    #[serde(default)]
-    test_covers_contract: Vec<(TestId, ContractId)>,
-    #[serde(default)]
-    test_verifies_work: Vec<(TestId, WorkId)>,
-    #[serde(default)]
-    run_proves_entity: Vec<(VerificationRunId, EntityId)>,
-    #[serde(default)]
-    run_proves_work: Vec<(VerificationRunId, WorkId)>,
-    #[serde(default)]
-    mock_hints: Vec<MockHint>,
-    #[serde(default)]
-    contracts: HashMap<ContractId, Contract>,
-    #[serde(default)]
-    actors: HashMap<ActorId, Actor>,
-    #[serde(default)]
-    delegations: Vec<Delegation>,
-    #[serde(default)]
-    approvals: Vec<Approval>,
-    #[serde(default)]
-    audit_events: Vec<AuditEvent>,
-    #[serde(default)]
-    shallow_files: Vec<ShallowTrackedFile>,
-    #[serde(default)]
-    structured_artifacts: Vec<StructuredArtifact>,
-    #[serde(default)]
-    opaque_artifacts: Vec<OpaqueArtifact>,
-    #[serde(default)]
-    file_hashes: HashMap<String, [u8; 32]>,
-    #[serde(default)]
-    sessions: HashMap<SessionId, AgentSession>,
-    #[serde(default)]
-    intents: HashMap<IntentId, Intent>,
-    #[serde(default)]
-    downstream_warnings: Vec<(IntentId, EntityId, String)>,
-}
-
-impl From<GraphSnapshotV3Legacy> for GraphSnapshot {
-    fn from(value: GraphSnapshotV3Legacy) -> Self {
-        let mut snapshot = GraphSnapshot::empty();
-        snapshot.entities = value.entities;
-        snapshot.relations = value
-            .relations
-            .into_iter()
-            .map(|(relation_id, relation)| (relation_id, relation.into()))
-            .collect();
-        snapshot.outgoing = value.outgoing;
-        snapshot.incoming = value.incoming;
-        snapshot.changes = value.changes;
-        snapshot.change_children = value.change_children;
-        snapshot.branches = value.branches;
-        snapshot.work_items = value.work_items;
-        snapshot.annotations = value.annotations;
-        snapshot.work_links = value.work_links;
-        snapshot.test_cases = value.test_cases;
-        snapshot.assertions = value.assertions;
-        snapshot.verification_runs = value.verification_runs;
-        snapshot.test_covers_entity = value.test_covers_entity;
-        snapshot.test_covers_contract = value.test_covers_contract;
-        snapshot.test_verifies_work = value.test_verifies_work;
-        snapshot.run_proves_entity = value.run_proves_entity;
-        snapshot.run_proves_work = value.run_proves_work;
-        snapshot.mock_hints = value.mock_hints;
-        snapshot.contracts = value.contracts;
-        snapshot.actors = value.actors;
-        snapshot.delegations = value.delegations;
-        snapshot.approvals = value.approvals;
-        snapshot.audit_events = value.audit_events;
-        snapshot.shallow_files = value.shallow_files;
-        snapshot.structured_artifacts = value.structured_artifacts;
-        snapshot.opaque_artifacts = value.opaque_artifacts;
-        snapshot.file_hashes = value.file_hashes;
-        snapshot.sessions = value.sessions;
-        snapshot.intents = value.intents;
-        snapshot.downstream_warnings = value.downstream_warnings;
-        snapshot
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct GraphSnapshotV4Legacy {
-    pub(crate) version: u32,
-    pub(crate) entities: HashMap<EntityId, Entity>,
-    pub(crate) relations: HashMap<RelationId, LegacyEntityRelation>,
-    pub(crate) outgoing: HashMap<EntityId, Vec<RelationId>>,
-    pub(crate) incoming: HashMap<EntityId, Vec<RelationId>>,
-    pub(crate) changes: HashMap<SemanticChangeId, SemanticChange>,
-    pub(crate) change_children: HashMap<SemanticChangeId, Vec<SemanticChangeId>>,
-    pub(crate) branches: HashMap<BranchName, Branch>,
-    #[serde(default)]
-    pub(crate) work_items: HashMap<WorkId, WorkItem>,
-    #[serde(default)]
-    pub(crate) annotations: HashMap<AnnotationId, Annotation>,
-    #[serde(default)]
-    pub(crate) work_links: Vec<WorkLink>,
-    #[serde(default)]
-    pub(crate) reviews: HashMap<ReviewId, Review>,
-    #[serde(default)]
-    pub(crate) review_decisions: HashMap<ReviewId, Vec<ReviewDecision>>,
-    #[serde(default)]
-    pub(crate) review_notes: Vec<ReviewNote>,
-    #[serde(default)]
-    pub(crate) review_discussions: Vec<ReviewDiscussion>,
-    #[serde(default)]
-    pub(crate) review_assignments: HashMap<ReviewId, Vec<ReviewAssignment>>,
-    #[serde(default)]
-    pub(crate) test_cases: HashMap<TestId, TestCase>,
-    #[serde(default)]
-    pub(crate) assertions: HashMap<AssertionId, Assertion>,
-    #[serde(default)]
-    pub(crate) verification_runs: HashMap<VerificationRunId, VerificationRun>,
-    #[serde(default)]
-    pub(crate) test_covers_entity: Vec<(TestId, EntityId)>,
-    #[serde(default)]
-    pub(crate) test_covers_contract: Vec<(TestId, ContractId)>,
-    #[serde(default)]
-    pub(crate) test_verifies_work: Vec<(TestId, WorkId)>,
-    #[serde(default)]
-    pub(crate) run_proves_entity: Vec<(VerificationRunId, EntityId)>,
-    #[serde(default)]
-    pub(crate) run_proves_work: Vec<(VerificationRunId, WorkId)>,
-    #[serde(default)]
-    pub(crate) mock_hints: Vec<MockHint>,
-    #[serde(default)]
-    pub(crate) contracts: HashMap<ContractId, Contract>,
-    #[serde(default)]
-    pub(crate) actors: HashMap<ActorId, Actor>,
-    #[serde(default)]
-    pub(crate) delegations: Vec<Delegation>,
-    #[serde(default)]
-    pub(crate) approvals: Vec<Approval>,
-    #[serde(default)]
-    pub(crate) audit_events: Vec<AuditEvent>,
-    #[serde(default)]
-    pub(crate) shallow_files: Vec<ShallowTrackedFile>,
-    #[serde(default)]
-    pub(crate) file_layouts: Vec<FileLayout>,
-    #[serde(default)]
-    pub(crate) structured_artifacts: Vec<StructuredArtifact>,
-    #[serde(default)]
-    pub(crate) opaque_artifacts: Vec<OpaqueArtifact>,
-    #[serde(default)]
-    pub(crate) file_hashes: HashMap<String, [u8; 32]>,
-    #[serde(default)]
-    pub(crate) sessions: HashMap<SessionId, AgentSession>,
-    #[serde(default)]
-    pub(crate) intents: HashMap<IntentId, Intent>,
-    #[serde(default)]
-    pub(crate) downstream_warnings: Vec<(IntentId, EntityId, String)>,
-}
-
-impl From<GraphSnapshotV4Legacy> for GraphSnapshot {
-    fn from(value: GraphSnapshotV4Legacy) -> Self {
-        let mut snapshot = GraphSnapshot::empty();
-        snapshot.entities = value.entities;
-        snapshot.relations = value
-            .relations
-            .into_iter()
-            .map(|(relation_id, relation)| (relation_id, relation.into()))
-            .collect();
-        snapshot.outgoing = value.outgoing;
-        snapshot.incoming = value.incoming;
-        snapshot.changes = value.changes;
-        snapshot.change_children = value.change_children;
-        snapshot.branches = value.branches;
-        snapshot.work_items = value.work_items;
-        snapshot.annotations = value.annotations;
-        snapshot.work_links = value.work_links;
-        snapshot.reviews = value.reviews;
-        snapshot.review_decisions = value.review_decisions;
-        snapshot.review_notes = value.review_notes;
-        snapshot.review_discussions = value.review_discussions;
-        snapshot.review_assignments = value.review_assignments;
-        snapshot.test_cases = value.test_cases;
-        snapshot.assertions = value.assertions;
-        snapshot.verification_runs = value.verification_runs;
-        snapshot.test_covers_entity = value.test_covers_entity;
-        snapshot.test_covers_contract = value.test_covers_contract;
-        snapshot.test_verifies_work = value.test_verifies_work;
-        snapshot.run_proves_entity = value.run_proves_entity;
-        snapshot.run_proves_work = value.run_proves_work;
-        snapshot.mock_hints = value.mock_hints;
-        snapshot.contracts = value.contracts;
-        snapshot.actors = value.actors;
-        snapshot.delegations = value.delegations;
-        snapshot.approvals = value.approvals;
-        snapshot.audit_events = value.audit_events;
-        snapshot.shallow_files = value.shallow_files;
-        snapshot.file_layouts = value.file_layouts;
-        snapshot.structured_artifacts = value.structured_artifacts;
-        snapshot.opaque_artifacts = value.opaque_artifacts;
-        snapshot.file_hashes = value.file_hashes;
-        snapshot.sessions = value.sessions;
-        snapshot.intents = value.intents;
-        snapshot.downstream_warnings = value.downstream_warnings;
-        snapshot
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kin_model::{EntityStore, VerificationStore};
 
     /// Regression (found by fuzzing): a snapshot header whose body_len is near
     /// usize::MAX must be rejected with an error, never wrap `16 + body_len`
@@ -1750,7 +1314,7 @@ mod tests {
             message: "cochange".into(),
             entity_deltas: vec![EntityDelta::Added(caller.clone())],
             relation_deltas: Vec::new(),
-            artifact_deltas: Vec::new(),
+            tree_deltas: Vec::new(),
             projected_files: vec![FilePathId::new("src/main.rs")],
             spec_link: None,
             evidence: Vec::new(),
@@ -1962,98 +1526,6 @@ mod tests {
     }
 
     #[test]
-    fn from_bytes_reads_v4_entity_relations_and_legacy_coverage() {
-        let e1 = test_entity("covered");
-        let e2 = test_entity("callee");
-        let test_id = TestId::new();
-        let relation_id = RelationId::new();
-        let legacy = GraphSnapshotV4Legacy {
-            version: 4,
-            entities: HashMap::from([(e1.id, e1.clone()), (e2.id, e2.clone())]),
-            relations: HashMap::from([(
-                relation_id,
-                LegacyEntityRelation {
-                    id: relation_id,
-                    kind: RelationKind::Calls,
-                    src: e1.id,
-                    dst: e2.id,
-                    confidence: 1.0,
-                    origin: RelationOrigin::Parsed,
-                    created_in: None,
-                    import_source: None,
-                },
-            )]),
-            outgoing: HashMap::from([(e1.id, vec![relation_id])]),
-            incoming: HashMap::from([(e2.id, vec![relation_id])]),
-            changes: HashMap::new(),
-            change_children: HashMap::new(),
-            branches: HashMap::new(),
-            work_items: HashMap::new(),
-            annotations: HashMap::new(),
-            work_links: Vec::new(),
-            reviews: HashMap::new(),
-            review_decisions: HashMap::new(),
-            review_notes: Vec::new(),
-            review_discussions: Vec::new(),
-            review_assignments: HashMap::new(),
-            test_cases: HashMap::from([(
-                test_id,
-                TestCase {
-                    test_id,
-                    name: "test_target".into(),
-                    language: "rust".into(),
-                    kind: TestKind::Unit,
-                    scopes: vec![],
-                    runner: TestRunner::Cargo,
-                    file_origin: None,
-                },
-            )]),
-            assertions: HashMap::new(),
-            verification_runs: HashMap::new(),
-            test_covers_entity: vec![(test_id, e1.id)],
-            test_covers_contract: Vec::new(),
-            test_verifies_work: Vec::new(),
-            run_proves_entity: Vec::new(),
-            run_proves_work: Vec::new(),
-            mock_hints: Vec::new(),
-            contracts: HashMap::new(),
-            actors: HashMap::new(),
-            delegations: Vec::new(),
-            approvals: Vec::new(),
-            audit_events: Vec::new(),
-            shallow_files: Vec::new(),
-            file_layouts: Vec::new(),
-            structured_artifacts: Vec::new(),
-            opaque_artifacts: Vec::new(),
-            file_hashes: HashMap::new(),
-            sessions: HashMap::new(),
-            intents: HashMap::new(),
-            downstream_warnings: Vec::new(),
-        };
-        let body = rmp_serde::to_vec(&legacy).unwrap();
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&GraphSnapshot::MAGIC);
-        bytes.extend_from_slice(&4u32.to_le_bytes());
-        bytes.extend_from_slice(&(body.len() as u64).to_le_bytes());
-        bytes.extend_from_slice(&body);
-        bytes.extend_from_slice(&Sha256::digest(&body));
-
-        let snapshot = GraphSnapshot::from_bytes(&bytes).unwrap();
-        let relation = snapshot.relations.get(&relation_id).unwrap();
-        assert_eq!(relation.src, GraphNodeId::Entity(e1.id));
-        assert_eq!(relation.dst, GraphNodeId::Entity(e2.id));
-        assert_eq!(snapshot.test_covers_entity, vec![(test_id, e1.id)]);
-
-        let graph = crate::InMemoryGraph::from_snapshot(snapshot);
-        let tests = graph.get_tests_for_entity(&e1.id).unwrap();
-        assert_eq!(tests.len(), 1);
-        let traversal = graph
-            .traverse(&GraphNodeId::Test(test_id), &[RelationKind::Covers], 1)
-            .unwrap();
-        assert!(traversal.nodes.contains(&GraphNodeId::Entity(e1.id)));
-    }
-
-    #[test]
     fn compact_removes_orphaned_approvals() {
         let mut snap = GraphSnapshot::empty();
 
@@ -2190,6 +1662,44 @@ mod tests {
     }
 
     #[test]
+    fn roundtrip_preserves_executable_symlink_and_unsupported_paths() {
+        let mut snapshot = GraphSnapshot::empty();
+        let executable = TreeEntry::regular(Hash256::from_bytes([0x41; 32]), true);
+        let symlink = TreeEntry::symlink(Hash256::from_bytes([0x42; 32]));
+        let opaque = TreeEntry::regular(Hash256::from_bytes([0x43; 32]), false);
+        snapshot
+            .working_tree
+            .insert("scripts/deploy".to_string(), executable);
+        snapshot
+            .working_tree
+            .insert("current-config".to_string(), symlink);
+        snapshot
+            .working_tree
+            .insert("assets/model.unsupported".to_string(), opaque);
+
+        let loaded = GraphSnapshot::from_bytes(&snapshot.to_bytes().unwrap()).unwrap();
+
+        assert_eq!(loaded.working_tree.get("scripts/deploy"), Some(&executable));
+        assert_eq!(loaded.working_tree.get("current-config"), Some(&symlink));
+        assert_eq!(
+            loaded.working_tree.get("assets/model.unsupported"),
+            Some(&opaque)
+        );
+    }
+
+    #[test]
+    fn current_snapshot_requires_explicit_working_tree_field() {
+        let mut encoded = serde_json::to_value(GraphSnapshot::empty()).unwrap();
+        encoded
+            .as_object_mut()
+            .expect("snapshot serializes as a map")
+            .remove("working_tree");
+
+        let error = serde_json::from_value::<GraphSnapshot>(encoded).unwrap_err();
+        assert!(error.to_string().contains("working_tree"));
+    }
+
+    #[test]
     fn current_version_checksum_is_appended() {
         let snap = GraphSnapshot::empty();
         let bytes = snap.to_bytes().unwrap();
@@ -2291,35 +1801,7 @@ mod tests {
     }
 
     #[test]
-    fn loads_v1_snapshot_with_new_fields_defaulted() {
-        let legacy = GraphSnapshotV1 {
-            version: 1,
-            entities: HashMap::new(),
-            relations: HashMap::new(),
-            outgoing: HashMap::new(),
-            incoming: HashMap::new(),
-            changes: HashMap::new(),
-            change_children: HashMap::new(),
-            branches: HashMap::new(),
-        };
-
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&GraphSnapshot::MAGIC);
-        bytes.extend_from_slice(&1u32.to_le_bytes());
-        let body = rmp_serde::to_vec(&legacy).unwrap();
-        bytes.extend_from_slice(&(body.len() as u64).to_le_bytes());
-        bytes.extend(body);
-
-        let loaded = GraphSnapshot::from_bytes(&bytes).unwrap();
-        assert_eq!(loaded.version, GraphSnapshot::CURRENT_VERSION);
-        assert!(loaded.work_items.is_empty());
-        assert!(loaded.shallow_files.is_empty());
-        assert!(loaded.sessions.is_empty());
-    }
-
-    #[test]
-    fn loads_v2_snapshot_without_checksum() {
-        // v2 snapshots have no checksum — must still load
+    fn rejects_v2_snapshot_without_inventing_tree_modes() {
         let snap = GraphSnapshot::empty();
         let mut snapshot = snap.clone();
         snapshot.version = 2;
@@ -2331,8 +1813,11 @@ mod tests {
         bytes.extend_from_slice(&(body.len() as u64).to_le_bytes());
         bytes.extend(body);
 
-        let loaded = GraphSnapshot::from_bytes(&bytes).unwrap();
-        assert!(loaded.entities.is_empty());
+        let error = GraphSnapshot::from_bytes(&bytes).unwrap_err();
+        assert!(matches!(
+            error,
+            crate::KinDbError::IncompatibleSnapshotVersion { found: 2, .. }
+        ));
     }
 
     /// A snapshot written by an older Kin (schema predating the supported
@@ -2371,8 +1856,8 @@ mod tests {
             "missing supported-range wording: {msg}"
         );
         assert!(
-            msg.contains("kin migrate") || msg.contains("kin embed --rebuild"),
-            "missing remediation command: {msg}"
+            msg.contains("reinitialize") && msg.contains("exact file modes"),
+            "missing exact-tree remediation: {msg}"
         );
     }
 
@@ -2407,61 +1892,7 @@ mod tests {
     }
 
     #[test]
-    fn loads_legacy_v3_snapshot_from_before_review_fields() {
-        let legacy = GraphSnapshotV3Legacy {
-            version: 3,
-            entities: HashMap::new(),
-            relations: HashMap::new(),
-            outgoing: HashMap::new(),
-            incoming: HashMap::new(),
-            changes: HashMap::new(),
-            change_children: HashMap::new(),
-            branches: HashMap::new(),
-            work_items: HashMap::new(),
-            annotations: HashMap::new(),
-            work_links: Vec::new(),
-            test_cases: HashMap::new(),
-            assertions: HashMap::new(),
-            verification_runs: HashMap::new(),
-            test_covers_entity: Vec::new(),
-            test_covers_contract: Vec::new(),
-            test_verifies_work: Vec::new(),
-            run_proves_entity: Vec::new(),
-            run_proves_work: Vec::new(),
-            mock_hints: Vec::new(),
-            contracts: HashMap::new(),
-            actors: HashMap::new(),
-            delegations: Vec::new(),
-            approvals: Vec::new(),
-            audit_events: Vec::new(),
-            shallow_files: Vec::new(),
-            structured_artifacts: Vec::new(),
-            opaque_artifacts: Vec::new(),
-            file_hashes: HashMap::new(),
-            sessions: HashMap::new(),
-            intents: HashMap::new(),
-            downstream_warnings: Vec::new(),
-        };
-
-        let body = rmp_serde::to_vec(&legacy).unwrap();
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&GraphSnapshot::MAGIC);
-        bytes.extend_from_slice(&3u32.to_le_bytes());
-        bytes.extend_from_slice(&(body.len() as u64).to_le_bytes());
-        bytes.extend_from_slice(&body);
-        bytes.extend_from_slice(&Sha256::digest(&body));
-
-        let loaded = GraphSnapshot::from_bytes(&bytes).unwrap();
-        assert_eq!(loaded.version, GraphSnapshot::CURRENT_VERSION);
-        assert!(loaded.reviews.is_empty());
-        assert!(loaded.review_decisions.is_empty());
-        assert!(loaded.review_notes.is_empty());
-        assert!(loaded.review_discussions.is_empty());
-        assert!(loaded.review_assignments.is_empty());
-    }
-
-    #[test]
-    fn loads_current_layout_v3_snapshot_and_upgrades_on_write() {
+    fn rejects_current_layout_body_with_v3_envelope() {
         let mut snapshot = GraphSnapshot::empty();
         snapshot.version = 3;
         let body = rmp_serde::to_vec(&snapshot).unwrap();
@@ -2473,12 +1904,11 @@ mod tests {
         bytes.extend_from_slice(&body);
         bytes.extend_from_slice(&Sha256::digest(&body));
 
-        let loaded = GraphSnapshot::from_bytes(&bytes).unwrap();
-        assert_eq!(loaded.version, 3);
-
-        let rewritten = loaded.to_bytes().unwrap();
-        let rewritten_version = u32::from_le_bytes(rewritten[4..8].try_into().unwrap());
-        assert_eq!(rewritten_version, GraphSnapshot::CURRENT_VERSION);
+        let error = GraphSnapshot::from_bytes(&bytes).unwrap_err();
+        assert!(matches!(
+            error,
+            crate::KinDbError::IncompatibleSnapshotVersion { found: 3, .. }
+        ));
     }
 
     #[test]

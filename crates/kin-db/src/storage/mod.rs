@@ -9,7 +9,6 @@ pub mod gcs;
 pub mod index;
 mod local_journal;
 pub mod merkle;
-pub mod migration;
 mod mmap;
 mod snapshot;
 #[cfg(feature = "sql")]

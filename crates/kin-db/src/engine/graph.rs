@@ -892,8 +892,8 @@ struct EntityData {
     node_incoming: HashMap<GraphNodeId, Vec<RelationId>>,
     /// Secondary indexes for fast lookup.
     indexes: IndexSet,
-    /// Incremental indexing: file path → SHA-256 content hash.
-    file_hashes: HashMap<String, [u8; 32]>,
+    /// Exact graph-owned working tree: file path → blob identity + source kind.
+    working_tree: HashMap<String, TreeEntry>,
     /// Shallow file tracking (C2 tier).
     shallow_files: HashMap<FilePathId, ShallowTrackedFile>,
     /// Persisted file layouts for projection.
@@ -1730,7 +1730,7 @@ impl InMemoryGraph {
                 node_outgoing: HashMap::new(),
                 node_incoming: HashMap::new(),
                 indexes: IndexSet::new(),
-                file_hashes: HashMap::new(),
+                working_tree: HashMap::new(),
                 shallow_files: HashMap::new(),
                 file_layouts: HashMap::new(),
                 structured_artifacts: HashMap::new(),
@@ -1955,7 +1955,7 @@ impl InMemoryGraph {
             file_layouts,
             structured_artifacts,
             opaque_artifacts,
-            file_hashes,
+            working_tree,
             sessions,
             intents,
             downstream_warnings,
@@ -2135,7 +2135,7 @@ impl InMemoryGraph {
             node_outgoing,
             node_incoming,
             indexes,
-            file_hashes: file_hashes.into_iter().collect(),
+            working_tree: working_tree.into_iter().collect(),
             shallow_files,
             file_layouts,
             structured_artifacts,
@@ -2367,7 +2367,7 @@ impl InMemoryGraph {
             node_outgoing,
             node_incoming,
             indexes,
-            file_hashes: HashMap::new(),
+            working_tree: HashMap::new(),
             shallow_files,
             file_layouts,
             structured_artifacts,
@@ -2777,14 +2777,14 @@ impl InMemoryGraph {
         record_relation_edge_delta(&mut pending, ent, relation);
     }
 
-    fn record_file_hash_delta_upsert(&self, path: String, hash: [u8; 32]) {
+    fn record_working_tree_delta_upsert(&self, path: String, entry: TreeEntry) {
         let mut pending = self.pending_delta.lock();
-        delta_map_upsert(&mut pending.delta.file_hashes, path, hash);
+        delta_map_upsert(&mut pending.delta.working_tree, path, entry);
     }
 
-    fn record_file_hash_delta_remove(&self, path: String) {
+    fn record_working_tree_delta_remove(&self, path: String) {
         let mut pending = self.pending_delta.lock();
-        delta_map_remove(&mut pending.delta.file_hashes, path);
+        delta_map_remove(&mut pending.delta.working_tree, path);
     }
 
     fn record_artifact_index_delta_upsert(&self, path: FilePathId, artifact_id: ArtifactId) {
@@ -3112,7 +3112,7 @@ impl InMemoryGraph {
                 relations: &ent.relations,
                 outgoing: &ent.outgoing,
                 incoming: &ent.incoming,
-                file_hashes: &ent.file_hashes,
+                working_tree: &ent.working_tree,
                 shallow_files: &ent.shallow_files,
                 file_layouts: &ent.file_layouts,
                 structured_artifacts: &ent.structured_artifacts,
@@ -3242,7 +3242,7 @@ impl InMemoryGraph {
             relations: ent.relations.into_iter().collect(),
             outgoing: ent.outgoing.into_iter().collect(),
             incoming: ent.incoming.into_iter().collect(),
-            file_hashes: ent.file_hashes.into_iter().collect(),
+            working_tree: ent.working_tree.into_iter().collect(),
             shallow_files: ent.shallow_files.into_values().collect(),
             file_layouts: ent.file_layouts.into_values().collect(),
             structured_artifacts: ent.structured_artifacts.into_values().collect(),
@@ -3429,7 +3429,7 @@ impl InMemoryGraph {
             file_layout_count: ent.file_layouts.len(),
             structured_artifact_count: ent.structured_artifacts.len(),
             opaque_artifact_count: ent.opaque_artifacts.len(),
-            file_hash_count: ent.file_hashes.len(),
+            working_tree_entry_count: ent.working_tree.len(),
             text_indexed_entity_count,
             text_index_coverage_percent: coverage_percent(
                 text_indexed_entity_count,
@@ -3581,21 +3581,21 @@ impl InMemoryGraph {
             RetrievalKey::ArtifactRevision(rev_id) => {
                 let chg = self.changes.read();
                 for change in chg.changes.values() {
-                    for delta in &change.artifact_deltas {
-                        if let Some(hash) = delta.new_hash {
+                    for delta in &change.tree_deltas {
+                        if let Some(entry) = delta.new_entry() {
                             let derived_id = ArtifactRevisionId::for_artifact_change(
-                                &delta.file_id,
+                                delta.file_id(),
                                 &change.id,
-                                &hash,
+                                &entry,
                             );
                             if derived_id == *rev_id {
                                 return Some(ResolvedRetrievalItem::ShallowFile(
                                     ShallowTrackedFile {
-                                        file_id: delta.file_id.clone(),
+                                        file_id: delta.file_id().clone(),
                                         language_hint: String::new(),
                                         declaration_count: 0,
                                         import_count: 0,
-                                        syntax_hash: hash,
+                                        syntax_hash: entry.blob_hash,
                                         signature_hash: None,
                                         declaration_names: vec![],
                                         import_paths: vec![],
@@ -5542,18 +5542,33 @@ impl InMemoryGraph {
     // Incremental indexing helpers
     // -------------------------------------------------------------------
 
-    /// Record the content hash for a file.
-    pub fn set_file_hash(&self, path: &str, hash: [u8; 32]) {
+    /// Publish one exact working-tree entry.
+    pub fn set_working_tree_entry(&self, path: &str, entry: TreeEntry) {
         self.entities
             .write()
-            .file_hashes
-            .insert(path.to_string(), hash);
-        self.record_file_hash_delta_upsert(path.to_string(), hash);
+            .working_tree
+            .insert(path.to_string(), entry);
+        self.record_working_tree_delta_upsert(path.to_string(), entry);
     }
 
-    /// Get the recorded hash for a file.
-    pub fn get_file_hash(&self, path: &str) -> Option<[u8; 32]> {
-        self.entities.read().file_hashes.get(path).copied()
+    /// Read one exact working-tree entry.
+    pub fn get_working_tree_entry(&self, path: &str) -> Option<TreeEntry> {
+        self.entities.read().working_tree.get(path).copied()
+    }
+
+    /// Snapshot the complete exact working tree.
+    pub fn working_tree_entries(&self) -> HashMap<String, TreeEntry> {
+        self.entities.read().working_tree.clone()
+    }
+
+    /// Remove one exact working-tree entry without changing its semantic
+    /// enrichment facets.
+    pub fn remove_working_tree_entry(&self, path: &str) -> Option<TreeEntry> {
+        let removed = self.entities.write().working_tree.remove(path);
+        if removed.is_some() {
+            self.record_working_tree_delta_remove(path.to_string());
+        }
+        removed
     }
 
     /// Remove all entities and their outgoing relations for entities in a given file.
@@ -5569,8 +5584,6 @@ impl InMemoryGraph {
         let entity_ids: Vec<EntityId> = ent.indexes.by_file(path).to_vec();
 
         if entity_ids.is_empty() {
-            ent.file_hashes.remove(path);
-            self.record_file_hash_delta_remove(path.to_string());
             return Vec::new();
         }
 
@@ -5631,21 +5644,18 @@ impl InMemoryGraph {
             }
         }
 
-        // Also remove the file hash entry.
-        ent.file_hashes.remove(path);
-        self.record_file_hash_delta_remove(path.to_string());
         self.refresh_merkle_for_entities(&ent, merkle_seeds);
 
         entity_ids
     }
 
-    /// Get all file paths that have recorded content hashes.
-    pub fn indexed_file_paths(&self) -> Vec<String> {
-        self.entities.read().file_hashes.keys().cloned().collect()
+    /// Get all paths present in the exact graph-owned working tree.
+    pub fn working_tree_paths(&self) -> Vec<String> {
+        self.entities.read().working_tree.keys().cloned().collect()
     }
 
     /// Get file paths that have at least one entity (function, class, etc.).
-    /// Unlike `indexed_file_paths` which returns every tracked file (including
+    /// Unlike `working_tree_paths` which returns every tracked file (including
     /// build artifacts, configs, etc.), this returns only files the parser
     /// extracted semantic entities from — the graph-native authority on what
     /// constitutes source code.
@@ -6703,14 +6713,8 @@ impl EntityStore for InMemoryGraph {
             .collect())
     }
 
-    fn get_file_hash(&self, file_id: &FilePathId) -> Result<Option<Hash256>, KinDbError> {
-        Ok(self
-            .entities
-            .read()
-            .file_hashes
-            .get(&file_id.0)
-            .copied()
-            .map(Hash256::from_bytes))
+    fn get_tree_entry(&self, file_id: &FilePathId) -> Result<Option<TreeEntry>, KinDbError> {
+        Ok(self.entities.read().working_tree.get(&file_id.0).copied())
     }
 
     fn delete_file_layout(&self, file_id: &FilePathId) -> Result<(), KinDbError> {
@@ -6741,7 +6745,52 @@ impl EntityStore for InMemoryGraph {
         {
             let mut ent = self.entities.write();
 
-            // 1. Process entity deltas
+            // Validate the complete tree transition before mutating any graph
+            // domain. This keeps tree, entity, and relation changes atomic and
+            // prevents a stale caller from silently overwriting graph truth.
+            let mut staged_tree = HashMap::<String, Option<TreeEntry>>::new();
+            for tree_delta in &delta.tree_deltas {
+                let path = tree_delta.file_id().0.clone();
+                let actual = staged_tree
+                    .get(&path)
+                    .copied()
+                    .unwrap_or_else(|| ent.working_tree.get(&path).copied());
+                let (expected, next) = match tree_delta {
+                    TreeDelta::Added { new_entry, .. } => (None, Some(*new_entry)),
+                    TreeDelta::Modified {
+                        old_entry,
+                        new_entry,
+                        ..
+                    } => (Some(*old_entry), Some(*new_entry)),
+                    TreeDelta::Removed { old_entry, .. } => (Some(*old_entry), None),
+                };
+                if actual != expected {
+                    return Err(KinDbError::WorkingTreeConflict {
+                        path,
+                        reason: format!("expected {expected:?}, found {actual:?}"),
+                    });
+                }
+                staged_tree.insert(tree_delta.file_id().0.clone(), next);
+            }
+
+            // 1. Process exact repository-tree deltas.
+            for tree_delta in &delta.tree_deltas {
+                match tree_delta {
+                    TreeDelta::Added { file_id, new_entry }
+                    | TreeDelta::Modified {
+                        file_id, new_entry, ..
+                    } => {
+                        ent.working_tree.insert(file_id.0.clone(), *new_entry);
+                        self.record_working_tree_delta_upsert(file_id.0.clone(), *new_entry);
+                    }
+                    TreeDelta::Removed { file_id, .. } => {
+                        ent.working_tree.remove(&file_id.0);
+                        self.record_working_tree_delta_remove(file_id.0.clone());
+                    }
+                }
+            }
+
+            // 2. Process entity deltas.
             for ent_delta in &delta.entity_deltas {
                 match ent_delta {
                     EntityDelta::Added(entity) | EntityDelta::Modified { new: entity, .. } => {
@@ -6827,7 +6876,7 @@ impl EntityStore for InMemoryGraph {
                 }
             }
 
-            // 2. Process relation deltas
+            // 3. Process relation deltas.
             for rel_delta in &delta.relation_deltas {
                 match rel_delta {
                     RelationDelta::Added(relation) => {
@@ -6856,7 +6905,7 @@ impl EntityStore for InMemoryGraph {
             self.refresh_merkle_for_entities(&ent, merkle_seeds.iter().copied());
         }
 
-        // 3. Clean up deleted entities from the embedding queue / vector index
+        // 4. Clean up deleted entities from the embedding queue / vector index
         #[cfg(feature = "vector")]
         {
             let mut eq = self.embedding_queue.lock();
@@ -6869,7 +6918,7 @@ impl EntityStore for InMemoryGraph {
             }
         }
 
-        // 4. Invalidate / refresh text index & embeddings for affected entities
+        // 5. Invalidate / refresh text index & embeddings for affected entities
         let affected_list: Vec<EntityId> = affected.into_iter().collect();
         if !affected_list.is_empty() {
             self.refresh_text_index_for_entities(&affected_list);
@@ -9060,6 +9109,80 @@ mod tests {
         }
     }
 
+    #[test]
+    fn transaction_applies_exact_non_language_tree_transitions() {
+        let graph = InMemoryGraph::new();
+        let file_id = FilePathId::new("compose.yaml");
+        let regular = TreeEntry::regular(Hash256::from_bytes([0x11; 32]), false);
+        let executable = TreeEntry::regular(Hash256::from_bytes([0x11; 32]), true);
+        let symlink = TreeEntry::symlink(Hash256::from_bytes([0x22; 32]));
+
+        graph
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: Vec::new(),
+                relation_deltas: Vec::new(),
+                tree_deltas: vec![TreeDelta::Added {
+                    file_id: file_id.clone(),
+                    new_entry: regular,
+                }],
+            })
+            .unwrap();
+        assert_eq!(graph.get_tree_entry(&file_id).unwrap(), Some(regular));
+
+        graph
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: Vec::new(),
+                relation_deltas: Vec::new(),
+                tree_deltas: vec![TreeDelta::Modified {
+                    file_id: file_id.clone(),
+                    old_entry: regular,
+                    new_entry: executable,
+                }],
+            })
+            .unwrap();
+        assert_eq!(graph.get_tree_entry(&file_id).unwrap(), Some(executable));
+
+        graph
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: Vec::new(),
+                relation_deltas: Vec::new(),
+                tree_deltas: vec![TreeDelta::Modified {
+                    file_id: file_id.clone(),
+                    old_entry: executable,
+                    new_entry: symlink,
+                }],
+            })
+            .unwrap();
+        assert_eq!(graph.get_tree_entry(&file_id).unwrap(), Some(symlink));
+    }
+
+    #[test]
+    fn stale_tree_transition_rejects_all_graph_mutations_atomically() {
+        let graph = InMemoryGraph::new();
+        let file_id = FilePathId::new("Dockerfile");
+        let current = TreeEntry::regular(Hash256::from_bytes([0x31; 32]), false);
+        let stale = TreeEntry::regular(Hash256::from_bytes([0x32; 32]), false);
+        let replacement = TreeEntry::regular(Hash256::from_bytes([0x33; 32]), true);
+        graph.set_working_tree_entry(&file_id.0, current);
+        let entity = test_entity("must_not_land", "src/lib.rs");
+
+        let error = graph
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: vec![EntityDelta::Added(entity.clone())],
+                relation_deltas: Vec::new(),
+                tree_deltas: vec![TreeDelta::Modified {
+                    file_id: file_id.clone(),
+                    old_entry: stale,
+                    new_entry: replacement,
+                }],
+            })
+            .unwrap_err();
+
+        assert!(matches!(error, KinDbError::WorkingTreeConflict { .. }));
+        assert_eq!(graph.get_tree_entry(&file_id).unwrap(), Some(current));
+        assert!(graph.get_entity(&entity.id).unwrap().is_none());
+    }
+
     fn test_relation(src: EntityId, dst: EntityId, kind: RelationKind) -> Relation {
         Relation {
             id: RelationId::new(),
@@ -10025,7 +10148,7 @@ mod tests {
             message: "genesis".to_string(),
             entity_deltas: vec![],
             relation_deltas: vec![],
-            artifact_deltas: vec![],
+            tree_deltas: vec![],
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],
@@ -10043,7 +10166,7 @@ mod tests {
             message: "child".to_string(),
             entity_deltas: vec![],
             relation_deltas: vec![],
-            artifact_deltas: vec![],
+            tree_deltas: vec![],
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],
@@ -10072,7 +10195,7 @@ mod tests {
             message: "immutable payload".to_string(),
             entity_deltas: vec![],
             relation_deltas: vec![],
-            artifact_deltas: vec![],
+            tree_deltas: vec![],
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],
@@ -10120,7 +10243,7 @@ mod tests {
             message: "exact float payload".to_string(),
             entity_deltas: vec![EntityDelta::Added(entity)],
             relation_deltas: vec![],
-            artifact_deltas: vec![],
+            tree_deltas: vec![],
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],
@@ -10162,7 +10285,7 @@ mod tests {
             message: "invalid float payload".to_string(),
             entity_deltas: vec![EntityDelta::Added(entity)],
             relation_deltas: vec![],
-            artifact_deltas: vec![],
+            tree_deltas: vec![],
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],
@@ -10191,7 +10314,7 @@ mod tests {
             message: "first".to_string(),
             entity_deltas: vec![EntityDelta::Added(entity)],
             relation_deltas: vec![],
-            artifact_deltas: vec![],
+            tree_deltas: vec![],
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],
@@ -10225,7 +10348,7 @@ mod tests {
             message: "batch exact float payload".to_string(),
             entity_deltas: vec![EntityDelta::Added(entity)],
             relation_deltas: vec![],
-            artifact_deltas: vec![],
+            tree_deltas: vec![],
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],
@@ -10259,7 +10382,7 @@ mod tests {
             message: "valid first entry".to_string(),
             entity_deltas: vec![EntityDelta::Added(test_entity("valid", "src/valid.rs"))],
             relation_deltas: vec![],
-            artifact_deltas: vec![],
+            tree_deltas: vec![],
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],
@@ -10278,7 +10401,7 @@ mod tests {
             message: "invalid later entry".to_string(),
             entity_deltas: vec![],
             relation_deltas: vec![RelationDelta::Added(relation)],
-            artifact_deltas: vec![],
+            tree_deltas: vec![],
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],
@@ -10319,7 +10442,7 @@ mod tests {
                 message: "genesis".to_string(),
                 entity_deltas: vec![EntityDelta::Added(original.clone())],
                 relation_deltas: vec![],
-                artifact_deltas: vec![],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
@@ -10337,7 +10460,7 @@ mod tests {
                     new: modified,
                 }],
                 relation_deltas: vec![],
-                artifact_deltas: vec![],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
@@ -10352,7 +10475,7 @@ mod tests {
                 message: "sibling".to_string(),
                 entity_deltas: vec![],
                 relation_deltas: vec![],
-                artifact_deltas: vec![],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
@@ -10496,7 +10619,7 @@ mod tests {
                 message: message.to_string(),
                 entity_deltas,
                 relation_deltas: vec![],
-                artifact_deltas: vec![],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
@@ -10639,7 +10762,7 @@ mod tests {
                 message: "genesis".to_string(),
                 entity_deltas: vec![],
                 relation_deltas: vec![],
-                artifact_deltas: vec![],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
@@ -10659,7 +10782,7 @@ mod tests {
                 message: "add foo".to_string(),
                 entity_deltas: vec![EntityDelta::Added(entity_v1.clone())],
                 relation_deltas: vec![],
-                artifact_deltas: vec![],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
@@ -10685,7 +10808,7 @@ mod tests {
                     new: entity_v2.clone(),
                 }],
                 relation_deltas: vec![],
-                artifact_deltas: vec![],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
@@ -10721,7 +10844,7 @@ mod tests {
                 message: "genesis".to_string(),
                 entity_deltas: vec![],
                 relation_deltas: vec![],
-                artifact_deltas: vec![],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
@@ -10741,7 +10864,7 @@ mod tests {
                 message: "add foo".to_string(),
                 entity_deltas: vec![EntityDelta::Added(entity_v1.clone())],
                 relation_deltas: vec![],
-                artifact_deltas: vec![],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
@@ -10767,7 +10890,7 @@ mod tests {
                     new: entity_v2.clone(),
                 }],
                 relation_deltas: vec![],
-                artifact_deltas: vec![],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
@@ -10804,7 +10927,7 @@ mod tests {
                 message: "genesis".to_string(),
                 entity_deltas: vec![],
                 relation_deltas: vec![],
-                artifact_deltas: vec![],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
@@ -10824,7 +10947,7 @@ mod tests {
                 message: "add foo".to_string(),
                 entity_deltas: vec![EntityDelta::Added(entity_v1.clone())],
                 relation_deltas: vec![],
-                artifact_deltas: vec![],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
@@ -10849,7 +10972,7 @@ mod tests {
                     new: entity_v2,
                 }],
                 relation_deltas: vec![],
-                artifact_deltas: vec![],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
@@ -10886,7 +11009,7 @@ mod tests {
                 message: "genesis".to_string(),
                 entity_deltas: vec![],
                 relation_deltas: vec![],
-                artifact_deltas: vec![],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
@@ -10906,7 +11029,7 @@ mod tests {
                 message: "add foo".to_string(),
                 entity_deltas: vec![EntityDelta::Added(entity_v1.clone())],
                 relation_deltas: vec![],
-                artifact_deltas: vec![],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
@@ -10931,7 +11054,7 @@ mod tests {
                     new: entity_v2,
                 }],
                 relation_deltas: vec![],
-                artifact_deltas: vec![],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
@@ -10972,7 +11095,7 @@ mod tests {
                 message: "genesis".to_string(),
                 entity_deltas: vec![],
                 relation_deltas: vec![],
-                artifact_deltas: vec![],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
@@ -10998,7 +11121,7 @@ mod tests {
                     EntityDelta::Added(callee.clone()),
                 ],
                 relation_deltas: vec![RelationDelta::Added(rel.clone())],
-                artifact_deltas: vec![],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
@@ -11017,7 +11140,7 @@ mod tests {
                 message: "remove relation".to_string(),
                 entity_deltas: vec![],
                 relation_deltas: vec![RelationDelta::Removed(rel.id)],
-                artifact_deltas: vec![],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
@@ -11049,7 +11172,7 @@ mod tests {
                 message: "genesis".to_string(),
                 entity_deltas: vec![],
                 relation_deltas: vec![],
-                artifact_deltas: vec![],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
@@ -11075,7 +11198,7 @@ mod tests {
                     EntityDelta::Added(callee.clone()),
                 ],
                 relation_deltas: vec![RelationDelta::Added(rel.clone())],
-                artifact_deltas: vec![],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
@@ -11094,7 +11217,7 @@ mod tests {
                 message: "remove callee".to_string(),
                 entity_deltas: vec![EntityDelta::Removed(callee.id)],
                 relation_deltas: vec![],
-                artifact_deltas: vec![],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
@@ -11117,7 +11240,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_graph_at_replays_file_tree_into_resolved_state() {
+    fn resolve_graph_at_replays_tree_into_resolved_state() {
         let graph = InMemoryGraph::new();
 
         let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x44; 32]));
@@ -11130,7 +11253,7 @@ mod tests {
                 message: "genesis".to_string(),
                 entity_deltas: vec![],
                 relation_deltas: vec![],
-                artifact_deltas: vec![],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
@@ -11151,11 +11274,9 @@ mod tests {
                 message: "add artifact".to_string(),
                 entity_deltas: vec![],
                 relation_deltas: vec![],
-                artifact_deltas: vec![ArtifactDelta {
+                tree_deltas: vec![TreeDelta::Added {
                     file_id: file_id.clone(),
-                    kind: ArtifactDeltaKind::Added,
-                    old_hash: None,
-                    new_hash: Some(content_hash),
+                    new_entry: TreeEntry::regular(content_hash, false),
                 }],
                 projected_files: vec![file_id.clone()],
                 spec_link: None,
@@ -11166,7 +11287,10 @@ mod tests {
             .unwrap();
 
         let state = graph.resolve_graph_at(&add_id).unwrap();
-        assert_eq!(state.file_tree.get(&file_id), Some(&content_hash));
+        assert_eq!(
+            state.tree.get(&file_id),
+            Some(&TreeEntry::regular(content_hash, false))
+        );
     }
 
     #[test]
@@ -11183,7 +11307,7 @@ mod tests {
                 message: "genesis".to_string(),
                 entity_deltas: vec![],
                 relation_deltas: vec![],
-                artifact_deltas: vec![],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
@@ -11203,7 +11327,7 @@ mod tests {
                 message: "add foo".to_string(),
                 entity_deltas: vec![EntityDelta::Added(entity.clone())],
                 relation_deltas: vec![],
-                artifact_deltas: vec![],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
@@ -11227,7 +11351,7 @@ mod tests {
                     new: main_entity,
                 }],
                 relation_deltas: vec![],
-                artifact_deltas: vec![],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
@@ -11251,7 +11375,7 @@ mod tests {
                     new: feature_entity,
                 }],
                 relation_deltas: vec![],
-                artifact_deltas: vec![],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
@@ -11282,7 +11406,7 @@ mod tests {
                 message: "genesis".to_string(),
                 entity_deltas: vec![],
                 relation_deltas: vec![],
-                artifact_deltas: vec![],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
@@ -11302,7 +11426,7 @@ mod tests {
                 message: "add foo".to_string(),
                 entity_deltas: vec![EntityDelta::Added(entity_v1.clone())],
                 relation_deltas: vec![],
-                artifact_deltas: vec![],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
@@ -11328,7 +11452,7 @@ mod tests {
                     new: entity_v2.clone(),
                 }],
                 relation_deltas: vec![],
-                artifact_deltas: vec![],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
@@ -11347,7 +11471,7 @@ mod tests {
                 message: "remove foo".to_string(),
                 entity_deltas: vec![EntityDelta::Removed(entity_v1.id)],
                 relation_deltas: vec![],
-                artifact_deltas: vec![],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
@@ -11388,7 +11512,7 @@ mod tests {
                 message: "genesis".to_string(),
                 entity_deltas: vec![],
                 relation_deltas: vec![],
-                artifact_deltas: vec![],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
@@ -11413,7 +11537,7 @@ mod tests {
                     EntityDelta::Added(callee.clone()),
                 ],
                 relation_deltas: vec![RelationDelta::Added(rel.clone())],
-                artifact_deltas: vec![],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
@@ -11432,7 +11556,7 @@ mod tests {
                 message: "remove relation".to_string(),
                 entity_deltas: vec![],
                 relation_deltas: vec![RelationDelta::Removed(rel.id)],
-                artifact_deltas: vec![],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
@@ -11467,7 +11591,7 @@ mod tests {
                 message: "genesis".to_string(),
                 entity_deltas: vec![],
                 relation_deltas: vec![],
-                artifact_deltas: vec![],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
@@ -11488,11 +11612,9 @@ mod tests {
                 message: "add artifact".to_string(),
                 entity_deltas: vec![],
                 relation_deltas: vec![],
-                artifact_deltas: vec![ArtifactDelta {
+                tree_deltas: vec![TreeDelta::Added {
                     file_id: file_id.clone(),
-                    kind: ArtifactDeltaKind::Added,
-                    old_hash: None,
-                    new_hash: Some(v1),
+                    new_entry: TreeEntry::regular(v1, false),
                 }],
                 projected_files: vec![file_id.clone()],
                 spec_link: None,
@@ -11513,11 +11635,10 @@ mod tests {
                 message: "modify artifact".to_string(),
                 entity_deltas: vec![],
                 relation_deltas: vec![],
-                artifact_deltas: vec![ArtifactDelta {
+                tree_deltas: vec![TreeDelta::Modified {
                     file_id: file_id.clone(),
-                    kind: ArtifactDeltaKind::Modified,
-                    old_hash: Some(v1),
-                    new_hash: Some(v2),
+                    old_entry: TreeEntry::regular(v1, false),
+                    new_entry: TreeEntry::regular(v2, false),
                 }],
                 projected_files: vec![file_id.clone()],
                 spec_link: None,
@@ -11537,11 +11658,9 @@ mod tests {
                 message: "remove artifact".to_string(),
                 entity_deltas: vec![],
                 relation_deltas: vec![],
-                artifact_deltas: vec![ArtifactDelta {
+                tree_deltas: vec![TreeDelta::Removed {
                     file_id: file_id.clone(),
-                    kind: ArtifactDeltaKind::Removed,
-                    old_hash: Some(v2),
-                    new_hash: None,
+                    old_entry: TreeEntry::regular(v2, false),
                 }],
                 projected_files: vec![file_id.clone()],
                 spec_link: None,
@@ -11555,9 +11674,9 @@ mod tests {
             .get_artifact_revisions_at(&file_id, &remove_id)
             .unwrap();
         assert_eq!(revisions.len(), 2);
-        assert_eq!(revisions[0].content_hash, v1);
+        assert_eq!(revisions[0].entry, TreeEntry::regular(v1, false));
         assert_eq!(revisions[0].ended_by, Some(modify_id));
-        assert_eq!(revisions[1].content_hash, v2);
+        assert_eq!(revisions[1].entry, TreeEntry::regular(v2, false));
         assert_eq!(revisions[1].ended_by, Some(remove_id));
         assert!(graph
             .resolve_artifact_revision_at(&file_id, &remove_id)
@@ -11566,7 +11685,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_file_tree_at_replays_artifact_deltas_for_target_head() {
+    fn resolve_tree_at_replays_tree_deltas_for_target_head() {
         let graph = InMemoryGraph::new();
 
         let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x61; 32]));
@@ -11579,7 +11698,7 @@ mod tests {
                 message: "genesis".to_string(),
                 entity_deltas: vec![],
                 relation_deltas: vec![],
-                artifact_deltas: vec![],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
@@ -11600,11 +11719,9 @@ mod tests {
                 message: "add artifact".to_string(),
                 entity_deltas: vec![],
                 relation_deltas: vec![],
-                artifact_deltas: vec![ArtifactDelta {
+                tree_deltas: vec![TreeDelta::Added {
                     file_id: file_id.clone(),
-                    kind: ArtifactDeltaKind::Added,
-                    old_hash: None,
-                    new_hash: Some(v1),
+                    new_entry: TreeEntry::regular(v1, false),
                 }],
                 projected_files: vec![file_id.clone()],
                 spec_link: None,
@@ -11625,11 +11742,10 @@ mod tests {
                 message: "modify artifact".to_string(),
                 entity_deltas: vec![],
                 relation_deltas: vec![],
-                artifact_deltas: vec![ArtifactDelta {
+                tree_deltas: vec![TreeDelta::Modified {
                     file_id: file_id.clone(),
-                    kind: ArtifactDeltaKind::Modified,
-                    old_hash: Some(v1),
-                    new_hash: Some(v2),
+                    old_entry: TreeEntry::regular(v1, false),
+                    new_entry: TreeEntry::regular(v2, false),
                 }],
                 projected_files: vec![file_id.clone()],
                 spec_link: None,
@@ -11639,11 +11755,14 @@ mod tests {
             })
             .unwrap();
 
-        let at_add = graph.resolve_file_tree_at(&add_id).unwrap();
-        assert_eq!(at_add.get(&file_id), Some(&v1));
+        let at_add = graph.resolve_tree_at(&add_id).unwrap();
+        assert_eq!(at_add.get(&file_id), Some(&TreeEntry::regular(v1, false)));
 
-        let at_modify = graph.resolve_file_tree_at(&modify_id).unwrap();
-        assert_eq!(at_modify.get(&file_id), Some(&v2));
+        let at_modify = graph.resolve_tree_at(&modify_id).unwrap();
+        assert_eq!(
+            at_modify.get(&file_id),
+            Some(&TreeEntry::regular(v2, false))
+        );
     }
 
     #[test]
@@ -11660,7 +11779,7 @@ mod tests {
                 message: "genesis".to_string(),
                 entity_deltas: vec![],
                 relation_deltas: vec![],
-                artifact_deltas: vec![],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
@@ -11681,11 +11800,9 @@ mod tests {
                 message: "add artifact".to_string(),
                 entity_deltas: vec![],
                 relation_deltas: vec![],
-                artifact_deltas: vec![ArtifactDelta {
+                tree_deltas: vec![TreeDelta::Added {
                     file_id: file_id.clone(),
-                    kind: ArtifactDeltaKind::Added,
-                    old_hash: None,
-                    new_hash: Some(v1),
+                    new_entry: TreeEntry::regular(v1, false),
                 }],
                 projected_files: vec![file_id.clone()],
                 spec_link: None,
@@ -11706,11 +11823,10 @@ mod tests {
                 message: "modify artifact".to_string(),
                 entity_deltas: vec![],
                 relation_deltas: vec![],
-                artifact_deltas: vec![ArtifactDelta {
+                tree_deltas: vec![TreeDelta::Modified {
                     file_id: file_id.clone(),
-                    kind: ArtifactDeltaKind::Modified,
-                    old_hash: Some(v1),
-                    new_hash: Some(v2),
+                    old_entry: TreeEntry::regular(v1, false),
+                    new_entry: TreeEntry::regular(v2, false),
                 }],
                 projected_files: vec![file_id.clone()],
                 spec_link: None,
@@ -11724,9 +11840,9 @@ mod tests {
             .get_artifact_revisions_at(&file_id, &modify_id)
             .unwrap();
         assert_eq!(revisions.len(), 2);
-        assert_eq!(revisions[0].content_hash, v1);
+        assert_eq!(revisions[0].entry, TreeEntry::regular(v1, false));
         assert_eq!(revisions[0].ended_by, Some(modify_id));
-        assert_eq!(revisions[1].content_hash, v2);
+        assert_eq!(revisions[1].entry, TreeEntry::regular(v2, false));
         assert_eq!(
             revisions[1].previous_revision,
             Some(revisions[0].revision_id)
@@ -12459,7 +12575,7 @@ mod tests {
                 .map(|e| EntityDelta::Added(e.clone()))
                 .collect(),
             relation_deltas: vec![],
-            artifact_deltas: vec![],
+            tree_deltas: vec![],
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],
@@ -13222,8 +13338,8 @@ mod tests {
         };
         graph.upsert_opaque_artifact(&opaque).unwrap();
 
-        // Set a file hash
-        graph.set_file_hash("src/a.rs", [1u8; 32]);
+        // Publish one exact working-tree entry.
+        graph.set_working_tree_entry("src/a.rs", crate::types::regular_tree_entry(1));
         graph.flush_text_index().unwrap();
 
         #[cfg(feature = "vector")]
@@ -13248,7 +13364,7 @@ mod tests {
         assert_eq!(stats.shallow_file_count, 1);
         assert_eq!(stats.structured_artifact_count, 1);
         assert_eq!(stats.opaque_artifact_count, 1);
-        assert_eq!(stats.file_hash_count, 1);
+        assert_eq!(stats.working_tree_entry_count, 1);
         assert_eq!(stats.text_indexed_entity_count, 3);
         assert!((stats.text_index_coverage_percent - 100.0).abs() < f64::EPSILON);
         #[cfg(feature = "vector")]
@@ -13287,7 +13403,7 @@ mod tests {
                 message: "genesis".to_string(),
                 entity_deltas: vec![],
                 relation_deltas: vec![],
-                artifact_deltas: vec![],
+                tree_deltas: vec![],
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
@@ -13311,7 +13427,7 @@ mod tests {
                     message: format!("change {idx}"),
                     entity_deltas: vec![],
                     relation_deltas: vec![],
-                    artifact_deltas: vec![],
+                    tree_deltas: vec![],
                     projected_files: vec![],
                     spec_link: None,
                     evidence: vec![],
@@ -13326,7 +13442,7 @@ mod tests {
         let state = graph.resolve_graph_at(&head).unwrap();
         assert!(state.entities.is_empty());
         assert!(state.relations.is_empty());
-        assert!(state.file_tree.is_empty());
+        assert!(state.tree.is_empty());
     }
 
     fn test_entity_with_id(id_seed: u128, name: &str) -> Entity {

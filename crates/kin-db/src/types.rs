@@ -11,7 +11,7 @@ pub use kin_model::{
     ArtifactId, ArtifactRevisionId, AuthorId, BranchId, BranchName, ConflictId, ContractId,
     EntityId, EntityRevisionId, EvidenceId, FilePathId, Hash256, IntentId, LanguageId, RelationId,
     RelationRevisionId, RetrievalKey, RetrievalKeyFileResolver, SemanticChangeId, SessionId,
-    SpecId,
+    SpecId, TreeEntry, TreeEntryKind,
 };
 
 // Entity types
@@ -24,9 +24,7 @@ pub use kin_model::{
 pub use kin_model::{GraphNodeId, Relation, RelationKind, RelationOrigin, RelationRevision};
 
 pub use kin_model::ArtifactRevision;
-pub use kin_model::{
-    ArtifactDelta, ArtifactDeltaKind, EntityDelta, RelationDelta, SemanticChange, TransactionDelta,
-};
+pub use kin_model::{EntityDelta, RelationDelta, SemanticChange, TransactionDelta, TreeDelta};
 
 // Branch types
 pub use kin_model::{Branch, GraphOverlay, MergeState, WorkingCopy};
@@ -77,3 +75,8 @@ pub use kin_model::{
 
 // Graph observability
 pub use kin_model::GraphStats;
+
+#[cfg(test)]
+pub(crate) fn regular_tree_entry(byte: u8) -> TreeEntry {
+    TreeEntry::regular(Hash256::from_bytes([byte; 32]), false)
+}

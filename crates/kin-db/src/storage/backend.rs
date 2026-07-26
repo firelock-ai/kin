@@ -3748,9 +3748,10 @@ mod tests {
 
         // Second write with correct generation succeeds with different bytes.
         let mut replacement = GraphSnapshot::empty();
-        replacement
-            .file_hashes
-            .insert("replacement.rs".to_string(), [7; 32]);
+        replacement.working_tree.insert(
+            "replacement.rs".to_string(),
+            crate::types::regular_tree_entry(7),
+        );
         let replacement_bytes = replacement.to_bytes().unwrap();
         let gen2 = backend
             .save_snapshot("test-repo", &replacement_bytes, gen1)
@@ -3846,9 +3847,9 @@ mod tests {
         // Save a delta
         let mut delta = crate::storage::delta::GraphSnapshotDelta::empty(gen1);
         delta
-            .file_hashes
+            .working_tree
             .added
-            .push(("new.rs".to_string(), [42; 32]));
+            .push(("new.rs".to_string(), crate::types::regular_tree_entry(42)));
         let delta_bytes = delta.to_bytes().unwrap();
         let gen2 = backend.save_delta("test-repo", &delta_bytes, gen1).unwrap();
         assert_eq!(gen2, 2);
@@ -3860,7 +3861,7 @@ mod tests {
 
         let loaded_delta =
             crate::storage::delta::GraphSnapshotDelta::from_bytes(&loaded[0].0).unwrap();
-        assert_eq!(loaded_delta.file_hashes.added.len(), 1);
+        assert_eq!(loaded_delta.working_tree.added.len(), 1);
 
         // No deltas since gen2
         let empty = backend.load_deltas_since("test-repo", gen2).unwrap();
@@ -3873,13 +3874,16 @@ mod tests {
         let backend = LocalFileBackend::new(dir.path());
         let repo_id = "generation-bytes";
         let mut base = GraphSnapshot::empty();
-        base.file_hashes.insert("base.rs".to_string(), [1; 32]);
+        base.working_tree
+            .insert("base.rs".to_string(), crate::types::regular_tree_entry(1));
         let base_bytes = base.to_bytes().unwrap();
         let gen1 = backend
             .save_snapshot(repo_id, &base_bytes, GENERATION_INIT)
             .unwrap();
         let mut current = base.clone();
-        current.file_hashes.insert("delta.rs".to_string(), [2; 32]);
+        current
+            .working_tree
+            .insert("delta.rs".to_string(), crate::types::regular_tree_entry(2));
         let delta = crate::storage::delta::compute_graph_delta(&base, &current, gen1);
         let gen2 = backend
             .save_delta(repo_id, &delta.to_bytes().unwrap(), gen1)
@@ -3918,7 +3922,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let repo_id = "restart-repo";
         let mut base = GraphSnapshot::empty();
-        base.file_hashes.insert("base.rs".to_string(), [1; 32]);
+        base.working_tree
+            .insert("base.rs".to_string(), crate::types::regular_tree_entry(1));
 
         {
             let backend = LocalFileBackend::new(dir.path());
@@ -3928,8 +3933,8 @@ mod tests {
 
             let mut after_first = base.clone();
             after_first
-                .file_hashes
-                .insert("first.rs".to_string(), [2; 32]);
+                .working_tree
+                .insert("first.rs".to_string(), crate::types::regular_tree_entry(2));
             let first_delta = crate::storage::delta::compute_graph_delta(&base, &after_first, gen1);
             let gen2 = backend
                 .save_delta(repo_id, &first_delta.to_bytes().unwrap(), gen1)
@@ -3937,8 +3942,8 @@ mod tests {
 
             let mut after_second = after_first.clone();
             after_second
-                .file_hashes
-                .insert("second.rs".to_string(), [3; 32]);
+                .working_tree
+                .insert("second.rs".to_string(), crate::types::regular_tree_entry(3));
             let second_delta =
                 crate::storage::delta::compute_graph_delta(&after_first, &after_second, gen2);
             let gen3 = backend
@@ -3954,10 +3959,10 @@ mod tests {
         assert_eq!(recovered.generation, 3);
         assert_eq!(recovered.deltas_seen, 2);
         assert_eq!(recovered.deltas_applied, 2);
-        assert_eq!(recovered.snapshot.file_hashes.len(), 3);
-        assert!(recovered.snapshot.file_hashes.contains_key("base.rs"));
-        assert!(recovered.snapshot.file_hashes.contains_key("first.rs"));
-        assert!(recovered.snapshot.file_hashes.contains_key("second.rs"));
+        assert_eq!(recovered.snapshot.working_tree.len(), 3);
+        assert!(recovered.snapshot.working_tree.contains_key("base.rs"));
+        assert!(recovered.snapshot.working_tree.contains_key("first.rs"));
+        assert!(recovered.snapshot.working_tree.contains_key("second.rs"));
     }
 
     #[test]
@@ -3987,9 +3992,10 @@ mod tests {
         let repo_id = "legacy-migration-cas";
         let original = GraphSnapshot::empty().to_bytes().unwrap();
         let mut replacement_snapshot = GraphSnapshot::empty();
-        replacement_snapshot
-            .file_hashes
-            .insert("new-writer.rs".to_string(), [9; 32]);
+        replacement_snapshot.working_tree.insert(
+            "new-writer.rs".to_string(),
+            crate::types::regular_tree_entry(9),
+        );
         let replacement = replacement_snapshot.to_bytes().unwrap();
         std::fs::create_dir_all(dir.path().join(repo_id)).unwrap();
         std::fs::write(backend.snapshot_path(repo_id), &original).unwrap();
@@ -4077,11 +4083,13 @@ mod tests {
         let backend = LocalFileBackend::new(dir.path());
         let repo_id = "legacy-rebuild";
         let mut base = GraphSnapshot::empty();
-        base.file_hashes.insert("base.rs".to_string(), [1; 32]);
+        base.working_tree
+            .insert("base.rs".to_string(), crate::types::regular_tree_entry(1));
         let mut reconciled = base.clone();
-        reconciled
-            .file_hashes
-            .insert("legacy-delta.rs".to_string(), [2; 32]);
+        reconciled.working_tree.insert(
+            "legacy-delta.rs".to_string(),
+            crate::types::regular_tree_entry(2),
+        );
         std::fs::create_dir_all(backend.deltas_dir(repo_id)).unwrap();
         std::fs::write(backend.snapshot_path(repo_id), base.to_bytes().unwrap()).unwrap();
         std::fs::write(backend.generation_path(repo_id), b"8").unwrap();
@@ -4112,7 +4120,7 @@ mod tests {
         assert!(!backend.legacy_rebuild_path(repo_id).exists());
         let recovered = load_recovered_snapshot(&backend, repo_id).unwrap().unwrap();
         assert_eq!(recovered.generation, retried);
-        assert_eq!(recovered.snapshot.file_hashes, reconciled.file_hashes);
+        assert_eq!(recovered.snapshot.working_tree, reconciled.working_tree);
     }
 
     #[test]
@@ -4122,9 +4130,10 @@ mod tests {
         let repo_id = "legacy-rebuild-marker-retry";
         let base = GraphSnapshot::empty();
         let mut reconciled = base.clone();
-        reconciled
-            .file_hashes
-            .insert("reconciled.rs".to_string(), [9; 32]);
+        reconciled.working_tree.insert(
+            "reconciled.rs".to_string(),
+            crate::types::regular_tree_entry(9),
+        );
         let delta_bytes = crate::storage::delta::GraphSnapshotDelta::empty(7)
             .to_bytes()
             .unwrap();
@@ -4187,9 +4196,9 @@ mod tests {
             .unwrap();
         let mut replacement_delta = crate::storage::delta::GraphSnapshotDelta::empty(7);
         replacement_delta
-            .file_hashes
+            .working_tree
             .added
-            .push(("raced.rs".to_string(), [8; 32]));
+            .push(("raced.rs".to_string(), crate::types::regular_tree_entry(8)));
         let replacement = replacement_delta.to_bytes().unwrap();
         std::fs::create_dir_all(backend.deltas_dir(repo_id)).unwrap();
         std::fs::write(backend.snapshot_path(repo_id), base.to_bytes().unwrap()).unwrap();
@@ -4228,7 +4237,9 @@ mod tests {
             .save_snapshot(repo_id, &base.to_bytes().unwrap(), GENERATION_INIT)
             .unwrap();
         let mut reconciled = base.clone();
-        reconciled.file_hashes.insert("v1.rs".to_string(), [4; 32]);
+        reconciled
+            .working_tree
+            .insert("v1.rs".to_string(), crate::types::regular_tree_entry(4));
         let delta = crate::storage::delta::compute_graph_delta(&base, &reconciled, base_generation);
         let head_generation = backend
             .save_delta(repo_id, &delta.to_bytes().unwrap(), base_generation)
@@ -4252,7 +4263,7 @@ mod tests {
         assert_eq!(committed, head_generation + 1);
         let recovered = load_recovered_snapshot(&backend, repo_id).unwrap().unwrap();
         assert_eq!(recovered.generation, committed);
-        assert_eq!(recovered.snapshot.file_hashes, reconciled.file_hashes);
+        assert_eq!(recovered.snapshot.working_tree, reconciled.working_tree);
     }
 
     #[test]
@@ -4349,9 +4360,10 @@ mod tests {
             .save_snapshot(repo_id, &base.to_bytes().unwrap(), GENERATION_INIT)
             .unwrap();
         let mut replacement_snapshot = GraphSnapshot::empty();
-        replacement_snapshot
-            .file_hashes
-            .insert("legacy-full.rs".to_string(), [4; 32]);
+        replacement_snapshot.working_tree.insert(
+            "legacy-full.rs".to_string(),
+            crate::types::regular_tree_entry(4),
+        );
         let replacement = replacement_snapshot.to_bytes().unwrap();
         LocalFileBackend::atomic_write(&backend.snapshot_path(repo_id), &replacement).unwrap();
         backend.write_generation(repo_id, generation).unwrap();
@@ -4380,9 +4392,10 @@ mod tests {
             .save_delta(repo_id, &delta.to_bytes().unwrap(), base_generation)
             .unwrap();
         let mut replacement_snapshot = GraphSnapshot::empty();
-        replacement_snapshot
-            .file_hashes
-            .insert("legacy-head.rs".to_string(), [5; 32]);
+        replacement_snapshot.working_tree.insert(
+            "legacy-head.rs".to_string(),
+            crate::types::regular_tree_entry(5),
+        );
         let replacement = replacement_snapshot.to_bytes().unwrap();
         LocalFileBackend::atomic_write(&backend.snapshot_path(repo_id), &replacement).unwrap();
         backend.write_generation(repo_id, head_generation).unwrap();
@@ -4431,9 +4444,10 @@ mod tests {
             .save_snapshot(repo_id, &base.to_bytes().unwrap(), GENERATION_INIT)
             .unwrap();
         let mut current = base.clone();
-        current
-            .file_hashes
-            .insert("committed.rs".to_string(), [7; 32]);
+        current.working_tree.insert(
+            "committed.rs".to_string(),
+            crate::types::regular_tree_entry(7),
+        );
         let committed = crate::storage::delta::compute_graph_delta(&base, &current, gen1);
         let gen2 = backend
             .save_delta(repo_id, &committed.to_bytes().unwrap(), gen1)
@@ -4465,9 +4479,10 @@ mod tests {
             .save_snapshot(repo_id, &base.to_bytes().unwrap(), GENERATION_INIT)
             .unwrap();
         let mut current = base.clone();
-        current
-            .file_hashes
-            .insert("committed.rs".to_string(), [7; 32]);
+        current.working_tree.insert(
+            "committed.rs".to_string(),
+            crate::types::regular_tree_entry(7),
+        );
         let committed = crate::storage::delta::compute_graph_delta(&base, &current, gen1);
         let gen2 = backend
             .save_delta(repo_id, &committed.to_bytes().unwrap(), gen1)
@@ -4499,9 +4514,10 @@ mod tests {
             .save_snapshot(repo_id, &base.to_bytes().unwrap(), GENERATION_INIT)
             .unwrap();
         let mut current = base.clone();
-        current
-            .file_hashes
-            .insert("retired.rs".to_string(), [7; 32]);
+        current.working_tree.insert(
+            "retired.rs".to_string(),
+            crate::types::regular_tree_entry(7),
+        );
         let delta = crate::storage::delta::compute_graph_delta(&base, &current, gen1);
         let gen2 = backend
             .save_delta(repo_id, &delta.to_bytes().unwrap(), gen1)
@@ -4537,9 +4553,10 @@ mod tests {
             .unwrap();
 
         let mut current = base.clone();
-        current
-            .file_hashes
-            .insert("current.rs".to_string(), [7; 32]);
+        current.working_tree.insert(
+            "current.rs".to_string(),
+            crate::types::regular_tree_entry(7),
+        );
         let delta = crate::storage::delta::compute_graph_delta(&base, &current, gen1);
         let gen2 = backend
             .save_delta(repo_id, &delta.to_bytes().unwrap(), gen1)
@@ -4557,8 +4574,8 @@ mod tests {
         assert_eq!(recovered.generation, gen3);
         assert_eq!(recovered.deltas_seen, 0);
         assert_eq!(recovered.deltas_applied, 0);
-        assert_eq!(recovered.snapshot.file_hashes.len(), 1);
-        assert!(recovered.snapshot.file_hashes.contains_key("current.rs"));
+        assert_eq!(recovered.snapshot.working_tree.len(), 1);
+        assert!(recovered.snapshot.working_tree.contains_key("current.rs"));
     }
 
     #[test]
@@ -4622,7 +4639,9 @@ mod tests {
             .save_snapshot(repo_id, &base.to_bytes().unwrap(), GENERATION_INIT)
             .unwrap();
         let mut current = base.clone();
-        current.file_hashes.insert("delta.rs".to_string(), [9; 32]);
+        current
+            .working_tree
+            .insert("delta.rs".to_string(), crate::types::regular_tree_entry(9));
         let delta = crate::storage::delta::compute_graph_delta(&base, &current, gen1);
         let gen2 = backend
             .save_delta(repo_id, &delta.to_bytes().unwrap(), gen1)
@@ -4643,7 +4662,7 @@ mod tests {
             .expect("old base plus acknowledged delta remains authoritative");
         assert_eq!(recovered.generation, gen2);
         assert_eq!(recovered.deltas_applied, 1);
-        assert!(recovered.snapshot.file_hashes.contains_key("delta.rs"));
+        assert!(recovered.snapshot.working_tree.contains_key("delta.rs"));
 
         let gen3 = reopened
             .save_snapshot(repo_id, &current.to_bytes().unwrap(), gen2)
@@ -4654,7 +4673,7 @@ mod tests {
             .expect("promoted snapshot exists");
         assert_eq!(promoted.generation, gen3);
         assert_eq!(promoted.deltas_applied, 0);
-        assert!(promoted.snapshot.file_hashes.contains_key("delta.rs"));
+        assert!(promoted.snapshot.working_tree.contains_key("delta.rs"));
     }
 
     #[test]
@@ -4667,7 +4686,9 @@ mod tests {
             .save_snapshot(repo_id, &base.to_bytes().unwrap(), GENERATION_INIT)
             .unwrap();
         let mut current = base.clone();
-        current.file_hashes.insert("delta.rs".to_string(), [9; 32]);
+        current
+            .working_tree
+            .insert("delta.rs".to_string(), crate::types::regular_tree_entry(9));
         let delta = crate::storage::delta::compute_graph_delta(&base, &current, gen1);
         let gen2 = backend
             .save_delta(repo_id, &delta.to_bytes().unwrap(), gen1)
@@ -4701,7 +4722,7 @@ mod tests {
         assert!(!mmap::recovery_marker_path(&backend.authority_path(repo_id)).exists());
         let recovered = load_recovered_snapshot(&backend, repo_id).unwrap().unwrap();
         assert_eq!(recovered.generation, generation);
-        assert_eq!(recovered.snapshot.file_hashes, current.file_hashes);
+        assert_eq!(recovered.snapshot.working_tree, current.working_tree);
     }
 
     #[test]
@@ -4740,11 +4761,14 @@ mod tests {
         let backend = LocalFileBackend::new(dir.path());
         let repo_id = "initial-projection-race";
         let mut requested = GraphSnapshot::empty();
-        requested
-            .file_hashes
-            .insert("requested.rs".to_string(), [1; 32]);
+        requested.working_tree.insert(
+            "requested.rs".to_string(),
+            crate::types::regular_tree_entry(1),
+        );
         let mut raced = GraphSnapshot::empty();
-        raced.file_hashes.insert("raced.rs".to_string(), [2; 32]);
+        raced
+            .working_tree
+            .insert("raced.rs".to_string(), crate::types::regular_tree_entry(2));
         let raced_bytes = raced.to_bytes().unwrap();
         let projection_path = backend.snapshot_path(repo_id);
         let generation_path = backend.generation_path(repo_id);
@@ -4773,11 +4797,14 @@ mod tests {
         let backend = LocalFileBackend::new(dir.path());
         let repo_id = "post-authority-projection-race";
         let mut requested = GraphSnapshot::empty();
-        requested
-            .file_hashes
-            .insert("requested.rs".to_string(), [8; 32]);
+        requested.working_tree.insert(
+            "requested.rs".to_string(),
+            crate::types::regular_tree_entry(8),
+        );
         let mut raced = GraphSnapshot::empty();
-        raced.file_hashes.insert("raced.rs".to_string(), [9; 32]);
+        raced
+            .working_tree
+            .insert("raced.rs".to_string(), crate::types::regular_tree_entry(9));
         let raced_bytes = raced.to_bytes().unwrap();
         let projection_path = backend.snapshot_path(repo_id);
         let generation_path = backend.generation_path(repo_id);
@@ -4974,7 +5001,9 @@ mod tests {
         )
         .unwrap();
         let mut raced = GraphSnapshot::empty();
-        raced.file_hashes.insert("raced.rs".to_string(), [4; 32]);
+        raced
+            .working_tree
+            .insert("raced.rs".to_string(), crate::types::regular_tree_entry(4));
         let raced_bytes = raced.to_bytes().unwrap();
         let projection_path = backend.snapshot_path(repo_id);
         let generation_path = backend.generation_path(repo_id);
@@ -5104,19 +5133,21 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let backend = LocalFileBackend::new(dir.path());
 
-        // Create initial snapshot with one file hash
+        // Create an initial snapshot with one exact tree entry.
         let mut snapshot = GraphSnapshot::empty();
-        snapshot.file_hashes.insert("old.rs".to_string(), [1; 32]);
+        snapshot
+            .working_tree
+            .insert("old.rs".to_string(), crate::types::regular_tree_entry(1));
         let bytes = snapshot.to_bytes().unwrap();
         let gen1 = backend
             .save_snapshot("test-repo", &bytes, GENERATION_INIT)
             .unwrap();
 
-        // Create a delta that adds a new file hash
+        // Create a delta that adds a new exact tree entry.
         let mut new_snapshot = snapshot.clone();
         new_snapshot
-            .file_hashes
-            .insert("new.rs".to_string(), [2; 32]);
+            .working_tree
+            .insert("new.rs".to_string(), crate::types::regular_tree_entry(2));
         let delta = crate::storage::delta::compute_graph_delta(&snapshot, &new_snapshot, gen1);
         let delta_bytes = delta.to_bytes().unwrap();
         let _gen2 = backend.save_delta("test-repo", &delta_bytes, gen1).unwrap();
@@ -5131,12 +5162,12 @@ mod tests {
             .unwrap();
         assert!(deltas.is_empty());
 
-        // Snapshot now contains both file hashes
+        // Snapshot now contains both exact tree entries.
         let (snap_bytes, _) = backend.load_snapshot("test-repo").unwrap().unwrap();
         let compacted = GraphSnapshot::from_bytes(&snap_bytes).unwrap();
-        assert_eq!(compacted.file_hashes.len(), 2);
-        assert!(compacted.file_hashes.contains_key("old.rs"));
-        assert!(compacted.file_hashes.contains_key("new.rs"));
+        assert_eq!(compacted.working_tree.len(), 2);
+        assert!(compacted.working_tree.contains_key("old.rs"));
+        assert!(compacted.working_tree.contains_key("new.rs"));
     }
 
     #[test]
@@ -5149,7 +5180,9 @@ mod tests {
             .save_snapshot(repo_id, &base.to_bytes().unwrap(), GENERATION_INIT)
             .unwrap();
         let mut current = base.clone();
-        current.file_hashes.insert("delta.rs".to_string(), [7; 32]);
+        current
+            .working_tree
+            .insert("delta.rs".to_string(), crate::types::regular_tree_entry(7));
         let delta = crate::storage::delta::compute_graph_delta(&base, &current, gen1);
         let head = backend
             .save_delta(repo_id, &delta.to_bytes().unwrap(), gen1)
@@ -5166,7 +5199,7 @@ mod tests {
         assert!(backend.delta_path(repo_id, head).exists());
         let recovered = load_recovered_snapshot(&backend, repo_id).unwrap().unwrap();
         assert_eq!(recovered.generation, committed);
-        assert_eq!(recovered.snapshot.file_hashes, current.file_hashes);
+        assert_eq!(recovered.snapshot.working_tree, current.working_tree);
     }
 
     #[test]
@@ -5179,9 +5212,10 @@ mod tests {
             .save_snapshot(repo_id, &base.to_bytes().unwrap(), GENERATION_INIT)
             .unwrap();
         let mut current = base.clone();
-        current
-            .file_hashes
-            .insert("committed.rs".to_string(), [7; 32]);
+        current.working_tree.insert(
+            "committed.rs".to_string(),
+            crate::types::regular_tree_entry(7),
+        );
         let committed_delta = crate::storage::delta::compute_graph_delta(&base, &current, gen1);
         let delta_generation = backend
             .save_delta(repo_id, &committed_delta.to_bytes().unwrap(), gen1)
@@ -5232,9 +5266,10 @@ mod tests {
             .save_snapshot(repo_id, &base.to_bytes().unwrap(), GENERATION_INIT)
             .unwrap();
         let mut current = base.clone();
-        current
-            .file_hashes
-            .insert("retired.rs".to_string(), [7; 32]);
+        current.working_tree.insert(
+            "retired.rs".to_string(),
+            crate::types::regular_tree_entry(7),
+        );
         let delta = crate::storage::delta::compute_graph_delta(&base, &current, gen1);
         let gen2 = backend
             .save_delta(repo_id, &delta.to_bytes().unwrap(), gen1)

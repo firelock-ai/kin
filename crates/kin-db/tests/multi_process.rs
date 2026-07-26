@@ -157,9 +157,10 @@ fn generation_staleness_detection() {
     // Second save with correct expected generation succeeds with different
     // content, so a later same-byte replay cannot be an exact idempotent retry.
     let mut replacement = GraphSnapshot::empty();
-    replacement
-        .file_hashes
-        .insert("replacement.rs".to_string(), [1; 32]);
+    replacement.working_tree.insert(
+        "replacement.rs".to_string(),
+        TreeEntry::regular(Hash256::from_bytes([1; 32]), false),
+    );
     let replacement_bytes = replacement.to_bytes().unwrap();
     let gen2 = backend
         .save_snapshot("test", &replacement_bytes, gen1)

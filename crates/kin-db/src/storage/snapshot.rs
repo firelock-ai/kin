@@ -1906,7 +1906,7 @@ fn authority_recovery_snapshot_domains_match(
         file_layouts: _,
         structured_artifacts: _,
         opaque_artifacts: _,
-        file_hashes: _,
+        working_tree: _,
         sessions: _,
         intents: _,
         downstream_warnings: _,
@@ -1950,7 +1950,7 @@ fn authority_recovery_snapshot_domains_match(
         verification_runs,
         contracts,
         actors,
-        file_hashes,
+        working_tree,
         sessions,
         intents,
         entity_revisions,
@@ -3749,7 +3749,7 @@ impl SnapshotManager {
     ///
     /// This is useful for graph-only workflows like warm-cache diffing where
     /// loading the full lexical index would dominate startup time even though
-    /// the caller only needs snapshot entities/file hashes.
+    /// the caller only needs snapshot entities and exact working-tree entries.
     pub fn open_without_text_index(path: impl Into<PathBuf>) -> Result<Self, KinDbError> {
         let path = normalize_snapshot_path(path.into());
         let lock_file = Self::acquire_lock(&path, false)?;
@@ -4933,13 +4933,13 @@ mod tests {
         let graph = mgr.graph();
         let mut entity = test_entity("delta_fn");
         graph.upsert_entity(&entity).unwrap();
-        graph.set_file_hash("src/main.rs", [1; 32]);
+        graph.set_working_tree_entry("src/main.rs", crate::types::regular_tree_entry(1));
         mgr.save().unwrap();
         assert_eq!(local_delta_count(&path).unwrap(), 0);
 
         entity.signature = "fn delta_fn() -> i32".to_string();
         graph.upsert_entity(&entity).unwrap();
-        graph.set_file_hash("src/main.rs", [2; 32]);
+        graph.set_working_tree_entry("src/main.rs", crate::types::regular_tree_entry(2));
 
         let generation = SnapshotManager::save_graph_delta(&path, graph.as_ref(), 1)
             .unwrap()
@@ -4956,9 +4956,9 @@ mod tests {
             .expect("delta entity should replay on reopen");
         assert_eq!(loaded.signature, "fn delta_fn() -> i32");
         assert_eq!(
-            reopened_graph.get_file_hash("src/main.rs"),
-            Some([2; 32]),
-            "delta file hash should replay on reopen"
+            reopened_graph.get_working_tree_entry("src/main.rs"),
+            Some(regular_tree_entry(2)),
+            "exact tree entry should replay on reopen"
         );
 
         drop(reopened);
@@ -5179,9 +5179,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("graph.kndb");
         let mut snapshot = GraphSnapshot::empty();
-        snapshot
-            .file_hashes
-            .insert("snapshot-only.rs".to_string(), [9; 32]);
+        snapshot.working_tree.insert(
+            "snapshot-only.rs".to_string(),
+            crate::types::regular_tree_entry(9),
+        );
         let snapshot_bytes = snapshot.to_bytes().unwrap();
         std::fs::write(&path, &snapshot_bytes).unwrap();
         let graph = InMemoryGraph::from_snapshot(snapshot);
@@ -5199,8 +5200,8 @@ mod tests {
         let reopened = SnapshotManager::open_without_text_index(&path).unwrap();
         assert_eq!(reopened.generation(), 1);
         assert_eq!(
-            reopened.graph().get_file_hash("snapshot-only.rs"),
-            Some([9; 32])
+            reopened.graph().get_working_tree_entry("snapshot-only.rs"),
+            Some(regular_tree_entry(9))
         );
         drop(reopened);
         let (retry_root, retry_generation) =
@@ -5221,7 +5222,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("graph.kndb");
         let mut base = GraphSnapshot::empty();
-        base.file_hashes.insert("base.rs".to_string(), [2; 32]);
+        base.working_tree
+            .insert("base.rs".to_string(), crate::types::regular_tree_entry(2));
         let snapshot_bytes = base.to_bytes().unwrap();
         std::fs::write(&path, &snapshot_bytes).unwrap();
         std::fs::write(dir.path().join("generation"), b"6").unwrap();
@@ -5231,8 +5233,10 @@ mod tests {
         let mut deltas = Vec::new();
         for generation in 3..=6 {
             let mut next = previous.clone();
-            next.file_hashes
-                .insert(format!("journal-{generation}.rs"), [generation as u8; 32]);
+            next.working_tree.insert(
+                format!("journal-{generation}.rs"),
+                regular_tree_entry(generation as u8),
+            );
             let delta = crate::storage::compute_graph_delta(&previous, &next, generation - 1);
             let bytes = delta.to_bytes().unwrap();
             std::fs::write(local_delta_path(&path, generation), &bytes).unwrap();
@@ -5256,8 +5260,8 @@ mod tests {
         let reopened = SnapshotManager::open_without_text_index(&path).unwrap();
         assert_eq!(reopened.generation(), 7);
         assert_eq!(
-            reopened.graph().get_file_hash("journal-6.rs"),
-            Some([6; 32])
+            reopened.graph().get_working_tree_entry("journal-6.rs"),
+            Some(regular_tree_entry(6))
         );
     }
 
@@ -5266,7 +5270,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("graph.kndb");
         let mut snapshot = GraphSnapshot::empty();
-        snapshot.file_hashes.insert("truth.rs".to_string(), [3; 32]);
+        snapshot
+            .working_tree
+            .insert("truth.rs".to_string(), crate::types::regular_tree_entry(3));
         let snapshot_bytes = snapshot.to_bytes().unwrap();
         std::fs::write(&path, &snapshot_bytes).unwrap();
         let graph = InMemoryGraph::from_snapshot(snapshot);
@@ -5285,20 +5291,22 @@ mod tests {
     }
 
     #[test]
-    fn evidence_bound_recovery_rejects_non_merkle_caller_graph_drift() {
+    fn evidence_bound_recovery_rejects_non_entity_caller_graph_drift() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("graph.kndb");
         let mut snapshot = GraphSnapshot::empty();
-        snapshot.file_hashes.insert("truth.rs".to_string(), [3; 32]);
+        snapshot
+            .working_tree
+            .insert("truth.rs".to_string(), crate::types::regular_tree_entry(3));
         let snapshot_bytes = snapshot.to_bytes().unwrap();
         std::fs::write(&path, &snapshot_bytes).unwrap();
         let caller = InMemoryGraph::from_snapshot(snapshot.clone());
         let root = compute_graph_root_hash(&snapshot);
-        caller.set_file_hash("truth.rs", [4; 32]);
+        caller.set_working_tree_entry("truth.rs", crate::types::regular_tree_entry(4));
         assert_eq!(
             caller.recompute_root_hash(),
             root,
-            "file hashes are intentionally outside the current Merkle root"
+            "tree entries are outside the entity Merkle root but covered by repository truth"
         );
         let evidence = recovery_evidence(&snapshot_bytes, GENERATION_INIT, root, &[]);
 
@@ -5317,9 +5325,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("graph.kndb");
         let mut snapshot = GraphSnapshot::empty();
-        snapshot
-            .file_hashes
-            .insert("captured.rs".to_string(), [5; 32]);
+        snapshot.working_tree.insert(
+            "captured.rs".to_string(),
+            crate::types::regular_tree_entry(5),
+        );
         let snapshot_bytes = snapshot.to_bytes().unwrap();
         std::fs::write(&path, &snapshot_bytes).unwrap();
         let caller = Arc::new(InMemoryGraph::from_snapshot(snapshot.clone()));
@@ -5327,15 +5336,21 @@ mod tests {
         let evidence = recovery_evidence(&snapshot_bytes, GENERATION_INIT, root, &[]);
         let racing_caller = Arc::clone(&caller);
         set_local_full_save_before_authority_commit_hook(move || {
-            racing_caller.set_file_hash("raced.rs", [8; 32]);
+            racing_caller.set_working_tree_entry("raced.rs", crate::types::regular_tree_entry(8));
         });
 
         SnapshotManager::recover_local_authority_with_evidence(&path, &caller, &evidence).unwrap();
 
-        assert_eq!(caller.get_file_hash("raced.rs"), Some([8; 32]));
+        assert_eq!(
+            caller.get_working_tree_entry("raced.rs"),
+            Some(regular_tree_entry(8))
+        );
         let reopened = SnapshotManager::open_without_text_index(&path).unwrap();
-        assert_eq!(reopened.graph().get_file_hash("captured.rs"), Some([5; 32]));
-        assert_eq!(reopened.graph().get_file_hash("raced.rs"), None);
+        assert_eq!(
+            reopened.graph().get_working_tree_entry("captured.rs"),
+            Some(regular_tree_entry(5))
+        );
+        assert_eq!(reopened.graph().get_working_tree_entry("raced.rs"), None);
     }
 
     #[test]
@@ -5493,9 +5508,9 @@ mod tests {
         let replacement = {
             let mut delta = GraphSnapshotDelta::empty(0);
             delta
-                .file_hashes
+                .working_tree
                 .added
-                .push(("raced.rs".to_string(), [7; 32]));
+                .push(("raced.rs".to_string(), crate::types::regular_tree_entry(7)));
             delta.to_bytes().unwrap()
         };
         let delta_path = local_delta_path(&path, 1);
@@ -5528,10 +5543,11 @@ mod tests {
             graph.upsert_entity(&entity).unwrap();
             snapshot.entities.insert(entity.id, entity);
         }
-        snapshot
-            .file_hashes
-            .insert("resume.rs".to_string(), [11; 32]);
-        graph.set_file_hash("resume.rs", [11; 32]);
+        snapshot.working_tree.insert(
+            "resume.rs".to_string(),
+            crate::types::regular_tree_entry(11),
+        );
+        graph.set_working_tree_entry("resume.rs", crate::types::regular_tree_entry(11));
         let snapshot_bytes = snapshot.to_bytes().unwrap();
         std::fs::write(&path, &snapshot_bytes).unwrap();
         let root = graph.recompute_root_hash();
@@ -5621,7 +5637,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("graph.kndb");
         let mut legacy = GraphSnapshot::empty();
-        legacy.file_hashes.insert("legacy.rs".to_string(), [1; 32]);
+        legacy
+            .working_tree
+            .insert("legacy.rs".to_string(), crate::types::regular_tree_entry(1));
         std::fs::write(&path, legacy.to_bytes().unwrap()).unwrap();
         std::fs::write(dir.path().join("generation"), b"8").unwrap();
         std::fs::create_dir_all(local_delta_dir_for(&path)).unwrap();
@@ -5630,9 +5648,10 @@ mod tests {
 
         let reconciled = InMemoryGraph::from_snapshot({
             let mut snapshot = legacy;
-            snapshot
-                .file_hashes
-                .insert("reconciled.rs".to_string(), [2; 32]);
+            snapshot.working_tree.insert(
+                "reconciled.rs".to_string(),
+                crate::types::regular_tree_entry(2),
+            );
             snapshot
         });
         let stale = SnapshotManager::rebuild_legacy_journal(&path, &reconciled, 7)
@@ -5647,10 +5666,13 @@ mod tests {
         assert!(!local_legacy_rebuild_marker_path(&path).exists());
         let reopened = SnapshotManager::open_without_text_index(&path).unwrap();
         assert_eq!(reopened.generation(), generation);
-        assert_eq!(reopened.graph().get_file_hash("legacy.rs"), Some([1; 32]));
         assert_eq!(
-            reopened.graph().get_file_hash("reconciled.rs"),
-            Some([2; 32])
+            reopened.graph().get_working_tree_entry("legacy.rs"),
+            Some(regular_tree_entry(1))
+        );
+        assert_eq!(
+            reopened.graph().get_working_tree_entry("reconciled.rs"),
+            Some(regular_tree_entry(2))
         );
         drop(reopened);
 
@@ -5860,7 +5882,9 @@ mod tests {
         let requested = InMemoryGraph::new();
         requested.upsert_entity(&test_entity("requested")).unwrap();
         let mut raced = GraphSnapshot::empty();
-        raced.file_hashes.insert("raced.rs".to_string(), [3; 32]);
+        raced
+            .working_tree
+            .insert("raced.rs".to_string(), crate::types::regular_tree_entry(3));
         let raced_bytes = raced.to_bytes().unwrap();
         let raced_path = path.clone();
         let generation_path = dir.path().join("generation");
@@ -5892,7 +5916,9 @@ mod tests {
             .upsert_entity(&test_entity("requested_after_authority"))
             .unwrap();
         let mut raced = GraphSnapshot::empty();
-        raced.file_hashes.insert("raced.rs".to_string(), [10; 32]);
+        raced
+            .working_tree
+            .insert("raced.rs".to_string(), crate::types::regular_tree_entry(10));
         let raced_bytes = raced.to_bytes().unwrap();
         let raced_path = path.clone();
         let legacy_generation_path = dir.path().join("generation");
@@ -5974,9 +6000,10 @@ mod tests {
         let graph = InMemoryGraph::new();
         let (_, generation) = SnapshotManager::save_graph_with_generation(&path, &graph).unwrap();
         let mut replacement = GraphSnapshot::empty();
-        replacement
-            .file_hashes
-            .insert("legacy-full.rs".to_string(), [4; 32]);
+        replacement.working_tree.insert(
+            "legacy-full.rs".to_string(),
+            crate::types::regular_tree_entry(4),
+        );
         let replacement_bytes = replacement.to_bytes().unwrap();
         mmap::atomic_write_bytes(&path, &replacement_bytes).unwrap();
         std::fs::write(dir.path().join("generation"), generation.to_string()).unwrap();
@@ -6005,9 +6032,10 @@ mod tests {
             .unwrap()
             .unwrap();
         let mut replacement = GraphSnapshot::empty();
-        replacement
-            .file_hashes
-            .insert("legacy-head.rs".to_string(), [5; 32]);
+        replacement.working_tree.insert(
+            "legacy-head.rs".to_string(),
+            crate::types::regular_tree_entry(5),
+        );
         let replacement_bytes = replacement.to_bytes().unwrap();
         mmap::atomic_write_bytes(&path, &replacement_bytes).unwrap();
         std::fs::write(dir.path().join("generation"), head_generation.to_string()).unwrap();
@@ -6091,7 +6119,9 @@ mod tests {
         .unwrap();
         std::fs::write(dir.path().join("generation"), legacy_generation.to_string()).unwrap();
         let mut raced = GraphSnapshot::empty();
-        raced.file_hashes.insert("raced.rs".to_string(), [5; 32]);
+        raced
+            .working_tree
+            .insert("raced.rs".to_string(), crate::types::regular_tree_entry(5));
         let raced_bytes = raced.to_bytes().unwrap();
         let raced_path = path.clone();
         let generation_path = dir.path().join("generation");
@@ -6157,9 +6187,10 @@ mod tests {
         let (mut snapshot, persisted_root) =
             GraphSnapshot::from_bytes_with_persisted_root_hash(&bytes).unwrap();
         let original_graph_root = compute_graph_root_hash(&snapshot);
-        snapshot
-            .file_hashes
-            .insert("tampered-non-entity.rs".to_string(), [8; 32]);
+        snapshot.working_tree.insert(
+            "tampered-non-entity.rs".to_string(),
+            crate::types::regular_tree_entry(8),
+        );
         assert_eq!(
             compute_graph_root_hash(&snapshot),
             original_graph_root,
@@ -6799,7 +6830,7 @@ mod tests {
             message: "cochange".into(),
             entity_deltas: vec![EntityDelta::Added(caller.clone())],
             relation_deltas: Vec::new(),
-            artifact_deltas: Vec::new(),
+            tree_deltas: Vec::new(),
             projected_files: vec![FilePathId::new("src/main.rs")],
             spec_link: None,
             evidence: Vec::new(),
@@ -6858,7 +6889,7 @@ mod tests {
     }
 
     #[test]
-    fn open_read_only_for_locate_decodes_snapshot_with_file_hashes() {
+    fn open_read_only_for_locate_decodes_snapshot_with_working_tree() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("graph.kndb");
 
@@ -6878,7 +6909,7 @@ mod tests {
             message: "cochange".into(),
             entity_deltas: vec![EntityDelta::Added(caller.clone())],
             relation_deltas: Vec::new(),
-            artifact_deltas: Vec::new(),
+            tree_deltas: Vec::new(),
             projected_files: vec![FilePathId::new("src/main.rs")],
             spec_link: None,
             evidence: Vec::new(),
@@ -6916,13 +6947,13 @@ mod tests {
         graph.upsert_relation(&calls).unwrap();
         graph.upsert_relation(&cochange).unwrap();
 
-        // file_hashes is HashMap<String, [u8; 32]>; the 32-byte values serialize
+        // working_tree is HashMap<String, [u8; 32]>; the 32-byte values serialize
         // as a sequence. A non-empty map exercises the snapshot field that the
         // locate decoder must skip rather than misread as artifact_index
         // (FastHashMap<FilePathId, ArtifactId>) — the latter expects 16-byte
         // UUID values and fails with "expected a 16 byte array" when drifted.
-        graph.set_file_hash("src/main.rs", [7u8; 32]);
-        graph.set_file_hash("src/lib.rs", [9u8; 32]);
+        graph.set_working_tree_entry("src/main.rs", crate::types::regular_tree_entry(7));
+        graph.set_working_tree_entry("src/lib.rs", crate::types::regular_tree_entry(9));
 
         graph
             .upsert_shallow_file(&ShallowTrackedFile {
@@ -7306,7 +7337,7 @@ mod tests {
             message: "snapshot roundtrip".into(),
             entity_deltas: vec![EntityDelta::Added(entity.clone())],
             relation_deltas: Vec::new(),
-            artifact_deltas: Vec::new(),
+            tree_deltas: Vec::new(),
             projected_files: vec![FilePathId::new("src/main.rs")],
             spec_link: None,
             evidence: Vec::new(),
@@ -7348,7 +7379,7 @@ mod tests {
                 text_preview: Some("<svg".into()),
             })
             .unwrap();
-        graph.set_file_hash("src/main.rs", [9; 32]);
+        graph.set_working_tree_entry("src/main.rs", crate::types::regular_tree_entry(9));
 
         let work = WorkItem {
             work_id: WorkId::new(),
@@ -7490,7 +7521,10 @@ mod tests {
         assert_eq!(graph.list_shallow_files().unwrap().len(), 1);
         assert_eq!(graph.list_structured_artifacts().unwrap().len(), 1);
         assert_eq!(graph.list_opaque_artifacts().unwrap().len(), 1);
-        assert_eq!(graph.get_file_hash("src/main.rs"), Some([9; 32]));
+        assert_eq!(
+            graph.get_working_tree_entry("src/main.rs"),
+            Some(regular_tree_entry(9))
+        );
         assert_eq!(
             graph.list_work_items(&WorkFilter::default()).unwrap().len(),
             1

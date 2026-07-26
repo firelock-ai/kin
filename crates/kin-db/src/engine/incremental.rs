@@ -4,13 +4,14 @@
 use hashbrown::HashSet;
 
 use super::graph::InMemoryGraph;
+use crate::types::TreeEntry;
 
-/// The result of comparing current file state against the graph's recorded hashes.
+/// The result of comparing an imported tree against graph-owned tree truth.
 #[derive(Debug, Clone, Default)]
 pub struct IncrementalDiff {
     /// Files present on disk but not in the graph.
     pub added_files: Vec<String>,
-    /// Files present in both but with different content hashes.
+    /// Files present in both but with different content identity or mode.
     pub modified_files: Vec<String>,
     /// Files in the graph but no longer on disk.
     pub removed_files: Vec<String>,
@@ -30,30 +31,30 @@ impl IncrementalDiff {
     }
 }
 
-/// Compare current file hashes against the graph's recorded hashes.
+/// Compare exact imported tree entries against the graph-owned working tree.
 ///
 /// - Files in `current_files` but not in the graph → `added_files`
-/// - Files in both but with different hashes → `modified_files`
+/// - Files in both but with different content or mode → `modified_files`
 /// - Files in the graph but not in `current_files` → `removed_files`
 pub fn compute_diff(
     graph: &InMemoryGraph,
-    current_files: &[(String, [u8; 32])],
+    current_files: &[(String, TreeEntry)],
 ) -> IncrementalDiff {
-    let indexed_paths: HashSet<String> = graph.indexed_file_paths().into_iter().collect();
+    let indexed_paths: HashSet<String> = graph.working_tree_paths().into_iter().collect();
     let current_paths: HashSet<&String> = current_files.iter().map(|(p, _)| p).collect();
 
     let mut diff = IncrementalDiff::default();
 
-    for (path, hash) in current_files {
-        match graph.get_file_hash(path) {
+    for (path, entry) in current_files {
+        match graph.get_working_tree_entry(path) {
             None => {
                 diff.added_files.push(path.clone());
             }
-            Some(stored_hash) if stored_hash != *hash => {
+            Some(stored_entry) if stored_entry != *entry => {
                 diff.modified_files.push(path.clone());
             }
             _ => {
-                // Hash matches — no change.
+                // Exact entry matches — no change.
             }
         }
     }
@@ -79,8 +80,8 @@ mod tests {
     use crate::store::EntityStore;
     use crate::types::*;
 
-    fn make_hash(byte: u8) -> [u8; 32] {
-        [byte; 32]
+    fn make_entry(byte: u8) -> TreeEntry {
+        regular_tree_entry(byte)
     }
 
     fn test_entity(name: &str, file: &str) -> Entity {
@@ -132,8 +133,8 @@ mod tests {
     fn diff_all_new_files() {
         let graph = InMemoryGraph::new();
         let current = vec![
-            ("a.rs".to_string(), make_hash(1)),
-            ("b.rs".to_string(), make_hash(2)),
+            ("a.rs".to_string(), make_entry(1)),
+            ("b.rs".to_string(), make_entry(2)),
         ];
 
         let diff = compute_diff(&graph, &current);
@@ -145,12 +146,12 @@ mod tests {
     #[test]
     fn diff_no_changes() {
         let graph = InMemoryGraph::new();
-        graph.set_file_hash("a.rs", make_hash(1));
-        graph.set_file_hash("b.rs", make_hash(2));
+        graph.set_working_tree_entry("a.rs", make_entry(1));
+        graph.set_working_tree_entry("b.rs", make_entry(2));
 
         let current = vec![
-            ("a.rs".to_string(), make_hash(1)),
-            ("b.rs".to_string(), make_hash(2)),
+            ("a.rs".to_string(), make_entry(1)),
+            ("b.rs".to_string(), make_entry(2)),
         ];
 
         let diff = compute_diff(&graph, &current);
@@ -160,9 +161,9 @@ mod tests {
     #[test]
     fn diff_modified_file() {
         let graph = InMemoryGraph::new();
-        graph.set_file_hash("a.rs", make_hash(1));
+        graph.set_working_tree_entry("a.rs", make_entry(1));
 
-        let current = vec![("a.rs".to_string(), make_hash(99))];
+        let current = vec![("a.rs".to_string(), make_entry(99))];
 
         let diff = compute_diff(&graph, &current);
         assert!(diff.added_files.is_empty());
@@ -173,10 +174,10 @@ mod tests {
     #[test]
     fn diff_removed_file() {
         let graph = InMemoryGraph::new();
-        graph.set_file_hash("a.rs", make_hash(1));
-        graph.set_file_hash("b.rs", make_hash(2));
+        graph.set_working_tree_entry("a.rs", make_entry(1));
+        graph.set_working_tree_entry("b.rs", make_entry(2));
 
-        let current = vec![("a.rs".to_string(), make_hash(1))];
+        let current = vec![("a.rs".to_string(), make_entry(1))];
 
         let diff = compute_diff(&graph, &current);
         assert!(diff.added_files.is_empty());
@@ -187,14 +188,14 @@ mod tests {
     #[test]
     fn diff_mixed_add_modify_remove() {
         let graph = InMemoryGraph::new();
-        graph.set_file_hash("existing.rs", make_hash(1));
-        graph.set_file_hash("modified.rs", make_hash(2));
-        graph.set_file_hash("deleted.rs", make_hash(3));
+        graph.set_working_tree_entry("existing.rs", make_entry(1));
+        graph.set_working_tree_entry("modified.rs", make_entry(2));
+        graph.set_working_tree_entry("deleted.rs", make_entry(3));
 
         let current = vec![
-            ("existing.rs".to_string(), make_hash(1)),  // unchanged
-            ("modified.rs".to_string(), make_hash(99)), // modified
-            ("new.rs".to_string(), make_hash(4)),       // added
+            ("existing.rs".to_string(), make_entry(1)),  // unchanged
+            ("modified.rs".to_string(), make_entry(99)), // modified
+            ("new.rs".to_string(), make_entry(4)),       // added
         ];
 
         let diff = compute_diff(&graph, &current);
@@ -218,8 +219,8 @@ mod tests {
         graph.upsert_entity(&e1).unwrap();
         graph.upsert_entity(&e2).unwrap();
         graph.upsert_entity(&e3).unwrap();
-        graph.set_file_hash("src/a.rs", make_hash(1));
-        graph.set_file_hash("src/b.rs", make_hash(2));
+        graph.set_working_tree_entry("src/a.rs", make_entry(1));
+        graph.set_working_tree_entry("src/b.rs", make_entry(2));
 
         assert_eq!(graph.entity_count(), 3);
 
@@ -231,10 +232,13 @@ mod tests {
         // e1/e2 should be gone
         assert!(graph.get_entity(&e1.id).unwrap().is_none());
         assert!(graph.get_entity(&e2.id).unwrap().is_none());
-        // File hash for a.rs should be cleared
-        assert!(graph.get_file_hash("src/a.rs").is_none());
-        // File hash for b.rs should remain
-        assert!(graph.get_file_hash("src/b.rs").is_some());
+        // Semantic enrichment removal must not erase exact tree truth.
+        assert_eq!(
+            graph.get_working_tree_entry("src/a.rs"),
+            Some(make_entry(1))
+        );
+        // The unrelated tree entry remains as well.
+        assert!(graph.get_working_tree_entry("src/b.rs").is_some());
     }
 
     #[test]
@@ -247,7 +251,7 @@ mod tests {
         graph.upsert_entity(&e1).unwrap();
         graph.upsert_entity(&e2).unwrap();
         graph.upsert_relation(&rel).unwrap();
-        graph.set_file_hash("src/a.rs", make_hash(1));
+        graph.set_working_tree_entry("src/a.rs", make_entry(1));
 
         assert_eq!(graph.relation_count(), 1);
 
@@ -269,7 +273,7 @@ mod tests {
         graph.upsert_entity(&e1).unwrap();
         graph.upsert_entity(&e2).unwrap();
         graph.upsert_relation(&rel).unwrap();
-        graph.set_file_hash("src/b.rs", make_hash(2));
+        graph.set_working_tree_entry("src/b.rs", make_entry(2));
 
         // Remove entities for b.rs (the callee's file).
         graph.remove_entities_for_file("src/b.rs");
@@ -293,7 +297,7 @@ mod tests {
         graph.upsert_entity(&e1).unwrap();
         graph.upsert_entity(&e2).unwrap();
         graph.upsert_relation(&rel).unwrap();
-        graph.set_file_hash("src/a.rs", make_hash(1));
+        graph.set_working_tree_entry("src/a.rs", make_entry(1));
 
         graph.remove_entities_for_file("src/a.rs");
 
@@ -313,8 +317,8 @@ mod tests {
         graph.upsert_entity(&e_a).unwrap();
         graph.upsert_entity(&e_c).unwrap();
         graph.upsert_relation(&rel1).unwrap();
-        graph.set_file_hash("src/a.rs", make_hash(1));
-        graph.set_file_hash("src/c.rs", make_hash(3));
+        graph.set_working_tree_entry("src/a.rs", make_entry(1));
+        graph.set_working_tree_entry("src/c.rs", make_entry(3));
 
         // Remove a.rs entities (simulating re-index of modified file).
         graph.remove_entities_for_file("src/a.rs");
@@ -328,7 +332,7 @@ mod tests {
 
         graph.upsert_entity(&e_a2).unwrap();
         graph.upsert_relation(&rel2).unwrap();
-        graph.set_file_hash("src/a.rs", make_hash(10));
+        graph.set_working_tree_entry("src/a.rs", make_entry(10));
 
         assert_eq!(graph.entity_count(), 2);
         assert_eq!(graph.relation_count(), 1);
@@ -351,36 +355,45 @@ mod tests {
     }
 
     #[test]
-    fn remove_entities_for_file_clears_hash_even_without_entities() {
+    fn remove_entities_for_file_preserves_tree_even_without_entities() {
         let graph = InMemoryGraph::new();
-        graph.set_file_hash("stale.rs", make_hash(7));
+        graph.set_working_tree_entry("stale.rs", make_entry(7));
 
         let removed = graph.remove_entities_for_file("stale.rs");
         assert!(removed.is_empty());
-        assert!(graph.get_file_hash("stale.rs").is_none());
+        assert_eq!(
+            graph.get_working_tree_entry("stale.rs"),
+            Some(make_entry(7))
+        );
+
+        assert_eq!(
+            graph.remove_working_tree_entry("stale.rs"),
+            Some(make_entry(7))
+        );
+        assert!(graph.get_working_tree_entry("stale.rs").is_none());
     }
 
     // -----------------------------------------------------------------------
-    // file_hash round-trip tests
+    // Exact working-tree round-trip tests
     // -----------------------------------------------------------------------
 
     #[test]
-    fn file_hash_set_get_roundtrip() {
+    fn working_tree_entry_set_get_roundtrip() {
         let graph = InMemoryGraph::new();
-        assert!(graph.get_file_hash("foo.rs").is_none());
+        assert!(graph.get_working_tree_entry("foo.rs").is_none());
 
-        graph.set_file_hash("foo.rs", make_hash(42));
-        assert_eq!(graph.get_file_hash("foo.rs"), Some(make_hash(42)));
+        graph.set_working_tree_entry("foo.rs", make_entry(42));
+        assert_eq!(graph.get_working_tree_entry("foo.rs"), Some(make_entry(42)));
     }
 
     #[test]
-    fn indexed_file_paths_returns_all() {
+    fn working_tree_paths_returns_all() {
         let graph = InMemoryGraph::new();
-        graph.set_file_hash("a.rs", make_hash(1));
-        graph.set_file_hash("b.rs", make_hash(2));
-        graph.set_file_hash("c.rs", make_hash(3));
+        graph.set_working_tree_entry("a.rs", make_entry(1));
+        graph.set_working_tree_entry("b.rs", make_entry(2));
+        graph.set_working_tree_entry("c.rs", make_entry(3));
 
-        let mut paths = graph.indexed_file_paths();
+        let mut paths = graph.working_tree_paths();
         paths.sort();
         assert_eq!(paths, vec!["a.rs", "b.rs", "c.rs"]);
     }

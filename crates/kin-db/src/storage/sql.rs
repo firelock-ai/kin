@@ -900,9 +900,10 @@ mod tests {
         let expected = Generation::try_from(i64::MAX).unwrap();
         let replacement = {
             let mut snapshot = GraphSnapshot::empty();
-            snapshot
-                .file_hashes
-                .insert("replacement.rs".to_string(), [8; 32]);
+            snapshot.working_tree.insert(
+                "replacement.rs".to_string(),
+                crate::types::regular_tree_entry(8),
+            );
             snapshot.to_bytes().unwrap()
         };
         let error = backend
@@ -915,7 +916,7 @@ mod tests {
         assert_eq!(
             GraphSnapshot::from_bytes(&authority.snapshot_bytes)
                 .unwrap()
-                .file_hashes
+                .working_tree
                 .len(),
             0
         );
@@ -1110,9 +1111,10 @@ mod tests {
             .expect_err("stale quiesce cursor must fail before the migration transaction");
         assert!(stale_error.to_string().contains("expected 7, found 8"));
         let mut reconciled = GraphSnapshot::empty();
-        reconciled
-            .file_hashes
-            .insert("reconciled.rs".to_string(), [9; 32]);
+        reconciled.working_tree.insert(
+            "reconciled.rs".to_string(),
+            crate::types::regular_tree_entry(9),
+        );
         let generation = backend
             .rebuild_legacy_journal("unbound", &reconciled.to_bytes().unwrap(), 8)
             .unwrap();
@@ -1122,7 +1124,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(recovered.generation, generation);
-        assert_eq!(recovered.snapshot.file_hashes, reconciled.file_hashes);
+        assert_eq!(recovered.snapshot.working_tree, reconciled.working_tree);
     }
 
     #[test]
@@ -1131,7 +1133,8 @@ mod tests {
         let db_path = dir.path().join("restart.db");
         let repo_id = "restart-repo";
         let mut base = GraphSnapshot::empty();
-        base.file_hashes.insert("base.rs".to_string(), [1; 32]);
+        base.working_tree
+            .insert("base.rs".to_string(), crate::types::regular_tree_entry(1));
 
         {
             let backend = SqliteBackend::new(&db_path).unwrap();
@@ -1141,8 +1144,8 @@ mod tests {
 
             let mut after_first = base.clone();
             after_first
-                .file_hashes
-                .insert("first.rs".to_string(), [2; 32]);
+                .working_tree
+                .insert("first.rs".to_string(), crate::types::regular_tree_entry(2));
             let first = crate::storage::delta::compute_graph_delta(&base, &after_first, gen1);
             let gen2 = backend
                 .save_delta(repo_id, &first.to_bytes().unwrap(), gen1)
@@ -1150,8 +1153,8 @@ mod tests {
 
             let mut after_second = after_first.clone();
             after_second
-                .file_hashes
-                .insert("second.rs".to_string(), [3; 32]);
+                .working_tree
+                .insert("second.rs".to_string(), crate::types::regular_tree_entry(3));
             let second =
                 crate::storage::delta::compute_graph_delta(&after_first, &after_second, gen2);
             backend
@@ -1163,18 +1166,18 @@ mod tests {
         let (base_bytes, base_generation) = reopened.load_snapshot(repo_id).unwrap().unwrap();
         assert_eq!(base_generation, 1, "tuple generation describes base bytes");
         assert_eq!(
-            GraphSnapshot::from_bytes(&base_bytes).unwrap().file_hashes,
-            base.file_hashes
+            GraphSnapshot::from_bytes(&base_bytes).unwrap().working_tree,
+            base.working_tree
         );
         let recovered = crate::storage::backend::load_recovered_snapshot(&reopened, repo_id)
             .unwrap()
             .expect("snapshot exists");
         assert_eq!(recovered.generation, 3);
         assert_eq!(recovered.deltas_applied, 2);
-        assert_eq!(recovered.snapshot.file_hashes.len(), 3);
-        assert!(recovered.snapshot.file_hashes.contains_key("base.rs"));
-        assert!(recovered.snapshot.file_hashes.contains_key("first.rs"));
-        assert!(recovered.snapshot.file_hashes.contains_key("second.rs"));
+        assert_eq!(recovered.snapshot.working_tree.len(), 3);
+        assert!(recovered.snapshot.working_tree.contains_key("base.rs"));
+        assert!(recovered.snapshot.working_tree.contains_key("first.rs"));
+        assert!(recovered.snapshot.working_tree.contains_key("second.rs"));
     }
 
     #[test]
@@ -1192,9 +1195,10 @@ mod tests {
             .save_snapshot(repo_id, &base.to_bytes().unwrap(), GENERATION_INIT)
             .unwrap();
         let mut promoted = base.clone();
-        promoted
-            .file_hashes
-            .insert("promoted.rs".to_string(), [4; 32]);
+        promoted.working_tree.insert(
+            "promoted.rs".to_string(),
+            crate::types::regular_tree_entry(4),
+        );
         let first = crate::storage::delta::compute_graph_delta(&base, &promoted, gen1);
         let gen2 = cleaner
             .save_delta(repo_id, &first.to_bytes().unwrap(), gen1)
@@ -1217,9 +1221,10 @@ mod tests {
         checked_rx.recv().unwrap();
 
         let mut with_concurrent = promoted.clone();
-        with_concurrent
-            .file_hashes
-            .insert("concurrent.rs".to_string(), [5; 32]);
+        with_concurrent.working_tree.insert(
+            "concurrent.rs".to_string(),
+            crate::types::regular_tree_entry(5),
+        );
         let concurrent =
             crate::storage::delta::compute_graph_delta(&promoted, &with_concurrent, gen3);
         let (writer_started_tx, writer_started_rx) = mpsc::channel();
@@ -1251,6 +1256,9 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(recovered.generation, gen4);
-        assert!(recovered.snapshot.file_hashes.contains_key("concurrent.rs"));
+        assert!(recovered
+            .snapshot
+            .working_tree
+            .contains_key("concurrent.rs"));
     }
 }

@@ -1173,7 +1173,8 @@ mod tests {
         let repo_id = "restart-repo";
 
         let mut base = GraphSnapshot::empty();
-        base.file_hashes.insert("base.rs".to_string(), [1; 32]);
+        base.working_tree
+            .insert("base.rs".to_string(), crate::types::regular_tree_entry(1));
         let gen1 = backend
             .save_snapshot(repo_id, &base.to_bytes().unwrap(), GENERATION_INIT)
             .unwrap();
@@ -1181,9 +1182,10 @@ mod tests {
         assert_eq!(stale_gen, gen1);
 
         let mut current = base.clone();
-        current
-            .file_hashes
-            .insert("current.rs".to_string(), [2; 32]);
+        current.working_tree.insert(
+            "current.rs".to_string(),
+            crate::types::regular_tree_entry(2),
+        );
         let gen2 = backend
             .save_snapshot(repo_id, &current.to_bytes().unwrap(), gen1)
             .unwrap();
@@ -1197,12 +1199,13 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(recovered.generation, gen2);
-        assert_eq!(recovered.snapshot.file_hashes, current.file_hashes);
+        assert_eq!(recovered.snapshot.working_tree, current.working_tree);
 
         let mut after_reopen = recovered.snapshot;
-        after_reopen
-            .file_hashes
-            .insert("after-reopen.rs".to_string(), [3; 32]);
+        after_reopen.working_tree.insert(
+            "after-reopen.rs".to_string(),
+            crate::types::regular_tree_entry(3),
+        );
         let gen3 = reopened
             .save_snapshot(repo_id, &after_reopen.to_bytes().unwrap(), gen2)
             .unwrap();
@@ -1213,8 +1216,8 @@ mod tests {
                 .unwrap();
         assert_eq!(final_recovery.generation, gen3);
         assert_eq!(
-            final_recovery.snapshot.file_hashes,
-            after_reopen.file_hashes
+            final_recovery.snapshot.working_tree,
+            after_reopen.working_tree
         );
     }
 
@@ -1259,9 +1262,10 @@ mod tests {
         let backend = GcsBackend::from_store(Box::new(Arc::clone(&store)), "fixture");
         let repo_id = "legacy-rebuild";
         let mut legacy_base = GraphSnapshot::empty();
-        legacy_base
-            .file_hashes
-            .insert("legacy-base.rs".to_string(), [1; 32]);
+        legacy_base.working_tree.insert(
+            "legacy-base.rs".to_string(),
+            crate::types::regular_tree_entry(1),
+        );
         let snapshot_path = backend.snapshot_path(repo_id);
         let legacy_put = backend
             .block_on(store.put(
@@ -1302,9 +1306,10 @@ mod tests {
         // graph below is deliberately caller-supplied and becomes the exact
         // full snapshot committed by the migration.
         let mut reconciled = legacy_base.clone();
-        reconciled
-            .file_hashes
-            .insert("reconciled.rs".to_string(), [2; 32]);
+        reconciled.working_tree.insert(
+            "reconciled.rs".to_string(),
+            crate::types::regular_tree_entry(2),
+        );
         store.fail_next_delete();
         let committed = backend
             .rebuild_legacy_journal(repo_id, &reconciled.to_bytes().unwrap(), legacy_generation)
@@ -1326,7 +1331,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(recovered.generation, retried);
-        assert_eq!(recovered.snapshot.file_hashes, reconciled.file_hashes);
+        assert_eq!(recovered.snapshot.working_tree, reconciled.working_tree);
     }
 
     #[test]
@@ -1395,7 +1400,8 @@ mod tests {
         let repo = "cas-test-repo";
 
         let mut base = GraphSnapshot::empty();
-        base.file_hashes.insert("base.rs".to_string(), [1; 32]);
+        base.working_tree
+            .insert("base.rs".to_string(), crate::types::regular_tree_entry(1));
         let bytes = base.to_bytes().unwrap();
         let gen1 = backend
             .save_snapshot(repo, &bytes, GENERATION_INIT)
@@ -1404,9 +1410,10 @@ mod tests {
         assert_eq!(stale_gen, gen1);
 
         let mut current = base.clone();
-        current
-            .file_hashes
-            .insert("current.rs".to_string(), [2; 32]);
+        current.working_tree.insert(
+            "current.rs".to_string(),
+            crate::types::regular_tree_entry(2),
+        );
         let gen2 = backend
             .save_snapshot(repo, &current.to_bytes().unwrap(), gen1)
             .expect("second save (conditional Update) must succeed against real GCS");
@@ -1419,7 +1426,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(recovered.generation, gen2);
-        assert_eq!(recovered.snapshot.file_hashes, current.file_hashes);
+        assert_eq!(recovered.snapshot.working_tree, current.working_tree);
 
         eprintln!(
             "gens: create={gen1} update={gen2} recovered={}",
