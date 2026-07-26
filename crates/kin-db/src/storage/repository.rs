@@ -31,11 +31,11 @@ use crate::engine::InMemoryGraph;
 use crate::error::KinDbError;
 use crate::storage::authority::{
     AuthorityCommitDecision, AuthorityPublication, AuthorityReadLease, DurableAuthorityPersistence,
-    VersionedAuthorityState,
+    PersistOutcome, VersionedAuthorityState,
 };
 use crate::storage::backend::{
     load_recovered_snapshot, validate_source_blob_size, verify_source_blob_digest, Generation,
-    StorageBackend, GENERATION_INIT, MAX_SOURCE_BLOB_BYTES,
+    SnapshotCursor, SnapshotSaveOutcome, StorageBackend, MAX_SOURCE_BLOB_BYTES,
 };
 use crate::storage::format::GraphSnapshot;
 
@@ -308,7 +308,38 @@ struct RepositorySnapshotPersistence<B: StorageBackend + ?Sized> {
     /// example 100, 101, ...), while `RootBundle::generation` is Kin's
     /// contiguous logical sequence (0, 1, ...). They must never be compared
     /// or substituted for one another.
-    backend_version: Mutex<Generation>,
+    backend_cursor: Mutex<SnapshotCursor>,
+}
+
+impl<B: StorageBackend + ?Sized> RepositorySnapshotPersistence<B> {
+    fn record_save_outcome(
+        cursor: &mut SnapshotCursor,
+        outcome: SnapshotSaveOutcome,
+    ) -> PersistOutcome {
+        match outcome {
+            SnapshotSaveOutcome::Committed {
+                cursor: committed_cursor,
+            } if committed_cursor != *cursor => {
+                *cursor = committed_cursor;
+                PersistOutcome::Committed
+            }
+            SnapshotSaveOutcome::Committed {
+                cursor: committed_cursor,
+            } => PersistOutcome::Indeterminate(KinDbError::StorageError(format!(
+                "snapshot backend acknowledged authority without advancing its CAS cursor from {}",
+                committed_cursor.backend_generation()
+            ))),
+            SnapshotSaveOutcome::NotCommitted(error) => PersistOutcome::NotCommitted(error),
+            SnapshotSaveOutcome::Indeterminate(error) => PersistOutcome::Indeterminate(error),
+        }
+    }
+
+    fn persist_bytes(&self, bytes: &[u8], cursor: &mut SnapshotCursor) -> PersistOutcome {
+        let outcome =
+            self.backend
+                .save_snapshot_classified(self.repository_id.as_str(), bytes, *cursor);
+        Self::record_save_outcome(cursor, outcome)
+    }
 }
 
 impl<B: StorageBackend + ?Sized + 'static> DurableAuthorityPersistence<RepositoryAuthorityState>
@@ -318,14 +349,70 @@ impl<B: StorageBackend + ?Sized + 'static> DurableAuthorityPersistence<Repositor
         &self,
         _expected_logical_generation: Generation,
         next: &RepositoryAuthorityState,
-    ) -> Result<(), KinDbError> {
-        let bytes = next.snapshot.to_bytes()?;
-        let mut backend_version = self.backend_version.lock();
-        let next_backend_version =
-            self.backend
-                .save_snapshot(self.repository_id.as_str(), &bytes, *backend_version)?;
-        *backend_version = next_backend_version;
-        Ok(())
+    ) -> PersistOutcome {
+        let bytes = match next.snapshot.to_bytes() {
+            Ok(bytes) => bytes,
+            Err(error) => return PersistOutcome::NotCommitted(error),
+        };
+        let mut cursor = self.backend_cursor.lock();
+        self.persist_bytes(&bytes, &mut cursor)
+    }
+
+    fn reconcile(
+        &self,
+        _expected_logical_generation: Generation,
+        next: &RepositoryAuthorityState,
+    ) -> PersistOutcome {
+        let bytes = match next.snapshot.to_bytes() {
+            Ok(bytes) => bytes,
+            Err(error) => return PersistOutcome::NotCommitted(error),
+        };
+        let mut cursor = self.backend_cursor.lock();
+        let installed = match self
+            .backend
+            .load_snapshot_authority(self.repository_id.as_str())
+        {
+            Ok(installed) => installed,
+            Err(error) => return PersistOutcome::Indeterminate(error),
+        };
+
+        match installed {
+            Some(authority)
+                if authority.snapshot_generation != authority.head_generation =>
+            {
+                PersistOutcome::NotCommitted(storage(format!(
+                    "repository {} authority advanced through an incremental journal while an exact full-snapshot commit was indeterminate",
+                    self.repository_id
+                )))
+            }
+            Some(authority) if authority.snapshot_bytes == bytes => {
+                let installed_cursor = authority.cursor();
+                if installed_cursor == *cursor {
+                    return PersistOutcome::Indeterminate(storage(format!(
+                        "repository {} exposes the pending successor bytes without advancing backend cursor {}",
+                        self.repository_id,
+                        cursor.backend_generation()
+                    )));
+                }
+                *cursor = installed_cursor;
+                PersistOutcome::Committed
+            }
+            Some(authority) if authority.cursor() != *cursor => {
+                PersistOutcome::NotCommitted(storage(format!(
+                    "repository {} backend authority advanced from cursor {} to {} with different snapshot bytes while a commit was indeterminate",
+                    self.repository_id,
+                    cursor.backend_generation(),
+                    authority.cursor().backend_generation()
+                )))
+            }
+            Some(_) => self.persist_bytes(&bytes, &mut cursor),
+            None if *cursor == SnapshotCursor::INITIAL => self.persist_bytes(&bytes, &mut cursor),
+            None => PersistOutcome::Indeterminate(storage(format!(
+                "repository {} backend authority disappeared while reconciling cursor {}",
+                self.repository_id,
+                cursor.backend_generation()
+            ))),
+        }
     }
 }
 
@@ -345,7 +432,7 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
     /// Open existing authority or prepare an unpersisted generation-zero repo.
     pub fn open(repository_id: RepositoryId, backend: Arc<B>) -> Result<Self, KinDbError> {
         let recovered = load_recovered_snapshot(backend.as_ref(), repository_id.as_str())?;
-        let (snapshot, backend_version) = if let Some(recovered) = recovered {
+        let (snapshot, backend_cursor) = if let Some(recovered) = recovered {
             if recovered.deltas_seen != 0 {
                 return Err(storage(format!(
                     "repository {} has an incremental graph journal; repository authority requires full-snapshot CAS only",
@@ -368,14 +455,17 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
                     metadata.repository_id, repository_id
                 )));
             }
-            (recovered.snapshot, recovered.generation)
+            (
+                recovered.snapshot,
+                SnapshotCursor::from_backend_generation(recovered.generation),
+            )
         } else {
             let mut snapshot = GraphSnapshot::empty();
             snapshot.repository_authority = Some(PersistedRepositoryAuthority::empty(
                 repository_id.clone(),
                 &snapshot,
             )?);
-            (snapshot, GENERATION_INIT)
+            (snapshot, SnapshotCursor::INITIAL)
         };
 
         snapshot.validate_storage_admission()?;
@@ -387,7 +477,7 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
         let persistence = RepositorySnapshotPersistence {
             backend: Arc::clone(&backend),
             repository_id: repository_id.clone(),
-            backend_version: Mutex::new(backend_version),
+            backend_cursor: Mutex::new(backend_cursor),
         };
         Ok(Self {
             repository_id,
@@ -2047,7 +2137,10 @@ mod tests {
     };
     use parking_lot::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use tempfile::TempDir;
     use uuid::Uuid;
+
+    use crate::storage::LocalFileBackend;
 
     #[derive(Default)]
     struct MemoryBackend {
@@ -2136,6 +2229,20 @@ mod tests {
             Ok(next)
         }
 
+        fn save_snapshot_classified(
+            &self,
+            repo_id: &str,
+            data: &[u8],
+            expected_cursor: SnapshotCursor,
+        ) -> SnapshotSaveOutcome {
+            match self.save_snapshot(repo_id, data, expected_cursor.backend_generation()) {
+                Ok(generation) => SnapshotSaveOutcome::Committed {
+                    cursor: SnapshotCursor::from_backend_generation(generation),
+                },
+                Err(error) => SnapshotSaveOutcome::NotCommitted(error),
+            }
+        }
+
         fn save_delta(
             &self,
             _repo_id: &str,
@@ -2197,8 +2304,8 @@ mod tests {
         RepositoryAuthorityManager::open(repository_id(), backend).unwrap()
     }
 
-    fn transaction_shell(
-        manager: &RepositoryAuthorityManager<MemoryBackend>,
+    fn transaction_shell<B: StorageBackend + ?Sized + 'static>(
+        manager: &RepositoryAuthorityManager<B>,
         operation: u128,
     ) -> RepositoryTransaction {
         let lease = manager.read_authority();
@@ -2361,8 +2468,8 @@ mod tests {
         transaction
     }
 
-    fn unborn_workspace_transaction(
-        manager: &RepositoryAuthorityManager<MemoryBackend>,
+    fn unborn_workspace_transaction<B: StorageBackend + ?Sized + 'static>(
+        manager: &RepositoryAuthorityManager<B>,
         operation: u128,
         workspace: u128,
         head: &[u8],
@@ -3472,6 +3579,117 @@ mod tests {
         assert!(manager.commit_repository_transaction(conflicting).is_err());
         assert_eq!(manager.read_authority().generation(), 1);
         assert_eq!(manager.read_authority().metadata().operation_log.len(), 1);
+    }
+
+    #[test]
+    fn local_indeterminate_install_recovers_exact_candidate_live_and_after_reopen() {
+        let directory = TempDir::new().unwrap();
+        let backend = Arc::new(LocalFileBackend::new(directory.path()));
+        let manager =
+            RepositoryAuthorityManager::open(repository_id(), Arc::clone(&backend)).unwrap();
+        let transaction = unborn_workspace_transaction(&manager, 0x5100, 0x5101, b"main");
+
+        backend.fail_next_snapshot_parent_sync_after_install();
+        let error = manager
+            .commit_repository_transaction(transaction.clone())
+            .expect_err("installed authority with a lost durability acknowledgement must fail");
+        assert!(matches!(
+            error,
+            KinDbError::SnapshotPersistenceIndeterminate(_)
+        ));
+        assert_eq!(manager.read_authority().generation(), 0);
+
+        let installed_bytes = backend
+            .load_snapshot_authority(repository_id().as_str())
+            .unwrap()
+            .expect("the exact candidate was installed")
+            .snapshot_bytes;
+
+        let reopened_backend = Arc::new(LocalFileBackend::new(directory.path()));
+        let reopened =
+            RepositoryAuthorityManager::open(repository_id(), Arc::clone(&reopened_backend))
+                .unwrap();
+        assert_eq!(reopened.read_authority().generation(), 1);
+        let reopened_receipt = reopened
+            .commit_repository_transaction(transaction.clone())
+            .expect("process reopen must expose the installed operation as idempotent");
+        assert_eq!(reopened_receipt.operation_id, transaction.operation_id);
+
+        let live_receipt = manager
+            .commit_repository_transaction(transaction)
+            .expect("live manager must reconcile its retained exact candidate");
+        assert_eq!(live_receipt, reopened_receipt);
+        assert_eq!(manager.read_authority().generation(), 1);
+        assert_eq!(
+            backend
+                .load_snapshot_authority(repository_id().as_str())
+                .unwrap()
+                .unwrap()
+                .snapshot_bytes,
+            installed_bytes,
+            "retry must confirm the installed candidate, not rebuild it"
+        );
+    }
+
+    #[test]
+    fn local_definite_preinstall_failure_retains_no_candidate() {
+        let directory = TempDir::new().unwrap();
+        let backend = Arc::new(LocalFileBackend::new(directory.path()));
+        let manager =
+            RepositoryAuthorityManager::open(repository_id(), Arc::clone(&backend)).unwrap();
+        let rejected = unborn_workspace_transaction(&manager, 0x5200, 0x5201, b"rejected");
+        let replacement = unborn_workspace_transaction(&manager, 0x5202, 0x5203, b"replacement");
+
+        backend.fail_next_snapshot_before_authority_commit();
+        manager
+            .commit_repository_transaction(rejected.clone())
+            .expect_err("injected failure is before authority installation");
+        assert_eq!(manager.read_authority().generation(), 0);
+        assert!(
+            backend
+                .load_snapshot_authority(repository_id().as_str())
+                .unwrap()
+                .is_none(),
+            "a staged file is not repository authority"
+        );
+
+        let receipt = manager
+            .commit_repository_transaction(replacement.clone())
+            .expect("a different generation-zero operation may proceed immediately");
+        assert_eq!(receipt.operation_id, replacement.operation_id);
+        let authority = manager.read_authority();
+        assert_eq!(authority.generation(), 1);
+        assert!(authority
+            .metadata()
+            .receipts
+            .iter()
+            .all(|receipt| receipt.operation_id != rejected.operation_id));
+    }
+
+    #[test]
+    fn local_stale_manager_cannot_replace_concurrent_authority() {
+        let directory = TempDir::new().unwrap();
+        let backend = Arc::new(LocalFileBackend::new(directory.path()));
+        let stale_backend = Arc::new(LocalFileBackend::new(directory.path()));
+        let manager =
+            RepositoryAuthorityManager::open(repository_id(), Arc::clone(&backend)).unwrap();
+        let stale =
+            RepositoryAuthorityManager::open(repository_id(), Arc::clone(&stale_backend)).unwrap();
+        let winner = unborn_workspace_transaction(&manager, 0x5300, 0x5301, b"winner");
+        let loser = unborn_workspace_transaction(&stale, 0x5302, 0x5303, b"loser");
+
+        manager.commit_repository_transaction(winner).unwrap();
+        stale
+            .commit_repository_transaction(loser)
+            .expect_err("stale local manager must lose backend CAS");
+        assert_eq!(stale.read_authority().generation(), 0);
+
+        let reopened = RepositoryAuthorityManager::open(
+            repository_id(),
+            Arc::new(LocalFileBackend::new(directory.path())),
+        )
+        .unwrap();
+        assert_eq!(reopened.read_authority().generation(), 1);
     }
 
     #[test]

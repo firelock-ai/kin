@@ -28,8 +28,9 @@ use sha2::{Digest, Sha256};
 use crate::error::KinDbError;
 use crate::storage::backend::{
     validate_source_blob_read_size, validate_source_blob_repo_id, validate_source_blob_size,
-    verify_source_blob_digest, Generation, SnapshotAuthority, SnapshotRecoveryState,
-    StorageBackend, GENERATION_INIT, MAX_SOURCE_BLOB_BYTES,
+    verify_source_blob_digest, Generation, SnapshotAuthority, SnapshotCursor,
+    SnapshotRecoveryState, SnapshotSaveOutcome, StorageBackend, GENERATION_INIT,
+    MAX_SOURCE_BLOB_BYTES,
 };
 
 const GCS_FULL_AUTHORITY_MAGIC: [u8; 8] = *b"KNGCSF02";
@@ -127,12 +128,6 @@ impl GcsBackend {
             KinDbError::StorageError(format!(
                 "GCS {authority} has nonnumeric object version {version:?}: {error}"
             ))
-        })
-    }
-
-    fn snapshot_meta(&self, path: &ObjectPath) -> Result<ObjectMeta, KinDbError> {
-        self.block_on(self.store.head(path)).map_err(|error| {
-            KinDbError::StorageError(format!("GCS head failed for {path}: {error}"))
         })
     }
 
@@ -271,44 +266,128 @@ impl GcsBackend {
     ) -> Result<Generation, KinDbError> {
         let path = self.snapshot_path(repo_id);
         let payload = PutPayload::from(Self::encode_full_snapshot_authority(data)?);
-        let opts = if expected_gen == GENERATION_INIT {
-            PutOptions {
-                mode: PutMode::Create,
-                ..PutOptions::default()
-            }
-        } else {
-            let meta = self.snapshot_meta(&path)?;
-            let current_generation =
-                Self::numeric_version(meta.version.as_deref(), &format!("snapshot {path}"))?;
-            if current_generation != expected_gen {
+        let current_meta = match self.block_on(self.store.head(&path)) {
+            Ok(meta) => Some(meta),
+            Err(object_store::Error::NotFound { .. }) => None,
+            Err(error) => {
                 return Err(KinDbError::StorageError(format!(
-                    "GCS snapshot generation mismatch for {path}: expected {expected_gen}, found {current_generation}"
+                    "GCS head failed for {path} before save: {error}"
                 )));
             }
-            PutOptions {
-                mode: PutMode::Update(UpdateVersion {
-                    e_tag: meta.e_tag,
-                    version: meta.version,
-                }),
+        };
+        let opts = match current_meta {
+            None if expected_gen == GENERATION_INIT => PutOptions {
+                mode: PutMode::Create,
                 ..PutOptions::default()
+            },
+            None => {
+                return Err(KinDbError::StorageError(format!(
+                    "GCS snapshot {path} is missing at expected cursor {expected_gen}"
+                )));
+            }
+            Some(meta) => {
+                let current_generation =
+                    Self::numeric_version(meta.version.as_deref(), &format!("snapshot {path}"))?;
+                if current_generation != expected_gen {
+                    return match self.confirm_exact_snapshot_retry(repo_id, data, expected_gen)? {
+                        Some(installed_generation) => Ok(installed_generation),
+                        None => Err(KinDbError::StorageError(format!(
+                            "GCS snapshot generation mismatch for {path}: expected {expected_gen}, found {current_generation}"
+                        ))),
+                    };
+                }
+                PutOptions {
+                    mode: PutMode::Update(UpdateVersion {
+                        e_tag: meta.e_tag,
+                        version: meta.version,
+                    }),
+                    ..PutOptions::default()
+                }
             }
         };
 
-        let result = self
-            .block_on(self.store.put_opts(&path, payload, opts))
-            .map_err(|error| {
-                KinDbError::StorageError(format!("GCS save failed for {path}: {error}"))
-            })?;
+        let result = match self.block_on(self.store.put_opts(&path, payload, opts)) {
+            Ok(result) => result,
+            Err(error)
+                if matches!(
+                    &error,
+                    object_store::Error::AlreadyExists { .. }
+                        | object_store::Error::Precondition { .. }
+                        | object_store::Error::NotModified { .. }
+                ) =>
+            {
+                return match self.confirm_exact_snapshot_retry(repo_id, data, expected_gen) {
+                    Ok(Some(installed_generation)) => Ok(installed_generation),
+                    Ok(None) => Err(KinDbError::StorageError(format!(
+                        "GCS conditional save failed for {path}: {error}"
+                    ))),
+                    Err(verification_error) => Err(KinDbError::StorageError(format!(
+                        "GCS conditional save failed for {path}: {error}; installed authority verification failed: {verification_error}"
+                    ))),
+                };
+            }
+            Err(
+                error @ (object_store::Error::NotFound { .. }
+                | object_store::Error::InvalidPath { .. }
+                | object_store::Error::NotSupported { .. }
+                | object_store::Error::NotImplemented { .. }
+                | object_store::Error::PermissionDenied { .. }
+                | object_store::Error::Unauthenticated { .. }
+                | object_store::Error::UnknownConfigurationKey { .. }),
+            ) => {
+                return Err(KinDbError::StorageError(format!(
+                    "GCS save was rejected before installation for {path}: {error}"
+                )));
+            }
+            Err(error) => {
+                return Err(KinDbError::SnapshotPersistenceIndeterminate(format!(
+                    "GCS save outcome is unknown for {path}: {error}"
+                )));
+            }
+        };
         let generation = Self::numeric_version(
             result.version.as_deref(),
             &format!("save result for {path}"),
-        )?;
+        )
+        .map_err(|error| {
+            KinDbError::SnapshotPersistenceIndeterminate(format!(
+                "GCS acknowledged save for {path}, but its installed cursor is unknown: {error}"
+            ))
+        })?;
         if generation <= expected_gen {
-            return Err(KinDbError::StorageError(format!(
+            return Err(KinDbError::SnapshotPersistenceIndeterminate(format!(
                 "GCS save result for {path} did not advance generation: expected above {expected_gen}, found {generation}"
             )));
         }
         Ok(generation)
+    }
+
+    /// Confirm a retry only when the store exposes the exact serialized
+    /// candidate at a cursor different from the caller's prior CAS cursor.
+    fn confirm_exact_snapshot_retry(
+        &self,
+        repo_id: &str,
+        data: &[u8],
+        expected_gen: Generation,
+    ) -> Result<Option<Generation>, KinDbError> {
+        let Some(authority) = self.load_snapshot_object(repo_id)? else {
+            if expected_gen == GENERATION_INIT {
+                return Ok(None);
+            }
+            return Err(KinDbError::StorageError(format!(
+                "GCS snapshot for repo {repo_id} is missing at expected cursor {expected_gen}"
+            )));
+        };
+        let current_generation = authority.head_generation;
+        if current_generation == expected_gen {
+            return Ok(None);
+        }
+        if authority.snapshot_bytes == data {
+            return Ok(Some(current_generation));
+        }
+        Err(KinDbError::StorageError(format!(
+            "GCS snapshot generation mismatch for repo {repo_id}: expected {expected_gen}, found {current_generation} with different authority bytes"
+        )))
     }
 }
 
@@ -508,6 +587,23 @@ impl StorageBackend for GcsBackend {
         Ok(generation)
     }
 
+    fn save_snapshot_classified(
+        &self,
+        repo_id: &str,
+        data: &[u8],
+        expected_cursor: SnapshotCursor,
+    ) -> SnapshotSaveOutcome {
+        match self.save_snapshot(repo_id, data, expected_cursor.backend_generation()) {
+            Ok(generation) => SnapshotSaveOutcome::Committed {
+                cursor: SnapshotCursor::from_backend_generation(generation),
+            },
+            Err(error @ KinDbError::SnapshotPersistenceIndeterminate(_)) => {
+                SnapshotSaveOutcome::Indeterminate(error)
+            }
+            Err(error) => SnapshotSaveOutcome::NotCommitted(error),
+        }
+    }
+
     fn save_delta(
         &self,
         repo_id: &str,
@@ -668,6 +764,7 @@ mod tests {
         state: Arc<tokio::sync::Mutex<VersionState>>,
         report_next_get_as_oversized: Arc<AtomicBool>,
         body_get_count: Arc<AtomicUsize>,
+        fail_next_put_after_commit: Arc<AtomicBool>,
     }
 
     impl VersionedMemoryStore {
@@ -680,6 +777,7 @@ mod tests {
                 })),
                 report_next_get_as_oversized: Arc::new(AtomicBool::new(false)),
                 body_get_count: Arc::new(AtomicUsize::new(0)),
+                fail_next_put_after_commit: Arc::new(AtomicBool::new(false)),
             }
         }
 
@@ -690,6 +788,11 @@ mod tests {
 
         fn body_get_count(&self) -> usize {
             self.body_get_count.load(Ordering::SeqCst)
+        }
+
+        fn fail_next_put_after_commit(&self) {
+            self.fail_next_put_after_commit
+                .store(true, Ordering::SeqCst);
         }
 
         fn precondition_error(path: &ObjectPath, message: String) -> object_store::Error {
@@ -748,6 +851,17 @@ mod tests {
             state.next_generation += 1;
             state.versions.insert(location.to_string(), generation);
             result.version = Some(generation.to_string());
+            if self
+                .fail_next_put_after_commit
+                .swap(false, Ordering::SeqCst)
+            {
+                return Err(object_store::Error::Generic {
+                    store: "VersionedMemoryStore",
+                    source: Box::new(std::io::Error::other(
+                        "injected acknowledgement loss after object install",
+                    )),
+                });
+            }
             Ok(result)
         }
 
@@ -1260,6 +1374,115 @@ mod tests {
         let final_backend = Arc::new(GcsBackend::from_store(Box::new(store), "fixture"));
         let final_manager = RepositoryAuthorityManager::open(repository_id, final_backend).unwrap();
         assert_eq!(final_manager.read_authority().roots().generation, 2);
+    }
+
+    #[test]
+    fn repository_authority_recovers_gcs_post_install_error_live_and_after_reopen() {
+        let store = Arc::new(VersionedMemoryStore::new());
+        let repository_id = RepositoryId::new("gcs-indeterminate-authority").unwrap();
+        let backend = Arc::new(GcsBackend::from_store(
+            Box::new(Arc::clone(&store)),
+            "fixture",
+        ));
+        let manager =
+            RepositoryAuthorityManager::open(repository_id.clone(), Arc::clone(&backend)).unwrap();
+        let transaction =
+            unborn_authority_transaction(&manager, &repository_id, WorkspaceId::new(), true);
+
+        store.fail_next_put_after_commit();
+        let error = manager
+            .commit_repository_transaction(transaction.clone())
+            .expect_err("installed object with a lost acknowledgement is indeterminate");
+        assert!(matches!(
+            error,
+            KinDbError::SnapshotPersistenceIndeterminate(_)
+        ));
+        assert_eq!(manager.read_authority().roots().generation, 0);
+
+        let installed = backend
+            .load_snapshot_authority(repository_id.as_str())
+            .unwrap()
+            .expect("the provider installed the exact candidate");
+        assert_eq!(installed.head_generation, 100);
+        let installed_bytes = installed.snapshot_bytes;
+
+        let reopened_backend = Arc::new(GcsBackend::from_store(
+            Box::new(Arc::clone(&store)),
+            "fixture",
+        ));
+        let reopened =
+            RepositoryAuthorityManager::open(repository_id.clone(), reopened_backend).unwrap();
+        assert_eq!(reopened.read_authority().roots().generation, 1);
+        let reopened_receipt = reopened
+            .commit_repository_transaction(transaction.clone())
+            .expect("reopen must recognize the installed operation as idempotent");
+
+        let live_receipt = manager
+            .commit_repository_transaction(transaction)
+            .expect("live manager must publish its retained exact candidate before prepare");
+        assert_eq!(live_receipt, reopened_receipt);
+        assert_eq!(manager.read_authority().roots().generation, 1);
+        let final_authority = backend
+            .load_snapshot_authority(repository_id.as_str())
+            .unwrap()
+            .unwrap();
+        assert_eq!(final_authority.head_generation, 100);
+        assert_eq!(
+            final_authority.snapshot_bytes, installed_bytes,
+            "reconciliation must not emit a timestamp-rebuilt successor"
+        );
+    }
+
+    #[test]
+    fn gcs_exact_content_retry_confirms_installed_candidate_without_rewrite() {
+        let store = Arc::new(VersionedMemoryStore::new());
+        let backend = GcsBackend::from_store(Box::new(Arc::clone(&store)), "fixture");
+        let repo_id = "gcs-exact-retry";
+        let bytes = GraphSnapshot::empty().to_bytes().unwrap();
+
+        store.fail_next_put_after_commit();
+        let error = backend
+            .save_snapshot(repo_id, &bytes, GENERATION_INIT)
+            .expect_err("provider acknowledgement loss must be surfaced");
+        assert!(matches!(
+            error,
+            KinDbError::SnapshotPersistenceIndeterminate(_)
+        ));
+
+        let cursor = backend
+            .save_snapshot(repo_id, &bytes, GENERATION_INIT)
+            .expect("exact retry must confirm the installed candidate");
+        assert_eq!(cursor, 100);
+        assert_eq!(
+            backend.load_snapshot(repo_id).unwrap().unwrap().1,
+            100,
+            "confirmation must not create provider version 101"
+        );
+    }
+
+    #[test]
+    fn gcs_normal_snapshot_cas_does_not_download_the_existing_body() {
+        let store = Arc::new(VersionedMemoryStore::new());
+        let backend = GcsBackend::from_store(Box::new(Arc::clone(&store)), "fixture");
+        let repo_id = "gcs-metadata-cas";
+        let base = GraphSnapshot::empty().to_bytes().unwrap();
+        let cursor = backend
+            .save_snapshot(repo_id, &base, GENERATION_INIT)
+            .unwrap();
+
+        let mut successor = GraphSnapshot::empty();
+        successor.admit_artifact_for_test(
+            "compose.yaml".to_string(),
+            crate::types::regular_tree_entry(1),
+        );
+        backend
+            .save_snapshot(repo_id, &successor.to_bytes().unwrap(), cursor)
+            .unwrap();
+        assert_eq!(
+            store.body_get_count(),
+            0,
+            "normal CAS should use HEAD; only retry reconciliation needs exact bytes"
+        );
     }
 
     #[test]

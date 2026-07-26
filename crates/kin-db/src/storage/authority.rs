@@ -27,15 +27,40 @@ pub trait VersionedAuthorityState: Send + Sync + 'static {
 
 /// Persistence boundary for a complete candidate authority state.
 ///
-/// Returning `Ok(())` acknowledges that `next` is durable and recoverable as
-/// the exact successor of `expected_generation`. Implementations must provide
-/// compare-and-swap semantics and must not acknowledge a partially persisted
-/// state.
+/// [`PersistOutcome::Committed`] acknowledges that `next` is durable and
+/// recoverable as the exact successor of `expected_generation`.
+/// Implementations must provide compare-and-swap semantics and must not
+/// acknowledge a partially persisted state.
 pub trait DurableAuthorityPersistence<S>: Send + Sync + 'static
 where
     S: VersionedAuthorityState,
 {
-    fn persist(&self, expected_generation: Generation, next: &S) -> Result<(), KinDbError>;
+    fn persist(&self, expected_generation: Generation, next: &S) -> PersistOutcome;
+
+    /// Reconcile a candidate retained after an indeterminate persistence
+    /// result.
+    ///
+    /// The default retries the exact candidate. Backends that can inspect
+    /// installed authority should override this to confirm exact bytes before
+    /// attempting another conditional write.
+    fn reconcile(&self, expected_generation: Generation, next: &S) -> PersistOutcome {
+        self.persist(expected_generation, next)
+    }
+}
+
+/// Classified result of attempting to durably persist one authority candidate.
+#[must_use = "an authority persistence outcome must be classified before publication"]
+#[derive(Debug)]
+pub enum PersistOutcome {
+    /// The exact candidate is durable and recoverable.
+    Committed,
+    /// The backend proved that the candidate was not committed.
+    NotCommitted(KinDbError),
+    /// The backend cannot prove whether the candidate was committed.
+    ///
+    /// The caller must retain the exact candidate and reconcile it before
+    /// preparing any later successor.
+    Indeterminate(KinDbError),
 }
 
 /// A coherent read lease for one published authority generation.
@@ -86,8 +111,12 @@ where
     P: DurableAuthorityPersistence<S>,
 {
     current: RwLock<Arc<S>>,
-    writer: Mutex<()>,
+    writer: Mutex<AuthorityWriterState<S>>,
     persistence: P,
+}
+
+struct AuthorityWriterState<S> {
+    pending: Option<Arc<S>>,
 }
 
 impl<S, P> AuthorityPublication<S, P>
@@ -98,7 +127,7 @@ where
     pub fn new(initial: S, persistence: P) -> Self {
         Self {
             current: RwLock::new(Arc::new(initial)),
-            writer: Mutex::new(()),
+            writer: Mutex::new(AuthorityWriterState { pending: None }),
             persistence,
         }
     }
@@ -118,8 +147,31 @@ where
         &self,
         prepare: impl FnOnce(&S) -> Result<AuthorityCommitDecision<S, O>, KinDbError>,
     ) -> Result<O, KinDbError> {
-        let _writer = self.writer.lock();
-        let current = Arc::clone(&self.current.read());
+        let mut writer = self.writer.lock();
+        let mut current = Arc::clone(&self.current.read());
+
+        // An indeterminate attempt may already have installed this exact
+        // candidate. No later operation may prepare a different successor
+        // until that uncertainty is resolved.
+        if let Some(pending) = writer.pending.as_ref().map(Arc::clone) {
+            let expected_generation = current.generation();
+            match self
+                .persistence
+                .reconcile(expected_generation, pending.as_ref())
+            {
+                PersistOutcome::Committed => {
+                    *self.current.write() = Arc::clone(&pending);
+                    writer.pending = None;
+                    current = pending;
+                }
+                PersistOutcome::NotCommitted(error) => {
+                    writer.pending = None;
+                    return Err(error);
+                }
+                PersistOutcome::Indeterminate(error) => return Err(error),
+            }
+        }
+
         match prepare(current.as_ref())? {
             AuthorityCommitDecision::IdempotentReplay { output } => Ok(output),
             AuthorityCommitDecision::Publish { next, output } => {
@@ -139,10 +191,17 @@ where
                 // Allocate before the durable boundary. After persist returns
                 // success there must be no fallible work before publication.
                 let next = Arc::new(next);
-                self.persistence
-                    .persist(expected_generation, next.as_ref())?;
-                *self.current.write() = next;
-                Ok(output)
+                match self.persistence.persist(expected_generation, next.as_ref()) {
+                    PersistOutcome::Committed => {
+                        *self.current.write() = next;
+                        Ok(output)
+                    }
+                    PersistOutcome::NotCommitted(error) => Err(error),
+                    PersistOutcome::Indeterminate(error) => {
+                        writer.pending = Some(next);
+                        Err(error)
+                    }
+                }
             }
         }
     }
@@ -171,23 +230,21 @@ mod tests {
     struct TestPersistence {
         fail_next: AtomicBool,
         persisted_generation: AtomicU64,
+        persisted_value: AtomicU64,
     }
 
     impl DurableAuthorityPersistence<TestState> for TestPersistence {
-        fn persist(
-            &self,
-            expected_generation: Generation,
-            next: &TestState,
-        ) -> Result<(), KinDbError> {
+        fn persist(&self, expected_generation: Generation, next: &TestState) -> PersistOutcome {
             if self.fail_next.swap(false, Ordering::SeqCst) {
-                return Err(KinDbError::StorageError(
+                return PersistOutcome::NotCommitted(KinDbError::StorageError(
                     "injected authority persistence failure".to_string(),
                 ));
             }
             assert_eq!(next.generation, expected_generation + 1);
             self.persisted_generation
                 .store(next.generation, Ordering::Release);
-            Ok(())
+            self.persisted_value.store(next.value, Ordering::Release);
+            PersistOutcome::Committed
         }
     }
 
@@ -226,7 +283,7 @@ mod tests {
     }
 
     #[test]
-    fn persistence_failure_publishes_nothing() {
+    fn definite_persistence_failure_publishes_and_retains_nothing() {
         let persistence = TestPersistence::default();
         persistence.fail_next.store(true, Ordering::Release);
         let authority = publication(persistence);
@@ -248,6 +305,191 @@ mod tests {
             .contains("injected authority persistence failure"));
         let current = authority.read();
         assert_eq!((current.generation, current.value), (0, 10));
+
+        authority
+            .commit(|current| {
+                assert_eq!(
+                    current.generation, 0,
+                    "a definitely uncommitted candidate must not be retried"
+                );
+                Ok(AuthorityCommitDecision::Publish {
+                    next: TestState {
+                        generation: 1,
+                        value: 20,
+                    },
+                    output: (),
+                })
+            })
+            .unwrap();
+        assert_eq!(authority.read().value, 20);
+        assert_eq!(
+            authority
+                .persistence
+                .persisted_value
+                .load(Ordering::Acquire),
+            20
+        );
+    }
+
+    struct IndeterminatePersistence {
+        fail_after_install_once: AtomicBool,
+        attempts: StdMutex<Vec<(Generation, Generation, u64, usize)>>,
+    }
+
+    impl DurableAuthorityPersistence<TestState> for IndeterminatePersistence {
+        fn persist(&self, expected_generation: Generation, next: &TestState) -> PersistOutcome {
+            self.attempts.lock().unwrap().push((
+                expected_generation,
+                next.generation,
+                next.value,
+                std::ptr::from_ref(next) as usize,
+            ));
+            if self.fail_after_install_once.swap(false, Ordering::SeqCst) {
+                return PersistOutcome::Indeterminate(
+                    KinDbError::SnapshotPersistenceIndeterminate(
+                        "injected acknowledgement loss after exact install".to_string(),
+                    ),
+                );
+            }
+            PersistOutcome::Committed
+        }
+    }
+
+    #[test]
+    fn indeterminate_candidate_is_reconciled_before_the_next_writer_prepares() {
+        let authority = AuthorityPublication::new(
+            TestState {
+                generation: 0,
+                value: 10,
+            },
+            IndeterminatePersistence {
+                fail_after_install_once: AtomicBool::new(true),
+                attempts: StdMutex::new(Vec::new()),
+            },
+        );
+
+        authority
+            .commit(|current| {
+                Ok(AuthorityCommitDecision::Publish {
+                    next: TestState {
+                        generation: current.generation + 1,
+                        value: 20,
+                    },
+                    output: "first receipt",
+                })
+            })
+            .expect_err("lost acknowledgement must remain indeterminate");
+        assert_eq!(
+            (authority.read().generation, authority.read().value),
+            (0, 10)
+        );
+
+        let output = authority
+            .commit(|current| {
+                assert_eq!(
+                    (current.generation, current.value),
+                    (1, 20),
+                    "the exact pending candidate must publish before prepare"
+                );
+                Ok(AuthorityCommitDecision::IdempotentReplay {
+                    output: "recovered receipt",
+                })
+            })
+            .unwrap();
+        assert_eq!(output, "recovered receipt");
+
+        authority
+            .commit(|current| {
+                assert_eq!(
+                    (current.generation, current.value),
+                    (1, 20),
+                    "a different operation must prepare from recovered authority"
+                );
+                Ok(AuthorityCommitDecision::Publish {
+                    next: TestState {
+                        generation: 2,
+                        value: 30,
+                    },
+                    output: (),
+                })
+            })
+            .unwrap();
+
+        let attempts = authority.persistence.attempts.lock().unwrap();
+        assert_eq!(attempts.len(), 3);
+        assert_eq!((attempts[0].0, attempts[0].1, attempts[0].2), (0, 1, 20));
+        assert_eq!((attempts[1].0, attempts[1].1, attempts[1].2), (0, 1, 20));
+        assert_eq!((attempts[2].0, attempts[2].1, attempts[2].2), (1, 2, 30));
+        assert_eq!(
+            attempts[0].3, attempts[1].3,
+            "reconciliation must retry the same retained Arc, not rebuild state"
+        );
+    }
+
+    struct ReconcileRejectionPersistence {
+        attempts: AtomicUsize,
+    }
+
+    impl DurableAuthorityPersistence<TestState> for ReconcileRejectionPersistence {
+        fn persist(&self, _expected_generation: Generation, _next: &TestState) -> PersistOutcome {
+            match self.attempts.fetch_add(1, Ordering::SeqCst) {
+                0 => PersistOutcome::Indeterminate(KinDbError::SnapshotPersistenceIndeterminate(
+                    "first result is unknown".to_string(),
+                )),
+                1 => PersistOutcome::NotCommitted(KinDbError::ConcurrentAccessError(
+                    "reconciliation proved that another authority won".to_string(),
+                )),
+                _ => PersistOutcome::Committed,
+            }
+        }
+    }
+
+    #[test]
+    fn definitive_reconciliation_rejection_drops_pending_before_a_later_writer() {
+        let authority = AuthorityPublication::new(
+            TestState {
+                generation: 0,
+                value: 10,
+            },
+            ReconcileRejectionPersistence {
+                attempts: AtomicUsize::new(0),
+            },
+        );
+        authority
+            .commit(|current| {
+                Ok(AuthorityCommitDecision::Publish {
+                    next: TestState {
+                        generation: current.generation + 1,
+                        value: 99,
+                    },
+                    output: (),
+                })
+            })
+            .expect_err("first result remains unknown");
+
+        authority
+            .commit::<()>(|_| panic!("prepare cannot run before pending reconciliation"))
+            .expect_err("definitive reconciliation rejection must reach the caller");
+        assert_eq!(
+            (authority.read().generation, authority.read().value),
+            (0, 10)
+        );
+
+        authority
+            .commit(|current| {
+                Ok(AuthorityCommitDecision::Publish {
+                    next: TestState {
+                        generation: current.generation + 1,
+                        value: 20,
+                    },
+                    output: (),
+                })
+            })
+            .unwrap();
+        assert_eq!(
+            (authority.read().generation, authority.read().value),
+            (1, 20)
+        );
     }
 
     struct SerializedPersistence {
@@ -257,11 +499,7 @@ mod tests {
     }
 
     impl DurableAuthorityPersistence<TestState> for SerializedPersistence {
-        fn persist(
-            &self,
-            expected_generation: Generation,
-            next: &TestState,
-        ) -> Result<(), KinDbError> {
+        fn persist(&self, expected_generation: Generation, next: &TestState) -> PersistOutcome {
             let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_active.fetch_max(active, Ordering::SeqCst);
             std::thread::sleep(Duration::from_millis(20));
@@ -272,7 +510,7 @@ mod tests {
             self.persisted_generation
                 .store(next.generation, Ordering::Release);
             self.active.fetch_sub(1, Ordering::SeqCst);
-            Ok(())
+            PersistOutcome::Committed
         }
     }
 
@@ -325,11 +563,7 @@ mod tests {
     }
 
     impl DurableAuthorityPersistence<TestState> for BlockingPersistence {
-        fn persist(
-            &self,
-            _expected_generation: Generation,
-            _next: &TestState,
-        ) -> Result<(), KinDbError> {
+        fn persist(&self, _expected_generation: Generation, _next: &TestState) -> PersistOutcome {
             let (entered, entered_cv) = self.entered.as_ref();
             *entered.lock().unwrap() = true;
             entered_cv.notify_one();
@@ -339,7 +573,7 @@ mod tests {
             while !*allowed {
                 allowed = release_cv.wait(allowed).unwrap();
             }
-            Ok(())
+            PersistOutcome::Committed
         }
     }
 

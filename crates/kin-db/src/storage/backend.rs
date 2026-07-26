@@ -38,6 +38,38 @@ pub type Generation = u64;
 /// Sentinel value indicating no prior generation exists (first write).
 pub const GENERATION_INIT: Generation = 0;
 
+/// Opaque backend compare-and-swap cursor for full snapshot authority.
+///
+/// This is intentionally distinct from Kin's logical repository generation.
+/// A local or SQLite backend may happen to allocate `1, 2, ...`, while a cloud
+/// provider can return unrelated object versions such as `100, 101, ...`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotCursor(Generation);
+
+impl SnapshotCursor {
+    pub const INITIAL: Self = Self(GENERATION_INIT);
+
+    pub const fn from_backend_generation(generation: Generation) -> Self {
+        Self(generation)
+    }
+
+    pub const fn backend_generation(self) -> Generation {
+        self.0
+    }
+}
+
+/// Classified outcome of a full snapshot compare-and-swap attempt.
+#[must_use = "a snapshot save outcome must be classified before authority publication"]
+#[derive(Debug)]
+pub enum SnapshotSaveOutcome {
+    /// The exact candidate is installed at `cursor`.
+    Committed { cursor: SnapshotCursor },
+    /// The backend proved the candidate was not installed.
+    NotCommitted(KinDbError),
+    /// The backend cannot prove whether the candidate was installed.
+    Indeterminate(KinDbError),
+}
+
 /// Maximum exact-source object size accepted by any storage backend.
 /// Archive consumers may apply a lower aggregate limit, but no individual
 /// object is allowed to force an allocation larger than this boundary.
@@ -620,6 +652,13 @@ pub struct SnapshotAuthority {
     pub head_generation: Generation,
 }
 
+impl SnapshotAuthority {
+    /// Backend CAS cursor represented by this coherent authority view.
+    pub const fn cursor(&self) -> SnapshotCursor {
+        SnapshotCursor::from_backend_generation(self.head_generation)
+    }
+}
+
 pub type PersistedDelta = (Vec<u8>, Generation);
 pub type SnapshotRecoveryState = (Option<SnapshotAuthority>, Vec<PersistedDelta>);
 
@@ -880,6 +919,27 @@ pub trait StorageBackend: Send + Sync {
         data: &[u8],
         expected_gen: Generation,
     ) -> Result<Generation, KinDbError>;
+
+    /// Save a snapshot while classifying whether an error is known to precede
+    /// installation or may have occurred after installation.
+    ///
+    /// The default is deliberately conservative: legacy backends only prove
+    /// success. Any error remains indeterminate until the caller reconciles
+    /// exact installed bytes. Backends with a precise commit boundary should
+    /// override this method.
+    fn save_snapshot_classified(
+        &self,
+        repo_id: &str,
+        data: &[u8],
+        expected_cursor: SnapshotCursor,
+    ) -> SnapshotSaveOutcome {
+        match self.save_snapshot(repo_id, data, expected_cursor.backend_generation()) {
+            Ok(generation) => SnapshotSaveOutcome::Committed {
+                cursor: SnapshotCursor::from_backend_generation(generation),
+            },
+            Err(error) => SnapshotSaveOutcome::Indeterminate(error),
+        }
+    }
 
     /// Save a delta (incremental diff from a base snapshot generation).
     ///
@@ -1757,7 +1817,7 @@ impl LocalFileBackend {
         match mmap::atomic_write_bytes_no_magic_outcome(&path, &bytes)? {
             AtomicWriteOutcome::Durable => Ok(()),
             AtomicWriteOutcome::InstalledButNotSynced(error) => {
-                Err(KinDbError::StorageError(format!(
+                Err(KinDbError::SnapshotPersistenceIndeterminate(format!(
                     "local authority {} was installed but its parent-directory durability is unconfirmed: {error}",
                     path.display()
                 )))
@@ -1831,9 +1891,18 @@ impl LocalFileBackend {
     }
 
     #[cfg(test)]
-    fn fail_next_snapshot_before_authority_commit(&self) {
+    pub(crate) fn fail_next_snapshot_before_authority_commit(&self) {
         self.fail_before_authority_commit
             .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_snapshot_parent_sync_after_install(&self) {
+        self.set_snapshot_before_authority_commit_hook(|| {
+            // Authority candidate publication and exact candidate claim consume
+            // two parent syncs; fail after the destination rename installed it.
+            mmap::fail_parent_sync_after(2);
+        });
     }
 
     #[cfg(test)]
@@ -2158,7 +2227,12 @@ impl StorageBackend for LocalFileBackend {
                 // Exact serialized-content retries are idempotent after an
                 // authority rename whose directory sync result was uncertain.
                 // Re-sync the authority directory before accepting.
-                mmap::sync_parent_dir(&self.authority_path(repo_id))?;
+                mmap::sync_parent_dir(&self.authority_path(repo_id)).map_err(|error| {
+                    KinDbError::SnapshotPersistenceIndeterminate(format!(
+                        "local authority {} is installed but durability remains unconfirmed: {error}",
+                        self.authority_path(repo_id).display()
+                    ))
+                })?;
                 return Ok(record.head_generation);
             }
         }
@@ -2218,6 +2292,23 @@ impl StorageBackend for LocalFileBackend {
             tracing::warn!(repo_id, error = %error, "deferred superseded local snapshot cleanup");
         }
         Ok(new_gen)
+    }
+
+    fn save_snapshot_classified(
+        &self,
+        repo_id: &str,
+        data: &[u8],
+        expected_cursor: SnapshotCursor,
+    ) -> SnapshotSaveOutcome {
+        match self.save_snapshot(repo_id, data, expected_cursor.backend_generation()) {
+            Ok(generation) => SnapshotSaveOutcome::Committed {
+                cursor: SnapshotCursor::from_backend_generation(generation),
+            },
+            Err(error @ KinDbError::SnapshotPersistenceIndeterminate(_)) => {
+                SnapshotSaveOutcome::Indeterminate(error)
+            }
+            Err(error) => SnapshotSaveOutcome::NotCommitted(error),
+        }
     }
 
     fn save_delta(

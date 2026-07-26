@@ -20,12 +20,12 @@ pub mod tiered;
 
 pub use authority::{
     AuthorityCommitDecision, AuthorityPublication, AuthorityReadLease, DurableAuthorityPersistence,
-    VersionedAuthorityState,
+    PersistOutcome, VersionedAuthorityState,
 };
 pub use backend::{
     load_recovered_snapshot, Generation, LocalFileBackend, PersistedDelta, RecoveredSnapshot,
-    SnapshotAuthority, SnapshotRecoveryState, StorageBackend, GENERATION_INIT,
-    MAX_SOURCE_BLOB_BYTES,
+    SnapshotAuthority, SnapshotCursor, SnapshotRecoveryState, SnapshotSaveOutcome, StorageBackend,
+    GENERATION_INIT, MAX_SOURCE_BLOB_BYTES,
 };
 pub use delta::{
     apply_graph_delta, compute_graph_delta, CollectionDelta, GraphSnapshotDelta, VecDelta,

@@ -21,6 +21,15 @@ pub enum KinDbError {
     #[error("storage error: {0}")]
     StorageError(String),
 
+    /// A snapshot write may have installed its exact candidate, but the
+    /// backend could not prove the commit outcome to the caller.
+    ///
+    /// Callers must retain and reconcile that same candidate. Rebuilding a
+    /// successor can change timestamps or other serialized identity and can
+    /// therefore neither confirm nor safely supersede the uncertain write.
+    #[error("snapshot persistence outcome is indeterminate: {0}")]
+    SnapshotPersistenceIndeterminate(String),
+
     #[error(
         "immutable source blob is {actual_bytes} bytes, above the caller-supplied {max_bytes}-byte read limit"
     )]
