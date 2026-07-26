@@ -4141,9 +4141,9 @@ mod tests {
         }
     }
 
-    fn exact_source_change(id_byte: u8, path: &str, entry: TreeEntry) -> kin_model::SemanticChange {
-        kin_model::SemanticChange {
-            id: kin_model::SemanticChangeId::from_hash(Hash256::from_bytes([id_byte; 32])),
+    fn exact_source_change(path: &str, entry: TreeEntry) -> kin_model::SemanticChange {
+        let mut change = kin_model::SemanticChange {
+            id: kin_model::SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
             origin: ChangeOrigin::Native,
             parents: vec![],
             author: kin_model::AuthorId::new("exact-source-preflight-test"),
@@ -4160,7 +4160,9 @@ mod tests {
             spec_link: None,
             evidence: vec![],
             risk_summary: None,
-        }
+        };
+        change.id = kin_core::compute_semantic_change_id(&change).unwrap();
+        change
     }
 
     fn local_object_path(layout: &KinLayout, hash: Hash256) -> std::path::PathBuf {
@@ -4596,6 +4598,7 @@ mod tests {
         let repo_dir = tempfile::tempdir().unwrap();
         let init = kin_core::init(repo_dir.path()).unwrap();
         let state = test_state(init.layout, repo_dir.path());
+        let primary_repo_id = state.cached_repo_id.clone();
         let entity = test_entity("stable_after_writer", "src/lib.rs");
         state.graph.upsert_entity(&entity).unwrap();
 
@@ -4617,8 +4620,8 @@ mod tests {
         let (retried, registered_root, registered_entity) = match state.ensure_spine() {
             Some(spine) => (
                 true,
-                spine.root_hash("test-repo"),
-                spine.lookup_by_id("test-repo", &entity.id).is_some(),
+                spine.root_hash(&primary_repo_id),
+                spine.lookup_by_id(&primary_repo_id, &entity.id).is_some(),
             ),
             None => (false, None, false),
         };
@@ -4648,6 +4651,7 @@ mod tests {
         let repo_dir = tempfile::tempdir().unwrap();
         let init = kin_core::init(repo_dir.path()).unwrap();
         let state = Arc::new(test_state(init.layout, repo_dir.path()));
+        let primary_repo_id = state.cached_repo_id.clone();
         let original = test_entity("before_publication", "src/original.rs");
         state.graph.upsert_entity(&original).unwrap();
 
@@ -4688,8 +4692,8 @@ mod tests {
         let (retried, registered_root, raced_entity) = match state.ensure_spine() {
             Some(spine) => (
                 true,
-                spine.root_hash("test-repo"),
-                spine.lookup_by_id("test-repo", &raced.id).is_some(),
+                spine.root_hash(&primary_repo_id),
+                spine.lookup_by_id(&primary_repo_id, &raced.id).is_some(),
             ),
             None => (false, None, false),
         };
@@ -5241,7 +5245,7 @@ mod tests {
         let bytes = b"verified local source\n";
         let blob_hash = state.blobs.write(bytes).unwrap();
         let hash = Hash256::from_bytes(blob_hash.0);
-        let change = exact_source_change(35, "src/lib.rs", TreeEntry::blob(hash, false));
+        let change = exact_source_change("src/lib.rs", TreeEntry::blob(hash, false));
 
         state
             .preflight_exact_source_change(&state.graph, &change)
@@ -5263,11 +5267,7 @@ mod tests {
             } else {
                 Hash256::from_bytes(kin_blobs::digest_bytes(expected))
             };
-            let change = exact_source_change(
-                if corrupt { 36 } else { 37 },
-                "src/lib.rs",
-                TreeEntry::blob(hash, false),
-            );
+            let change = exact_source_change("src/lib.rs", TreeEntry::blob(hash, false));
             let root_before = state.graph.compute_root_hash();
             let generation_before = state.snapshot_generation.load(Ordering::SeqCst);
 
@@ -5296,13 +5296,12 @@ mod tests {
             ("src/escape", true, b"../../outside".as_slice()),
         ];
 
-        for (index, (file_id, symlink, bytes)) in cases.into_iter().enumerate() {
+        for (file_id, symlink, bytes) in cases {
             let repo_dir = tempfile::tempdir().unwrap();
             let init = kin_core::init(repo_dir.path()).unwrap();
             let state = test_state(init.layout, repo_dir.path());
             let blob_hash = state.blobs.write(bytes).unwrap();
             let change = exact_source_change(
-                38 + index as u8,
                 file_id,
                 if symlink {
                     TreeEntry::symlink(Hash256::from_bytes(blob_hash.0))
@@ -5334,7 +5333,7 @@ mod tests {
         let state = test_state(init.layout, repo_dir.path());
         let file_hash = Hash256::from_bytes(state.blobs.write(b"file bytes").unwrap().0);
         let child_hash = Hash256::from_bytes(state.blobs.write(b"child bytes").unwrap().0);
-        let mut change = exact_source_change(40, "pkg", TreeEntry::blob(file_hash, false));
+        let mut change = exact_source_change("pkg", TreeEntry::blob(file_hash, false));
         change.tree_deltas.push(TreeDelta::Added {
             artifact_id: ArtifactId::new(),
             new: LocatedEntry::new(
@@ -5342,6 +5341,7 @@ mod tests {
                 TreeEntry::blob(child_hash, false),
             ),
         });
+        change.id = kin_core::compute_semantic_change_id(&change).unwrap();
         let root_before = state.graph.compute_root_hash();
         let generation_before = state.snapshot_generation.load(Ordering::SeqCst);
 
@@ -5364,12 +5364,13 @@ mod tests {
         let init = kin_core::init(repo_dir.path()).unwrap();
         let state = test_state(init.layout, repo_dir.path());
         let child_hash = Hash256::from_bytes(state.blobs.write(b"parent child bytes").unwrap().0);
-        let parent = exact_source_change(41, "pkg/lib.rs", TreeEntry::blob(child_hash, false));
+        let parent = exact_source_change("pkg/lib.rs", TreeEntry::blob(child_hash, false));
         state.graph.create_change(&parent).unwrap();
 
         let file_hash = Hash256::from_bytes(state.blobs.write(b"incoming file bytes").unwrap().0);
-        let mut incoming = exact_source_change(42, "pkg", TreeEntry::blob(file_hash, false));
+        let mut incoming = exact_source_change("pkg", TreeEntry::blob(file_hash, false));
         incoming.parents = vec![parent.id];
+        incoming.id = kin_core::compute_semantic_change_id(&incoming).unwrap();
         let root_before = state.graph.compute_root_hash();
 
         let error = state
@@ -5382,19 +5383,18 @@ mod tests {
     }
 
     #[test]
-    fn local_exact_source_preflight_rejects_merge_parent_tree_collision() {
+    fn local_exact_source_preflight_uses_explicit_first_parent_merge_tree() {
         let repo_dir = tempfile::tempdir().unwrap();
         let init = kin_core::init(repo_dir.path()).unwrap();
         let state = test_state(init.layout, repo_dir.path());
         let child_hash = Hash256::from_bytes(state.blobs.write(b"left child bytes").unwrap().0);
-        let left = exact_source_change(43, "pkg/lib.rs", TreeEntry::blob(child_hash, false));
+        let left = exact_source_change("pkg/lib.rs", TreeEntry::blob(child_hash, false));
         let file_hash = Hash256::from_bytes(state.blobs.write(b"right file bytes").unwrap().0);
-        let right = exact_source_change(44, "pkg", TreeEntry::blob(file_hash, false));
+        let right = exact_source_change("pkg", TreeEntry::blob(file_hash, false));
         state.graph.create_change(&left).unwrap();
         state.graph.create_change(&right).unwrap();
 
         let mut merge = exact_source_change(
-            45,
             "merge-marker.txt",
             TreeEntry::blob(
                 Hash256::from_bytes(state.blobs.write(b"merge marker").unwrap().0),
@@ -5402,13 +5402,13 @@ mod tests {
             ),
         );
         merge.parents = vec![left.id, right.id];
+        merge.id = kin_core::compute_semantic_change_id(&merge).unwrap();
         let root_before = state.graph.compute_root_hash();
 
-        let error = state
+        state
             .preflight_exact_source_change(&state.graph, &merge)
-            .expect_err("all merge parents must participate in prospective tree validation");
+            .expect("the explicit first-parent merge result is the exact repository tree");
 
-        assert!(error.to_string().contains("not materializable"));
         assert!(state.graph.get_change(&merge.id).unwrap().is_none());
         assert_eq!(state.graph.compute_root_hash(), root_before);
     }
@@ -6160,6 +6160,21 @@ mod tests {
             .graph
             .upsert_entity(&test_entity("embed_me", "src/lib.rs"))
             .unwrap();
+        let vector_path = state.layout.kindb_vector_index_path();
+        let descriptor = kin_db::vector::IndexDescriptor {
+            model_id: Some("fixture-embedder-v1".to_string()),
+            graph_root: Some("fixture-root".to_string()),
+        };
+        let vectors = kin_db::VectorIndex::new(4).unwrap();
+        vectors.set_descriptor(descriptor.clone());
+        vectors.save(&vector_path).unwrap();
+        assert!(matches!(
+            state
+                .graph
+                .load_vector_index_compatible(&vector_path, &descriptor),
+            kin_db::vector::VectorIndexLoad::Loaded(0)
+        ));
+        std::fs::remove_file(&vector_path).unwrap();
         state.graph.queue_missing_for_embedding();
 
         let pending = state.flush_embed_progress().expect("flush must succeed");
@@ -6168,11 +6183,7 @@ mod tests {
             "vector progress must not recreate graph.kndb authority"
         );
         assert!(
-            state
-                .layout
-                .kindb_snapshot_path()
-                .with_extension("kvec")
-                .exists(),
+            state.layout.kindb_vector_index_path().exists(),
             "flush must persist the derived vector sidecar"
         );
         assert!(
