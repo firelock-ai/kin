@@ -150,6 +150,7 @@ fn path_exists(path: &Path) -> Result<bool> {
 
 fn print_json_result(result: &kin_core::InitResult, boundary: InitBoundary) -> Result<()> {
     let workspace = &result.authority.workspace;
+    let default_ref = initialized_default_ref(result)?;
     let payload = InitResultPayload {
         schema: "kin.init-result.v3",
         authority: "repository-v6",
@@ -160,7 +161,7 @@ fn print_json_result(result: &kin_core::InitResult, boundary: InitBoundary) -> R
         kin_dir: result.layout.root().display().to_string(),
         repository_id: &result.repository_id,
         workspace_id: result.workspace_id,
-        default_ref: &result.default_ref,
+        default_ref,
         authority_generation: result.authority.receipt.generation,
         workspace_generation: workspace.workspace_generation,
         workspace_head: &workspace.workspace_head,
@@ -176,6 +177,7 @@ fn print_json_result(result: &kin_core::InitResult, boundary: InitBoundary) -> R
 }
 
 fn print_human_result(result: &kin_core::InitResult, boundary: InitBoundary) -> Result<()> {
+    let default_ref = initialized_default_ref(result)?;
     println!(
         "Initialized Kin repository authority at {}",
         result.layout.root().display()
@@ -183,7 +185,7 @@ fn print_human_result(result: &kin_core::InitResult, boundary: InitBoundary) -> 
     println!("  Authority: repository-v6 (graph-owned)");
     println!("  Repository: {}", result.repository_id);
     println!("  Workspace: {}", result.workspace_id);
-    println!("  Default ref: {}", result.default_ref);
+    println!("  Default ref: {default_ref}");
     println!(
         "  Authority generation: {}",
         result.authority.receipt.generation
@@ -209,4 +211,15 @@ fn print_human_result(result: &kin_core::InitResult, boundary: InitBoundary) -> 
         }
     }
     Ok(())
+}
+
+fn initialized_default_ref(result: &kin_core::InitResult) -> Result<&kin_model::RefName> {
+    result
+        .authority
+        .receipt
+        .operation
+        .default_ref_mutation
+        .as_ref()
+        .and_then(|mutation| mutation.new_default.as_ref())
+        .ok_or_else(|| anyhow::anyhow!("initialized authority did not publish a default ref"))
 }
