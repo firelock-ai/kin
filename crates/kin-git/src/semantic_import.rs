@@ -17,10 +17,9 @@ use kin_model::{
     compute_resolved_tree_hash, compute_semantic_change_id, validate_semantic_change_id,
     ArtifactId, AuthorId, ChangeOrigin, DefaultRefExpectation, DefaultRefMutation,
     ExternalChangeAlias, ExternalObjectId, ExternalObjectKind, ExternalObjectRecord, GitObjectId,
-    Hash256, OperationId, RefExpectation, RefMutation, RefName, RefTarget, RefUpdatePolicy,
-    RepositoryId, RepositoryRefState, RepositoryTransaction, ResolvedArtifact, ResolvedTree,
-    RootBundle, SemanticChange, SemanticChangeId, Timestamp, TreeDelta, TreeEntry, WorkspaceHead,
-    REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+    Hash256, RefExpectation, RefMutation, RefName, RefTarget, RefUpdatePolicy, RepositoryId,
+    RepositoryRefState, ResolvedArtifact, ResolvedTree, SemanticChange, SemanticChangeId,
+    Timestamp, TreeDelta, TreeEntry, WorkspaceHead,
 };
 use uuid::Uuid;
 
@@ -91,45 +90,6 @@ impl SemanticGitImportPlan {
             ));
         }
         Ok(())
-    }
-
-    /// Bind caller-owned compare-and-swap context around the already-complete
-    /// history, raw-object, alias, and ref fields.
-    ///
-    /// Workspace mutation is deliberately left unset. The subsequent
-    /// migration-preflight lane must prove index/worktree state and admission
-    /// policy before constructing it.
-    #[allow(clippy::too_many_arguments)]
-    pub fn into_repository_transaction(
-        self,
-        blob_store: &BlobStore,
-        operation_id: OperationId,
-        expected_generation: u64,
-        expected_roots: RootBundle,
-        actor: AuthorId,
-        reason: impl Into<String>,
-    ) -> Result<RepositoryTransaction> {
-        self.validate(blob_store)?;
-        let transaction = RepositoryTransaction {
-            schema_version: REPOSITORY_TRANSACTION_SCHEMA_VERSION,
-            operation_id,
-            repository_id: self.repository_id,
-            expected_generation,
-            expected_roots,
-            actor,
-            reason: reason.into(),
-            external_objects: self.external_objects,
-            changes: self.changes,
-            aliases: self.aliases,
-            git_authority_delta: None,
-            ref_mutations: self.ref_mutations,
-            default_ref_mutation: self.default_ref_mutation,
-            workspace_mutation: None,
-            local_overlay_delta: None,
-            admission_scan_token: None,
-        };
-        transaction.validate()?;
-        Ok(transaction)
     }
 }
 
@@ -926,13 +886,14 @@ mod tests {
     use std::process::{Command, Output};
 
     use kin_model::{
-        AuthorityRoot, RepoPath, REPOSITORY_ROOT_SCHEMA_VERSION,
-        REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+        AdmissionRuleSourceKind, AuthorityRoot, OperationId, RepoPath, RootBundle,
+        SharedAdmissionPolicy, REPOSITORY_ROOT_SCHEMA_VERSION,
     };
     use pretty_assertions::assert_eq;
     use tempfile::{tempdir, TempDir};
 
     use super::*;
+    use crate::admission_history::{admit_semantic_git_import, AdmittedSemanticGitImportPlan};
     use crate::lossless::capture_lossless_git_repository;
 
     struct SemanticFixture {
@@ -1004,6 +965,15 @@ mod tests {
                 "NOTICE.txt",
                 b"This is unrelated legal and operational text.\n",
             );
+            write(
+                &repo,
+                "unclassified/archive.unknownlang",
+                b"opaque unsupported-language source\n",
+            );
+            write(&repo, ".gitignore", b"*.scratch\n");
+            write(&repo, ".kinignore", b".kin-local/\n");
+            write(&repo, "config/.gitignore", b"*.generated\n");
+            write(&repo, "config/.kinignore", b"private-*.yaml\n");
             write(&repo, "assets/raw.bin", &[0, 255, 1, 128, b'\n', 0, 42]);
             write(&repo, "scripts/tool.sh", b"#!/bin/sh\nprintf 'kin\\n'\n");
             let executable = repo.join("scripts/tool.sh");
@@ -1041,13 +1011,20 @@ mod tests {
             git_ok(&repo, ["switch", "-c", "one"]);
             write(&repo, "branch-one.txt", b"unique branch one\n");
             write(&repo, "same-a.bin", b"ambiguous shared body\n");
+            write(&repo, ".gitignore", b"*.scratch\n*.branch-one\n");
             let executable = repo.join("scripts/tool.sh");
             let mut permissions = fs::metadata(&executable).unwrap().permissions();
             permissions.set_mode(0o644);
             fs::set_permissions(&executable, permissions).unwrap();
             git_ok(
                 &repo,
-                ["add", "branch-one.txt", "same-a.bin", "scripts/tool.sh"],
+                [
+                    "add",
+                    "branch-one.txt",
+                    "same-a.bin",
+                    "scripts/tool.sh",
+                    ".gitignore",
+                ],
             );
             git_ok(&repo, ["commit", "-m", "branch one"]);
             let one = git_text(&repo, ["rev-parse", "HEAD"]);
@@ -1056,11 +1033,24 @@ mod tests {
             git_ok(&repo, ["switch", "-c", "two"]);
             write(&repo, "branch-two.txt", b"unique branch two\n");
             write(&repo, "same-b.bin", b"ambiguous shared body\n");
+            fs::remove_file(repo.join("config/.gitignore")).unwrap();
+            write(
+                &repo,
+                "config/.kinignore",
+                b"private-*.yaml\nbranch-two-*.yaml\n",
+            );
             fs::remove_file(repo.join("config-link")).unwrap();
             symlink("compose.yaml", repo.join("config-link")).unwrap();
             git_ok(
                 &repo,
-                ["add", "branch-two.txt", "same-b.bin", "config-link"],
+                [
+                    "add",
+                    "branch-two.txt",
+                    "same-b.bin",
+                    "config-link",
+                    "config/.gitignore",
+                    "config/.kinignore",
+                ],
             );
             git_ok(&repo, ["commit", "-m", "branch two"]);
             let two = git_text(&repo, ["rev-parse", "HEAD"]);
@@ -1338,27 +1328,230 @@ mod tests {
                 }
             }) if oid == fixture.merge
         ));
+    }
 
-        let transaction = second
+    #[cfg(unix)]
+    #[test]
+    fn admits_branch_versioned_policy_from_exact_commit_trees_and_cas() {
+        let fixture = SemanticFixture::octopus_polyglot();
+        let snapshot = capture_lossless_git_repository(
+            &fixture.repo,
+            RepositoryId::new("semantic-admission-history").unwrap(),
+            &fixture.blob_store,
+        )
+        .unwrap();
+        let semantic = plan_semantic_git_import(&snapshot, &fixture.blob_store).unwrap();
+        let admitted = admit_semantic_git_import(&semantic, &fixture.blob_store).unwrap();
+
+        fs::rename(
+            &fixture.repo,
+            fixture.root.path().join("source-remains-offline"),
+        )
+        .unwrap();
+        let replay = admit_semantic_git_import(&semantic, &fixture.blob_store).unwrap();
+        assert_eq!(replay, admitted);
+        replay.validate(&fixture.blob_store).unwrap();
+
+        assert_eq!(admitted.external_objects, semantic.external_objects);
+        assert_eq!(admitted.commit_trees, semantic.commit_trees);
+        assert_eq!(admitted.refs, semantic.refs);
+        assert_eq!(admitted.head, semantic.head);
+        assert_eq!(admitted.workspace_seed, semantic.workspace_seed);
+        assert_eq!(admitted.changes.len(), semantic.changes.len());
+        assert_eq!(admitted.aliases.len(), semantic.aliases.len());
+        assert_eq!(admitted.commit_policies.len(), semantic.commit_trees.len());
+
+        let initial_policy = admitted.commit_policies.get(&fixture.initial).unwrap();
+        assert_eq!(initial_policy.generation, 0);
+        assert_eq!(
+            initial_policy
+                .sources
+                .iter()
+                .map(|source| (
+                    source.kind,
+                    source.path.as_bytes().to_vec(),
+                    source
+                        .base_directory
+                        .as_ref()
+                        .map(|base| base.as_bytes().to_vec()),
+                    source.precedence,
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    AdmissionRuleSourceKind::GitIgnore,
+                    b".gitignore".to_vec(),
+                    None,
+                    0,
+                ),
+                (
+                    AdmissionRuleSourceKind::KinIgnore,
+                    b".kinignore".to_vec(),
+                    None,
+                    1,
+                ),
+                (
+                    AdmissionRuleSourceKind::GitIgnore,
+                    b"config/.gitignore".to_vec(),
+                    Some(b"config".to_vec()),
+                    2,
+                ),
+                (
+                    AdmissionRuleSourceKind::KinIgnore,
+                    b"config/.kinignore".to_vec(),
+                    Some(b"config".to_vec()),
+                    3,
+                ),
+            ]
+        );
+        for source in &initial_policy.sources {
+            let body = fixture.blob_store.read(&source.body_hash).unwrap();
+            assert_eq!(source.body_len, u64::try_from(body.len()).unwrap());
+            let tree_entry = semantic
+                .commit_trees
+                .get(&fixture.initial)
+                .unwrap()
+                .artifact_at_path(&source.path)
+                .unwrap()
+                .entry;
+            assert!(matches!(
+                tree_entry,
+                TreeEntry::Blob { hash, .. } if hash == source.body_hash
+            ));
+        }
+        let initial_delta = admitted_change_for_oid(&admitted, fixture.initial)
+            .admission_policy_delta
+            .as_ref()
+            .unwrap();
+        assert_eq!(initial_delta.old, None);
+        assert_eq!(initial_delta.new.as_ref(), Some(initial_policy));
+
+        let empty_policy = admitted.commit_policies.get(&fixture.empty).unwrap();
+        assert_eq!(empty_policy, initial_policy);
+        assert!(admitted_change_for_oid(&admitted, fixture.empty)
+            .admission_policy_delta
+            .is_none());
+        let branch_three_policy = admitted.commit_policies.get(&fixture.three).unwrap();
+        assert_eq!(branch_three_policy, initial_policy);
+        assert!(admitted_change_for_oid(&admitted, fixture.three)
+            .admission_policy_delta
+            .is_none());
+
+        let branch_one_policy = admitted.commit_policies.get(&fixture.one).unwrap();
+        assert_eq!(branch_one_policy.generation, 1);
+        assert_ne!(branch_one_policy.hash, initial_policy.hash);
+        let branch_one_delta = admitted_change_for_oid(&admitted, fixture.one)
+            .admission_policy_delta
+            .as_ref()
+            .unwrap();
+        assert_eq!(branch_one_delta.old.as_ref(), Some(initial_policy));
+        assert_eq!(branch_one_delta.new.as_ref(), Some(branch_one_policy));
+
+        let branch_two_policy = admitted.commit_policies.get(&fixture.two).unwrap();
+        assert_eq!(branch_two_policy.generation, 1);
+        assert!(branch_two_policy
+            .sources
+            .iter()
+            .all(|source| source.path.as_bytes() != b"config/.gitignore"));
+        assert_eq!(
+            branch_two_policy
+                .sources
+                .iter()
+                .find(|source| source.path.as_bytes() == b"config/.kinignore")
+                .unwrap()
+                .body_len,
+            u64::try_from(b"private-*.yaml\nbranch-two-*.yaml\n".len()).unwrap()
+        );
+
+        let merge_policy = admitted.commit_policies.get(&fixture.merge).unwrap();
+        assert_eq!(merge_policy.generation, 1);
+        let merge_delta = admitted_change_for_oid(&admitted, fixture.merge)
+            .admission_policy_delta
+            .as_ref()
+            .unwrap();
+        assert_eq!(merge_delta.old.as_ref(), Some(empty_policy));
+        assert_eq!(merge_delta.new.as_ref(), Some(merge_policy));
+        assert!(merge_policy
+            .sources
+            .iter()
+            .all(|source| source.path.as_bytes() != b"config/.gitignore"));
+        assert_eq!(
+            admitted_change_for_oid(&admitted, fixture.merge).parents,
+            [fixture.empty, fixture.one, fixture.two, fixture.three]
+                .map(|oid| admitted_alias_for_oid(&admitted, oid).change_id)
+        );
+
+        for original_alias in &semantic.aliases {
+            let admitted_alias = admitted_alias_for_oid(&admitted, original_alias.oid);
+            assert_ne!(admitted_alias.change_id, original_alias.change_id);
+        }
+        assert_eq!(admitted.workspace_policy(), merge_policy);
+        assert_eq!(
+            admitted.workspace_base_change_id(),
+            Some(admitted_alias_for_oid(&admitted, fixture.merge).change_id)
+        );
+
+        let merge_tree = admitted.commit_trees.get(&fixture.merge).unwrap();
+        for path in [
+            b"compose.yaml".as_slice(),
+            b"assets/raw.bin",
+            b"unclassified/archive.unknownlang",
+            b"NOTICE.txt",
+        ] {
+            assert_eq!(
+                merge_tree.artifact_at_path(&repo_path(path)),
+                semantic
+                    .commit_trees
+                    .get(&fixture.merge)
+                    .unwrap()
+                    .artifact_at_path(&repo_path(path)),
+                "non-policy artifact changed during admission: {}",
+                display_path(path)
+            );
+        }
+
+        let transaction = admitted
             .clone()
-            .into_repository_transaction(
+            .into_generation_zero_repository_transaction(
                 &fixture.blob_store,
-                OperationId::from_uuid(Uuid::from_u128(1)),
-                0,
+                OperationId::from_uuid(Uuid::from_u128(2)),
                 root_bundle(),
-                AuthorId::new("migration-test"),
-                "admit exact Git history",
+                AuthorId::new("admission-history-test"),
+                "admit branch-versioned Git history",
             )
             .unwrap();
-        assert_eq!(
-            transaction.schema_version,
-            REPOSITORY_TRANSACTION_SCHEMA_VERSION
-        );
-        assert_eq!(transaction.external_objects, second.external_objects);
-        assert_eq!(transaction.changes, second.changes);
-        assert_eq!(transaction.aliases, second.aliases);
+        assert_eq!(transaction.changes, admitted.changes);
+        assert_eq!(transaction.aliases, admitted.aliases);
+        assert!(transaction.git_authority_delta.is_none());
         assert!(transaction.workspace_mutation.is_none());
         transaction.validate().unwrap();
+    }
+
+    #[test]
+    fn unborn_import_has_canonical_empty_workspace_policy() {
+        let root = tempdir().unwrap();
+        let repo = root.path().join("source");
+        fs::create_dir(&repo).unwrap();
+        git_ok(&repo, ["init", "--initial-branch=main"]);
+        configure_git(&repo);
+        let blob_store = BlobStore::new(root.path().join("cas")).unwrap();
+        let snapshot = capture_lossless_git_repository(
+            &repo,
+            RepositoryId::new("semantic-unborn-admission").unwrap(),
+            &blob_store,
+        )
+        .unwrap();
+        let semantic = plan_semantic_git_import(&snapshot, &blob_store).unwrap();
+        let admitted = admit_semantic_git_import(&semantic, &blob_store).unwrap();
+
+        assert!(admitted.changes.is_empty());
+        assert!(admitted.commit_policies.is_empty());
+        assert_eq!(
+            admitted.workspace_policy(),
+            &SharedAdmissionPolicy::empty(0)
+        );
+        assert_eq!(admitted.workspace_base_change_id(), None);
+        admitted.validate(&blob_store).unwrap();
     }
 
     #[test]
@@ -1373,6 +1566,7 @@ mod tests {
             "compose.yaml",
             b"services:\n  api:\n    image: kin\n",
         );
+        write(&repo, ".gitignore", b"*.scratch\n");
         git_ok(&repo, ["add", "--all"]);
         git_ok(&repo, ["commit", "-m", "initial"]);
         let cas_root = root.path().join("cas");
@@ -1384,6 +1578,7 @@ mod tests {
         )
         .unwrap();
         let plan = plan_semantic_git_import(&snapshot, &blob_store).unwrap();
+        let admitted = admit_semantic_git_import(&plan, &blob_store).unwrap();
 
         let mut mutated = plan.clone();
         mutated.changes[0].message.push_str("tampered");
@@ -1392,18 +1587,36 @@ mod tests {
             Err(GitError::InvalidSnapshot(_))
         ));
 
-        let descriptor = snapshot.objects.first().unwrap();
-        let body = blob_store.read(&descriptor.body_hash).unwrap();
-        blob_store.delete(&descriptor.body_hash).unwrap();
+        let ignore_hash = match plan
+            .commit_trees
+            .values()
+            .next()
+            .unwrap()
+            .artifact_at_path(&repo_path(b".gitignore"))
+            .unwrap()
+            .entry
+        {
+            TreeEntry::Blob { hash, .. } => hash,
+            other => panic!("unexpected .gitignore entry {other:?}"),
+        };
+        let mut mutated_admitted = admitted.clone();
+        mutated_admitted.workspace_policy.generation += 1;
         assert!(matches!(
-            plan_semantic_git_import(&snapshot, &blob_store),
+            mutated_admitted.validate(&blob_store),
+            Err(GitError::InvalidSnapshot(_))
+        ));
+
+        let body = blob_store.read(&ignore_hash).unwrap();
+        blob_store.delete(&ignore_hash).unwrap();
+        assert!(matches!(
+            admit_semantic_git_import(&plan, &blob_store),
             Err(GitError::Blob(kin_blobs::BlobError::NotFound { .. }))
         ));
-        assert_eq!(blob_store.write(&body).unwrap(), descriptor.body_hash);
+        assert_eq!(blob_store.write(&body).unwrap(), ignore_hash);
 
-        fs::write(cas_path(&cas_root, &descriptor.body_hash), b"tampered").unwrap();
+        fs::write(cas_path(&cas_root, &ignore_hash), b"tampered").unwrap();
         assert!(matches!(
-            plan_semantic_git_import(&snapshot, &blob_store),
+            admit_semantic_git_import(&plan, &blob_store),
             Err(GitError::Blob(kin_blobs::BlobError::HashMismatch { .. }))
         ));
     }
@@ -1416,6 +1629,23 @@ mod tests {
     }
 
     fn alias_for_oid(plan: &SemanticGitImportPlan, oid: GitObjectId) -> &ExternalChangeAlias {
+        plan.aliases.iter().find(|alias| alias.oid == oid).unwrap()
+    }
+
+    fn admitted_change_for_oid(
+        plan: &AdmittedSemanticGitImportPlan,
+        oid: GitObjectId,
+    ) -> &SemanticChange {
+        plan.changes
+            .iter()
+            .find(|change| change.origin == ChangeOrigin::GitCommit { oid })
+            .unwrap()
+    }
+
+    fn admitted_alias_for_oid(
+        plan: &AdmittedSemanticGitImportPlan,
+        oid: GitObjectId,
+    ) -> &ExternalChangeAlias {
         plan.aliases.iter().find(|alias| alias.oid == oid).unwrap()
     }
 
