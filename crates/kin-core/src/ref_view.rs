@@ -129,7 +129,7 @@ pub fn build_graph_at_ref(
         );
     }
 
-    Ok(InMemoryGraph::from_snapshot(snapshot))
+    InMemoryGraph::from_snapshot(snapshot).map_err(|error| KinError::Graph(error.to_string()))
 }
 
 /// Post-filter vector search results to retain only entities present in a

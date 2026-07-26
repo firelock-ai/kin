@@ -213,7 +213,7 @@ async fn open_snapshot_daemon_first_with_mode(
         ));
     }
 
-    let graph = graph_from_bootstrap_snapshot(layout, snapshot, true);
+    let graph = graph_from_bootstrap_snapshot(layout, snapshot, true)?;
     let snap =
         kin_db::SnapshotManager::from_bootstrap_graph_read_only(kindb_snapshot_path(layout), graph);
     load_vector_index_if_exists(&snap, layout);
@@ -268,7 +268,7 @@ fn graph_from_bootstrap_snapshot(
     layout: &kin_core::KinLayout,
     snapshot: kin_db::GraphSnapshot,
     read_only: bool,
-) -> kin_db::InMemoryGraph {
+) -> std::result::Result<kin_db::InMemoryGraph, kin_db::KinDbError> {
     // Prefer the on-disk text index's stored root hash so the hash check
     // passes without an expensive Merkle recomputation.  Falls back to
     // computing the hash from the snapshot when no text index exists.
@@ -1074,7 +1074,8 @@ mod tests {
             snapshot,
             layout.text_index_dir(),
             expected_root,
-        );
+        )
+        .unwrap();
         kin_db::SnapshotManager::save_graph(layout.kindb_snapshot_path(), &graph).unwrap();
 
         let persisted = kin_db::TextIndex::open_read_only(Some(&layout.text_index_dir())).unwrap();

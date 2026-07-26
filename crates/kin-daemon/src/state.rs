@@ -1451,7 +1451,8 @@ impl DaemonState {
                     let g = kin_db::InMemoryGraph::from_snapshot_with_text_index(
                         recovered.snapshot,
                         text_index_path.clone(),
-                    );
+                    )
+                    .map_err(DaemonError::from)?;
                     info!(
                         repo_id,
                         generation = recovered.generation,
@@ -2399,10 +2400,13 @@ impl DaemonState {
         {
             Some(recovered) => {
                 let text_index_path = self.layout.text_index_dir();
-                let graph = Arc::new(kin_db::InMemoryGraph::from_snapshot_with_text_index(
-                    recovered.snapshot,
-                    text_index_path,
-                ));
+                let graph = Arc::new(
+                    kin_db::InMemoryGraph::from_snapshot_with_text_index(
+                        recovered.snapshot,
+                        text_index_path,
+                    )
+                    .map_err(DaemonError::from)?,
+                );
                 info!(
                     repo_id,
                     generation = recovered.generation,
@@ -3436,7 +3440,10 @@ impl DaemonState {
                             ),
                         )));
                     }
-                    Arc::new(kin_db::InMemoryGraph::from_snapshot(recovered.snapshot))
+                    Arc::new(
+                        kin_db::InMemoryGraph::from_snapshot(recovered.snapshot)
+                            .map_err(DaemonError::from)?,
+                    )
                 }
                 None if generation == kin_db::GENERATION_INIT => Arc::clone(&self.graph),
                 None => {
