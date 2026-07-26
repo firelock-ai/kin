@@ -4575,7 +4575,11 @@ async fn run_multiquery_fused_locate(
     // primary earned; it must not widen it. Caller-supplied fusion keeps its
     // union width.
     if auto_fanout {
-        kin_cli::commands::locate::bound_fused_declaration_to_primary(&mut fused, primary_declared);
+        kin_cli::commands::locate::bound_fused_declaration_to_primary(
+            &mut fused,
+            primary_declared,
+            !max_files_explicit,
+        );
     }
     Ok(fused)
 }
@@ -4636,7 +4640,11 @@ fn run_multiquery_locate_at_ref(
     // primary earned; it must not widen it. Caller-supplied fusion keeps its
     // union width.
     if auto_fanout {
-        kin_cli::commands::locate::bound_fused_declaration_to_primary(&mut fused, primary_declared);
+        kin_cli::commands::locate::bound_fused_declaration_to_primary(
+            &mut fused,
+            primary_declared,
+            !max_files_explicit,
+        );
     }
     Ok(fused)
 }

@@ -15409,11 +15409,24 @@ pub fn fuse_locate_results(
 /// automatic sharp variant may reorder and substitute files within the
 /// declaration the single query earned, but must not widen it (fusion width
 /// is what turns recall gains into precision losses on list-scored
-/// surfaces). Entities and attribution are untouched; only the declared
-/// file list truncates. No-op when the fused list already fits.
-pub fn bound_fused_declaration_to_primary(result: &mut LocateResult, primary_declared: usize) {
-    if result.files.len() > primary_declared {
-        result.files.truncate(primary_declared);
+/// surfaces). When the declaration was adaptively sized (no explicit
+/// max-files from the caller), the fused list additionally holds to the
+/// confident prefix, KIN_LOCATE_FUSED_DECLARATION_CAP entries (default 8):
+/// fused rankings concentrate their precision in the leading entries, and
+/// width past that prefix converts recall into list-precision loss. An
+/// explicit caller width is honored as-is. Entities and attribution are
+/// untouched; only the declared file list truncates.
+pub fn bound_fused_declaration_to_primary(
+    result: &mut LocateResult,
+    primary_declared: usize,
+    adaptive_declaration: bool,
+) {
+    let mut budget = primary_declared;
+    if adaptive_declaration {
+        budget = budget.min(locate_env_usize("KIN_LOCATE_FUSED_DECLARATION_CAP", 8));
+    }
+    if result.files.len() > budget {
+        result.files.truncate(budget);
     }
 }
 
@@ -15885,7 +15898,7 @@ mod tests {
             fused.files[0].path, "c.go",
             "corroborated file fuses to the top"
         );
-        bound_fused_declaration_to_primary(&mut fused, 3);
+        bound_fused_declaration_to_primary(&mut fused, 3, false);
         assert_eq!(
             fused.files.len(),
             3,
@@ -15895,8 +15908,44 @@ mod tests {
             fused.files[0].path, "c.go",
             "bounded list keeps the fused order"
         );
-        bound_fused_declaration_to_primary(&mut fused, 10);
+        bound_fused_declaration_to_primary(&mut fused, 10, false);
         assert_eq!(fused.files.len(), 3, "larger budget is a no-op");
+    }
+
+    #[test]
+    fn fused_declaration_confident_prefix_caps_adaptive_widths_only() {
+        let entry = |path: &str, score: f32| -> LocateFileEntry {
+            serde_json::from_value(serde_json::json!({ "path": path, "score": score }))
+                .expect("minimal file entry deserializes")
+        };
+        let wide = |n: usize| -> LocateResult {
+            let mut result = LocateResult::default();
+            result.files = (0..n)
+                .map(|i| entry(&format!("f{i}.go"), (n - i) as f32))
+                .collect();
+            result
+        };
+        let mut adaptive = wide(12);
+        bound_fused_declaration_to_primary(&mut adaptive, 12, true);
+        assert_eq!(
+            adaptive.files.len(),
+            8,
+            "adaptive declarations hold to the confident prefix"
+        );
+        let mut explicit = wide(12);
+        bound_fused_declaration_to_primary(&mut explicit, 12, false);
+        assert_eq!(
+            explicit.files.len(),
+            12,
+            "explicit caller widths are honored as-is"
+        );
+        let mut narrow = wide(4);
+        bound_fused_declaration_to_primary(&mut narrow, 4, true);
+        assert_eq!(
+            narrow.files.len(),
+            4,
+            "the prefix cap never widens a narrow budget"
+        );
     }
 
     #[test]
