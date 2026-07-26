@@ -53,12 +53,18 @@ async fn run_daemon_commit(
         .timeout(std::time::Duration::from_secs(120))
         .connect_timeout(std::time::Duration::from_millis(500))
         .build()?;
+    // Create these once per CLI invocation so transport retry logic can reuse
+    // the byte-identical repository transaction.
+    let operation_id = kin_model::OperationId::new();
+    let timestamp = kin_model::Timestamp::now();
     let mut request = client
         .post(format!(
             "{}/v1/commands/commit",
             daemon_url.trim_end_matches('/')
         ))
         .json(&serde_json::json!({
+            "operation_id": operation_id,
+            "timestamp": timestamp,
             "message": message,
             "dry_run": false,
         }));

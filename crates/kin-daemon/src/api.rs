@@ -3073,14 +3073,13 @@ async fn command_session_workspace(
 
 /// POST /commands/commit — Thin-client commit endpoint.
 ///
-/// The daemon runs the entire commit pipeline: reconcile pending file changes,
-/// build entity deltas from the working copy overlay, create the semantic change,
-/// and update the branch head. The CLI just sends the message and dry_run flag.
-///
-/// This replaces the old pattern where the CLI did all parsing locally and
-/// POSTed the pre-built SemanticChange to /graph/commit.
+/// The daemon first admits pending filesystem input into graph state, then
+/// publishes one repository-v6 transaction containing the semantic change,
+/// exact tree, workspace base, and named-ref compare-and-swap.
 #[derive(Debug, Deserialize)]
 struct CommandCommitRequest {
+    operation_id: kin_model::OperationId,
+    timestamp: kin_model::Timestamp,
     message: String,
     #[serde(default)]
     dry_run: bool,
@@ -3117,60 +3116,34 @@ async fn command_commit(
         .map_err(internal_error)?;
 
     let graph = &*state.graph;
-
-    // Read current branch from the .kin/HEAD file.
-    let branch_name = kin_core::read_current_branch(&state.layout).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to read HEAD: {e}"),
-        )
-    })?;
-
-    // Ensure the branch exists in the graph (bootstrap if needed).
-    let branch = graph
-        .get_branch(&branch_name)
-        .map_err(internal_error)?
-        .ok_or_else(|| {
-            (
-                StatusCode::BAD_REQUEST,
-                format!("branch '{}' not found", branch_name),
-            )
-        })?;
-
-    // Compute deltas reconstructively by diffing current graph state against
-    // the last-committed change-DAG node.  The reconcile loop's
-    // `apply_overlay_to_graph` folds mutations into the primary graph and
-    // then clears the working-copy overlay, so reading the overlay here
-    // would always produce empty deltas.  Instead we walk the change DAG
-    // from genesis to branch.head to reconstruct the committed baseline,
-    // then diff it against the live graph — robust regardless of overlay drain timing.
-    let commit_deltas = crate::commit_deltas::compute_deltas_vs_last_commit(graph, &branch.head)
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to compute commit deltas: {e}"),
-            )
-        })?;
-
-    let entity_deltas = commit_deltas.entity_deltas;
-    let relation_deltas = commit_deltas.relation_deltas;
-    let tree_deltas = commit_deltas.tree_deltas;
-    let expected_tree = commit_deltas.expected_tree;
-
-    let entity_count = entity_deltas.len();
-    let relation_count = relation_deltas.len();
-    let file_count = tree_deltas.len();
+    let plan = crate::repository_commit::plan_native_commit(
+        &state.layout,
+        graph,
+        state.blobs.as_ref(),
+        request.operation_id,
+        request.timestamp,
+        kin_model::AuthorId::new(kin_core::whoami()),
+        request.message,
+    )
+    .map_err(repository_commit_error)?;
+    let change_id = plan.change.id;
+    let branch_name = plan.branch.clone();
+    let entity_count = plan.entity_count;
+    let relation_count = plan.relation_count;
+    let file_count = plan.file_count;
 
     // --- Lease enforcement gate (same as /graph/commit) ---
     {
         use kin_model::session::IntentScope;
 
-        let scopes: Vec<IntentScope> = entity_deltas
+        let scopes: Vec<IntentScope> = plan
+            .change
+            .entity_deltas
             .iter()
-            .map(|d| match d {
-                kin_model::EntityDelta::Added(e) => IntentScope::Entity(e.id),
+            .map(|delta| match delta {
+                kin_model::EntityDelta::Added { new } => IntentScope::Entity(new.id),
                 kin_model::EntityDelta::Modified { new, .. } => IntentScope::Entity(new.id),
-                kin_model::EntityDelta::Removed(ref id) => IntentScope::Entity(*id),
+                kin_model::EntityDelta::Removed { old } => IntentScope::Entity(old.id),
             })
             .collect();
 
@@ -3218,7 +3191,7 @@ async fn command_commit(
 
     if request.dry_run {
         return Ok(Json(CommandCommitResponse {
-            change_id: "dry-run".to_string(),
+            change_id: change_id.to_string(),
             branch: branch_name.to_string(),
             entity_count,
             relation_count,
@@ -3226,62 +3199,16 @@ async fn command_commit(
         }));
     }
 
-    // Create the semantic change.
-    let mut change = kin_model::SemanticChange {
-        id: kin_model::SemanticChangeId::from_hash(kin_model::Hash256::from_bytes([0; 32])),
-        parents: vec![branch.head],
-        author: kin_model::AuthorId::new(kin_core::whoami()),
-        message: request.message,
-        timestamp: kin_model::Timestamp::now(),
-        entity_deltas,
-        relation_deltas,
-        tree_deltas,
-        projected_files: vec![],
-        spec_link: None,
-        evidence: vec![],
-        risk_summary: None,
-        authored_on: None,
-    };
-    change.id = kin_core::compute_semantic_change_id(&change).map_err(internal_error)?;
-
-    let change_id = change.id;
-
-    // `/commands/commit` constructs the change in-process, but it publishes
-    // through the same immutable graph authority as `/graph/commit`. Keep the
-    // exact-source gate identical across both entry points and run it before
-    // any change or branch mutation.
-    state
-        .preflight_exact_source_change(graph, &change)
-        .map_err(internal_error)?;
-
-    if graph.resolved_tree() != expected_tree {
-        return Err((
-            StatusCode::CONFLICT,
-            "live graph tree changed during serialized commit construction; retry commit"
-                .to_string(),
-        ));
-    }
-    graph.create_change(&change).map_err(internal_error)?;
-    let change_tree = graph.resolve_tree_at(&change_id).map_err(internal_error)?;
-    if change_tree != expected_tree {
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "constructed commit does not resolve to the exact live graph tree".to_string(),
-        ));
-    }
+    let committed =
+        crate::repository_commit::commit_native_plan(&state.layout, state.blobs.as_ref(), plan)
+            .map_err(repository_commit_error)?;
+    // The repository transaction is durable authority. The in-process graph is
+    // a derived query view; install the exact immutable change only after the
+    // authority CAS succeeds.
     graph
-        .update_branch_head(&branch_name, &change_id)
+        .create_change(&committed.change)
         .map_err(internal_error)?;
-
-    // Clear the working copy overlay — mutations are now committed.
-    let mut working_copy = state.working_copy.write().await;
-    working_copy.base_change = change_id;
-    working_copy.uncommitted_mutations = kin_model::GraphOverlay::default();
-    drop(working_copy);
-
-    // Broadcast events and mark dirty for background persistence.
     state.bump_version();
-    state.save_snapshot_full().map_err(internal_error)?;
     state.emit_event(DaemonEvent::GraphRootChanged {
         old_root_hash: None,
         new_root_hash: change_id.to_string(),
@@ -3294,6 +3221,22 @@ async fn command_commit(
         relation_count,
         file_count,
     }))
+}
+
+fn repository_commit_error(error: crate::error::DaemonError) -> (StatusCode, String) {
+    let status = match &error {
+        crate::error::DaemonError::Graph(kin_db::KinDbError::Model(
+            kin_model::ModelError::Conflict(_),
+        )) => StatusCode::CONFLICT,
+        crate::error::DaemonError::Graph(kin_db::KinDbError::Model(
+            kin_model::ModelError::InvalidOperation(_),
+        ))
+        | crate::error::DaemonError::Core(kin_core::KinError::Model(
+            kin_model::ModelError::InvalidOperation(_),
+        )) => StatusCode::BAD_REQUEST,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (status, error.to_string())
 }
 
 // ── Branch Management ───────────────────────────────────────────────────
@@ -12839,7 +12782,12 @@ mod tests {
                 Request::post("/commands/commit")
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        json!({ "message": "must not infer emptyDir removals" }).to_string(),
+                        json!({
+                            "operation_id": kin_model::OperationId::new(),
+                            "timestamp": kin_model::Timestamp::now(),
+                            "message": "must not infer emptyDir removals"
+                        })
+                        .to_string(),
                     ))
                     .unwrap(),
             )
