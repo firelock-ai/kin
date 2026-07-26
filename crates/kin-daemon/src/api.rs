@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener as StdTcpListener};
 use std::path::{Component, Path as FsPath, PathBuf};
@@ -22,9 +22,9 @@ use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use kin_model::session::{Intent, IntentScope, IntentSummary, LockType};
 use kin_model::{
-    Branch, BranchName, ChangeStore, ContractId, EntityId, EntityStore, FileLayout, FilePathId,
-    GraphNodeId, IntentId, ProvenanceStore, SessionCapabilities, SessionId, SessionStore,
-    SessionTransport, TreeDelta, TreeEntry, TreeEntryKind, WorkStore,
+    Branch, BranchName, ChangeStore, ContractId, EntityId, EntityStore, FilePathId, GraphNodeId,
+    IntentId, ProvenanceStore, SessionCapabilities, SessionId, SessionStore, SessionTransport,
+    TreeDelta, TreeEntry, TreeEntryKind, WorkStore,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -519,14 +519,6 @@ pub struct ProvenanceBrokenChain {
 struct RepoEntitiesQuery {
     #[serde(default)]
     query: Option<String>,
-}
-
-/// Query parameters for VFS read endpoint.
-#[derive(Debug, Deserialize)]
-struct VfsReadParams {
-    /// Optional session ID for session-scoped overlay (future).
-    #[serde(default)]
-    session_id: Option<String>,
 }
 
 /// Request body for VFS file-changed notification.
@@ -8270,28 +8262,116 @@ async fn vfs_version(State(state): State<Arc<DaemonState>>) -> impl IntoResponse
     Json(json!({ "version": state.vfs_version.load(std::sync::atomic::Ordering::SeqCst) }))
 }
 
-/// GET /vfs/tree — full file tree as `{ files: { path: hex_hash, ... }, timestamps: { path: epoch_secs, ... } }`.
+#[derive(Debug, Serialize)]
+struct VfsTreeResponse {
+    entries: BTreeMap<String, TreeEntry>,
+    sizes: BTreeMap<String, u64>,
+    timestamps: BTreeMap<String, u64>,
+}
+
+fn validate_vfs_tree_path(path: &str) -> Result<(), String> {
+    let mut components = path.split('/');
+    if path.is_empty()
+        || path.starts_with('/')
+        || path.ends_with('/')
+        || components.any(|component| component.is_empty() || component == "." || component == "..")
+    {
+        return Err(format!(
+            "graph tree contains non-canonical repository path {path:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_vfs_tree_paths(
+    tree: &HashMap<FilePathId, TreeEntry>,
+) -> Result<(), (StatusCode, String)> {
+    let paths: HashSet<&str> = tree.keys().map(|file_id| file_id.0.as_str()).collect();
+
+    for path in &paths {
+        validate_vfs_tree_path(path)
+            .map_err(|message| (StatusCode::INTERNAL_SERVER_ERROR, message))?;
+
+        let component_count = path.split('/').count();
+        let mut ancestor = String::new();
+        for component in path.split('/').take(component_count - 1) {
+            if !ancestor.is_empty() {
+                ancestor.push('/');
+            }
+            ancestor.push_str(component);
+            if paths.contains(ancestor.as_str()) {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("graph tree contains file/directory collision at {ancestor:?}"),
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn build_vfs_tree_response(
+    snapshot: &VfsTreeSnapshot,
+    blobs: &kin_blobs::BlobStore,
+) -> Result<VfsTreeResponse, (StatusCode, String)> {
+    validate_vfs_tree_paths(&snapshot.files)?;
+
+    let mut entries = BTreeMap::new();
+    let mut sizes = BTreeMap::new();
+    let mut timestamps = BTreeMap::new();
+    for (file_id, entry) in snapshot.files.iter() {
+        let blob_hash = kin_blobs::Hash256(entry.blob_hash.0);
+        let bytes = blobs.read(&blob_hash).map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "graph tree blob unavailable for {} at {}: {error}",
+                    file_id, entry.blob_hash
+                ),
+            )
+        })?;
+        let size = u64::try_from(bytes.len()).map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("graph tree blob size exceeds u64 for {file_id}"),
+            )
+        })?;
+
+        entries.insert(file_id.0.clone(), *entry);
+        sizes.insert(file_id.0.clone(), size);
+        if let Some(timestamp) = snapshot.timestamps.get(file_id) {
+            timestamps.insert(file_id.0.clone(), *timestamp);
+        }
+    }
+
+    Ok(VfsTreeResponse {
+        entries,
+        sizes,
+        timestamps,
+    })
+}
+
+/// GET /vfs/tree — exact graph-owned repository tree.
 ///
-/// Merges the committed tree with overlay additions and removals from the
-/// working copy so the VFS sees uncommitted new/deleted files.
+/// Every entry has exactly one size derived from its verified CAS blob. A
+/// missing or corrupt blob, non-canonical path, or file/directory collision is
+/// an authority gap and fails the whole response.
 async fn vfs_tree(
     State(state): State<Arc<DaemonState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let snapshot = current_vfs_snapshot(&state).await?;
+    let blobs = Arc::clone(&state.blobs);
+    let response = tokio::task::spawn_blocking(move || build_vfs_tree_response(&snapshot, &blobs))
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("VFS exact tree metadata task failed: {error}"),
+            )
+        })??;
 
-    let files: HashMap<String, String> = snapshot
-        .files
-        .iter()
-        .map(|(path, entry)| (path.0.clone(), entry.blob_hash.to_string()))
-        .collect();
-
-    let ts: HashMap<String, u64> = snapshot
-        .timestamps
-        .iter()
-        .map(|(path, epoch)| (path.0.clone(), *epoch))
-        .collect();
-
-    Ok(Json(json!({ "files": files, "timestamps": ts })))
+    Ok(Json(response))
 }
 
 /// GET /vfs/stat/*path — return VirtualStat-like JSON for a file path.
@@ -8365,83 +8445,174 @@ async fn vfs_stat(
     Err((StatusCode::NOT_FOUND, format!("not found: {path}")))
 }
 
-/// GET /vfs/read/*path — return file content, with overlay projection if needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VfsRangeError {
+    Malformed,
+    Unsatisfiable,
+}
+
+fn parse_vfs_byte_range(
+    headers: &HeaderMap,
+    total_size: u64,
+) -> Result<Option<(usize, usize)>, VfsRangeError> {
+    let mut values = headers.get_all(header::RANGE).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(VfsRangeError::Malformed);
+    }
+
+    let value = value.to_str().map_err(|_| VfsRangeError::Malformed)?;
+    let range = value
+        .strip_prefix("bytes=")
+        .ok_or(VfsRangeError::Malformed)?;
+    if range.contains(',') {
+        return Err(VfsRangeError::Malformed);
+    }
+
+    let (start, end) = range.split_once('-').ok_or(VfsRangeError::Malformed)?;
+    if start.is_empty() || end.is_empty() {
+        return Err(VfsRangeError::Malformed);
+    }
+    let start = start.parse::<u64>().map_err(|_| VfsRangeError::Malformed)?;
+    let requested_end = end.parse::<u64>().map_err(|_| VfsRangeError::Malformed)?;
+
+    if total_size == 0 || start >= total_size || requested_end < start {
+        return Err(VfsRangeError::Unsatisfiable);
+    }
+
+    let end = requested_end.min(total_size - 1);
+    let start = usize::try_from(start).map_err(|_| VfsRangeError::Unsatisfiable)?;
+    let end = usize::try_from(end).map_err(|_| VfsRangeError::Unsatisfiable)?;
+    Ok(Some((start, end)))
+}
+
+fn vfs_read_error(
+    status: StatusCode,
+    message: impl Into<String>,
+) -> (StatusCode, HeaderMap, String) {
+    (status, HeaderMap::new(), message.into())
+}
+
+fn vfs_unsatisfiable_range_error(total_size: u64) -> (StatusCode, HeaderMap, String) {
+    let mut headers = HeaderMap::new();
+    headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    let content_range = HeaderValue::from_str(&format!("bytes */{total_size}"))
+        .expect("numeric unsatisfied Content-Range is always a valid HTTP header");
+    headers.insert(header::CONTENT_RANGE, content_range);
+    (
+        StatusCode::RANGE_NOT_SATISFIABLE,
+        headers,
+        format!("requested byte range is unsatisfiable for {total_size}-byte blob"),
+    )
+}
+
+/// GET /vfs/read/*path — return exact graph-owned blob bytes.
 ///
-/// 1. Read blob content from committed tree
-/// 2. Check if working copy overlay has entity mutations for this file
-/// 3. If no overlap → return blob directly (zero overhead fast path)
-/// 4. If overlap → project overlay mutations onto blob content
+/// This endpoint deliberately does not project working-copy/session overlays:
+/// `/vfs/tree` advertises the committed graph blob identity, so serving any
+/// other bytes under that hash would make the wire contract dishonest.
 async fn vfs_read(
     Path(path): Path<String>,
-    Query(params): Query<VfsReadParams>,
     State(state): State<Arc<DaemonState>>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let snapshot = current_vfs_snapshot(&state).await?;
+    headers: HeaderMap,
+) -> Result<Response, (StatusCode, HeaderMap, String)> {
+    validate_vfs_tree_path(&path)
+        .map_err(|message| vfs_read_error(StatusCode::BAD_REQUEST, message))?;
+
+    let snapshot = current_vfs_snapshot(&state)
+        .await
+        .map_err(|(status, message)| vfs_read_error(status, message))?;
     let tree = &snapshot.files;
 
     let file_id = FilePathId::new(&path);
-    let entry = tree
-        .get(&file_id)
-        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("file not found: {path}")))?;
-
-    let blob_hash = kin_blobs::Hash256(entry.blob_hash.0);
-    let blob_data = state.blobs.read(&blob_hash).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("blob read error: {e}"),
+    let entry = *tree.get(&file_id).ok_or_else(|| {
+        vfs_read_error(
+            StatusCode::NOT_FOUND,
+            format!("file not found in graph tree: {path}"),
         )
     })?;
 
-    // Build merged overlay bodies: committed graph → global overlay → session overlay.
-    // Session overlay takes priority over global overlay.
-    let wc = state.working_copy.read().await;
-    let mut merged_bodies = wc.uncommitted_mutations.entity_bodies.clone();
+    let blob_hash = kin_blobs::Hash256(entry.blob_hash.0);
+    let blobs = Arc::clone(&state.blobs);
+    let blob_data = tokio::task::spawn_blocking(move || blobs.read(&blob_hash))
+        .await
+        .map_err(|error| {
+            vfs_read_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("VFS graph blob read task failed for {path}: {error}"),
+            )
+        })?
+        .map_err(|error| {
+            vfs_read_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "graph blob unavailable for {path} at {}: {error}",
+                    entry.blob_hash
+                ),
+            )
+        })?;
+    let total_size = u64::try_from(blob_data.len()).map_err(|_| {
+        vfs_read_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("graph blob size exceeds u64 for {path}"),
+        )
+    })?;
 
-    // Merge session overlay on top of global overlay if session_id is provided.
-    if let Some(ref session_id_str) = params.session_id {
-        if let Ok(session_id) = parse_session_id(session_id_str) {
-            let session_overlay = state.get_or_create_session_overlay(&session_id).await;
-            // Session overlay bodies take priority over global overlay bodies.
-            for (entity_id, body) in session_overlay.entity_bodies {
-                merged_bodies.insert(entity_id, body);
-            }
+    let byte_range = match parse_vfs_byte_range(&headers, total_size) {
+        Ok(range) => range,
+        Err(VfsRangeError::Malformed) => {
+            return Err(vfs_read_error(
+                StatusCode::BAD_REQUEST,
+                "Range must contain exactly one closed byte interval: bytes=start-end",
+            ));
         }
-    }
-
-    if merged_bodies.is_empty() {
-        drop(wc);
-        return Ok(blob_data);
-    }
-
-    // Try to get the FileLayout for this file from projection state.
-    let projection = state.projection.read().await;
-    let layout = projection.get_layout(&file_id);
-
-    let projected = project_vfs_overlay_bytes(&file_id, &blob_data, layout, &merged_bodies)?;
-
-    drop(projection);
-    drop(wc);
-    Ok(projected)
-}
-
-fn project_vfs_overlay_bytes(
-    file_id: &FilePathId,
-    blob_data: &[u8],
-    layout: Option<&FileLayout>,
-    merged_bodies: &HashMap<EntityId, Vec<u8>>,
-) -> Result<Vec<u8>, (StatusCode, String)> {
-    let Some(layout) = layout else {
-        return Ok(blob_data.to_vec());
+        Err(VfsRangeError::Unsatisfiable) => {
+            return Err(vfs_unsatisfiable_range_error(total_size));
+        }
     };
 
-    match kin_projection::project_overlay_to_bytes(blob_data, layout, merged_bodies) {
-        Ok(Some(projected)) => Ok(projected),
-        Ok(None) => Ok(blob_data.to_vec()),
-        Err(e) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("projection failed for {}: {}", file_id, e),
-        )),
+    let (status, response_bytes, content_range) = match byte_range {
+        Some((start, end)) => (
+            StatusCode::PARTIAL_CONTENT,
+            blob_data[start..=end].to_vec(),
+            Some(format!("bytes {start}-{end}/{total_size}")),
+        ),
+        None => (StatusCode::OK, blob_data, None),
+    };
+
+    let mut response = response_bytes.into_response();
+    *response.status_mut() = status;
+    response
+        .headers_mut()
+        .insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("x-kin-blob-hash"),
+        HeaderValue::from_str(&entry.blob_hash.to_string()).map_err(|error| {
+            vfs_read_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("invalid graph blob hash header for {path}: {error}"),
+            )
+        })?,
+    );
+    if let Some(content_range) = content_range {
+        response.headers_mut().insert(
+            header::CONTENT_RANGE,
+            HeaderValue::from_str(&content_range).map_err(|error| {
+                vfs_read_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("invalid Content-Range for {path}: {error}"),
+                )
+            })?,
+        );
     }
+
+    Ok(response)
 }
 
 /// GET /vfs/readdir/*path — return directory listing derived from the file tree.
@@ -12586,11 +12757,11 @@ mod tests {
     use kin_model::{
         Actor, ActorId, ActorKind, AgentSession, AnnotationFilter, Approval, ApprovalDecision,
         ApprovalId, ArtifactDelta, ArtifactDeltaKind, AuditEventId, AuthorId, Branch, BranchName,
-        Entity, EntityDelta, EntityId, EntityKind, EntityRole, FilePathId, FingerprintAlgorithm,
-        Hash256, IdentityRef, ImportSection, IntentScope, LanguageId, Priority, RelationKind,
-        SemanticChange, SemanticChangeId, SemanticFingerprint, SourceRegion, SourceSpan, TestCase,
-        TestKind, TestRunner, Timestamp, Visibility, WorkItem, WorkKind, WorkScope, WorkStatus,
-        WorkStore,
+        Entity, EntityDelta, EntityId, EntityKind, EntityRole, FileLayout, FilePathId,
+        FingerprintAlgorithm, Hash256, IdentityRef, ImportSection, IntentScope, LanguageId,
+        Priority, RelationKind, SemanticChange, SemanticChangeId, SemanticFingerprint,
+        SourceRegion, SourceSpan, TestCase, TestKind, TestRunner, Timestamp, Visibility, WorkItem,
+        WorkKind, WorkScope, WorkStatus, WorkStore,
     };
     use kin_model::{ReviewStore, VerificationStore};
     use kin_registry::Ecosystem;
@@ -12785,28 +12956,27 @@ mod tests {
         }
     }
 
-    fn install_branch_file(state: &Arc<DaemonState>, rel_path: &str, content: &[u8]) {
+    fn install_branch_entries(
+        state: &Arc<DaemonState>,
+        entries: impl IntoIterator<Item = (FilePathId, TreeEntry)>,
+    ) {
         let branch_name = BranchName::new("main");
         let genesis = kin_core::build_genesis_change();
         state.graph.create_change(&genesis).unwrap();
 
-        let blob_store = kin_blobs::BlobStore::new(state.layout.objects_dir()).unwrap();
-        let blob_hash = blob_store.write(content).unwrap();
         let change = SemanticChange {
             id: SemanticChangeId::from_hash(Hash256::from_bytes([0x77; 32])),
             parents: vec![genesis.id],
             timestamp: Timestamp::now(),
             author: AuthorId::new("test"),
-            message: "add test file".to_string(),
+            message: "install exact test tree".to_string(),
             entity_deltas: vec![],
             relation_deltas: vec![],
-            artifact_deltas: vec![ArtifactDelta {
-                file_id: FilePathId::new(rel_path),
-                kind: ArtifactDeltaKind::Added,
-                old_hash: None,
-                new_hash: Some(blob_hash),
-            }],
-            projected_files: vec![FilePathId::new(rel_path)],
+            tree_deltas: entries
+                .into_iter()
+                .map(|(file_id, new_entry)| TreeDelta::Added { file_id, new_entry })
+                .collect(),
+            projected_files: vec![],
             spec_link: None,
             evidence: vec![],
             risk_summary: None,
@@ -12821,6 +12991,17 @@ mod tests {
             })
             .unwrap();
         kin_core::write_current_branch(&state.layout, &branch_name).unwrap();
+    }
+
+    fn install_branch_file(state: &Arc<DaemonState>, rel_path: &str, content: &[u8]) {
+        let blob_hash = state.blobs.write(content).unwrap();
+        install_branch_entries(
+            state,
+            [(
+                FilePathId::new(rel_path),
+                TreeEntry::regular(Hash256::from_bytes(blob_hash.0), false),
+            )],
+        );
     }
 
     fn install_release_test_branch(state: &Arc<DaemonState>) -> SemanticChangeId {
@@ -13037,11 +13218,9 @@ mod tests {
             message: "advance test branch".to_string(),
             entity_deltas: vec![],
             relation_deltas: vec![],
-            artifact_deltas: vec![ArtifactDelta {
+            tree_deltas: vec![TreeDelta::Added {
                 file_id: FilePathId::new(rel_path),
-                kind: ArtifactDeltaKind::Added,
-                old_hash: None,
-                new_hash: Some(blob_hash),
+                new_entry: TreeEntry::regular(Hash256::from_bytes(blob_hash.0), false),
             }],
             projected_files: vec![FilePathId::new(rel_path)],
             spec_link: None,
@@ -18102,7 +18281,312 @@ mod tests {
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(json["files"].as_object().unwrap().is_empty());
+        assert!(json["entries"].as_object().unwrap().is_empty());
+        assert!(json["sizes"].as_object().unwrap().is_empty());
+        assert!(json["timestamps"].as_object().unwrap().is_empty());
+        assert!(json.get("files").is_none());
+    }
+
+    #[tokio::test]
+    async fn vfs_tree_returns_exact_entries_sizes_and_kinds() {
+        let state = test_state();
+        let compose = b"services:\n  api:\n    image: kin/example\n";
+        let executable = b"#!/bin/sh\nexec kin \"$@\"\n";
+        let link_target = b"scripts/run-kin";
+        let binary = [0x00, 0xff, 0x89, b'K', b'I', b'N'];
+
+        let compose_hash = state.blobs.write(compose).unwrap();
+        let executable_hash = state.blobs.write(executable).unwrap();
+        let link_hash = state.blobs.write(link_target).unwrap();
+        let binary_hash = state.blobs.write(&binary).unwrap();
+        install_branch_entries(
+            &state,
+            [
+                (
+                    FilePathId::new("compose.yaml"),
+                    TreeEntry::regular(Hash256::from_bytes(compose_hash.0), false),
+                ),
+                (
+                    FilePathId::new("scripts/run-kin"),
+                    TreeEntry::regular(Hash256::from_bytes(executable_hash.0), true),
+                ),
+                (
+                    FilePathId::new("current"),
+                    TreeEntry::symlink(Hash256::from_bytes(link_hash.0)),
+                ),
+                (
+                    FilePathId::new("assets/logo.bin"),
+                    TreeEntry::regular(Hash256::from_bytes(binary_hash.0), false),
+                ),
+            ],
+        );
+
+        let response = router(state)
+            .oneshot(Request::get("/vfs/tree").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        let object = json.as_object().unwrap();
+        assert_eq!(
+            object.keys().map(String::as_str).collect::<HashSet<_>>(),
+            HashSet::from(["entries", "sizes", "timestamps"])
+        );
+        let entries = object["entries"].as_object().unwrap();
+        let sizes = object["sizes"].as_object().unwrap();
+        assert_eq!(entries.len(), 4);
+        assert_eq!(
+            entries.keys().collect::<HashSet<_>>(),
+            sizes.keys().collect()
+        );
+        assert_eq!(sizes["compose.yaml"], compose.len());
+        assert_eq!(sizes["scripts/run-kin"], executable.len());
+        assert_eq!(sizes["current"], link_target.len());
+        assert_eq!(sizes["assets/logo.bin"], binary.len());
+        assert_eq!(
+            entries["scripts/run-kin"]["kind"],
+            serde_json::json!({ "type": "regular", "executable": true })
+        );
+        assert_eq!(
+            entries["current"]["kind"],
+            serde_json::json!({ "type": "symlink" })
+        );
+    }
+
+    #[test]
+    fn vfs_tree_rejects_noncanonical_and_colliding_paths() {
+        let entry = TreeEntry::regular(Hash256::from_bytes([0x11; 32]), false);
+        for invalid in [
+            "",
+            "/absolute",
+            "dir/",
+            "dir//file",
+            "dir/./file",
+            "dir/../file",
+        ] {
+            let tree = HashMap::from([(FilePathId::new(invalid), entry)]);
+            assert!(
+                validate_vfs_tree_paths(&tree).is_err(),
+                "{invalid:?} must be rejected"
+            );
+        }
+
+        let collision = HashMap::from([
+            (FilePathId::new("tools"), entry),
+            (FilePathId::new("tools/run"), entry),
+        ]);
+        assert!(validate_vfs_tree_paths(&collision).is_err());
+    }
+
+    #[test]
+    fn vfs_range_parser_rejects_malformed_multi_and_unsatisfiable_ranges() {
+        for malformed in [
+            "items=0-1",
+            "bytes=0-1,3-4",
+            "bytes=-4",
+            "bytes=4-",
+            "bytes=wat-9",
+        ] {
+            let headers =
+                HeaderMap::from_iter([(header::RANGE, HeaderValue::from_str(malformed).unwrap())]);
+            assert_eq!(
+                parse_vfs_byte_range(&headers, 10),
+                Err(VfsRangeError::Malformed),
+                "{malformed:?} must be rejected"
+            );
+        }
+
+        let mut duplicated = HeaderMap::new();
+        duplicated.append(header::RANGE, HeaderValue::from_static("bytes=0-1"));
+        duplicated.append(header::RANGE, HeaderValue::from_static("bytes=2-3"));
+        assert_eq!(
+            parse_vfs_byte_range(&duplicated, 10),
+            Err(VfsRangeError::Malformed)
+        );
+
+        for unsatisfiable in ["bytes=10-12", "bytes=7-6"] {
+            let headers = HeaderMap::from_iter([(
+                header::RANGE,
+                HeaderValue::from_str(unsatisfiable).unwrap(),
+            )]);
+            assert_eq!(
+                parse_vfs_byte_range(&headers, 10),
+                Err(VfsRangeError::Unsatisfiable)
+            );
+        }
+
+        let clamped =
+            HeaderMap::from_iter([(header::RANGE, HeaderValue::from_static("bytes=7-99"))]);
+        assert_eq!(parse_vfs_byte_range(&clamped, 10), Ok(Some((7, 9))));
+    }
+
+    #[tokio::test]
+    async fn vfs_read_serves_exact_full_and_ranged_graph_blob_bytes() {
+        let state = test_state();
+        let bytes = [0x00, 0xff, 0x89, b'K', b'I', b'N', 0x01, 0x02];
+        let blob_hash = state.blobs.write(&bytes).unwrap();
+        let model_hash = Hash256::from_bytes(blob_hash.0);
+        install_branch_entries(
+            &state,
+            [(
+                FilePathId::new("assets/logo.bin"),
+                TreeEntry::regular(model_hash, false),
+            )],
+        );
+        let app = router(state);
+
+        let full = app
+            .clone()
+            .oneshot(
+                Request::get("/vfs/read/assets/logo.bin")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(full.status(), StatusCode::OK);
+        assert_eq!(
+            full.headers()["x-kin-blob-hash"].to_str().unwrap(),
+            model_hash.to_string()
+        );
+        assert_eq!(full.headers()[header::ACCEPT_RANGES], "bytes");
+        let full_body = axum::body::to_bytes(full.into_body(), 1024).await.unwrap();
+        assert_eq!(full_body.as_ref(), bytes);
+
+        let partial = app
+            .oneshot(
+                Request::get("/vfs/read/assets/logo.bin")
+                    .header(header::RANGE, "bytes=2-5")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(partial.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(partial.headers()[header::CONTENT_RANGE], "bytes 2-5/8");
+        assert_eq!(
+            partial.headers()["x-kin-blob-hash"].to_str().unwrap(),
+            model_hash.to_string()
+        );
+        let partial_body = axum::body::to_bytes(partial.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(partial_body.as_ref(), &bytes[2..=5]);
+    }
+
+    #[tokio::test]
+    async fn vfs_read_rejects_bad_ranges_with_correct_status_and_metadata() {
+        let state = test_state();
+        install_branch_file(&state, "data.bin", b"12345");
+        let app = router(state);
+
+        let malformed = app
+            .clone()
+            .oneshot(
+                Request::get("/vfs/read/data.bin")
+                    .header(header::RANGE, "bytes=0-1,3-4")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+
+        let unsatisfiable = app
+            .oneshot(
+                Request::get("/vfs/read/data.bin")
+                    .header(header::RANGE, "bytes=5-9")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unsatisfiable.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(unsatisfiable.headers()[header::CONTENT_RANGE], "bytes */5");
+        assert_eq!(unsatisfiable.headers()[header::ACCEPT_RANGES], "bytes");
+    }
+
+    #[tokio::test]
+    async fn vfs_tree_and_read_fail_loud_on_missing_graph_blob() {
+        let state = test_state();
+        let missing_hash = Hash256::from_bytes([0x42; 32]);
+        install_branch_entries(
+            &state,
+            [(
+                FilePathId::new("missing.bin"),
+                TreeEntry::regular(missing_hash, false),
+            )],
+        );
+        let app = router(state);
+
+        let tree = app
+            .clone()
+            .oneshot(Request::get("/vfs/tree").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(tree.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let read = app
+            .oneshot(
+                Request::get("/vfs/read/missing.bin")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(read.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn vfs_read_ignores_projected_overlay_when_tree_advertises_graph_blob() {
+        let state = test_state();
+        let committed = b"fn value() -> u8 { 1 }\n";
+        install_branch_file(&state, "src/lib.rs", committed);
+
+        let entity_id = EntityId::new();
+        let file_id = FilePathId::new("src/lib.rs");
+        let layout = FileLayout {
+            file_id: file_id.clone(),
+            parse_completeness: Default::default(),
+            imports: ImportSection {
+                byte_range: 0..0,
+                items: Vec::new(),
+            },
+            regions: vec![SourceRegion::EntityRef {
+                entity_id,
+                byte_range: 0..committed.len(),
+            }],
+        };
+        state
+            .projection
+            .write()
+            .await
+            .register_file(layout, committed.to_vec());
+        state
+            .working_copy
+            .write()
+            .await
+            .uncommitted_mutations
+            .entity_bodies
+            .insert(entity_id, b"fn value() -> u8 { 2 }\n".to_vec());
+
+        let response = router(state)
+            .oneshot(
+                Request::get("/vfs/read/src/lib.rs?session_id=ignored")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), committed);
     }
 
     #[tokio::test]
@@ -18306,32 +18790,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[test]
-    fn vfs_read_rejects_projection_failures_instead_of_serving_raw_blob() {
-        let entity_id = EntityId::new();
-        let file_id = FilePathId::new("src/lib.rs");
-        let layout = FileLayout {
-            file_id: file_id.clone(),
-            parse_completeness: Default::default(),
-            imports: ImportSection {
-                byte_range: 0..0,
-                items: Vec::new(),
-            },
-            regions: vec![SourceRegion::EntityRef {
-                entity_id,
-                byte_range: 32..40,
-            }],
-        };
-        let mut merged_bodies = HashMap::new();
-        merged_bodies.insert(entity_id, b"new_body".to_vec());
-
-        let err = project_vfs_overlay_bytes(&file_id, b"short", Some(&layout), &merged_bodies)
-            .expect_err("invalid layouts must not fall back to raw blob bytes");
-
-        assert_eq!(err.0, StatusCode::INTERNAL_SERVER_ERROR);
-        assert!(err.1.contains("projection failed for src/lib.rs"));
     }
 
     // -----------------------------------------------------------------------
