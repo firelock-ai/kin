@@ -7,7 +7,7 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use kin_model::{ChangeStore, EntityRole, EntityStore};
+use kin_model::EntityRole;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -158,88 +158,13 @@ async fn run_daemon_status(json: bool) -> Result<CommandStatusResponse> {
 }
 
 pub fn build_status_summary(
-    layout: &kin_core::KinLayout,
-    graph: &kin_db::InMemoryGraph,
+    _layout: &kin_core::KinLayout,
+    _graph: &kin_db::InMemoryGraph,
 ) -> Result<StatusSummary> {
-    let current = kin_core::read_current_branch(layout)?;
-    let source_root = kin_core::source_dir(layout);
-    let config = kin_core::KinConfig::load_or_default(&layout.config_path())?;
-    let default_remote = config
-        .resolve_remote(None)
-        .map(|remote| format!("{} [{} / {}]", remote.name, remote.host, remote.transport))
-        .unwrap_or_else(|| "(not configured)".to_string());
-
-    let all_entities = graph.list_all_entities()?;
-    let entities = all_entities.len();
-    let mut role_counts: HashMap<EntityRole, usize> = HashMap::new();
-    for e in &all_entities {
-        *role_counts.entry(e.role).or_insert(0) += 1;
-    }
-    let embed_status = graph.embedding_status();
-
-    let genesis = kin_core::build_genesis_change().id;
-    let (branch, head, import_state, readiness, blocked) = match graph.get_branch(&current)? {
-        Some(branch) => {
-            let import_state = if entities == 0 && branch.head == genesis {
-                "bootstrap only (entities will be populated on next `kin init`)".to_string()
-            } else if entities == 0 {
-                "empty semantic graph (run `kin init` to populate)".to_string()
-            } else {
-                "materialized semantic graph".to_string()
-            };
-            let readiness = if entities == 0 {
-                "blocked: semantic state is not materialized yet".to_string()
-            } else {
-                "ready: trace, review, and publish can operate on stored semantic state".to_string()
-            };
-            let blocked = entities == 0;
-            (
-                branch.name.to_string(),
-                branch.head.to_string(),
-                import_state,
-                readiness,
-                blocked,
-            )
-        }
-        None => (
-            format!("{current} (not found in graph)"),
-            "(missing)".to_string(),
-            format!("missing semantic branch `{current}`"),
-            "blocked: current branch is not stored in the semantic graph".to_string(),
-            true,
-        ),
-    };
-
-    // Check for in-progress merge.
-    let merge_state = crate::commands::conflicts::load_merge_state(layout)
-        .ok()
-        .flatten()
-        .map(|ms| {
-            format!(
-                "merging '{}' -> '{}' ({} unresolved)",
-                ms.source_branch,
-                ms.target_branch,
-                ms.unresolved_count()
-            )
-        });
-
-    Ok(StatusSummary {
-        repo_root: layout.working_dir().to_path_buf(),
-        source_root,
-        world_preset: config.world.preset.to_string(),
-        default_remote,
-        branch,
-        head,
-        entities,
-        role_counts,
-        embeddings_indexed: embed_status.indexed,
-        embeddings_pending: embed_status.pending,
-        embeddings_total: embed_status.total,
-        import_state,
-        readiness,
-        blocked,
-        merge_state,
-    })
+    anyhow::bail!(
+        "status is fail-closed until its daemon executor reads one coherent repository-v6 \
+         workspace/ref/root generation; inspect `kin capabilities --json`"
+    )
 }
 
 impl StatusSummary {

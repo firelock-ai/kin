@@ -83,7 +83,7 @@ pub async fn todo_import(path: Option<String>) -> Result<()> {
     let scan_root = path
         .clone()
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| kin_core::source_dir(&layout));
+        .unwrap_or_else(|| layout.working_dir().to_path_buf());
     println!("Scanning for inline TODOs in {}...", scan_root.display());
     print_note_response(run_daemon_note(&NoteRequest::TodoImport { path }).await?);
     Ok(())

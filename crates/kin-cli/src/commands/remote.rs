@@ -9,9 +9,7 @@ use std::path::Path;
 use anyhow::Result;
 use kin_core::{KinConfig, KinLayout, RemoteHostKind, RemoteRefConfig, RemoteTransportKind};
 use kin_model::provenance::ApprovalDecision;
-use kin_model::{
-    ChangeStore, ProvenanceStore, SessionCapabilities, SessionLease, SessionTransport,
-};
+use kin_model::{ProvenanceStore, SessionCapabilities, SessionLease, SessionTransport};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use url::Url;
@@ -215,6 +213,7 @@ fn parse_native_remote_locator(locator: &str) -> Option<NativeRemoteTarget> {
     })
 }
 
+#[cfg(test)]
 pub(crate) fn explicit_native_remote_target(locator: &str) -> Option<NativeRemoteTarget> {
     parse_native_remote_locator(locator)
 }
@@ -552,32 +551,31 @@ pub(crate) async fn load_push_plan(requested_remote: Option<&str>) -> Result<Pus
     let snap =
         crate::backend::open_snapshot_explicit_admin_read_only(&layout, "kin remote").await?;
     let graph = &*snap.graph();
-    let branch_name = kin_core::read_current_branch(&layout)?;
+    let authority =
+        crate::commands::repository_authority::ActiveRepositoryAuthority::open(&layout)?;
+    let workspace = authority.workspace()?;
+    let branch_name = match &workspace.head {
+        kin_model::WorkspaceHead::Symbolic { target } => target.to_string(),
+        kin_model::WorkspaceHead::Detached { .. } => "(detached)".to_string(),
+    };
 
-    let (local_head, approved, semantic_state_note) = if let Some(branch) =
-        graph.get_branch(&branch_name)?
+    let (local_head, approved, semantic_state_note) = if let Some(head) =
+        authority.current_change_id()?
     {
-        let approvals = graph.get_approvals_for_change(&branch.head)?;
+        let approvals = graph.get_approvals_for_change(&head)?;
         let approved = approvals
             .iter()
             .any(|approval| approval.decision == ApprovalDecision::Approved);
-        (Some(branch.head.to_string()), approved, None)
+        (Some(head.to_string()), approved, None)
     } else {
-        let available_branches = graph
-            .list_branches()?
-            .into_iter()
-            .map(|branch| branch.name.to_string())
-            .collect::<Vec<_>>();
-        let note = if available_branches.is_empty() {
-            "No semantic branches are stored yet. Record Kin state with `kin commit` or import/sync from Git before publishing.".to_string()
-        } else {
-            format!(
-                "Current branch pointer '{}' is not present in the Kin graph. Available semantic branches: {}. Repair `.kin/HEAD` or switch branches before publishing.",
-                branch_name,
-                available_branches.join(", ")
-            )
-        };
-        (None, false, Some(note))
+        (
+            None,
+            false,
+            Some(
+                "The repository-v6 workspace head is unborn; there is no semantic change to publish."
+                    .to_string(),
+            ),
+        )
     };
 
     let (remote_head, remote_state_note) = if let Some(target) = native_target.as_ref() {
@@ -589,7 +587,7 @@ pub(crate) async fn load_push_plan(requested_remote: Option<&str>) -> Result<Pus
 
     Ok(PushPlanContext {
         remote,
-        branch_name: branch_name.to_string(),
+        branch_name,
         organization_id,
         repo_id,
         local_head,

@@ -2,7 +2,6 @@
 // Copyright 2026 Firelock, LLC
 
 use anyhow::{Context, Result};
-use kin_model::ChangeStore;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,48 +39,12 @@ async fn run_daemon_log(layout: &kin_core::KinLayout, request: &LogRequest) -> R
 }
 
 pub fn build_log_response(
-    layout: &kin_core::KinLayout,
-    graph: &kin_db::InMemoryGraph,
-    request: &LogRequest,
+    _layout: &kin_core::KinLayout,
+    _graph: &kin_db::InMemoryGraph,
+    _request: &LogRequest,
 ) -> Result<LogResponse> {
-    let current = kin_core::read_current_branch(layout)?;
-    let branch = graph
-        .get_branch(&current)?
-        .ok_or_else(|| anyhow::anyhow!("branch '{}' not found", current))?;
-
-    let mut lines = vec![
-        format!("Semantic change log (branch: {}):", branch.name),
-        format!("  Head: {}", branch.head),
-    ];
-
-    // Walk the change DAG from head
-    let mut current_id = Some(branch.head);
-    let mut shown = 0usize;
-
-    while let Some(id) = current_id {
-        if shown >= request.count {
-            break;
-        }
-        if let Some(change) = graph.get_change(&id)? {
-            lines.push(String::new());
-            lines.push(format!("  {} - {}", change.id, change.message));
-            lines.push(format!("    Author: {}", change.author));
-            lines.push(format!("    Time: {}", change.timestamp));
-            lines.push(format!(
-                "    Entities: {} added/modified/removed",
-                change.entity_deltas.len()
-            ));
-            shown += 1;
-            current_id = change.parents.first().copied();
-        } else {
-            break;
-        }
-    }
-
-    if shown == 0 {
-        lines.push(String::new());
-        lines.push("  (no changes found)".to_string());
-    }
-
-    Ok(LogResponse { lines })
+    anyhow::bail!(
+        "log is fail-closed until its daemon executor resolves the active repository-v6 \
+         workspace/ref and immutable change DAG; inspect `kin capabilities --json`"
+    )
 }
