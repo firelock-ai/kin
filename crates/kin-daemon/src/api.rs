@@ -11177,8 +11177,14 @@ mod tests {
 
         let vector_path = kin_cli::backend::vector_index_path(&state.layout);
         let vectors = kin_db::VectorIndex::new(4).unwrap();
+        let descriptor = vectors.descriptor();
         vectors.save(&vector_path).unwrap();
-        state.graph.load_vector_index(&vector_path).unwrap();
+        assert!(matches!(
+            state
+                .graph
+                .load_vector_index_compatible(&vector_path, &descriptor),
+            kin_db::VectorIndexLoad::Loaded(0)
+        ));
         state.graph.queue_missing_for_embedding();
         assert!(state.graph.pending_embeddings() > 0);
 
