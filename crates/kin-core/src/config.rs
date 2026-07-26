@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fmt;
 use std::path::Path;
+#[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+use std::path::PathBuf;
 
 use gix::bstr::ByteSlice;
 
@@ -724,6 +726,12 @@ impl Default for KinConfig {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConfigAuthorityKind {
+    PublishedRepository,
+    InitializationStage,
+}
+
 impl KinConfig {
     /// Apply a worldview preset and synchronize the explicit policy knobs.
     pub fn apply_world_preset(&mut self, preset: WorldPreset) {
@@ -759,11 +767,31 @@ impl KinConfig {
         }
     }
 
-    /// Save config to a TOML file.
+    /// Atomically and durably replace `.kin/config.toml`.
+    ///
+    /// The writer retains the real `.kin` directory, creates and flushes an
+    /// owner-private sibling temp file, and publishes through that capability.
+    /// Existing config is exchanged rather than blindly overwritten so a
+    /// raced name can be detected and restored. Unsupported hosts fail before
+    /// creating a temp file; there is no truncating path-based fallback.
     pub fn save(&self, path: &Path) -> Result<()> {
+        self.validate()?;
         let contents = toml::to_string_pretty(self)?;
-        std::fs::write(path, contents).map_err(|e| KinError::io(path, e))?;
-        Ok(())
+        save_config_atomically(path, contents.as_bytes())
+    }
+
+    /// Save config inside an already validated unpublished repository stage.
+    ///
+    /// This is deliberately crate-private: ordinary callers own only the
+    /// published `.kin/config.toml` namespace.
+    pub(crate) fn save_initialization_stage(&self, staging_root: &Path) -> Result<()> {
+        self.validate()?;
+        let contents = toml::to_string_pretty(self)?;
+        save_config_atomically_scoped(
+            &staging_root.join("config.toml"),
+            contents.as_bytes(),
+            ConfigAuthorityKind::InitializationStage,
+        )
     }
 
     /// Resolve a configured remote by explicit name or default remote.
@@ -773,9 +801,650 @@ impl KinConfig {
     }
 }
 
+#[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ConfigFileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConfigSaveHookPoint {
+    AfterPartialTempWrite,
+    AfterTempSync,
+    BeforePublication,
+    AfterPublication,
+}
+
+#[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+struct ConfigAuthority {
+    directory: cap_std::fs::Dir,
+    directory_identity: ConfigFileIdentity,
+    display_directory: PathBuf,
+    display_config: PathBuf,
+    config_name: std::ffi::OsString,
+    expected_config: Option<ConfigFileIdentity>,
+}
+
+#[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+struct ConfigTemp {
+    file: std::fs::File,
+    name: std::ffi::OsString,
+    identity: ConfigFileIdentity,
+    display_path: PathBuf,
+}
+
+#[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+impl ConfigAuthority {
+    fn open(path: &Path, kind: ConfigAuthorityKind) -> Result<Self> {
+        if !path.is_absolute() {
+            return Err(KinError::Config(format!(
+                "repository config path must be absolute: {}",
+                path.display()
+            )));
+        }
+        let config_name = path.file_name().ok_or_else(|| {
+            KinError::Config(format!(
+                "repository config path has no file name: {}",
+                path.display()
+            ))
+        })?;
+        if config_name != std::ffi::OsStr::new("config.toml") {
+            return Err(KinError::Config(format!(
+                "KinConfig::save only owns .kin/config.toml, not {}",
+                path.display()
+            )));
+        }
+        let directory_path = path.parent().ok_or_else(|| {
+            KinError::Config(format!(
+                "repository config path has no .kin parent: {}",
+                path.display()
+            ))
+        })?;
+        match kind {
+            ConfigAuthorityKind::PublishedRepository
+                if directory_path.file_name() != Some(std::ffi::OsStr::new(".kin")) =>
+            {
+                return Err(KinError::Config(format!(
+                    "repository config must be a direct child of .kin: {}",
+                    path.display()
+                )));
+            }
+            ConfigAuthorityKind::InitializationStage
+                if !is_initialization_stage_directory(directory_path) =>
+            {
+                return Err(KinError::Config(format!(
+                    "staged repository config must be a direct child of a canonical \
+                     .kin.init-<uuid-v4> authority: {}",
+                    path.display()
+                )));
+            }
+            _ => {}
+        }
+
+        let directory = open_config_directory_nofollow(directory_path)?;
+        let directory_identity = config_directory_identity(&directory)
+            .map_err(|error| KinError::io(directory_path, error))?;
+        let expected_config =
+            inspect_config_file(&directory, config_name, path, "repository config")?;
+        let authority = Self {
+            directory,
+            directory_identity,
+            display_directory: directory_path.to_path_buf(),
+            display_config: path.to_path_buf(),
+            config_name: config_name.to_os_string(),
+            expected_config,
+        };
+        authority.revalidate_visible_directory()?;
+        authority.revalidate_expected_config()?;
+        Ok(authority)
+    }
+
+    fn create_temp(&self) -> Result<ConfigTemp> {
+        loop {
+            let name = std::ffi::OsString::from(format!(
+                ".config.toml.kin-tmp-{}",
+                uuid::Uuid::new_v4().simple()
+            ));
+            let display_path = self.display_directory.join(&name);
+            let descriptor = match rustix::fs::openat(
+                &self.directory,
+                &name,
+                rustix::fs::OFlags::WRONLY
+                    | rustix::fs::OFlags::CREATE
+                    | rustix::fs::OFlags::EXCL
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::from_raw_mode(0o600),
+            ) {
+                Ok(descriptor) => descriptor,
+                Err(error) if error == rustix::io::Errno::EXIST => continue,
+                Err(error) => {
+                    return Err(KinError::io(&display_path, std::io::Error::from(error)));
+                }
+            };
+            let file = std::fs::File::from(descriptor);
+            let identity = config_std_file_identity(&file)
+                .map_err(|error| KinError::io(&display_path, error))?;
+            self.require_named_identity(&name, identity, &display_path, "config temp file")?;
+            return Ok(ConfigTemp {
+                file,
+                name,
+                identity,
+                display_path,
+            });
+        }
+    }
+
+    fn revalidate_visible_directory(&self) -> Result<()> {
+        let visible = open_config_directory_nofollow(&self.display_directory)?;
+        let visible_identity = config_directory_identity(&visible)
+            .map_err(|error| KinError::io(&self.display_directory, error))?;
+        let retained_identity = config_directory_identity(&self.directory)
+            .map_err(|error| KinError::io(&self.display_directory, error))?;
+        if visible_identity != self.directory_identity
+            || retained_identity != self.directory_identity
+        {
+            return Err(KinError::Config(format!(
+                "retained .kin authority changed or was replaced while saving {}",
+                self.display_config.display()
+            )));
+        }
+        Ok(())
+    }
+
+    fn revalidate_expected_config(&self) -> Result<()> {
+        let actual = inspect_config_file(
+            &self.directory,
+            &self.config_name,
+            &self.display_config,
+            "repository config",
+        )?;
+        if actual != self.expected_config {
+            return Err(KinError::Config(format!(
+                "repository config changed identity while saving {}",
+                self.display_config.display()
+            )));
+        }
+        Ok(())
+    }
+
+    fn require_named_identity(
+        &self,
+        name: &std::ffi::OsStr,
+        expected: ConfigFileIdentity,
+        display: &Path,
+        label: &str,
+    ) -> Result<()> {
+        let actual = inspect_config_file(&self.directory, name, display, label)?;
+        if actual != Some(expected) {
+            return Err(KinError::Config(format!(
+                "{label} changed identity while saving {}",
+                self.display_config.display()
+            )));
+        }
+        Ok(())
+    }
+
+    fn require_named_absent(
+        &self,
+        name: &std::ffi::OsStr,
+        display: &Path,
+        label: &str,
+    ) -> Result<()> {
+        match self.directory.symlink_metadata(name) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(KinError::io(display, error)),
+            Ok(_) => Err(KinError::Config(format!(
+                "{label} unexpectedly exists while saving {}",
+                self.display_config.display()
+            ))),
+        }
+    }
+
+    fn sync(&self) -> Result<()> {
+        rustix::fs::fsync(&self.directory)
+            .map_err(|error| KinError::io(&self.display_directory, std::io::Error::from(error)))
+    }
+
+    fn cleanup_exact_temp(&self, temp: &ConfigTemp) -> Result<()> {
+        match inspect_config_file(
+            &self.directory,
+            &temp.name,
+            &temp.display_path,
+            "config temp file",
+        )? {
+            None => return Ok(()),
+            Some(actual) if actual == temp.identity => {}
+            Some(_) => {
+                return Err(KinError::Config(format!(
+                    "refusing to remove a replacement at config temp name {}",
+                    temp.display_path.display()
+                )));
+            }
+        }
+        rustix::fs::unlinkat(&self.directory, &temp.name, rustix::fs::AtFlags::empty())
+            .map_err(|error| KinError::io(&temp.display_path, std::io::Error::from(error)))?;
+        self.sync()
+    }
+
+    fn rollback_exchange(&self, temp: &ConfigTemp) -> Result<()> {
+        self.require_named_identity(
+            &self.config_name,
+            temp.identity,
+            &self.display_config,
+            "published repository config",
+        )?;
+        self.directory
+            .symlink_metadata(&temp.name)
+            .map_err(|error| KinError::io(&temp.display_path, error))?;
+        rustix::fs::renameat_with(
+            &self.directory,
+            &self.config_name,
+            &self.directory,
+            &temp.name,
+            rustix::fs::RenameFlags::EXCHANGE,
+        )
+        .map_err(|error| KinError::io(&self.display_config, std::io::Error::from(error)))?;
+        self.sync()?;
+        self.require_named_identity(
+            &temp.name,
+            temp.identity,
+            &temp.display_path,
+            "rolled-back config temp file",
+        )
+    }
+
+    fn rollback_new_publication(&self, temp: &ConfigTemp) -> Result<()> {
+        self.require_named_identity(
+            &self.config_name,
+            temp.identity,
+            &self.display_config,
+            "published repository config",
+        )?;
+        self.require_named_absent(&temp.name, &temp.display_path, "config temp file")?;
+        rustix::fs::renameat_with(
+            &self.directory,
+            &self.config_name,
+            &self.directory,
+            &temp.name,
+            rustix::fs::RenameFlags::NOREPLACE,
+        )
+        .map_err(|error| KinError::io(&self.display_config, std::io::Error::from(error)))?;
+        self.sync()?;
+        self.require_named_absent(&self.config_name, &self.display_config, "repository config")?;
+        self.require_named_identity(
+            &temp.name,
+            temp.identity,
+            &temp.display_path,
+            "rolled-back config temp file",
+        )
+    }
+}
+
+#[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+fn save_config_atomically(path: &Path, contents: &[u8]) -> Result<()> {
+    save_config_atomically_scoped(path, contents, ConfigAuthorityKind::PublishedRepository)
+}
+
+#[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
+fn save_config_atomically(path: &Path, _contents: &[u8]) -> Result<()> {
+    Err(KinError::Config(format!(
+        "capability-owned atomic repository config replacement is unsupported on this platform: {}",
+        path.display()
+    )))
+}
+
+#[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+fn is_initialization_stage_directory(path: &Path) -> bool {
+    let Some(raw) = path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .and_then(|name| name.strip_prefix(".kin.init-"))
+    else {
+        return false;
+    };
+    let Ok(id) = uuid::Uuid::parse_str(raw) else {
+        return false;
+    };
+    id.get_version_num() == 4 && id.to_string() == raw
+}
+
+#[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+fn save_config_atomically_scoped(
+    path: &Path,
+    contents: &[u8],
+    kind: ConfigAuthorityKind,
+) -> Result<()> {
+    save_config_atomically_scoped_with_hook(path, contents, kind, |_| Ok(()))
+}
+
+#[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
+fn save_config_atomically_scoped(
+    path: &Path,
+    _contents: &[u8],
+    _kind: ConfigAuthorityKind,
+) -> Result<()> {
+    Err(KinError::Config(format!(
+        "capability-owned atomic repository config replacement is unsupported on this platform: {}",
+        path.display()
+    )))
+}
+
+#[cfg(all(
+    test,
+    any(target_vendor = "apple", target_os = "linux", target_os = "android")
+))]
+fn save_config_atomically_with_hook(
+    path: &Path,
+    contents: &[u8],
+    hook: impl FnMut(ConfigSaveHookPoint) -> Result<()>,
+) -> Result<()> {
+    save_config_atomically_scoped_with_hook(
+        path,
+        contents,
+        ConfigAuthorityKind::PublishedRepository,
+        hook,
+    )
+}
+
+#[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+fn save_config_atomically_scoped_with_hook(
+    path: &Path,
+    contents: &[u8],
+    kind: ConfigAuthorityKind,
+    mut hook: impl FnMut(ConfigSaveHookPoint) -> Result<()>,
+) -> Result<()> {
+    use std::io::Write as _;
+
+    let authority = ConfigAuthority::open(path, kind)?;
+    let mut temp = authority.create_temp()?;
+    let result = (|| {
+        let split = contents.len() / 2;
+        temp.file
+            .write_all(&contents[..split])
+            .map_err(|error| KinError::io(&temp.display_path, error))?;
+        hook(ConfigSaveHookPoint::AfterPartialTempWrite)?;
+        temp.file
+            .write_all(&contents[split..])
+            .map_err(|error| KinError::io(&temp.display_path, error))?;
+        temp.file
+            .sync_all()
+            .map_err(|error| KinError::io(&temp.display_path, error))?;
+        authority.require_named_identity(
+            &temp.name,
+            temp.identity,
+            &temp.display_path,
+            "config temp file",
+        )?;
+        hook(ConfigSaveHookPoint::AfterTempSync)?;
+        authority.revalidate_visible_directory()?;
+        authority.revalidate_expected_config()?;
+        authority.require_named_identity(
+            &temp.name,
+            temp.identity,
+            &temp.display_path,
+            "config temp file",
+        )?;
+        hook(ConfigSaveHookPoint::BeforePublication)?;
+
+        if let Some(expected) = authority.expected_config {
+            rustix::fs::renameat_with(
+                &authority.directory,
+                &temp.name,
+                &authority.directory,
+                &authority.config_name,
+                rustix::fs::RenameFlags::EXCHANGE,
+            )
+            .map_err(|error| KinError::io(path, std::io::Error::from(error)))?;
+
+            let post_publication = authority
+                .sync()
+                .and_then(|()| hook(ConfigSaveHookPoint::AfterPublication))
+                .and_then(|()| {
+                    authority.require_named_identity(
+                        &authority.config_name,
+                        temp.identity,
+                        &authority.display_config,
+                        "published repository config",
+                    )
+                })
+                .and_then(|()| {
+                    authority.require_named_identity(
+                        &temp.name,
+                        expected,
+                        &temp.display_path,
+                        "replaced repository config",
+                    )
+                })
+                .and_then(|()| authority.revalidate_visible_directory());
+            if let Err(error) = post_publication {
+                let rollback = authority.rollback_exchange(&temp);
+                return Err(config_save_rollback_error(error, rollback));
+            }
+
+            authority
+                .cleanup_named_identity(
+                    &temp.name,
+                    expected,
+                    &temp.display_path,
+                    "replaced repository config",
+                )
+                .map_err(|error| {
+                    KinError::Other(format!(
+                        "repository config was atomically published at {}, but durable cleanup of \
+                         the replaced config failed: {error}",
+                        path.display()
+                    ))
+                })?;
+        } else {
+            rustix::fs::renameat_with(
+                &authority.directory,
+                &temp.name,
+                &authority.directory,
+                &authority.config_name,
+                rustix::fs::RenameFlags::NOREPLACE,
+            )
+            .map_err(|error| {
+                if error == rustix::io::Errno::EXIST {
+                    KinError::Config(format!(
+                        "repository config appeared while saving {}; refusing to replace it",
+                        path.display()
+                    ))
+                } else {
+                    KinError::io(path, std::io::Error::from(error))
+                }
+            })?;
+
+            let post_publication = authority
+                .sync()
+                .and_then(|()| hook(ConfigSaveHookPoint::AfterPublication))
+                .and_then(|()| {
+                    authority.require_named_identity(
+                        &authority.config_name,
+                        temp.identity,
+                        &authority.display_config,
+                        "published repository config",
+                    )
+                })
+                .and_then(|()| {
+                    authority.require_named_absent(
+                        &temp.name,
+                        &temp.display_path,
+                        "config temp file",
+                    )
+                })
+                .and_then(|()| authority.revalidate_visible_directory());
+            if let Err(error) = post_publication {
+                let rollback = authority.rollback_new_publication(&temp);
+                return Err(config_save_rollback_error(error, rollback));
+            }
+        }
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let cleanup = authority.cleanup_exact_temp(&temp);
+        if let Err(cleanup) = cleanup {
+            return Err(KinError::Other(format!(
+                "{}; exact config temp cleanup also failed: {cleanup}",
+                result.expect_err("checked error")
+            )));
+        }
+    }
+    drop(temp.file);
+    result
+}
+
+#[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+impl ConfigAuthority {
+    fn cleanup_named_identity(
+        &self,
+        name: &std::ffi::OsStr,
+        expected: ConfigFileIdentity,
+        display: &Path,
+        label: &str,
+    ) -> Result<()> {
+        self.require_named_identity(name, expected, display, label)?;
+        rustix::fs::unlinkat(&self.directory, name, rustix::fs::AtFlags::empty())
+            .map_err(|error| KinError::io(display, std::io::Error::from(error)))?;
+        self.sync()?;
+        self.require_named_absent(name, display, label)
+    }
+}
+
+#[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+fn config_save_rollback_error(error: KinError, rollback: Result<()>) -> KinError {
+    match rollback {
+        Ok(()) => error,
+        Err(rollback) => KinError::Other(format!(
+            "{error}; capability-owned config rollback also failed: {rollback}"
+        )),
+    }
+}
+
+#[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+fn open_config_directory_nofollow(path: &Path) -> Result<cap_std::fs::Dir> {
+    rustix::fs::open(
+        path,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .map(|descriptor| cap_std::fs::Dir::from_std_file(descriptor.into()))
+    .map_err(|error| KinError::io(path, std::io::Error::from(error)))
+}
+
+#[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+fn config_directory_identity(directory: &cap_std::fs::Dir) -> std::io::Result<ConfigFileIdentity> {
+    use cap_std::fs::MetadataExt as _;
+
+    directory.dir_metadata().map(|metadata| ConfigFileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+fn config_std_file_identity(file: &std::fs::File) -> std::io::Result<ConfigFileIdentity> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::other(
+            "repository config object is not a regular file",
+        ));
+    }
+    Ok(ConfigFileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+fn inspect_config_file(
+    directory: &cap_std::fs::Dir,
+    name: &std::ffi::OsStr,
+    display: &Path,
+    label: &str,
+) -> Result<Option<ConfigFileIdentity>> {
+    let descriptor = match rustix::fs::openat(
+        directory,
+        name,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC
+            | rustix::fs::OFlags::NONBLOCK,
+        rustix::fs::Mode::empty(),
+    ) {
+        Ok(descriptor) => descriptor,
+        Err(error) if error == rustix::io::Errno::NOENT => return Ok(None),
+        Err(error) => return Err(KinError::io(display, std::io::Error::from(error))),
+    };
+    let file = std::fs::File::from(descriptor);
+    let identity = config_std_file_identity(&file).map_err(|error| KinError::io(display, error))?;
+    let named = directory
+        .symlink_metadata(name)
+        .map_err(|error| KinError::io(display, error))?;
+    if named.file_type().is_symlink() || !named.is_file() {
+        return Err(KinError::Config(format!(
+            "{label} at {} is not a regular no-follow file",
+            display.display()
+        )));
+    }
+    use cap_std::fs::MetadataExt as _;
+    let named_identity = ConfigFileIdentity {
+        device: named.dev(),
+        inode: named.ino(),
+    };
+    if named_identity != identity {
+        return Err(KinError::Config(format!(
+            "{label} changed identity while opening {}",
+            display.display()
+        )));
+    }
+    Ok(Some(identity))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn repository_config_path(directory: &tempfile::TempDir) -> std::path::PathBuf {
+        let kin = directory.path().join(".kin");
+        std::fs::create_dir(&kin).unwrap();
+        kin.join("config.toml")
+    }
+
+    #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+    fn config_temp_entries(path: &Path) -> Vec<std::path::PathBuf> {
+        let parent = path.parent().unwrap();
+        std::fs::read_dir(parent)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with(".config.toml.kin-tmp-"))
+            })
+            .collect()
+    }
+
+    #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+    fn named_config(name: &str) -> KinConfig {
+        KinConfig {
+            name: Some(name.to_string()),
+            ..KinConfig::default()
+        }
+    }
+
+    #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+    fn serialized_config(config: &KinConfig) -> Vec<u8> {
+        toml::to_string_pretty(config).unwrap().into_bytes()
+    }
 
     #[test]
     fn default_config_round_trips() {
@@ -798,7 +1467,7 @@ mod tests {
     #[test]
     fn save_and_load() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
+        let path = repository_config_path(&dir);
 
         let config = KinConfig {
             name: Some("test-repo".to_string()),
@@ -809,6 +1478,152 @@ mod tests {
         let loaded = KinConfig::load(&path).unwrap();
         assert_eq!(loaded.name, Some("test-repo".to_string()));
         assert_eq!(loaded.default_branch, "main");
+    }
+
+    #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+    #[test]
+    fn save_rejects_a_non_authority_path_without_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let error = KinConfig::default()
+            .save(&path)
+            .expect_err("config save must be scoped to a retained .kin authority");
+        assert!(
+            error.to_string().contains("direct child of .kin"),
+            "unexpected path rejection: {error}"
+        );
+        assert!(!path.exists());
+    }
+
+    #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+    #[test]
+    fn atomic_save_failure_after_temp_sync_preserves_the_complete_previous_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = repository_config_path(&dir);
+        let original = named_config("original");
+        original.save(&path).unwrap();
+        let original_bytes = std::fs::read(&path).unwrap();
+        let replacement = serialized_config(&named_config("replacement"));
+
+        let error = save_config_atomically_with_hook(&path, &replacement, |point| {
+            if point == ConfigSaveHookPoint::AfterTempSync {
+                return Err(KinError::Other(
+                    "injected failure after durable temp write".to_string(),
+                ));
+            }
+            Ok(())
+        })
+        .expect_err("a prepublication failure must not replace config");
+
+        assert!(error.to_string().contains("injected failure"));
+        assert_eq!(std::fs::read(&path).unwrap(), original_bytes);
+        assert!(config_temp_entries(&path).is_empty());
+    }
+
+    #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+    #[test]
+    fn atomic_save_discards_a_torn_temp_without_exposing_partial_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = repository_config_path(&dir);
+        let original = named_config("original");
+        original.save(&path).unwrap();
+        let original_bytes = std::fs::read(&path).unwrap();
+        let replacement = serialized_config(&named_config("replacement-with-more-bytes"));
+
+        let error = save_config_atomically_with_hook(&path, &replacement, |point| {
+            if point == ConfigSaveHookPoint::AfterPartialTempWrite {
+                return Err(KinError::Other(
+                    "injected failure after partial config temp write".to_string(),
+                ));
+            }
+            Ok(())
+        })
+        .expect_err("a torn temp must never become the named repository config");
+
+        assert!(error.to_string().contains("partial config temp"));
+        assert_eq!(std::fs::read(&path).unwrap(), original_bytes);
+        assert!(config_temp_entries(&path).is_empty());
+        KinConfig::load(&path).expect("the named config must remain complete and parseable");
+    }
+
+    #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+    #[test]
+    fn atomic_save_restores_a_raced_config_name_instead_of_overwriting_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = repository_config_path(&dir);
+        let displaced = path.with_file_name("config.displaced");
+        let original = named_config("original");
+        original.save(&path).unwrap();
+        let original_bytes = std::fs::read(&path).unwrap();
+        let replacement_bytes = b"name = \"raced-name\"\n".to_vec();
+        let intended = serialized_config(&named_config("intended"));
+
+        let error = save_config_atomically_with_hook(&path, &intended, |point| {
+            if point == ConfigSaveHookPoint::BeforePublication {
+                std::fs::rename(&path, &displaced).unwrap();
+                std::fs::write(&path, &replacement_bytes).unwrap();
+            }
+            Ok(())
+        })
+        .expect_err("a raced config name must fail closed");
+
+        assert!(error.to_string().contains("changed identity"));
+        assert_eq!(std::fs::read(&path).unwrap(), replacement_bytes);
+        assert_eq!(std::fs::read(&displaced).unwrap(), original_bytes);
+        assert!(config_temp_entries(&path).is_empty());
+    }
+
+    #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+    #[test]
+    fn atomic_save_rolls_back_inside_the_retained_parent_when_dot_kin_is_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = repository_config_path(&dir);
+        let kin = path.parent().unwrap().to_path_buf();
+        let displaced_kin = dir.path().join(".kin.displaced");
+        let original = named_config("original");
+        original.save(&path).unwrap();
+        let original_bytes = std::fs::read(&path).unwrap();
+        let intended = serialized_config(&named_config("intended"));
+        let replacement_bytes = b"name = \"replacement-parent\"\n".to_vec();
+
+        let error = save_config_atomically_with_hook(&path, &intended, |point| {
+            if point == ConfigSaveHookPoint::AfterPublication {
+                std::fs::rename(&kin, &displaced_kin).unwrap();
+                std::fs::create_dir(&kin).unwrap();
+                std::fs::write(kin.join("config.toml"), &replacement_bytes).unwrap();
+            }
+            Ok(())
+        })
+        .expect_err("a replaced .kin parent must fail closed");
+
+        assert!(error.to_string().contains("replaced"));
+        assert_eq!(std::fs::read(&path).unwrap(), replacement_bytes);
+        assert_eq!(
+            std::fs::read(displaced_kin.join("config.toml")).unwrap(),
+            original_bytes
+        );
+        assert!(config_temp_entries(&displaced_kin.join("config.toml")).is_empty());
+    }
+
+    #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+    #[test]
+    fn first_save_refuses_a_raced_destination_without_overwriting_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = repository_config_path(&dir);
+        let raced_bytes = b"name = \"raced-first-config\"\n".to_vec();
+        let intended = serialized_config(&named_config("intended"));
+
+        let error = save_config_atomically_with_hook(&path, &intended, |point| {
+            if point == ConfigSaveHookPoint::BeforePublication {
+                std::fs::write(&path, &raced_bytes).unwrap();
+            }
+            Ok(())
+        })
+        .expect_err("a raced first config must fail no-replace");
+
+        assert!(error.to_string().contains("appeared while saving"));
+        assert_eq!(std::fs::read(&path).unwrap(), raced_bytes);
+        assert!(config_temp_entries(&path).is_empty());
     }
 
     #[test]
@@ -1021,7 +1836,7 @@ args = ["--verbose"]
         // valid TOML if `providers` is the last field of the section — this
         // exercises that ordering end to end.
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
+        let path = repository_config_path(&dir);
         let mut config = KinConfig::default();
         config.lsp.proof_mode = LspProofMode::Citable;
         config.lsp.required = vec!["rust".to_string()];

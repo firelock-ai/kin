@@ -439,7 +439,7 @@ pub fn prepare_repository_layout_at(
         crate::tree::initialize_projection_control_directory(layout.root())?;
         std::fs::write(layout.version_path(), KIN_LAYOUT_VERSION.to_string())
             .map_err(|error| KinError::io(layout.version_path(), error))?;
-        config.save(&layout.config_path())?;
+        config.save_initialization_stage(layout.root())?;
         manifest.save(&layout.manifest_path())?;
         let metadata_seal = capture_metadata_seal(&layout)?;
 
