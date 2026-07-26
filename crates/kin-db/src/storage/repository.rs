@@ -4890,6 +4890,10 @@ mod tests {
 
         let lease = manager.read_authority();
         assert_eq!(lease.generation(), 0);
+        assert!(
+            lease.authenticated_gitlinks().is_empty(),
+            "an unpersisted Git transaction must not contaminate the derived authority index"
+        );
         assert!(lease.metadata().git_external_authority.is_none());
         assert!(lease.metadata().external_objects.is_empty());
         assert!(lease.metadata().aliases.is_empty());
