@@ -221,7 +221,7 @@ pub fn rehydrate_lossless_git_repository(
     })
 }
 
-fn open_repo(path: &Path) -> Result<gix::Repository> {
+pub(crate) fn open_repo(path: &Path) -> Result<gix::Repository> {
     let dot_git = path.join(".git");
     let open_path = if dot_git.is_dir() { &dot_git } else { path };
     // Exact migration must see the repository's physical object database and
@@ -236,7 +236,7 @@ fn open_repo(path: &Path) -> Result<gix::Repository> {
         .map_err(|error| GitError::Git(format!("open {}: {error}", path.display())))
 }
 
-fn reject_shallow_repository(repo: &gix::Repository) -> Result<()> {
+pub(crate) fn reject_shallow_repository(repo: &gix::Repository) -> Result<()> {
     let shallow = repo
         .shallow_commits()
         .map_err(|error| GitError::Git(format!("read shallow boundary: {error}")))?;
