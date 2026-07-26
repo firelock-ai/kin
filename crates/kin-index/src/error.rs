@@ -25,6 +25,9 @@ pub enum IndexError {
 
     #[error("watcher error: {0}")]
     Watcher(String),
+
+    #[error(transparent)]
+    IncompleteRepositoryScan(#[from] crate::repository::IncompleteRepositoryScan),
 }
 
 impl IndexError {

@@ -9,10 +9,10 @@ use kin_model::EntityStore;
 use kin_model::VerificationStore;
 use kin_model::{
     ArtifactId, AuthorId, Entity, EntityDelta, EntityFilter, EntityId, FileLayout, FilePathId,
-    GraphNodeId, Hash256, OpaqueArtifact, ParseCompleteness, Relation, RelationDelta, RelationId,
-    RelationKind, RelationOrigin, SemanticChange, SemanticChangeId, ShallowTrackedFile,
-    SourceRegion, StructuredArtifact, TestCase, TestId, TestKind, TestRunner, Timestamp, TreeDelta,
-    TreeEntry, TreeEntryKind, WorkScope,
+    GraphNodeId, Hash256, LocatedEntry, OpaqueArtifact, ParseCompleteness, Relation, RelationDelta,
+    RelationId, RelationKind, RelationOrigin, RepoPath, ResolvedTree, SemanticChange,
+    SemanticChangeId, ShallowTrackedFile, SourceRegion, StructuredArtifact, TestCase, TestId,
+    TestKind, TestRunner, Timestamp, TreeDelta, TreeEntry, TreeEntryKind, WorkScope,
 };
 use kin_projection::build_layout;
 use rayon::prelude::*;
@@ -103,116 +103,6 @@ fn init_max_discovered_files() -> usize {
         .unwrap_or(INIT_MAX_DISCOVERED_FILES)
 }
 
-/// Repo-scoped ignore rules loaded from a `.kinignore` file at the repo root.
-///
-/// Each non-empty, non-`#` line is a pattern. A pattern without a `/` matches a
-/// path component (basename) at any nesting level; a pattern containing a `/`
-/// matches a repo-relative path or subtree prefix. No glob expansion — patterns
-/// are matched literally so behavior is predictable.
-#[derive(Debug, Default)]
-struct KinIgnore {
-    names: HashSet<String>,
-    prefixes: Vec<String>,
-}
-
-impl KinIgnore {
-    fn load(root: &Path) -> Self {
-        let mut ignore = KinIgnore::default();
-        let Ok(content) = fs::read_to_string(root.join(".kinignore")) else {
-            return ignore;
-        };
-        for raw in content.lines() {
-            let line = raw.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            let pattern = line.trim_end_matches('/');
-            let pattern = pattern.strip_prefix("./").unwrap_or(pattern);
-            if pattern.is_empty() {
-                continue;
-            }
-            if pattern.contains('/') {
-                ignore.prefixes.push(pattern.to_string());
-            } else {
-                ignore.names.insert(pattern.to_string());
-            }
-        }
-        ignore
-    }
-
-    fn matches(&self, rel: &Path, name: &str) -> bool {
-        if self.names.contains(name) {
-            return true;
-        }
-        if self.prefixes.is_empty() {
-            return false;
-        }
-        let rel_str = rel.to_string_lossy();
-        self.prefixes
-            .iter()
-            .any(|prefix| rel_str == prefix.as_str() || rel_str.starts_with(&format!("{prefix}/")))
-    }
-}
-
-/// True when a directory or file entry must never enter the init snapshot.
-///
-/// Matched by component name at every nesting level so nested sub-repos
-/// (`.git`), nested or renamed Kin graph dirs (`.kin*`), and nested vendored
-/// trees (`node_modules`, `target`, …) are all pruned — not just the ones at the
-/// repo root.
-fn snapshot_entry_ignored(name: &str, rel: &Path, ignore: &KinIgnore) -> bool {
-    if kin_index::should_skip_dir(name) || name.starts_with(".kin") {
-        return true;
-    }
-    ignore.matches(rel, name)
-}
-
-/// Count indexable files under `root`, applying the same pruning as the snapshot
-/// walk. Stops early once `cap` is exceeded so a huge tree is never fully walked.
-fn count_discoverable_files(
-    root: &Path,
-    dir: &Path,
-    ignore: &KinIgnore,
-    count: &mut usize,
-    cap: usize,
-) -> bool {
-    let entries = match fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(_) => return false,
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-        let Ok(rel) = path.strip_prefix(root) else {
-            continue;
-        };
-        if snapshot_entry_ignored(&name_str, rel, ignore) {
-            continue;
-        }
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-        if file_type.is_dir() {
-            if count_discoverable_files(root, &path, ignore, count, cap) {
-                return true;
-            }
-        } else if file_type.is_file() {
-            *count += 1;
-            if *count > cap {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-/// True when the prune-aware file count under `root` exceeds `cap`.
-fn discovery_exceeds_cap(root: &Path, ignore: &KinIgnore, cap: usize) -> bool {
-    let mut count = 0usize;
-    count_discoverable_files(root, root, ignore, &mut count, cap)
-}
-
 const INIT_WARM_CACHE_SCHEMA_VERSION: &str = "v1";
 pub(crate) const INIT_WARM_CACHE_PIPELINE_EPOCH: &str =
     "init-warm-2026-06-15-stable-delta-entity-ids";
@@ -252,9 +142,9 @@ struct IndexableFile {
 #[derive(Debug, Clone)]
 struct ExactInitSourceEntry {
     abs_path: PathBuf,
-    rel_path: String,
+    repo_path: RepoPath,
     hash: [u8; 32],
-    kind: TreeEntryKind,
+    entry: TreeEntry,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize)]
@@ -299,8 +189,11 @@ struct WarmCacheDeltaResult {
 /// Take an independent snapshot of the working tree before `kin init` mutates
 /// it. Regular files are copied rather than hardlinked; symbolic links are
 /// recreated with their exact target bytes.
-/// Take snapshot BEFORE kin init creates .kin/.
-/// We snapshot to a temp dir, then move it into .kin/snapshot/ after init succeeds.
+/// Take snapshot BEFORE kin init creates `.kin/`.
+///
+/// The staging directory is unique and lives beside the repository whenever
+/// possible. No fixed in-repository name is reserved or deleted: a user path
+/// such as `.kin-snapshot-tmp` is ordinary repository truth.
 ///
 /// Returns `(snapshot_path, manifest_json)`.  The manifest is NOT written to
 /// disk here — the caller must write it *after* `collect_source_files` has
@@ -311,14 +204,32 @@ fn snapshot_repo(dir: &Path, force: bool) -> Result<(PathBuf, serde_json::Value)
         root = %dir.display()
     )
     .entered();
-    let tmp_snapshot = dir.join(".kin-snapshot-tmp");
-    if tmp_snapshot.exists() {
-        fs::remove_dir_all(&tmp_snapshot)?;
-    }
-
-    let ignore = KinIgnore::load(dir);
+    let (tracked_paths, graph_only_paths) = if let Some(layout) = kin_core::KinLayout::discover(dir)
+    {
+        let snapshot = crate::backend::open_kindb_snapshot_read_only(&layout)
+            .context("open existing graph truth before warm init snapshot")?;
+        let tree = snapshot.graph().resolved_tree();
+        (
+            tree.artifacts_by_path()
+                .map(|artifact| artifact.path.clone())
+                .collect::<Vec<_>>(),
+            tree.artifacts_by_path()
+                .filter(|artifact| matches!(artifact.entry, TreeEntry::Gitlink { .. }))
+                .map(|artifact| artifact.path.clone())
+                .collect::<Vec<_>>(),
+        )
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    let ignore = kin_index::RepositoryIgnore::load(dir)?;
+    let scan = kin_index::scan_repository_preserving_graph_only(
+        dir,
+        &ignore,
+        tracked_paths.iter(),
+        graph_only_paths.iter(),
+    )?;
     let cap = init_max_discovered_files();
-    if discovery_exceeds_cap(dir, &ignore, cap) {
+    if scan.len() > cap {
         if !force {
             anyhow::bail!(
                 "kin init discovered more than {cap} indexable files under {} — refusing to \
@@ -335,23 +246,28 @@ fn snapshot_repo(dir: &Path, force: bool) -> Result<(PathBuf, serde_json::Value)
         );
     }
 
-    fs::create_dir_all(&tmp_snapshot)?;
+    let staging_parent = dir
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(dir);
+    let tmp_snapshot = tempfile::Builder::new()
+        .prefix(".kin-init-snapshot-")
+        .tempdir_in(staging_parent)
+        .with_context(|| {
+            format!(
+                "create exact init snapshot staging directory beside {}",
+                dir.display()
+            )
+        })?
+        .keep();
     let snapshot_dir = &tmp_snapshot;
 
-    let mut file_count: u64 = 0;
-    let mut total_bytes: u64 = 0;
-
-    if let Err(err) = walk_and_snapshot(
-        dir,
-        dir,
-        snapshot_dir,
-        &ignore,
-        &mut file_count,
-        &mut total_bytes,
-    ) {
+    if let Err(err) = snapshot_complete_scan(dir, snapshot_dir, &scan) {
         let _ = fs::remove_dir_all(&tmp_snapshot);
         return Err(err);
     }
+    let file_count = scan.len() as u64;
+    let total_bytes = scan.diagnostics().content_bytes_read;
 
     // Try to capture git HEAD for the manifest.
     let git_head = read_git_head(dir);
@@ -375,62 +291,71 @@ fn write_snapshot_manifest(snapshot_dir: &Path, manifest: &serde_json::Value) ->
     Ok(())
 }
 
-fn walk_and_snapshot(
+fn snapshot_complete_scan(
     root: &Path,
-    current: &Path,
     snapshot_dir: &Path,
-    ignore: &KinIgnore,
-    file_count: &mut u64,
-    total_bytes: &mut u64,
+    scan: &kin_index::CompleteRepositoryScan,
 ) -> Result<()> {
-    let entries = fs::read_dir(current)
-        .with_context(|| format!("read source directory {}", current.display()))?;
-
-    for entry in entries {
-        let entry = entry?;
-        let path = entry.path();
-        let rel = path.strip_prefix(root)?;
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-
-        if snapshot_entry_ignored(&name_str, rel, ignore) {
-            continue;
-        }
-
-        let ft = entry.file_type()?;
-        if ft.is_dir() {
-            walk_and_snapshot(root, &path, snapshot_dir, ignore, file_count, total_bytes)?;
-        } else if ft.is_file() {
-            let dest = snapshot_dir.join(rel);
-            if let Some(parent) = dest.parent() {
-                fs::create_dir_all(parent)?;
-            }
-
-            // Always copy — hardlinks share inodes so later writes
-            // to the original would corrupt the snapshot.
-            fs::copy(&path, &dest)?;
-
-            *total_bytes += entry.metadata()?.len();
-            *file_count += 1;
-        } else if ft.is_symlink() {
-            #[cfg(not(unix))]
-            anyhow::bail!(
-                "kin init cannot preserve symbolic link {} on this platform",
-                rel.display()
-            );
-            #[cfg(unix)]
-            {
-                let dest = snapshot_dir.join(rel);
+    for entry in scan.entries() {
+        let rel = entry.host_path.strip_prefix(root).with_context(|| {
+            format!(
+                "scanned path {} escaped repository root {}",
+                entry.host_path.display(),
+                root.display()
+            )
+        })?;
+        let dest = snapshot_dir.join(rel);
+        let verified_bytes = kin_index::read_verified_scanned_entry(entry).with_context(|| {
+            format!(
+                "re-read exact repository entry while snapshotting {}",
+                entry.repo_path
+            )
+        })?;
+        match entry.kind {
+            kin_index::ScannedEntryKind::Regular { executable } => {
                 if let Some(parent) = dest.parent() {
                     fs::create_dir_all(parent)?;
                 }
-                let target = fs::read_link(&path)?;
-                std::os::unix::fs::symlink(&target, &dest)?;
-                *total_bytes += target.as_os_str().len() as u64;
-                *file_count += 1;
+                fs::write(&dest, &verified_bytes)
+                    .with_context(|| format!("snapshot repository file {}", entry.repo_path))?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(
+                        &dest,
+                        fs::Permissions::from_mode(if executable { 0o755 } else { 0o644 }),
+                    )?;
+                }
+            }
+            kin_index::ScannedEntryKind::Symlink => {
+                #[cfg(not(unix))]
+                anyhow::bail!(
+                    "kin init cannot preserve symbolic link {} on this platform",
+                    rel.display()
+                );
+                #[cfg(unix)]
+                {
+                    let dest = snapshot_dir.join(rel);
+                    if let Some(parent) = dest.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    use std::os::unix::ffi::OsStringExt;
+                    let target = PathBuf::from(std::ffi::OsString::from_vec(verified_bytes));
+                    std::os::unix::fs::symlink(&target, &dest)?;
+                }
             }
         }
-        // Skip other special types.
+
+        let (snapshot_bytes, snapshot_kind) = read_exact_init_source(&dest)?;
+        let snapshot_hash = kin_blobs::digest_bytes(&snapshot_bytes);
+        let snapshot_entry = exact_tree_entry(snapshot_hash, snapshot_kind);
+        let expected_entry = exact_tree_entry(entry.content_hash, entry.kind);
+        if snapshot_hash != entry.content_hash || snapshot_entry != expected_entry {
+            anyhow::bail!(
+                "repository entry changed while taking the init snapshot: {}",
+                entry.repo_path
+            );
+        }
     }
 
     Ok(())
@@ -688,15 +613,16 @@ pub async fn run(
         let blob_hash = kin_blobs::Hash256::from_bytes(entry.hash);
         if !blob_store.exists(&blob_hash).unwrap_or(false) {
             let (content, observed_kind) = read_exact_init_source(&entry.abs_path)?;
-            if observed_kind != entry.kind || kin_blobs::digest_bytes(&content) != entry.hash {
+            let observed_entry = exact_tree_entry(entry.hash, observed_kind);
+            if observed_entry != entry.entry || kin_blobs::digest_bytes(&content) != entry.hash {
                 anyhow::bail!(
                     "frozen init source changed while building graph authority: {}",
-                    entry.rel_path
+                    entry.repo_path
                 );
             }
             blob_store
                 .write(&content)
-                .with_context(|| format!("store exact init source {}", entry.rel_path))?;
+                .with_context(|| format!("store exact init source {}", entry.repo_path))?;
         }
     }
     phase!("persist_exact_source_entries");
@@ -710,17 +636,9 @@ pub async fn run(
         if is_warm {
             // NATIVE WARM CACHE: Run the diff directly against the existing graph!
             let graph = snap.graph();
-            let current_files: Vec<(String, TreeEntry)> = exact_source_entries
+            let current_files: Vec<(RepoPath, TreeEntry)> = exact_source_entries
                 .iter()
-                .map(|file| {
-                    (
-                        file.rel_path.clone(),
-                        TreeEntry {
-                            blob_hash: Hash256::from_bytes(file.hash),
-                            kind: file.kind,
-                        },
-                    )
-                })
+                .map(|file| (file.repo_path.clone(), file.entry))
                 .collect();
             let diff = kin_db::engine::compute_diff(graph.as_ref(), &current_files);
 
@@ -797,7 +715,7 @@ pub async fn run(
             &compute_artifact_fingerprint(
                 exact_source_entries
                     .iter()
-                    .map(|entry| (entry.rel_path.as_str(), &entry.hash, entry.kind)),
+                    .map(|entry| (&entry.repo_path, &entry.hash, entry.entry)),
             ),
         );
 
@@ -1153,8 +1071,12 @@ fn parse_and_index(
         pi_timer.elapsed().as_secs_f64()
     );
     // Cross-file relation linking (progress printed by the linker itself)
-    let mut linked_relations =
-        kin_index::link_cross_file_with_completeness(&file_parse_data, &parse_completeness_by_file);
+    let artifact_ids = graph_artifact_identity_map(graph);
+    let mut linked_relations = kin_index::link_cross_file_with_completeness(
+        &file_parse_data,
+        &artifact_ids,
+        &parse_completeness_by_file,
+    )?;
     linked_relations.extend(projection_relations);
     eprintln!(
         "  [init-timer] {:>30}: {:.2}s",
@@ -3578,7 +3500,7 @@ fn collect_indexable_files(
     Ok(files)
 }
 
-fn read_exact_init_source(path: &Path) -> Result<(Vec<u8>, TreeEntryKind)> {
+fn read_exact_init_source(path: &Path) -> Result<(Vec<u8>, kin_index::ScannedEntryKind)> {
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("inspect exact init source {}", path.display()))?;
     if metadata.file_type().is_symlink() {
@@ -3600,7 +3522,7 @@ fn read_exact_init_source(path: &Path) -> Result<(Vec<u8>, TreeEntryKind)> {
             })?
             .as_bytes()
             .to_vec();
-        return Ok((target, TreeEntryKind::Symlink));
+        return Ok((target, kin_index::ScannedEntryKind::Symlink));
     }
     if !metadata.is_file() {
         anyhow::bail!("unsupported source entry type: {}", path.display());
@@ -3614,8 +3536,16 @@ fn read_exact_init_source(path: &Path) -> Result<(Vec<u8>, TreeEntryKind)> {
     let executable = false;
     Ok((
         fs::read(path).with_context(|| format!("read exact init source {}", path.display()))?,
-        TreeEntryKind::Regular { executable },
+        kin_index::ScannedEntryKind::Regular { executable },
     ))
+}
+
+fn exact_tree_entry(hash: [u8; 32], kind: kin_index::ScannedEntryKind) -> TreeEntry {
+    let hash = Hash256::from_bytes(hash);
+    match kind {
+        kin_index::ScannedEntryKind::Regular { executable } => TreeEntry::blob(hash, executable),
+        kin_index::ScannedEntryKind::Symlink => TreeEntry::symlink(hash),
+    }
 }
 
 fn collect_exact_init_source_entries(
@@ -3625,18 +3555,21 @@ fn collect_exact_init_source_entries(
     all_files
         .iter()
         .map(|path| {
-            let rel_path = path
-                .strip_prefix(source_root)
-                .unwrap_or(path)
-                .to_str()
-                .ok_or_else(|| anyhow!("source path is not valid UTF-8: {}", path.display()))?
-                .replace(std::path::MAIN_SEPARATOR, "/");
+            let relative = path.strip_prefix(source_root).with_context(|| {
+                format!(
+                    "frozen source path {} escaped root {}",
+                    path.display(),
+                    source_root.display()
+                )
+            })?;
+            let repo_path = kin_index::repo_path_from_host_relative(relative)?;
             let (bytes, kind) = read_exact_init_source(path)?;
+            let hash = kin_blobs::digest_bytes(&bytes);
             Ok(ExactInitSourceEntry {
                 abs_path: path.clone(),
-                rel_path,
-                hash: kin_blobs::digest_bytes(&bytes),
-                kind,
+                repo_path,
+                hash,
+                entry: exact_tree_entry(hash, kind),
             })
         })
         .collect()
@@ -3646,46 +3579,53 @@ fn collect_exact_init_source_entries(
 /// must record removals as well as additions/mode changes, including deletion
 /// of the final source file, or graph-owned source history keeps ghost files.
 fn build_exact_init_tree_deltas(
-    parent: HashMap<FilePathId, TreeEntry>,
+    parent: ResolvedTree,
     current: &[ExactInitSourceEntry],
 ) -> Vec<TreeDelta> {
-    let current: BTreeMap<&str, &ExactInitSourceEntry> = current
+    let current: BTreeMap<&RepoPath, &ExactInitSourceEntry> = current
         .iter()
-        .map(|entry| (entry.rel_path.as_str(), entry))
-        .collect();
-    let parent: BTreeMap<String, TreeEntry> = parent
-        .into_iter()
-        .map(|(path, entry)| (path.0, entry))
+        .map(|entry| (&entry.repo_path, entry))
         .collect();
     let mut deltas = Vec::new();
 
-    for (path, old) in &parent {
-        if !current.contains_key(path.as_str()) {
+    for old in parent.artifacts_by_path() {
+        if matches!(old.entry, TreeEntry::Gitlink { .. }) {
+            // Gitlink identity is graph/import truth. A host checkout cannot
+            // prove either its target or its removal.
+            continue;
+        }
+        if !current.contains_key(&old.path) {
             deltas.push(TreeDelta::Removed {
-                file_id: FilePathId::new(path),
-                old_entry: *old,
+                artifact_id: old.artifact_id,
+                old: old.located_entry(),
             });
         }
     }
     for (path, entry) in current {
-        let new_entry = TreeEntry {
-            blob_hash: Hash256::from_bytes(entry.hash),
-            kind: entry.kind,
-        };
-        match parent.get(path) {
-            Some(old) if *old == new_entry => {}
-            Some(old) => deltas.push(TreeDelta::Modified {
-                file_id: FilePathId::new(path),
-                old_entry: *old,
-                new_entry,
+        match parent.artifact_at_path(path) {
+            Some(old) if old.entry == entry.entry => {}
+            Some(old) => deltas.push(TreeDelta::Updated {
+                artifact_id: old.artifact_id,
+                old: old.located_entry(),
+                new: LocatedEntry::new((*path).clone(), entry.entry),
             }),
             None => deltas.push(TreeDelta::Added {
-                file_id: FilePathId::new(path),
-                new_entry,
+                artifact_id: ArtifactId::new(),
+                new: LocatedEntry::new((*path).clone(), entry.entry),
             }),
         }
     }
-    deltas.sort_by(|left, right| left.file_id().0.cmp(&right.file_id().0));
+    deltas.sort_by(|left, right| {
+        let left = left
+            .new_state()
+            .or_else(|| left.old_state())
+            .expect("tree delta has one side");
+        let right = right
+            .new_state()
+            .or_else(|| right.old_state())
+            .expect("tree delta has one side");
+        left.path.cmp(&right.path)
+    });
     deltas
 }
 
@@ -3946,11 +3886,10 @@ fn apply_warm_cache_delta(
             FileClassification::EntitySource => None,
             FileClassification::ShallowSyntax { .. }
             | FileClassification::StructuredArtifact(_)
-            | FileClassification::OpaqueArtifact { .. } => {
-                Some(artifact_id_for_file(graph, &file.rel_path))
-            }
+            | FileClassification::OpaqueArtifact { .. } => Some(&file.rel_path),
         })
-        .collect();
+        .map(|path| artifact_id_for_file(graph, path))
+        .collect::<Result<_>>()?;
     queued_artifacts.sort_unstable();
     queued_artifacts.dedup();
     let incremental_linker = build_incremental_linker_from_graph(graph)?;
@@ -3964,7 +3903,7 @@ fn apply_warm_cache_delta(
         &file_parse_data,
         &incremental_linker,
         &parse_completeness_by_file,
-    );
+    )?;
     linked_relations.extend(projection_relations);
     let new_relation_ids: HashSet<RelationId> = linked_relations
         .iter()
@@ -4027,7 +3966,7 @@ where
             }
         }
 
-        let artifact_node = GraphNodeId::Artifact(artifact_id_for_file(graph, file));
+        let artifact_node = GraphNodeId::Artifact(artifact_id_for_file(graph, file)?);
         for relation in graph.get_all_relations_for_node(&artifact_node)? {
             if relation.src == artifact_node {
                 relations.insert(relation.id, relation);
@@ -4046,7 +3985,7 @@ where
 {
     let mut relation_ids = HashSet::new();
     for file in files {
-        let artifact_node = GraphNodeId::Artifact(artifact_id_for_file(graph, file));
+        let artifact_node = GraphNodeId::Artifact(artifact_id_for_file(graph, file)?);
         for relation in graph.get_all_relations_for_node(&artifact_node)? {
             relation_ids.insert(relation.id);
         }
@@ -4054,10 +3993,27 @@ where
     Ok(relation_ids.into_iter().collect())
 }
 
-fn artifact_id_for_file(graph: &kin_db::InMemoryGraph, path: &str) -> ArtifactId {
+fn artifact_id_for_file(graph: &kin_db::InMemoryGraph, path: &str) -> Result<ArtifactId> {
+    let repo_path = RepoPath::from_utf8(path)
+        .with_context(|| format!("semantic file path is not a valid repository path: {path}"))?;
     graph
-        .artifact_id_for_path(&FilePathId::new(path))
-        .unwrap_or_else(|| ArtifactId::seed_from_path(path))
+        .artifact_id_at_path(&repo_path)
+        .ok_or_else(|| anyhow!("semantic enrichment requires admitted tree identity at {path}"))
+}
+
+fn graph_artifact_identity_map(
+    graph: &kin_db::InMemoryGraph,
+) -> kin_index::linker::ArtifactIdentityMap {
+    graph
+        .resolved_tree()
+        .artifacts_by_path()
+        .filter_map(|artifact| {
+            artifact
+                .path
+                .as_utf8()
+                .map(|path| (path.to_string(), artifact.artifact_id))
+        })
+        .collect()
 }
 
 fn remove_relations_batch_by_id(
@@ -4135,7 +4091,11 @@ fn build_incremental_linker_from_graph(
     graph: &kin_db::InMemoryGraph,
 ) -> Result<kin_index::IncrementalLinker> {
     let mut linker = kin_index::IncrementalLinker::new();
-    let indexed_paths = graph.working_tree_paths();
+    let indexed_paths = graph
+        .repository_paths()
+        .into_iter()
+        .filter_map(|path| path.as_utf8().map(str::to_owned))
+        .collect::<Vec<_>>();
     for path in &indexed_paths {
         linker.known_files.insert(path.clone());
     }
@@ -4150,7 +4110,8 @@ fn build_incremental_linker_from_graph(
         entities_by_file.entry(file_path).or_default().push(entity);
     }
     for (file_path, entities) in entities_by_file {
-        linker.add_file(&file_path, &entities);
+        let artifact_id = artifact_id_for_file(graph, &file_path)?;
+        linker.add_file(&file_path, artifact_id, &entities);
     }
 
     // Rehydrate per-file class hierarchies from the committed Extends edges so
@@ -4189,7 +4150,7 @@ fn build_incremental_linker_from_graph(
     // edges so include-closure disambiguation keeps working across reopen —
     // the reparsed subset alone would only see step-local includes.
     for path in &indexed_paths {
-        let artifact_node = GraphNodeId::Artifact(artifact_id_for_file(graph, path));
+        let artifact_node = GraphNodeId::Artifact(artifact_id_for_file(graph, path)?);
         let mut targets = Vec::new();
         for relation in graph.get_all_relations_for_node(&artifact_node)? {
             if relation.kind != RelationKind::Includes || relation.src != artifact_node {
@@ -4198,10 +4159,13 @@ fn build_incremental_linker_from_graph(
             let GraphNodeId::Artifact(dst_artifact) = relation.dst else {
                 continue;
             };
-            let Some(dst_path) = graph.path_for_artifact_id(&dst_artifact) else {
+            let Some(dst_path) = graph.repo_path_for_artifact_id(&dst_artifact) else {
                 continue;
             };
-            targets.push(dst_path.0);
+            let Some(dst_path) = dst_path.as_utf8() else {
+                continue;
+            };
+            targets.push(dst_path.to_owned());
         }
         if !targets.is_empty() {
             targets.sort();
@@ -4929,53 +4893,18 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Collect all source files, skipping .kin/, .git/, and common artifact directories.
+/// Collect every admitted repository leaf from one complete scan.
+///
+/// This is a compatibility view for semantic-enrichment callers that still
+/// consume host paths. Repository membership itself is owned by
+/// `kin_index::scan_repository`.
 pub(crate) fn collect_source_files(root: &Path) -> Result<Vec<PathBuf>> {
-    let mut files = Vec::new();
-    collect_source_files_recursive(root, root, &mut files)?;
-    files.sort_by(|left, right| {
-        source_file_sort_key(root, left).cmp(&source_file_sort_key(root, right))
-    });
-    Ok(files)
-}
-
-fn source_file_sort_key(root: &Path, path: &Path) -> String {
-    path.strip_prefix(root)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .replace(std::path::MAIN_SEPARATOR, "/")
-}
-
-fn collect_source_files_recursive(root: &Path, dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
-    let entries = fs::read_dir(dir)
-        .with_context(|| format!("read frozen source directory {}", dir.display()))?;
-
-    for entry in entries {
-        let entry = entry?;
-        let path = entry.path();
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-        let file_type = entry.file_type()?;
-
-        if file_type.is_dir() {
-            if kin_index::should_skip_dir(name_str.as_ref()) {
-                continue;
-            }
-            collect_source_files_recursive(root, &path, files)?;
-        } else if file_type.is_file() || file_type.is_symlink() {
-            // A git *worktree* root carries `.git` as a FILE (a `gitdir:` pointer
-            // holding a machine-absolute path), not a directory. Apply the same
-            // VCS/internal skip to file entries so that pointer file — and any
-            // other internal-named file (`.kin`, `.git-export`) — can never
-            // become an indexed entity and leak a machine path into graph truth.
-            if kin_index::should_skip_dir(name_str.as_ref()) {
-                continue;
-            }
-            files.push(path);
-        }
-    }
-
-    Ok(())
+    let ignore = kin_index::RepositoryIgnore::load(root)?;
+    let scan = kin_index::scan_repository(root, &ignore, std::iter::empty())?;
+    Ok(scan
+        .entries()
+        .map(|entry| entry.host_path.clone())
+        .collect())
 }
 
 /// Enumerate every admitted working-tree entry and preserve its exact content
@@ -5054,21 +4983,30 @@ fn ensure_graph_surface_materialized(
 /// independent of wall-clock time, machine path, and walk order. The path
 /// length prefix keeps the digest unambiguous across path boundaries.
 fn compute_artifact_fingerprint<'a>(
-    entries: impl IntoIterator<Item = (&'a str, &'a [u8; 32], TreeEntryKind)>,
+    entries: impl IntoIterator<Item = (&'a RepoPath, &'a [u8; 32], TreeEntry)>,
 ) -> [u8; 32] {
     let mut entries: Vec<_> = entries.into_iter().collect();
     entries.sort_unstable_by(|left, right| left.0.cmp(right.0));
     let mut hasher = Sha256::new();
-    hasher.update(b"kin-init-artifacts-v2:");
-    for (path, hash, kind) in entries {
-        hasher.update((path.len() as u64).to_le_bytes());
+    hasher.update(b"kin-init-artifacts-v3:");
+    for (path, hash, entry) in entries {
+        hasher.update((path.as_bytes().len() as u64).to_le_bytes());
         hasher.update(path.as_bytes());
         hasher.update(hash);
-        hasher.update([match kind {
-            TreeEntryKind::Regular { executable: false } => 0,
-            TreeEntryKind::Regular { executable: true } => 1,
-            TreeEntryKind::Symlink => 2,
-        }]);
+        match entry {
+            TreeEntry::Blob {
+                executable: false, ..
+            } => hasher.update([0]),
+            TreeEntry::Blob {
+                executable: true, ..
+            } => hasher.update([1]),
+            TreeEntry::Symlink { .. } => hasher.update([2]),
+            TreeEntry::Gitlink { target } => {
+                hasher.update([3]);
+                hasher.update((target.as_bytes().len() as u64).to_le_bytes());
+                hasher.update(target.as_bytes());
+            }
+        }
     }
     let result = hasher.finalize();
     let mut bytes = [0u8; 32];
@@ -8445,14 +8383,14 @@ func prCheckout(cmd *cobra.Command, args []string) error {
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(root.join("src/main.rs"), "fn main() {}").unwrap();
 
-        // Create a directory that should be skipped.
+        // Generated/vendor-style names are still repository truth.
         fs::create_dir_all(root.join("node_modules/foo")).unwrap();
-        fs::write(root.join("node_modules/foo/index.js"), "skip me").unwrap();
+        fs::write(root.join("node_modules/foo/index.js"), "track me").unwrap();
 
         let (snapshot, manifest) = snapshot_repo(root, false).unwrap();
         assert!(snapshot.join("README.md").exists());
         assert!(snapshot.join("src/main.rs").exists());
-        assert!(!snapshot.join("node_modules").exists());
+        assert!(snapshot.join("node_modules/foo/index.js").exists());
         // manifest.json should NOT exist on disk until explicitly written
         assert!(!snapshot.join("manifest.json").exists());
         write_snapshot_manifest(&snapshot, &manifest).unwrap();
@@ -8493,20 +8431,31 @@ func prCheckout(cmd *cobra.Command, args []string) error {
         let exact = collect_exact_init_source_entries(&snapshot, &all_files).unwrap();
         let kinds: BTreeMap<_, _> = exact
             .iter()
-            .map(|entry| (entry.rel_path.as_str(), entry.kind))
+            .map(|entry| (entry.repo_path.as_utf8().unwrap(), entry.entry))
             .collect();
         assert_eq!(
             kinds.get("plain.txt"),
-            Some(&TreeEntryKind::Regular { executable: false })
+            Some(&TreeEntry::blob(
+                Hash256::from_bytes(kin_blobs::digest_bytes(b"plain\n")),
+                false
+            ))
         );
         assert_eq!(
             kinds.get("bin/run"),
-            Some(&TreeEntryKind::Regular { executable: true })
+            Some(&TreeEntry::blob(
+                Hash256::from_bytes(kin_blobs::digest_bytes(b"#!/bin/sh\n")),
+                true
+            ))
         );
-        assert_eq!(kinds.get("current"), Some(&TreeEntryKind::Symlink));
+        assert_eq!(
+            kinds.get("current"),
+            Some(&TreeEntry::symlink(Hash256::from_bytes(
+                kin_blobs::digest_bytes(b"plain.txt")
+            )))
+        );
         let link = exact
             .iter()
-            .find(|entry| entry.rel_path == "current")
+            .find(|entry| entry.repo_path.as_utf8() == Some("current"))
             .unwrap();
         let (target, _) = read_exact_init_source(&link.abs_path).unwrap();
         assert_eq!(target, b"plain.txt");
@@ -8518,38 +8467,45 @@ func prCheckout(cmd *cobra.Command, args []string) error {
         let deleted_hash = Hash256::from_bytes([0x22; 32]);
         let added_hash = [0x33; 32];
         let unchanged_hash = Hash256::from_bytes([0x44; 32]);
-        let parent = HashMap::from([
-            (
-                FilePathId::new("legacy.sh"),
-                TreeEntry::regular(retained_hash, false),
+        let legacy_id = ArtifactId::new();
+        let deleted_id = ArtifactId::new();
+        let unchanged_id = ArtifactId::new();
+        let parent = ResolvedTree::from_artifacts([
+            kin_model::ResolvedArtifact::new(
+                legacy_id,
+                RepoPath::from_utf8("legacy.sh").unwrap(),
+                TreeEntry::blob(retained_hash, false),
             ),
-            (
-                FilePathId::new("deleted.txt"),
-                TreeEntry::regular(deleted_hash, false),
+            kin_model::ResolvedArtifact::new(
+                deleted_id,
+                RepoPath::from_utf8("deleted.txt").unwrap(),
+                TreeEntry::blob(deleted_hash, false),
             ),
-            (
-                FilePathId::new("unchanged.txt"),
-                TreeEntry::regular(unchanged_hash, false),
+            kin_model::ResolvedArtifact::new(
+                unchanged_id,
+                RepoPath::from_utf8("unchanged.txt").unwrap(),
+                TreeEntry::blob(unchanged_hash, false),
             ),
-        ]);
+        ])
+        .unwrap();
         let current = vec![
             ExactInitSourceEntry {
                 abs_path: PathBuf::from("legacy.sh"),
-                rel_path: "legacy.sh".to_string(),
+                repo_path: RepoPath::from_utf8("legacy.sh").unwrap(),
                 hash: *retained_hash.as_bytes(),
-                kind: TreeEntryKind::Regular { executable: true },
+                entry: TreeEntry::blob(retained_hash, true),
             },
             ExactInitSourceEntry {
                 abs_path: PathBuf::from("new-link"),
-                rel_path: "new-link".to_string(),
+                repo_path: RepoPath::from_utf8("new-link").unwrap(),
                 hash: added_hash,
-                kind: TreeEntryKind::Symlink,
+                entry: TreeEntry::symlink(Hash256::from_bytes(added_hash)),
             },
             ExactInitSourceEntry {
                 abs_path: PathBuf::from("unchanged.txt"),
-                rel_path: "unchanged.txt".to_string(),
+                repo_path: RepoPath::from_utf8("unchanged.txt").unwrap(),
                 hash: *unchanged_hash.as_bytes(),
-                kind: TreeEntryKind::Regular { executable: false },
+                entry: TreeEntry::blob(unchanged_hash, false),
             },
         ];
 
@@ -8558,31 +8514,44 @@ func prCheckout(cmd *cobra.Command, args []string) error {
         assert_eq!(
             deltas[0],
             TreeDelta::Removed {
-                file_id: FilePathId::new("deleted.txt"),
-                old_entry: TreeEntry::regular(deleted_hash, false),
+                artifact_id: deleted_id,
+                old: LocatedEntry::new(
+                    RepoPath::from_utf8("deleted.txt").unwrap(),
+                    TreeEntry::blob(deleted_hash, false),
+                ),
             }
         );
         // Same bytes, new exact mode: an executable-bit-only transition is a
         // real delta and must survive intact.
         assert_eq!(
             deltas[1],
-            TreeDelta::Modified {
-                file_id: FilePathId::new("legacy.sh"),
-                old_entry: TreeEntry::regular(retained_hash, false),
-                new_entry: TreeEntry::regular(retained_hash, true),
+            TreeDelta::Updated {
+                artifact_id: legacy_id,
+                old: LocatedEntry::new(
+                    RepoPath::from_utf8("legacy.sh").unwrap(),
+                    TreeEntry::blob(retained_hash, false),
+                ),
+                new: LocatedEntry::new(
+                    RepoPath::from_utf8("legacy.sh").unwrap(),
+                    TreeEntry::blob(retained_hash, true),
+                ),
             }
         );
+        let TreeDelta::Added { new, .. } = &deltas[2] else {
+            panic!("new link must be an addition");
+        };
         assert_eq!(
-            deltas[2],
-            TreeDelta::Added {
-                file_id: FilePathId::new("new-link"),
-                new_entry: TreeEntry::symlink(Hash256::from_bytes(added_hash)),
-            }
+            new,
+            &LocatedEntry::new(
+                RepoPath::from_utf8("new-link").unwrap(),
+                TreeEntry::symlink(Hash256::from_bytes(added_hash)),
+            )
         );
         assert!(
-            deltas
-                .iter()
-                .all(|delta| delta.file_id().0 != "unchanged.txt"),
+            deltas.iter().all(|delta| delta
+                .new_state()
+                .or_else(|| delta.old_state())
+                .is_none_or(|state| state.path.as_utf8() != Some("unchanged.txt"))),
             "a path whose exact entry is unchanged must not produce a delta"
         );
     }
@@ -8604,56 +8573,67 @@ func prCheckout(cmd *cobra.Command, args []string) error {
     }
 
     #[test]
-    fn snapshot_skips_all_excluded_dirs() {
+    fn snapshot_includes_generated_and_vendor_named_directories() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
 
-        // Create all the skip dirs with a file inside each.
-        for skip in kin_index::SKIP_DIRS {
-            let p = root.join(skip);
+        let repository_dirs = [
+            "node_modules",
+            "target",
+            "__pycache__",
+            "vendor",
+            ".next",
+            "dist",
+            "build",
+            "out",
+        ];
+        for directory in repository_dirs {
+            let p = root.join(directory);
             fs::create_dir_all(&p).unwrap();
-            fs::write(p.join("file.txt"), "skip").unwrap();
+            fs::write(p.join("file.txt"), "repository truth").unwrap();
         }
 
-        // One real file.
         fs::write(root.join("keep.txt"), "keep").unwrap();
 
         let (snapshot, _manifest) = snapshot_repo(root, false).unwrap();
         assert!(snapshot.join("keep.txt").exists());
-        assert!(!snapshot.join("node_modules").exists());
-        assert!(!snapshot.join("target").exists());
-        assert!(!snapshot.join("__pycache__").exists());
-        assert!(!snapshot.join(".next").exists());
-        assert!(!snapshot.join("dist").exists());
-        assert!(!snapshot.join("build").exists());
+        for directory in repository_dirs {
+            assert!(
+                snapshot.join(directory).join("file.txt").exists(),
+                "missing repository directory {directory}"
+            );
+        }
     }
 
     #[test]
-    fn snapshot_skips_kin_temporary_dirs() {
+    fn snapshot_preserves_arbitrary_kin_like_names_and_skips_real_control() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
 
         fs::create_dir_all(root.join(".kin-snapshot-tmp/nested")).unwrap();
         fs::write(root.join(".kin-snapshot-tmp/nested/file.txt"), "skip").unwrap();
         fs::create_dir_all(root.join(".kin-other/tmp")).unwrap();
-        fs::write(root.join(".kin-other/tmp/file.txt"), "skip").unwrap();
+        fs::write(root.join(".kin-other/tmp/file.txt"), "track").unwrap();
+        fs::create_dir_all(root.join(".kin-session")).unwrap();
+        fs::write(root.join(".kin-session/base.json"), "control").unwrap();
         fs::write(root.join("keep.txt"), "keep").unwrap();
 
         let (snapshot, _manifest) = snapshot_repo(root, false).unwrap();
         assert!(snapshot.join("keep.txt").exists());
-        assert!(!snapshot.join(".kin-snapshot-tmp").exists());
-        assert!(!snapshot.join(".kin-other").exists());
+        assert!(snapshot.join(".kin-snapshot-tmp/nested/file.txt").exists());
+        assert!(snapshot.join(".kin-other/tmp/file.txt").exists());
+        assert!(!snapshot.join(".kin-session").exists());
     }
 
     #[test]
-    fn snapshot_prunes_nested_vendored_git_and_kin_dirs() {
+    fn snapshot_prunes_only_nested_git_and_kin_control_dirs() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
 
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(root.join("src/lib.rs"), "pub fn f() {}").unwrap();
 
-        // Nested vendored dir (not at the repo root).
+        // Nested vendored dir is repository truth.
         fs::create_dir_all(root.join("pkg/inner/node_modules/dep")).unwrap();
         fs::write(root.join("pkg/inner/node_modules/dep/index.js"), "vendored").unwrap();
 
@@ -8661,7 +8641,8 @@ func prCheckout(cmd *cobra.Command, args []string) error {
         fs::create_dir_all(root.join("sub/.git/objects")).unwrap();
         fs::write(root.join("sub/.git/config"), "[core]").unwrap();
 
-        // Nested Kin graph dir and a renamed Kin graph dir.
+        // Nested Kin graph dir is control metadata. An arbitrary `.kindb`
+        // directory is not implicitly treated as control.
         fs::create_dir_all(root.join("sub/.kin/snapshot")).unwrap();
         fs::write(root.join("sub/.kin/graph.bin"), "graph").unwrap();
         fs::create_dir_all(root.join("data/.kindb")).unwrap();
@@ -8681,8 +8662,8 @@ func prCheckout(cmd *cobra.Command, args []string) error {
 
         assert!(rels.contains("src/lib.rs"), "got: {:?}", rels);
         assert!(
-            !rels.iter().any(|p| p.contains("node_modules")),
-            "nested vendored dir leaked: {:?}",
+            rels.contains("pkg/inner/node_modules/dep/index.js"),
+            "nested vendored dir was not admitted: {:?}",
             rels
         );
         assert!(
@@ -8691,11 +8672,16 @@ func prCheckout(cmd *cobra.Command, args []string) error {
             rels
         );
         assert!(
-            !rels.iter().any(|p| p.contains(".kin")),
-            "nested/renamed Kin graph dir leaked: {:?}",
+            !rels.iter().any(|p| p.starts_with("sub/.kin/")),
+            "nested Kin graph dir leaked: {:?}",
             rels
         );
-        assert_eq!(manifest["file_count"], 1);
+        assert!(
+            rels.contains("data/.kindb/blob"),
+            "unrelated dot-directory was not admitted: {:?}",
+            rels
+        );
+        assert_eq!(manifest["file_count"], 3);
     }
 
     #[test]
@@ -8751,13 +8737,14 @@ func prCheckout(cmd *cobra.Command, args []string) error {
             fs::write(root.join(format!("f{i}.rs")), "x").unwrap();
         }
 
-        let ignore = KinIgnore::load(root);
-        assert!(discovery_exceeds_cap(root, &ignore, 5));
-        assert!(!discovery_exceeds_cap(root, &ignore, 100));
+        let ignore = kin_index::RepositoryIgnore::load(root).unwrap();
+        let scan = kin_index::scan_repository(root, &ignore, std::iter::empty()).unwrap();
+        assert!(scan.len() > 5);
+        assert!(scan.len() <= 100);
     }
 
     #[test]
-    fn discovery_cap_excludes_pruned_dirs() {
+    fn discovery_cap_counts_generated_and_vendor_named_dirs() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         fs::write(root.join("real.rs"), "x").unwrap();
@@ -8766,32 +8753,43 @@ func prCheckout(cmd *cobra.Command, args []string) error {
             fs::write(root.join(format!("node_modules/v{i}.js")), "x").unwrap();
         }
 
-        let ignore = KinIgnore::load(root);
-        assert!(!discovery_exceeds_cap(root, &ignore, 5));
+        let ignore = kin_index::RepositoryIgnore::load(root).unwrap();
+        let scan = kin_index::scan_repository(root, &ignore, std::iter::empty()).unwrap();
+        assert!(scan.len() > 5);
     }
 
     #[test]
-    fn snapshot_entry_ignored_prunes_internal_and_vendored() {
-        let ignore = KinIgnore::default();
-        let rel = Path::new("x");
+    fn repository_admission_excludes_only_control_metadata() {
         for name in [
             ".kin",
-            ".kindb",
-            ".kin-snapshot-tmp",
+            ".kin-session",
+            ".kin-session.json",
+            ".kin-shadow",
+            ".kin-reconcile-test",
+            ".kin-checkout-test",
             ".git",
             ".git-export",
-            "node_modules",
-            "target",
-            "vendor",
         ] {
             assert!(
-                snapshot_entry_ignored(name, rel, &ignore),
+                !kin_index::should_track_host_relative_path(Path::new(name)),
                 "should prune {name}"
             );
         }
-        for name in ["src", "main.rs", ".gitignore", ".github"] {
+        for name in [
+            ".kindb",
+            ".kin-release",
+            ".kin-snapshot-tmp",
+            ".kin-other",
+            "node_modules",
+            "target",
+            "vendor",
+            "src",
+            "main.rs",
+            ".gitignore",
+            ".github",
+        ] {
             assert!(
-                !snapshot_entry_ignored(name, rel, &ignore),
+                kin_index::should_track_host_relative_path(Path::new(name)),
                 "should keep {name}"
             );
         }
@@ -8807,13 +8805,14 @@ func prCheckout(cmd *cobra.Command, args []string) error {
         )
         .unwrap();
 
-        let ignore = KinIgnore::load(root);
-        assert!(ignore.matches(Path::new("a/b/build"), "build"));
-        assert!(ignore.matches(Path::new("out"), "out"));
-        assert!(ignore.matches(Path::new("thirdparty/large"), "large"));
-        assert!(ignore.matches(Path::new("thirdparty/large/x"), "x"));
-        assert!(!ignore.matches(Path::new("thirdparty/small"), "small"));
-        assert!(!ignore.matches(Path::new("src/keep.rs"), "keep.rs"));
+        let ignore = kin_index::RepositoryIgnore::load(root).unwrap();
+        let repo_path = |value| kin_model::RepoPath::from_utf8(value).unwrap();
+        assert!(ignore.matches(&repo_path("a/b/build")));
+        assert!(ignore.matches(&repo_path("out")));
+        assert!(ignore.matches(&repo_path("thirdparty/large")));
+        assert!(ignore.matches(&repo_path("thirdparty/large/x")));
+        assert!(!ignore.matches(&repo_path("thirdparty/small")));
+        assert!(!ignore.matches(&repo_path("src/keep.rs")));
     }
 
     #[test]
