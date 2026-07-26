@@ -154,11 +154,27 @@ never answers Kin runtime queries or repairs missing graph truth.
   Kin deliberately has no partial-history or snapshot-only initialization mode.
 - After import, Kin's graph owns repository identity, tree state, history, refs,
   and semantic relations. Filesystem and Git views are projections.
-- `kin eject` first proves that the checked-out branch, graph blobs, and working
-  projection agree exactly. It then stops the daemon and atomically moves
-  `.kin/` to a recoverable archive outside the repository, leaving working
-  files and `.git` untouched. `--purge-metadata --yes` permanently removes that
-  archive after the same verification.
+- `kin git export --output ../repo.git` writes a new bare Git projection from
+  one graph-owned authority generation. It does not consult working files or an
+  ambient `.git/` object store, and it refuses an existing or in-repository
+  destination. Objects, refs, and directories are flushed before the
+  no-replace destination publication is acknowledged. Capability-anchored
+  publication is currently available on Unix hosts; other hosts refuse before
+  creating the export.
+- `kin eject` first proves that the graph-owned workspace, source blobs, and
+  working projection agree exactly. It builds and verifies a complete ordinary
+  Git replacement, stops graph projection, revalidates authority, then swaps
+  authority in a durable order: the replacement `.git/` is installed first,
+  then the locked `.kin/` namespace is detached with a no-replace rename. The
+  replacement `.git/` comes from Kin authority; the previous repository-local
+  `.git` entry and the detached `.kin/` are retained in a private, recoverable
+  sibling archive.
+  Credential-free remote and branch-tracking settings sealed during import are
+  restored without copying ambient Git configuration.
+  `--purge-metadata --yes` permanently removes that archive only after the same
+  verification and handoff. Capability-anchored eject is currently available
+  on Unix hosts; Windows fails before namespace mutation until an equally
+  durable retained-handle transaction is available.
 
 This lets a team migrate an existing repository without giving up its editor,
 compiler, build system, or Git interoperability while Kin becomes authoritative.

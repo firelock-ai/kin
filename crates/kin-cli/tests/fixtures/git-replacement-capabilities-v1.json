@@ -139,29 +139,36 @@
     },
     {
       "command": "git export",
-      "status": "open_gate",
-      "exposure": "fail_closed",
+      "status": "ready",
+      "exposure": "enabled",
       "authority": "repository-v6 exact external objects, refs, aliases, and source CAS",
       "required_for_bounded_dogfood": true,
       "acceptance_spec": [
         "rehydrate an exact Git repository from repository authority without synthesizing or rewriting imported objects",
         "export native Kin changes deterministically with refs updated only after object closure verification"
       ],
-      "evidence_tests": [],
-      "note": "The legacy semantic-change exporter was removed and the repository-v6 export command is not wired."
+      "evidence_tests": [
+        "crates/kin-git/src/repository_export.rs",
+        "crates/kin-cli/tests/git_export_roundtrip.rs",
+        "crates/kin-cli/tests/eject_round_trip.rs"
+      ],
+      "note": "On Unix, Git export captures one repository-v6 authority lease, loads exact source and imported object bodies only from repository CAS, self-verifies staged refs and HEAD, and publishes only to a new external destination through a retained parent capability. Other hosts fail before creating the export."
     },
     {
       "command": "eject",
-      "status": "open_gate",
-      "exposure": "fail_closed",
+      "status": "ready",
+      "exposure": "enabled",
       "authority": "repository-v6 workspace tree and source CAS",
       "required_for_bounded_dogfood": true,
       "acceptance_spec": [
         "verify every projected path, kind, mode, symlink target, and blob against one durable workspace generation",
-        "stop graph projection, reopen the same roots, and detach metadata atomically without restoring a file-first snapshot"
+        "stop graph projection, freeze the same authority roots, and atomically detach the locked .kin namespace only after exact replacement Git is durable",
+        "restore only the credential-free Git remote, tracking, refspec, and push configuration sealed during exact admission"
       ],
-      "evidence_tests": [],
-      "note": "Projection verification still expects the removed .kin/objects BlobStore."
+      "evidence_tests": [
+        "crates/kin-cli/tests/eject_round_trip.rs"
+      ],
+      "note": "On Unix, eject proves the complete graph-owned workspace against repository source CAS, durably builds and fsck-verifies a replacement ordinary Git repository, restores sealed safe Git interoperability config, then holds projection and authority freezes through one capability-anchored Git replacement and .kin detach transaction. Windows currently fails before namespace mutation."
     },
     {
       "command": "clone",

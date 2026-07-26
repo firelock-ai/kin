@@ -10,6 +10,7 @@
 //! repository and publishes the destination only after an exact recapture.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -26,6 +27,36 @@ use kin_model::{
 use crate::error::{GitError, Result};
 
 static STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+std::thread_local! {
+    static FAIL_NEXT_PUBLICATION_PARENT_SYNC: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn inject_next_publication_parent_sync_failure() {
+    FAIL_NEXT_PUBLICATION_PARENT_SYNC.set(true);
+}
+
+#[cfg(test)]
+fn fail_publication_parent_sync_if_injected(output_path: &Path) -> Result<()> {
+    FAIL_NEXT_PUBLICATION_PARENT_SYNC.with(|fail| {
+        if fail.replace(false) {
+            Err(GitError::Other(format!(
+                "injected Git publication parent sync failure at {}",
+                output_path.display()
+            )))
+        } else {
+            Ok(())
+        }
+    })
+}
+
+#[cfg(not(test))]
+fn fail_publication_parent_sync_if_injected(_output_path: &Path) -> Result<()> {
+    Ok(())
+}
 
 /// Hash algorithm used by the source Git object database.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -180,9 +211,11 @@ pub fn capture_lossless_git_repository(
 ///
 /// The destination must not exist. All CAS bodies and graph closure are
 /// preflighted before filesystem mutation. Objects, refs, and HEAD are then
-/// built in a private sibling directory, recaptured exactly, and atomically
-/// renamed into place. SHA-256 fails before creating any output until gix's
-/// writer is enabled and covered by the same exact acceptance gate.
+/// built in a private sibling directory, recaptured exactly, and published
+/// through a retained output-parent capability. Platforms without that
+/// namespace primitive fail before creating the export. SHA-256 fails before
+/// creating any output until gix's writer is enabled and covered by the same
+/// exact acceptance gate.
 pub fn rehydrate_lossless_git_repository(
     snapshot: &LosslessGitRepository,
     blob_store: &BlobStore,
@@ -202,16 +235,14 @@ pub fn rehydrate_lossless_git_repository(
             output_path.display()
         ))
     })?;
-    fs::create_dir_all(parent).map_err(|error| GitError::io(parent, error))?;
-    let staging = claim_staging_path(parent)?;
-    let build_result = build_staging_repository(snapshot, &bodies, blob_store, &staging);
+    require_anchored_publication_platform(output_path)?;
+    let mut staging = claim_staging_path(parent)?;
+    let build_result = build_staging_repository(snapshot, &bodies, blob_store, staging.path());
     if let Err(error) = build_result {
-        let _ = fs::remove_dir_all(&staging);
-        return Err(error);
+        return Err(staging.cleanup_after_error(error));
     }
-    if let Err(error) = publish_staging(&staging, output_path) {
-        let _ = fs::remove_dir_all(&staging);
-        return Err(error);
+    if let Err(error) = publish_staging(&mut staging, output_path) {
+        return Err(staging.cleanup_after_error(error));
     }
 
     Ok(GitRehydrationResult {
@@ -845,46 +876,260 @@ pub(crate) fn reject_existing_destination(output_path: &Path) -> Result<()> {
     }
 }
 
-pub(crate) fn claim_staging_path(parent: &Path) -> Result<PathBuf> {
-    loop {
-        let sequence = STAGING_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let candidate = parent.join(format!(
-            ".kin-git-rehydrate-{}-{sequence}",
-            std::process::id()
-        ));
-        match create_private_directory(&candidate) {
-            Ok(()) => return Ok(candidate),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(GitError::io(&candidate, error)),
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PublicationIdentity {
+    device: u64,
+    inode: u64,
+}
+
+/// An owner-private Git stage bound to its original namespace parent.
+///
+/// The path exists only for builders that still require a pathname. Final
+/// publication, rollback, and cleanup use the retained handles and identities,
+/// so a replacement of the ambient parent cannot redirect a mutation.
+pub(crate) struct ClaimedStaging {
+    path: PathBuf,
+    parent_display: PathBuf,
+    name: OsString,
+    published: bool,
+    #[cfg(unix)]
+    parent: cap_std::fs::Dir,
+    #[cfg(unix)]
+    parent_identity: PublicationIdentity,
+    #[cfg(unix)]
+    directory: cap_std::fs::Dir,
+    #[cfg(unix)]
+    directory_identity: PublicationIdentity,
+}
+
+impl ClaimedStaging {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) fn cleanup_after_error(&mut self, error: GitError) -> GitError {
+        match self.cleanup() {
+            Ok(()) => error,
+            Err(cleanup) => GitError::Other(format!(
+                "{error}; retained-capability staging cleanup also failed at {}: {cleanup}",
+                self.path.display()
+            )),
         }
+    }
+
+    fn cleanup(&mut self) -> Result<()> {
+        if self.published {
+            return Ok(());
+        }
+        #[cfg(unix)]
+        {
+            self.revalidate_retained_stage()?;
+            clear_publication_directory(&self.directory, &self.path)?;
+            rustix::fs::unlinkat(&self.parent, &self.name, rustix::fs::AtFlags::REMOVEDIR)
+                .map_err(|error| GitError::io(&self.path, error.into()))?;
+            sync_publication_directory_capability(&self.parent, &self.parent_display)?;
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            Err(unsupported_anchored_publication(&self.path))
+        }
+    }
+
+    #[cfg(unix)]
+    fn revalidate_retained_parent(&self) -> Result<()> {
+        if publication_directory_identity(&self.parent)
+            .map_err(|error| GitError::io(&self.parent_display, error))?
+            != self.parent_identity
+        {
+            return Err(GitError::Other(format!(
+                "retained Git publication parent {} changed identity",
+                self.parent_display.display()
+            )));
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn revalidate_visible_parent(&self) -> Result<()> {
+        self.revalidate_retained_parent()?;
+        let visible = open_publication_directory_nofollow(&self.parent_display)
+            .map_err(|error| GitError::io(&self.parent_display, error))?;
+        if publication_directory_identity(&visible)
+            .map_err(|error| GitError::io(&self.parent_display, error))?
+            != self.parent_identity
+        {
+            return Err(GitError::Other(format!(
+                "Git publication parent {} was replaced while retained",
+                self.parent_display.display()
+            )));
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn revalidate_retained_stage(&self) -> Result<()> {
+        self.revalidate_retained_parent()?;
+        if publication_directory_identity(&self.directory)
+            .map_err(|error| GitError::io(&self.path, error))?
+            != self.directory_identity
+        {
+            return Err(GitError::Other(format!(
+                "retained Git staging directory {} changed identity",
+                self.path.display()
+            )));
+        }
+        let named = open_publication_child_directory_nofollow(&self.parent, &self.name)
+            .map_err(|error| GitError::io(&self.path, error))?;
+        if publication_directory_identity(&named)
+            .map_err(|error| GitError::io(&self.path, error))?
+            != self.directory_identity
+        {
+            return Err(GitError::Other(format!(
+                "Git staging directory {} was replaced while retained",
+                self.path.display()
+            )));
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn revalidate_visible_stage(&self) -> Result<()> {
+        self.revalidate_visible_parent()?;
+        self.revalidate_retained_stage()
+    }
+}
+
+pub(crate) fn claim_staging_path(parent: &Path) -> Result<ClaimedStaging> {
+    #[cfg(unix)]
+    {
+        let parent_handle = open_publication_directory_nofollow(parent)
+            .map_err(|error| GitError::io(parent, error))?;
+        let parent_identity = publication_directory_identity(&parent_handle)
+            .map_err(|error| GitError::io(parent, error))?;
+        loop {
+            let sequence = STAGING_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let name = OsString::from(format!(
+                ".kin-git-rehydrate-{}-{sequence}",
+                std::process::id()
+            ));
+            let candidate = parent.join(&name);
+            match rustix::fs::mkdirat(
+                &parent_handle,
+                &name,
+                rustix::fs::Mode::from_raw_mode(0o700),
+            ) {
+                Ok(()) => {
+                    sync_publication_directory_capability(&parent_handle, parent)?;
+                    let directory =
+                        open_publication_child_directory_nofollow(&parent_handle, &name)
+                            .map_err(|error| GitError::io(&candidate, error))?;
+                    let directory_identity = publication_directory_identity(&directory)
+                        .map_err(|error| GitError::io(&candidate, error))?;
+                    let staging = ClaimedStaging {
+                        path: candidate,
+                        parent_display: parent.to_path_buf(),
+                        name,
+                        published: false,
+                        parent: parent_handle,
+                        parent_identity,
+                        directory,
+                        directory_identity,
+                    };
+                    staging.revalidate_visible_stage()?;
+                    return Ok(staging);
+                }
+                Err(error) if error == rustix::io::Errno::EXIST => continue,
+                Err(error) => return Err(GitError::io(&candidate, error.into())),
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        Err(unsupported_anchored_publication(parent))
+    }
+}
+
+pub(crate) fn require_anchored_publication_platform(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let _ = path;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        Err(unsupported_anchored_publication(path))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PublicationHookPoint {
+    AfterNamespaceMutation,
+}
+
+pub(crate) fn publish_staging(staging: &mut ClaimedStaging, output_path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        publish_staging_with_hook(staging, output_path, |_| {})
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = staging;
+        Err(unsupported_anchored_publication(output_path))
     }
 }
 
 #[cfg(unix)]
-fn create_private_directory(path: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::DirBuilderExt;
+fn publish_staging_with_hook(
+    staging: &mut ClaimedStaging,
+    output_path: &Path,
+    mut hook: impl FnMut(PublicationHookPoint),
+) -> Result<()> {
+    let output_parent = output_path.parent().ok_or_else(|| {
+        GitError::InvalidSnapshot(format!(
+            "Git publication destination {} has no parent",
+            output_path.display()
+        ))
+    })?;
+    let output_name = output_path.file_name().ok_or_else(|| {
+        GitError::InvalidSnapshot(format!(
+            "Git publication destination {} has no file name",
+            output_path.display()
+        ))
+    })?;
+    validate_publication_component(output_name, output_path)?;
+    if output_parent != staging.parent_display {
+        return Err(GitError::Other(format!(
+            "Git destination parent {} differs from the retained staging parent {}",
+            output_parent.display(),
+            staging.parent_display.display()
+        )));
+    }
+    let retained_output_parent = open_publication_directory_nofollow(output_parent)
+        .map_err(|error| GitError::io(output_parent, error))?;
+    if publication_directory_identity(&retained_output_parent)
+        .map_err(|error| GitError::io(output_parent, error))?
+        != staging.parent_identity
+    {
+        return Err(GitError::Other(format!(
+            "Git staging parent {} and destination parent {} are not the same retained directory",
+            staging.parent_display.display(),
+            output_parent.display()
+        )));
+    }
 
-    let mut builder = fs::DirBuilder::new();
-    builder.mode(0o700).create(path)
-}
+    staging.revalidate_visible_stage()?;
+    ensure_publication_name_absent(&staging.parent, output_name, output_path)?;
+    sync_git_directory_capability(&staging.directory, &staging.path)?;
+    staging.revalidate_visible_stage()?;
+    ensure_publication_name_absent(&staging.parent, output_name, output_path)?;
 
-#[cfg(not(unix))]
-fn create_private_directory(path: &Path) -> std::io::Result<()> {
-    fs::create_dir(path)
-}
-
-#[cfg(any(
-    target_vendor = "apple",
-    target_os = "linux",
-    target_os = "android",
-    target_os = "redox"
-))]
-pub(crate) fn publish_staging(staging: &Path, output_path: &Path) -> Result<()> {
     rustix::fs::renameat_with(
-        rustix::fs::CWD,
-        staging,
-        rustix::fs::CWD,
-        output_path,
+        &staging.parent,
+        &staging.name,
+        &retained_output_parent,
+        output_name,
         rustix::fs::RenameFlags::NOREPLACE,
     )
     .map_err(|error| {
@@ -893,20 +1138,381 @@ pub(crate) fn publish_staging(staging: &Path, output_path: &Path) -> Result<()> 
         } else {
             GitError::io(output_path, error.into())
         }
-    })
+    })?;
+
+    hook(PublicationHookPoint::AfterNamespaceMutation);
+
+    let post_publication = fail_publication_parent_sync_if_injected(output_path)
+        .and_then(|()| {
+            sync_publication_directory_capability(&staging.parent, &staging.parent_display)
+        })
+        .and_then(|()| {
+            validate_publication_name_identity(
+                &staging.parent,
+                output_name,
+                staging.directory_identity,
+                output_path,
+            )
+        })
+        .and_then(|()| staging.revalidate_visible_parent());
+    if let Err(error) = post_publication {
+        let rollback = rustix::fs::renameat_with(
+            &staging.parent,
+            output_name,
+            &staging.parent,
+            &staging.name,
+            rustix::fs::RenameFlags::NOREPLACE,
+        )
+        .map_err(|rollback| GitError::io(&staging.path, rollback.into()))
+        .and_then(|()| {
+            sync_publication_directory_capability(&staging.parent, &staging.parent_display)
+        })
+        .and_then(|()| staging.revalidate_retained_stage());
+        return Err(GitError::Other(format!(
+            "Git staging was renamed to {}, but durable retained-parent publication failed: \
+             {error}; rollback: {}",
+            output_path.display(),
+            rollback
+                .map(|()| "restored the private staging name".to_string())
+                .unwrap_or_else(|rollback| rollback.to_string())
+        )));
+    }
+
+    staging.published = true;
+    Ok(())
 }
 
-#[cfg(not(any(
-    target_vendor = "apple",
-    target_os = "linux",
-    target_os = "android",
-    target_os = "redox"
-)))]
-pub(crate) fn publish_staging(staging: &Path, output_path: &Path) -> Result<()> {
-    // Windows rename already fails when the destination exists. Other targets
-    // retain the explicit preflight check and fail any rename error closed.
-    reject_existing_destination(output_path)?;
-    fs::rename(staging, output_path).map_err(|error| GitError::io(output_path, error))
+#[cfg(not(unix))]
+fn unsupported_anchored_publication(path: &Path) -> GitError {
+    GitError::Other(format!(
+        "retained-capability Git publication is unsupported on this platform: {}",
+        path.display()
+    ))
+}
+
+#[cfg(unix)]
+fn publication_directory_identity(
+    directory: &cap_std::fs::Dir,
+) -> std::io::Result<PublicationIdentity> {
+    use cap_std::fs::MetadataExt as _;
+
+    directory
+        .dir_metadata()
+        .map(|metadata| PublicationIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+}
+
+#[cfg(unix)]
+fn open_publication_directory_nofollow(path: &Path) -> std::io::Result<cap_std::fs::Dir> {
+    rustix::fs::open(
+        path,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .map(|fd| cap_std::fs::Dir::from_std_file(fd.into()))
+    .map_err(Into::into)
+}
+
+#[cfg(unix)]
+fn open_publication_child_directory_nofollow(
+    parent: &cap_std::fs::Dir,
+    name: &std::ffi::OsStr,
+) -> std::io::Result<cap_std::fs::Dir> {
+    rustix::fs::openat(
+        parent,
+        name,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .map(|fd| cap_std::fs::Dir::from_std_file(fd.into()))
+    .map_err(Into::into)
+}
+
+#[cfg(unix)]
+fn sync_publication_directory_capability(
+    directory: &cap_std::fs::Dir,
+    display: &Path,
+) -> Result<()> {
+    rustix::fs::fsync(directory).map_err(|error| GitError::io(display, std::io::Error::from(error)))
+}
+
+#[cfg(unix)]
+fn sync_git_directory_capability(directory: &cap_std::fs::Dir, display: &Path) -> Result<()> {
+    let children = directory
+        .entries()
+        .map_err(|error| GitError::io(display, error))?
+        .map(|entry| {
+            entry
+                .map(|entry| entry.file_name())
+                .map_err(|error| GitError::io(display, error))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    for name in children {
+        let child_display = display.join(&name);
+        let metadata = directory
+            .symlink_metadata(&name)
+            .map_err(|error| GitError::io(&child_display, error))?;
+        if metadata.file_type().is_symlink() {
+            return Err(GitError::InvalidSnapshot(format!(
+                "staged Git repository contains a symbolic link at {}",
+                child_display.display()
+            )));
+        }
+        if metadata.is_dir() {
+            let child = open_publication_child_directory_nofollow(directory, &name)
+                .map_err(|error| GitError::io(&child_display, error))?;
+            sync_git_directory_capability(&child, &child_display)?;
+            continue;
+        }
+        if metadata.is_file() {
+            let file = rustix::fs::openat(
+                directory,
+                &name,
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )
+            .map(fs::File::from)
+            .map_err(|error| GitError::io(&child_display, error.into()))?;
+            if !file
+                .metadata()
+                .map_err(|error| GitError::io(&child_display, error))?
+                .is_file()
+            {
+                return Err(GitError::InvalidSnapshot(format!(
+                    "staged Git file changed kind while syncing {}",
+                    child_display.display()
+                )));
+            }
+            file.sync_all()
+                .map_err(|error| GitError::io(&child_display, error))?;
+            continue;
+        }
+        return Err(GitError::InvalidSnapshot(format!(
+            "staged Git repository contains an unsupported filesystem object at {}",
+            child_display.display()
+        )));
+    }
+    sync_publication_directory_capability(directory, display)
+}
+
+#[cfg(unix)]
+fn clear_publication_directory(directory: &cap_std::fs::Dir, display: &Path) -> Result<()> {
+    let children = directory
+        .entries()
+        .map_err(|error| GitError::io(display, error))?
+        .map(|entry| {
+            entry
+                .map(|entry| entry.file_name())
+                .map_err(|error| GitError::io(display, error))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    for name in children {
+        let child_display = display.join(&name);
+        let metadata = directory
+            .symlink_metadata(&name)
+            .map_err(|error| GitError::io(&child_display, error))?;
+        if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            let child = open_publication_child_directory_nofollow(directory, &name)
+                .map_err(|error| GitError::io(&child_display, error))?;
+            clear_publication_directory(&child, &child_display)?;
+            rustix::fs::unlinkat(directory, &name, rustix::fs::AtFlags::REMOVEDIR)
+                .map_err(|error| GitError::io(&child_display, error.into()))?;
+        } else {
+            rustix::fs::unlinkat(directory, &name, rustix::fs::AtFlags::empty())
+                .map_err(|error| GitError::io(&child_display, error.into()))?;
+        }
+    }
+    sync_publication_directory_capability(directory, display)
+}
+
+#[cfg(unix)]
+fn validate_publication_component(name: &std::ffi::OsStr, display: &Path) -> Result<()> {
+    let mut components = Path::new(name).components();
+    if !matches!(
+        components.next(),
+        Some(std::path::Component::Normal(component)) if component == name
+    ) || components.next().is_some()
+    {
+        return Err(GitError::InvalidSnapshot(format!(
+            "Git publication destination is not one safe path component: {}",
+            display.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn ensure_publication_name_absent(
+    parent: &cap_std::fs::Dir,
+    name: &std::ffi::OsStr,
+    display: &Path,
+) -> Result<()> {
+    match parent.symlink_metadata(name) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(GitError::io(display, error)),
+        Ok(_) => Err(GitError::DestinationExists(display.display().to_string())),
+    }
+}
+
+#[cfg(unix)]
+fn validate_publication_name_identity(
+    parent: &cap_std::fs::Dir,
+    name: &std::ffi::OsStr,
+    expected: PublicationIdentity,
+    display: &Path,
+) -> Result<()> {
+    let named = open_publication_child_directory_nofollow(parent, name)
+        .map_err(|error| GitError::io(display, error))?;
+    if publication_directory_identity(&named).map_err(|error| GitError::io(display, error))?
+        != expected
+    {
+        return Err(GitError::Other(format!(
+            "published Git directory {} changed identity",
+            display.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Make every regular file and directory in a fully built Git repository
+/// durable before an authority handoff.
+///
+/// The traversal rejects symbolic links and unsupported filesystem objects,
+/// flushes children before parents, and opens Unix files/directories with
+/// `NOFOLLOW`. Namespace publication must still durably sync the destination
+/// parent after moving this tree into place.
+pub fn sync_git_repository_for_authority_handoff(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| GitError::io(path, error))?;
+    if metadata.file_type().is_symlink() {
+        return Err(GitError::InvalidSnapshot(format!(
+            "staged Git repository contains a symbolic link at {}",
+            path.display()
+        )));
+    }
+    if metadata.is_file() {
+        return sync_publication_file(path);
+    }
+    if !metadata.is_dir() {
+        return Err(GitError::InvalidSnapshot(format!(
+            "staged Git repository contains an unsupported filesystem object at {}",
+            path.display()
+        )));
+    }
+
+    let children = fs::read_dir(path)
+        .map_err(|error| GitError::io(path, error))?
+        .map(|entry| {
+            entry
+                .map(|entry| entry.path())
+                .map_err(|error| GitError::io(path, error))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    for child in children {
+        sync_git_repository_for_authority_handoff(&child)?;
+    }
+    sync_publication_directory(path)
+}
+
+#[cfg(unix)]
+fn sync_publication_file(path: &Path) -> Result<()> {
+    let file = rustix::fs::open(
+        path,
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NOFOLLOW,
+        rustix::fs::Mode::empty(),
+    )
+    .map(fs::File::from)
+    .map_err(|error| GitError::io(path, error.into()))?;
+    if !file
+        .metadata()
+        .map_err(|error| GitError::io(path, error))?
+        .is_file()
+    {
+        return Err(GitError::InvalidSnapshot(format!(
+            "staged Git file changed kind while syncing {}",
+            path.display()
+        )));
+    }
+    file.sync_all().map_err(|error| GitError::io(path, error))
+}
+
+#[cfg(windows)]
+fn sync_publication_file(path: &Path) -> Result<()> {
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|error| GitError::io(path, error))?;
+    if !file
+        .metadata()
+        .map_err(|error| GitError::io(path, error))?
+        .is_file()
+    {
+        return Err(GitError::InvalidSnapshot(format!(
+            "staged Git file changed kind while syncing {}",
+            path.display()
+        )));
+    }
+    file.sync_all().map_err(|error| GitError::io(path, error))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn sync_publication_file(path: &Path) -> Result<()> {
+    Err(GitError::Other(format!(
+        "durable Git publication is unsupported on this platform: {}",
+        path.display()
+    )))
+}
+
+#[cfg(unix)]
+fn sync_publication_directory(path: &Path) -> Result<()> {
+    let directory = rustix::fs::open(
+        path,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::CLOEXEC
+            | rustix::fs::OFlags::NOFOLLOW,
+        rustix::fs::Mode::empty(),
+    )
+    .map(fs::File::from)
+    .map_err(|error| GitError::io(path, error.into()))?;
+    directory
+        .sync_all()
+        .map_err(|error| GitError::io(path, error))
+}
+
+#[cfg(windows)]
+fn sync_publication_directory(path: &Path) -> Result<()> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    };
+
+    let directory = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(|error| GitError::io(path, error))?;
+    directory
+        .sync_all()
+        .map_err(|error| GitError::io(path, error))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn sync_publication_directory(path: &Path) -> Result<()> {
+    Err(GitError::Other(format!(
+        "durable Git directory publication is unsupported on this platform: {}",
+        path.display()
+    )))
 }
 
 fn build_staging_repository(
@@ -1043,6 +1649,134 @@ mod tests {
         blob_store: BlobStore,
         first_commit: String,
         gitlink_oid: String,
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_publication_rejects_an_unflushable_staging_tree_before_rename() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempdir().unwrap();
+        let mut staging = claim_staging_path(root.path()).unwrap();
+        let staging_path = staging.path().to_path_buf();
+        let destination = root.path().join("published.git");
+        fs::write(staging_path.join("HEAD"), b"ref: refs/heads/main\n").unwrap();
+        symlink("HEAD", staging_path.join("raced-link")).unwrap();
+
+        let error = publish_staging(&mut staging, &destination)
+            .expect_err("publication must flush and validate the complete stage before rename");
+        assert!(
+            error.to_string().contains("symbolic link"),
+            "unexpected durable-publication error: {error}"
+        );
+        assert!(
+            staging_path.is_dir(),
+            "failed prepublication durability proof must retain the private stage"
+        );
+        assert!(
+            !destination.exists(),
+            "failed durability proof must not expose a destination"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn destination_parent_sync_failure_rolls_back_to_the_durable_private_stage() {
+        let root = tempdir().unwrap();
+        let mut staging = claim_staging_path(root.path()).unwrap();
+        let staging_path = staging.path().to_path_buf();
+        let destination = root.path().join("published.git");
+        fs::write(staging_path.join("HEAD"), b"ref: refs/heads/main\n").unwrap();
+        inject_next_publication_parent_sync_failure();
+
+        let error = publish_staging(&mut staging, &destination)
+            .expect_err("an unacknowledged destination namespace must not remain published");
+        assert!(
+            error.to_string().contains("retained-parent publication")
+                && error
+                    .to_string()
+                    .contains("restored the private staging name"),
+            "unexpected parent-sync failure: {error}"
+        );
+        assert!(
+            staging_path.is_dir(),
+            "failed destination sync must restore the durable private stage"
+        );
+        assert!(
+            staging_path.join("HEAD").is_file(),
+            "durable stage contents must survive namespace rollback"
+        );
+        assert!(
+            !destination.exists(),
+            "destination whose parent was not synced must be unpublished"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publication_parent_replacement_rolls_back_without_touching_replacement_namespace() {
+        let outer = tempdir().unwrap();
+        let parent = outer.path().join("publication-parent");
+        let displaced_parent = outer.path().join("publication-parent.displaced");
+        fs::create_dir(&parent).unwrap();
+        let mut staging = claim_staging_path(&parent).unwrap();
+        let staging_name = staging.name.clone();
+        fs::write(staging.path().join("HEAD"), b"ref: refs/heads/main\n").unwrap();
+        let destination = parent.join("published.git");
+
+        let error = publish_staging_with_hook(&mut staging, &destination, |point| {
+            if point == PublicationHookPoint::AfterNamespaceMutation {
+                fs::rename(&parent, &displaced_parent).unwrap();
+                fs::create_dir(&parent).unwrap();
+                fs::write(parent.join("replacement-marker"), b"replacement").unwrap();
+            }
+        })
+        .expect_err("a replaced visible publication parent must block success");
+
+        assert!(error.to_string().contains("publication parent"));
+        assert_eq!(
+            fs::read(parent.join("replacement-marker")).unwrap(),
+            b"replacement"
+        );
+        assert!(!parent.join("published.git").exists());
+        assert!(!parent.join(&staging_name).exists());
+        assert!(!displaced_parent.join("published.git").exists());
+        assert!(displaced_parent.join(&staging_name).is_dir());
+        assert_eq!(
+            fs::read(displaced_parent.join(&staging_name).join("HEAD")).unwrap(),
+            b"ref: refs/heads/main\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staging_cleanup_cannot_delete_from_a_replacement_parent() {
+        let outer = tempdir().unwrap();
+        let parent = outer.path().join("publication-parent");
+        let displaced_parent = outer.path().join("publication-parent.displaced");
+        fs::create_dir(&parent).unwrap();
+        let mut staging = claim_staging_path(&parent).unwrap();
+        let staging_name = staging.name.clone();
+        fs::write(staging.path().join("owned-marker"), b"owned").unwrap();
+
+        fs::rename(&parent, &displaced_parent).unwrap();
+        fs::create_dir(&parent).unwrap();
+        fs::create_dir(parent.join(&staging_name)).unwrap();
+        fs::write(
+            parent.join(&staging_name).join("replacement-marker"),
+            b"replacement",
+        )
+        .unwrap();
+
+        staging
+            .cleanup()
+            .expect("cleanup must stay bound to the retained original parent");
+
+        assert_eq!(
+            fs::read(parent.join(&staging_name).join("replacement-marker")).unwrap(),
+            b"replacement"
+        );
+        assert!(!displaced_parent.join(&staging_name).exists());
     }
 
     impl Fixture {

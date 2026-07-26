@@ -462,14 +462,26 @@ kin eject
 ```
 
 Kin resolves the current branch from graph history, verifies every referenced
-blob and every projected file byte, kind, and executable mode, then stops the
-daemon and checks the persisted graph again. If anything is missing, locally
-edited, or raced during shutdown, eject refuses before moving metadata.
+blob and every projected file byte, kind, symlink target, and executable mode,
+then builds and strictly verifies a complete ordinary Git replacement off to
+the side. Every replacement Git object, ref, config, directory, and index when
+one exists is flushed before Kin authority is detached, as are the publication
+parent entries. It stops the daemon and checks the persisted graph and working
+projection again before changing either authority namespace. If anything is
+missing, locally edited, unsupported (including a Gitlink/submodule), or raced
+during shutdown, eject refuses before detaching Kin.
 
-On success, working files are not rewritten. `.kin/` is atomically moved to a
-recoverable sibling archive outside the repository, so the directory is no
-longer a Kin repository and a Git checkout does not gain untracked Kin
-metadata. The command prints the exact archive path and recovery instruction.
+On success, working files are not rewritten. The exact graph-derived Git
+repository is durably installed at `.git/` first, then the locked `.kin/`
+namespace is atomically detached with a no-replace rename. The detached
+metadata and the pre-eject repository-local `.git` entry are retained in a
+private sibling archive as `kin/` and `previous-git/`. Credential-free remote
+URLs, refspecs, branch tracking, and push defaults sealed during Git import are
+restored; credentials and ambient Git configuration are never copied. The
+command prints the exact archive path. The capability-anchored transaction is
+currently supported on Unix hosts. Windows eject fails before namespace
+mutation until the same durable retained-handle guarantees are implemented
+there.
 
 For an intentional, irreversible removal:
 
@@ -479,5 +491,17 @@ kin eject --yes --purge-metadata
 
 This performs the same graph/projection checks and atomic detach, then deletes
 the detached archive. Kin never restores an initialization-time filesystem
-snapshot and never rewrites `.git`; Git is only an explicit interoperability
-boundary.
+snapshot or treats the old `.git/` as authority.
+
+To keep Kin attached and instead create a standalone interoperability
+projection, export one exact authority generation to a new bare repository:
+
+```sh
+kin git export --output ../project-export.git
+```
+
+The destination parent must already exist. The destination itself must not
+exist and cannot be inside the Kin working repository. Working-file edits and
+the ambient `.git/` object store are not export inputs. Exact publication is
+currently supported on Unix hosts; other hosts refuse before creating the
+export until an equivalent retained-handle namespace transaction is available.
