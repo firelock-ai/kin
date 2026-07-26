@@ -65,16 +65,19 @@
     },
     {
       "command": "diff",
-      "status": "open_gate",
-      "exposure": "fail_closed",
+      "status": "ready",
+      "exposure": "enabled",
       "authority": "immutable repository-v6 trees and semantic changes",
       "required_for_bounded_dogfood": true,
       "acceptance_spec": [
         "diff exact tree membership, byte paths, content identities, executable bits, symlinks, and gitlinks as well as semantic entity and relation changes",
         "resolve omitted endpoints from repository-v6 workspace/ref authority"
       ],
-      "evidence_tests": [],
-      "note": "The current response is entity-only and does not yet prove exact artifact deltas."
+      "evidence_tests": [
+        "crates/kin-cli/src/commands/diff.rs",
+        "crates/kin-cli/tests/repository_diff.rs"
+      ],
+      "note": "Diff resolves refs, changes, Git aliases, HEAD, and the graph-owned workspace from one authority lease; exact byte-path artifact transitions remain complete when semantic enrichment is absent."
     },
     {
       "command": "branch list",
