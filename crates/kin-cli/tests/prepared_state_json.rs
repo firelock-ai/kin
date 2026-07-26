@@ -92,9 +92,9 @@ fn seed_local_vectors(cache_graph_path: &Path) {
         .collect::<Vec<_>>();
 
     let artifact_ids = graph_snapshot
-        .artifact_index
-        .values()
-        .copied()
+        .resolved_tree
+        .artifacts()
+        .map(|artifact| artifact.artifact_id)
         .collect::<Vec<_>>();
 
     let vector_path = cache_graph_path.with_extension("kvec.seed");
@@ -132,10 +132,16 @@ fn seed_local_vectors(cache_graph_path: &Path) {
             )
             .expect("upsert entity revision vector");
     }
+    let descriptor = kin_db::IndexDescriptor {
+        model_id: Some("prepared-state-fixture@v1".to_string()),
+        graph_root: Some(hex::encode(graph.compute_root_hash())),
+    };
+    vectors.set_descriptor(descriptor.clone());
     vectors.save(&vector_path).expect("save vector index");
-    graph
-        .load_vector_index(&vector_path)
-        .expect("load vector index into graph");
+    assert!(matches!(
+        graph.load_vector_index_compatible(&vector_path, &descriptor),
+        kin_db::VectorIndexLoad::Loaded(_)
+    ));
     snapshot.save().expect("persist seeded vectors");
     fs::remove_file(vector_path).expect("remove temp vector file");
 }

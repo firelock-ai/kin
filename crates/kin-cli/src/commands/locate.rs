@@ -3564,7 +3564,7 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
 
 pub fn run_with_graph_capture_at_ref(
     layout: &kin_core::KinLayout,
-    graph: &kin_db::InMemoryGraph,
+    vector_source: &kin_db::InMemoryGraph,
     _blob_store: &kin_blobs::BlobStore,
     head: &SemanticChangeId,
     reference: &str,
@@ -3574,10 +3574,42 @@ pub fn run_with_graph_capture_at_ref(
     max_files_explicit: bool,
     snippet_opts: SnippetOptions,
 ) -> Result<LocateResult> {
-    let changes = kin_core::collect_changes_at_ref(graph, head)
-        .map_err(|err| anyhow::anyhow!(err.to_string()))?;
     let authority = crate::commands::repository_authority::ActiveRepositoryAuthority::open(layout)?;
-    let historical = kin_core::build_graph_at_ref(authority.manager(), head)
+    run_with_repository_authority_capture_at_ref(
+        authority.manager(),
+        vector_source,
+        head,
+        reference,
+        text,
+        explain,
+        max_files,
+        max_files_explicit,
+        snippet_opts,
+    )
+}
+
+fn run_with_repository_authority_capture_at_ref<B>(
+    authority: &kin_db::RepositoryAuthorityManager<B>,
+    vector_source: &kin_db::InMemoryGraph,
+    head: &SemanticChangeId,
+    reference: &str,
+    text: &str,
+    explain: bool,
+    max_files: usize,
+    max_files_explicit: bool,
+    snippet_opts: SnippetOptions,
+) -> Result<LocateResult>
+where
+    B: kin_db::StorageBackend + ?Sized + 'static,
+{
+    let history = {
+        let lease = authority.read_authority();
+        kin_db::InMemoryGraph::from_snapshot(lease.snapshot().clone())
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?
+    };
+    let changes = kin_core::collect_changes_at_ref(&history, head)
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+    let historical = kin_core::build_graph_at_ref(authority, head)
         .map_err(|err| anyhow::anyhow!(err.to_string()))?;
     let _ = crate::commands::cochange::refresh_from_changes(&historical, &changes);
     let extra_priority_files =
@@ -3590,7 +3622,7 @@ pub fn run_with_graph_capture_at_ref(
         max_files,
         max_files_explicit,
         extra_priority_files,
-        Some(graph),
+        Some(vector_source),
         snippet_opts,
     )
 }
@@ -15741,14 +15773,156 @@ fn output_text(result: &LocateResult) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    use kin_db::{LocalFileBackend, RepositoryAuthorityManager};
     use kin_model::ArtifactId;
     use kin_model::{
-        AuthorId, ChangeStore, Entity, EntityDelta, EntityId, EntityMetadata, EntityStore,
-        FilePathId, FingerprintAlgorithm, Hash256, LanguageId, OpaqueArtifact, Relation,
-        RelationEvidence, RelationId, RelationKind, RelationOrigin, RepoPath, SemanticChange,
-        SemanticChangeId, SemanticFingerprint, SourceSpan, Timestamp, TransactionDelta, TreeDelta,
-        TreeEntry, Visibility,
+        AdmissionCase, AdmissionPolicyDelta, AuthorId, ChangeOrigin, ChangeStore,
+        DefaultRefExpectation, DefaultRefMutation, EffectiveAdmissionPolicyStamp, Entity,
+        EntityDelta, EntityId, EntityMetadata, EntityStore, FilePathId, FingerprintAlgorithm,
+        FrozenLocalOverlay, FrozenLocalOverlayDelta, Hash256, LanguageId, LocatedEntry,
+        OpaqueArtifact, OperationId, RefExpectation, RefMutation, RefName, RefTarget,
+        RefUpdatePolicy, Relation, RelationDelta, RelationEvidence, RelationId, RelationKind,
+        RelationOrigin, RepoPath, RepositoryId, RepositoryTransaction, ResolvedTree,
+        SemanticChange, SemanticChangeId, SemanticFingerprint, SharedAdmissionPolicy, SourceSpan,
+        Timestamp, TransactionDelta, TreeDelta, TreeEntry, Visibility, WorkspaceExpectation,
+        WorkspaceHead, WorkspaceId, WorkspaceMutation, REPOSITORY_TRANSACTION_SCHEMA_VERSION,
     };
+
+    fn located(path: &str, hash: Hash256) -> LocatedEntry {
+        LocatedEntry::new(
+            RepoPath::from_utf8(path).expect("valid test repository path"),
+            TreeEntry::blob(hash, false),
+        )
+    }
+
+    fn native_change(
+        parents: Vec<SemanticChangeId>,
+        message: &str,
+        entity_deltas: Vec<EntityDelta>,
+        tree_deltas: Vec<TreeDelta>,
+    ) -> SemanticChange {
+        let admission_policy_delta = parents
+            .is_empty()
+            .then(|| AdmissionPolicyDelta::initialize(SharedAdmissionPolicy::empty(0)));
+        let mut change = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+            origin: ChangeOrigin::Native,
+            parents,
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("locate-test"),
+            message: message.to_string(),
+            entity_deltas,
+            relation_deltas: Vec::new(),
+            tree_deltas,
+            admission_policy_delta,
+            projected_files: Vec::new(),
+            spec_link: None,
+            evidence: Vec::new(),
+            risk_summary: None,
+        };
+        change.id = kin_core::compute_semantic_change_id(&change).unwrap();
+        change
+    }
+
+    fn persist_test_history(
+        root: &std::path::Path,
+        repository_name: &str,
+        changes: Vec<SemanticChange>,
+        bodies: &[(Hash256, &[u8])],
+    ) -> RepositoryAuthorityManager<LocalFileBackend> {
+        let repository_id = RepositoryId::new(repository_name).unwrap();
+        let manager = RepositoryAuthorityManager::open(
+            repository_id.clone(),
+            Arc::new(LocalFileBackend::new(root.join("kindb"))),
+        )
+        .unwrap();
+        for (digest, body) in bodies {
+            manager.save_source_blob(*digest, body).unwrap();
+        }
+        let shared_policy = SharedAdmissionPolicy::empty(0);
+        let workspace_id = WorkspaceId::from_uuid(uuid::Uuid::new_v4());
+        let overlay =
+            FrozenLocalOverlay::new(workspace_id, 0, AdmissionCase::Sensitive, Vec::new()).unwrap();
+        let admission_policy = EffectiveAdmissionPolicyStamp {
+            shared: shared_policy.stamp(),
+            local: overlay.stamp(),
+        };
+        let main = RefName::branch(b"main").unwrap();
+        let mut tree = ResolvedTree::default();
+        let mut previous_target = None;
+        let mut previous_tree_hash = None;
+        for (index, change) in changes.into_iter().enumerate() {
+            let prior_target = previous_target.clone();
+            let prior_tree_hash = previous_tree_hash;
+            tree = tree.apply(&change.tree_deltas).unwrap();
+            let tree_hash = kin_model::compute_resolved_tree_hash(&tree).unwrap();
+            let target = RefTarget::change(change.id);
+            let lease = manager.read_authority();
+            let transaction = RepositoryTransaction {
+                schema_version: REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+                operation_id: OperationId::new(),
+                repository_id: repository_id.clone(),
+                expected_generation: lease.roots().generation,
+                expected_roots: lease.roots().clone(),
+                actor: AuthorId::new("locate-test"),
+                reason: format!("persist exact locate history fixture: {}", change.message),
+                external_objects: Vec::new(),
+                git_authority_delta: None,
+                changes: vec![change.clone()],
+                aliases: Vec::new(),
+                ref_mutations: vec![RefMutation {
+                    name: main.clone(),
+                    expected: prior_target
+                        .clone()
+                        .map_or(RefExpectation::MustNotExist, |target| {
+                            RefExpectation::MustEqual { target }
+                        }),
+                    new_target: Some(target.clone()),
+                    policy: RefUpdatePolicy::FastForwardOnly,
+                }],
+                default_ref_mutation: (index == 0).then(|| DefaultRefMutation {
+                    expected: DefaultRefExpectation::MustBeUnset,
+                    new_default: Some(main.clone()),
+                }),
+                workspace_mutation: Some(WorkspaceMutation {
+                    workspace_id,
+                    expected: if index == 0 {
+                        WorkspaceExpectation::MustNotExist
+                    } else {
+                        WorkspaceExpectation::MustEqual {
+                            generation: u64::try_from(index - 1).unwrap(),
+                            head: WorkspaceHead::Symbolic {
+                                target: main.clone(),
+                            },
+                            base_target: prior_target,
+                            base_tree_hash: prior_tree_hash,
+                            tree_hash: prior_tree_hash.unwrap(),
+                            admission_policy: admission_policy.clone(),
+                        }
+                    },
+                    new_generation: u64::try_from(index).unwrap(),
+                    new_head: WorkspaceHead::Symbolic {
+                        target: main.clone(),
+                    },
+                    new_base_target: Some(target.clone()),
+                    new_base_tree_hash: Some(tree_hash),
+                    tree_deltas: change.tree_deltas,
+                    new_tree_hash: tree_hash,
+                    new_shared_admission_policy: shared_policy.clone(),
+                    new_admission_policy: admission_policy.clone(),
+                }),
+                local_overlay_delta: (index == 0)
+                    .then(|| FrozenLocalOverlayDelta::initialize(overlay.clone())),
+            };
+            drop(lease);
+            manager.commit_repository_transaction(transaction).unwrap();
+            previous_target = Some(target);
+            previous_tree_hash = Some(tree_hash);
+        }
+        manager
+    }
 
     trait TestArtifactAdmission {
         fn put_opaque(&self, artifact: &OpaqueArtifact) -> kin_db::Result<()>;
@@ -15779,6 +15953,7 @@ mod tests {
                     entity_deltas: Vec::new(),
                     relation_deltas: Vec::new(),
                     tree_deltas: vec![tree_delta],
+                    admission_policy_delta: None,
                 })?;
             }
             EntityStore::upsert_opaque_artifact(self, artifact)
@@ -15792,14 +15967,30 @@ mod tests {
             .expect("test artifact must be explicitly admitted")
     }
 
+    fn admit_test_source(graph: &kin_db::InMemoryGraph, path: &str, body: &str) {
+        graph
+            .put_opaque(&OpaqueArtifact {
+                file_id: FilePathId::new(path),
+                content_hash: kin_blobs::digest(body.as_bytes()),
+                mime_type: Some("text/plain".to_string()),
+                text_preview: Some(body.to_string()),
+            })
+            .unwrap();
+    }
+
     #[test]
     fn result_provenance_fails_loud_when_tree_identity_is_missing() {
         let graph = kin_db::InMemoryGraph::new();
-        let error =
-            collect_result_provenance(&graph, &[("README.md".to_string(), 1.0)], &HashMap::new())
-                .expect_err(
-                    "locate provenance must not fabricate a path-derived artifact identity",
-                );
+        let error = match collect_result_provenance(
+            &graph,
+            &[("README.md".to_string(), 1.0)],
+            &HashMap::new(),
+        ) {
+            Err(error) => error,
+            Ok(_) => {
+                panic!("locate provenance must not fabricate a path-derived artifact identity")
+            }
+        };
 
         assert!(
             error
@@ -16873,8 +17064,25 @@ mod tests {
                     .unwrap();
             }
         }
+        for (idx, artifact) in graph.resolved_tree().artifacts().enumerate() {
+            let x = 1.0f32 / ((entities.len() + idx + 1) as f32);
+            index
+                .upsert_retrievable(
+                    kin_model::RetrievalKey::Artifact(artifact.artifact_id),
+                    &[x, 1.0 - x],
+                )
+                .unwrap();
+        }
+        let descriptor = kin_db::IndexDescriptor {
+            model_id: Some("locate-test@v1".to_string()),
+            graph_root: Some(hex::encode(graph.compute_root_hash())),
+        };
+        index.set_descriptor(descriptor.clone());
         index.save(&path).unwrap();
-        graph.load_vector_index(&path).unwrap();
+        assert!(matches!(
+            graph.load_vector_index_compatible(&path, &descriptor),
+            kin_db::VectorIndexLoad::Loaded(_)
+        ));
         let status = graph.embedding_status();
         assert_eq!(
             status.indexed, status.total,
@@ -16912,6 +17120,7 @@ mod tests {
         let graph = kin_db::InMemoryGraph::new();
         let entity = test_entity("handler", "src/lib.py", 1, 5);
         graph.upsert_entity(&entity).unwrap();
+        admit_test_source(&graph, "src/lib.py", "def handler():\n    pass\n");
 
         std::env::set_var("KIN_REQUIRE_COMPLETE_EMBEDDINGS", "1");
         std::env::remove_var("KIN_BYPASS_EMBEDDING_COVERAGE_CHECK");
@@ -16935,6 +17144,7 @@ mod tests {
         let graph = kin_db::InMemoryGraph::new();
         let entity = test_entity("handler", "src/lib.py", 1, 5);
         graph.upsert_entity(&entity).unwrap();
+        admit_test_source(&graph, "src/lib.py", "def handler():\n    pass\n");
 
         std::env::set_var("KIN_REQUIRE_COMPLETE_EMBEDDINGS", "1");
         std::env::remove_var("KIN_BYPASS_EMBEDDING_COVERAGE_CHECK");
@@ -16966,6 +17176,7 @@ mod tests {
         let graph = kin_db::InMemoryGraph::new();
         let entity = test_entity("handler", "src/lib.py", 1, 5);
         graph.upsert_entity(&entity).unwrap();
+        admit_test_source(&graph, "src/lib.py", "def handler():\n    pass\n");
 
         std::env::remove_var("KIN_REQUIRE_COMPLETE_EMBEDDINGS");
         std::env::remove_var("KIN_BYPASS_EMBEDDING_COVERAGE_CHECK");
@@ -16976,7 +17187,10 @@ mod tests {
             .semantic_coverage
             .expect("semantic_coverage must be reported");
         assert_eq!(coverage.indexed, 0, "no embeddings indexed in this graph");
-        assert_eq!(coverage.total, 1, "one embeddable entity");
+        assert_eq!(
+            coverage.total, 2,
+            "one entity and its admitted artifact require embeddings"
+        );
         assert!(!coverage.complete, "coverage must be marked incomplete");
         assert!(
             coverage.note.is_some(),
@@ -21539,92 +21753,98 @@ mod tests {
     }
 
     #[test]
-    fn historical_locate_rehydrates_cochange_relations_from_reachable_changes() {
-        let graph = kin_db::InMemoryGraph::new();
+    fn historical_locate_uses_persisted_cochange_relations_from_reachable_changes() {
         let temp = tempfile::tempdir().unwrap();
-        let blob_store = kin_blobs::BlobStore::new(temp.path().join("objects")).unwrap();
-        let _layout = kin_core::KinLayout::new(temp.path().join(".kin"));
-
         let caller = test_entity("caller", "src/a.py", 1, 10);
         let peer = test_entity("peer", "src/b.py", 12, 24);
         let a_path = FilePathId::new("src/a.py");
         let b_path = FilePathId::new("src/b.py");
-        let a_hash_v1 = blob_store.write(b"def caller():\n    pass\n").unwrap();
-        let b_hash_v1 = blob_store.write(b"def peer():\n    pass\n").unwrap();
-        let a_hash_v2 = blob_store
-            .write(b"def caller():\n    return 'ok'\n")
-            .unwrap();
-        let b_hash_v2 = blob_store
-            .write(b"def peer():\n    return 'peer'\n")
-            .unwrap();
+        let a_body_v1 = b"def caller():\n    pass\n".as_slice();
+        let b_body_v1 = b"def peer():\n    pass\n".as_slice();
+        let a_body_v2 = b"def caller():\n    return 'ok'\n".as_slice();
+        let b_body_v2 = b"def peer():\n    return 'peer'\n".as_slice();
+        let a_hash_v1 = kin_blobs::digest(a_body_v1);
+        let b_hash_v1 = kin_blobs::digest(b_body_v1);
+        let a_hash_v2 = kin_blobs::digest(a_body_v2);
+        let b_hash_v2 = kin_blobs::digest(b_body_v2);
+        let a_artifact = ArtifactId::new();
+        let b_artifact = ArtifactId::new();
 
-        let add_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x61; 32]));
-        let genesis = SemanticChange {
-            id: add_id,
-            parents: vec![],
-            timestamp: Timestamp::now(),
-            author: AuthorId::new("test"),
-            message: "add files".to_string(),
-            entity_deltas: vec![
-                EntityDelta::Added(caller.clone()),
-                EntityDelta::Added(peer.clone()),
+        let genesis = native_change(
+            vec![],
+            "add files",
+            vec![
+                EntityDelta::Added {
+                    new: caller.clone(),
+                },
+                EntityDelta::Added { new: peer.clone() },
             ],
-            relation_deltas: vec![],
-            tree_deltas: vec![
+            vec![
                 TreeDelta::Added {
-                    file_id: a_path.clone(),
-                    new_entry: TreeEntry::regular(a_hash_v1, false),
+                    artifact_id: a_artifact,
+                    new: located(&a_path.0, a_hash_v1),
                 },
                 TreeDelta::Added {
-                    file_id: b_path.clone(),
-                    new_entry: TreeEntry::regular(b_hash_v1, false),
+                    artifact_id: b_artifact,
+                    new: located(&b_path.0, b_hash_v1),
                 },
             ],
-            projected_files: vec![a_path.clone(), b_path.clone()],
-            spec_link: None,
-            evidence: vec![],
-            risk_summary: None,
-            authored_on: None,
-        };
-        graph.create_change(&genesis).unwrap();
-
-        let modify_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x62; 32]));
-        let cochange_source = SemanticChange {
-            id: modify_id,
-            parents: vec![add_id],
-            timestamp: Timestamp::now(),
-            author: AuthorId::new("test"),
-            message: "modify together".to_string(),
-            entity_deltas: vec![],
-            relation_deltas: vec![],
-            tree_deltas: vec![
-                TreeDelta::Modified {
-                    file_id: a_path.clone(),
-                    old_entry: TreeEntry::regular(a_hash_v1, false),
-                    new_entry: TreeEntry::regular(a_hash_v2, false),
+        );
+        let cochange_source = native_change(
+            vec![genesis.id],
+            "modify together",
+            Vec::new(),
+            vec![
+                TreeDelta::Updated {
+                    artifact_id: a_artifact,
+                    old: located(&a_path.0, a_hash_v1),
+                    new: located(&a_path.0, a_hash_v2),
                 },
-                TreeDelta::Modified {
-                    file_id: b_path.clone(),
-                    old_entry: TreeEntry::regular(b_hash_v1, false),
-                    new_entry: TreeEntry::regular(b_hash_v2, false),
+                TreeDelta::Updated {
+                    artifact_id: b_artifact,
+                    old: located(&b_path.0, b_hash_v1),
+                    new: located(&b_path.0, b_hash_v2),
                 },
             ],
-            projected_files: vec![a_path.clone(), b_path.clone()],
-            spec_link: None,
-            evidence: vec![],
-            risk_summary: None,
-            authored_on: None,
+        );
+        let mut enrichment = native_change(
+            vec![cochange_source.id],
+            "persist cochange enrichment",
+            Vec::new(),
+            Vec::new(),
+        );
+        enrichment.relation_deltas = vec![RelationDelta::Added {
+            new: Relation {
+                id: RelationId::new(),
+                kind: RelationKind::CoChanges,
+                src: GraphNodeId::Entity(caller.id),
+                dst: GraphNodeId::Entity(peer.id),
+                confidence: 0.8,
+                origin: RelationOrigin::Inferred,
+                created_in: Some(cochange_source.id),
+                import_source: None,
+                evidence: Vec::new(),
+            },
+        }];
+        enrichment.id = kin_core::compute_semantic_change_id(&enrichment).unwrap();
+        let head_id = enrichment.id;
+        let authority = persist_test_history(
+            temp.path(),
+            "locate-cochange-history",
+            vec![genesis, cochange_source, enrichment],
+            &[
+                (a_hash_v1, a_body_v1),
+                (b_hash_v1, b_body_v1),
+                (a_hash_v2, a_body_v2),
+                (b_hash_v2, b_body_v2),
+            ],
+        );
+        let history = {
+            let lease = authority.read_authority();
+            kin_db::InMemoryGraph::from_snapshot(lease.snapshot().clone()).unwrap()
         };
-        graph.create_change(&cochange_source).unwrap();
-        crate::commands::cochange::refresh_from_changes(
-            &graph,
-            &[genesis.clone(), cochange_source.clone()],
-        )
-        .unwrap();
-        graph.flush_text_index().unwrap();
-
-        let changes = kin_core::collect_changes_at_ref(&graph, &modify_id).unwrap();
-        let historical = kin_core::build_graph_at_ref(&graph, &blob_store, &modify_id).unwrap();
+        let changes = kin_core::collect_changes_at_ref(&history, &head_id).unwrap();
+        let historical = kin_core::build_graph_at_ref(&authority, &head_id).unwrap();
         let seeds = HashMap::from([(
             String::from("src/a.py"),
             vec![FileHit {
@@ -21635,15 +21855,19 @@ mod tests {
 
         let before = extract_cochange_signals(&[&seeds], &historical).unwrap();
         assert!(
-            !before.contains_key("src/b.py"),
-            "historical graph replay alone should not retain mined cochange relations"
+            before.contains_key("src/b.py"),
+            "historical replay must retain graph-owned cochange relations"
         );
 
-        crate::commands::cochange::refresh_from_changes(&historical, &changes).unwrap();
+        assert_eq!(
+            crate::commands::cochange::refresh_from_changes(&historical, &changes).unwrap(),
+            0,
+            "historical query paths must not remine cochange state"
+        );
         let after = extract_cochange_signals(&[&seeds], &historical).unwrap();
         assert!(
             after.contains_key("src/b.py"),
-            "historical locate should restore cochange hits from reachable changes before ranking"
+            "historical locate should preserve persisted cochange hits before ranking"
         );
     }
 
@@ -22843,29 +23067,8 @@ mod tests {
 
     #[test]
     fn locate_at_ref_uses_historical_entity_and_tree_state() {
-        let graph = kin_db::InMemoryGraph::new();
         let temp = tempfile::tempdir().unwrap();
-        let blob_store = kin_blobs::BlobStore::new(temp.path().join("objects")).unwrap();
-        let layout = kin_core::KinLayout::new(temp.path().join(".kin"));
-
-        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x71; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: genesis_id,
-                parents: vec![],
-                timestamp: Timestamp::now(),
-                author: AuthorId::new("test"),
-                message: "genesis".to_string(),
-                entity_deltas: vec![],
-                relation_deltas: vec![],
-                tree_deltas: vec![],
-                projected_files: vec![],
-                spec_link: None,
-                evidence: vec![],
-                risk_summary: None,
-                authored_on: None,
-            })
-            .unwrap();
+        let genesis = native_change(Vec::new(), "genesis", Vec::new(), Vec::new());
 
         let entity_v1 = test_entity("handler", "src/lib.py", 1, 10);
         let mut entity_v2 = entity_v1.clone();
@@ -22874,66 +23077,76 @@ mod tests {
         entity_v2.fingerprint.signature_hash = Hash256::from_bytes([0x72; 32]);
 
         let tree_path = FilePathId::new("docs/api.json");
-        let tree_hash_v1 = blob_store.write(br#"{"version":"handler guide"}"#).unwrap();
-        let tree_hash_v2 = blob_store
-            .write(br#"{"version":"processor guide"}"#)
-            .unwrap();
+        let source_path = FilePathId::new("src/lib.py");
+        let tree_body_v1 = br#"{"version":"handler guide"}"#.as_slice();
+        let tree_body_v2 = br#"{"version":"processor guide"}"#.as_slice();
+        let source_body_v1 = b"def handler(value):\n    return value\n".as_slice();
+        let source_body_v2 = b"def processor(value):\n    return value\n".as_slice();
+        let tree_hash_v1 = kin_blobs::digest(tree_body_v1);
+        let tree_hash_v2 = kin_blobs::digest(tree_body_v2);
+        let source_hash_v1 = kin_blobs::digest(source_body_v1);
+        let source_hash_v2 = kin_blobs::digest(source_body_v2);
+        let tree_artifact = ArtifactId::new();
+        let source_artifact = ArtifactId::new();
 
-        let add_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x75; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: add_id,
-                parents: vec![genesis_id],
-                timestamp: Timestamp::now(),
-                author: AuthorId::new("test"),
-                message: "add handler".to_string(),
-                entity_deltas: vec![EntityDelta::Added(entity_v1.clone())],
-                relation_deltas: vec![],
-                tree_deltas: vec![TreeDelta::Added {
-                    file_id: tree_path.clone(),
-                    new_entry: TreeEntry::regular(tree_hash_v1, false),
-                }],
-                projected_files: vec![tree_path.clone()],
-                spec_link: None,
-                evidence: vec![],
-                risk_summary: None,
-                authored_on: None,
-            })
-            .unwrap();
-
-        let modify_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x76; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: modify_id,
-                parents: vec![add_id],
-                timestamp: Timestamp::now(),
-                author: AuthorId::new("test"),
-                message: "modify handler".to_string(),
-                entity_deltas: vec![EntityDelta::Modified {
-                    old: entity_v1.clone(),
-                    new: entity_v2.clone(),
-                }],
-                relation_deltas: vec![],
-                tree_deltas: vec![TreeDelta::Modified {
-                    file_id: tree_path.clone(),
-                    old_entry: TreeEntry::regular(tree_hash_v1, false),
-                    new_entry: TreeEntry::regular(tree_hash_v2, false),
-                }],
-                projected_files: vec![tree_path.clone()],
-                spec_link: None,
-                evidence: vec![],
-                risk_summary: None,
-                authored_on: None,
-            })
-            .unwrap();
+        let add = native_change(
+            vec![genesis.id],
+            "add handler",
+            vec![EntityDelta::Added {
+                new: entity_v1.clone(),
+            }],
+            vec![
+                TreeDelta::Added {
+                    artifact_id: tree_artifact,
+                    new: located(&tree_path.0, tree_hash_v1),
+                },
+                TreeDelta::Added {
+                    artifact_id: source_artifact,
+                    new: located(&source_path.0, source_hash_v1),
+                },
+            ],
+        );
+        let modify = native_change(
+            vec![add.id],
+            "modify handler",
+            vec![EntityDelta::Modified {
+                old: entity_v1.clone(),
+                new: entity_v2.clone(),
+            }],
+            vec![
+                TreeDelta::Updated {
+                    artifact_id: tree_artifact,
+                    old: located(&tree_path.0, tree_hash_v1),
+                    new: located(&tree_path.0, tree_hash_v2),
+                },
+                TreeDelta::Updated {
+                    artifact_id: source_artifact,
+                    old: located(&source_path.0, source_hash_v1),
+                    new: located(&source_path.0, source_hash_v2),
+                },
+            ],
+        );
+        let add_id = add.id;
+        let modify_id = modify.id;
+        let authority = persist_test_history(
+            temp.path(),
+            "locate-ref-history",
+            vec![genesis, add, modify],
+            &[
+                (tree_hash_v1, tree_body_v1),
+                (tree_hash_v2, tree_body_v2),
+                (source_hash_v1, source_body_v1),
+                (source_hash_v2, source_body_v2),
+            ],
+        );
+        let current_graph = kin_core::build_graph_at_ref(&authority, &modify_id).unwrap();
 
         #[cfg(feature = "vector")]
-        load_complete_test_vectors(&graph, &[entity_v2.clone()]);
+        load_complete_test_vectors(&current_graph, &[entity_v2.clone()]);
 
-        let historical = run_with_graph_capture_at_ref(
-            &layout,
-            &graph,
-            &blob_store,
+        let historical = run_with_repository_authority_capture_at_ref(
+            &authority,
+            &current_graph,
             &add_id,
             "change:add",
             "handler failure",
@@ -22953,10 +23166,9 @@ mod tests {
             "historical locate should surface the pre-rename source file"
         );
 
-        let current = run_with_graph_capture_at_ref(
-            &layout,
-            &graph,
-            &blob_store,
+        let current = run_with_repository_authority_capture_at_ref(
+            &authority,
+            &current_graph,
             &modify_id,
             "change:modify",
             "handler failure",
@@ -22971,10 +23183,13 @@ mod tests {
             "current locate should not surface the renamed source file for the old query"
         );
 
-        let rebuilt = kin_core::build_graph_at_ref(&graph, &blob_store, &add_id).unwrap();
+        let rebuilt = kin_core::build_graph_at_ref(&authority, &add_id).unwrap();
         assert_eq!(
-            rebuilt.get_file_hash(&tree_path.0),
-            Some(*tree_hash_v1.as_bytes())
+            rebuilt
+                .resolved_tree()
+                .artifact_at_path(&RepoPath::from_utf8(&tree_path.0).unwrap())
+                .and_then(|artifact| artifact.entry.blob_identity()),
+            Some(tree_hash_v1)
         );
         assert!(
             rebuilt

@@ -1250,9 +1250,9 @@ mod tests {
         let layout = kin_core::KinLayout::new(repo.join(".kin"));
         let graph = kin_db::InMemoryGraph::new();
         let branch_a_change =
-            kin_git::semantic_change_id_from_git_oid_hex(&branch_a).expect("valid Git oid");
+            kin_model::SemanticChangeId::from_hash(kin_model::Hash256::from_bytes([0xa1; 32]));
         let branch_b_change =
-            kin_git::semantic_change_id_from_git_oid_hex(&branch_b).expect("valid Git oid");
+            kin_model::SemanticChangeId::from_hash(kin_model::Hash256::from_bytes([0xb2; 32]));
 
         let error = build_shadow_run_response(
             &layout,
@@ -1286,44 +1286,45 @@ mod tests {
         let graph = kin_db::InMemoryGraph::new();
         let layout = kin_core::KinLayout::new(std::path::PathBuf::from("/nonexistent/.kin"));
 
-        let base_id =
-            kin_model::SemanticChangeId::from_hash(kin_model::Hash256::from_bytes([0x10; 32]));
-        let head_id =
-            kin_model::SemanticChangeId::from_hash(kin_model::Hash256::from_bytes([0x20; 32]));
-        graph
-            .create_change(&kin_model::SemanticChange {
-                id: base_id,
-                parents: vec![],
-                timestamp: kin_model::Timestamp::now(),
-                author: kin_model::AuthorId::new("test"),
-                message: "base".into(),
-                entity_deltas: vec![],
-                relation_deltas: vec![],
-                tree_deltas: vec![],
-                projected_files: vec![],
-                spec_link: None,
-                evidence: vec![],
-                risk_summary: None,
-                authored_on: None,
-            })
-            .unwrap();
-        graph
-            .create_change(&kin_model::SemanticChange {
-                id: head_id,
-                parents: vec![base_id],
-                timestamp: kin_model::Timestamp::now(),
-                author: kin_model::AuthorId::new("test"),
-                message: "head".into(),
-                entity_deltas: vec![],
-                relation_deltas: vec![],
-                tree_deltas: vec![],
-                projected_files: vec![],
-                spec_link: None,
-                evidence: vec![],
-                risk_summary: None,
-                authored_on: None,
-            })
-            .unwrap();
+        let mut base = kin_model::SemanticChange {
+            id: kin_model::SemanticChangeId::from_hash(kin_model::Hash256::from_bytes([0; 32])),
+            parents: vec![],
+            origin: kin_model::ChangeOrigin::Native,
+            timestamp: kin_model::Timestamp::now(),
+            author: kin_model::AuthorId::new("test"),
+            message: "base".into(),
+            entity_deltas: vec![],
+            relation_deltas: vec![],
+            tree_deltas: vec![],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            admission_policy_delta: None,
+        };
+        base.id = kin_model::compute_semantic_change_id(&base).unwrap();
+        let base_id = base.id;
+        graph.create_change(&base).unwrap();
+
+        let mut head = kin_model::SemanticChange {
+            id: kin_model::SemanticChangeId::from_hash(kin_model::Hash256::from_bytes([0; 32])),
+            parents: vec![base_id],
+            origin: kin_model::ChangeOrigin::Native,
+            timestamp: kin_model::Timestamp::now(),
+            author: kin_model::AuthorId::new("test"),
+            message: "head".into(),
+            entity_deltas: vec![],
+            relation_deltas: vec![],
+            tree_deltas: vec![],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            admission_policy_delta: None,
+        };
+        head.id = kin_model::compute_semantic_change_id(&head).unwrap();
+        let head_id = head.id;
+        graph.create_change(&head).unwrap();
 
         let response = build_shadow_run_response(
             &layout,

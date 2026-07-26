@@ -846,12 +846,12 @@ pub(crate) fn read_entity_file_bytes_from_graph(
 mod tests {
     use super::*;
     use kin_model::{
-        ArtifactId, AuthorId, Branch, BranchName, ChangeStore, Entity, EntityDelta, EntityMetadata,
-        FilePathId, FingerprintAlgorithm, GraphNodeId, Hash256, LanguageId, LocatedEntry, Relation,
-        RelationId, RelationOrigin, RepoPath, SemanticChange, SemanticChangeId,
-        SemanticFingerprint, SourceSpan, Timestamp, TreeDelta, TreeEntry, Visibility,
+        ArtifactId, Entity, EntityMetadata, FilePathId, FingerprintAlgorithm, GraphNodeId, Hash256,
+        LanguageId, Relation, RelationId, RelationOrigin, RepoPath, ResolvedArtifact, ResolvedTree,
+        SemanticFingerprint, SourceSpan, TreeEntry, Visibility,
     };
     use std::fs;
+    use std::process::Command;
 
     #[test]
     fn graph_entity_not_found_lines_keep_signal_and_offer_next_steps() {
@@ -925,7 +925,7 @@ mod tests {
             end_line: 1,
             end_col: 10,
         });
-        let relations = kin_index::link_cross_file(&[kin_index::FileParseData {
+        let files = [kin_index::FileParseData {
             file_path: "src/app.rs".to_string(),
             entities: vec![caller.clone()],
             relations: vec![kin_parser::ExtractedRelation {
@@ -936,7 +936,11 @@ mod tests {
                 import_source: Some("kin_db".to_string()),
             }],
             imports: Vec::new(),
-        }]);
+        }];
+        let artifact_ids =
+            std::collections::HashMap::from([("src/app.rs".to_string(), ArtifactId::new())]);
+        let relations = kin_index::link_cross_file(&files, &artifact_ids)
+            .expect("test file has an admitted artifact identity");
         assert_eq!(relations.len(), 1);
         let relation = relations.into_iter().next().unwrap();
         assert!(kin_index::is_external_import_placeholder(&relation));
@@ -1068,53 +1072,52 @@ mod tests {
 
     fn graph_source_fixture(source: Option<&[u8]>) -> GraphSourceFixture {
         let temp = tempfile::tempdir().unwrap();
-        let kin_root = temp.path().join(".kin");
-        fs::create_dir_all(kin_root.join("objects")).unwrap();
-        let layout = kin_core::KinLayout::new(kin_root);
-        let graph = kin_db::InMemoryGraph::new();
-
-        let branch_name = BranchName::new("main");
-        let genesis = kin_core::build_genesis_change();
-        graph.create_change(&genesis).unwrap();
-
+        let repo = temp.path().join("repo");
+        fs::create_dir(&repo).unwrap();
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "--initial-branch=main"]);
+        git(&["config", "user.email", "kin@example.invalid"]);
+        git(&["config", "user.name", "Kin"]);
         let file_id = FilePathId::new("src/lib.rs");
-        let blob_hash = if let Some(source) = source {
-            let blob_store = kin_blobs::BlobStore::new(layout.objects_dir()).unwrap();
-            blob_store.write(source).unwrap()
+        if let Some(source) = source {
+            fs::create_dir_all(repo.join("src")).unwrap();
+            fs::write(repo.join(&file_id.0), source).unwrap();
         } else {
-            Hash256::from_bytes([0x99; 32])
-        };
-        let mut change = SemanticChange {
-            id: SemanticChangeId::from_hash(Hash256::from_bytes([0x42; 32])),
-            parents: vec![genesis.id],
-            timestamp: Timestamp::now(),
-            author: AuthorId::new("test"),
-            message: "add source".to_string(),
-            entity_deltas: vec![],
-            relation_deltas: vec![],
-            tree_deltas: vec![TreeDelta::Added {
-                artifact_id: ArtifactId::new(),
-                new: LocatedEntry::new(
-                    RepoPath::from_utf8(file_id.0.clone()).unwrap(),
-                    TreeEntry::blob(blob_hash, false),
-                ),
-            }],
-            projected_files: vec![file_id.clone()],
-            spec_link: None,
-            evidence: vec![],
-            risk_summary: None,
-            authored_on: Some(branch_name.clone()),
-        };
-        change.id = kin_model::compute_semantic_change_id(&change).unwrap();
-        let change_id = change.id;
-        graph.create_change(&change).unwrap();
-        graph
-            .create_branch(&Branch {
-                name: branch_name.clone(),
-                head: change_id,
-            })
-            .unwrap();
-        kin_core::write_current_branch(&layout, &branch_name).unwrap();
+            fs::write(repo.join("README.md"), b"authority without source\n").unwrap();
+        }
+        git(&["add", "--all"]);
+        git(&["commit", "-m", "seed exact source authority"]);
+        let init = kin_core::init_from_git(&repo).unwrap();
+        let layout = init.layout;
+        let authority =
+            crate::commands::repository_authority::ActiveRepositoryAuthority::open(&layout)
+                .unwrap();
+        let mut resolved_tree = authority.workspace().unwrap().tree;
+        if source.is_none() {
+            let mut artifacts = resolved_tree.into_artifacts().collect::<Vec<_>>();
+            artifacts.push(ResolvedArtifact::new(
+                ArtifactId::new(),
+                RepoPath::from_utf8(file_id.0.clone()).unwrap(),
+                TreeEntry::blob(Hash256::from_bytes([0x99; 32]), false),
+            ));
+            resolved_tree = ResolvedTree::from_artifacts(artifacts).unwrap();
+        }
+        let mut snapshot = kin_db::GraphSnapshot::empty();
+        snapshot.resolved_tree = resolved_tree;
+        let graph = kin_db::InMemoryGraph::from_snapshot(snapshot).unwrap();
 
         GraphSourceFixture {
             _temp: temp,
@@ -1142,34 +1145,6 @@ mod tests {
 
     fn commit_source_entity(fixture: &GraphSourceFixture, entity: &Entity) {
         fixture.graph.upsert_entity(entity).unwrap();
-        let branch_name = BranchName::new("main");
-        let parent = fixture
-            .graph
-            .get_branch(&branch_name)
-            .unwrap()
-            .unwrap()
-            .head;
-        let mut change = SemanticChange {
-            id: SemanticChangeId::from_hash(Hash256::from_bytes([0x43; 32])),
-            parents: vec![parent],
-            timestamp: Timestamp::now(),
-            author: AuthorId::new("test"),
-            message: format!("add entity {}", entity.name),
-            entity_deltas: vec![EntityDelta::Added(entity.clone())],
-            relation_deltas: vec![],
-            tree_deltas: vec![],
-            projected_files: vec![entity.file_origin.clone().unwrap()],
-            spec_link: None,
-            evidence: vec![],
-            risk_summary: None,
-            authored_on: Some(branch_name.clone()),
-        };
-        change.id = kin_model::compute_semantic_change_id(&change).unwrap();
-        fixture.graph.create_change(&change).unwrap();
-        fixture
-            .graph
-            .update_branch_head(&branch_name, &change.id)
-            .unwrap();
     }
 
     #[test]
@@ -1195,66 +1170,21 @@ mod tests {
     }
 
     #[test]
-    fn graph_source_rejects_path_reuse_by_a_different_artifact() {
+    fn graph_source_ignores_checkout_path_reuse() {
         let original = b"fn target() {}\n";
         let fixture = graph_source_fixture(Some(original));
         let entity = source_entity("target", fixture.file_id.clone(), 0, original.len() - 1);
         let id = entity.id;
         commit_source_entity(&fixture, &entity);
 
-        let branch_name = BranchName::new("main");
-        let parent = fixture
-            .graph
-            .get_branch(&branch_name)
-            .unwrap()
-            .unwrap()
-            .head;
-        let path = RepoPath::from_utf8(fixture.file_id.0.clone()).unwrap();
-        let parent_tree = fixture.graph.resolve_tree_at(&parent).unwrap();
-        let old_artifact = parent_tree.artifact_at_path(&path).unwrap();
-        let replacement_hash = kin_blobs::BlobStore::new(fixture.layout.objects_dir())
-            .unwrap()
-            .write(b"fn replacement() {}\n")
-            .unwrap();
-        let mut replacement = SemanticChange {
-            id: SemanticChangeId::from_hash(Hash256::from_bytes([0x44; 32])),
-            parents: vec![parent],
-            timestamp: Timestamp::now(),
-            author: AuthorId::new("test"),
-            message: "replace source artifact".to_string(),
-            entity_deltas: vec![],
-            relation_deltas: vec![],
-            tree_deltas: vec![
-                TreeDelta::Removed {
-                    artifact_id: old_artifact.artifact_id,
-                    old: old_artifact.located_entry(),
-                },
-                TreeDelta::Added {
-                    artifact_id: ArtifactId::new(),
-                    new: LocatedEntry::new(path, TreeEntry::blob(replacement_hash, false)),
-                },
-            ],
-            projected_files: vec![fixture.file_id.clone()],
-            spec_link: None,
-            evidence: vec![],
-            risk_summary: None,
-            authored_on: Some(branch_name.clone()),
-        };
-        replacement.id = kin_model::compute_semantic_change_id(&replacement).unwrap();
-        fixture.graph.create_change(&replacement).unwrap();
-        fixture
-            .graph
-            .update_branch_head(&branch_name, &replacement.id)
-            .unwrap();
-
-        let error = build_graph_source_response(&fixture.layout, &fixture.graph, &id.to_string())
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains("source path 'src/lib.rs' was reused"),
-            "{error}"
-        );
-        assert!(error.contains(&id.to_string()), "{error}");
+        fs::write(
+            fixture.layout.working_dir().join(&fixture.file_id.0),
+            b"fn replacement() {}\n",
+        )
+        .unwrap();
+        let response =
+            build_graph_source_response(&fixture.layout, &fixture.graph, &id.to_string()).unwrap();
+        assert_eq!(response.source.unwrap().body, "fn target() {}");
     }
 
     #[test]
@@ -1278,7 +1208,7 @@ mod tests {
     }
 
     #[test]
-    fn graph_source_returns_error_on_missing_blob() {
+    fn graph_source_returns_error_when_path_is_absent_from_authority() {
         let fixture = graph_source_fixture(None);
         let entity = source_entity("target", fixture.file_id.clone(), 0, 8);
         let id = entity.id;
@@ -1288,8 +1218,10 @@ mod tests {
             .unwrap_err()
             .to_string();
 
-        assert!(err.contains("at 'src/lib.rs' is unavailable"), "{err}");
-        assert!(err.contains("source body cannot be read"), "{err}");
+        assert!(
+            err.contains("source 'src/lib.rs' is absent from repository-v6 workspace"),
+            "{err}"
+        );
     }
 
     #[test]

@@ -279,8 +279,7 @@ fn log_peels_detached_annotated_tag_only_through_admitted_cas() {
     assert!(init_payload["default_ref"].is_null());
     assert_eq!(init_payload["raw_git_head"]["type"], "direct");
     assert_eq!(
-        init_payload["raw_git_head"]["object"]["kind"],
-        "tag",
+        init_payload["raw_git_head"]["object"]["kind"], "tag",
         "raw detached tag identity was not preserved"
     );
     let before = require_kin_json(&repo, &home, &["log", "--json"]);

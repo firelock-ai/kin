@@ -29,7 +29,8 @@ use kin_index::{
 };
 use kin_model::review::{RiskLevel, RiskSummary};
 use kin_model::{
-    Entity, FileLayout, FilePathId, GraphNodeId, ImportSection, ParseCompleteness, RelationKind,
+    ArtifactId, Entity, FileLayout, FilePathId, GraphNodeId, Hash256, ImportSection,
+    ParseCompleteness, RelationKind, RepoPath, ResolvedArtifact, ResolvedTree, TreeEntry,
 };
 use kin_parser::{is_call_extraction_incomplete_marker, LanguageAdapter, PythonAdapter};
 use kin_review::{
@@ -114,10 +115,31 @@ fn link_parsed_files_into_graph_with_completeness(
     completeness: FileParseCompletenessMap,
 ) -> (Vec<FileParseData>, Vec<kin_model::Relation>, InMemoryGraph) {
     // Real linker: resolves calls and persists each Calls edge's argument shape.
-    let relations = link_cross_file_with_completeness(&files, &completeness);
+    let artifact_ids: std::collections::HashMap<String, ArtifactId> = files
+        .iter()
+        .map(|file| (file.file_path.clone(), ArtifactId::new()))
+        .collect();
+    let relations = link_cross_file_with_completeness(&files, &artifact_ids, &completeness)
+        .expect("test file paths have graph-assigned artifact identities");
 
     // Persist entities and edges into a real graph store, exactly as ingest does.
-    let graph = InMemoryGraph::new();
+    let mut admitted = artifact_ids.iter().collect::<Vec<_>>();
+    admitted.sort_by(|(left, _), (right, _)| left.cmp(right));
+    let resolved_tree = ResolvedTree::from_artifacts(admitted.into_iter().enumerate().map(
+        |(index, (path, artifact_id))| {
+            let identity_byte =
+                u8::try_from(index + 1).expect("call-shape fixture has fewer than 256 files");
+            ResolvedArtifact::new(
+                *artifact_id,
+                RepoPath::from_utf8(path).expect("valid test repository path"),
+                TreeEntry::blob(Hash256::from_bytes([identity_byte; 32]), false),
+            )
+        },
+    ))
+    .expect("unique admitted test artifacts");
+    let mut snapshot = kin_db::GraphSnapshot::empty();
+    snapshot.resolved_tree = resolved_tree;
+    let graph = InMemoryGraph::from_snapshot(snapshot).expect("open admitted test graph");
     for file in &files {
         graph
             .upsert_file_layout(&FileLayout {
@@ -1006,7 +1028,12 @@ fn e2e_same_caller_all_positional_shapes_remain_neutral_and_deterministic() {
 fn e2e_legacy_serialized_single_shape_evidence_stays_blocking() {
     let files = vec![parse_python("mod.py", SAME_CALLER_POSITIONAL_THEN_KEYWORD)];
     let target = find_entity(&files, "target");
-    let relations = link_cross_file(&files);
+    let artifact_ids = files
+        .iter()
+        .map(|file| (file.file_path.clone(), ArtifactId::new()))
+        .collect();
+    let relations = link_cross_file(&files, &artifact_ids)
+        .expect("test file paths have graph-assigned artifact identities");
     let mut legacy_edge = relations
         .iter()
         .find(|relation| {
