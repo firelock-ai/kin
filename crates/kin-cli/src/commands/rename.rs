@@ -834,11 +834,11 @@ mod tests {
     use super::{build_rename_response, RenameRequest};
     use kin_db::InMemoryGraph;
     use kin_model::{
-        ArtifactDelta, ArtifactDeltaKind, AuthorId, Branch, BranchName, ChangeStore, Entity,
-        EntityId, EntityKind, EntityMetadata, EntityRole, EntityStore, FilePathId,
-        FingerprintAlgorithm, GraphNodeId, Hash256, LanguageId, Relation, RelationId, RelationKind,
-        RelationOrigin, SemanticChange, SemanticChangeId, SemanticFingerprint, SourceSpan,
-        Timestamp, Visibility,
+        AuthorId, Branch, BranchName, ChangeStore, Entity, EntityId, EntityKind, EntityMetadata,
+        EntityRole, EntityStore, FilePathId, FingerprintAlgorithm, GraphNodeId, Hash256,
+        LanguageId, Relation, RelationId, RelationKind, RelationOrigin, SemanticChange,
+        SemanticChangeId, SemanticFingerprint, SourceSpan, Timestamp, TreeDelta, TreeEntry,
+        Visibility,
     };
 
     struct Fixture {
@@ -865,16 +865,14 @@ mod tests {
         graph.create_change(&genesis).unwrap();
 
         let blobs = kin_blobs::BlobStore::new(layout.objects_dir()).unwrap();
-        let mut artifact_deltas = Vec::new();
+        let mut tree_deltas = Vec::new();
         let mut projected_files = Vec::new();
         for (path, content) in graph_files {
             let hash = blobs.write(content.as_bytes()).unwrap();
             let file_id = FilePathId::new(*path);
-            artifact_deltas.push(ArtifactDelta {
+            tree_deltas.push(TreeDelta::Added {
                 file_id: file_id.clone(),
-                kind: ArtifactDeltaKind::Added,
-                old_hash: None,
-                new_hash: Some(Hash256::from_bytes(hash.0)),
+                new_entry: TreeEntry::regular(Hash256::from_bytes(hash.0), false),
             });
             projected_files.push(file_id);
         }
@@ -890,7 +888,7 @@ mod tests {
                 message: "seed graph-owned source".to_string(),
                 entity_deltas: vec![],
                 relation_deltas: vec![],
-                artifact_deltas,
+                tree_deltas,
                 projected_files,
                 spec_link: None,
                 evidence: vec![],

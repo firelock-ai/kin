@@ -191,7 +191,7 @@ fn normalize_checkout_path(path: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kin_model::{ArtifactDelta, ArtifactDeltaKind, AuthorId, SemanticChange, Timestamp};
+    use kin_model::{AuthorId, SemanticChange, Timestamp, TreeDelta};
 
     #[test]
     fn normalizes_relative_path_prefix() {
@@ -260,7 +260,7 @@ mod tests {
             root,
             [(
                 &tracked,
-                SourceEntryKind::File { executable: false },
+                TreeEntryKind::Regular { executable: false },
                 b"new".as_slice(),
             )],
             should_skip_checkout_clean,
@@ -287,7 +287,7 @@ mod tests {
             root,
             [(
                 &tracked,
-                SourceEntryKind::File { executable: false },
+                TreeEntryKind::Regular { executable: false },
                 b"child".as_slice(),
             )],
             should_skip_checkout_clean,
@@ -315,7 +315,7 @@ mod tests {
             root,
             [(
                 &tracked,
-                SourceEntryKind::File { executable: false },
+                TreeEntryKind::Regular { executable: false },
                 b"tracked".as_slice(),
             )],
             should_skip_checkout_clean,
@@ -342,18 +342,14 @@ mod tests {
             message: "exact checkout fixture".to_string(),
             entity_deltas: vec![],
             relation_deltas: vec![],
-            artifact_deltas: vec![
-                ArtifactDelta {
+            tree_deltas: vec![
+                TreeDelta::Added {
                     file_id: FilePathId("a-parent/child.txt".to_string()),
-                    kind: ArtifactDeltaKind::AddedRegularFile,
-                    old_hash: None,
-                    new_hash: Some(valid_hash),
+                    new_entry: TreeEntry::regular(valid_hash, false),
                 },
-                ArtifactDelta {
+                TreeDelta::Added {
                     file_id: FilePathId("z-missing.txt".to_string()),
-                    kind: ArtifactDeltaKind::AddedRegularFile,
-                    old_hash: None,
-                    new_hash: Some(missing_hash),
+                    new_entry: TreeEntry::regular(missing_hash, false),
                 },
             ],
             projected_files: vec![],
@@ -409,11 +405,9 @@ mod tests {
             message: "blocking ancestor fixture".to_string(),
             entity_deltas: vec![],
             relation_deltas: vec![],
-            artifact_deltas: vec![ArtifactDelta {
+            tree_deltas: vec![TreeDelta::Added {
                 file_id: FilePathId("a-parent/child.txt".to_string()),
-                kind: ArtifactDeltaKind::AddedRegularFile,
-                old_hash: None,
-                new_hash: Some(child_hash),
+                new_entry: TreeEntry::regular(child_hash, false),
             }],
             projected_files: vec![],
             spec_link: None,

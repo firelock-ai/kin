@@ -868,10 +868,10 @@ fn read_entity_file_bytes_from_graph(
 mod tests {
     use super::*;
     use kin_model::{
-        ArtifactDelta, ArtifactDeltaKind, AuthorId, Branch, BranchName, ChangeStore, Entity,
-        EntityMetadata, FingerprintAlgorithm, GraphNodeId, Hash256, LanguageId, Relation,
-        RelationId, RelationOrigin, SemanticChange, SemanticChangeId, SemanticFingerprint,
-        SourceSpan, Timestamp, Visibility,
+        AuthorId, Branch, BranchName, ChangeStore, Entity, EntityMetadata, FingerprintAlgorithm,
+        GraphNodeId, Hash256, LanguageId, Relation, RelationId, RelationOrigin, SemanticChange,
+        SemanticChangeId, SemanticFingerprint, SourceSpan, Timestamp, TreeDelta, TreeEntry,
+        Visibility,
     };
     use std::fs;
 
@@ -1116,11 +1116,9 @@ mod tests {
                 message: "add source".to_string(),
                 entity_deltas: vec![],
                 relation_deltas: vec![],
-                artifact_deltas: vec![ArtifactDelta {
+                tree_deltas: vec![TreeDelta::Added {
                     file_id: file_id.clone(),
-                    kind: ArtifactDeltaKind::Added,
-                    old_hash: None,
-                    new_hash: Some(blob_hash),
+                    new_entry: TreeEntry::regular(blob_hash, false),
                 }],
                 projected_files: vec![file_id.clone()],
                 spec_link: None,

@@ -15560,10 +15560,11 @@ mod tests {
     use super::*;
     use kin_model::ArtifactId;
     use kin_model::{
-        ArtifactDelta, ArtifactDeltaKind, AuthorId, ChangeStore, Entity, EntityDelta, EntityId,
-        EntityMetadata, EntityStore, FilePathId, FingerprintAlgorithm, Hash256, LanguageId,
-        OpaqueArtifact, Relation, RelationEvidence, RelationId, RelationKind, RelationOrigin,
-        SemanticChange, SemanticChangeId, SemanticFingerprint, SourceSpan, Timestamp, Visibility,
+        AuthorId, ChangeStore, Entity, EntityDelta, EntityId, EntityMetadata, EntityStore,
+        FilePathId, FingerprintAlgorithm, Hash256, LanguageId, OpaqueArtifact, Relation,
+        RelationEvidence, RelationId, RelationKind, RelationOrigin, SemanticChange,
+        SemanticChangeId, SemanticFingerprint, SourceSpan, Timestamp, TreeDelta, TreeEntry,
+        Visibility,
     };
 
     fn hit(score: f32) -> Vec<FileHit> {
@@ -21191,18 +21192,14 @@ mod tests {
                 EntityDelta::Added(peer.clone()),
             ],
             relation_deltas: vec![],
-            artifact_deltas: vec![
-                ArtifactDelta {
+            tree_deltas: vec![
+                TreeDelta::Added {
                     file_id: a_path.clone(),
-                    kind: ArtifactDeltaKind::Added,
-                    old_hash: None,
-                    new_hash: Some(a_hash_v1),
+                    new_entry: TreeEntry::regular(a_hash_v1, false),
                 },
-                ArtifactDelta {
+                TreeDelta::Added {
                     file_id: b_path.clone(),
-                    kind: ArtifactDeltaKind::Added,
-                    old_hash: None,
-                    new_hash: Some(b_hash_v1),
+                    new_entry: TreeEntry::regular(b_hash_v1, false),
                 },
             ],
             projected_files: vec![a_path.clone(), b_path.clone()],
@@ -21222,18 +21219,16 @@ mod tests {
             message: "modify together".to_string(),
             entity_deltas: vec![],
             relation_deltas: vec![],
-            artifact_deltas: vec![
-                ArtifactDelta {
+            tree_deltas: vec![
+                TreeDelta::Modified {
                     file_id: a_path.clone(),
-                    kind: ArtifactDeltaKind::Modified,
-                    old_hash: Some(a_hash_v1),
-                    new_hash: Some(a_hash_v2),
+                    old_entry: TreeEntry::regular(a_hash_v1, false),
+                    new_entry: TreeEntry::regular(a_hash_v2, false),
                 },
-                ArtifactDelta {
+                TreeDelta::Modified {
                     file_id: b_path.clone(),
-                    kind: ArtifactDeltaKind::Modified,
-                    old_hash: Some(b_hash_v1),
-                    new_hash: Some(b_hash_v2),
+                    old_entry: TreeEntry::regular(b_hash_v1, false),
+                    new_entry: TreeEntry::regular(b_hash_v2, false),
                 },
             ],
             projected_files: vec![a_path.clone(), b_path.clone()],
@@ -22477,7 +22472,7 @@ mod tests {
     }
 
     #[test]
-    fn locate_at_ref_uses_historical_entity_and_artifact_state() {
+    fn locate_at_ref_uses_historical_entity_and_tree_state() {
         let graph = kin_db::InMemoryGraph::new();
         let temp = tempfile::tempdir().unwrap();
         let blob_store = kin_blobs::BlobStore::new(temp.path().join("objects")).unwrap();
@@ -22508,9 +22503,9 @@ mod tests {
         entity_v2.signature = "def processor(value)".to_string();
         entity_v2.fingerprint.signature_hash = Hash256::from_bytes([0x72; 32]);
 
-        let artifact_path = FilePathId::new("docs/api.json");
-        let artifact_v1 = blob_store.write(br#"{"version":"handler guide"}"#).unwrap();
-        let artifact_v2 = blob_store
+        let tree_path = FilePathId::new("docs/api.json");
+        let tree_hash_v1 = blob_store.write(br#"{"version":"handler guide"}"#).unwrap();
+        let tree_hash_v2 = blob_store
             .write(br#"{"version":"processor guide"}"#)
             .unwrap();
 
@@ -22524,13 +22519,11 @@ mod tests {
                 message: "add handler".to_string(),
                 entity_deltas: vec![EntityDelta::Added(entity_v1.clone())],
                 relation_deltas: vec![],
-                artifact_deltas: vec![ArtifactDelta {
-                    file_id: artifact_path.clone(),
-                    kind: ArtifactDeltaKind::Added,
-                    old_hash: None,
-                    new_hash: Some(artifact_v1),
+                tree_deltas: vec![TreeDelta::Added {
+                    file_id: tree_path.clone(),
+                    new_entry: TreeEntry::regular(tree_hash_v1, false),
                 }],
-                projected_files: vec![artifact_path.clone()],
+                projected_files: vec![tree_path.clone()],
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
@@ -22551,13 +22544,12 @@ mod tests {
                     new: entity_v2.clone(),
                 }],
                 relation_deltas: vec![],
-                artifact_deltas: vec![ArtifactDelta {
-                    file_id: artifact_path.clone(),
-                    kind: ArtifactDeltaKind::Modified,
-                    old_hash: Some(artifact_v1),
-                    new_hash: Some(artifact_v2),
+                tree_deltas: vec![TreeDelta::Modified {
+                    file_id: tree_path.clone(),
+                    old_entry: TreeEntry::regular(tree_hash_v1, false),
+                    new_entry: TreeEntry::regular(tree_hash_v2, false),
                 }],
-                projected_files: vec![artifact_path.clone()],
+                projected_files: vec![tree_path.clone()],
                 spec_link: None,
                 evidence: vec![],
                 risk_summary: None,
@@ -22611,8 +22603,8 @@ mod tests {
 
         let rebuilt = kin_core::build_graph_at_ref(&graph, &blob_store, &add_id).unwrap();
         assert_eq!(
-            rebuilt.get_file_hash(&artifact_path.0),
-            Some(*artifact_v1.as_bytes())
+            rebuilt.get_file_hash(&tree_path.0),
+            Some(*tree_hash_v1.as_bytes())
         );
         assert!(
             rebuilt
@@ -22620,8 +22612,8 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|artifact| {
-                    artifact.file_id == artifact_path
-                        && artifact.content_hash == artifact_v1
+                    artifact.file_id == tree_path
+                        && artifact.content_hash == tree_hash_v1
                         && artifact
                             .text_preview
                             .as_deref()
