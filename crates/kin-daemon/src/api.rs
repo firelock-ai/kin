@@ -5494,7 +5494,10 @@ fn fused_match_evidence(
 /// `snippet` is a bounded inline body excerpt (entity granularity only),
 /// projected from graph-owned content via the same body projection
 /// `get_entity_source` uses, so one `semantic_locate` is act-on-able without a
-/// follow-up read; omitted on a graph gap or when `include_snippet` is false.
+/// follow-up read. A graph/tree/blob authority gap fails the tool call instead
+/// of returning an apparently complete hit without its graph-owned body;
+/// snippets are omitted only when `include_snippet` is false or a hit has no
+/// entity body.
 /// Max entity pages retained for a single `semantic_locate` ranking. Bounds the
 /// per-query snippet/projection work while still letting a cursor walk well past
 /// the first page.
@@ -5754,10 +5757,19 @@ fn build_semantic_locate_result(
         }
 
         // Project the bounded snippet from graph-owned content — no working-tree
-        // read; a graph gap yields no snippet rather than a fallback.
+        // read and no silent graph-gap downgrade.
         let snippet = if include_snippet {
             if let kin_db::ResolvedRetrievalItem::Entity(entity) = &item {
-                kin_mcp::handlers::common::read_bounded_entity_snippet(graph, entity)
+                match kin_mcp::handlers::common::read_bounded_entity_snippet(graph, entity) {
+                    Ok(snippet) => snippet,
+                    Err(error) => {
+                        return kin_mcp::ToolCallResult::error(format!(
+                            "semantic_locate could not read graph-owned source for entity {}: \
+                             {error}",
+                            entity.id
+                        ));
+                    }
+                }
             } else {
                 None
             }
