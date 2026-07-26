@@ -633,9 +633,18 @@ impl GcsBackend {
 mod tests {
     use super::*;
     use crate::storage::format::GraphSnapshot;
+    use crate::storage::RepositoryAuthorityManager;
     use async_trait::async_trait;
     use futures_util::stream::BoxStream;
     use futures_util::StreamExt;
+    use kin_model::{
+        compute_resolved_tree_hash, AdmissionScanToken, AuthorId, DefaultRefExpectation,
+        DefaultRefMutation, EffectiveAdmissionPolicyStamp, FrozenLocalOverlay,
+        FrozenLocalOverlayDelta, OperationId, RefName, RepositoryId, RepositoryTransaction,
+        ResolvedTree, SharedAdmissionPolicy, WorkspaceExpectation, WorkspaceHead, WorkspaceId,
+        WorkspaceMutation, ADMISSION_POLICY_SEMANTICS_VERSION,
+        REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+    };
     use object_store::memory::InMemory;
     use object_store::{
         CopyOptions, GetResult, ListResult, MultipartUpload, PutMultipartOptions, PutResult,
@@ -842,6 +851,70 @@ mod tests {
 
     fn source_digest(data: &[u8]) -> [u8; 32] {
         Sha256::digest(data).into()
+    }
+
+    fn unborn_authority_transaction(
+        manager: &RepositoryAuthorityManager<GcsBackend>,
+        repository_id: &RepositoryId,
+        workspace_id: WorkspaceId,
+        publish_default_ref: bool,
+    ) -> RepositoryTransaction {
+        let default_ref = RefName::branch(b"main").unwrap();
+        let head = WorkspaceHead::Symbolic {
+            target: default_ref.clone(),
+        };
+        let tree_hash = compute_resolved_tree_hash(&ResolvedTree::default()).unwrap();
+        let shared = SharedAdmissionPolicy::empty(0);
+        let overlay = FrozenLocalOverlay::new(workspace_id, 0, Vec::new()).unwrap();
+        let policy = EffectiveAdmissionPolicyStamp {
+            shared: shared.stamp(),
+            local: overlay.stamp(),
+        };
+        let workspace_mutation = WorkspaceMutation {
+            workspace_id,
+            expected: WorkspaceExpectation::MustNotExist,
+            new_generation: 0,
+            new_head: head.clone(),
+            new_base_target: None,
+            new_base_tree_hash: None,
+            tree_deltas: Vec::new(),
+            new_tree_hash: tree_hash,
+            new_shared_admission_policy: shared,
+            new_admission_policy: policy,
+        };
+        let lease = manager.read_authority();
+        let transaction = RepositoryTransaction {
+            schema_version: REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+            operation_id: OperationId::new(),
+            repository_id: repository_id.clone(),
+            expected_generation: lease.roots().generation,
+            expected_roots: lease.roots().clone(),
+            actor: AuthorId::new("gcs-authority-test"),
+            reason: "publish an exact unborn GCS workspace".to_string(),
+            external_objects: Vec::new(),
+            changes: Vec::new(),
+            aliases: Vec::new(),
+            ref_mutations: Vec::new(),
+            default_ref_mutation: publish_default_ref.then_some(DefaultRefMutation {
+                expected: DefaultRefExpectation::MustBeUnset,
+                new_default: Some(default_ref),
+            }),
+            workspace_mutation: Some(workspace_mutation),
+            local_overlay_delta: Some(FrozenLocalOverlayDelta::initialize(overlay)),
+            admission_scan_token: Some(AdmissionScanToken {
+                repository_id: repository_id.clone(),
+                workspace_id,
+                workspace_generation: 0,
+                workspace_head: head,
+                baseline_tree_hash: tree_hash,
+                observed_tree_hash: tree_hash,
+                matcher_semantics_version: ADMISSION_POLICY_SEMANTICS_VERSION,
+                shared_policy: policy.shared,
+                local_overlay: policy.local,
+            }),
+        };
+        drop(lease);
+        transaction
     }
 
     #[test]
@@ -1123,6 +1196,70 @@ mod tests {
             final_recovery.snapshot.resolved_tree,
             after_reopen.resolved_tree
         );
+    }
+
+    #[test]
+    fn repository_authority_separates_logical_generation_from_gcs_version() {
+        let store = Arc::new(VersionedMemoryStore::new());
+        let repository_id = RepositoryId::new("gcs-authority-repo").unwrap();
+        let backend = Arc::new(GcsBackend::from_store(
+            Box::new(Arc::clone(&store)),
+            "fixture",
+        ));
+        let stale_backend = Arc::new(GcsBackend::from_store(
+            Box::new(Arc::clone(&store)),
+            "fixture",
+        ));
+        let manager =
+            RepositoryAuthorityManager::open(repository_id.clone(), Arc::clone(&backend)).unwrap();
+        let stale = RepositoryAuthorityManager::open(repository_id.clone(), stale_backend).unwrap();
+        let stale_transaction =
+            unborn_authority_transaction(&stale, &repository_id, WorkspaceId::new(), false);
+
+        let first =
+            unborn_authority_transaction(&manager, &repository_id, WorkspaceId::new(), true);
+        let receipt = manager.commit_repository_transaction(first).unwrap();
+        assert_eq!(receipt.generation, 1);
+        assert_eq!(
+            backend
+                .load_snapshot(repository_id.as_str())
+                .unwrap()
+                .unwrap()
+                .1,
+            100,
+            "provider-assigned version is deliberately not Kin generation 1"
+        );
+
+        stale
+            .commit_repository_transaction(stale_transaction)
+            .expect_err("a manager holding the pre-create GCS cursor must lose CAS");
+        assert_eq!(stale.read_authority().roots().generation, 0);
+
+        let reopened_backend = Arc::new(GcsBackend::from_store(
+            Box::new(Arc::clone(&store)),
+            "fixture",
+        ));
+        let reopened =
+            RepositoryAuthorityManager::open(repository_id.clone(), Arc::clone(&reopened_backend))
+                .unwrap();
+        assert_eq!(reopened.read_authority().roots().generation, 1);
+
+        let second =
+            unborn_authority_transaction(&reopened, &repository_id, WorkspaceId::new(), false);
+        let receipt = reopened.commit_repository_transaction(second).unwrap();
+        assert_eq!(receipt.generation, 2);
+        assert_eq!(
+            reopened_backend
+                .load_snapshot(repository_id.as_str())
+                .unwrap()
+                .unwrap()
+                .1,
+            101
+        );
+
+        let final_backend = Arc::new(GcsBackend::from_store(Box::new(store), "fixture"));
+        let final_manager = RepositoryAuthorityManager::open(repository_id, final_backend).unwrap();
+        assert_eq!(final_manager.read_authority().roots().generation, 2);
     }
 
     #[test]

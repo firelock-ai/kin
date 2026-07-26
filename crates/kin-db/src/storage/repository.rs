@@ -14,6 +14,8 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
+use parking_lot::Mutex;
+
 use kin_model::{
     AuthorId, AuthorityRoot, ChangeStore, DefaultRefExpectation, DefaultRefMutation,
     ExternalChangeAlias, ExternalObjectId, ExternalObjectKind, ExternalObjectRecord,
@@ -33,7 +35,7 @@ use crate::storage::authority::{
 };
 use crate::storage::backend::{
     load_recovered_snapshot, validate_source_blob_size, verify_source_blob_digest, Generation,
-    StorageBackend, MAX_SOURCE_BLOB_BYTES,
+    StorageBackend, GENERATION_INIT, MAX_SOURCE_BLOB_BYTES,
 };
 use crate::storage::format::GraphSnapshot;
 
@@ -300,6 +302,13 @@ impl VersionedAuthorityState for RepositoryAuthorityState {
 struct RepositorySnapshotPersistence<B: StorageBackend + ?Sized> {
     backend: Arc<B>,
     repository_id: RepositoryId,
+    /// Backend CAS cursor, not the logical repository generation.
+    ///
+    /// GCS object generations are provider-assigned opaque versions (for
+    /// example 100, 101, ...), while `RootBundle::generation` is Kin's
+    /// contiguous logical sequence (0, 1, ...). They must never be compared
+    /// or substituted for one another.
+    backend_version: Mutex<Generation>,
 }
 
 impl<B: StorageBackend + ?Sized + 'static> DurableAuthorityPersistence<RepositoryAuthorityState>
@@ -307,19 +316,15 @@ impl<B: StorageBackend + ?Sized + 'static> DurableAuthorityPersistence<Repositor
 {
     fn persist(
         &self,
-        expected_generation: Generation,
+        _expected_logical_generation: Generation,
         next: &RepositoryAuthorityState,
     ) -> Result<(), KinDbError> {
         let bytes = next.snapshot.to_bytes()?;
-        let generation =
+        let mut backend_version = self.backend_version.lock();
+        let next_backend_version =
             self.backend
-                .save_snapshot(self.repository_id.as_str(), &bytes, expected_generation)?;
-        if generation != next.generation() {
-            return Err(storage(format!(
-                "backend acknowledged generation {generation}, but repository envelope is generation {}",
-                next.generation()
-            )));
-        }
+                .save_snapshot(self.repository_id.as_str(), &bytes, *backend_version)?;
+        *backend_version = next_backend_version;
         Ok(())
     }
 }
@@ -340,7 +345,7 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
     /// Open existing authority or prepare an unpersisted generation-zero repo.
     pub fn open(repository_id: RepositoryId, backend: Arc<B>) -> Result<Self, KinDbError> {
         let recovered = load_recovered_snapshot(backend.as_ref(), repository_id.as_str())?;
-        let snapshot = if let Some(recovered) = recovered {
+        let (snapshot, backend_version) = if let Some(recovered) = recovered {
             if recovered.deltas_seen != 0 {
                 return Err(storage(format!(
                     "repository {} has an incremental graph journal; repository authority requires full-snapshot CAS only",
@@ -363,20 +368,14 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
                     metadata.repository_id, repository_id
                 )));
             }
-            if metadata.roots.generation != recovered.generation {
-                return Err(storage(format!(
-                    "snapshot backend generation {} disagrees with root generation {}",
-                    recovered.generation, metadata.roots.generation
-                )));
-            }
-            recovered.snapshot
+            (recovered.snapshot, recovered.generation)
         } else {
             let mut snapshot = GraphSnapshot::empty();
             snapshot.repository_authority = Some(PersistedRepositoryAuthority::empty(
                 repository_id.clone(),
                 &snapshot,
             )?);
-            snapshot
+            (snapshot, GENERATION_INIT)
         };
 
         snapshot.validate_storage_admission()?;
@@ -388,6 +387,7 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
         let persistence = RepositorySnapshotPersistence {
             backend: Arc::clone(&backend),
             repository_id: repository_id.clone(),
+            backend_version: Mutex::new(backend_version),
         };
         Ok(Self {
             repository_id,
