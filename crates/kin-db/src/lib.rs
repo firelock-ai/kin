@@ -55,4 +55,4 @@ pub use store::{
 };
 pub use types::*;
 #[cfg(feature = "vector")]
-pub use vector::VectorIndex;
+pub use vector::{IndexDescriptor, VectorIndex, VectorIndexLoad};
