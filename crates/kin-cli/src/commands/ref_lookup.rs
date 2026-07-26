@@ -360,11 +360,27 @@ where
     let entities = graph
         .query_entities(&filter)
         .map_err(|err| anyhow!(err.to_string()))?;
-    choose_entity_match(entities, entity_query).or_else(|_| {
-        let all = graph
+    choose_entity_match(entities, entity_query).or_else(|primary| {
+        // The store-side name_pattern filter and the local matcher do not agree
+        // on every query shape, so a whole-graph sweep is the backstop. It must
+        // still be narrowed to the query: handing choose_entity_match an
+        // unfiltered graph makes it report the first five entities
+        // alphabetically as "matches", which is how `kin history alwaysTrue`
+        // came back with "Multiple entities match 'alwaysTrue': AND_THEN,
+        // AND_WHEN, ANON_TEST_CASE, Approx". None of those contain the query.
+        let narrowed = graph
             .list_all_entities()
-            .map_err(|err| anyhow!(err.to_string()))?;
-        choose_entity_match(all, entity_query)
+            .map_err(|err| anyhow!(err.to_string()))?
+            .into_iter()
+            .filter(|entity| entity_matches_query(entity, entity_query))
+            .collect::<Vec<_>>();
+        if narrowed.is_empty() {
+            // Nothing in the graph matches, so the first attempt's message is
+            // the accurate one. Surfacing a second, wider failure here would
+            // bury it.
+            return Err(primary);
+        }
+        choose_entity_match(narrowed, entity_query)
     })
 }
 
@@ -999,6 +1015,72 @@ mod tests {
         walk(root, &mut files);
         files.sort();
         files
+    }
+
+    fn named_entity(name: &str) -> Entity {
+        use kin_model::{
+            EntityId, EntityKind, EntityMetadata, EntityRole, FilePathId, FingerprintAlgorithm,
+            Hash256, LanguageId, SemanticFingerprint, Visibility,
+        };
+        Entity {
+            id: EntityId::new(),
+            kind: EntityKind::Function,
+            name: name.to_string(),
+            language: LanguageId::Rust,
+            fingerprint: SemanticFingerprint {
+                algorithm: FingerprintAlgorithm::V1TreeSitter,
+                ast_hash: Hash256::from_bytes([0; 32]),
+                signature_hash: Hash256::from_bytes([1; 32]),
+                behavior_hash: Hash256::from_bytes([2; 32]),
+                equivalence_hash: Hash256::from_bytes([0; 32]),
+                stability_score: 1.0,
+            },
+            file_origin: Some(FilePathId::new("src/lib.rs")),
+            span: None,
+            signature: format!("fn {name}()"),
+            visibility: Visibility::Public,
+            role: EntityRole::Source,
+            doc_summary: None,
+            metadata: EntityMetadata::default(),
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        }
+    }
+
+    /// `resolve_entity_query` sweeps the whole graph when the store-side name
+    /// filter comes back unusable. That sweep must still be narrowed to the
+    /// query. It previously was not, so `choose_entity_match` received every
+    /// entity in the repo and reported the first five alphabetically as
+    /// "matches" — `kin history alwaysTrue` answered "Multiple entities match
+    /// 'alwaysTrue': AND_THEN, AND_WHEN, ANON_TEST_CASE, Approx", none of which
+    /// contain the query.
+    #[test]
+    fn whole_graph_fallback_stays_narrowed_to_the_query() {
+        use kin_model::EntityStore;
+        let graph = InMemoryGraph::new();
+        for name in [
+            "AND_THEN",
+            "AND_WHEN",
+            "ANON_TEST_CASE",
+            "Approx",
+            "alwaysTrue",
+            "alwaysFalse",
+        ] {
+            graph.upsert_entity(&named_entity(name)).unwrap();
+        }
+
+        let resolved = resolve_entity_query(&graph, "alwaysTrue")
+            .expect("an exact name present in the graph must resolve");
+        assert_eq!(resolved.name, "alwaysTrue");
+
+        let err = resolve_entity_query(&graph, "definitely_not_here")
+            .expect_err("a query matching nothing must fail");
+        let message = err.to_string();
+        assert!(
+            !message.contains("AND_THEN") && !message.contains("Approx"),
+            "an unmatched query must not list unrelated entities as matches, got: {message}"
+        );
     }
 
     fn temp_layout() -> kin_core::KinLayout {

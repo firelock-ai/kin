@@ -47,6 +47,56 @@ impl PreparedHistoryRequest {
     }
 }
 
+/// Twelve hex characters, matching the width Kin already uses when it echoes a
+/// change range back to the operator.
+fn abbreviate_id(id: &str) -> String {
+    id.chars().take(12).collect()
+}
+
+/// The first non-empty line of a commit message. Git calls this the subject and
+/// renders exactly this in `--oneline`; the body belongs in a detail view, not
+/// in a one-row-per-revision list.
+fn subject_line(message: &str) -> String {
+    message
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("(no message)")
+        .to_string()
+}
+
+/// `YYYY-MM-DD` from an ISO-8601 timestamp. The clock time costs eleven columns
+/// and tells you nothing an entity history is asked for; the date is what makes
+/// a gap between two revisions legible.
+fn calendar_date(timestamp: &str) -> String {
+    timestamp
+        .split('T')
+        .next()
+        .filter(|date| date.len() == 10)
+        .unwrap_or(timestamp)
+        .to_string()
+}
+
+/// Drop the `<email>` from a git-style author. The name identifies the person;
+/// the address just eats the column and then gets ellipsized anyway.
+fn author_name(author: &str) -> String {
+    author
+        .split('<')
+        .next()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .unwrap_or(author)
+        .to_string()
+}
+
+fn truncate(value: &str, width: usize) -> String {
+    if value.chars().count() <= width {
+        return value.to_string();
+    }
+    let kept: String = value.chars().take(width.saturating_sub(1)).collect();
+    format!("{kept}…")
+}
+
 pub async fn run(entity: String, reference: Option<String>) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
@@ -115,9 +165,16 @@ pub fn render_prepared_history_request(
         }
         None => crate::commands::ref_lookup::resolve_entity_query(graph, &request.entity)?,
     };
+    // Identifiers are abbreviated and messages are reduced to their subject
+    // line, the way `git log --oneline` does. Printing two full 64-character
+    // hashes per row plus a whole commit body pushed every readable field off
+    // the right edge and turned a three-entry history into a wall of hex.
     let mut lines = vec![format!(
         "History for '{}' ({:?}, {}) at {}:",
-        target.name, target.kind, target.language, head
+        target.name,
+        target.kind,
+        target.language,
+        abbreviate_id(&head.to_string())
     )];
 
     let revisions = graph.get_entity_revisions_at(&target.id, &head)?;
@@ -126,13 +183,20 @@ pub fn render_prepared_history_request(
     } else {
         for revision in &revisions {
             let change = graph.get_change(&revision.introduced_by)?;
-            let message = change
-                .as_ref()
-                .map(|entry| entry.message.as_str())
-                .unwrap_or("unknown");
+            let (when, who, subject) = match change.as_ref() {
+                Some(entry) => (
+                    calendar_date(&entry.timestamp.to_string()),
+                    author_name(&entry.author.to_string()),
+                    subject_line(&entry.message),
+                ),
+                None => ("?".to_string(), "?".to_string(), "unknown".to_string()),
+            };
             lines.push(format!(
-                "  {} @ {} - {}",
-                revision.revision_id, revision.introduced_by, message
+                "  {}  {:<10}  {:<20}  {}",
+                abbreviate_id(&revision.introduced_by.to_string()),
+                when,
+                truncate(&who, 20),
+                subject
             ));
         }
     }
