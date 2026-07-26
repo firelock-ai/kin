@@ -122,9 +122,9 @@ Public Git history is part of the product, so keep it clean and reviewable:
 - **Keep private context private.** Do not publish private session URLs or IDs,
   secrets, or internal-only tracker references. Put non-sensitive technical
   context in the pull request.
-- **Preserve provenance.** Tool-specific attribution is optional. Existing
-  attribution must not be stripped, and authors, committers, timestamps, and
-  history must not be rewritten.
+- **Preserve provenance.** Tool-specific attribution is optional and is not
+  required. Hooks must not add, remove, or rewrite it, or rewrite authors,
+  committers, timestamps, or history.
 - **Use hooks only for validation.** Hooks may reject private references or
   secrets, but they must not mutate commit metadata or history. Do not skip
   configured validation with `--no-verify`.
