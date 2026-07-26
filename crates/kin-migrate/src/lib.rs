@@ -23,9 +23,7 @@ pub mod strategy;
 
 pub use error::{MigrateError, Result};
 pub use executor::{execute_migration_persisted, MigrationResult};
-pub use finalize::{
-    build_and_save_kidx, ensure_eject_snapshot, trigger_lsp_sweep, update_registry,
-};
+pub use finalize::{build_and_save_kidx, trigger_lsp_sweep, update_registry};
 pub use forge::{configure_forge_remote, detect_forge, ForgeInfo, ForgeKind};
 pub use scanner::{scan_repo, RepoScan};
 pub use strategy::{plan_migration, MigrationPlan, MigrationStrategy};
