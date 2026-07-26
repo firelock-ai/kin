@@ -14,9 +14,11 @@
 
 pub mod error;
 pub mod lossless;
+pub mod semantic_import;
 
 pub use error::{GitError, Result};
 pub use lossless::{
     capture_lossless_git_repository, rehydrate_lossless_git_repository, GitObjectFormat,
     GitRehydrationResult, LosslessGitRepository,
 };
+pub use semantic_import::{plan_semantic_git_import, GitWorkspaceSeed, SemanticGitImportPlan};
