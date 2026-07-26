@@ -12,7 +12,64 @@ test('all schemas load', async () => {
   assert.ok(schemas.kinCommandResult);
   assert.ok(schemas.scmSnapshot);
   assert.ok(schemas.scmResourceGroups);
+  assert.ok(schemas.mcpArtifactReadInput);
   assert.ok(schemas.shadowGateReport);
+});
+
+test('exact MCP artifact reads accept lossless paths and reject lossy selectors', async () => {
+  const sourceChangeId = 'a'.repeat(64);
+  const artifactId = '3fa85f64-5717-4562-b3fc-2c963f66afa6';
+  const nonUtf8Path = { bytes_hex: '6173736574732fff7061796c6f61642e62696e' };
+
+  assert.equal(
+    (await validateContract('mcpArtifactReadInput', {
+      artifact_id: artifactId,
+      source_change_id: sourceChangeId
+    })).ok,
+    true
+  );
+  assert.equal(
+    (await validateContract('mcpArtifactReadInput', {
+      path: nonUtf8Path,
+      source_change_id: sourceChangeId
+    })).ok,
+    true
+  );
+  assert.equal(
+    (await validateContract('mcpArtifactReadInput', {
+      artifact_id: artifactId,
+      path: nonUtf8Path,
+      source_change_id: sourceChangeId
+    })).ok,
+    true,
+    'callers may bind both identity and location for an exact coherence check'
+  );
+
+  assert.equal(
+    (await validateContract('mcpArtifactReadInput', {
+      path: { display: 'assets/�payload.bin' }
+    })).ok,
+    false
+  );
+  assert.equal(
+    (await validateContract('mcpArtifactReadInput', {
+      path: { bytes_hex: 'FF' }
+    })).ok,
+    false
+  );
+  assert.equal(
+    (await validateContract('mcpArtifactReadInput', {
+      source_change_id: sourceChangeId
+    })).ok,
+    false
+  );
+  assert.equal(
+    (await validateContract('mcpArtifactReadInput', {
+      artifact_id: artifactId,
+      fallback_path: 'assets/payload.bin'
+    })).ok,
+    false
+  );
 });
 
 test('shadow gate report contract accepts the kin review shadow payload shape', async () => {

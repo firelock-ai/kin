@@ -8,6 +8,54 @@ pub fn tool_definitions() -> ToolsListResult {
     ToolsListResult {
         tools: vec![
             ToolDefinition {
+                name: "kin_artifact_list".into(),
+                description: crate::handlers::artifacts::ARTIFACT_LIST_DESC.into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "source_change_id": {
+                            "type": "string",
+                            "pattern": "^[0-9a-f]{64}$",
+                            "description": "Exact semantic change ID. Defaults to the current branch head."
+                        },
+                        "offset": { "type": "integer", "minimum": 0, "default": 0 },
+                        "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 200 }
+                    },
+                    "additionalProperties": false
+                }),
+            },
+            ToolDefinition {
+                name: "kin_artifact_read".into(),
+                description: crate::handlers::artifacts::ARTIFACT_READ_DESC.into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "artifact_id": { "type": "string", "format": "uuid" },
+                        "path": {
+                            "type": "object",
+                            "properties": {
+                                "bytes_hex": {
+                                    "type": "string",
+                                    "pattern": "^(?:[0-9a-f]{2})+$"
+                                }
+                            },
+                            "required": ["bytes_hex"],
+                            "additionalProperties": false
+                        },
+                        "source_change_id": {
+                            "type": "string",
+                            "pattern": "^[0-9a-f]{64}$",
+                            "description": "Exact semantic change ID. Defaults to the current branch head."
+                        }
+                    },
+                    "anyOf": [
+                        { "required": ["artifact_id"] },
+                        { "required": ["path"] }
+                    ],
+                    "additionalProperties": false
+                }),
+            },
+            ToolDefinition {
                 name: "semantic_search".into(),
                 description: crate::handlers::entities::SEMANTIC_SEARCH_DESC.into(),
                 input_schema: serde_json::json!({
@@ -980,6 +1028,8 @@ pub fn benchmark_tool_names() -> &'static [&'static str] {
 /// Tool names for the small default agent profile.
 pub fn agent_default_tool_names() -> &'static [&'static str] {
     &[
+        "kin_artifact_list",
+        "kin_artifact_read",
         "kin_graph_status",
         "semantic_locate",
         "semantic_search",
@@ -1008,6 +1058,8 @@ pub fn agent_default_tool_names() -> &'static [&'static str] {
 /// `get_entity_source`/`get_context_pack` — all without ever touching a file.
 pub fn context_bench_tool_names() -> &'static [&'static str] {
     &[
+        "kin_artifact_list",
+        "kin_artifact_read",
         "kin_graph_status",
         "semantic_locate",
         "semantic_search",
@@ -1066,8 +1118,8 @@ mod tests {
     fn expected_tool_count() {
         let list = tool_definitions();
         // 54 + 5 transaction tools + 1 semantic_locate + 1 shadow_gate_report
-        // + 1 get_entity_sources = 62
-        assert_eq!(list.tools.len(), 62);
+        // + 1 get_entity_sources + 2 exact artifact tools = 64
+        assert_eq!(list.tools.len(), 64);
     }
 
     #[test]

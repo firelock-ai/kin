@@ -23,6 +23,7 @@ const schemaFiles = {
   intent: 'intent.schema.json',
   intentConflict: 'intent-conflict.schema.json',
   trafficReport: 'traffic-report.schema.json',
+  mcpArtifactReadInput: 'mcp-artifact-read-input.schema.json',
   shadowGateReport: 'shadow-gate-report.schema.json'
 };
 
@@ -115,6 +116,25 @@ function validateAgainstSchema(schema, value, schemas, pointer, errors, rootSche
       errors.push(`${pointer}: expected exactly one matching schema`);
     }
     return;
+  }
+
+  if (schema.anyOf) {
+    const matched = schema.anyOf.some(candidate => {
+      const candidateErrors = [];
+      validateAgainstSchema(
+        candidate,
+        value,
+        schemas,
+        pointer,
+        candidateErrors,
+        rootSchema
+      );
+      return candidateErrors.length === 0;
+    });
+    if (!matched) {
+      errors.push(`${pointer}: expected at least one matching schema`);
+      return;
+    }
   }
 
   if (schema.type !== undefined && !matchesType(schema.type, value)) {
