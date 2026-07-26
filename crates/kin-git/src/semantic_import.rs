@@ -15,11 +15,11 @@ use chrono::{DateTime, Utc};
 use kin_blobs::BlobStore;
 use kin_model::{
     compute_resolved_tree_hash, compute_semantic_change_id, validate_semantic_change_id,
-    ArtifactId, AuthorId, ChangeOrigin, DefaultRefExpectation, DefaultRefMutation,
+    ArtifactId, AuthorId, ChangeOrigin, DefaultRefExpectation, DefaultRefMutation, EntityDelta,
     ExternalChangeAlias, ExternalObjectId, ExternalObjectKind, ExternalObjectRecord, GitObjectId,
-    Hash256, RefExpectation, RefMutation, RefName, RefTarget, RefUpdatePolicy, RepositoryId,
-    RepositoryRefState, ResolvedArtifact, ResolvedTree, SemanticChange, SemanticChangeId,
-    Timestamp, TreeDelta, TreeEntry, WorkspaceHead,
+    Hash256, RefExpectation, RefMutation, RefName, RefTarget, RefUpdatePolicy, RelationDelta,
+    RepositoryId, RepositoryRefState, ResolvedArtifact, ResolvedTree, SemanticChange,
+    SemanticChangeId, Timestamp, TreeDelta, TreeEntry, WorkspaceHead,
 };
 use uuid::Uuid;
 
@@ -86,7 +86,40 @@ impl SemanticGitImportPlan {
             refs: self.refs.clone(),
             head: self.head.clone(),
         };
-        let rebuilt = build_semantic_git_import_plan(&snapshot, blob_store)?;
+        let base = build_semantic_git_import_plan(&snapshot, blob_store)?;
+        let mut by_oid = BTreeMap::new();
+        for change in &self.changes {
+            let ChangeOrigin::GitCommit { oid } = change.origin else {
+                return Err(GitError::InvalidSnapshot(
+                    "semantic Git import contains a native-origin change".to_string(),
+                ));
+            };
+            if by_oid.insert(oid, change).is_some() {
+                return Err(GitError::InvalidSnapshot(format!(
+                    "semantic Git import repeats commit {oid}"
+                )));
+            }
+        }
+        let deltas = base
+            .changes
+            .iter()
+            .map(|base_change| {
+                let ChangeOrigin::GitCommit { oid } = base_change.origin else {
+                    unreachable!("the exact Git planner only emits Git-origin changes");
+                };
+                let enriched = by_oid.get(&oid).ok_or_else(|| {
+                    GitError::InvalidSnapshot(format!(
+                        "semantic Git import is missing enriched commit {oid}"
+                    ))
+                })?;
+                Ok((
+                    base_change.id,
+                    enriched.entity_deltas.clone(),
+                    enriched.relation_deltas.clone(),
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let rebuilt = apply_historical_semantic_deltas_unchecked(base, &deltas)?;
         if rebuilt != *self {
             return Err(GitError::InvalidSnapshot(
                 "semantic Git import plan does not match its deterministic raw-object derivation"
@@ -94,6 +127,30 @@ impl SemanticGitImportPlan {
             ));
         }
         Ok(())
+    }
+
+    /// Bind deterministic CAS-native semantic deltas and recompute every
+    /// change identity, parent edge, and external alias in parent-first order.
+    pub fn with_historical_semantics(
+        self,
+        blob_store: &BlobStore,
+        deltas: &[(SemanticChangeId, Vec<EntityDelta>, Vec<RelationDelta>)],
+    ) -> Result<Self> {
+        let snapshot = LosslessGitRepository {
+            repository_id: self.repository_id.clone(),
+            object_format: self.object_format,
+            objects: self.external_objects.clone(),
+            refs: self.refs.clone(),
+            head: self.head.clone(),
+        };
+        let exact = build_semantic_git_import_plan(&snapshot, blob_store)?;
+        if exact != self {
+            return Err(GitError::InvalidSnapshot(
+                "historical semantics may only be bound to the exact unenriched import plan"
+                    .to_string(),
+            ));
+        }
+        apply_historical_semantic_deltas_unchecked(self, deltas)
     }
 }
 
@@ -103,6 +160,75 @@ pub fn plan_semantic_git_import(
     blob_store: &BlobStore,
 ) -> Result<SemanticGitImportPlan> {
     build_semantic_git_import_plan(snapshot, blob_store)
+}
+
+fn apply_historical_semantic_deltas_unchecked(
+    mut plan: SemanticGitImportPlan,
+    deltas: &[(SemanticChangeId, Vec<EntityDelta>, Vec<RelationDelta>)],
+) -> Result<SemanticGitImportPlan> {
+    let mut delta_by_change = BTreeMap::new();
+    for (change_id, entity_deltas, relation_deltas) in deltas {
+        if delta_by_change
+            .insert(*change_id, (entity_deltas, relation_deltas))
+            .is_some()
+        {
+            return Err(GitError::InvalidSnapshot(format!(
+                "historical semantic deltas repeat change {}",
+                change_id
+            )));
+        }
+    }
+    if delta_by_change.len() != plan.changes.len() {
+        return Err(GitError::InvalidSnapshot(format!(
+            "historical semantic delta count {} does not match change count {}",
+            delta_by_change.len(),
+            plan.changes.len()
+        )));
+    }
+
+    let mut old_to_new = BTreeMap::<SemanticChangeId, SemanticChangeId>::new();
+    let mut changes = Vec::with_capacity(plan.changes.len());
+    let mut aliases = Vec::with_capacity(plan.changes.len());
+    for mut change in plan.changes {
+        let old_id = change.id;
+        let delta = delta_by_change.remove(&old_id).ok_or_else(|| {
+            GitError::InvalidSnapshot(format!("historical semantic deltas omit change {old_id}"))
+        })?;
+        change.parents = change
+            .parents
+            .iter()
+            .map(|parent| {
+                old_to_new.get(parent).copied().ok_or_else(|| {
+                    GitError::InvalidSnapshot(format!(
+                        "parent {parent} was not reidentified before change {old_id}"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        change.entity_deltas = delta.0.clone();
+        change.relation_deltas = delta.1.clone();
+        change.id = placeholder_change_id();
+        change.id = compute_semantic_change_id(&change)?;
+        validate_semantic_change_id(&change)?;
+        let ChangeOrigin::GitCommit { oid } = change.origin else {
+            return Err(GitError::InvalidSnapshot(
+                "semantic Git import contains a native-origin change".to_string(),
+            ));
+        };
+        let alias = ExternalChangeAlias::new(plan.repository_id.clone(), oid, change.id);
+        alias.validate_change(&change)?;
+        old_to_new.insert(old_id, change.id);
+        changes.push(change);
+        aliases.push(alias);
+    }
+    if !delta_by_change.is_empty() {
+        return Err(GitError::InvalidSnapshot(
+            "historical semantic deltas contain unknown changes".to_string(),
+        ));
+    }
+    plan.changes = changes;
+    plan.aliases = aliases;
+    Ok(plan)
 }
 
 #[derive(Debug, Clone)]
