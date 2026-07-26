@@ -16,8 +16,8 @@ use kin_model::{
     compute_resolved_tree_hash, compute_semantic_change_id, AuthorId, ChangeOrigin,
     EffectiveAdmissionPolicyStamp, Hash256, ModelError, OperationId, RefExpectation, RefMutation,
     RefName, RefTarget, RefUpdatePolicy, RepositoryCommitReceipt, RepositoryId,
-    RepositoryTransaction, SemanticChange, SemanticChangeId, SharedAdmissionPolicy, Timestamp,
-    WorkspaceExpectation, WorkspaceHead, WorkspaceId, WorkspaceMutation,
+    RepositoryTransaction, RootBundle, SemanticChange, SemanticChangeId, SharedAdmissionPolicy,
+    Timestamp, WorkspaceExpectation, WorkspaceHead, WorkspaceId, WorkspaceMutation,
     REPOSITORY_TRANSACTION_SCHEMA_VERSION,
 };
 
@@ -49,6 +49,18 @@ pub struct NativeCommitResult {
     pub entity_count: usize,
     pub relation_count: usize,
     pub file_count: usize,
+}
+
+/// One coherent, clean workspace authority base for a prospective native
+/// commit.
+///
+/// The graph is materialized from the workspace lease, not from the daemon's
+/// mutable query overlay. `roots` must still match when the final plan is
+/// constructed; repository publication independently repeats the same CAS.
+pub struct NativeCommitBase {
+    pub graph: kin_db::InMemoryGraph,
+    pub roots: RootBundle,
+    pub tree: kin_model::ResolvedTree,
 }
 
 /// Result of durably admitting one exact working-tree transition.
@@ -212,12 +224,70 @@ pub fn plan_native_commit(
     author: AuthorId,
     message: String,
 ) -> Result<NativeCommitPlan> {
+    plan_native_commit_inner(
+        layout,
+        graph,
+        blobs,
+        operation_id,
+        timestamp,
+        author,
+        message,
+        None,
+    )
+}
+
+/// Construct one exact native transaction against the authority generation
+/// from which `base` was materialized.
+///
+/// This closes the read-plan race where a caller could build a prospective
+/// graph from generation N while the generic planner silently based its delta
+/// on generation N+1. Publication still performs the storage CAS, so a move
+/// after planning also fails closed.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_native_commit_from_base(
+    layout: &kin_core::KinLayout,
+    graph: &kin_db::InMemoryGraph,
+    blobs: &kin_blobs::BlobStore,
+    operation_id: OperationId,
+    timestamp: Timestamp,
+    author: AuthorId,
+    message: String,
+    base: &NativeCommitBase,
+) -> Result<NativeCommitPlan> {
+    plan_native_commit_inner(
+        layout,
+        graph,
+        blobs,
+        operation_id,
+        timestamp,
+        author,
+        message,
+        Some(&base.roots),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_native_commit_inner(
+    layout: &kin_core::KinLayout,
+    graph: &kin_db::InMemoryGraph,
+    blobs: &kin_blobs::BlobStore,
+    operation_id: OperationId,
+    timestamp: Timestamp,
+    author: AuthorId,
+    message: String,
+    expected_roots: Option<&RootBundle>,
+) -> Result<NativeCommitPlan> {
     if message.trim().is_empty() {
         return Err(invalid("native commit message must not be empty"));
     }
     let (repository_id, workspace_id) = repository_identity(layout)?;
     let authority = open_authority(layout, repository_id.clone())?;
     let lease = authority.read_authority();
+    if expected_roots.is_some_and(|expected| expected != lease.roots()) {
+        return Err(invalid(
+            "repository authority moved after the prospective commit base was read",
+        ));
+    }
     let metadata = lease.metadata();
     let workspace = metadata
         .workspaces
@@ -382,6 +452,114 @@ pub fn plan_native_commit(
         target_tree: deltas.expected_tree,
         source_hashes: source_hashes.into_iter().collect(),
     })
+}
+
+/// Load one clean local workspace from repository-v6 authority.
+///
+/// Dirty workspace authority is a separate uncommitted state and must never be
+/// folded into an MCP semantic commit implicitly. Callers must explicitly
+/// commit or discard it first.
+pub fn load_native_commit_base(layout: &kin_core::KinLayout) -> Result<NativeCommitBase> {
+    let (repository_id, workspace_id) = repository_identity(layout)?;
+    let authority = open_authority(layout, repository_id)?;
+    let lease = authority.read_authority();
+    let workspace = lease
+        .metadata()
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.workspace_id == workspace_id)
+        .ok_or_else(|| {
+            invalid(format!(
+                "repository authority has no local workspace {workspace_id}"
+            ))
+        })?;
+    if workspace.is_dirty() {
+        return Err(invalid(format!(
+            "MCP repository commit requires a clean exact workspace {}; commit or discard its pending tree first",
+            workspace.workspace_id
+        )));
+    }
+    let tree = workspace.tree.clone();
+    let snapshot = lease
+        .workspace_graph_snapshot(&workspace_id)?
+        .ok_or_else(|| {
+            invalid(format!(
+                "repository authority has no graph snapshot for workspace {workspace_id}"
+            ))
+        })?;
+    let roots = lease.roots().clone();
+    drop(lease);
+    let graph = kin_db::InMemoryGraph::from_snapshot(snapshot)?;
+    Ok(NativeCommitBase { graph, roots, tree })
+}
+
+/// Load one immutable source body directly from repository-owned CAS.
+pub fn load_native_source_blob(layout: &kin_core::KinLayout, hash: Hash256) -> Result<Vec<u8>> {
+    let (repository_id, _) = repository_identity(layout)?;
+    let authority = open_authority(layout, repository_id)?;
+    authority.load_source_blob(hash)?.ok_or_else(|| {
+        invalid(format!(
+            "repository source CAS is missing exact body {hash}"
+        ))
+    })
+}
+
+/// Recover the exact native change and receipt for a caller-stable operation.
+///
+/// A daemon can use this after restart or an indeterminate local persistence
+/// acknowledgement. No transaction is rebuilt and no branch is advanced.
+pub fn recover_native_commit(
+    layout: &kin_core::KinLayout,
+    operation_id: OperationId,
+) -> Result<Option<NativeCommitResult>> {
+    let (repository_id, _) = repository_identity(layout)?;
+    let authority = open_authority(layout, repository_id)?;
+    let lease = authority.read_authority();
+    let Some(receipt) = lease
+        .metadata()
+        .receipts
+        .iter()
+        .find(|receipt| receipt.operation_id == operation_id)
+        .cloned()
+    else {
+        return Ok(None);
+    };
+    let mut native_targets = receipt
+        .operation
+        .ref_mutations
+        .iter()
+        .filter_map(|mutation| match mutation.new_target.as_ref() {
+            Some(RefTarget::Change { change_id }) => Some((mutation.name.clone(), *change_id)),
+            _ => None,
+        });
+    let (branch, change_id) = native_targets.next().ok_or_else(|| {
+        invalid(format!(
+            "repository receipt for MCP operation {operation_id} has no native change target"
+        ))
+    })?;
+    if native_targets.next().is_some() {
+        return Err(invalid(format!(
+            "repository receipt for MCP operation {operation_id} has multiple native change targets"
+        )));
+    }
+    let change = lease
+        .snapshot()
+        .changes
+        .get(&change_id)
+        .cloned()
+        .ok_or_else(|| {
+            invalid(format!(
+                "repository receipt for MCP operation {operation_id} references missing change {change_id}"
+            ))
+        })?;
+    Ok(Some(NativeCommitResult {
+        entity_count: change.entity_deltas.len(),
+        relation_count: change.relation_deltas.len(),
+        file_count: change.tree_deltas.len(),
+        change,
+        receipt,
+        branch,
+    }))
 }
 
 /// Persist immutable bodies, then atomically publish the complete repository

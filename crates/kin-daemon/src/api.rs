@@ -173,20 +173,6 @@ fn lock_recover<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> 
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Read-acquire a `std::sync::RwLock`, recovering on poison. See
-/// [`lock_recover`] for why recovery (not propagation) is correct here.
-fn read_recover<T>(lock: &std::sync::RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
-    lock.read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-/// Write-acquire a `std::sync::RwLock`, recovering on poison. See
-/// [`lock_recover`] for why recovery (not propagation) is correct here.
-fn write_recover<T>(lock: &std::sync::RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
-    lock.write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
 /// Health check response.
 #[derive(Debug, Serialize, serde::Deserialize)]
 pub struct HealthResponse {
@@ -4267,9 +4253,9 @@ fn mcp_tool_mutates_graph(name: &str) -> bool {
             | "kin_review_discuss_resolve"
             | "kin_review_assign"
             | "kin_review_unassign"
-            // Commit applies staged entity/relation deltas via
-            // apply_transaction_delta, so it must run against the canonical
-            // mutable graph — never a session's read-only temporal-scope view.
+            // Commit publishes one repository-v6 semantic/tree/ref transaction,
+            // then installs that receipt into the canonical derived graph. It
+            // must never run against a session's read-only temporal view.
             | "kin_transaction_commit"
     )
 }
@@ -4333,57 +4319,6 @@ fn forget_mcp_transaction(state: &DaemonState, transaction_id: &str) {
     // Keep the durable mirror in step with the in-memory eviction so a
     // committed/aborted transaction does not reappear after a restart.
     crate::state::write_persisted_mcp_transactions(&state.layout, &store);
-}
-
-/// Collect the current graph state of all entities referenced in a commit
-/// transaction's staged operations.  Called immediately before the commit is
-/// applied so the returned entities carry the source-span metadata set by the
-/// last reconcile — the information
-/// [`project_after_mcp_commit`](crate::projection_wiring::project_after_mcp_commit)
-/// needs to splice the mutation back into the working-directory files.
-///
-/// Only entity operations are projected (relations and blobs have no file span).
-/// Entities not yet in the graph (new creates staged for the first time) are
-/// silently omitted — they have no span, so
-/// `project_after_mcp_commit` would skip them anyway.
-fn collect_pre_commit_entities(
-    state: &DaemonState,
-    sessions: &kin_mcp::SessionRegistry,
-    arguments: &HashMap<String, serde_json::Value>,
-) -> (
-    Vec<kin_model::Entity>,
-    HashMap<kin_model::EntityId, Vec<u8>>,
-) {
-    let Some(tx_id) = arguments
-        .get("transaction_id")
-        .and_then(serde_json::Value::as_str)
-    else {
-        return (vec![], HashMap::new());
-    };
-    let Some(transaction) = sessions.get_transaction(tx_id) else {
-        return (vec![], HashMap::new());
-    };
-
-    let mut entities = Vec::new();
-    let mut supplied_bodies: HashMap<kin_model::EntityId, Vec<u8>> = HashMap::new();
-    for op in &transaction.staged_operations {
-        let Some(kin_mcp::McpMutationPayload::Entity(payload_entity)) = op.payload.as_ref() else {
-            continue;
-        };
-        // Capture the agent-supplied new source text (if present) keyed
-        // by entity id, so the post-commit projection writes it to the working
-        // file instead of re-splicing the file's own bytes (an identity no-op).
-        if let Some(body) = op.body.as_ref() {
-            supplied_bodies.insert(payload_entity.id, body.clone().into_bytes());
-        }
-        // Look up the pre-commit entity from the graph — it carries the span
-        // set by the last reconcile.  The agent's staged payload may not have
-        // span metadata (agents do not know file placement).
-        if let Ok(Some(graph_entity)) = state.graph.get_entity(&payload_entity.id) {
-            entities.push(graph_entity);
-        }
-    }
-    (entities, supplied_bodies)
 }
 
 fn transaction_coordination_context(
@@ -5688,16 +5623,6 @@ async fn mcp_tools_call(
         })
         .unwrap_or_default();
 
-    // Snapshot entity state before the commit so we can project the
-    // mutations into working-directory files after the graph is updated.
-    // Entities without a span (new creates, relation-only ops) are included but
-    // silently skipped by project_after_mcp_commit.
-    let (pre_commit_entities, supplied_bodies) = if request.name == "kin_transaction_commit" {
-        collect_pre_commit_entities(&state, &sessions, &request.arguments)
-    } else {
-        (vec![], HashMap::new())
-    };
-
     if request.name == "kin_transaction_commit" && transaction_id.is_some() {
         persist_coordination_reservation(
             &state,
@@ -5729,7 +5654,7 @@ async fn mcp_tools_call(
     }
 
     let graph_mutation = mutates.then(|| state.begin_graph_authority_mutation());
-    let mut result = if transaction_preflight
+    let result = if transaction_preflight
         .as_ref()
         .is_some_and(|preflight| !preflight.allowed)
     {
@@ -5740,7 +5665,7 @@ async fn mcp_tools_call(
         )
         .map_err(internal_error)?;
         kin_mcp::ToolCallResult::error(format!(
-            "coordination enforcement rejected transaction before graph apply: {evidence}"
+            "coordination enforcement rejected transaction before repository publication: {evidence}"
         ))
     } else {
         let handled = if request.name == "find_references" {
@@ -5763,6 +5688,13 @@ async fn mcp_tools_call(
                 |_| {},
             )
             .await
+        } else if request.name == "kin_transaction_commit" {
+            Ok(crate::mcp_commit::commit_exact_transaction(
+                &state,
+                &sessions,
+                &request.arguments,
+                transaction_preflight.as_ref(),
+            ))
         } else {
             kin_mcp::handlers::handle_tool_call(
                 &request.name,
@@ -5796,14 +5728,20 @@ async fn mcp_tools_call(
         let coordination_rejected = transaction_preflight
             .as_ref()
             .is_some_and(|preflight| !preflight.allowed);
+        let receipt_recovery_pending = transaction_id
+            .as_deref()
+            .and_then(|transaction_id| sessions.get_transaction(transaction_id))
+            .is_some_and(|transaction| transaction.state == "committing");
         persist_coordination_event(
             &state,
             CoordinationEventDraft {
                 event: "transaction_outcome",
                 outcome: if coordination_rejected {
-                    "coordination_rejected_before_graph_apply"
+                    "coordination_rejected_before_repository_apply"
+                } else if receipt_recovery_pending {
+                    "repository_receipt_recovery_pending"
                 } else {
-                    "commit_failed_before_graph_apply"
+                    "commit_failed_before_repository_apply"
                 }
                 .to_string(),
                 session_id: transaction_session_id.clone(),
@@ -5839,108 +5777,7 @@ async fn mcp_tools_call(
         });
     }
 
-    // Project entity mutations into working-directory files (so the next
-    // reconcile does not silently clobber the graph — file-wins LWW) and enrich
-    // the commit response with what the commit actually did.
-    //
-    // The graph commit has already landed and the version counter already
-    // reflects it above.  A projection failure does NOT roll back the graph —
-    // the agent's intent is preserved and the caller is told loudly so it can
-    // retry or inspect the source file.
-    //
-    // Conflicts (skip-conflicted semantics): entities where a
-    // concurrent human file edit was detected are NOT projected; the commit is
-    // surfaced as an error so the agent can resolve.
     if request.name == "kin_transaction_commit" && result.is_error != Some(true) {
-        // The real graph Merkle root, now that the delta has landed.
-        let new_root_hash = hex::encode(state.graph.compute_root_hash());
-
-        let (modified_files, collision_warnings) = if pre_commit_entities.is_empty() {
-            // Relation-only / new-entity / zero-op commit: nothing to project.
-            (Vec::new(), Vec::new())
-        } else {
-            match crate::projection_wiring::project_after_mcp_commit(
-                &state,
-                &pre_commit_entities,
-                &supplied_bodies,
-            )
-            .await
-            {
-                Err(proj_err) => {
-                    persist_coordination_event(
-                        &state,
-                        CoordinationEventDraft {
-                            event: "transaction_outcome",
-                            outcome: "projection_failed_after_graph_apply".to_string(),
-                            session_id: transaction_session_id.clone(),
-                            intent_id: None,
-                            intent_ids: transaction_intent_ids.clone(),
-                            transaction_id: transaction_id.clone(),
-                            scopes: transaction_scope_labels.clone(),
-                            enforcement_mode: transaction_preflight
-                                .as_ref()
-                                .map(|preflight| preflight.mode.as_str())
-                                .unwrap_or_else(|| state.coordination_mode().as_str())
-                                .to_string(),
-                            blocking_intent_ids: Vec::new(),
-                        },
-                    )?;
-                    return Ok(Json(kin_mcp::ToolCallResult::error(format!(
-                        "graph commit succeeded but file projection failed — agent intent is \
-                         preserved in the graph; retry projection or inspect the source file. \
-                         Detail: {proj_err}"
-                    ))));
-                }
-                Ok((_modified, _warnings, conflicts)) if !conflicts.is_empty() => {
-                    // Some entities were skipped due to concurrent file edits.
-                    // Surface each conflict loudly so the agent can resolve.
-                    let conflict_msgs: Vec<String> = conflicts
-                        .iter()
-                        .map(|c| {
-                            format!(
-                                "conflict on {}: {}",
-                                c.affected_files
-                                    .first()
-                                    .map(|f| f.to_string())
-                                    .unwrap_or_else(|| "<unknown file>".into()),
-                                c.divergence_reason
-                            )
-                        })
-                        .collect();
-                    persist_coordination_event(
-                        &state,
-                        CoordinationEventDraft {
-                            event: "transaction_outcome",
-                            outcome: "projection_conflict_after_graph_apply".to_string(),
-                            session_id: transaction_session_id.clone(),
-                            intent_id: None,
-                            intent_ids: transaction_intent_ids.clone(),
-                            transaction_id: transaction_id.clone(),
-                            scopes: transaction_scope_labels.clone(),
-                            enforcement_mode: transaction_preflight
-                                .as_ref()
-                                .map(|preflight| preflight.mode.as_str())
-                                .unwrap_or_else(|| state.coordination_mode().as_str())
-                                .to_string(),
-                            blocking_intent_ids: Vec::new(),
-                        },
-                    )?;
-                    return Ok(Json(kin_mcp::ToolCallResult::error(format!(
-                        "graph commit succeeded but {n} entity/entities had concurrent file \
-                         edits — those entities were NOT projected (human edits preserved). \
-                         Resolve conflicts and retry. Details: {details}",
-                        n = conflicts.len(),
-                        details = conflict_msgs.join("; "),
-                    ))));
-                }
-                Ok((modified, warnings, _conflicts)) => (modified, warnings),
-            }
-        };
-
-        // Fold the projection outcome and root hash into the success
-        // response so a commit reports what it did instead of an opaque
-        // "committed". `ops_applied`/`empty` already rode in from the handler.
-        result = enrich_commit_result(result, &new_root_hash, &modified_files, &collision_warnings);
         persist_coordination_event(
             &state,
             CoordinationEventDraft {
@@ -5972,54 +5809,6 @@ async fn mcp_tools_call(
 
     drop(graph_mutation);
     Ok(Json(result))
-}
-
-/// Enrich a successful `kin_transaction_commit` text result with the
-/// post-commit graph root hash and the graph→file projection outcome.
-///
-/// The base handler returns `{transaction_id, state, status, ops_applied,
-/// empty}`; this adds `new_root_hash`, `modified_files`, `collision_warnings`,
-/// and `conflicts: []` (a non-empty conflict set is surfaced as an error by the
-/// caller, so the success path always reports an empty conflicts list). Errors
-/// and non-JSON payloads pass through untouched.
-fn enrich_commit_result(
-    result: kin_mcp::ToolCallResult,
-    new_root_hash: &str,
-    modified_files: &[FilePathId],
-    collision_warnings: &[kin_model::IntentSummary],
-) -> kin_mcp::ToolCallResult {
-    if result.is_error == Some(true) {
-        return result;
-    }
-    let Some(kin_mcp::ContentBlock::Text { text }) = result.content.first() else {
-        return result;
-    };
-    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(text) else {
-        return result;
-    };
-    let Some(map) = value.as_object_mut() else {
-        return result;
-    };
-    map.insert("new_root_hash".into(), serde_json::json!(new_root_hash));
-    map.insert(
-        "modified_files".into(),
-        serde_json::json!(modified_files
-            .iter()
-            .map(|f| f.to_string())
-            .collect::<Vec<_>>()),
-    );
-    map.insert(
-        "collision_warnings".into(),
-        serde_json::to_value(collision_warnings).unwrap_or_else(|_| serde_json::json!([])),
-    );
-    map.insert("conflicts".into(), serde_json::json!([]));
-
-    match serde_json::to_string_pretty(&value) {
-        Ok(json) => kin_mcp::ToolCallResult::text(json),
-        Err(_) => kin_mcp::ToolCallResult::error(
-            "commit succeeded but response serialization failed".to_string(),
-        ),
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -7610,15 +7399,6 @@ fn parse_exact_source_change_id(
     ))
 }
 
-fn resolve_exact_source_tree(
-    graph: &kin_db::InMemoryGraph,
-    requested_change: &kin_model::SemanticChangeId,
-) -> Result<kin_model::ResolvedTree, (StatusCode, String)> {
-    graph
-        .resolve_tree_at(requested_change)
-        .map_err(internal_error)
-}
-
 fn validate_exact_source_path(path: &str) -> Result<(), (StatusCode, String)> {
     kin_core::validate_portable_source_paths(std::iter::once(path)).map_err(|error| {
         (
@@ -8107,10 +7887,6 @@ async fn repo_exact_source_tar_gz(
 
 fn internal_error<E: std::fmt::Display>(error: E) -> (StatusCode, String) {
     (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
-}
-
-fn bad_request<E: std::fmt::Display>(error: E) -> (StatusCode, String) {
-    (StatusCode::BAD_REQUEST, error.to_string())
 }
 
 impl From<Intent> for IntentResponse {
@@ -9244,9 +9020,9 @@ mod tests {
     use kin_model::{
         AgentSession, AnnotationFilter, AuthorId, Entity, EntityDelta, EntityId, EntityKind,
         EntityRole, FilePathId, FingerprintAlgorithm, Hash256, IdentityRef, IntentScope,
-        LanguageId, Priority, SemanticChange, SemanticChangeId, SemanticFingerprint, SourceSpan,
-        TestCase, TestKind, TestRunner, Timestamp, Visibility, WorkItem, WorkKind, WorkScope,
-        WorkStatus, WorkStore,
+        LanguageId, Priority, RelationKind, SemanticChange, SemanticChangeId, SemanticFingerprint,
+        SourceSpan, TestCase, TestKind, TestRunner, Timestamp, Visibility, WorkItem, WorkKind,
+        WorkScope, WorkStatus, WorkStore,
     };
     use kin_model::{ReviewStore, VerificationStore};
     use kin_registry::Ecosystem;
@@ -9410,6 +9186,43 @@ mod tests {
             .unwrap()
             .change
             .id
+    }
+
+    fn install_repository_entities(
+        state: &Arc<DaemonState>,
+        entities: Vec<Entity>,
+    ) -> SemanticChangeId {
+        state
+            .graph
+            .apply_transaction_delta(&kin_model::TransactionDelta {
+                entity_deltas: entities
+                    .into_iter()
+                    .map(|new| EntityDelta::Added { new })
+                    .collect(),
+                ..kin_model::TransactionDelta::default()
+            })
+            .unwrap();
+        let plan = crate::repository_commit::plan_native_commit(
+            &state.layout,
+            &state.graph,
+            &state.blobs,
+            kin_model::OperationId::new(),
+            Timestamp::now(),
+            AuthorId::new("api-test"),
+            "install graph-only relation endpoints".to_string(),
+        )
+        .unwrap();
+        let committed =
+            crate::repository_commit::commit_native_plan(&state.layout, &state.blobs, plan)
+                .unwrap();
+        state
+            .graph
+            .create_changes(vec![committed.change.clone()])
+            .unwrap();
+        state
+            .record_repository_authority_commit(committed.receipt.generation)
+            .unwrap();
+        committed.change.id
     }
 
     #[tokio::test]
@@ -10037,16 +9850,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mcp_transaction_commit_lands_in_canonical_graph() {
-        // End-to-end: begin → stage → commit across separate calls must apply the
-        // staged entity to the canonical state.graph (commit is a mutating tool, so
-        // it routes there rather than a session's read-only scoped view).
+    async fn mcp_transaction_commit_lands_relation_in_repository_authority() {
+        // End-to-end: begin → stage → commit across separate calls must publish
+        // the relation through repository authority and then derive the live
+        // query graph from that committed state.
         let state = test_state();
-        install_repository_file(&state, "src/lib.rs", b"fn committed_fn() {}\n");
+        let mut caller = test_entity("caller", "src/lib.rs");
+        caller.file_origin = None;
+        caller.span = None;
+        let mut callee = test_entity("callee", "src/lib.rs");
+        callee.file_origin = None;
+        callee.span = None;
+        install_repository_entities(&state, vec![caller.clone(), callee.clone()]);
         state
             .is_initialized
             .store(true, std::sync::atomic::Ordering::Relaxed);
-        let before = state.graph.entity_count();
+        let before = state.graph.relation_count();
 
         let begin = mcp_call(
             router(Arc::clone(&state)),
@@ -10063,9 +9882,15 @@ mod tests {
             serde_json::json!({
                 "transaction_id": tx_id,
                 "operations": [{
-                    "verb": "create",
+                    "verb": "add",
                     "target": "",
-                    "payload": { "Entity": test_entity("committed_fn", "src/lib.rs") },
+                    "payload": {
+                        "Relation": {
+                            "from": caller.id,
+                            "to": callee.id,
+                            "kind": RelationKind::Calls
+                        }
+                    },
                     "description": ""
                 }]
             }),
@@ -10086,14 +9911,19 @@ mod tests {
         );
 
         assert_eq!(
-            state.graph.entity_count(),
+            state.graph.relation_count(),
             before + 1,
-            "committed entity must land in the canonical graph"
+            "committed relation must land in the canonical graph"
+        );
+        let authority = crate::repository_commit::load_native_commit_base(&state.layout).unwrap();
+        assert_eq!(
+            authority.graph.relation_count(),
+            state.graph.relation_count()
         );
     }
 
     #[tokio::test]
-    async fn mcp_transaction_enforce_rejects_before_graph_apply_and_records_event() {
+    async fn mcp_transaction_enforce_rejects_before_repository_apply_and_records_event() {
         let state = test_state();
         *state
             .coordination_mode
@@ -10185,7 +10015,7 @@ mod tests {
         )
         .await;
         assert_eq!(commit.is_error, Some(true));
-        assert!(mcp_result_text(&commit).contains("before graph apply"));
+        assert!(mcp_result_text(&commit).contains("before repository publication"));
         assert_eq!(
             state.graph.entity_count(),
             before,
@@ -10196,7 +10026,10 @@ mod tests {
         let last: crate::state::CoordinationEventEnvelope =
             serde_json::from_str(records.lines().last().unwrap()).unwrap();
         assert_eq!(last.event, "transaction_outcome");
-        assert_eq!(last.outcome, "coordination_rejected_before_graph_apply");
+        assert_eq!(
+            last.outcome,
+            "coordination_rejected_before_repository_apply"
+        );
         assert_eq!(last.transaction_id.as_deref(), Some(tx_id.as_str()));
         assert_eq!(last.session_id, Some(caller.to_string()));
         assert_eq!(last.enforcement_mode, "enforce");
@@ -10349,7 +10182,7 @@ mod tests {
         let records = std::fs::read_to_string(state.coordination_events.path()).unwrap();
         let last: crate::state::CoordinationEventEnvelope =
             serde_json::from_str(records.lines().last().unwrap()).unwrap();
-        assert_eq!(last.outcome, "commit_failed_before_graph_apply");
+        assert_eq!(last.outcome, "commit_failed_before_repository_apply");
         assert!(last.blocking_intent_ids.is_empty());
     }
 
@@ -10498,6 +10331,13 @@ mod tests {
     async fn mcp_transaction_commit_evicts_from_durable_store() {
         // A committed transaction is terminal and must not linger in the store.
         let state = test_state();
+        let mut caller = test_entity("caller", "src/lib.rs");
+        caller.file_origin = None;
+        caller.span = None;
+        let mut callee = test_entity("callee", "src/lib.rs");
+        callee.file_origin = None;
+        callee.span = None;
+        install_repository_entities(&state, vec![caller.clone(), callee.clone()]);
         state
             .is_initialized
             .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -10512,6 +10352,27 @@ mod tests {
         let tx_id = begin_json["transaction_id"].as_str().unwrap().to_string();
         assert!(state.mcp_transactions.lock().unwrap().contains_key(&tx_id));
 
+        let stage = mcp_call(
+            router(Arc::clone(&state)),
+            "kin_transaction_stage",
+            serde_json::json!({
+                "transaction_id": tx_id,
+                "operations": [{
+                    "verb": "add",
+                    "target": "",
+                    "payload": {
+                        "Relation": {
+                            "from": caller.id,
+                            "to": callee.id,
+                            "kind": RelationKind::Calls
+                        }
+                    },
+                    "description": ""
+                }]
+            }),
+        )
+        .await;
+        assert_ne!(stage.is_error, Some(true), "{}", mcp_result_text(&stage));
         let commit = mcp_call(
             router(Arc::clone(&state)),
             "kin_transaction_commit",

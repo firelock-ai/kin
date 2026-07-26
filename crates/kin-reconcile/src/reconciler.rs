@@ -527,6 +527,30 @@ impl Reconciler {
 
     /// Inner implementation of reconcile_file_edit, separated so the caller
     /// can restore internal LKG state on error.
+    ///
+    /// This entrypoint derives the same semantic/layout transaction from bytes
+    /// already parsed out of immutable repository CAS. It performs no host
+    /// filesystem read or membership inference, making it suitable for
+    /// graph-authority planners such as daemon-owned MCP commits.
+    pub fn reconcile_indexed_content<G: GraphStore>(
+        &mut self,
+        indexed: &kin_index::IndexedFile,
+        blob_store: &BlobStore,
+        graph: &G,
+    ) -> Result<ReconcileResult> {
+        let lkg_snapshot = self.lkg.clone();
+        let file_id = indexed.file_id.clone();
+        let display_path = PathBuf::from(&file_id.0);
+        let result =
+            self.reconcile_file_edit_inner(indexed, &file_id, &display_path, blob_store, graph);
+        if result.is_err() {
+            self.lkg = lkg_snapshot;
+        }
+        result
+    }
+
+    /// Inner implementation of reconcile_file_edit, separated so the caller
+    /// can restore internal LKG state on error.
     fn reconcile_file_edit_inner<G: GraphStore>(
         &mut self,
         indexed: &kin_index::IndexedFile,
