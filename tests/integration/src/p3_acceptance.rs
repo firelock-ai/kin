@@ -151,11 +151,9 @@ fn branch_switch_reprojects_working_directory() {
 
     let entity_main = make_entity("main_fn", "src/lib.rs", EntityKind::Function);
     let mut change_main = make_change(genesis_id, vec![entity_main], "add main_fn");
-    change_main.artifact_deltas.push(ArtifactDelta {
+    change_main.tree_deltas.push(TreeDelta::Added {
         file_id: FilePathId::new("src/lib.rs"),
-        kind: ArtifactDeltaKind::AddedRegularFile,
-        old_hash: None,
-        new_hash: Some(main_hash),
+        new_entry: TreeEntry::regular(main_hash, false),
     });
     graph.create_change(&change_main).unwrap();
     graph
@@ -176,11 +174,9 @@ fn branch_switch_reprojects_working_directory() {
 
     let entity_feature = make_entity("feature_fn", "src/feature.rs", EntityKind::Function);
     let mut change_feature = make_change(change_main.id, vec![entity_feature], "add feature_fn");
-    change_feature.artifact_deltas.push(ArtifactDelta {
+    change_feature.tree_deltas.push(TreeDelta::Added {
         file_id: FilePathId::new("src/feature.rs"),
-        kind: ArtifactDeltaKind::AddedRegularFile,
-        old_hash: None,
-        new_hash: Some(feature_hash),
+        new_entry: TreeEntry::regular(feature_hash, false),
     });
     graph.create_change(&change_feature).unwrap();
     graph
@@ -613,7 +609,7 @@ fn git_export_import_round_trip() {
     let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
     let blob_store = BlobStore::new(layout.objects_dir()).unwrap();
 
-    // Create entities and a change with artifact deltas.
+    // Create entities and a change with tree deltas.
     let file_content = b"pub fn round_trip() -> bool { true }\n";
     let blob_hash = blob_store.write(file_content).unwrap();
     let content_hash = Hash256::from_bytes(blob_hash.0);
@@ -622,11 +618,9 @@ fn git_export_import_round_trip() {
     graph.upsert_entity(&entity).unwrap();
 
     let mut change = make_change(genesis_id, vec![entity], "add round_trip function");
-    change.artifact_deltas.push(ArtifactDelta {
+    change.tree_deltas.push(TreeDelta::Added {
         file_id: FilePathId::new("src/lib.rs"),
-        kind: ArtifactDeltaKind::AddedRegularFile,
-        old_hash: None,
-        new_hash: Some(content_hash),
+        new_entry: TreeEntry::regular(content_hash, false),
     });
     graph.create_change(&change).unwrap();
     graph
@@ -664,13 +658,11 @@ fn git_export_import_round_trip() {
         "import should produce at least one change"
     );
 
-    // Verify at least one imported change has artifact deltas.
-    let has_artifacts = imported
-        .iter()
-        .any(|ic| !ic.change.artifact_deltas.is_empty());
+    // Verify at least one imported change has tree deltas.
+    let has_tree_deltas = imported.iter().any(|ic| !ic.change.tree_deltas.is_empty());
     assert!(
-        has_artifacts,
-        "at least one imported change should have artifact deltas"
+        has_tree_deltas,
+        "at least one imported change should have tree deltas"
     );
 }
 
@@ -768,9 +760,9 @@ fn build_merge_change_for_test(
         .iter()
         .flat_map(|c| c.relation_deltas.clone())
         .collect();
-    let artifact_deltas: Vec<_> = their_changes
+    let tree_deltas: Vec<_> = their_changes
         .iter()
-        .flat_map(|c| c.artifact_deltas.clone())
+        .flat_map(|c| c.tree_deltas.clone())
         .collect();
 
     SemanticChange {
@@ -781,7 +773,7 @@ fn build_merge_change_for_test(
         message: message.to_string(),
         entity_deltas,
         relation_deltas,
-        artifact_deltas,
+        tree_deltas,
         projected_files: vec![],
         spec_link: None,
         evidence: vec![],

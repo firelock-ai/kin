@@ -351,7 +351,7 @@ fn git_export_creates_commits() {
     let (dir, graph, genesis_id) = init_kin_repo();
     let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
 
-    // Create a change with an artifact delta (so export has file content).
+    // Create a change with a tree delta (so export has file content).
     let blob_store = BlobStore::new(layout.objects_dir()).unwrap();
 
     // Store actual file content in the blob store.
@@ -362,13 +362,11 @@ fn git_export_creates_commits() {
     let entity = make_entity("exported_fn", "src/lib.rs", EntityKind::Function);
     graph.upsert_entity(&entity).unwrap();
 
-    // Build a change with an artifact delta so the export has file content.
+    // Build a change with a tree delta so the export has file content.
     let mut change = make_change(genesis_id, vec![entity], "add exported function");
-    change.artifact_deltas.push(kin_model::ArtifactDelta {
+    change.tree_deltas.push(kin_model::TreeDelta::Added {
         file_id: kin_model::FilePathId::new("src/lib.rs"),
-        kind: kin_model::ArtifactDeltaKind::AddedRegularFile,
-        old_hash: None,
-        new_hash: Some(content_hash),
+        new_entry: kin_model::TreeEntry::regular(content_hash, false),
     });
     graph.create_change(&change).unwrap();
     graph
@@ -489,7 +487,7 @@ pub fn add(a: i32, b: i32) -> i32 {
         .map(|e| EntityDelta::Added(e.clone()))
         .collect();
 
-    // Store file in blob store for artifact delta
+    // Store file in blob store for the tree delta
     let file_bytes = std::fs::read(&rs_path).unwrap();
     let blob_hash = blob_store.write(&file_bytes).unwrap();
     let content_hash = Hash256::from_bytes(blob_hash.0);
@@ -513,11 +511,9 @@ pub fn add(a: i32, b: i32) -> i32 {
         message: "add hello and add functions".to_string(),
         entity_deltas,
         relation_deltas: vec![],
-        artifact_deltas: vec![kin_model::ArtifactDelta {
+        tree_deltas: vec![kin_model::TreeDelta::Added {
             file_id: FilePathId::new("src/lib.rs"),
-            kind: kin_model::ArtifactDeltaKind::Added,
-            old_hash: None,
-            new_hash: Some(content_hash),
+            new_entry: kin_model::TreeEntry::regular(content_hash, false),
         }],
         projected_files: vec![],
         spec_link: None,

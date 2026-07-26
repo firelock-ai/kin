@@ -2182,7 +2182,7 @@ struct CachedParse {
     imports: Vec<kin_parser::FileImport>,
 }
 
-/// One artifact delta's resolved parse disposition for a commit's reconcile
+/// One tree delta's resolved parse disposition for a commit's reconcile
 /// pass, computed by the plan/parse phases so the serial reconcile is a pure
 /// fold over pre-resolved parses with no blob I/O or parsing on its path.
 enum ImportedFileResolution {
@@ -2365,7 +2365,7 @@ fn enrich_imported_changes_with_semantics_with_checkpoints_and_boundary_root(
     validate_imported_parent_closure(imported, boundary_root)?;
 
     // Resolve each imported commit's FIRST git parent to an in-set slice index.
-    // kin-git derives a commit's artifact deltas by diffing its tree against its
+    // kin-git derives a commit's tree deltas by diffing its tree against its
     // first parent's tree, so the first parent's semantic state is the correct
     // baseline for that commit's entity and relation deltas. Diffing against a
     // linearized commit-time running map instead attributes an interleaved
@@ -2847,7 +2847,7 @@ fn enrich_imported_changes_with_semantics_with_checkpoints_and_boundary_root(
             RelationDelta::Removed(relation_id) => relation_id.0,
         });
 
-        // Artifact deltas describe the merge target against its first parent,
+        // Tree deltas describe the merge target against its first parent,
         // while runtime DAG replay reaches a merge by replaying every parent.
         // Rebase the computed target onto that actual all-parent baseline so a
         // secondary-parent-only entity or relation cannot leak through merely
@@ -5883,31 +5883,46 @@ mod tests {
     }
 
     #[test]
-    fn git_history_mode_upgrade_accepts_only_the_proven_exact_kind_change() {
+    fn git_history_payload_match_ignores_parents_but_not_exact_tree_entries() {
         let root = kin_core::build_genesis_change();
         let mut exact = root.clone();
         exact.id = SemanticChangeId::from_hash(Hash256::from_bytes([0x91; 32]));
         exact.parents = vec![root.id];
         exact.message = "imported git commit".to_string();
-        exact.artifact_deltas = vec![kin_model::ArtifactDelta {
+        exact.tree_deltas = vec![TreeDelta::Added {
             file_id: FilePathId::new("src/lib.rs"),
-            kind: ArtifactDeltaKind::AddedRegularFile,
-            old_hash: None,
-            new_hash: Some(Hash256::from_bytes([0x22; 32])),
+            new_entry: TreeEntry::regular(Hash256::from_bytes([0x22; 32]), false),
         }];
-        let mut legacy = exact.clone();
-        legacy.artifact_deltas[0].kind = ArtifactDeltaKind::Added;
 
-        assert!(legacy_git_source_mode_upgrade_matches(
-            &legacy, &exact, false
+        // Re-anchoring the parent window is the only difference this matcher
+        // may absorb.
+        let mut reparented = exact.clone();
+        reparented.parents = vec![SemanticChangeId::from_hash(Hash256::from_bytes([0x92; 32]))];
+        assert!(stable_change_payload_without_parents_matches(
+            &exact,
+            &reparented
+        ));
+
+        // The exact tree entry is part of the immutable payload: an
+        // executable-bit-only difference is a real mismatch, not a mode upgrade.
+        let mut executable = exact.clone();
+        executable.tree_deltas = vec![TreeDelta::Added {
+            file_id: FilePathId::new("src/lib.rs"),
+            new_entry: TreeEntry::regular(Hash256::from_bytes([0x22; 32]), true),
+        }];
+        assert!(!stable_change_payload_without_parents_matches(
+            &exact,
+            &executable
         ));
 
         let mut changed_bytes = exact.clone();
-        changed_bytes.artifact_deltas[0].new_hash = Some(Hash256::from_bytes([0x23; 32]));
-        assert!(!legacy_git_source_mode_upgrade_matches(
-            &legacy,
-            &changed_bytes,
-            false
+        changed_bytes.tree_deltas = vec![TreeDelta::Added {
+            file_id: FilePathId::new("src/lib.rs"),
+            new_entry: TreeEntry::regular(Hash256::from_bytes([0x23; 32]), false),
+        }];
+        assert!(!stable_change_payload_without_parents_matches(
+            &exact,
+            &changed_bytes
         ));
     }
 
@@ -6291,7 +6306,7 @@ mod tests {
         let parent = SemanticChangeId::from_hash(Hash256::from_bytes([0x11; 32]));
         let a: [u8; 32] = [0xaa; 32];
         let b: [u8; 32] = [0xbb; 32];
-        let regular = kin_model::SourceEntryKind::File { executable: false };
+        let regular = TreeEntryKind::Regular { executable: false };
         let fingerprint =
             compute_artifact_fingerprint([("src/a.rs", &a, regular), ("src/b.rs", &b, regular)]);
 
@@ -6434,22 +6449,19 @@ mod tests {
                 [0x11; 32],
                 [0; 32],
                 "imported root",
-                vec![artifact_delta(
+                vec![added_regular_delta(
                     "src/lib.py",
-                    kin_model::ArtifactDeltaKind::Added,
-                    None,
-                    Some(Hash256::from_bytes(blob_v1.0)),
+                    Hash256::from_bytes(blob_v1.0),
                 )],
             ),
             imported_change(
                 [0x12; 32],
                 [0x11; 32],
                 "imported modify",
-                vec![artifact_delta(
+                vec![modified_regular_delta(
                     "src/lib.py",
-                    kin_model::ArtifactDeltaKind::Modified,
-                    Some(Hash256::from_bytes(blob_v1.0)),
-                    Some(Hash256::from_bytes(blob_v2.0)),
+                    Hash256::from_bytes(blob_v1.0),
+                    Hash256::from_bytes(blob_v2.0),
                 )],
             ),
         ];
@@ -6614,33 +6626,26 @@ mod tests {
                     [0x31; 32],
                     [0; 32],
                     "add module",
-                    vec![artifact_delta(
-                        "src/mod.py",
-                        kin_model::ArtifactDeltaKind::Added,
-                        None,
-                        Some(Hash256::from_bytes(v1.0)),
-                    )],
+                    vec![added_regular_delta("src/mod.py", Hash256::from_bytes(v1.0))],
                 ),
                 imported_change(
                     [0x32; 32],
                     [0x31; 32],
                     "shrink module",
-                    vec![artifact_delta(
+                    vec![modified_regular_delta(
                         "src/mod.py",
-                        kin_model::ArtifactDeltaKind::Modified,
-                        Some(Hash256::from_bytes(v1.0)),
-                        Some(Hash256::from_bytes(v2.0)),
+                        Hash256::from_bytes(v1.0),
+                        Hash256::from_bytes(v2.0),
                     )],
                 ),
                 imported_change(
                     [0x33; 32],
                     [0x32; 32],
                     "revert module",
-                    vec![artifact_delta(
+                    vec![modified_regular_delta(
                         "src/mod.py",
-                        kin_model::ArtifactDeltaKind::Modified,
-                        Some(Hash256::from_bytes(v2.0)),
-                        Some(Hash256::from_bytes(v1.0)),
+                        Hash256::from_bytes(v2.0),
+                        Hash256::from_bytes(v1.0),
                     )],
                 ),
             ]
@@ -6746,30 +6751,10 @@ mod tests {
                     [0; 32],
                     "seed the tree",
                     vec![
-                        artifact_delta(
-                            "src/util/log.ts",
-                            kin_model::ArtifactDeltaKind::Added,
-                            None,
-                            Some(Hash256::from_bytes(log_v1.0)),
-                        ),
-                        artifact_delta(
-                            "src/util/math.ts",
-                            kin_model::ArtifactDeltaKind::Added,
-                            None,
-                            Some(Hash256::from_bytes(math_v1.0)),
-                        ),
-                        artifact_delta(
-                            "src/core/base.ts",
-                            kin_model::ArtifactDeltaKind::Added,
-                            None,
-                            Some(Hash256::from_bytes(base_v1.0)),
-                        ),
-                        artifact_delta(
-                            "src/app/main.ts",
-                            kin_model::ArtifactDeltaKind::Added,
-                            None,
-                            Some(Hash256::from_bytes(main_v1.0)),
-                        ),
+                        added_regular_delta("src/util/log.ts", Hash256::from_bytes(log_v1.0)),
+                        added_regular_delta("src/util/math.ts", Hash256::from_bytes(math_v1.0)),
+                        added_regular_delta("src/core/base.ts", Hash256::from_bytes(base_v1.0)),
+                        added_regular_delta("src/app/main.ts", Hash256::from_bytes(main_v1.0)),
                     ],
                 ),
                 imported_change(
@@ -6777,18 +6762,12 @@ mod tests {
                     [0x41; 32],
                     "grow math + add a worker",
                     vec![
-                        artifact_delta(
+                        modified_regular_delta(
                             "src/util/math.ts",
-                            kin_model::ArtifactDeltaKind::Modified,
-                            Some(Hash256::from_bytes(math_v1.0)),
-                            Some(Hash256::from_bytes(math_v2.0)),
+                            Hash256::from_bytes(math_v1.0),
+                            Hash256::from_bytes(math_v2.0),
                         ),
-                        artifact_delta(
-                            "src/app/worker.ts",
-                            kin_model::ArtifactDeltaKind::Added,
-                            None,
-                            Some(Hash256::from_bytes(worker_v1.0)),
-                        ),
+                        added_regular_delta("src/app/worker.ts", Hash256::from_bytes(worker_v1.0)),
                     ],
                 ),
                 imported_change(
@@ -6798,19 +6777,13 @@ mod tests {
                     vec![
                         // Reverts to commit 1's exact bytes: a memo hit whose
                         // reconciliation still runs against commit 2's state.
-                        artifact_delta(
+                        modified_regular_delta(
                             "src/util/math.ts",
-                            kin_model::ArtifactDeltaKind::Modified,
-                            Some(Hash256::from_bytes(math_v2.0)),
-                            Some(Hash256::from_bytes(math_v1.0)),
+                            Hash256::from_bytes(math_v2.0),
+                            Hash256::from_bytes(math_v1.0),
                         ),
                         // Non-source file: takes the removal path, never a job.
-                        artifact_delta(
-                            "README.md",
-                            kin_model::ArtifactDeltaKind::Added,
-                            None,
-                            Some(Hash256::from_bytes(readme.0)),
-                        ),
+                        added_regular_delta("README.md", Hash256::from_bytes(readme.0)),
                     ],
                 ),
             ]
@@ -6988,22 +6961,19 @@ func prCheckout(cmd *cobra.Command, args []string) error {
                 [0x21; 32],
                 [0; 32],
                 "imported root",
-                vec![artifact_delta(
+                vec![added_regular_delta(
                     "command/pr_checkout.go",
-                    kin_model::ArtifactDeltaKind::Added,
-                    None,
-                    Some(Hash256::from_bytes(blob_v1.0)),
+                    Hash256::from_bytes(blob_v1.0),
                 )],
             ),
             imported_change(
                 [0x22; 32],
                 [0x21; 32],
                 "prefix branch names",
-                vec![artifact_delta(
+                vec![modified_regular_delta(
                     "command/pr_checkout.go",
-                    kin_model::ArtifactDeltaKind::Modified,
-                    Some(Hash256::from_bytes(blob_v1.0)),
-                    Some(Hash256::from_bytes(blob_v2.0)),
+                    Hash256::from_bytes(blob_v1.0),
+                    Hash256::from_bytes(blob_v2.0),
                 )],
             ),
         ];
@@ -7049,29 +7019,18 @@ func prCheckout(cmd *cobra.Command, args []string) error {
                 [0; 32],
                 "imported root",
                 vec![
-                    artifact_delta(
-                        "src/utils/tools.ts",
-                        kin_model::ArtifactDeltaKind::Added,
-                        None,
-                        Some(Hash256::from_bytes(tools_v1.0)),
-                    ),
-                    artifact_delta(
-                        "src/routes/api.ts",
-                        kin_model::ArtifactDeltaKind::Added,
-                        None,
-                        Some(Hash256::from_bytes(api_v1.0)),
-                    ),
+                    added_regular_delta("src/utils/tools.ts", Hash256::from_bytes(tools_v1.0)),
+                    added_regular_delta("src/routes/api.ts", Hash256::from_bytes(api_v1.0)),
                 ],
             ),
             imported_change(
                 [0x22; 32],
                 [0x21; 32],
                 "remove callee",
-                vec![artifact_delta(
+                vec![modified_regular_delta(
                     "src/utils/tools.ts",
-                    kin_model::ArtifactDeltaKind::Modified,
-                    Some(Hash256::from_bytes(tools_v1.0)),
-                    Some(Hash256::from_bytes(tools_v2.0)),
+                    Hash256::from_bytes(tools_v1.0),
+                    Hash256::from_bytes(tools_v2.0),
                 )],
             ),
         ];
@@ -7132,29 +7091,18 @@ func prCheckout(cmd *cobra.Command, args []string) error {
                 [0; 32],
                 "imported root",
                 vec![
-                    artifact_delta(
-                        "src/utils/tools.ts",
-                        kin_model::ArtifactDeltaKind::Added,
-                        None,
-                        Some(Hash256::from_bytes(tools_v1.0)),
-                    ),
-                    artifact_delta(
-                        "src/routes/api.ts",
-                        kin_model::ArtifactDeltaKind::Added,
-                        None,
-                        Some(Hash256::from_bytes(api_v1.0)),
-                    ),
+                    added_regular_delta("src/utils/tools.ts", Hash256::from_bytes(tools_v1.0)),
+                    added_regular_delta("src/routes/api.ts", Hash256::from_bytes(api_v1.0)),
                 ],
             ),
             imported_change(
                 [0x32; 32],
                 [0x31; 32],
                 "semantic update",
-                vec![artifact_delta(
+                vec![modified_regular_delta(
                     "src/utils/tools.ts",
-                    kin_model::ArtifactDeltaKind::Modified,
-                    Some(Hash256::from_bytes(tools_v1.0)),
-                    Some(Hash256::from_bytes(tools_v2.0)),
+                    Hash256::from_bytes(tools_v1.0),
+                    Hash256::from_bytes(tools_v2.0),
                 )],
             ),
         ];
@@ -7188,22 +7136,19 @@ func prCheckout(cmd *cobra.Command, args []string) error {
                 [0x41; 32],
                 [0; 32],
                 "imported root",
-                vec![artifact_delta(
+                vec![added_regular_delta(
                     "src/lib.py",
-                    kin_model::ArtifactDeltaKind::Added,
-                    None,
-                    Some(Hash256::from_bytes(blob_v1.0)),
+                    Hash256::from_bytes(blob_v1.0),
                 )],
             ),
             imported_change(
                 [0x42; 32],
                 [0x41; 32],
                 "missing blob",
-                vec![artifact_delta(
+                vec![modified_regular_delta(
                     "src/lib.py",
-                    kin_model::ArtifactDeltaKind::Modified,
-                    Some(Hash256::from_bytes(blob_v1.0)),
-                    Some(missing_hash),
+                    Hash256::from_bytes(blob_v1.0),
+                    missing_hash,
                 )],
             ),
         ];
@@ -7246,33 +7191,29 @@ func prCheckout(cmd *cobra.Command, args []string) error {
                 [0x51; 32],
                 [0; 32],
                 "root: add f",
-                vec![artifact_delta(
+                vec![added_regular_delta(
                     "src/lib.py",
-                    kin_model::ArtifactDeltaKind::Added,
-                    None,
-                    Some(Hash256::from_bytes(f_v1.0)),
+                    Hash256::from_bytes(f_v1.0),
                 )],
             ),
             imported_change(
                 [0x52; 32],
                 [0x51; 32],
                 "branch A: rewrite f body",
-                vec![artifact_delta(
+                vec![modified_regular_delta(
                     "src/lib.py",
-                    kin_model::ArtifactDeltaKind::Modified,
-                    Some(Hash256::from_bytes(f_v1.0)),
-                    Some(Hash256::from_bytes(f_v2.0)),
+                    Hash256::from_bytes(f_v1.0),
+                    Hash256::from_bytes(f_v2.0),
                 )],
             ),
             imported_change(
                 [0x53; 32],
                 [0x51; 32],
                 "branch B: add g, f unchanged",
-                vec![artifact_delta(
+                vec![modified_regular_delta(
                     "src/lib.py",
-                    kin_model::ArtifactDeltaKind::Modified,
-                    Some(Hash256::from_bytes(f_v1.0)),
-                    Some(Hash256::from_bytes(f_v3.0)),
+                    Hash256::from_bytes(f_v1.0),
+                    Hash256::from_bytes(f_v3.0),
                 )],
             ),
         ];
@@ -7343,29 +7284,18 @@ func prCheckout(cmd *cobra.Command, args []string) error {
             [0; 32],
             "root",
             vec![
-                artifact_delta(
-                    "tools.py",
-                    kin_model::ArtifactDeltaKind::AddedRegularFile,
-                    None,
-                    Some(Hash256::from_bytes(tools.0)),
-                ),
-                artifact_delta(
-                    "app.py",
-                    kin_model::ArtifactDeltaKind::AddedRegularFile,
-                    None,
-                    Some(Hash256::from_bytes(app_root.0)),
-                ),
+                added_regular_delta("tools.py", Hash256::from_bytes(tools.0)),
+                added_regular_delta("app.py", Hash256::from_bytes(app_root.0)),
             ],
         );
         let first_parent = imported_change(
             [0x82; 32],
             [0x81; 32],
             "first parent",
-            vec![artifact_delta(
+            vec![modified_regular_delta(
                 "app.py",
-                kin_model::ArtifactDeltaKind::ModifiedRegularFile,
-                Some(Hash256::from_bytes(app_root.0)),
-                Some(Hash256::from_bytes(app_first_parent.0)),
+                Hash256::from_bytes(app_root.0),
+                Hash256::from_bytes(app_first_parent.0),
             )],
         );
         let secondary_parent = imported_change(
@@ -7373,18 +7303,12 @@ func prCheckout(cmd *cobra.Command, args []string) error {
             [0x81; 32],
             "secondary parent",
             vec![
-                artifact_delta(
+                modified_regular_delta(
                     "app.py",
-                    kin_model::ArtifactDeltaKind::ModifiedRegularFile,
-                    Some(Hash256::from_bytes(app_root.0)),
-                    Some(Hash256::from_bytes(app_secondary_parent.0)),
+                    Hash256::from_bytes(app_root.0),
+                    Hash256::from_bytes(app_secondary_parent.0),
                 ),
-                artifact_delta(
-                    "secondary.py",
-                    kin_model::ArtifactDeltaKind::AddedRegularFile,
-                    None,
-                    Some(Hash256::from_bytes(secondary_only.0)),
-                ),
+                added_regular_delta("secondary.py", Hash256::from_bytes(secondary_only.0)),
             ],
         );
         let mut merge = imported_change(
@@ -7392,18 +7316,12 @@ func prCheckout(cmd *cobra.Command, args []string) error {
             [0x82; 32],
             "merge choosing first-parent tree",
             vec![
-                artifact_delta(
+                modified_regular_delta(
                     "app.py",
-                    kin_model::ArtifactDeltaKind::ModifiedRegularFile,
-                    Some(Hash256::from_bytes(app_secondary_parent.0)),
-                    Some(Hash256::from_bytes(app_first_parent.0)),
+                    Hash256::from_bytes(app_secondary_parent.0),
+                    Hash256::from_bytes(app_first_parent.0),
                 ),
-                artifact_delta(
-                    "secondary.py",
-                    kin_model::ArtifactDeltaKind::Removed,
-                    Some(Hash256::from_bytes(secondary_only.0)),
-                    None,
-                ),
+                removed_regular_delta("secondary.py", Hash256::from_bytes(secondary_only.0)),
             ],
         );
         merge.change.parents = vec![first_parent.change.id, secondary_parent.change.id];
@@ -7564,7 +7482,7 @@ func prCheckout(cmd *cobra.Command, args []string) error {
         probe.id = SemanticChangeId::from_hash(Hash256::from_bytes([0xf9; 32]));
         probe.entity_deltas.clear();
         probe.relation_deltas.clear();
-        probe.artifact_deltas.clear();
+        probe.tree_deltas.clear();
         graph.create_change(&probe).unwrap();
         let authoritative = graph.resolve_graph_at(&probe.id).unwrap();
 
@@ -7645,20 +7563,16 @@ func prCheckout(cmd *cobra.Command, args []string) error {
             [0x85; 32],
             [0x81; 32],
             "tertiary parent",
-            vec![artifact_delta(
+            vec![added_regular_delta(
                 "tertiary.py",
-                kin_model::ArtifactDeltaKind::AddedRegularFile,
-                None,
-                Some(Hash256::from_bytes(tertiary_blob.0)),
+                Hash256::from_bytes(tertiary_blob.0),
             )],
         );
         let mut merge = fixture.pop().unwrap();
         merge.change.parents.push(tertiary.change.id);
-        merge.change.artifact_deltas.push(artifact_delta(
+        merge.change.tree_deltas.push(removed_regular_delta(
             "tertiary.py",
-            kin_model::ArtifactDeltaKind::Removed,
-            Some(Hash256::from_bytes(tertiary_blob.0)),
-            None,
+            Hash256::from_bytes(tertiary_blob.0),
         ));
         let merge_id = merge.change.id;
 
@@ -7722,27 +7636,27 @@ func prCheckout(cmd *cobra.Command, args []string) error {
         let dir = tempfile::tempdir().unwrap();
         let blob_store = kin_blobs::BlobStore::new(dir.path().join("objects")).unwrap();
         let mut imported = merge_rebase_fixture(&blob_store);
-        let tools_hash = imported[0]
+        let tools_entry = imported[0]
             .change
-            .artifact_deltas
+            .tree_deltas
             .iter()
-            .find(|delta| delta.file_id.0 == "tools.py")
-            .and_then(|delta| delta.new_hash)
+            .find(|delta| delta.file_id().0 == "tools.py")
+            .and_then(|delta| delta.new_entry())
             .unwrap();
-        let app_first_parent_hash = imported[1].change.artifact_deltas[0].new_hash.unwrap();
-        let app_secondary_hash = imported[2]
+        let app_first_parent_entry = imported[1].change.tree_deltas[0].new_entry().unwrap();
+        let app_secondary_entry = imported[2]
             .change
-            .artifact_deltas
+            .tree_deltas
             .iter()
-            .find(|delta| delta.file_id.0 == "app.py")
-            .and_then(|delta| delta.new_hash)
+            .find(|delta| delta.file_id().0 == "app.py")
+            .and_then(|delta| delta.new_entry())
             .unwrap();
-        let secondary_hash = imported[2]
+        let secondary_entry = imported[2]
             .change
-            .artifact_deltas
+            .tree_deltas
             .iter()
-            .find(|delta| delta.file_id.0 == "secondary.py")
-            .and_then(|delta| delta.new_hash)
+            .find(|delta| delta.file_id().0 == "secondary.py")
+            .and_then(|delta| delta.new_entry())
             .unwrap();
         let novel_hash = Hash256::from_bytes(
             blob_store
@@ -7754,26 +7668,32 @@ func prCheckout(cmd *cobra.Command, args []string) error {
         let merge = imported.last_mut().unwrap();
         let app_delta = merge
             .change
-            .artifact_deltas
+            .tree_deltas
             .iter_mut()
-            .find(|delta| delta.file_id.0 == "app.py")
+            .find(|delta| delta.file_id().0 == "app.py")
             .unwrap();
-        app_delta.old_hash = Some(app_first_parent_hash);
-        app_delta.new_hash = Some(app_secondary_hash);
+        *app_delta = TreeDelta::Modified {
+            file_id: FilePathId::new("app.py"),
+            old_entry: app_first_parent_entry,
+            new_entry: app_secondary_entry,
+        };
+        // The merge keeps the secondary parent's entry for this path, restated
+        // unchanged the way a complete correction over the parent union is.
         let secondary_delta = merge
             .change
-            .artifact_deltas
+            .tree_deltas
             .iter_mut()
-            .find(|delta| delta.file_id.0 == "secondary.py")
+            .find(|delta| delta.file_id().0 == "secondary.py")
             .unwrap();
-        secondary_delta.kind = kin_model::ArtifactDeltaKind::ModifiedRegularFile;
-        secondary_delta.new_hash = Some(secondary_hash);
-        merge.change.artifact_deltas.push(artifact_delta(
-            "novel.py",
-            kin_model::ArtifactDeltaKind::AddedRegularFile,
-            None,
-            Some(novel_hash),
-        ));
+        *secondary_delta = TreeDelta::Modified {
+            file_id: FilePathId::new("secondary.py"),
+            old_entry: secondary_entry,
+            new_entry: secondary_entry,
+        };
+        merge
+            .change
+            .tree_deltas
+            .push(added_regular_delta("novel.py", novel_hash));
         let merge_id = merge.change.id;
 
         enrich_imported_changes_with_semantics(&mut imported, &blob_store).unwrap();
@@ -7788,30 +7708,19 @@ func prCheckout(cmd *cobra.Command, args []string) error {
             [0; 32],
             "independent exact merge target",
             vec![
-                artifact_delta(
-                    "tools.py",
-                    kin_model::ArtifactDeltaKind::AddedRegularFile,
-                    None,
-                    Some(tools_hash),
-                ),
-                artifact_delta(
-                    "app.py",
-                    kin_model::ArtifactDeltaKind::AddedRegularFile,
-                    None,
-                    Some(app_secondary_hash),
-                ),
-                artifact_delta(
-                    "secondary.py",
-                    kin_model::ArtifactDeltaKind::AddedRegularFile,
-                    None,
-                    Some(secondary_hash),
-                ),
-                artifact_delta(
-                    "novel.py",
-                    kin_model::ArtifactDeltaKind::AddedRegularFile,
-                    None,
-                    Some(novel_hash),
-                ),
+                TreeDelta::Added {
+                    file_id: FilePathId::new("tools.py"),
+                    new_entry: tools_entry,
+                },
+                TreeDelta::Added {
+                    file_id: FilePathId::new("app.py"),
+                    new_entry: app_secondary_entry,
+                },
+                TreeDelta::Added {
+                    file_id: FilePathId::new("secondary.py"),
+                    new_entry: secondary_entry,
+                },
+                added_regular_delta("novel.py", novel_hash),
             ],
         )];
         enrich_imported_changes_with_semantics(&mut oracle, &blob_store).unwrap();
@@ -8356,7 +8265,7 @@ func prCheckout(cmd *cobra.Command, args []string) error {
         assert_eq!(first.len(), 4, "expected base-link + 3 windowed commits");
 
         // (1) THE Fix-D determinism guarantee: change ids, parents, and the ORDER
-        // and identity of every entity/relation/artifact delta are byte-identical.
+        // and identity of every entity/relation/tree delta are byte-identical.
         // The only non-deterministic surface in a SemanticChange is
         // `Entity.metadata.extra`, a `HashMap` of auxiliary embedding-context
         // strings (a pre-existing, kin-wide parser artifact that no entity id,
@@ -8480,17 +8389,25 @@ func prCheckout(cmd *cobra.Command, args []string) error {
         );
     }
 
-    fn artifact_delta(
-        file_path: &str,
-        kind: kin_model::ArtifactDeltaKind,
-        old_hash: Option<Hash256>,
-        new_hash: Option<Hash256>,
-    ) -> kin_model::ArtifactDelta {
-        kin_model::ArtifactDelta {
+    fn added_regular_delta(file_path: &str, new_hash: Hash256) -> TreeDelta {
+        TreeDelta::Added {
             file_id: FilePathId::new(file_path),
-            kind,
-            old_hash,
-            new_hash,
+            new_entry: TreeEntry::regular(new_hash, false),
+        }
+    }
+
+    fn modified_regular_delta(file_path: &str, old_hash: Hash256, new_hash: Hash256) -> TreeDelta {
+        TreeDelta::Modified {
+            file_id: FilePathId::new(file_path),
+            old_entry: TreeEntry::regular(old_hash, false),
+            new_entry: TreeEntry::regular(new_hash, false),
+        }
+    }
+
+    fn removed_regular_delta(file_path: &str, old_hash: Hash256) -> TreeDelta {
+        TreeDelta::Removed {
+            file_id: FilePathId::new(file_path),
+            old_entry: TreeEntry::regular(old_hash, false),
         }
     }
 
@@ -8498,7 +8415,7 @@ func prCheckout(cmd *cobra.Command, args []string) error {
         id_bytes: [u8; 32],
         parent_bytes: [u8; 32],
         message: &str,
-        artifact_deltas: Vec<kin_model::ArtifactDelta>,
+        tree_deltas: Vec<TreeDelta>,
     ) -> kin_git::ImportedChange {
         kin_git::ImportedChange {
             change: SemanticChange {
@@ -8513,7 +8430,7 @@ func prCheckout(cmd *cobra.Command, args []string) error {
                 message: message.to_string(),
                 entity_deltas: vec![],
                 relation_deltas: vec![],
-                artifact_deltas,
+                tree_deltas,
                 projected_files: vec![],
                 spec_link: None,
                 evidence: vec![],
@@ -8542,44 +8459,34 @@ func prCheckout(cmd *cobra.Command, args []string) error {
                 [0x71; 32],
                 [0; 32],
                 history_checkpoint::BASE_LINK_MESSAGE,
-                vec![artifact_delta(
+                vec![added_regular_delta(
                     "util.py",
-                    kin_model::ArtifactDeltaKind::Added,
-                    None,
-                    Some(Hash256::from_bytes(util_v1.0)),
+                    Hash256::from_bytes(util_v1.0),
                 )],
             ),
             imported_change(
                 [0x72; 32],
                 [0x71; 32],
                 "add caller",
-                vec![artifact_delta(
-                    "app.py",
-                    kin_model::ArtifactDeltaKind::Added,
-                    None,
-                    Some(Hash256::from_bytes(app_v1.0)),
-                )],
+                vec![added_regular_delta("app.py", Hash256::from_bytes(app_v1.0))],
             ),
             imported_change(
                 [0x73; 32],
                 [0x71; 32],
                 "add sibling branch",
-                vec![artifact_delta(
+                vec![added_regular_delta(
                     "sibling.py",
-                    kin_model::ArtifactDeltaKind::Added,
-                    None,
-                    Some(Hash256::from_bytes(sibling_v1.0)),
+                    Hash256::from_bytes(sibling_v1.0),
                 )],
             ),
             imported_change(
                 [0x74; 32],
                 [0x72; 32],
                 "change helper",
-                vec![artifact_delta(
+                vec![modified_regular_delta(
                     "util.py",
-                    kin_model::ArtifactDeltaKind::Modified,
-                    Some(Hash256::from_bytes(util_v1.0)),
-                    Some(Hash256::from_bytes(util_v2.0)),
+                    Hash256::from_bytes(util_v1.0),
+                    Hash256::from_bytes(util_v2.0),
                 )],
             ),
         ]
@@ -8596,11 +8503,9 @@ func prCheckout(cmd *cobra.Command, args []string) error {
         (1..=count)
             .map(|position| {
                 let deltas = if position == 1 {
-                    vec![artifact_delta(
+                    vec![added_regular_delta(
                         "scale.py",
-                        kin_model::ArtifactDeltaKind::Added,
-                        None,
-                        Some(Hash256::from_bytes(source.0)),
+                        Hash256::from_bytes(source.0),
                     )]
                 } else {
                     Vec::new()
@@ -10084,16 +9989,13 @@ func prCheckout(cmd *cobra.Command, args []string) error {
             .collect();
         assert_eq!(
             kinds.get("plain.txt"),
-            Some(&kin_model::SourceEntryKind::File { executable: false })
+            Some(&TreeEntryKind::Regular { executable: false })
         );
         assert_eq!(
             kinds.get("bin/run"),
-            Some(&kin_model::SourceEntryKind::File { executable: true })
+            Some(&TreeEntryKind::Regular { executable: true })
         );
-        assert_eq!(
-            kinds.get("current"),
-            Some(&kin_model::SourceEntryKind::Symlink)
-        );
+        assert_eq!(kinds.get("current"), Some(&TreeEntryKind::Symlink));
         let link = exact
             .iter()
             .find(|entry| entry.rel_path == "current")
@@ -10103,45 +10005,78 @@ func prCheckout(cmd *cobra.Command, args []string) error {
     }
 
     #[test]
-    fn exact_init_repair_restates_retained_paths_and_removes_deleted_gaps() {
+    fn exact_init_tree_deltas_record_mode_change_removal_and_added_symlink() {
         let retained_hash = Hash256::from_bytes([0x11; 32]);
         let deleted_hash = Hash256::from_bytes([0x22; 32]);
         let added_hash = [0x33; 32];
+        let unchanged_hash = Hash256::from_bytes([0x44; 32]);
         let parent = HashMap::from([
-            (FilePathId::new("legacy.sh"), retained_hash),
-            (FilePathId::new("deleted.txt"), deleted_hash),
+            (
+                FilePathId::new("legacy.sh"),
+                TreeEntry::regular(retained_hash, false),
+            ),
+            (
+                FilePathId::new("deleted.txt"),
+                TreeEntry::regular(deleted_hash, false),
+            ),
+            (
+                FilePathId::new("unchanged.txt"),
+                TreeEntry::regular(unchanged_hash, false),
+            ),
         ]);
         let current = vec![
             ExactInitSourceEntry {
                 abs_path: PathBuf::from("legacy.sh"),
                 rel_path: "legacy.sh".to_string(),
                 hash: *retained_hash.as_bytes(),
-                kind: SourceEntryKind::File { executable: true },
+                kind: TreeEntryKind::Regular { executable: true },
             },
             ExactInitSourceEntry {
                 abs_path: PathBuf::from("new-link"),
                 rel_path: "new-link".to_string(),
                 hash: added_hash,
-                kind: SourceEntryKind::Symlink,
+                kind: TreeEntryKind::Symlink,
+            },
+            ExactInitSourceEntry {
+                abs_path: PathBuf::from("unchanged.txt"),
+                rel_path: "unchanged.txt".to_string(),
+                hash: *unchanged_hash.as_bytes(),
+                kind: TreeEntryKind::Regular { executable: false },
             },
         ];
 
-        let deltas = build_exact_init_repair_deltas(parent, &current);
+        let deltas = build_exact_init_tree_deltas(parent, &current);
         assert_eq!(deltas.len(), 3);
-        assert_eq!(deltas[0].file_id, FilePathId::new("deleted.txt"));
-        assert_eq!(deltas[0].kind, kin_model::ArtifactDeltaKind::Removed);
-        assert_eq!(deltas[0].old_hash, Some(deleted_hash));
-        assert_eq!(deltas[1].file_id, FilePathId::new("legacy.sh"));
         assert_eq!(
-            deltas[1].kind,
-            kin_model::ArtifactDeltaKind::ModifiedExecutableFile
+            deltas[0],
+            TreeDelta::Removed {
+                file_id: FilePathId::new("deleted.txt"),
+                old_entry: TreeEntry::regular(deleted_hash, false),
+            }
         );
-        assert_eq!(deltas[1].old_hash, Some(retained_hash));
-        assert_eq!(deltas[1].new_hash, Some(retained_hash));
-        assert_eq!(deltas[2].file_id, FilePathId::new("new-link"));
-        assert_eq!(deltas[2].kind, kin_model::ArtifactDeltaKind::AddedSymlink);
-        assert_eq!(deltas[2].old_hash, None);
-        assert_eq!(deltas[2].new_hash, Some(Hash256::from_bytes(added_hash)));
+        // Same bytes, new exact mode: an executable-bit-only transition is a
+        // real delta and must survive intact.
+        assert_eq!(
+            deltas[1],
+            TreeDelta::Modified {
+                file_id: FilePathId::new("legacy.sh"),
+                old_entry: TreeEntry::regular(retained_hash, false),
+                new_entry: TreeEntry::regular(retained_hash, true),
+            }
+        );
+        assert_eq!(
+            deltas[2],
+            TreeDelta::Added {
+                file_id: FilePathId::new("new-link"),
+                new_entry: TreeEntry::symlink(Hash256::from_bytes(added_hash)),
+            }
+        );
+        assert!(
+            deltas
+                .iter()
+                .all(|delta| delta.file_id().0 != "unchanged.txt"),
+            "a path whose exact entry is unchanged must not produce a delta"
+        );
     }
 
     #[test]
