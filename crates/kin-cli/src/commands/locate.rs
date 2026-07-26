@@ -15405,6 +15405,18 @@ pub fn fuse_locate_results(
     }
 }
 
+/// Bound a fused locate declaration to the primary variant's budget: the
+/// automatic sharp variant may reorder and substitute files within the
+/// declaration the single query earned, but must not widen it (fusion width
+/// is what turns recall gains into precision losses on list-scored
+/// surfaces). Entities and attribution are untouched; only the declared
+/// file list truncates. No-op when the fused list already fits.
+pub fn bound_fused_declaration_to_primary(result: &mut LocateResult, primary_declared: usize) {
+    if result.files.len() > primary_declared {
+        result.files.truncate(primary_declared);
+    }
+}
+
 fn build_result(
     results: &[(String, f32)],
     all_hits: &[HashMap<String, Vec<FileHit>>],
@@ -15854,6 +15866,37 @@ mod tests {
         assert_eq!(e2.matched_queries, vec!["identifier query".to_string()]);
         let e3 = fused.entities.iter().find(|e| e.entity_id == "e3").unwrap();
         assert_eq!(e3.matched_queries, vec!["behavior query".to_string()]);
+    }
+
+    #[test]
+    fn bound_fused_declaration_keeps_primary_budget_and_order() {
+        let entry = |path: &str, score: f32| -> LocateFileEntry {
+            serde_json::from_value(serde_json::json!({ "path": path, "score": score }))
+                .expect("minimal file entry deserializes")
+        };
+        let mut v0 = LocateResult::default();
+        v0.files = vec![entry("a.go", 3.0), entry("b.go", 2.0), entry("c.go", 1.0)];
+        let mut v1 = LocateResult::default();
+        v1.files = vec![entry("c.go", 9.0), entry("d.go", 8.0), entry("e.go", 7.0)];
+        let variants = vec!["broad".to_string(), "sharp".to_string()];
+        let mut fused = fuse_locate_results(variants, vec![v0, v1], 60.0);
+        assert_eq!(fused.files.len(), 5, "union widens before the bound");
+        assert_eq!(
+            fused.files[0].path, "c.go",
+            "corroborated file fuses to the top"
+        );
+        bound_fused_declaration_to_primary(&mut fused, 3);
+        assert_eq!(
+            fused.files.len(),
+            3,
+            "auto fusion must not widen the declaration"
+        );
+        assert_eq!(
+            fused.files[0].path, "c.go",
+            "bounded list keeps the fused order"
+        );
+        bound_fused_declaration_to_primary(&mut fused, 10);
+        assert_eq!(fused.files.len(), 3, "larger budget is a no-op");
     }
 
     #[test]
