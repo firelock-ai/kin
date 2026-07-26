@@ -241,7 +241,7 @@ const TEXT_INDEX_IMPORT_SOURCE_WEIGHT: f32 = 1.4;
 const TEXT_INDEX_NEIGHBOR_NAME_WEIGHT: f32 = 1.0;
 #[cfg(all(feature = "embeddings", feature = "vector"))]
 const MAX_EMBED_CONTEXT_VALUES_PER_LABEL: usize = 3;
-const PHASE9_RELATION_NAMESPACE: uuid::Uuid =
+const VERIFICATION_RELATION_NAMESPACE: uuid::Uuid =
     uuid::Uuid::from_u128(0x6a5a6d56593e4f4fb6f6f2e1de3d4f99);
 
 fn coverage_percent(indexed: usize, total: usize) -> f64 {
@@ -328,25 +328,6 @@ fn semantic_change_payload(change: &SemanticChange) -> Result<SemanticChangePayl
     })
 }
 
-fn build_artifact_indexes_from_paths<I>(
-    paths: I,
-) -> (
-    HashMap<FilePathId, ArtifactId>,
-    HashMap<ArtifactId, FilePathId>,
-)
-where
-    I: IntoIterator<Item = FilePathId>,
-{
-    let mut artifact_index = HashMap::new();
-    let mut artifact_reverse = HashMap::new();
-    for path in paths {
-        let id = ArtifactId::seed_from_file_id(&path);
-        artifact_index.entry(path.clone()).or_insert(id);
-        artifact_reverse.entry(id).or_insert(path);
-    }
-    (artifact_index, artifact_reverse)
-}
-
 fn reverse_artifact_index(
     artifact_index: &HashMap<FilePathId, ArtifactId>,
 ) -> HashMap<ArtifactId, FilePathId> {
@@ -355,6 +336,35 @@ fn reverse_artifact_index(
         artifact_reverse.entry(*id).or_insert_with(|| path.clone());
     }
     artifact_reverse
+}
+
+fn validate_artifact_indexes(entity_data: &EntityData) -> Result<(), KinDbError> {
+    for (path, artifact_id) in &entity_data.artifact_index {
+        match entity_data.artifact_reverse.get(artifact_id) {
+            Some(reverse_path) if reverse_path == path => {}
+            Some(reverse_path) => {
+                return Err(KinDbError::StorageError(format!(
+                    "artifact identity {artifact_id:?} maps forward to {} but backward to {}",
+                    path.0, reverse_path.0
+                )));
+            }
+            None => {
+                return Err(KinDbError::StorageError(format!(
+                    "artifact identity {artifact_id:?} for {} is missing its reverse mapping",
+                    path.0
+                )));
+            }
+        }
+    }
+    for (artifact_id, path) in &entity_data.artifact_reverse {
+        if entity_data.artifact_index.get(path) != Some(artifact_id) {
+            return Err(KinDbError::StorageError(format!(
+                "artifact reverse mapping {artifact_id:?} -> {} has no matching forward mapping",
+                path.0
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn topologically_order_changes<I>(changes: I) -> Vec<SemanticChange>
@@ -757,7 +767,7 @@ pub(crate) fn build_relation_indexes_with_reuse(
 fn verification_relation_id(kind: RelationKind, src: GraphNodeId, dst: GraphNodeId) -> RelationId {
     let payload = format!("{kind:?}|{src}|{dst}");
     RelationId(uuid::Uuid::new_v5(
-        &PHASE9_RELATION_NAMESPACE,
+        &VERIFICATION_RELATION_NAMESPACE,
         payload.as_bytes(),
     ))
 }
@@ -773,55 +783,6 @@ fn verification_relation(kind: RelationKind, src: GraphNodeId, dst: GraphNodeId)
         created_in: None,
         import_source: None,
         evidence: Vec::new(),
-    }
-}
-
-fn migrate_legacy_verification_relations(snapshot: &mut GraphSnapshot) {
-    let mut seen: HashSet<(RelationKind, GraphNodeId, GraphNodeId)> = snapshot
-        .relations
-        .values()
-        .map(|relation| (relation.kind, relation.src, relation.dst))
-        .collect();
-
-    for (test_id, entity_id) in snapshot.test_covers_entity.drain(..) {
-        let src = GraphNodeId::Test(test_id);
-        let dst = GraphNodeId::Entity(entity_id);
-        if seen.insert((RelationKind::Covers, src, dst)) {
-            let relation = verification_relation(RelationKind::Covers, src, dst);
-            snapshot.relations.insert(relation.id, relation);
-        }
-    }
-    for (test_id, contract_id) in snapshot.test_covers_contract.drain(..) {
-        let src = GraphNodeId::Test(test_id);
-        let dst = GraphNodeId::Contract(contract_id);
-        if seen.insert((RelationKind::Covers, src, dst)) {
-            let relation = verification_relation(RelationKind::Covers, src, dst);
-            snapshot.relations.insert(relation.id, relation);
-        }
-    }
-    for (test_id, work_id) in snapshot.test_verifies_work.drain(..) {
-        let src = GraphNodeId::Test(test_id);
-        let dst = GraphNodeId::Work(work_id);
-        if seen.insert((RelationKind::Covers, src, dst)) {
-            let relation = verification_relation(RelationKind::Covers, src, dst);
-            snapshot.relations.insert(relation.id, relation);
-        }
-    }
-    for (run_id, entity_id) in snapshot.run_proves_entity.drain(..) {
-        let src = GraphNodeId::VerificationRun(run_id);
-        let dst = GraphNodeId::Entity(entity_id);
-        if seen.insert((RelationKind::DerivedFrom, src, dst)) {
-            let relation = verification_relation(RelationKind::DerivedFrom, src, dst);
-            snapshot.relations.insert(relation.id, relation);
-        }
-    }
-    for (run_id, work_id) in snapshot.run_proves_work.drain(..) {
-        let src = GraphNodeId::VerificationRun(run_id);
-        let dst = GraphNodeId::Work(work_id);
-        if seen.insert((RelationKind::DerivedFrom, src, dst)) {
-            let relation = verification_relation(RelationKind::DerivedFrom, src, dst);
-            snapshot.relations.insert(relation.id, relation);
-        }
     }
 }
 
@@ -1804,8 +1765,7 @@ impl InMemoryGraph {
     }
 
     /// Restore a graph from a snapshot (RAM-only text index).
-    pub fn from_snapshot(mut snapshot: GraphSnapshot) -> Self {
-        migrate_legacy_verification_relations(&mut snapshot);
+    pub fn from_snapshot(snapshot: GraphSnapshot) -> Self {
         let expected_root_hash = compute_graph_root_hash(&snapshot);
         Self::from_snapshot_inner(snapshot, None, expected_root_hash, false, false)
     }
@@ -1813,10 +1773,9 @@ impl InMemoryGraph {
     /// Restore a graph from a snapshot (RAM-only text index) with a precomputed
     /// graph root hash.
     pub fn from_snapshot_with_root_hash(
-        mut snapshot: GraphSnapshot,
+        snapshot: GraphSnapshot,
         expected_root_hash: [u8; 32],
     ) -> Self {
-        migrate_legacy_verification_relations(&mut snapshot);
         Self::from_snapshot_inner(snapshot, None, expected_root_hash, false, false)
     }
 
@@ -1825,20 +1784,18 @@ impl InMemoryGraph {
     /// This is intended for graph-only workflows such as warm-cache diffing
     /// where entity/file truth is needed but lexical retrieval is not.
     pub fn from_snapshot_without_text_index_with_root_hash(
-        mut snapshot: GraphSnapshot,
+        snapshot: GraphSnapshot,
         expected_root_hash: [u8; 32],
     ) -> Self {
-        migrate_legacy_verification_relations(&mut snapshot);
         Self::from_snapshot_inner(snapshot, None, expected_root_hash, false, true)
     }
 
     /// Restore a graph from a snapshot with a persistent text index at the
     /// given directory path.
     pub fn from_snapshot_with_text_index(
-        mut snapshot: GraphSnapshot,
+        snapshot: GraphSnapshot,
         text_index_path: PathBuf,
     ) -> Self {
-        migrate_legacy_verification_relations(&mut snapshot);
         let expected_root_hash = compute_graph_root_hash(&snapshot);
         Self::from_snapshot_inner(
             snapshot,
@@ -1852,10 +1809,9 @@ impl InMemoryGraph {
     /// Restore a graph from a snapshot with a persistent text index loaded in
     /// read-only mode.
     pub fn from_snapshot_with_text_index_read_only(
-        mut snapshot: GraphSnapshot,
+        snapshot: GraphSnapshot,
         text_index_path: PathBuf,
     ) -> Self {
-        migrate_legacy_verification_relations(&mut snapshot);
         let expected_root_hash = compute_graph_root_hash(&snapshot);
         Self::from_snapshot_inner(
             snapshot,
@@ -1869,11 +1825,10 @@ impl InMemoryGraph {
     /// Restore a graph from a snapshot with a persistent text index and a
     /// precomputed graph root hash.
     pub fn from_snapshot_with_text_index_and_root_hash(
-        mut snapshot: GraphSnapshot,
+        snapshot: GraphSnapshot,
         text_index_path: PathBuf,
         expected_root_hash: [u8; 32],
     ) -> Self {
-        migrate_legacy_verification_relations(&mut snapshot);
         Self::from_snapshot_inner(
             snapshot,
             Some(text_index_path),
@@ -1886,11 +1841,10 @@ impl InMemoryGraph {
     /// Restore a graph from a snapshot with a persistent text index loaded in
     /// read-only mode and a precomputed graph root hash.
     pub fn from_snapshot_with_text_index_and_root_hash_read_only(
-        mut snapshot: GraphSnapshot,
+        snapshot: GraphSnapshot,
         text_index_path: PathBuf,
         expected_root_hash: [u8; 32],
     ) -> Self {
-        migrate_legacy_verification_relations(&mut snapshot);
         Self::from_snapshot_inner(
             snapshot,
             Some(text_index_path),
@@ -1940,11 +1894,6 @@ impl InMemoryGraph {
             test_cases,
             assertions,
             verification_runs,
-            test_covers_entity: _,
-            test_covers_contract: _,
-            test_verifies_work: _,
-            run_proves_entity: _,
-            run_proves_work: _,
             mock_hints,
             contracts,
             actors,
@@ -1960,9 +1909,6 @@ impl InMemoryGraph {
             intents,
             downstream_warnings,
             entity_revisions,
-            entity_tombstones: _,
-            relation_tombstones: _,
-            change_order: _,
             artifact_index,
         } = snapshot;
         let entity_revisions: HashMap<EntityId, Vec<EntityRevision>> =
@@ -2110,21 +2056,8 @@ impl InMemoryGraph {
             .into_iter()
             .map(|artifact| (artifact.file_id.clone(), artifact))
             .collect();
-        let persisted_artifact_index: HashMap<FilePathId, ArtifactId> =
-            artifact_index.into_iter().collect();
-        let (artifact_index, artifact_reverse) = if persisted_artifact_index.is_empty() {
-            build_artifact_indexes_from_paths(
-                shallow_files
-                    .keys()
-                    .chain(file_layouts.keys())
-                    .chain(structured_artifacts.keys())
-                    .chain(opaque_artifacts.keys())
-                    .cloned(),
-            )
-        } else {
-            let artifact_reverse = reverse_artifact_index(&persisted_artifact_index);
-            (persisted_artifact_index, artifact_reverse)
-        };
+        let artifact_index: HashMap<FilePathId, ArtifactId> = artifact_index.into_iter().collect();
+        let artifact_reverse = reverse_artifact_index(&artifact_index);
 
         let entity_data = EntityData {
             entities: entities.into_iter().collect(),
@@ -2336,21 +2269,8 @@ impl InMemoryGraph {
             .into_iter()
             .map(|artifact| (artifact.file_id.clone(), artifact))
             .collect();
-        let persisted_artifact_index: HashMap<FilePathId, ArtifactId> =
-            artifact_index.into_iter().collect();
-        let (artifact_index, artifact_reverse) = if persisted_artifact_index.is_empty() {
-            build_artifact_indexes_from_paths(
-                shallow_files
-                    .keys()
-                    .chain(file_layouts.keys())
-                    .chain(structured_artifacts.keys())
-                    .chain(opaque_artifacts.keys())
-                    .cloned(),
-            )
-        } else {
-            let artifact_reverse = reverse_artifact_index(&persisted_artifact_index);
-            (persisted_artifact_index, artifact_reverse)
-        };
+        let artifact_index: HashMap<FilePathId, ArtifactId> = artifact_index.into_iter().collect();
+        let artifact_reverse = reverse_artifact_index(&artifact_index);
 
         let entity_data = EntityData {
             entities,
@@ -3089,6 +3009,7 @@ impl InMemoryGraph {
         let ver = self.verification.read();
         let prv = self.provenance.read();
         let ses = self.sessions.read();
+        validate_artifact_indexes(&ent)?;
         let t_lock = t0.elapsed();
 
         let t1 = std::time::Instant::now();
@@ -3117,6 +3038,7 @@ impl InMemoryGraph {
                 file_layouts: &ent.file_layouts,
                 structured_artifacts: &ent.structured_artifacts,
                 opaque_artifacts: &ent.opaque_artifacts,
+                artifact_index: &ent.artifact_index,
                 changes: &chg.changes,
                 change_children: &chg.change_children,
                 branches: &chg.branches,
@@ -3177,15 +3099,17 @@ impl InMemoryGraph {
         self.entities.read().artifact_reverse.get(id).cloned()
     }
 
-    /// Idempotent: returns existing ID if tracked, else assigns new one.
-    /// For migration, uses from_path() deterministic derivation so existing
-    /// graph edges remain valid.
+    /// Idempotent: returns the graph-owned ID if assigned, otherwise mints and
+    /// persists the path's first identity.
     pub fn ensure_artifact_id(&self, path: &FilePathId) -> ArtifactId {
         let mut ent = self.entities.write();
         if let Some(id) = ent.artifact_index.get(path) {
             *id
         } else {
-            let new_id = ArtifactId::seed_from_path(&path.0);
+            let mut new_id = ArtifactId::seed_from_path(&path.0);
+            while ent.artifact_reverse.contains_key(&new_id) {
+                new_id = ArtifactId::new();
+            }
             ent.artifact_index.insert(path.clone(), new_id);
             ent.artifact_reverse.insert(new_id, path.clone());
             self.record_artifact_index_delta_upsert(path.clone(), new_id);
@@ -3200,6 +3124,12 @@ impl InMemoryGraph {
         new_path: &FilePathId,
     ) -> Option<ArtifactId> {
         let mut ent = self.entities.write();
+        if old_path == new_path {
+            return ent.artifact_index.get(old_path).copied();
+        }
+        if ent.artifact_index.contains_key(new_path) {
+            return None;
+        }
         let id = ent.artifact_index.remove(old_path)?;
         ent.artifact_index.insert(new_path.clone(), id);
         ent.artifact_reverse.insert(id, new_path.clone());
@@ -3261,11 +3191,6 @@ impl InMemoryGraph {
             test_cases: ver.test_cases.into_iter().collect(),
             assertions: ver.assertions.into_iter().collect(),
             verification_runs: ver.verification_runs.into_iter().collect(),
-            test_covers_entity: Vec::new(),
-            test_covers_contract: Vec::new(),
-            test_verifies_work: Vec::new(),
-            run_proves_entity: Vec::new(),
-            run_proves_work: Vec::new(),
             mock_hints: ver.mock_hints,
             contracts: ver.contracts.into_iter().collect(),
             actors: prv.actors.into_iter().collect(),
@@ -3275,9 +3200,6 @@ impl InMemoryGraph {
             sessions: ses.sessions.into_iter().collect(),
             intents: ses.intents.into_iter().collect(),
             downstream_warnings: ses.downstream_warnings,
-            entity_tombstones: std::collections::HashMap::new(),
-            relation_tombstones: std::collections::HashMap::new(),
-            change_order: std::collections::HashMap::new(),
             artifact_index: ent.artifact_index.into_iter().collect(),
         }
     }
@@ -6031,6 +5953,10 @@ impl EntityStore for InMemoryGraph {
     // inherent O(1) artifact-index lookup) rather than re-deriving from the path.
     fn artifact_id_for_path(&self, path: &FilePathId) -> Option<ArtifactId> {
         InMemoryGraph::artifact_id_for_path(self, path)
+    }
+
+    fn ensure_artifact_id(&self, path: &FilePathId) -> Result<ArtifactId, KinDbError> {
+        Ok(InMemoryGraph::ensure_artifact_id(self, path))
     }
 
     // -----------------------------------------------------------------------

@@ -1891,11 +1891,6 @@ fn authority_recovery_snapshot_domains_match(
         test_cases: _,
         assertions: _,
         verification_runs: _,
-        test_covers_entity: _,
-        test_covers_contract: _,
-        test_verifies_work: _,
-        run_proves_entity: _,
-        run_proves_work: _,
         mock_hints: _,
         contracts: _,
         actors: _,
@@ -1911,9 +1906,6 @@ fn authority_recovery_snapshot_domains_match(
         intents: _,
         downstream_warnings: _,
         entity_revisions: _,
-        entity_tombstones: _,
-        relation_tombstones: _,
-        change_order: _,
         artifact_index: _,
     } = expected;
 
@@ -1954,9 +1946,6 @@ fn authority_recovery_snapshot_domains_match(
         sessions,
         intents,
         entity_revisions,
-        entity_tombstones,
-        relation_tombstones,
-        change_order,
         artifact_index,
     );
 
@@ -2002,11 +1991,6 @@ fn authority_recovery_snapshot_domains_match(
     }
     compare_ordered_domains!(
         work_links,
-        test_covers_entity,
-        test_covers_contract,
-        test_verifies_work,
-        run_proves_entity,
-        run_proves_work,
         mock_hints,
         delegations,
         approvals,
@@ -5410,14 +5394,16 @@ mod tests {
 
     #[test]
     fn evidence_bound_recovery_compares_content_addressed_map_keys() {
-        let change_id = SemanticChangeId::from_hash(Hash256::from_bytes([9; 32]));
+        let file_id = FilePathId::new("compose.yaml");
         let mut expected = GraphSnapshot::empty();
-        expected.change_order.insert(change_id, 1);
+        expected
+            .artifact_index
+            .insert(file_id.clone(), ArtifactId::new());
         let mut actual = expected.clone();
 
         assert!(authority_recovery_snapshot_domains_match(&expected, &actual).unwrap());
 
-        actual.change_order.insert(change_id, 2);
+        actual.artifact_index.insert(file_id, ArtifactId::new());
         assert!(!authority_recovery_snapshot_domains_match(&expected, &actual).unwrap());
     }
 
@@ -6947,11 +6933,8 @@ mod tests {
         graph.upsert_relation(&calls).unwrap();
         graph.upsert_relation(&cochange).unwrap();
 
-        // working_tree is HashMap<String, [u8; 32]>; the 32-byte values serialize
-        // as a sequence. A non-empty map exercises the snapshot field that the
-        // locate decoder must skip rather than misread as artifact_index
-        // (FastHashMap<FilePathId, ArtifactId>) — the latter expects 16-byte
-        // UUID values and fails with "expected a 16 byte array" when drifted.
+        // A non-empty exact working tree exercises the positional field that
+        // the locate decoder must drain rather than misread as artifact_index.
         graph.set_working_tree_entry("src/main.rs", crate::types::regular_tree_entry(7));
         graph.set_working_tree_entry("src/lib.rs", crate::types::regular_tree_entry(9));
 
@@ -8960,6 +8943,13 @@ mod tests {
         let graph = InMemoryGraph::new();
         let entity = test_entity("RoundTrip");
         graph.upsert_entity(&entity).unwrap();
+        let old_path = FilePathId::new("config/old-name.yaml");
+        let new_path = FilePathId::new("config/current.yaml");
+        let artifact_id = graph.ensure_artifact_id(&old_path);
+        assert_eq!(
+            graph.rename_artifact(&old_path, &new_path),
+            Some(artifact_id)
+        );
 
         // Save via borrowed path (now the default)
         SnapshotManager::save_graph(&snap_path, &graph).unwrap();
@@ -8971,6 +8961,8 @@ mod tests {
         assert_eq!(loaded_entity.name, "RoundTrip");
         assert_eq!(loaded_entity.kind, EntityKind::Function);
         assert_eq!(loaded_entity.language, LanguageId::Rust);
+        assert_eq!(loaded.artifact_index.get(&new_path), Some(&artifact_id));
+        assert!(!loaded.artifact_index.contains_key(&old_path));
     }
 
     #[test]

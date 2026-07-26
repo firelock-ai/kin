@@ -128,11 +128,6 @@ fn generate_snapshot(n: usize, rels_per_entity: usize) -> (GraphSnapshot, Vec<En
         test_cases: HashMap::new(),
         assertions: HashMap::new(),
         verification_runs: HashMap::new(),
-        test_covers_entity: Vec::new(),
-        test_covers_contract: Vec::new(),
-        test_verifies_work: Vec::new(),
-        run_proves_entity: Vec::new(),
-        run_proves_work: Vec::new(),
         mock_hints: Vec::new(),
         contracts: HashMap::new(),
         actors: HashMap::new(),
@@ -147,9 +142,6 @@ fn generate_snapshot(n: usize, rels_per_entity: usize) -> (GraphSnapshot, Vec<En
         sessions: HashMap::new(),
         intents: HashMap::new(),
         downstream_warnings: Vec::new(),
-        entity_tombstones: HashMap::new(),
-        relation_tombstones: HashMap::new(),
-        change_order: HashMap::new(),
         artifact_index: HashMap::new(),
     };
 

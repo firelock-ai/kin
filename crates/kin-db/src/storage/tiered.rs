@@ -585,47 +585,6 @@ fn merge_hot_into_cold(
     cold.assertions.extend(hot.assertions);
     cold.verification_runs.extend(hot.verification_runs);
 
-    // Merge tuple-Vec fields by deduplicating
-    if !hot.test_covers_entity.is_empty() {
-        let existing: HashSet<_> = cold.test_covers_entity.iter().cloned().collect();
-        cold.test_covers_entity.extend(
-            hot.test_covers_entity
-                .into_iter()
-                .filter(|t| !existing.contains(t)),
-        );
-    }
-    if !hot.test_covers_contract.is_empty() {
-        let existing: HashSet<_> = cold.test_covers_contract.iter().cloned().collect();
-        cold.test_covers_contract.extend(
-            hot.test_covers_contract
-                .into_iter()
-                .filter(|t| !existing.contains(t)),
-        );
-    }
-    if !hot.test_verifies_work.is_empty() {
-        let existing: HashSet<_> = cold.test_verifies_work.iter().cloned().collect();
-        cold.test_verifies_work.extend(
-            hot.test_verifies_work
-                .into_iter()
-                .filter(|t| !existing.contains(t)),
-        );
-    }
-    if !hot.run_proves_entity.is_empty() {
-        let existing: HashSet<_> = cold.run_proves_entity.iter().cloned().collect();
-        cold.run_proves_entity.extend(
-            hot.run_proves_entity
-                .into_iter()
-                .filter(|t| !existing.contains(t)),
-        );
-    }
-    if !hot.run_proves_work.is_empty() {
-        let existing: HashSet<_> = cold.run_proves_work.iter().cloned().collect();
-        cold.run_proves_work.extend(
-            hot.run_proves_work
-                .into_iter()
-                .filter(|t| !existing.contains(t)),
-        );
-    }
     if !hot.mock_hints.is_empty() {
         let existing: HashSet<_> = cold.mock_hints.iter().map(|m| m.hint_id).collect();
         cold.mock_hints.extend(
@@ -847,7 +806,7 @@ impl std::fmt::Display for TieredGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
     use tempfile::TempDir;
 
     use crate::storage::{build_entity_hash_map, compute_graph_root_hash, verify_subgraph};

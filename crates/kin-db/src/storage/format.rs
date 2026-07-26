@@ -22,10 +22,6 @@ pub struct CompactionStats {
     pub orphaned_outgoing_cleaned: usize,
     /// Incoming edge-list entries cleaned (non-existent entities or relations).
     pub orphaned_incoming_cleaned: usize,
-    /// Test coverage entries removed (non-existent test or entity/contract/work).
-    pub orphaned_test_coverage_removed: usize,
-    /// Verification run references removed (non-existent run, entity, or work).
-    pub orphaned_verification_refs_removed: usize,
     /// Mock hints removed (non-existent test).
     pub orphaned_mock_hints_removed: usize,
     /// Downstream warnings removed (non-existent intent or entity).
@@ -48,8 +44,6 @@ impl CompactionStats {
         self.orphaned_relations_removed
             + self.orphaned_outgoing_cleaned
             + self.orphaned_incoming_cleaned
-            + self.orphaned_test_coverage_removed
-            + self.orphaned_verification_refs_removed
             + self.orphaned_mock_hints_removed
             + self.orphaned_downstream_warnings_removed
             + self.orphaned_approvals_removed
@@ -76,79 +70,34 @@ pub struct GraphSnapshot {
     pub changes: HashMap<SemanticChangeId, SemanticChange>,
     pub change_children: HashMap<SemanticChangeId, Vec<SemanticChangeId>>,
     pub branches: HashMap<BranchName, Branch>,
-    #[serde(default)]
     pub work_items: HashMap<WorkId, WorkItem>,
-    #[serde(default)]
     pub annotations: HashMap<AnnotationId, Annotation>,
-    #[serde(default)]
     pub work_links: Vec<WorkLink>,
-    #[serde(default)]
     pub reviews: HashMap<ReviewId, Review>,
-    #[serde(default)]
     pub review_decisions: HashMap<ReviewId, Vec<ReviewDecision>>,
-    #[serde(default)]
     pub review_notes: Vec<ReviewNote>,
-    #[serde(default)]
     pub review_discussions: Vec<ReviewDiscussion>,
-    #[serde(default)]
     pub review_assignments: HashMap<ReviewId, Vec<ReviewAssignment>>,
-    #[serde(default)]
     pub test_cases: HashMap<TestId, TestCase>,
-    #[serde(default)]
     pub assertions: HashMap<AssertionId, Assertion>,
-    #[serde(default)]
     pub verification_runs: HashMap<VerificationRunId, VerificationRun>,
-    #[serde(default)]
-    pub test_covers_entity: Vec<(TestId, EntityId)>,
-    #[serde(default)]
-    pub test_covers_contract: Vec<(TestId, ContractId)>,
-    #[serde(default)]
-    pub test_verifies_work: Vec<(TestId, WorkId)>,
-    #[serde(default)]
-    pub run_proves_entity: Vec<(VerificationRunId, EntityId)>,
-    #[serde(default)]
-    pub run_proves_work: Vec<(VerificationRunId, WorkId)>,
-    #[serde(default)]
     pub mock_hints: Vec<MockHint>,
-    #[serde(default)]
     pub contracts: HashMap<ContractId, Contract>,
-    #[serde(default)]
     pub actors: HashMap<ActorId, Actor>,
-    #[serde(default)]
     pub delegations: Vec<Delegation>,
-    #[serde(default)]
     pub approvals: Vec<Approval>,
-    #[serde(default)]
     pub audit_events: Vec<AuditEvent>,
-    #[serde(default)]
     pub shallow_files: Vec<ShallowTrackedFile>,
-    #[serde(default)]
     pub file_layouts: Vec<FileLayout>,
-    #[serde(default)]
     pub structured_artifacts: Vec<StructuredArtifact>,
-    #[serde(default)]
     pub opaque_artifacts: Vec<OpaqueArtifact>,
     /// Exact graph-owned working tree. Every tracked path has a blob identity
     /// and materialization kind; parser support is not part of admission.
     pub working_tree: HashMap<String, TreeEntry>,
-    #[serde(default)]
     pub sessions: HashMap<SessionId, AgentSession>,
-    #[serde(default)]
     pub intents: HashMap<IntentId, Intent>,
-    #[serde(default)]
     pub downstream_warnings: Vec<(IntentId, EntityId, String)>,
-    #[serde(default)]
     pub entity_revisions: HashMap<EntityId, Vec<EntityRevision>>,
-    #[serde(default)]
-    pub entity_tombstones: HashMap<EntityId, (Entity, SemanticChangeId)>,
-    #[serde(default)]
-    pub relation_tombstones: HashMap<RelationId, (Relation, SemanticChangeId)>,
-    /// Topological ordinal map for temporal scope queries.
-    /// Maps each `SemanticChangeId` to its position in the DAG
-    /// (0 = oldest/genesis, N = newest/head).
-    #[serde(default)]
-    pub change_order: HashMap<SemanticChangeId, u64>,
-    #[serde(default)]
     pub artifact_index: HashMap<FilePathId, ArtifactId>,
 }
 
@@ -173,7 +122,6 @@ pub(crate) struct LocateGraphSnapshot {
     pub file_layouts: Vec<FileLayout>,
     pub structured_artifacts: Vec<StructuredArtifact>,
     pub opaque_artifacts: Vec<OpaqueArtifact>,
-    #[serde(default)]
     pub artifact_index: FastHashMap<FilePathId, ArtifactId>,
 }
 
@@ -303,20 +251,17 @@ impl GraphSnapshot {
     /// Current format version.
     pub const CURRENT_VERSION: u32 = 9;
 
-    /// Oldest on-disk format version this binary can load (directly or via
-    /// migration). Snapshots below this predate a schema we no longer read and
-    /// must be rebuilt.
+    /// The only on-disk format version this pre-release binary accepts.
     pub const MIN_SUPPORTED_VERSION: u32 = Self::CURRENT_VERSION;
 
     /// Magic bytes for the file header: "KNDB"
     pub const MAGIC: [u8; 4] = *b"KNDB";
 
-    /// Size of the checksum appended to v3+ snapshots.
+    /// Size of the checksum appended to every current snapshot.
     pub const CHECKSUM_LEN: usize = 32;
 
-    /// Optional trailer magic that binds a persisted graph root hash to the
-    /// already-verified snapshot body checksum without changing the v6 body
-    /// layout. Older readers ignore these trailing bytes.
+    /// Optional trailer magic that binds a persisted graph-root cache value to
+    /// the already-verified snapshot body checksum.
     const ROOT_HASH_TRAILER_MAGIC: [u8; 4] = *b"KRTH";
     const ROOT_HASH_TRAILER_LEN: usize = 4 + 32 + 32;
 
@@ -341,11 +286,6 @@ impl GraphSnapshot {
             test_cases: HashMap::new(),
             assertions: HashMap::new(),
             verification_runs: HashMap::new(),
-            test_covers_entity: Vec::new(),
-            test_covers_contract: Vec::new(),
-            test_verifies_work: Vec::new(),
-            run_proves_entity: Vec::new(),
-            run_proves_work: Vec::new(),
             mock_hints: Vec::new(),
             contracts: HashMap::new(),
             actors: HashMap::new(),
@@ -361,9 +301,6 @@ impl GraphSnapshot {
             intents: HashMap::new(),
             downstream_warnings: Vec::new(),
             entity_revisions: HashMap::new(),
-            entity_tombstones: HashMap::new(),
-            relation_tombstones: HashMap::new(),
-            change_order: HashMap::new(),
             artifact_index: HashMap::new(),
         }
     }
@@ -373,8 +310,6 @@ impl GraphSnapshot {
     /// Performs garbage collection across all cross-referenced collections:
     /// - Relations whose src or dst entity no longer exists
     /// - Outgoing/incoming edge lists referencing non-existent entities or relations
-    /// - Test coverage entries for non-existent tests, entities, contracts, or work items
-    /// - Verification run references for non-existent runs, entities, or work items
     /// - Mock hints for non-existent tests
     /// - Downstream warnings for non-existent intents or entities
     /// - Approvals for non-existent changes
@@ -397,31 +332,7 @@ impl GraphSnapshot {
 
         // 1. Remove orphaned relations (missing node on either endpoint)
         let before = self.relations.len();
-        let artifact_ids: HashSet<ArtifactId> = self
-            .artifact_index
-            .values()
-            .copied()
-            .chain(
-                self.shallow_files
-                    .iter()
-                    .map(|file| ArtifactId::seed_from_file_id(&file.file_id)),
-            )
-            .chain(
-                self.file_layouts
-                    .iter()
-                    .map(|layout| ArtifactId::seed_from_file_id(&layout.file_id)),
-            )
-            .chain(
-                self.structured_artifacts
-                    .iter()
-                    .map(|artifact| ArtifactId::seed_from_file_id(&artifact.file_id)),
-            )
-            .chain(
-                self.opaque_artifacts
-                    .iter()
-                    .map(|artifact| ArtifactId::seed_from_file_id(&artifact.file_id)),
-            )
-            .collect();
+        let artifact_ids: HashSet<ArtifactId> = self.artifact_index.values().copied().collect();
         self.relations.retain(|_, rel| {
             graph_node_exists(
                 rel.src,
@@ -462,57 +373,26 @@ impl GraphSnapshot {
         self.incoming.retain(|_, rels| !rels.is_empty());
         stats.orphaned_incoming_cleaned = before.saturating_sub(self.incoming.len());
 
-        // 4. Clean legacy test coverage entries
-        let mut coverage_removed = 0usize;
-        let before = self.test_covers_entity.len();
-        self.test_covers_entity
-            .retain(|(tid, eid)| test_ids.contains(tid) && entity_ids.contains(eid));
-        coverage_removed += before - self.test_covers_entity.len();
-
-        let before = self.test_covers_contract.len();
-        self.test_covers_contract
-            .retain(|(tid, cid)| test_ids.contains(tid) && contract_ids.contains(cid));
-        coverage_removed += before - self.test_covers_contract.len();
-
-        let before = self.test_verifies_work.len();
-        self.test_verifies_work
-            .retain(|(tid, wid)| test_ids.contains(tid) && work_ids.contains(wid));
-        coverage_removed += before - self.test_verifies_work.len();
-        stats.orphaned_test_coverage_removed = coverage_removed;
-
-        // 5. Clean legacy verification run references
-        let mut vr_removed = 0usize;
-        let before = self.run_proves_entity.len();
-        self.run_proves_entity
-            .retain(|(rid, eid)| run_ids.contains(rid) && entity_ids.contains(eid));
-        vr_removed += before - self.run_proves_entity.len();
-
-        let before = self.run_proves_work.len();
-        self.run_proves_work
-            .retain(|(rid, wid)| run_ids.contains(rid) && work_ids.contains(wid));
-        vr_removed += before - self.run_proves_work.len();
-        stats.orphaned_verification_refs_removed = vr_removed;
-
-        // 6. Clean mock hints for non-existent tests
+        // 4. Clean mock hints for non-existent tests
         let before = self.mock_hints.len();
         self.mock_hints
             .retain(|hint| test_ids.contains(&hint.test_id));
         stats.orphaned_mock_hints_removed = before - self.mock_hints.len();
 
-        // 7. Clean downstream warnings for non-existent intents or entities
+        // 5. Clean downstream warnings for non-existent intents or entities
         let intent_ids: HashSet<IntentId> = self.intents.keys().copied().collect();
         let before = self.downstream_warnings.len();
         self.downstream_warnings
             .retain(|(iid, eid, _)| intent_ids.contains(iid) && entity_ids.contains(eid));
         stats.orphaned_downstream_warnings_removed = before - self.downstream_warnings.len();
 
-        // 8. Clean approvals for non-existent changes
+        // 6. Clean approvals for non-existent changes
         let change_ids: HashSet<SemanticChangeId> = self.changes.keys().copied().collect();
         let before = self.approvals.len();
         self.approvals.retain(|a| change_ids.contains(&a.change_id));
         stats.orphaned_approvals_removed = before - self.approvals.len();
 
-        // 9. Clean delegations for non-existent actors
+        // 7. Clean delegations for non-existent actors
         let actor_ids: HashSet<ActorId> = self.actors.keys().copied().collect();
         let before = self.delegations.len();
         self.delegations
@@ -550,20 +430,17 @@ impl GraphSnapshot {
         &self,
         persisted_root_hash: Option<[u8; 32]>,
     ) -> Result<Vec<u8>, crate::error::KinDbError> {
-        let body = if self.version == Self::CURRENT_VERSION {
-            // Fast path: version matches, serialize directly without cloning.
-            // This saves ~200MB+ of peak memory for graphs with >500K entities.
-            rmp_serde::to_vec(self).map_err(|e| {
-                crate::error::KinDbError::StorageError(format!("serialization failed: {e}"))
-            })?
-        } else {
-            // Slow path: version mismatch, must clone and update version.
-            let mut snapshot = self.clone();
-            snapshot.version = Self::CURRENT_VERSION;
-            rmp_serde::to_vec(&snapshot).map_err(|e| {
-                crate::error::KinDbError::StorageError(format!("serialization failed: {e}"))
-            })?
-        };
+        if self.version != Self::CURRENT_VERSION {
+            return Err(crate::error::KinDbError::StorageError(format!(
+                "refusing to serialize snapshot body version {}; current schema is exactly v{}",
+                self.version,
+                Self::CURRENT_VERSION
+            )));
+        }
+        self.validate_artifact_index()?;
+        let body = rmp_serde::to_vec(self).map_err(|e| {
+            crate::error::KinDbError::StorageError(format!("serialization failed: {e}"))
+        })?;
 
         let trailer_len = persisted_root_hash
             .map(|_| Self::ROOT_HASH_TRAILER_LEN)
@@ -618,6 +495,7 @@ impl GraphSnapshot {
             Self::CURRENT_VERSION => Self::decode_current_snapshot(frame.body)?,
             _ => unreachable!("decode_frame validates supported versions"),
         };
+        snapshot.validate_artifact_index()?;
 
         let persisted_root_hash = if verify_checksum {
             Self::decode_root_hash_trailer(data, &frame)?
@@ -706,6 +584,19 @@ impl GraphSnapshot {
         rmp_serde::from_slice(body).map_err(|e| {
             crate::error::KinDbError::StorageError(format!("deserialization failed: {e}"))
         })
+    }
+
+    fn validate_artifact_index(&self) -> Result<(), crate::error::KinDbError> {
+        let mut reverse = HashMap::<ArtifactId, &FilePathId>::new();
+        for (path, artifact_id) in &self.artifact_index {
+            if let Some(existing_path) = reverse.insert(*artifact_id, path) {
+                return Err(crate::error::KinDbError::StorageError(format!(
+                    "artifact identity {artifact_id:?} is assigned to both {} and {}",
+                    existing_path.0, path.0
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn verify_checksum(
@@ -858,6 +749,17 @@ impl LocateGraphSnapshot {
             GraphSnapshot::CURRENT_VERSION => Self::decode_current_snapshot(frame.body)?,
             _ => unreachable!("decode_frame validates supported versions"),
         };
+        {
+            let mut reverse = HashMap::<ArtifactId, &FilePathId>::new();
+            for (path, artifact_id) in &snapshot.artifact_index {
+                if let Some(existing_path) = reverse.insert(*artifact_id, path) {
+                    return Err(crate::error::KinDbError::StorageError(format!(
+                        "artifact identity {artifact_id:?} is assigned to both {} and {}",
+                        existing_path.0, path.0
+                    )));
+                }
+            }
+        }
 
         let persisted_root_hash = if verify_checksum {
             GraphSnapshot::decode_root_hash_trailer(data, &frame)?
@@ -956,7 +858,7 @@ impl<'de> Deserialize<'de> for LocateGraphSnapshot {
                     .next_element()?
                     .ok_or_else(|| serde::de::Error::invalid_length(5, &self))?;
 
-                for index in 6..30 {
+                for index in 6..25 {
                     let _: IgnoredAny = seq
                         .next_element()?
                         .ok_or_else(|| serde::de::Error::invalid_length(index, &self))?;
@@ -964,26 +866,25 @@ impl<'de> Deserialize<'de> for LocateGraphSnapshot {
 
                 let shallow_files = seq
                     .next_element()?
-                    .ok_or_else(|| serde::de::Error::invalid_length(30, &self))?;
+                    .ok_or_else(|| serde::de::Error::invalid_length(25, &self))?;
                 let file_layouts = seq
                     .next_element()?
-                    .ok_or_else(|| serde::de::Error::invalid_length(31, &self))?;
+                    .ok_or_else(|| serde::de::Error::invalid_length(26, &self))?;
                 let structured_artifacts = seq
                     .next_element()?
-                    .ok_or_else(|| serde::de::Error::invalid_length(32, &self))?;
+                    .ok_or_else(|| serde::de::Error::invalid_length(27, &self))?;
                 let opaque_artifacts = seq
                     .next_element()?
-                    .ok_or_else(|| serde::de::Error::invalid_length(33, &self))?;
+                    .ok_or_else(|| serde::de::Error::invalid_length(28, &self))?;
 
-                // Everything after opaque_artifacts (working_tree, sessions,
-                // intents, downstream_warnings, entity_revisions, the tombstone
-                // maps, change_order, artifact_index) is drained rather than
-                // read by index. Those trailing fields grow over time and the
-                // borrowed save path stops before artifact_index, so any fixed
-                // position drifts against the canonical layout. artifact_index
-                // is rebuilt from artifact file paths in from_locate_snapshot,
-                // so locate starts from an empty map here.
-                while let Some(_) = seq.next_element::<IgnoredAny>()? {}
+                for index in 29..34 {
+                    let _: IgnoredAny = seq
+                        .next_element()?
+                        .ok_or_else(|| serde::de::Error::invalid_length(index, &self))?;
+                }
+                let artifact_index = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(34, &self))?;
 
                 Ok(LocateGraphSnapshot {
                     version,
@@ -994,7 +895,7 @@ impl<'de> Deserialize<'de> for LocateGraphSnapshot {
                     file_layouts,
                     structured_artifacts,
                     opaque_artifacts,
-                    artifact_index: FastHashMap::default(),
+                    artifact_index,
                 })
             }
         }
@@ -1019,7 +920,7 @@ struct SnapshotFrame<'a> {
 /// (hashbrown maps + vecs), we avoid the ~18 GB clone that `to_snapshot()`
 /// materialises for large graphs.
 ///
-/// The `Serialize` impl manually writes 39 fields in the same positional
+/// The `Serialize` impl manually writes 35 fields in the same positional
 /// order as the derive(Serialize) on `GraphSnapshot`, so the resulting
 /// msgpack is byte-for-byte compatible with the owned version.
 pub struct BorrowedGraphSnapshot<'a> {
@@ -1033,6 +934,7 @@ pub struct BorrowedGraphSnapshot<'a> {
     pub file_layouts: &'a hashbrown::HashMap<FilePathId, FileLayout>,
     pub structured_artifacts: &'a hashbrown::HashMap<FilePathId, StructuredArtifact>,
     pub opaque_artifacts: &'a hashbrown::HashMap<FilePathId, OpaqueArtifact>,
+    pub artifact_index: &'a hashbrown::HashMap<FilePathId, ArtifactId>,
     // ChangeData fields
     pub changes: &'a hashbrown::HashMap<SemanticChangeId, SemanticChange>,
     pub change_children: &'a hashbrown::HashMap<SemanticChangeId, Vec<SemanticChangeId>>,
@@ -1068,10 +970,10 @@ pub struct BorrowedGraphSnapshot<'a> {
 impl<'a> Serialize for BorrowedGraphSnapshot<'a> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        // Must produce exactly 39 fields in the same order as GraphSnapshot's
+        // Must produce exactly 35 fields in the same order as GraphSnapshot's
         // derive(Serialize).  rmp_serde serializes structs as arrays, so
         // position (not name) determines the mapping.
-        let mut state = serializer.serialize_struct("GraphSnapshot", 39)?;
+        let mut state = serializer.serialize_struct("GraphSnapshot", 35)?;
 
         // 1. version
         state.serialize_field("version", &GraphSnapshot::CURRENT_VERSION)?;
@@ -1114,53 +1016,44 @@ impl<'a> Serialize for BorrowedGraphSnapshot<'a> {
         state.serialize_field("assertions", self.assertions)?;
         // 19. verification_runs
         state.serialize_field("verification_runs", self.verification_runs)?;
-        // 20-24. coverage vecs — empty in to_snapshot()
-        let empty_tid_eid: &[(TestId, EntityId)] = &[];
-        let empty_tid_cid: &[(TestId, ContractId)] = &[];
-        let empty_tid_wid: &[(TestId, WorkId)] = &[];
-        let empty_rid_eid: &[(VerificationRunId, EntityId)] = &[];
-        let empty_rid_wid: &[(VerificationRunId, WorkId)] = &[];
-        state.serialize_field("test_covers_entity", empty_tid_eid)?;
-        state.serialize_field("test_covers_contract", empty_tid_cid)?;
-        state.serialize_field("test_verifies_work", empty_tid_wid)?;
-        state.serialize_field("run_proves_entity", empty_rid_eid)?;
-        state.serialize_field("run_proves_work", empty_rid_wid)?;
-        // 25. mock_hints
+        // 20. mock_hints
         state.serialize_field("mock_hints", self.mock_hints)?;
-        // 26. contracts
+        // 21. contracts
         state.serialize_field("contracts", self.contracts)?;
-        // 27. actors
+        // 22. actors
         state.serialize_field("actors", self.actors)?;
-        // 28. delegations
+        // 23. delegations
         state.serialize_field("delegations", self.delegations)?;
-        // 29. approvals
+        // 24. approvals
         state.serialize_field("approvals", self.approvals)?;
-        // 30. audit_events
+        // 25. audit_events
         state.serialize_field("audit_events", self.audit_events)?;
-        // 31. shallow_files  (HashMap values → seq)
+        // 26. shallow_files  (HashMap values → seq)
         state.serialize_field("shallow_files", &HashMapValuesAsSeq(self.shallow_files))?;
-        // 32. file_layouts  (HashMap values → seq)
+        // 27. file_layouts  (HashMap values → seq)
         state.serialize_field("file_layouts", &HashMapValuesAsSeq(self.file_layouts))?;
-        // 33. structured_artifacts  (HashMap values → seq)
+        // 28. structured_artifacts  (HashMap values → seq)
         state.serialize_field(
             "structured_artifacts",
             &HashMapValuesAsSeq(self.structured_artifacts),
         )?;
-        // 34. opaque_artifacts  (HashMap values → seq)
+        // 29. opaque_artifacts  (HashMap values → seq)
         state.serialize_field(
             "opaque_artifacts",
             &HashMapValuesAsSeq(self.opaque_artifacts),
         )?;
-        // 35. working_tree
+        // 30. working_tree
         state.serialize_field("working_tree", self.working_tree)?;
-        // 36. sessions
+        // 31. sessions
         state.serialize_field("sessions", self.sessions)?;
-        // 37. intents
+        // 32. intents
         state.serialize_field("intents", self.intents)?;
-        // 38. downstream_warnings
+        // 33. downstream_warnings
         state.serialize_field("downstream_warnings", self.downstream_warnings)?;
-        // 39. entity_revisions
+        // 34. entity_revisions
         state.serialize_field("entity_revisions", self.entity_revisions)?;
+        // 35. artifact_index
+        state.serialize_field("artifact_index", self.artifact_index)?;
 
         state.end()
     }
@@ -1329,8 +1222,10 @@ mod tests {
         snapshot.outgoing.insert(caller.id, vec![relation.id]);
         snapshot.incoming.insert(callee.id, vec![relation.id]);
         snapshot.changes.insert(change.id, change.clone());
+        let file_id = FilePathId::new("src/main.rs");
+        let assigned_artifact_id = ArtifactId::new();
         snapshot.shallow_files.push(ShallowTrackedFile {
-            file_id: FilePathId::new("src/main.rs"),
+            file_id: file_id.clone(),
             language_hint: "rust".into(),
             declaration_count: 2,
             import_count: 0,
@@ -1339,6 +1234,9 @@ mod tests {
             declaration_names: vec!["caller".into(), "callee".into()],
             import_paths: Vec::new(),
         });
+        snapshot
+            .artifact_index
+            .insert(file_id.clone(), assigned_artifact_id);
 
         let persisted_root_hash = [7; 32];
         let bytes = snapshot
@@ -1352,11 +1250,19 @@ mod tests {
         assert_eq!(locate_snapshot.relations.len(), 1);
         assert_eq!(locate_snapshot.changes.len(), 1);
         assert_eq!(locate_snapshot.shallow_files.len(), 1);
+        assert_eq!(
+            locate_snapshot.artifact_index.get(&file_id),
+            Some(&assigned_artifact_id)
+        );
 
         let decoded: GraphSnapshot = locate_snapshot.into();
         assert_eq!(decoded.entities.len(), 2);
         assert_eq!(decoded.relations.len(), 1);
         assert_eq!(decoded.changes.len(), 1);
+        assert_eq!(
+            decoded.artifact_index.get(&file_id),
+            Some(&assigned_artifact_id)
+        );
         assert!(decoded.outgoing.is_empty());
         assert!(decoded.incoming.is_empty());
         assert!(decoded.work_items.is_empty());
@@ -1371,6 +1277,21 @@ mod tests {
         assert_eq!(stats.total_removed(), 0);
         assert_eq!(stats.entities_before, 0);
         assert_eq!(stats.relations_before, 0);
+    }
+
+    #[test]
+    fn snapshot_rejects_duplicate_artifact_identity_assignments() {
+        let mut snapshot = GraphSnapshot::empty();
+        let artifact_id = ArtifactId::new();
+        snapshot
+            .artifact_index
+            .insert(FilePathId::new("compose.yaml"), artifact_id);
+        snapshot
+            .artifact_index
+            .insert(FilePathId::new("Cargo.lock"), artifact_id);
+
+        let error = snapshot.to_bytes().unwrap_err();
+        assert!(error.to_string().contains("assigned to both"));
     }
 
     #[test]
@@ -1455,38 +1376,6 @@ mod tests {
         let stats = snap.compact();
         assert_eq!(stats.orphaned_relations_removed, 0);
         assert_eq!(snap.relations.len(), 1);
-    }
-
-    #[test]
-    fn compact_removes_orphaned_test_coverage() {
-        let mut snap = GraphSnapshot::empty();
-
-        let e1 = test_entity("covered");
-        snap.entities.insert(e1.id, e1.clone());
-
-        let dead_test = TestId::new();
-        let live_test = TestId::new();
-        snap.test_cases.insert(
-            live_test,
-            TestCase {
-                test_id: live_test,
-                name: "live_test".into(),
-                language: "rust".into(),
-                kind: TestKind::Unit,
-                scopes: vec![],
-                runner: TestRunner::Cargo,
-                file_origin: None,
-            },
-        );
-
-        // One valid coverage entry, one orphaned (dead_test doesn't exist)
-        snap.test_covers_entity.push((live_test, e1.id));
-        snap.test_covers_entity.push((dead_test, e1.id));
-
-        let stats = snap.compact();
-        assert_eq!(stats.orphaned_test_coverage_removed, 1);
-        assert_eq!(snap.test_covers_entity.len(), 1);
-        assert_eq!(snap.test_covers_entity[0].0, live_test);
     }
 
     #[test]
@@ -1594,15 +1483,12 @@ mod tests {
         let rel = test_relation(e1.id, dead_entity);
         snap.relations.insert(rel.id, rel);
 
-        let dead_test = TestId::new();
-        snap.test_covers_entity.push((dead_test, e1.id));
-
         let dead_intent = IntentId::new();
         snap.downstream_warnings
             .push((dead_intent, e1.id, "orphan".into()));
 
         let stats = snap.compact();
-        assert!(stats.total_removed() >= 3);
+        assert!(stats.total_removed() >= 2);
         assert!(!stats.is_clean());
     }
 
@@ -1631,24 +1517,17 @@ mod tests {
     }
 
     #[test]
-    fn to_bytes_fast_path_avoids_clone() {
-        // Verify that the fast path (version == CURRENT_VERSION) produces
-        // identical output to the slow path
+    fn to_bytes_rejects_noncurrent_body_version() {
         let mut snap = GraphSnapshot::empty();
         let e = test_entity("fast_path");
         snap.entities.insert(e.id, e);
 
         assert_eq!(snap.version, GraphSnapshot::CURRENT_VERSION);
-        let fast_bytes = snap.to_bytes().unwrap();
+        assert!(snap.to_bytes().is_ok());
 
-        // Force slow path by changing version
         snap.version = 1;
-        let slow_bytes = snap.to_bytes().unwrap();
-
-        // Both should produce valid current-version output
-        let fast_loaded = GraphSnapshot::from_bytes(&fast_bytes).unwrap();
-        let slow_loaded = GraphSnapshot::from_bytes(&slow_bytes).unwrap();
-        assert_eq!(fast_loaded.entities.len(), slow_loaded.entities.len());
+        let error = snap.to_bytes().unwrap_err();
+        assert!(error.to_string().contains("exactly v9"));
     }
 
     #[test]
@@ -1688,15 +1567,28 @@ mod tests {
     }
 
     #[test]
-    fn current_snapshot_requires_explicit_working_tree_field() {
-        let mut encoded = serde_json::to_value(GraphSnapshot::empty()).unwrap();
-        encoded
-            .as_object_mut()
+    fn current_snapshot_requires_every_persisted_field() {
+        let encoded = serde_json::to_value(GraphSnapshot::empty()).unwrap();
+        let fields: Vec<String> = encoded
+            .as_object()
             .expect("snapshot serializes as a map")
-            .remove("working_tree");
+            .keys()
+            .cloned()
+            .collect();
 
-        let error = serde_json::from_value::<GraphSnapshot>(encoded).unwrap_err();
-        assert!(error.to_string().contains("working_tree"));
+        for field in fields {
+            let mut missing = encoded.clone();
+            missing
+                .as_object_mut()
+                .expect("snapshot serializes as a map")
+                .remove(&field);
+
+            let error = serde_json::from_value::<GraphSnapshot>(missing).unwrap_err();
+            assert!(
+                error.to_string().contains(&field),
+                "missing {field} should fail explicitly: {error}"
+            );
+        }
     }
 
     #[test]
@@ -1938,48 +1830,5 @@ mod tests {
         let mut data = vec![0u8; 64];
         data[0..4].copy_from_slice(b"XXXX");
         assert!(GraphSnapshot::from_bytes(&data).is_err());
-    }
-
-    #[test]
-    fn tombstone_snapshot_roundtrip() {
-        let mut snapshot = GraphSnapshot::empty();
-        let entity = test_entity("removed_fn");
-        let change_id = SemanticChangeId::from_hash(Hash256::from_bytes([0xAA; 32]));
-        let relation = test_relation(entity.id, EntityId::new());
-        let rel_id = relation.id;
-
-        snapshot
-            .entity_tombstones
-            .insert(entity.id, (entity.clone(), change_id));
-        snapshot
-            .relation_tombstones
-            .insert(rel_id, (relation.clone(), change_id));
-
-        let bytes = snapshot.to_bytes().unwrap();
-        let loaded = GraphSnapshot::from_bytes(&bytes).unwrap();
-
-        assert_eq!(loaded.entity_tombstones.len(), 1);
-        let (loaded_entity, loaded_change) = loaded.entity_tombstones.get(&entity.id).unwrap();
-        assert_eq!(loaded_entity.name, "removed_fn");
-        assert_eq!(*loaded_change, change_id);
-
-        assert_eq!(loaded.relation_tombstones.len(), 1);
-        let (loaded_rel, loaded_rel_change) = loaded.relation_tombstones.get(&rel_id).unwrap();
-        assert_eq!(loaded_rel.id, rel_id);
-        assert_eq!(*loaded_rel_change, change_id);
-    }
-
-    #[test]
-    fn tombstone_fields_default_empty_on_legacy_snapshot() {
-        // A snapshot without tombstone fields should deserialize with empty tombstones.
-        let snapshot = GraphSnapshot::empty();
-        assert!(snapshot.entity_tombstones.is_empty());
-        assert!(snapshot.relation_tombstones.is_empty());
-
-        // Serialize and deserialize — tombstones should remain empty.
-        let bytes = snapshot.to_bytes().unwrap();
-        let loaded = GraphSnapshot::from_bytes(&bytes).unwrap();
-        assert!(loaded.entity_tombstones.is_empty());
-        assert!(loaded.relation_tombstones.is_empty());
     }
 }

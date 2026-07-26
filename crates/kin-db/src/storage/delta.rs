@@ -126,11 +126,6 @@ pub struct GraphSnapshotDelta {
     pub test_cases: CollectionDelta<TestId, TestCase>,
     pub assertions: CollectionDelta<AssertionId, Assertion>,
     pub verification_runs: CollectionDelta<VerificationRunId, VerificationRun>,
-    pub test_covers_entity: VecDelta<(TestId, EntityId)>,
-    pub test_covers_contract: VecDelta<(TestId, ContractId)>,
-    pub test_verifies_work: VecDelta<(TestId, WorkId)>,
-    pub run_proves_entity: VecDelta<(VerificationRunId, EntityId)>,
-    pub run_proves_work: VecDelta<(VerificationRunId, WorkId)>,
     pub mock_hints: VecDelta<MockHint>,
 
     // Contracts
@@ -144,21 +139,16 @@ pub struct GraphSnapshotDelta {
 
     // File tracking
     pub shallow_files: VecDelta<ShallowTrackedFile>,
-    #[serde(default)]
     pub file_layouts: VecDelta<FileLayout>,
-    #[serde(default)]
     pub structured_artifacts: VecDelta<StructuredArtifact>,
-    #[serde(default)]
     pub opaque_artifacts: VecDelta<OpaqueArtifact>,
     pub working_tree: CollectionDelta<String, TreeEntry>,
-    #[serde(default)]
     pub artifact_index: CollectionDelta<FilePathId, ArtifactId>,
 
     // Sessions/intents
     pub sessions: CollectionDelta<SessionId, AgentSession>,
     pub intents: CollectionDelta<IntentId, Intent>,
     pub downstream_warnings: VecDelta<(IntentId, EntityId, String)>,
-    #[serde(default)]
     pub entity_revisions: CollectionDelta<EntityId, Vec<EntityRevision>>,
 }
 
@@ -194,11 +184,6 @@ impl GraphSnapshotDelta {
             test_cases: CollectionDelta::default(),
             assertions: CollectionDelta::default(),
             verification_runs: CollectionDelta::default(),
-            test_covers_entity: VecDelta::default(),
-            test_covers_contract: VecDelta::default(),
-            test_verifies_work: VecDelta::default(),
-            run_proves_entity: VecDelta::default(),
-            run_proves_work: VecDelta::default(),
             mock_hints: VecDelta::default(),
             contracts: CollectionDelta::default(),
             actors: CollectionDelta::default(),
@@ -238,11 +223,6 @@ impl GraphSnapshotDelta {
             && self.test_cases.is_empty()
             && self.assertions.is_empty()
             && self.verification_runs.is_empty()
-            && self.test_covers_entity.is_empty()
-            && self.test_covers_contract.is_empty()
-            && self.test_verifies_work.is_empty()
-            && self.run_proves_entity.is_empty()
-            && self.run_proves_work.is_empty()
             && self.mock_hints.is_empty()
             && self.contracts.is_empty()
             && self.actors.is_empty()
@@ -506,11 +486,6 @@ pub fn compute_graph_delta(
         test_cases: diff_maps(&old.test_cases, &new.test_cases),
         assertions: diff_maps(&old.assertions, &new.assertions),
         verification_runs: diff_maps(&old.verification_runs, &new.verification_runs),
-        test_covers_entity: diff_vecs(&old.test_covers_entity, &new.test_covers_entity),
-        test_covers_contract: diff_vecs(&old.test_covers_contract, &new.test_covers_contract),
-        test_verifies_work: diff_vecs(&old.test_verifies_work, &new.test_verifies_work),
-        run_proves_entity: diff_vecs(&old.run_proves_entity, &new.run_proves_entity),
-        run_proves_work: diff_vecs(&old.run_proves_work, &new.run_proves_work),
         mock_hints: diff_vecs(&old.mock_hints, &new.mock_hints),
         contracts: diff_maps(&old.contracts, &new.contracts),
         actors: diff_maps(&old.actors, &new.actors),
@@ -606,14 +581,6 @@ pub fn apply_graph_delta(snapshot: &mut GraphSnapshot, delta: &GraphSnapshotDelt
     apply_map_delta(&mut snapshot.test_cases, &delta.test_cases);
     apply_map_delta(&mut snapshot.assertions, &delta.assertions);
     apply_map_delta(&mut snapshot.verification_runs, &delta.verification_runs);
-    apply_vec_delta(&mut snapshot.test_covers_entity, &delta.test_covers_entity);
-    apply_vec_delta(
-        &mut snapshot.test_covers_contract,
-        &delta.test_covers_contract,
-    );
-    apply_vec_delta(&mut snapshot.test_verifies_work, &delta.test_verifies_work);
-    apply_vec_delta(&mut snapshot.run_proves_entity, &delta.run_proves_entity);
-    apply_vec_delta(&mut snapshot.run_proves_work, &delta.run_proves_work);
     apply_vec_delta(&mut snapshot.mock_hints, &delta.mock_hints);
 
     // Contracts

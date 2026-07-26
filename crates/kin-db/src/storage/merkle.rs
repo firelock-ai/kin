@@ -778,8 +778,7 @@ impl RepoTruthHash {
 /// including them would produce spurious mismatches on an unchanged repo:
 /// - `outgoing` / `incoming`: adjacency indexes over `relations`;
 /// - `change_children`: inverse index over `changes[].parents`;
-/// - `change_order`: topological ordinals derived from the change DAG;
-/// - `entity_revisions`: re-derived from `changes` whenever it is absent.
+/// - `entity_revisions`: re-derived from `changes` whenever it is empty.
 pub fn compute_repo_truth_hash(snapshot: &GraphSnapshot) -> MerkleHash {
     // Exhaustive destructuring is the coverage guard: adding a domain to
     // `GraphSnapshot` breaks this build until the new field is either hashed or
@@ -808,11 +807,6 @@ pub fn compute_repo_truth_hash(snapshot: &GraphSnapshot) -> MerkleHash {
         test_cases,
         assertions,
         verification_runs,
-        test_covers_entity,
-        test_covers_contract,
-        test_verifies_work,
-        run_proves_entity,
-        run_proves_work,
         mock_hints,
         contracts,
         actors,
@@ -827,13 +821,9 @@ pub fn compute_repo_truth_hash(snapshot: &GraphSnapshot) -> MerkleHash {
         sessions,
         intents,
         downstream_warnings,
-        // Re-derived from `changes` whenever it is absent, so a load can
+        // Re-derived from `changes` whenever it is empty, so a load can
         // legitimately populate it on an otherwise unchanged repo.
         entity_revisions: _,
-        entity_tombstones,
-        relation_tombstones,
-        // Topological ordinals derived from the change DAG.
-        change_order: _,
         artifact_index,
     } = snapshot;
 
@@ -867,11 +857,6 @@ pub fn compute_repo_truth_hash(snapshot: &GraphSnapshot) -> MerkleHash {
     hash_map_domain(&mut hasher, "test_cases", test_cases);
     hash_map_domain(&mut hasher, "assertions", assertions);
     hash_map_domain(&mut hasher, "verification_runs", verification_runs);
-    hash_vec_domain(&mut hasher, "test_covers_entity", test_covers_entity);
-    hash_vec_domain(&mut hasher, "test_covers_contract", test_covers_contract);
-    hash_vec_domain(&mut hasher, "test_verifies_work", test_verifies_work);
-    hash_vec_domain(&mut hasher, "run_proves_entity", run_proves_entity);
-    hash_vec_domain(&mut hasher, "run_proves_work", run_proves_work);
     hash_vec_domain(&mut hasher, "mock_hints", mock_hints);
     hash_map_domain(&mut hasher, "contracts", contracts);
 
@@ -890,9 +875,6 @@ pub fn compute_repo_truth_hash(snapshot: &GraphSnapshot) -> MerkleHash {
     hash_map_domain(&mut hasher, "sessions", sessions);
     hash_map_domain(&mut hasher, "intents", intents);
     hash_vec_domain(&mut hasher, "downstream_warnings", downstream_warnings);
-
-    hash_map_domain(&mut hasher, "entity_tombstones", entity_tombstones);
-    hash_map_domain(&mut hasher, "relation_tombstones", relation_tombstones);
 
     let result = hasher.finalize();
     let mut hash = [0u8; 32];
@@ -2251,26 +2233,6 @@ mod tests {
                 "verification_runs",
                 map_elements_encode(&snapshot.verification_runs),
             ),
-            (
-                "test_covers_entity",
-                vec_elements_encode(&snapshot.test_covers_entity),
-            ),
-            (
-                "test_covers_contract",
-                vec_elements_encode(&snapshot.test_covers_contract),
-            ),
-            (
-                "test_verifies_work",
-                vec_elements_encode(&snapshot.test_verifies_work),
-            ),
-            (
-                "run_proves_entity",
-                vec_elements_encode(&snapshot.run_proves_entity),
-            ),
-            (
-                "run_proves_work",
-                vec_elements_encode(&snapshot.run_proves_work),
-            ),
             ("mock_hints", vec_elements_encode(&snapshot.mock_hints)),
             ("contracts", map_elements_encode(&snapshot.contracts)),
             ("actors", map_elements_encode(&snapshot.actors)),
@@ -2300,14 +2262,6 @@ mod tests {
             (
                 "downstream_warnings",
                 vec_elements_encode(&snapshot.downstream_warnings),
-            ),
-            (
-                "entity_tombstones",
-                map_elements_encode(&snapshot.entity_tombstones),
-            ),
-            (
-                "relation_tombstones",
-                map_elements_encode(&snapshot.relation_tombstones),
             ),
         ] {
             assert!(
