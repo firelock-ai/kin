@@ -81,7 +81,7 @@ impl WorkspaceTreeSnapshot {
                 self.schema, WORKSPACE_TREE_SNAPSHOT_SCHEMA_VERSION
             )));
         }
-        self.binding.roots.validate()?;
+        self.binding.validate()?;
 
         for pair in self.artifacts.windows(2) {
             if pair[0].artifact_id >= pair[1].artifact_id {

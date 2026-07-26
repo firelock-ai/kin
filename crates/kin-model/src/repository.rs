@@ -113,6 +113,24 @@ pub struct WorkspaceSnapshotBinding {
 }
 
 impl WorkspaceSnapshotBinding {
+    /// Validate the repository/workspace authority fields carried over a
+    /// projection boundary.
+    pub fn validate(&self) -> Result<()> {
+        self.roots.validate()?;
+        if self.base_target.is_some() != self.base_tree_hash.is_some() {
+            return Err(ModelError::InvalidOperation(
+                "workspace snapshot base target and tree must both be present or absent"
+                    .to_string(),
+            ));
+        }
+        validate_head_base(
+            &self.workspace_head,
+            &self.base_target,
+            self.base_tree_hash,
+            "workspace snapshot",
+        )
+    }
+
     pub fn is_dirty(&self) -> bool {
         self.base_tree_hash.map_or_else(
             || {
@@ -216,7 +234,7 @@ impl WorkspaceState {
     pub fn snapshot_binding(&self, roots: RootBundle) -> Result<WorkspaceSnapshotBinding> {
         self.validate()?;
         roots.validate()?;
-        Ok(WorkspaceSnapshotBinding {
+        let binding = WorkspaceSnapshotBinding {
             repository_id: self.repository_id.clone(),
             workspace_id: self.workspace_id,
             workspace_head: self.head.clone(),
@@ -226,7 +244,9 @@ impl WorkspaceState {
             roots,
             workspace_generation: self.generation,
             admission_policy: self.admission_policy,
-        })
+        };
+        binding.validate()?;
+        Ok(binding)
     }
 
     pub fn is_dirty(&self) -> bool {
@@ -1182,7 +1202,80 @@ mod tests {
                 },
             },
         };
+        binding.validate().unwrap();
         assert!(binding.is_dirty());
+    }
+
+    #[test]
+    fn workspace_snapshot_binding_requires_complete_base_authority() {
+        let mut binding = WorkspaceSnapshotBinding {
+            repository_id: RepositoryId::new("repo").unwrap(),
+            workspace_id: WorkspaceId::new(),
+            workspace_head: WorkspaceHead::Symbolic {
+                target: RefName::branch(b"main").unwrap(),
+            },
+            base_target: Some(RefTarget::change(SemanticChangeId::from_hash(
+                Hash256::from_bytes([0x31; 32]),
+            ))),
+            base_tree_hash: Some(Hash256::from_bytes([0x32; 32])),
+            workspace_tree_hash: Hash256::from_bytes([0x32; 32]),
+            roots: roots(),
+            workspace_generation: 3,
+            admission_policy: EffectiveAdmissionPolicyStamp {
+                shared: AdmissionPolicyStamp {
+                    hash: crate::AdmissionPolicyHash(Hash256::from_bytes([0x33; 32])),
+                    generation: 1,
+                },
+                local: LocalOverlayStamp {
+                    hash: LocalOverlayHash(Hash256::from_bytes([0x34; 32])),
+                    generation: 2,
+                },
+            },
+        };
+        binding.validate().unwrap();
+
+        binding.base_tree_hash = None;
+        let error = binding.validate().unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("base target and tree must both be present or absent"));
+    }
+
+    #[test]
+    fn workspace_snapshot_binding_rejects_detached_target_mismatch() {
+        let head_target =
+            RefTarget::change(SemanticChangeId::from_hash(Hash256::from_bytes([0x41; 32])));
+        let mut binding = WorkspaceSnapshotBinding {
+            repository_id: RepositoryId::new("repo").unwrap(),
+            workspace_id: WorkspaceId::new(),
+            workspace_head: WorkspaceHead::Detached {
+                target: head_target.clone(),
+            },
+            base_target: Some(head_target),
+            base_tree_hash: Some(Hash256::from_bytes([0x42; 32])),
+            workspace_tree_hash: Hash256::from_bytes([0x42; 32]),
+            roots: roots(),
+            workspace_generation: 4,
+            admission_policy: EffectiveAdmissionPolicyStamp {
+                shared: AdmissionPolicyStamp {
+                    hash: crate::AdmissionPolicyHash(Hash256::from_bytes([0x43; 32])),
+                    generation: 1,
+                },
+                local: LocalOverlayStamp {
+                    hash: LocalOverlayHash(Hash256::from_bytes([0x44; 32])),
+                    generation: 2,
+                },
+            },
+        };
+        binding.validate().unwrap();
+
+        binding.base_target = Some(RefTarget::change(SemanticChangeId::from_hash(
+            Hash256::from_bytes([0x45; 32]),
+        )));
+        let error = binding.validate().unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("detached HEAD must bind its exact target and tree"));
     }
 
     #[test]
