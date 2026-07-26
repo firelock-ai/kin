@@ -78,6 +78,9 @@ pub struct GitIndexPreflightProof {
 pub struct GitTrackedWorktreeProof {
     pub entry_count: usize,
     pub gitlink_count: usize,
+    /// Exact Git paths that this host cannot name losslessly and therefore
+    /// proves only as graph-owned, physically absent entries.
+    pub host_unrepresentable_count: usize,
     pub fingerprint: Hash256,
 }
 
@@ -671,7 +674,7 @@ fn prove_worktree(
 ) -> Result<(GitTrackedWorktreeProof, IgnoredLocalWorktreeFact)> {
     let ignore_inputs = local_ignore_inputs(ignore_repo)?;
     let (mut excludes, ignore_case) = frozen_ignore_stack(ignore_repo, index, &ignore_inputs)?;
-    let mut tracked_hash = FramedHash::new(b"kin.git.preflight.worktree.v1");
+    let mut tracked_hash = FramedHash::new(b"kin.git.preflight.worktree.v2");
     tracked_hash.u64(expected.len() as u64);
     let mut state = WorktreeWalk {
         expected,
@@ -679,8 +682,25 @@ fn prove_worktree(
         seen: BTreeSet::new(),
         tracked_hash,
         gitlink_count: 0,
+        host_unrepresentable_count: 0,
         ignored: Vec::new(),
     };
+    let graph_only_paths = expected
+        .iter()
+        .filter(|(path, _)| !host_can_materialize_repo_path(path))
+        .map(|(path, entry)| (path.clone(), *entry))
+        .collect::<Vec<_>>();
+    for (path, entry) in &graph_only_paths {
+        if !state.seen.insert(path.clone()) {
+            return Err(preflight_error(format!(
+                "worktree graph-only proof repeats path {path}"
+            )));
+        }
+        state.host_unrepresentable_count += 1;
+        if matches!(entry.tree_entry, TreeEntry::Gitlink { .. }) {
+            state.gitlink_count += 1;
+        }
+    }
     walk_directory(
         workdir,
         &[],
@@ -703,6 +723,9 @@ fn prove_worktree(
         return Err(preflight_error(format!(
             "worktree is missing committed path {missing}"
         )));
+    }
+    for (path, entry) in &graph_only_paths {
+        hash_host_unrepresentable_entry(&mut state.tracked_hash, path, entry.tree_entry);
     }
     state
         .ignored
@@ -727,6 +750,7 @@ fn prove_worktree(
         GitTrackedWorktreeProof {
             entry_count: state.seen.len(),
             gitlink_count: state.gitlink_count,
+            host_unrepresentable_count: state.host_unrepresentable_count,
             fingerprint: state.tracked_hash.finish(),
         },
         IgnoredLocalWorktreeFact {
@@ -744,7 +768,41 @@ struct WorktreeWalk<'a> {
     seen: BTreeSet<RepoPath>,
     tracked_hash: FramedHash,
     gitlink_count: usize,
+    host_unrepresentable_count: usize,
     ignored: Vec<IgnoredLocalEntry>,
+}
+
+fn host_can_materialize_repo_path(path: &RepoPath) -> bool {
+    if path.as_utf8().is_none() {
+        #[cfg(any(windows, target_os = "macos"))]
+        return false;
+    }
+    true
+}
+
+fn hash_host_unrepresentable_entry(hash: &mut FramedHash, path: &RepoPath, entry: TreeEntry) {
+    hash.bytes(path.as_bytes());
+    // Representation code 4 is deliberately distinct from materialized blob,
+    // symlink, and Gitlink codes 1-3 below.
+    hash.u64(4);
+    match entry {
+        TreeEntry::Blob {
+            hash: blob,
+            executable,
+        } => {
+            hash.u64(1);
+            hash.bytes(blob.as_bytes());
+            hash.u64(u64::from(executable));
+        }
+        TreeEntry::Symlink { target_blob } => {
+            hash.u64(2);
+            hash.bytes(target_blob.as_bytes());
+        }
+        TreeEntry::Gitlink { target } => {
+            hash.u64(3);
+            hash.bytes(target.as_bytes());
+        }
+    }
 }
 
 fn walk_directory(
@@ -2124,6 +2182,7 @@ mod tests {
         assert!(!proof.index.sparse);
         assert_eq!(proof.tracked_worktree.entry_count, 8);
         assert_eq!(proof.tracked_worktree.gitlink_count, 1);
+        assert_eq!(proof.tracked_worktree.host_unrepresentable_count, 0);
         assert!(proof
             .ignored_local
             .entries
@@ -2209,6 +2268,60 @@ mod tests {
             proof.observation_fingerprint,
             digest(b"kin.git.preflight.unset")
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn proves_host_unrepresentable_index_path_as_graph_only_absent() {
+        let (temp, repo) = config_only_repository();
+        fs::write(repo.join("README.md"), b"materialized\n").expect("README");
+        git(&repo, &["add", "README.md"]);
+
+        let blob_oid = String::from_utf8(
+            git_stdin(
+                &repo,
+                &["hash-object", "-w", "--stdin"],
+                "graph-only bytes\n",
+            )
+            .stdout,
+        )
+        .expect("blob oid")
+        .trim()
+        .to_string();
+        let raw_path = b"opaque-\xff.bin";
+        let mut cache_info = format!("100644,{blob_oid},").into_bytes();
+        cache_info.extend_from_slice(raw_path);
+        let arguments = [
+            OsString::from("update-index"),
+            OsString::from("--add"),
+            OsString::from("--cacheinfo"),
+            OsString::from_vec(cache_info),
+        ];
+        let output = git_command(&repo)
+            .args(&arguments)
+            .output()
+            .expect("add raw index path");
+        assert!(
+            output.status.success(),
+            "raw update-index failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        commit(&repo, "host-unrepresentable exact path");
+
+        let store = BlobStore::new(temp.path().join("cas")).expect("blob store");
+        let (snapshot, plan) = snapshot_plan(&repo, &store);
+        assert!(plan
+            .workspace_seed
+            .base_tree
+            .artifact_at_path(&RepoPath::from_bytes(raw_path.to_vec()).unwrap())
+            .is_some());
+
+        let proof =
+            preflight_git_migration(&repo, &snapshot, &plan, &store).expect("exact preflight");
+        assert_eq!(proof.index.entry_count, 2);
+        assert_eq!(proof.tracked_worktree.entry_count, 2);
+        assert_eq!(proof.tracked_worktree.host_unrepresentable_count, 1);
+        assert_eq!(proof.tracked_worktree.gitlink_count, 0);
     }
 
     #[test]

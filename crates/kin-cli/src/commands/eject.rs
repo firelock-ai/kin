@@ -181,17 +181,18 @@ impl WorkspaceProjectionProof {
         let blobs = kin_blobs::BlobStore::new(directory.path().to_path_buf())
             .context("open bounded eject source proof store")?;
         for artifact in tree.artifacts_by_path() {
-            let digest = artifact.entry.blob_identity().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "workspace contains gitlink {} at {}; eject cannot produce a complete \
-                     materialized ordinary working tree for submodules",
-                    artifact.path,
-                    match artifact.entry {
-                        TreeEntry::Gitlink { target } => target.to_string(),
-                        _ => "unknown".to_string(),
-                    }
-                )
-            })?;
+            let digest = match artifact.entry {
+                TreeEntry::Blob { hash, .. } => hash,
+                TreeEntry::Symlink { target_blob } => target_blob,
+                TreeEntry::Gitlink { .. } => {
+                    // Gitlinks are exact graph-owned commit pointers rather
+                    // than repository-owned source bodies. The staged Git
+                    // export binds their target OID, while the frozen
+                    // workspace proof accepts only an absent path or the same
+                    // retained real directory.
+                    continue;
+                }
+            };
             let body = authority.load_source_blob(digest).with_context(|| {
                 format!(
                     "load repository source body {digest} for graph-owned path {}",
@@ -289,31 +290,25 @@ impl StagedGitRepository {
                 &["reset", "--mixed", "--quiet", "HEAD"],
             )
             .context("build ordinary Git index from graph-projected HEAD")?;
+            run_git(
+                &worktree,
+                Some(&git_dir),
+                &["diff-index", "--cached", "--quiet", "HEAD", "--"],
+            )
+            .context("verify staged ordinary Git index against graph-projected HEAD")?;
         }
         // A genuinely unborn Git repository canonically has no index. Creating
         // one with `read-tree --empty` would require adding an unreachable
         // empty-tree object that is absent from exact repository authority.
         run_git(&worktree, Some(&git_dir), &["fsck", "--strict"])
             .context("verify staged ordinary Git object closure")?;
-        let status = run_git_output(
-            repository_root,
-            Some(&git_dir),
-            &["status", "--porcelain=v1", "-z", "--untracked-files=no"],
-        )?;
-        if !status.status.success() {
-            bail!(
-                "staged ordinary Git could not read the exact working projection: stdout={} \
-                 stderr={}",
-                String::from_utf8_lossy(&status.stdout),
-                String::from_utf8_lossy(&status.stderr)
-            );
-        }
-        if !status.stdout.is_empty() {
-            bail!(
-                "staged ordinary Git index does not exactly match the graph-owned working \
-                 projection"
-            );
-        }
+        // Do not ask Git's file-first status heuristic to re-authorize the
+        // workspace here. The retained Kin projection proof verifies every
+        // host-materializable entry from graph CAS and applies typed graph-only
+        // policy to Gitlinks and host-unrepresentable byte paths. The export
+        // proof plus the index-vs-HEAD check above bind the replacement Git
+        // repository without falsely treating those graph-only entries as
+        // worktree deletions.
         kin_git::sync_git_repository_for_authority_handoff(&git_dir)
             .context("make the replacement Git repository durable before eject")?;
 
