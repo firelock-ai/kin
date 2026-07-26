@@ -423,13 +423,9 @@ fn compute_review(
         Some(h) => kin_model::SemanticChangeId::from_hash(
             kin_model::Hash256::from_hex(&h).map_err(|e| anyhow::anyhow!("invalid hash: {}", e))?,
         ),
-        None => {
-            let current = kin_core::read_current_branch(layout)?;
-            let branch = graph
-                .get_branch(&current)?
-                .ok_or_else(|| anyhow::anyhow!("branch '{}' not found", current))?;
-            branch.head
-        }
+        None => crate::commands::repository_authority::ActiveRepositoryAuthority::open(layout)?
+            .current_change_id()?
+            .ok_or_else(|| anyhow::anyhow!("repository-v6 workspace head is unborn"))?,
     };
 
     let semantic_change = graph
@@ -504,7 +500,7 @@ fn append_review_provenance(
             writeln!(text, "Changed entities: {}", changed_entity_count)?;
             for delta in &semantic_change.entity_deltas {
                 match delta {
-                    kin_model::EntityDelta::Added(e) => {
+                    kin_model::EntityDelta::Added { new: e } => {
                         writeln!(
                             text,
                             "  + {} ({:?}) by {}",
@@ -518,8 +514,8 @@ fn append_review_provenance(
                             new.name, new.kind, semantic_change.author
                         )?;
                     }
-                    kin_model::EntityDelta::Removed(id) => {
-                        writeln!(text, "  - {} by {}", id, semantic_change.author)?;
+                    kin_model::EntityDelta::Removed { old } => {
+                        writeln!(text, "  - {} by {}", old.id, semantic_change.author)?;
                     }
                 }
             }

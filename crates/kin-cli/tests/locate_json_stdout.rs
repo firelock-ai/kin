@@ -140,7 +140,6 @@ fn locate_autostarts_daemon_when_available() {
     let init = kin_command()
         .arg("init")
         .arg(".")
-        .arg("--no-lsp")
         .current_dir(repo.path())
         .output()
         .expect("run kin init");
@@ -280,7 +279,6 @@ fn locate_ref_can_resolve_historical_files_from_the_public_cli() {
     let init = kin_command()
         .arg("init")
         .arg(".")
-        .arg("--no-lsp")
         .current_dir(repo.path())
         .output()
         .expect("run kin init");
@@ -479,9 +477,6 @@ fn locate_ref_hydrates_missing_imported_git_history_on_demand() {
     let init = kin_command()
         .arg("init")
         .arg(".")
-        .arg("--no-lsp")
-        .arg("--git-history")
-        .arg("off")
         .current_dir(repo.path())
         .output()
         .expect("run kin init");
@@ -618,8 +613,6 @@ fn locate_ref_resolves_tip_and_root_after_full_history_init() {
     let init = kin_command()
         .arg("init")
         .arg(".")
-        .arg("--no-lsp")
-        .args(["--git-history", "full"])
         .current_dir(repo.path())
         .output()
         .expect("run kin init");

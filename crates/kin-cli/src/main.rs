@@ -36,6 +36,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Show which Git-replacement commands are ready on repository-v6
+    Capabilities {
+        /// Output the versioned capability inventory as JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// Initialize a new Kin repository
     Init {
         /// Directory to initialize (defaults to current directory)
@@ -43,26 +49,14 @@ enum Command {
         /// Output machine-readable JSON status instead of human text
         #[arg(long, default_value_t = false)]
         json: bool,
-        /// Skip the Git repository check (init even if .git/ exists)
-        #[arg(long, default_value_t = false)]
-        force: bool,
-        /// Show detailed classification, parsing, and role assignment info
-        #[arg(short, long, default_value_t = false)]
-        verbose: bool,
-        /// Skip LSP enrichment (faster init, tree-sitter only)
-        #[arg(long, default_value_t = false)]
-        no_lsp: bool,
-        /// Git import boundary: `off`, `snapshot` (exact HEAD tree), or `full` (all reachable history)
-        #[arg(long, default_value = "snapshot", value_parser = ["off", "snapshot", "full"])]
-        git_history: String,
     },
-    /// Show working copy status
+    /// Show coherent repository-v6 workspace status
     Status {
         /// Output machine-readable JSON for editor integrations
         #[arg(long, default_value_t = false)]
         json: bool,
     },
-    /// Create a semantic commit
+    /// [OPEN GATE] Create an exact semantic and artifact commit
     Commit {
         /// Commit message
         #[arg(short, long)]
@@ -74,30 +68,29 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Show semantic change log
+    /// [OPEN GATE] Show the repository-v6 change log
     Log {
         /// Maximum number of entries
         #[arg(short = 'n', long, default_value = "10")]
         count: usize,
     },
-    /// Branch operations
+    /// Repository-v6 branch operations (see subcommand readiness)
     Branch {
         #[command(subcommand)]
         action: BranchAction,
     },
-    /// Show entity diff between changes
+    /// [OPEN GATE] Show exact artifact and semantic changes between refs
     Diff {
         /// Base change ID
         base: Option<String>,
         /// Head change ID
         head: Option<String>,
     },
-    /// Verify the graph-derived working tree and detach Kin from this repository.
+    /// [OPEN GATE] Verify the graph-derived projection and detach Kin.
     ///
-    /// Eject never restores initialization-time files. It requires every
-    /// graph-owned artifact and blob to match the current projection, stops the
-    /// repository daemon, rechecks persisted graph truth, and atomically moves
-    /// `.kin/` to a recoverable sibling archive. Working files are not rewritten.
+    /// The acceptance gate requires every graph-owned artifact and blob to
+    /// match one durable projection generation before metadata can be detached.
+    /// Until that executor lands, this command fails before repository discovery.
     Eject {
         /// Skip the typed "eject" confirmation.
         #[arg(long)]
@@ -311,8 +304,9 @@ enum Command {
     /// Embeddings enable semantic similarity
     /// search in `kin locate` and `kin search --semantic`.
     ///
-    /// Fast init + progressive embedding: `kin init` builds the graph instantly,
-    /// then `kin embed` adds vector search capability as a separate step.
+    /// Repository admission and enrichment are separate: `kin init` commits
+    /// repository authority; `kin embed` adds vectors for graph-owned entities
+    /// after semantic enrichment exists.
     ///
     /// If a repo was indexed with an older model at a different dimension, pass
     /// `--rebuild` to drop the stale index and re-embed every entity at the
@@ -335,7 +329,7 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Build a semantic rename plan for an entity and its references
+    /// [OPEN GATE] Build a semantic rename plan from graph and source-CAS truth
     Rename {
         /// Entity name or symbol under the cursor
         symbol: String,
@@ -459,7 +453,7 @@ enum Command {
         #[command(subcommand)]
         action: SpecAction,
     },
-    /// Semantic merge from another branch
+    /// [OPEN GATE] Merge semantic and exact-tree changes from another branch
     Merge {
         /// Branch to merge from
         branch: String,
@@ -467,9 +461,9 @@ enum Command {
         #[arg(short, long, default_value = "structural")]
         strategy: String,
     },
-    /// Show active merge conflicts
+    /// [OPEN GATE] Show repository-v6 merge conflicts
     Conflicts,
-    /// Resolve merge conflicts
+    /// [OPEN GATE] Resolve repository-v6 merge conflicts
     Resolve {
         /// Keep your (target branch) version of a conflicting entity
         #[arg(long, value_name = "ENTITY")]
@@ -490,7 +484,7 @@ enum Command {
         #[arg(long)]
         abort: bool,
     },
-    /// Stash working copy state
+    /// [OPEN GATE] Stash exact repository-v6 workspace state
     Stash {
         #[command(subcommand)]
         action: StashAction,
@@ -533,13 +527,13 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Plan or prepare a publish to the default remote
+    /// [OPEN GATE] Plan or prepare an exact publish to the default remote
     Push {
         /// Remote name (defaults to configured default or detected origin)
         #[arg(long)]
         remote: Option<String>,
     },
-    /// Pull changes from a remote
+    /// [OPEN GATE] Pull exact changes from a remote
     #[command(visible_alias = "fetch")]
     Pull {
         /// Remote name (defaults to configured default)
@@ -548,12 +542,12 @@ enum Command {
     },
     /// Clone a repository
     Clone {
-        /// Repository URL (Git or Kin)
+        /// Git repository URL (native Kin transport is an explicit open gate)
         url: String,
         /// Target directory (defaults to repo name)
         path: Option<String>,
     },
-    /// Restore a file from a specific change
+    /// [OPEN GATE] Restore an artifact from an immutable repository-v6 tree
     Checkout {
         /// File path to restore
         path: String,
@@ -566,7 +560,7 @@ enum Command {
         #[command(subcommand)]
         action: VerifyAction,
     },
-    /// Run a command in a graph-backed session workspace
+    /// [OPEN GATE] Run a command in an exact graph-backed session workspace
     Exec {
         /// Command to run (put kin flags before it: `kin exec --keep -- npm test`)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
@@ -648,14 +642,14 @@ enum Command {
         #[arg(long)]
         propagate: bool,
     },
-    /// Analyze semver impact of changes
+    /// [OPEN GATE] Analyze semver impact from immutable repository-v6 changes
     Semver,
     /// Cross-repo release orchestration and per-repo release snapshots
     Release {
         #[command(subcommand)]
         action: ReleaseAction,
     },
-    /// Create a release snapshot (alias of `kin release snapshot`)
+    /// [OPEN GATE] Create a repository-v6 release snapshot
     Tag {
         /// Release tag
         tag: String,
@@ -669,7 +663,7 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
-    /// Rollback to a previous change
+    /// [OPEN GATE] Commit an exact inverse of a previous change
     #[command(visible_alias = "revert")]
     Rollback {
         /// Change ID to rollback to
@@ -691,9 +685,6 @@ enum Command {
         /// Distinct destination (defaults to an in-place migration)
         #[arg(long)]
         target: Option<PathBuf>,
-        /// Git history boundary: `snapshot` (exact HEAD tree) or `full` (all reachable history)
-        #[arg(long, default_value = "snapshot", value_parser = ["snapshot", "full"])]
-        history: String,
     },
     /// Inspect and bound the on-disk embedding cache
     Cache {
@@ -705,7 +696,7 @@ enum Command {
         #[command(subcommand)]
         action: GraphAction,
     },
-    /// Git interop commands
+    /// Git interop commands (currently fail-closed pending exact export)
     Git {
         #[command(subcommand)]
         action: GitAction,
@@ -748,7 +739,7 @@ enum Command {
         #[command(subcommand)]
         action: TodoAction,
     },
-    /// Launch an editor in a materialized session workspace
+    /// [OPEN GATE] Launch an editor in an exact graph-derived session workspace
     Open {
         /// Editor to launch: code or cursor
         editor: String,
@@ -759,7 +750,7 @@ enum Command {
         #[arg(long, conflicts_with = "restrict_discovery")]
         restrict_filesystem: bool,
     },
-    /// Launch an assistant with Kin guidance injected
+    /// [OPEN GATE] Launch an assistant in a graph-derived session
     With {
         /// Assistant to launch: claude, codex, gemini
         assistant: String,
@@ -781,7 +772,7 @@ enum Command {
         #[arg(last = true)]
         task: Vec<String>,
     },
-    /// Reconcile session workspace changes back into the graph
+    /// [OPEN GATE] Admit explicit session deltas into repository-v6 authority
     Reconcile {
         /// Session ID (defaults to most recent session)
         session: Option<String>,
@@ -789,7 +780,7 @@ enum Command {
         #[arg(long)]
         cleanup: bool,
     },
-    /// Open an interactive shell in a materialized session workspace
+    /// [OPEN GATE] Open a shell in an exact graph-derived session workspace
     Shell {
         /// Materialization strategy
         #[arg(long)]
@@ -906,12 +897,10 @@ enum Command {
         /// Emit the machine-readable health report as JSON
         #[arg(long, default_value_t = false)]
         json: bool,
-        /// Check for graph⇄file drift: on-disk source files that no longer match
-        /// graph truth (edited out of band, deleted, or added)
+        /// [OPEN GATE] Compare an explicit projection observation with graph truth
         #[arg(long, default_value_t = false)]
         drift: bool,
-        /// Restore drifted and missing files from graph truth. Implies --drift;
-        /// explicit invocation only — never runs automatically
+        /// [OPEN GATE] Rematerialize a projection from graph truth. Implies --drift
         #[arg(long, default_value_t = false)]
         heal: bool,
     },
@@ -976,19 +965,23 @@ enum ResourcesAction {
 
 #[derive(Subcommand)]
 enum BranchAction {
-    /// List branches
-    List,
-    /// Create a new branch
+    /// List byte-exact repository-v6 branch refs
+    List {
+        /// Output exact ref names and targets as JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// [OPEN GATE] Create a ref with compare-and-swap
     Create {
         /// Branch name
         name: String,
     },
-    /// Delete a branch
+    /// [OPEN GATE] Delete a ref with force-with-lease
     Delete {
         /// Branch name
         name: String,
     },
-    /// Switch to a branch
+    /// [OPEN GATE] Switch workspace authority and projection atomically
     Switch {
         /// Branch name
         name: String,
@@ -1124,7 +1117,7 @@ enum CacheAction {
 
 #[derive(Subcommand)]
 enum GitAction {
-    /// Export current state to Git
+    /// [OPEN GATE] Export exact objects, refs, aliases, and source CAS to Git
     Export {
         /// Target directory
         #[arg(short, long)]
@@ -1162,7 +1155,7 @@ enum RemoteAction {
         #[arg(long, default_value_t = false)]
         default: bool,
     },
-    /// Show the push plan for a remote
+    /// [OPEN GATE] Show an exact closure and lease-protected push plan
     PlanPush {
         /// Remote name (defaults to configured default or detected origin)
         #[arg(long)]
@@ -1396,10 +1389,7 @@ enum AssistantAction {
 
 #[derive(Subcommand)]
 enum StashAction {
-    /// Snapshot current working state (non-destructive by default).
-    ///
-    /// Files are snapshotted into .kin/stashes/ but are NOT removed from the
-    /// working tree unless --remove-from-tree is given.
+    /// [OPEN GATE] Snapshot exact repository-v6 workspace state.
     Push {
         /// DESTRUCTIVE: delete source files from the working tree after
         /// snapshotting. Requires typing "remove" to confirm (or --yes).
@@ -1409,9 +1399,9 @@ enum StashAction {
         #[arg(long)]
         yes: bool,
     },
-    /// Restore the most recent stash entry
+    /// [OPEN GATE] Restore the most recent exact stash transaction
     Pop,
-    /// List stash entries
+    /// [OPEN GATE] List repository-v6 stash transactions
     List,
 }
 
@@ -1800,8 +1790,7 @@ enum ReleaseAction {
         /// Repo to gate (e.g. kin, kin-db).
         repo: String,
     },
-    /// Create a release snapshot of the current entity graph state (the original
-    /// `kin release <tag>` behavior; also available as `kin tag <tag>`).
+    /// [OPEN GATE] Create a release snapshot bound to exact repository roots.
     Snapshot {
         /// Release tag
         tag: String,
@@ -1897,43 +1886,30 @@ fn main() -> Result<()> {
     let result = runtime.block_on(
         (async move {
             match cli.command {
-                Command::Init {
-                    path,
-                    json,
-                    force,
-                    verbose,
-                    no_lsp,
-                    git_history,
-                } => commands::init::run(path, json, force, verbose, no_lsp, git_history).await,
-                Command::Status { json } => {
-                    if json {
-                        commands::status::run_json().await
-                    } else {
-                        commands::status::run().await
-                    }
-                }
+                Command::Capabilities { json } => commands::capabilities::run(json),
+                Command::Init { path, json } => commands::init::run(path, json).await,
+                Command::Status { json } => commands::status::run(json),
                 Command::Resources { action } => match action {
                     ResourcesAction::Inspect { json, profile } => {
                         commands::resources::run(json, profile).await
                     }
                 },
-                Command::Commit {
-                    message,
-                    quiet,
-                    dry_run: _,
-                } => commands::commit::run(message, quiet).await,
-                Command::Log { count } => commands::log::run(count).await,
+                Command::Commit { .. } => commands::capabilities::require_ready("commit"),
+                Command::Log { count: _ } => commands::capabilities::require_ready("log"),
                 Command::Branch { action } => match action {
-                    BranchAction::List => commands::branch::list().await,
-                    BranchAction::Create { name } => commands::branch::create(name).await,
-                    BranchAction::Delete { name } => commands::branch::delete(name).await,
-                    BranchAction::Switch { name } => commands::branch::switch(name).await,
+                    BranchAction::List { json } => commands::branch::list(json),
+                    BranchAction::Create { name: _ } => {
+                        commands::capabilities::require_ready("branch create")
+                    }
+                    BranchAction::Delete { name: _ } => {
+                        commands::capabilities::require_ready("branch delete")
+                    }
+                    BranchAction::Switch { name: _ } => {
+                        commands::capabilities::require_ready("branch switch")
+                    }
                 },
-                Command::Diff { base, head } => commands::diff::run(base, head).await,
-                Command::Eject {
-                    yes,
-                    purge_metadata,
-                } => commands::eject::run(yes, purge_metadata).await,
+                Command::Diff { .. } => commands::capabilities::require_ready("diff"),
+                Command::Eject { .. } => commands::capabilities::require_ready("eject"),
                 Command::Impact {
                     entity,
                     depth,
@@ -2239,14 +2215,7 @@ fn main() -> Result<()> {
                     rebuild,
                     json,
                 } => commands::embed::run(batch_size, json, max_seconds, rebuild).await,
-                Command::Rename {
-                    symbol,
-                    new_name,
-                    file,
-                    line,
-                    column,
-                    json,
-                } => commands::rename::run(symbol, new_name, file, line, column, json).await,
+                Command::Rename { .. } => commands::capabilities::require_ready("rename"),
                 Command::Refs {
                     entity,
                     kind,
@@ -2390,27 +2359,10 @@ fn main() -> Result<()> {
                     SpecAction::List => commands::spec::list().await,
                     SpecAction::Show { id } => commands::spec::show(id).await,
                 },
-                Command::Merge { branch, strategy } => commands::merge::run(branch, strategy).await,
-                Command::Conflicts => commands::conflicts::run().await,
-                Command::Resolve {
-                    ours,
-                    theirs,
-                    all_ours,
-                    all_theirs,
-                    do_continue,
-                    abort,
-                } => {
-                    commands::resolve::run(ours, theirs, all_ours, all_theirs, do_continue, abort)
-                        .await
-                }
-                Command::Stash { action } => match action {
-                    StashAction::Push {
-                        remove_from_tree,
-                        yes,
-                    } => commands::stash::push(remove_from_tree, yes).await,
-                    StashAction::Pop => commands::stash::pop().await,
-                    StashAction::List => commands::stash::list().await,
-                },
+                Command::Merge { .. } => commands::capabilities::require_ready("merge"),
+                Command::Conflicts => commands::capabilities::require_ready("conflicts"),
+                Command::Resolve { .. } => commands::capabilities::require_ready("resolve"),
+                Command::Stash { action: _ } => commands::capabilities::require_ready("stash"),
                 Command::Blame { entity, reference } => {
                     commands::blame::run(entity, reference).await
                 }
@@ -2448,7 +2400,9 @@ fn main() -> Result<()> {
                         )
                         .await
                     }
-                    RemoteAction::PlanPush { remote } => commands::remote::plan_push(remote).await,
+                    RemoteAction::PlanPush { .. } => {
+                        commands::capabilities::require_ready("remote plan-push")
+                    }
                     RemoteAction::Lease {
                         remote,
                         actor_id,
@@ -2467,10 +2421,10 @@ fn main() -> Result<()> {
                     let registry = std::env::var("KIN_REGISTRY_URL").unwrap_or(registry);
                     commands::publish::run(packages, registry, dry_run).await
                 }
-                Command::Push { remote } => commands::push::run(remote).await,
-                Command::Pull { remote } => commands::pull::run(remote).await,
+                Command::Push { remote: _ } => commands::capabilities::require_ready("push"),
+                Command::Pull { remote: _ } => commands::capabilities::require_ready("pull"),
                 Command::Clone { url, path } => commands::clone::run(url, path).await,
-                Command::Checkout { path, change } => commands::checkout::run(path, change).await,
+                Command::Checkout { .. } => commands::capabilities::require_ready("checkout"),
                 Command::Verify { action } => match action {
                     VerifyAction::Entity { entity } => commands::verify::run(entity).await,
                     VerifyAction::Plan { entity, depth } => {
@@ -2487,14 +2441,7 @@ fn main() -> Result<()> {
                         depth,
                     } => commands::verify::run_verification(entity, runner, depth).await,
                 },
-                Command::Exec {
-                    command,
-                    shell,
-                    keep,
-                    discard,
-                    strategy,
-                    scope,
-                } => commands::exec::run_full(command, shell, keep, discard, strategy, scope).await,
+                Command::Exec { .. } => commands::capabilities::require_ready("exec"),
                 Command::Telemetry { action } => match action {
                     TelemetryAction::Status => commands::telemetry::run_status().await,
                     TelemetryAction::Consent => commands::telemetry::run_consent().await,
@@ -2549,7 +2496,7 @@ fn main() -> Result<()> {
                 Command::Security { propagate } => {
                     commands::security::run_with_options(propagate).await
                 }
-                Command::Semver => commands::release::semver().await,
+                Command::Semver => commands::capabilities::require_ready("semver"),
                 Command::Release { action } => match action {
                     ReleaseAction::Plan { offline } => commands::release_orch::plan(offline).await,
                     ReleaseAction::Apply {
@@ -2559,48 +2506,14 @@ fn main() -> Result<()> {
                         no_lock,
                     } => commands::release_orch::apply(crate_name, version, repos, !no_lock).await,
                     ReleaseAction::Intent { repo } => commands::release_orch::intent(repo).await,
-                    ReleaseAction::Snapshot {
-                        tag,
-                        require_proof,
-                        require_approval,
-                        force,
-                    } => {
-                        commands::release::release_with_options(
-                            tag,
-                            commands::release::ReleaseOptions {
-                                force,
-                                require_proof,
-                                require_approval,
-                            },
-                        )
-                        .await
+                    ReleaseAction::Snapshot { .. } => {
+                        commands::capabilities::require_ready("release snapshot")
                     }
                 },
-                Command::Tag {
-                    tag,
-                    require_proof,
-                    require_approval,
-                    force,
-                } => {
-                    commands::release::release_with_options(
-                        tag,
-                        commands::release::ReleaseOptions {
-                            force,
-                            require_proof,
-                            require_approval,
-                        },
-                    )
-                    .await
-                }
-                Command::Rollback { change_id, feature } => {
-                    commands::release::rollback_with_options(change_id, feature).await
-                }
+                Command::Tag { .. } => commands::capabilities::require_ready("tag"),
+                Command::Rollback { .. } => commands::capabilities::require_ready("rollback"),
                 Command::Bench { args } => commands::bench::bench_proxy(&args),
-                Command::Migrate {
-                    source,
-                    target,
-                    history,
-                } => commands::migrate::run(source, target, history).await,
+                Command::Migrate { source, target } => commands::migrate::run(source, target).await,
                 Command::Cache { action } => match action {
                     CacheAction::Status { json } => commands::cache::status(json).await,
                     CacheAction::Gc {
@@ -2621,11 +2534,7 @@ fn main() -> Result<()> {
                     GraphAction::Body { entity, json } => commands::graph::body(entity, json).await,
                     GraphAction::Viz { port, open } => commands::graph_viz::run(port, open).await,
                 },
-                Command::Git { action } => match action {
-                    GitAction::Export { output, in_place } => {
-                        commands::git::export(output, in_place).await
-                    }
-                },
+                Command::Git { action: _ } => commands::capabilities::require_ready("git export"),
                 Command::Intent { action } => match action {
                     IntentAction::List => commands::intent::list().await,
                     IntentAction::Register {
@@ -2715,37 +2624,10 @@ fn main() -> Result<()> {
                 Command::Todo { action } => match action {
                     TodoAction::Import { path } => commands::note::todo_import(path).await,
                 },
-                Command::Open {
-                    editor,
-                    restrict_discovery,
-                    restrict_filesystem,
-                } => commands::open::run(editor, restrict_discovery, restrict_filesystem).await,
-                Command::Reconcile { session, cleanup } => {
-                    commands::reconcile::run(session, cleanup).await
-                }
-                Command::With {
-                    assistant,
-                    session,
-                    passive_guidance,
-                    restrict_discovery,
-                    restrict_filesystem,
-                    task,
-                } => {
-                    commands::with::run(
-                        assistant,
-                        task,
-                        session,
-                        passive_guidance,
-                        restrict_discovery,
-                        restrict_filesystem,
-                    )
-                    .await
-                }
-                Command::Shell {
-                    strategy,
-                    restrict_discovery,
-                    restrict_filesystem,
-                } => commands::shell::run(strategy, restrict_discovery, restrict_filesystem).await,
+                Command::Open { .. } => commands::capabilities::require_ready("open"),
+                Command::Reconcile { .. } => commands::capabilities::require_ready("reconcile"),
+                Command::With { .. } => commands::capabilities::require_ready("with"),
+                Command::Shell { .. } => commands::capabilities::require_ready("shell"),
                 Command::Overview { compact, json } => {
                     if json {
                         commands::overview::run_json().await
@@ -2811,7 +2693,7 @@ fn main() -> Result<()> {
                     // `--drift`/`--heal` run the graph⇄file drift tripwire; bare
                     // `kin doctor` stays the first-run config health check.
                     if drift || heal {
-                        commands::doctor_drift::run(heal, json).await
+                        commands::capabilities::require_ready("doctor --drift")
                     } else {
                         commands::setup::doctor(fix, json).await
                     }

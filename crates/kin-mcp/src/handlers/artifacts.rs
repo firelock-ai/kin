@@ -27,14 +27,15 @@ Docker Compose files, Dockerfiles, lockfiles, configuration, binary assets, unsu
 languages, symlinks, executable files, and gitlinks. Paths are returned as canonical \
 lowercase `bytes_hex` objects; `path_label` is presentation-only and \
 `path_label_lossy` says whether replacement characters were required. Identity comes from \
-`artifact_id`, never from a path. Omit `source_change_id` to read the current branch head.";
+`artifact_id`, never from a path. Omit `source_change_id` to read the exact current \
+workspace tree.";
 
 pub const ARTIFACT_READ_DESC: &str = "\
 Read one exact graph-owned repository artifact by stable `artifact_id` or canonical \
 byte-exact `path`. Blob and symlink bytes are returned losslessly as base64 and, only when \
 valid UTF-8, as `text_utf8`. Gitlinks return their external object identity and have no \
 repository-owned body. The read is bound to the resolved tree entry at \
-`source_change_id` (or the current branch head) and fails loudly when the tree, identity, \
+`source_change_id` (or the exact current workspace) and fails loudly when the tree, identity, \
 or content-addressed blob is missing. It never reads the working directory.";
 
 #[derive(Debug, Serialize)]
@@ -63,7 +64,7 @@ impl From<&ResolvedArtifact> for ArtifactWire {
 #[derive(Debug)]
 pub(crate) struct ExactTreeSelection {
     pub layout: Option<kin_core::KinLayout>,
-    pub source_change_id: SemanticChangeId,
+    pub source_change_id: Option<SemanticChangeId>,
     pub tree: ResolvedTree,
 }
 
@@ -99,27 +100,6 @@ fn explicit_source_change_id(
         .transpose()
 }
 
-pub(crate) fn active_source_head<G: GraphStore>(
-    store: &G,
-    layout: &kin_core::KinLayout,
-) -> Result<SemanticChangeId> {
-    let branch_name = kin_core::read_current_branch(layout).map_err(|error| {
-        McpError::Context(format!(
-            "graph authority gap: cannot resolve current Kin branch: {error}"
-        ))
-    })?;
-    let branch = store
-        .get_branch(&branch_name)
-        .map_err(McpError::graph)?
-        .ok_or_else(|| {
-            McpError::Context(format!(
-                "graph authority gap: current branch '{}' is absent from graph truth",
-                branch_name
-            ))
-        })?;
-    Ok(branch.head)
-}
-
 pub(crate) fn resolve_tree_selection<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
@@ -131,21 +111,31 @@ pub(crate) fn resolve_tree_selection<G: GraphStore>(
     } else {
         None
     };
-    let source_change_id = match explicit {
-        Some(id) => id,
-        None => active_source_head(
-            store,
-            layout
+    let (source_change_id, tree) = match explicit {
+        Some(id) => {
+            let tree = store.resolve_tree_at(&id).map_err(|error| {
+                McpError::Context(format!(
+                    "graph authority gap: cannot resolve exact repository tree at \
+                     {id}: {error}"
+                ))
+            })?;
+            (Some(id), tree)
+        }
+        None => {
+            let authority = super::repository_authority::ActiveRepositoryAuthority::open(
+                layout
+                    .as_ref()
+                    .expect("layout is required when the source change is implicit"),
+            )?;
+            let workspace = authority.workspace()?;
+            let source_change_id = workspace
+                .base_target
                 .as_ref()
-                .expect("layout is required when the source change is implicit"),
-        )?,
+                .map(|target| authority.resolve_target(target))
+                .transpose()?;
+            (source_change_id, workspace.tree)
+        }
     };
-    let tree = store.resolve_tree_at(&source_change_id).map_err(|error| {
-        McpError::Context(format!(
-            "graph authority gap: cannot resolve exact repository tree at \
-                 {source_change_id}: {error}"
-        ))
-    })?;
     Ok(ExactTreeSelection {
         layout,
         source_change_id,
@@ -260,11 +250,8 @@ pub fn handle_artifact_read<G: GraphStore>(
                 .layout
                 .as_ref()
                 .expect("artifact reads always require a bound layout");
-            let blobs = kin_blobs::BlobStore::new(layout.objects_dir()).map_err(|error| {
-                McpError::Context(format!("cannot open graph blob store: {error}"))
-            })?;
-            let blob_hash = kin_blobs::Hash256(*hash.as_bytes());
-            let bytes = blobs.read(&blob_hash).map_err(|error| {
+            let authority = super::repository_authority::ActiveRepositoryAuthority::open(layout)?;
+            let bytes = authority.load_source_blob(hash).map_err(|error| {
                 McpError::Context(format!(
                     "graph authority gap: blob {} for artifact {:?} at {} is unavailable or \
                      corrupt: {error}",

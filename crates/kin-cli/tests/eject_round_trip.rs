@@ -239,7 +239,7 @@ fn brownfield_eject_preserves_exact_files_and_git_with_recoverable_metadata() {
     let tracked_before = tracked_state(&repo);
     let git_before = directory_bytes(&repo.join(".git"));
 
-    run_kin_ok(&repo, &registry, &["init", "--no-lsp", "."]);
+    run_kin_ok(&repo, &registry, &["init", "."]);
     assert!(repo.join(".kin").is_dir());
     assert!(
         !repo.join(".kin/snapshot").exists(),
@@ -276,7 +276,7 @@ fn eject_refuses_a_projection_that_differs_from_current_graph_ref() {
     let registry = root.path().join("registry.toml");
     seed_git_repo(&repo);
     let original = fs::read(repo.join("compose.yaml")).unwrap();
-    run_kin_ok(&repo, &registry, &["init", "--no-lsp", "."]);
+    run_kin_ok(&repo, &registry, &["init", "."]);
 
     fs::write(
         repo.join("compose.yaml"),
@@ -297,7 +297,7 @@ fn eject_refuses_a_projection_that_differs_from_current_graph_ref() {
 }
 
 #[test]
-fn native_repo_ejects_without_git_or_language_support() {
+fn exact_git_repo_ejects_without_language_support() {
     let root = tempdir().unwrap();
     let repo = root.path().join("repo");
     let registry = root.path().join("registry.toml");
@@ -309,20 +309,21 @@ fn native_repo_ejects_without_git_or_language_support() {
     .unwrap();
     fs::write(repo.join("vendor.lock"), b"opaque lock syntax\n").unwrap();
     fs::write(repo.join("firmware.bin"), [0, 0xff, 0x42, 0x80]).unwrap();
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["config", "user.email", "kin@example.invalid"]);
+    git(&repo, &["config", "user.name", "Kin Test"]);
+    git(&repo, &["add", "--all"]);
+    git(&repo, &["commit", "-q", "-m", "exact non-code tree"]);
     let before = ["compose.yaml", "vendor.lock", "firmware.bin"]
         .into_iter()
         .map(|path| (path, entry_state(&repo.join(path))))
         .collect::<BTreeMap<_, _>>();
 
-    run_kin_ok(
-        &repo,
-        &registry,
-        &["init", "--no-lsp", "--git-history", "off", "."],
-    );
+    run_kin_ok(&repo, &registry, &["init", "."]);
     run_kin_ok(&repo, &registry, &["eject", "--yes", "--purge-metadata"]);
 
     assert!(!repo.join(".kin").exists());
-    assert!(!repo.join(".git").exists());
+    assert!(repo.join(".git").exists());
     assert!(metadata_archives(&repo).is_empty());
     for (path, expected) in before {
         assert_eq!(entry_state(&repo.join(path)), expected);
@@ -335,7 +336,7 @@ fn legacy_snapshot_restore_flag_is_not_a_product_surface() {
     let repo = root.path().join("repo");
     let registry = root.path().join("registry.toml");
     seed_git_repo(&repo);
-    run_kin_ok(&repo, &registry, &["init", "--no-lsp", "."]);
+    run_kin_ok(&repo, &registry, &["init", "."]);
 
     let output = run_kin(&repo, &registry, &["eject", "--revert-files", "--yes"]);
     assert_refused(&output, "unexpected argument");

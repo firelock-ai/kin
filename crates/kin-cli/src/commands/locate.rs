@@ -1451,10 +1451,9 @@ pub fn run_with_graph_capture(
 }
 
 fn locate_workspace_root() -> Option<std::path::PathBuf> {
-    let cwd = std::env::current_dir().ok()?;
-    kin_core::KinLayout::discover(&cwd)
-        .map(|layout| kin_core::source_dir(&layout))
-        .or(Some(cwd))
+    // Runtime locate answers from graph-owned retrieval state. A working-tree
+    // root would let ranking helpers infer evidence from raw files.
+    None
 }
 
 pub fn run_with_graph_capture_in_workspace(
@@ -3564,9 +3563,9 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
 }
 
 pub fn run_with_graph_capture_at_ref(
-    _layout: &kin_core::KinLayout,
+    layout: &kin_core::KinLayout,
     graph: &kin_db::InMemoryGraph,
-    blob_store: &kin_blobs::BlobStore,
+    _blob_store: &kin_blobs::BlobStore,
     head: &SemanticChangeId,
     reference: &str,
     text: &str,
@@ -3577,7 +3576,8 @@ pub fn run_with_graph_capture_at_ref(
 ) -> Result<LocateResult> {
     let changes = kin_core::collect_changes_at_ref(graph, head)
         .map_err(|err| anyhow::anyhow!(err.to_string()))?;
-    let historical = kin_core::build_graph_at_ref(graph, blob_store, head)
+    let authority = crate::commands::repository_authority::ActiveRepositoryAuthority::open(layout)?;
+    let historical = kin_core::build_graph_at_ref(authority.manager(), head)
         .map_err(|err| anyhow::anyhow!(err.to_string()))?;
     let _ = crate::commands::cochange::refresh_from_changes(&historical, &changes);
     let extra_priority_files =
