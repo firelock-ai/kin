@@ -10856,7 +10856,17 @@ mod tests {
     #[tokio::test]
     async fn trace_endpoint_uses_live_graph() {
         let state = test_state();
-        let entity = test_entity("handler", "src/lib.py");
+        let source = "def handler():\n    return 1\n";
+        install_repository_file(&state, "src/lib.py", source.as_bytes());
+        std::fs::create_dir_all(state.layout.working_dir().join("src")).unwrap();
+        std::fs::write(
+            state.layout.working_dir().join("src/lib.py"),
+            "def handler():\n    return 'checkout drift'\n",
+        )
+        .unwrap();
+        let mut entity = test_entity("handler", "src/lib.py");
+        entity.span.as_mut().unwrap().end_byte = source.len();
+        entity.span.as_mut().unwrap().end_line = 2;
         state.graph.upsert_entity(&entity).unwrap();
         state
             .is_initialized
