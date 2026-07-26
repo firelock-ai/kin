@@ -7,14 +7,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::scanner::RepoScan;
 
-/// Migration strategy: controls how much history is imported.
+/// Migration strategy retained in persisted result schemas.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum MigrationStrategy {
-    /// Import an exact current-tree snapshot without claiming ancestry.
-    #[default]
+    /// Removed pre-release snapshot boundary; execution fails closed.
     Snapshot,
     /// Import every reachable Git commit and exact parent edge.
+    #[default]
     Full,
 }
 
@@ -97,8 +97,8 @@ mod tests {
     }
 
     #[test]
-    fn default_strategy_is_snapshot() {
-        assert_eq!(MigrationStrategy::default(), MigrationStrategy::Snapshot);
+    fn default_strategy_is_full() {
+        assert_eq!(MigrationStrategy::default(), MigrationStrategy::Full);
     }
 
     #[test]

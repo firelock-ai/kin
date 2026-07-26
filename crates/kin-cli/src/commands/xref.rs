@@ -165,9 +165,9 @@ fn xref_not_found_guidance(entity: &str) -> Vec<String> {
         format!(
             "      If '{entity}' is defined only in a sibling/dependency repo, run xref from the repo"
         ),
-        "      that defines it. Use `kin clone URL` for a remote or `kin init PATH --git-history full`"
+        "      that defines it. Use `kin clone URL` for a remote or `kin init PATH` for a clean"
             .to_string(),
-        "      for an existing checkout, then run `kin deps` to refresh dependency discovery."
+        "      existing checkout, then run `kin deps` to refresh dependency discovery."
             .to_string(),
     ]
 }
@@ -245,7 +245,7 @@ mod tests {
         );
         assert!(
             joined.contains("kin clone")
-                && joined.contains("kin init PATH --git-history full")
+                && joined.contains("kin init PATH")
                 && joined.contains("kin deps"),
             "should give an actionable next step: {joined}"
         );

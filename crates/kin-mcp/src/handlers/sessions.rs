@@ -831,13 +831,20 @@ pub async fn handle_transaction_commit<G: GraphStore>(
                                 new,
                             });
                         } else {
-                            entity_deltas.push(kin_model::change::EntityDelta::Added(new));
+                            entity_deltas.push(kin_model::change::EntityDelta::Added { new });
                         }
                     } else if verb == "update" || verb == "modify" {
                         let old = old_opt.unwrap_or_else(|| entity.clone());
                         entity_deltas.push(kin_model::change::EntityDelta::Modified { old, new });
                     } else if verb == "delete" || verb == "remove" {
-                        entity_deltas.push(kin_model::change::EntityDelta::Removed(entity.id));
+                        let Some(old) = old_opt else {
+                            return Ok(ToolCallResult::error(format!(
+                                "Cannot commit transaction {}: entity '{}' does not exist in \
+                                 graph authority",
+                                transaction_id, entity.id
+                            )));
+                        };
+                        entity_deltas.push(kin_model::change::EntityDelta::Removed { old });
                     }
                 }
                 McpMutationPayload::Relation { from, to, kind } => {
@@ -853,7 +860,8 @@ pub async fn handle_transaction_commit<G: GraphStore>(
                             import_source: None,
                             evidence: Vec::new(),
                         };
-                        relation_deltas.push(kin_model::change::RelationDelta::Added(relation));
+                        relation_deltas
+                            .push(kin_model::change::RelationDelta::Added { new: relation });
                     } else if verb == "delete" || verb == "remove" {
                         let matching_relation = store
                             .get_all_relations_for_entity(&from)
@@ -866,7 +874,8 @@ pub async fn handle_transaction_commit<G: GraphStore>(
                                 })
                             });
                         if let Some(rel) = matching_relation {
-                            relation_deltas.push(kin_model::change::RelationDelta::Removed(rel.id));
+                            relation_deltas
+                                .push(kin_model::change::RelationDelta::Removed { old: rel });
                         }
                     }
                 }
@@ -884,6 +893,7 @@ pub async fn handle_transaction_commit<G: GraphStore>(
         entity_deltas,
         relation_deltas,
         tree_deltas: Vec::new(),
+        admission_policy_delta: None,
     };
 
     if let Err(err) = store.apply_transaction_delta(&delta) {

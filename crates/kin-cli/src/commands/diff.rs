@@ -2,7 +2,6 @@
 // Copyright 2026 Firelock, LLC
 
 use anyhow::{Context, Result};
-use kin_model::ChangeStore;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,44 +45,11 @@ async fn run_daemon_diff(
 }
 
 pub fn build_diff_response(
-    graph: &kin_db::InMemoryGraph,
-    request: &DiffRequest,
+    _graph: &kin_db::InMemoryGraph,
+    _request: &DiffRequest,
 ) -> Result<DiffResponse> {
-    let mut lines = Vec::new();
-    match (&request.base, &request.head) {
-        (Some(b), Some(h)) => {
-            let base_id = kin_model::SemanticChangeId::from_hash(
-                kin_model::Hash256::from_hex(b)
-                    .map_err(|e| anyhow::anyhow!("invalid base hash: {}", e))?,
-            );
-            let head_id = kin_model::SemanticChangeId::from_hash(
-                kin_model::Hash256::from_hex(h)
-                    .map_err(|e| anyhow::anyhow!("invalid head hash: {}", e))?,
-            );
-            let changes = graph.get_changes_since(&base_id, &head_id)?;
-            lines.push(format!("Changes between {} and {}:", b, h));
-            for change in &changes {
-                lines.push(format!("  {} - {}", change.id, change.message));
-                for delta in &change.entity_deltas {
-                    match delta {
-                        kin_model::change::EntityDelta::Added(e) => {
-                            lines.push(format!("    + {} ({:?})", e.name, e.kind))
-                        }
-                        kin_model::change::EntityDelta::Modified { old, new } => lines.push(
-                            format!("    ~ {} -> {} ({:?})", old.name, new.name, new.kind),
-                        ),
-                        kin_model::change::EntityDelta::Removed(id) => {
-                            lines.push(format!("    - {}", id))
-                        }
-                    }
-                }
-            }
-        }
-        _ => {
-            lines.push("Usage: kin diff <base> <head>".to_string());
-            lines.push("Shows entity-level diff between two semantic changes.".to_string());
-        }
-    }
-
-    Ok(DiffResponse { lines })
+    anyhow::bail!(
+        "diff is fail-closed until its daemon executor compares exact repository-v6 trees and \
+         semantic changes together; inspect `kin capabilities --json`"
+    )
 }
