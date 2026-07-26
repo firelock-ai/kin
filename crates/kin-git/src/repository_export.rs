@@ -1219,6 +1219,187 @@ mod tests {
         );
     }
 
+    #[test]
+    fn exports_unborn_repository_without_inventing_history_or_refs() {
+        let root = tempdir().unwrap();
+        let store = BlobStore::new(root.path().join("source-cas")).unwrap();
+        let repository_id = RepositoryId::new("unborn-export").unwrap();
+        let main = kin_model::RefName::from_bytes(b"refs/heads/main".to_vec()).unwrap();
+        let plan = RepositoryGitExportPlan {
+            repository_id,
+            changes: Vec::new(),
+            aliases: Vec::new(),
+            refs: RepositoryRefState {
+                refs: Vec::new(),
+                default_ref: Some(main.clone()),
+            },
+            head: WorkspaceHead::Symbolic {
+                target: main.clone(),
+            },
+            git_authority: None,
+        };
+        let exported = root.path().join("unborn.git");
+        let mut loader = StoreLoader { store: &store };
+        let result = export_repository_to_git(&plan, &mut loader, &exported).unwrap();
+        assert_eq!(result.imported_commits_reused, 0);
+        assert_eq!(result.native_commits_written, 0);
+        assert_eq!(result.refs_written, 0);
+        assert!(result.change_commits.is_empty());
+        assert_eq!(
+            String::from_utf8(git_bare(&exported, &["symbolic-ref", "HEAD"]))
+                .unwrap()
+                .trim(),
+            "refs/heads/main"
+        );
+        let show_ref = Command::new("git")
+            .arg("--git-dir")
+            .arg(&exported)
+            .arg("show-ref")
+            .output()
+            .unwrap();
+        assert_eq!(show_ref.status.code(), Some(1));
+        assert!(show_ref.stdout.is_empty());
+    }
+
+    #[test]
+    fn native_merge_preserves_parent_order_and_first_parent_tree() {
+        let root = tempdir().unwrap();
+        let store = BlobStore::new(root.path().join("source-cas")).unwrap();
+        let repository_id = RepositoryId::new("native-merge-export").unwrap();
+        let path = RepoPath::from_utf8("compose.yaml").unwrap();
+        let artifact_id = artifact_id(&path);
+        let root_hash = store_body(&store, b"services:\n  api:\n    image: root\n");
+        let main_hash = store_body(&store, b"services:\n  api:\n    image: main\n");
+        let feature_hash = store_body(&store, b"services:\n  api:\n    image: feature\n");
+        let root_entry = TreeEntry::blob(root_hash, false);
+        let main_entry = TreeEntry::blob(main_hash, false);
+        let feature_entry = TreeEntry::blob(feature_hash, false);
+
+        let root_change = native_change(
+            Vec::new(),
+            "root",
+            vec![TreeDelta::Added {
+                artifact_id,
+                new: LocatedEntry::new(path.clone(), root_entry),
+            }],
+        );
+        let main_change = native_change(
+            vec![root_change.id],
+            "main",
+            vec![TreeDelta::Updated {
+                artifact_id,
+                old: LocatedEntry::new(path.clone(), root_entry),
+                new: LocatedEntry::new(path.clone(), main_entry),
+            }],
+        );
+        let feature_change = native_change(
+            vec![root_change.id],
+            "feature",
+            vec![TreeDelta::Updated {
+                artifact_id,
+                old: LocatedEntry::new(path.clone(), root_entry),
+                new: LocatedEntry::new(path.clone(), feature_entry),
+            }],
+        );
+        let merge_change = native_change(
+            vec![main_change.id, feature_change.id],
+            "merge feature",
+            Vec::new(),
+        );
+        let main = kin_model::RefName::from_bytes(b"refs/heads/main".to_vec()).unwrap();
+        let feature = kin_model::RefName::from_bytes(b"refs/heads/feature".to_vec()).unwrap();
+        let plan = RepositoryGitExportPlan {
+            repository_id: repository_id.clone(),
+            changes: vec![
+                merge_change.clone(),
+                feature_change.clone(),
+                root_change.clone(),
+                main_change.clone(),
+            ],
+            aliases: Vec::new(),
+            refs: RepositoryRefState {
+                refs: vec![
+                    RepositoryRef {
+                        repository_id: repository_id.clone(),
+                        name: feature,
+                        target: RefTarget::change(feature_change.id),
+                    },
+                    RepositoryRef {
+                        repository_id,
+                        name: main.clone(),
+                        target: RefTarget::change(merge_change.id),
+                    },
+                ],
+                default_ref: Some(main.clone()),
+            },
+            head: WorkspaceHead::Symbolic { target: main },
+            git_authority: None,
+        };
+        let exported = root.path().join("merge.git");
+        let mut loader = StoreLoader { store: &store };
+        let result = export_repository_to_git(&plan, &mut loader, &exported).unwrap();
+        assert_eq!(result.imported_commits_reused, 0);
+        assert_eq!(result.native_commits_written, 4);
+        assert_eq!(result.refs_written, 2);
+
+        let oid_for = |change_id| {
+            result
+                .change_commits
+                .iter()
+                .find(|binding| binding.change_id == change_id)
+                .unwrap()
+                .commit_oid
+                .to_string()
+        };
+        let ancestry = String::from_utf8(git_bare(
+            &exported,
+            &["rev-list", "--parents", "-n", "1", "main"],
+        ))
+        .unwrap();
+        assert_eq!(
+            ancestry.split_whitespace().collect::<Vec<_>>(),
+            vec![
+                oid_for(merge_change.id),
+                oid_for(main_change.id),
+                oid_for(feature_change.id),
+            ]
+        );
+        assert_eq!(
+            tree_blob(&exported, "main", b"compose.yaml"),
+            b"services:\n  api:\n    image: main\n"
+        );
+        assert_eq!(
+            tree_blob(&exported, "feature", b"compose.yaml"),
+            b"services:\n  api:\n    image: feature\n"
+        );
+        git_bare(&exported, &["fsck", "--strict"]);
+    }
+
+    fn native_change(
+        parents: Vec<SemanticChangeId>,
+        message: &str,
+        tree_deltas: Vec<TreeDelta>,
+    ) -> SemanticChange {
+        let mut change = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+            origin: ChangeOrigin::Native,
+            parents,
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("Kin Native"),
+            message: message.to_string(),
+            entity_deltas: Vec::new(),
+            relation_deltas: Vec::new(),
+            tree_deltas,
+            admission_policy_delta: None,
+            projected_files: Vec::new(),
+            spec_link: None,
+            evidence: Vec::new(),
+            risk_summary: None,
+        };
+        change.id = compute_semantic_change_id(&change).unwrap();
+        change
+    }
+
     fn artifact_id(path: &RepoPath) -> ArtifactId {
         ArtifactId(Uuid::new_v5(&Uuid::NAMESPACE_OID, path.as_bytes()))
     }
