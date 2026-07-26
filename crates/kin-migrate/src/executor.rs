@@ -89,8 +89,9 @@ impl PreparedEnrichment {
 ///
 /// 1. Import exact Git tree/history into a staging blob store.
 /// 2. Resolve and validate the imported head without graph mutation.
-/// 3. Read every referenced blob back by hash and prepare optional enrichment.
-/// 4. Atomically admit the imported change batch into the staging graph.
+/// 3. Atomically admit the imported change batch and exact active head tree
+///    into the staging graph.
+/// 4. Read every referenced blob back by hash and prepare optional enrichment.
 /// 5. Persist enrichment, then publish the branch head last.
 /// 6. Save and reopen-verify the staging graph.
 /// 7. For a distinct target, project the exact resolved tree into a separate
@@ -148,14 +149,10 @@ pub fn execute_migration_persisted(plan: &MigrationPlan) -> Result<MigrationResu
         reject_unmaterializable_gitlinks(&imported_head.tree)?;
     }
 
-    // Enrichment is computed only from the resolved head and bytes read back
-    // from the content-addressed store. Missing/corrupt blobs fail here, before
-    // the staging graph changes.
-    let enrichment = prepare_head_enrichment(&imported_head.tree, &blob_store)?;
-
     // kin-db validates every immutable payload before mutation and admits this
-    // batch under one changes lock. The branch remains at genesis until every
-    // enrichment facet below has persisted successfully.
+    // batch under one changes lock. The exact active repository head is then
+    // admitted through one identity-bearing tree transaction. The branch
+    // remains at genesis until every enrichment facet below has persisted.
     graph
         .create_changes(
             conversion
@@ -166,6 +163,12 @@ pub fn execute_migration_persisted(plan: &MigrationPlan) -> Result<MigrationResu
         )
         .map_err(|error| MigrateError::Graph(error.to_string()))?;
     admit_resolved_head(graph.as_ref(), &imported_head.tree)?;
+
+    // Enrichment begins only after exact tree/history admission. It is
+    // computed solely from the admitted resolved head and bytes read back from
+    // the content-addressed store. Missing/corrupt blobs fail loudly inside
+    // this hidden transaction and never expose a partial repository.
+    let enrichment = prepare_head_enrichment(&imported_head.tree, &blob_store)?;
     persist_enrichment(graph.as_ref(), &enrichment)?;
     graph
         .update_branch_head(&BranchName::new(&branch_name), &imported_head.change_id)
