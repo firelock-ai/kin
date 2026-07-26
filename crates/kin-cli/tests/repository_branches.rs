@@ -7,6 +7,8 @@ use kin_model::{
     RepositoryTransaction, REPOSITORY_TRANSACTION_SCHEMA_VERSION,
 };
 use serde_json::Value;
+#[cfg(target_os = "macos")]
+use std::ffi::OsString;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
@@ -96,6 +98,120 @@ fn run_git(path: &Path, args: &[&str]) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[cfg(target_os = "macos")]
+fn run_git_os(path: &Path, args: &[OsString]) {
+    let output = Command::new("git")
+        .args(args)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .current_dir(path)
+        .output()
+        .expect("run Git with byte-exact arguments");
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(unix)]
+fn git_stdout(path: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .args(args)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .current_dir(path)
+        .output()
+        .expect("run git");
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("Git text output")
+        .trim()
+        .to_string()
+}
+
+#[cfg(unix)]
+fn add_gitlink_branch_history(repo: &Path) -> (String, String) {
+    let first_target = git_stdout(repo, &["rev-parse", "HEAD"]);
+    run_git(repo, &["switch", "-c", "gitlink-a"]);
+    run_git(
+        repo,
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("160000,{first_target},vendor/dependency"),
+        ],
+    );
+    run_git(repo, &["commit", "-m", "add exact gitlink"]);
+    let second_target = git_stdout(repo, &["rev-parse", "HEAD"]);
+
+    run_git(repo, &["switch", "-c", "gitlink-b"]);
+    run_git(
+        repo,
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("160000,{second_target},vendor/dependency"),
+        ],
+    );
+    run_git(repo, &["commit", "-m", "retarget exact gitlink"]);
+
+    run_git(repo, &["switch", "-c", "gitlink-removed"]);
+    run_git(
+        repo,
+        &["update-index", "--force-remove", "vendor/dependency"],
+    );
+    run_git(repo, &["commit", "-m", "remove exact gitlink"]);
+    run_git(repo, &["switch", "main"]);
+    (first_target, second_target)
+}
+
+#[cfg(target_os = "macos")]
+fn add_host_unrepresentable_branch(repo: &Path) -> (Vec<u8>, Vec<u8>) {
+    use std::os::unix::ffi::OsStringExt as _;
+
+    let raw_path = b"assets/icon-\xff.bin".to_vec();
+    let body = b"opaque exact graph bytes\n".to_vec();
+    let body_file = repo
+        .parent()
+        .expect("repository parent")
+        .join("raw-path-body.bin");
+    fs::write(&body_file, &body).expect("write raw-path blob input");
+    let object_id = git_stdout(
+        repo,
+        &[
+            "hash-object",
+            "-w",
+            body_file.to_str().expect("temporary body path is UTF-8"),
+        ],
+    );
+
+    run_git(repo, &["switch", "-c", "raw-path"]);
+    let mut cache_info = format!("100644,{object_id},").into_bytes();
+    cache_info.extend_from_slice(&raw_path);
+    run_git_os(
+        repo,
+        &[
+            OsString::from("update-index"),
+            OsString::from("--add"),
+            OsString::from("--cacheinfo"),
+            OsString::from_vec(cache_info),
+        ],
+    );
+    run_git(
+        repo,
+        &["commit", "-m", "track host-unrepresentable byte path"],
+    );
+    run_git(repo, &["switch", "main"]);
+    (raw_path, body)
 }
 
 fn run_kin(repo: &Path, home: &Path, args: &[&str]) -> std::process::Output {
@@ -693,5 +809,207 @@ fn branch_switch_rejects_local_tracked_edits_and_preserves_authority() {
         manager.read_authority().roots(),
         &before,
         "rejected projection advanced repository authority"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn branch_switch_preserves_graph_only_gitlinks_without_traversing_nested_checkout() {
+    let root = tempdir().expect("temp root");
+    let home = root.path().join("home");
+    let repo = root.path().join("repo");
+    let dependency = repo.join("vendor/dependency");
+    fs::create_dir_all(&home).expect("create home");
+    initialize_git_repo(&repo);
+    let (first_target, second_target) = add_gitlink_branch_history(&repo);
+    let layout = initialize_kin_repo(&repo, &home);
+    let (repository_id, _) = open_authority(&layout);
+    fs::rename(repo.join(".git"), repo.join("git-authority-disabled"))
+        .expect("hide admitted Git metadata");
+
+    let add_absent = run_kin(&repo, &home, &["branch", "switch", "gitlink-a"]);
+    assert!(
+        add_absent.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&add_absent.stdout),
+        String::from_utf8_lossy(&add_absent.stderr)
+    );
+    assert!(
+        !dependency.exists(),
+        "an absent Gitlink must not acquire an invented blob or directory"
+    );
+    assert_workspace_gitlink(&open_authority(&layout).1, &first_target);
+
+    fs::create_dir_all(dependency.join("nested")).expect("create independent nested checkout");
+    fs::write(dependency.join("nested/owned.txt"), b"independent before\n")
+        .expect("write independent checkout content");
+
+    let retarget = run_kin(&repo, &home, &["branch", "switch", "gitlink-b"]);
+    assert!(
+        retarget.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&retarget.stdout),
+        String::from_utf8_lossy(&retarget.stderr)
+    );
+    assert_eq!(
+        fs::read(dependency.join("nested/owned.txt")).unwrap(),
+        b"independent before\n"
+    );
+    assert_workspace_gitlink(&open_authority(&layout).1, &second_target);
+
+    fs::write(dependency.join("nested/owned.txt"), b"independent after\n")
+        .expect("mutate independently owned descendants");
+    fs::write(dependency.join("untracked.bin"), [0_u8, 0xff, 0x44])
+        .expect("add independent opaque content");
+    let remove = run_kin(&repo, &home, &["branch", "switch", "gitlink-removed"]);
+    assert!(
+        remove.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&remove.stdout),
+        String::from_utf8_lossy(&remove.stderr)
+    );
+    assert_eq!(
+        fs::read(dependency.join("nested/owned.txt")).unwrap(),
+        b"independent after\n"
+    );
+    assert_eq!(
+        fs::read(dependency.join("untracked.bin")).unwrap(),
+        [0_u8, 0xff, 0x44]
+    );
+    assert_workspace_has_no_path(&open_authority(&layout).1, b"vendor/dependency");
+
+    let add_retained = run_kin(&repo, &home, &["branch", "switch", "gitlink-a"]);
+    assert!(
+        add_retained.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&add_retained.stdout),
+        String::from_utf8_lossy(&add_retained.stderr)
+    );
+    assert_eq!(
+        fs::read(dependency.join("nested/owned.txt")).unwrap(),
+        b"independent after\n"
+    );
+    assert_eq!(
+        fs::read(dependency.join("untracked.bin")).unwrap(),
+        [0_u8, 0xff, 0x44]
+    );
+    assert_workspace_gitlink(&open_authority(&layout).1, &first_target);
+
+    let reopened = RepositoryAuthorityManager::open(
+        repository_id,
+        Arc::new(LocalFileBackend::new(layout.kindb_dir())),
+    )
+    .expect("reopen exact authority after graph-only switches");
+    assert_workspace_gitlink(&reopened, &first_target);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn branch_switch_retains_host_unrepresentable_byte_path_in_graph_authority() {
+    let root = tempdir().expect("temp root");
+    let home = root.path().join("home");
+    let repo = root.path().join("repo");
+    fs::create_dir_all(&home).expect("create home");
+    initialize_git_repo(&repo);
+    let (raw_path, body) = add_host_unrepresentable_branch(&repo);
+    let layout = initialize_kin_repo(&repo, &home);
+    let (repository_id, _) = open_authority(&layout);
+    fs::rename(repo.join(".git"), repo.join("git-authority-disabled"))
+        .expect("hide admitted Git metadata");
+
+    let switched = run_kin(&repo, &home, &["branch", "switch", "raw-path"]);
+    assert!(
+        switched.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&switched.stdout),
+        String::from_utf8_lossy(&switched.stderr)
+    );
+    assert!(
+        !repo.join("assets").exists(),
+        "macOS-unrepresentable repository bytes must not acquire a lossy host alias"
+    );
+    assert_workspace_blob(&open_authority(&layout).1, &raw_path, &body);
+
+    let removed = run_kin(&repo, &home, &["branch", "switch", "main"]);
+    assert!(
+        removed.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&removed.stdout),
+        String::from_utf8_lossy(&removed.stderr)
+    );
+    assert_workspace_has_no_path(&open_authority(&layout).1, &raw_path);
+
+    let restored = run_kin(&repo, &home, &["branch", "switch", "raw-path"]);
+    assert!(
+        restored.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&restored.stdout),
+        String::from_utf8_lossy(&restored.stderr)
+    );
+    assert_workspace_blob(&open_authority(&layout).1, &raw_path, &body);
+
+    let reopened = RepositoryAuthorityManager::open(
+        repository_id,
+        Arc::new(LocalFileBackend::new(layout.kindb_dir())),
+    )
+    .expect("reopen authority with host-unrepresentable workspace member");
+    assert_workspace_blob(&reopened, &raw_path, &body);
+}
+
+#[cfg(unix)]
+fn assert_workspace_gitlink(
+    manager: &RepositoryAuthorityManager<LocalFileBackend>,
+    expected_hex: &str,
+) {
+    let expected = kin_model::GitObjectId::sha1(
+        hex::decode(expected_hex)
+            .expect("hex Git object ID")
+            .try_into()
+            .expect("SHA-1 Git object ID"),
+    );
+    let lease = manager.read_authority();
+    let workspace = lease.metadata().workspaces.first().expect("workspace");
+    let artifact = workspace
+        .tree
+        .artifacts_by_path()
+        .find(|artifact| artifact.path.as_bytes() == b"vendor/dependency")
+        .expect("Gitlink authority member");
+    assert_eq!(artifact.entry, kin_model::TreeEntry::gitlink(expected));
+}
+
+#[cfg(unix)]
+fn assert_workspace_has_no_path(
+    manager: &RepositoryAuthorityManager<LocalFileBackend>,
+    expected_path: &[u8],
+) {
+    let lease = manager.read_authority();
+    let workspace = lease.metadata().workspaces.first().expect("workspace");
+    assert!(workspace
+        .tree
+        .artifacts_by_path()
+        .all(|artifact| artifact.path.as_bytes() != expected_path));
+}
+
+#[cfg(target_os = "macos")]
+fn assert_workspace_blob(
+    manager: &RepositoryAuthorityManager<LocalFileBackend>,
+    expected_path: &[u8],
+    expected_body: &[u8],
+) {
+    let lease = manager.read_authority();
+    let workspace = lease.metadata().workspaces.first().expect("workspace");
+    let artifact = workspace
+        .tree
+        .artifacts_by_path()
+        .find(|artifact| artifact.path.as_bytes() == expected_path)
+        .expect("exact workspace blob member");
+    let expected_identity = artifact.entry.blob_identity().expect("blob identity");
+    drop(lease);
+    assert_eq!(
+        manager
+            .load_source_blob(expected_identity)
+            .expect("load exact source-CAS body")
+            .expect("source-CAS body present"),
+        expected_body
     );
 }
