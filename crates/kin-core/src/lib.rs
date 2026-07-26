@@ -11,6 +11,7 @@ pub mod disambiguation;
 pub mod env_registry;
 pub mod error;
 pub mod exact_tree;
+pub mod git_init;
 pub mod hooks;
 pub mod init;
 pub mod layout;
@@ -42,6 +43,7 @@ pub use exact_tree::{
     exact_tree_correction, plan_artifact_copy, plan_artifact_move, plan_artifact_operations,
     plan_observed_tree_deltas, ArtifactTreeOperation,
 };
+pub use git_init::init_from_git;
 pub use hooks::{
     generate_claude_hooks, render_hooks_instructions, render_hooks_json, HookTemplate,
 };
