@@ -2,13 +2,44 @@
 // Copyright 2026 Firelock, LLC
 
 use anyhow::Result;
-use kin_model::{EntityStore, GraphStats, TreeEntry};
+use kin_model::{EntityStore, GraphStats, Hash256, RepoPath, ResolvedTree, TreeEntry};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+
+use super::repository_authority::ActiveRepositoryAuthority;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RepositoryArtifactCoverage {
+    /// Complete repository-v6 workspace membership, independent of language
+    /// support or semantic relationships.
+    pub authority_artifact_count: usize,
+    /// Exact tree currently carried by the derived query graph.
+    pub graph_tree_artifact_count: usize,
+    /// Whether the derived graph carries the same stable artifact identities,
+    /// byte-exact paths, entry kinds, modes, and content identities.
+    pub repository_tree_in_sync: bool,
+    /// UTF-8 regular files that can carry one query-facing enrichment facet.
+    pub enrichable_artifact_count: usize,
+    /// Enrichable artifacts with at least one persisted facet.
+    pub enriched_artifact_count: usize,
+    /// Symlinks, gitlinks, and non-UTF-8 paths that remain exact tree truth but
+    /// do not currently have a `FilePathId` enrichment surface.
+    pub exact_only_artifact_count: usize,
+    pub missing_enrichment_path_count: usize,
+    pub conflicting_enrichment_path_count: usize,
+    pub stale_enrichment_path_count: usize,
+    pub content_mismatch_path_count: usize,
+    pub orphan_entity_count: usize,
+    /// Hard repository-coverage gate. Semantic relations are intentionally not
+    /// part of this value: zero evidence-backed relationships is valid.
+    pub complete: bool,
+    pub issue_paths_sample: Vec<String>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GraphHealthReport {
+    pub repository_artifact_coverage: RepositoryArtifactCoverage,
     pub supported_entity_source_file_count: usize,
     pub supported_shallow_source_file_count: usize,
     pub graph_empty_for_supported_inputs: bool,
@@ -40,17 +71,171 @@ struct ContaminationSummary {
 }
 
 pub(crate) fn inspect_graph(
-    _layout: &kin_core::KinLayout,
+    layout: &kin_core::KinLayout,
     graph: &kin_db::InMemoryGraph,
 ) -> Result<GraphHealthReport> {
     let stats = graph.graph_stats();
     let supported_inputs = collect_supported_inputs(graph);
     let contamination = collect_contamination(graph)?;
+    let artifact_coverage = collect_repository_artifact_coverage(layout, graph)?;
     Ok(build_graph_health_report(
         &stats,
         &supported_inputs,
         &contamination,
+        artifact_coverage,
     ))
+}
+
+#[derive(Default)]
+struct EnrichmentFacets {
+    count: usize,
+    content_hashes: Vec<Hash256>,
+}
+
+fn collect_repository_artifact_coverage(
+    layout: &kin_core::KinLayout,
+    graph: &kin_db::InMemoryGraph,
+) -> Result<RepositoryArtifactCoverage> {
+    let authority = ActiveRepositoryAuthority::open(layout)?;
+    let workspace = authority.workspace()?;
+    workspace.validate()?;
+    collect_repository_artifact_coverage_for_tree(&workspace.tree, graph)
+}
+
+fn collect_repository_artifact_coverage_for_tree(
+    authority_tree: &ResolvedTree,
+    graph: &kin_db::InMemoryGraph,
+) -> Result<RepositoryArtifactCoverage> {
+    let graph_tree = graph.resolved_tree();
+    let repository_tree_in_sync = graph_tree == *authority_tree;
+
+    let mut issue_paths = BTreeSet::new();
+    if !repository_tree_in_sync {
+        collect_tree_divergence_paths(authority_tree, &graph_tree, &mut issue_paths);
+    }
+
+    let mut facets = BTreeMap::<String, EnrichmentFacets>::new();
+    for layout in graph.list_file_layouts()? {
+        facets.entry(layout.file_id.0).or_default().count += 1;
+    }
+    for shallow in graph.list_shallow_files()? {
+        facets.entry(shallow.file_id.0).or_default().count += 1;
+    }
+    for artifact in graph.list_structured_artifacts()? {
+        let facet = facets.entry(artifact.file_id.0).or_default();
+        facet.count += 1;
+        facet.content_hashes.push(artifact.content_hash);
+    }
+    for artifact in graph.list_opaque_artifacts()? {
+        let facet = facets.entry(artifact.file_id.0).or_default();
+        facet.count += 1;
+        facet.content_hashes.push(artifact.content_hash);
+    }
+
+    let mut enrichable_artifact_count = 0usize;
+    let mut enriched_artifact_count = 0usize;
+    let mut exact_only_artifact_count = 0usize;
+    let mut missing_enrichment_paths = BTreeSet::new();
+    let mut conflicting_enrichment_paths = BTreeSet::new();
+    let mut content_mismatch_paths = BTreeSet::new();
+
+    for artifact in authority_tree.artifacts_by_path() {
+        let (Some(path), TreeEntry::Blob { hash, .. }) = (artifact.path.as_utf8(), artifact.entry)
+        else {
+            exact_only_artifact_count += 1;
+            continue;
+        };
+        enrichable_artifact_count += 1;
+        match facets.get(path) {
+            None => {
+                missing_enrichment_paths.insert(path.to_string());
+            }
+            Some(facet) => {
+                enriched_artifact_count += 1;
+                if facet.count != 1 {
+                    conflicting_enrichment_paths.insert(path.to_string());
+                }
+                if facet
+                    .content_hashes
+                    .iter()
+                    .any(|content_hash| *content_hash != hash)
+                {
+                    content_mismatch_paths.insert(path.to_string());
+                }
+            }
+        }
+    }
+
+    let mut stale_enrichment_paths = BTreeSet::new();
+    for path in facets.keys() {
+        let exact_blob_exists = RepoPath::from_utf8(path.clone())
+            .ok()
+            .and_then(|path| authority_tree.artifact_at_path(&path))
+            .is_some_and(|artifact| matches!(artifact.entry, TreeEntry::Blob { .. }));
+        if !exact_blob_exists {
+            stale_enrichment_paths.insert(path.clone());
+        }
+    }
+
+    let mut orphan_entity_count = 0usize;
+    for entity in graph.list_all_entities()? {
+        let Some(file_origin) = entity.file_origin else {
+            continue;
+        };
+        let exact_blob_exists = RepoPath::from_utf8(file_origin.0.clone())
+            .ok()
+            .and_then(|path| authority_tree.artifact_at_path(&path))
+            .is_some_and(|artifact| matches!(artifact.entry, TreeEntry::Blob { .. }));
+        if !exact_blob_exists {
+            orphan_entity_count += 1;
+            issue_paths.insert(file_origin.0);
+        }
+    }
+
+    issue_paths.extend(missing_enrichment_paths.iter().cloned());
+    issue_paths.extend(conflicting_enrichment_paths.iter().cloned());
+    issue_paths.extend(stale_enrichment_paths.iter().cloned());
+    issue_paths.extend(content_mismatch_paths.iter().cloned());
+
+    let complete = repository_tree_in_sync
+        && missing_enrichment_paths.is_empty()
+        && conflicting_enrichment_paths.is_empty()
+        && stale_enrichment_paths.is_empty()
+        && content_mismatch_paths.is_empty()
+        && orphan_entity_count == 0;
+
+    Ok(RepositoryArtifactCoverage {
+        authority_artifact_count: authority_tree.len(),
+        graph_tree_artifact_count: graph_tree.len(),
+        repository_tree_in_sync,
+        enrichable_artifact_count,
+        enriched_artifact_count,
+        exact_only_artifact_count,
+        missing_enrichment_path_count: missing_enrichment_paths.len(),
+        conflicting_enrichment_path_count: conflicting_enrichment_paths.len(),
+        stale_enrichment_path_count: stale_enrichment_paths.len(),
+        content_mismatch_path_count: content_mismatch_paths.len(),
+        orphan_entity_count,
+        complete,
+        issue_paths_sample: issue_paths.into_iter().take(8).collect(),
+    })
+}
+
+fn collect_tree_divergence_paths(
+    authority_tree: &ResolvedTree,
+    graph_tree: &ResolvedTree,
+    issue_paths: &mut BTreeSet<String>,
+) {
+    for artifact in authority_tree.artifacts() {
+        if graph_tree.get(&artifact.artifact_id) != Some(artifact) {
+            issue_paths.insert(artifact.path.to_string());
+        }
+    }
+    for artifact in graph_tree.artifacts() {
+        if authority_tree.get(&artifact.artifact_id) != Some(artifact) {
+            issue_paths.insert(artifact.path.to_string());
+        }
+    }
 }
 
 fn collect_supported_inputs(graph: &kin_db::InMemoryGraph) -> SupportedInputCounts {
@@ -129,6 +314,7 @@ fn build_graph_health_report(
     stats: &GraphStats,
     supported_inputs: &SupportedInputCounts,
     contamination: &ContaminationSummary,
+    artifact_coverage: RepositoryArtifactCoverage,
 ) -> GraphHealthReport {
     let test_role_entity_count = stats.role_counts.get("Test").copied().unwrap_or(0);
     let cochange_relation_count = stats.relation_counts.get("CoChanges").copied().unwrap_or(0);
@@ -141,24 +327,56 @@ fn build_graph_health_report(
         semantic_relation_count as f64 / stats.total_entities as f64
     };
 
+    // A supported source file may legitimately contain no entities, and bytes
+    // with a parser-looking extension may correctly route to an opaque facet.
+    // Health therefore keys on universal facet coverage, never on entity or
+    // relationship counts.
     let graph_empty_for_supported_inputs = (supported_inputs.entity_source > 0
-        && stats.total_entities == 0)
-        || (supported_inputs.shallow_source > 0 && stats.shallow_file_count == 0);
+        || supported_inputs.shallow_source > 0)
+        && artifact_coverage.enriched_artifact_count == 0;
 
     let mut critical_issues = Vec::new();
     let mut warnings = Vec::new();
 
-    if supported_inputs.entity_source > 0 && stats.total_entities == 0 {
+    if !artifact_coverage.repository_tree_in_sync {
         critical_issues.push(format!(
-            "supported entity-source files present ({}) but the graph contains zero entities",
-            supported_inputs.entity_source
+            "derived graph tree has {} artifacts but repository authority has {}",
+            artifact_coverage.graph_tree_artifact_count, artifact_coverage.authority_artifact_count
         ));
     }
 
-    if supported_inputs.shallow_source > 0 && stats.shallow_file_count == 0 {
+    if artifact_coverage.missing_enrichment_path_count > 0 {
         critical_issues.push(format!(
-            "supported shallow-syntax files present ({}) but the graph contains zero shallow files",
-            supported_inputs.shallow_source
+            "{} admitted regular files have no query-facing enrichment facet",
+            artifact_coverage.missing_enrichment_path_count
+        ));
+    }
+
+    if artifact_coverage.conflicting_enrichment_path_count > 0 {
+        critical_issues.push(format!(
+            "{} admitted regular files have conflicting enrichment facets",
+            artifact_coverage.conflicting_enrichment_path_count
+        ));
+    }
+
+    if artifact_coverage.stale_enrichment_path_count > 0 {
+        critical_issues.push(format!(
+            "{} enrichment paths are absent from the exact repository tree",
+            artifact_coverage.stale_enrichment_path_count
+        ));
+    }
+
+    if artifact_coverage.content_mismatch_path_count > 0 {
+        critical_issues.push(format!(
+            "{} artifact facets disagree with exact repository content identity",
+            artifact_coverage.content_mismatch_path_count
+        ));
+    }
+
+    if artifact_coverage.orphan_entity_count > 0 {
+        critical_issues.push(format!(
+            "{} entities refer to files absent from the exact repository tree",
+            artifact_coverage.orphan_entity_count
         ));
     }
 
@@ -203,6 +421,7 @@ fn build_graph_health_report(
     }
 
     GraphHealthReport {
+        repository_artifact_coverage: artifact_coverage,
         supported_entity_source_file_count: supported_inputs.entity_source,
         supported_shallow_source_file_count: supported_inputs.shallow_source,
         graph_empty_for_supported_inputs,
@@ -224,6 +443,24 @@ fn build_graph_health_report(
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    fn complete_coverage() -> RepositoryArtifactCoverage {
+        RepositoryArtifactCoverage {
+            authority_artifact_count: 0,
+            graph_tree_artifact_count: 0,
+            repository_tree_in_sync: true,
+            enrichable_artifact_count: 0,
+            enriched_artifact_count: 0,
+            exact_only_artifact_count: 0,
+            missing_enrichment_path_count: 0,
+            conflicting_enrichment_path_count: 0,
+            stale_enrichment_path_count: 0,
+            content_mismatch_path_count: 0,
+            orphan_entity_count: 0,
+            complete: true,
+            issue_paths_sample: Vec::new(),
+        }
+    }
 
     fn stats() -> GraphStats {
         GraphStats {
@@ -251,7 +488,7 @@ mod tests {
     }
 
     #[test]
-    fn health_report_flags_empty_graph_for_supported_inputs() {
+    fn health_report_does_not_require_entities_for_supported_inputs() {
         let stats = stats();
         let supported_inputs = SupportedInputCounts {
             entity_source: 3,
@@ -263,19 +500,18 @@ mod tests {
             path_count: 0,
             path_samples: Vec::new(),
         };
+        let coverage = RepositoryArtifactCoverage {
+            authority_artifact_count: 4,
+            graph_tree_artifact_count: 4,
+            enrichable_artifact_count: 4,
+            enriched_artifact_count: 4,
+            ..complete_coverage()
+        };
 
-        let report = build_graph_health_report(&stats, &supported_inputs, &contamination);
+        let report = build_graph_health_report(&stats, &supported_inputs, &contamination, coverage);
 
-        assert!(report.graph_empty_for_supported_inputs);
-        assert_eq!(report.critical_issues.len(), 2);
-        assert!(report
-            .critical_issues
-            .iter()
-            .any(|issue| issue.contains("entity-source files present (3)")));
-        assert!(report
-            .critical_issues
-            .iter()
-            .any(|issue| issue.contains("shallow-syntax files present (1)")));
+        assert!(!report.graph_empty_for_supported_inputs);
+        assert!(report.critical_issues.is_empty());
     }
 
     #[test]
@@ -298,6 +534,7 @@ mod tests {
                 path_count: 3,
                 path_samples: vec!["out/generated.rs".to_string()],
             },
+            complete_coverage(),
         );
 
         assert_eq!(report.contaminated_path_count, 3);
@@ -310,5 +547,243 @@ mod tests {
             .warnings
             .iter()
             .any(|issue| issue.contains("no verification test-case catalog")));
+    }
+
+    #[test]
+    fn artifact_coverage_is_independent_of_semantic_relationships() {
+        let mut stats = stats();
+        stats.total_entities = 2;
+        let coverage = RepositoryArtifactCoverage {
+            authority_artifact_count: 5,
+            graph_tree_artifact_count: 5,
+            repository_tree_in_sync: true,
+            enrichable_artifact_count: 4,
+            enriched_artifact_count: 4,
+            exact_only_artifact_count: 1,
+            ..complete_coverage()
+        };
+
+        let report = build_graph_health_report(
+            &stats,
+            &SupportedInputCounts {
+                entity_source: 0,
+                shallow_source: 0,
+            },
+            &ContaminationSummary {
+                entity_count: 0,
+                non_entity_count: 0,
+                path_count: 0,
+                path_samples: Vec::new(),
+            },
+            coverage,
+        );
+
+        assert!(report.repository_artifact_coverage.complete);
+        assert!(report.critical_issues.is_empty());
+        assert_eq!(report.semantic_relation_count, 0);
+    }
+
+    #[test]
+    fn artifact_coverage_gaps_are_critical_and_sampled() {
+        let coverage = RepositoryArtifactCoverage {
+            authority_artifact_count: 3,
+            graph_tree_artifact_count: 2,
+            repository_tree_in_sync: false,
+            enrichable_artifact_count: 3,
+            enriched_artifact_count: 2,
+            exact_only_artifact_count: 0,
+            missing_enrichment_path_count: 1,
+            conflicting_enrichment_path_count: 0,
+            stale_enrichment_path_count: 0,
+            content_mismatch_path_count: 0,
+            orphan_entity_count: 0,
+            complete: false,
+            issue_paths_sample: vec!["unknown.custom".to_string()],
+        };
+        let report = build_graph_health_report(
+            &stats(),
+            &SupportedInputCounts {
+                entity_source: 0,
+                shallow_source: 0,
+            },
+            &ContaminationSummary {
+                entity_count: 0,
+                non_entity_count: 0,
+                path_count: 0,
+                path_samples: Vec::new(),
+            },
+            coverage,
+        );
+
+        assert!(!report.repository_artifact_coverage.complete);
+        assert!(report
+            .critical_issues
+            .iter()
+            .any(|issue| issue.contains("repository authority has 3")));
+        assert!(report
+            .critical_issues
+            .iter()
+            .any(|issue| issue.contains("no query-facing enrichment facet")));
+    }
+
+    #[test]
+    fn arbitrary_repository_members_are_covered_without_relationships() {
+        use kin_model::{
+            ArtifactId, ArtifactKind, FilePathId, LocatedEntry, OpaqueArtifact, ResolvedArtifact,
+            StructuredArtifact, TransactionDelta, TreeDelta,
+        };
+
+        let compose_hash = Hash256::from_bytes([0x11; 32]);
+        let unknown_hash = Hash256::from_bytes([0x22; 32]);
+        let symlink_target_hash = Hash256::from_bytes([0x33; 32]);
+        let compose_id = ArtifactId::new();
+        let unknown_id = ArtifactId::new();
+        let symlink_id = ArtifactId::new();
+        let compose_path = RepoPath::from_utf8("compose.yaml").unwrap();
+        let unknown_path = RepoPath::from_utf8("assets/unknown.custom").unwrap();
+        let symlink_path = RepoPath::from_utf8("current-config").unwrap();
+        let tree = ResolvedTree::from_artifacts([
+            ResolvedArtifact::new(
+                compose_id,
+                compose_path.clone(),
+                TreeEntry::blob(compose_hash, false),
+            ),
+            ResolvedArtifact::new(
+                unknown_id,
+                unknown_path.clone(),
+                TreeEntry::blob(unknown_hash, false),
+            ),
+            ResolvedArtifact::new(
+                symlink_id,
+                symlink_path.clone(),
+                TreeEntry::symlink(symlink_target_hash),
+            ),
+        ])
+        .unwrap();
+        let graph = kin_db::InMemoryGraph::new();
+        graph
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: Vec::new(),
+                relation_deltas: Vec::new(),
+                tree_deltas: vec![
+                    TreeDelta::Added {
+                        artifact_id: compose_id,
+                        new: LocatedEntry::new(compose_path, TreeEntry::blob(compose_hash, false)),
+                    },
+                    TreeDelta::Added {
+                        artifact_id: unknown_id,
+                        new: LocatedEntry::new(unknown_path, TreeEntry::blob(unknown_hash, false)),
+                    },
+                    TreeDelta::Added {
+                        artifact_id: symlink_id,
+                        new: LocatedEntry::new(
+                            symlink_path,
+                            TreeEntry::symlink(symlink_target_hash),
+                        ),
+                    },
+                ],
+                admission_policy_delta: None,
+            })
+            .unwrap();
+        graph
+            .upsert_structured_artifact(&StructuredArtifact {
+                file_id: FilePathId::new("compose.yaml"),
+                kind: ArtifactKind::ComposeFile,
+                content_hash: compose_hash,
+                text_preview: Some("services:".to_string()),
+            })
+            .unwrap();
+        graph
+            .upsert_opaque_artifact(&OpaqueArtifact {
+                file_id: FilePathId::new("assets/unknown.custom"),
+                content_hash: unknown_hash,
+                mime_type: None,
+                text_preview: None,
+            })
+            .unwrap();
+
+        let coverage = collect_repository_artifact_coverage_for_tree(&tree, &graph).unwrap();
+
+        assert!(coverage.complete);
+        assert!(coverage.repository_tree_in_sync);
+        assert_eq!(coverage.authority_artifact_count, 3);
+        assert_eq!(coverage.enrichable_artifact_count, 2);
+        assert_eq!(coverage.enriched_artifact_count, 2);
+        assert_eq!(coverage.exact_only_artifact_count, 1);
+        assert_eq!(graph.graph_stats().total_relations, 0);
+    }
+
+    #[test]
+    fn coverage_rejects_conflicting_stale_and_wrong_content_facets() {
+        use kin_model::{
+            ArtifactId, FilePathId, LocatedEntry, OpaqueArtifact, ResolvedArtifact,
+            StructuredArtifact, TransactionDelta, TreeDelta,
+        };
+
+        let exact_hash = Hash256::from_bytes([0x41; 32]);
+        let wrong_hash = Hash256::from_bytes([0x42; 32]);
+        let artifact_id = ArtifactId::new();
+        let ghost_id = ArtifactId::new();
+        let path = RepoPath::from_utf8("compose.yaml").unwrap();
+        let ghost_path = RepoPath::from_utf8("ghost.bin").unwrap();
+        let tree = ResolvedTree::from_artifacts([ResolvedArtifact::new(
+            artifact_id,
+            path.clone(),
+            TreeEntry::blob(exact_hash, false),
+        )])
+        .unwrap();
+        let graph = kin_db::InMemoryGraph::new();
+        graph
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: Vec::new(),
+                relation_deltas: Vec::new(),
+                tree_deltas: vec![
+                    TreeDelta::Added {
+                        artifact_id,
+                        new: LocatedEntry::new(path, TreeEntry::blob(exact_hash, false)),
+                    },
+                    TreeDelta::Added {
+                        artifact_id: ghost_id,
+                        new: LocatedEntry::new(ghost_path, TreeEntry::blob(wrong_hash, false)),
+                    },
+                ],
+                admission_policy_delta: None,
+            })
+            .unwrap();
+        graph
+            .upsert_structured_artifact(&StructuredArtifact {
+                file_id: FilePathId::new("compose.yaml"),
+                kind: kin_model::ArtifactKind::ComposeFile,
+                content_hash: exact_hash,
+                text_preview: None,
+            })
+            .unwrap();
+        graph
+            .upsert_opaque_artifact(&OpaqueArtifact {
+                file_id: FilePathId::new("compose.yaml"),
+                content_hash: wrong_hash,
+                mime_type: None,
+                text_preview: None,
+            })
+            .unwrap();
+        graph
+            .upsert_opaque_artifact(&OpaqueArtifact {
+                file_id: FilePathId::new("ghost.bin"),
+                content_hash: wrong_hash,
+                mime_type: Some("application/octet-stream".to_string()),
+                text_preview: None,
+            })
+            .unwrap();
+
+        let coverage = collect_repository_artifact_coverage_for_tree(&tree, &graph).unwrap();
+
+        assert!(!coverage.complete);
+        assert_eq!(coverage.conflicting_enrichment_path_count, 1);
+        assert_eq!(coverage.content_mismatch_path_count, 1);
+        assert_eq!(coverage.stale_enrichment_path_count, 1);
+        assert_eq!(
+            coverage.issue_paths_sample,
+            vec!["compose.yaml".to_string(), "ghost.bin".to_string()]
+        );
     }
 }
