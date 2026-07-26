@@ -46,6 +46,5 @@ pub struct GraphStats {
     /// Total relation count across all kinds.
     pub total_relations: usize,
     /// Entity counts keyed by EntityRole debug name (e.g. "Source", "Test").
-    #[serde(default)]
     pub role_counts: HashMap<String, usize>,
 }

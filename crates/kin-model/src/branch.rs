@@ -40,7 +40,6 @@ pub struct GraphOverlay {
     pub tree_deltas: Vec<TreeDelta>,
     /// Entity bodies for modified/added entities.
     /// Used by VFS to project overlay changes without re-reading files.
-    #[serde(default)]
     pub entity_bodies: HashMap<EntityId, Vec<u8>>,
 }
 

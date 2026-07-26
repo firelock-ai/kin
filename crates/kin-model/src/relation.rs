@@ -96,11 +96,8 @@ pub struct Relation {
     /// Enables qualified cross-repo resolution in the spine.
     /// e.g., "requests" for `from requests import get`,
     ///        "kin_db" for `use kin_db::InMemoryGraph`
-    #[serde(default)]
     pub import_source: Option<String>,
-    /// Parser/linker evidence for this edge. Older snapshots do not carry this
-    /// field, so it must remain defaultable.
-    #[serde(default)]
+    /// Parser/linker evidence for this edge.
     pub evidence: Vec<RelationEvidence>,
 }
 
@@ -120,18 +117,14 @@ pub struct Relation {
 pub struct CallArgShape {
     /// Number of positional argument expressions passed. A `*sequence` splat is
     /// not counted here; it is recorded by `has_var_positional`.
-    #[serde(default)]
     pub positional: u32,
     /// Sorted, deduplicated names of explicit keyword arguments (`name=value`).
-    #[serde(default)]
     pub keywords: Vec<String>,
     /// The call forwards a `*sequence` positional splat (or an equivalent
     /// pack-expansion).
-    #[serde(default)]
     pub has_var_positional: bool,
     /// The call forwards a `**mapping` keyword splat, so its keyword set is not
     /// statically known.
-    #[serde(default)]
     pub has_var_keyword: bool,
 }
 
@@ -159,27 +152,20 @@ impl CallArgShape {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct RelationEvidence {
     /// Source span of the syntax that produced the edge, when available.
-    #[serde(default)]
     pub source_span: Option<SourceSpan>,
     /// Parser or linker rule that produced this evidence.
-    #[serde(default)]
     pub parser_rule: Option<String>,
     /// Lexical token at the evidence site, e.g. a macro name or imported symbol.
-    #[serde(default)]
     pub token: Option<String>,
     /// Module/include path as written in source.
-    #[serde(default)]
     pub source_path: Option<String>,
     /// Resolved graph-owned target path, when the linker could resolve it.
-    #[serde(default)]
     pub resolved_path: Option<String>,
     /// Number of equivalent occurrences collapsed into this evidence record.
-    #[serde(default = "default_relation_evidence_count")]
     pub occurrence_count: u32,
     /// Argument shape of the call site that produced this edge, when captured.
-    /// Present only for `Calls` edges from languages that emit shapes; older
-    /// snapshots, non-call edges, and unresolved calls leave it `None`.
-    #[serde(default)]
+    /// Present only for `Calls` edges from languages that emit shapes;
+    /// non-call edges and unresolved calls leave it `None`.
     pub call_shape: Option<CallArgShape>,
 }
 
@@ -340,5 +326,9 @@ mod tests {
             parsed.evidence[0].resolved_path.as_deref(),
             Some("include/app.hpp")
         );
+
+        let mut missing_evidence = serde_json::to_value(&relation).unwrap();
+        missing_evidence.as_object_mut().unwrap().remove("evidence");
+        assert!(serde_json::from_value::<Relation>(missing_evidence).is_err());
     }
 }

@@ -25,7 +25,6 @@ pub struct ContextPack {
     /// Populated when `include_traffic=true`.
     pub traffic: Vec<TrafficEntry>,
     /// Graph-owned non-entity context projected into the pack.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub supporting_artifacts: Vec<ArtifactContextEntry>,
     pub token_budget: TokenBudget,
     pub actual_tokens: usize,
@@ -34,7 +33,6 @@ pub struct ContextPack {
 /// Planner handoff describing which retrieval seeds should shape a context pack.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ContextPlan {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub seeds: Vec<ContextPlanSeed>,
 }
 
@@ -42,12 +40,9 @@ pub struct ContextPlan {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextPlanSeed {
     pub retrieval_key: RetrievalKey,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_path: Option<FilePathId>,
     pub score: f32,
-    #[serde(default)]
     pub lexical: bool,
-    #[serde(default)]
     pub semantic: bool,
 }
 

@@ -21,7 +21,6 @@ pub struct Entity {
     pub span: Option<SourceSpan>,
     pub signature: String,
     pub visibility: Visibility,
-    #[serde(default)]
     pub role: EntityRole,
     pub doc_summary: Option<String>,
     pub metadata: EntityMetadata,

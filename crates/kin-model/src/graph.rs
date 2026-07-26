@@ -709,7 +709,6 @@ pub trait GraphStore:
 /// A subgraph returned from neighborhood queries.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SubGraph {
-    #[serde(default)]
     pub nodes: Vec<GraphNodeId>,
     pub entities: HashMap<EntityId, Entity>,
     pub relations: Vec<Relation>,
@@ -718,21 +717,16 @@ pub struct SubGraph {
 /// Immutable committed graph state resolved at a specific semantic ref.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ResolvedGraphState {
-    #[serde(default)]
     pub entities: HashMap<EntityId, Entity>,
-    #[serde(default)]
     pub relations: HashMap<RelationId, Relation>,
-    #[serde(default)]
     pub entity_revisions: HashMap<EntityId, Vec<EntityRevision>>,
     pub tree: HashMap<FilePathId, TreeEntry>,
     /// Entities that were explicitly removed by a semantic change.
     /// Maps entity ID to the removed entity and the change that removed it.
-    #[serde(default)]
     pub entity_tombstones: HashMap<EntityId, (Entity, SemanticChangeId)>,
     /// Relations that were explicitly removed by a semantic change or pruned
     /// because a referenced entity was removed.
     /// Maps relation ID to the removed relation and the change that caused removal.
-    #[serde(default)]
     pub relation_tombstones: HashMap<RelationId, (Relation, SemanticChangeId)>,
 }
 

@@ -22,9 +22,7 @@ pub struct EntityRevision {
     pub entity_id: EntityId,
     pub entity: Entity,
     pub introduced_by: SemanticChangeId,
-    #[serde(default)]
     pub previous_revision: Option<EntityRevisionId>,
-    #[serde(default)]
     pub ended_by: Option<SemanticChangeId>,
 }
 
@@ -68,9 +66,7 @@ pub struct RelationRevision {
     pub relation_id: RelationId,
     pub relation: Relation,
     pub introduced_by: SemanticChangeId,
-    #[serde(default)]
     pub previous_revision: Option<RelationRevisionId>,
-    #[serde(default)]
     pub ended_by: Option<SemanticChangeId>,
 }
 
@@ -114,9 +110,7 @@ pub struct ArtifactRevision {
     pub file_id: FilePathId,
     pub entry: TreeEntry,
     pub introduced_by: SemanticChangeId,
-    #[serde(default)]
     pub previous_revision: Option<ArtifactRevisionId>,
-    #[serde(default)]
     pub ended_by: Option<SemanticChangeId>,
 }
 
