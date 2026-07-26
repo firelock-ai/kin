@@ -936,7 +936,7 @@ fn store_evidence_blob(layout: &kin_core::KinLayout, evidence_text: &str) -> Opt
 mod tests {
     use super::*;
     use kin_model::{
-        AuthorId, BranchName, EntityId, EntityKind, EntityMetadata, EntityRole, FilePathId,
+        AuthorId, ChangeOrigin, EntityId, EntityKind, EntityMetadata, EntityRole, FilePathId,
         FingerprintAlgorithm, GraphNodeId, IdentityRef, LanguageId, Priority, ProvenanceStore,
         Relation, RelationId, RelationKind, RelationOrigin, SemanticFingerprint, TestKind,
         Visibility, WorkStatus, WorkStore,
@@ -1169,6 +1169,7 @@ mod tests {
         let change = SemanticChange {
             id: SemanticChangeId::from_hash(Hash256::from_bytes([7; 32])),
             parents: vec![],
+            origin: ChangeOrigin::Native,
             timestamp: Timestamp::now(),
             author: AuthorId::new("test"),
             message: "touch checkout core".into(),
@@ -1182,7 +1183,7 @@ mod tests {
             spec_link: None,
             evidence: vec![],
             risk_summary: None,
-            authored_on: Some(BranchName::new("main")),
+            admission_policy_delta: None,
         };
 
         let plan = build_change_verification_plan(graph.as_ref(), &change, 1).unwrap();
