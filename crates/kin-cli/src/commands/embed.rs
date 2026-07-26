@@ -60,13 +60,6 @@ pub struct EmbedResponse {
     pub lines: Vec<String>,
 }
 
-pub(crate) fn invalidate_vector_index(path: &std::path::Path) -> Result<()> {
-    if path.exists() {
-        std::fs::remove_file(path)?;
-    }
-    Ok(())
-}
-
 /// Decide whether the embed loop should enqueue missing retrievable objects.
 ///
 /// Reopened graphs may have a stale or partially useful queue while the vector

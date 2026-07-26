@@ -12,8 +12,8 @@
 //! together they cover {bare call, module-attribute call, method call} x
 //! {same-file, cross-file}.
 
-use kin_index::{link_cross_file, FileParseData};
-use kin_model::{Entity, EntityId, FilePathId, RelationKind};
+use kin_index::{link_cross_file as link_cross_file_with_identities, FileParseData};
+use kin_model::{ArtifactId, Entity, EntityId, FilePathId, RelationKind};
 use kin_parser::{LanguageAdapter, PythonAdapter};
 
 fn parse_py(file_path: &str, source: &str) -> FileParseData {
@@ -53,6 +53,15 @@ fn has_call(relations: &[kin_model::Relation], src: EntityId, dst: EntityId) -> 
             && r.src.as_entity() == Some(src)
             && r.dst.as_entity() == Some(dst)
     })
+}
+
+fn link_cross_file(files: &[FileParseData]) -> Vec<kin_model::Relation> {
+    let artifact_ids = files
+        .iter()
+        .map(|file| (file.file_path.clone(), ArtifactId::new()))
+        .collect();
+    link_cross_file_with_identities(files, &artifact_ids)
+        .expect("every fixture file has an explicitly assigned artifact identity")
 }
 
 #[test]
@@ -316,14 +325,15 @@ fn incremental_inherited_self_call_resolves_with_batch_parity() {
 
     let mut linker = IncrementalLinker::new();
     for file in &files {
-        linker.add_file(&file.file_path, &file.entities);
+        linker.add_file(&file.file_path, ArtifactId::new(), &file.entities);
     }
     linker.record_class_bases(&files);
 
     let caller = entity_id(&files, "runserver.py", "Command.inner_run");
     let target = entity_id(&files, "base.py", "BaseCommand.validate");
 
-    let relations = link_cross_file_incremental(&files, &linker);
+    let relations = link_cross_file_incremental(&files, &linker)
+        .expect("every fixture file has an explicitly assigned artifact identity");
     assert!(
         has_call(&relations, caller, target),
         "incremental linking must resolve the inherited method exactly like the batch linker"
@@ -354,10 +364,10 @@ fn incremental_hierarchy_persists_across_steps() {
     );
 
     let mut linker = IncrementalLinker::new();
-    linker.add_file(&base.file_path, &base.entities);
+    linker.add_file(&base.file_path, ArtifactId::new(), &base.entities);
     linker.record_class_bases(std::slice::from_ref(&base));
 
-    linker.add_file(&caller.file_path, &caller.entities);
+    linker.add_file(&caller.file_path, ArtifactId::new(), &caller.entities);
 
     let caller_id = entity_id(
         std::slice::from_ref(&caller),
@@ -373,7 +383,8 @@ fn incremental_hierarchy_persists_across_steps() {
     // Only the caller file is in this step's parse data; base.py's hierarchy
     // lives in the persistent linker state (and the caller's own hierarchy in
     // the step-local overlay).
-    let relations = link_cross_file_incremental(std::slice::from_ref(&caller), &linker);
+    let relations = link_cross_file_incremental(std::slice::from_ref(&caller), &linker)
+        .expect("every fixture file has an explicitly assigned artifact identity");
     assert!(
         has_call(&relations, caller_id, target_id),
         "an inheritance walk must cross incremental step boundaries via recorded hierarchy state"

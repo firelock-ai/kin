@@ -27,19 +27,22 @@ pub enum KinError {
     #[error("already initialized: {0}")]
     AlreadyInitialized(String),
 
+    #[error(
+        "repository was published at {path}, but durability or final verification is uncertain: \
+         {detail}. Do not reinitialize or delete it; reopen and verify the existing repository"
+    )]
+    RepositoryPublishedButUncertain { path: String, detail: String },
+
     #[error("not a kin repository: {0}")]
     NotARepository(String),
 
     #[error("model error: {0}")]
     Model(#[from] kin_model::ModelError),
 
-    #[error("blob error: {0}")]
-    Blob(#[from] kin_blobs::BlobError),
-
     #[error("graph error: {0}")]
     Graph(String),
 
-    #[error("incompatible .kin/ version: found v{found}, this binary supports up to v{supported}")]
+    #[error("incompatible .kin/ version: found v{found}, this binary requires v{supported}")]
     IncompatibleVersion { found: u32, supported: u32 },
 
     #[error("{0}")]

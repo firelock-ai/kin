@@ -8,9 +8,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const PREPARED_PUBLISH_SCHEMA: &str = "kin.prepared-state.publish.v1";
-const PREPARED_MATERIALIZE_SCHEMA: &str = "kin.prepared-state.materialize.v1";
-const PREPARED_MANIFEST_SCHEMA: &str = "kin.prepared-state.v1";
+const PREPARED_PUBLISH_SCHEMA: &str = "kin.prepared-state.publish.v2";
+const PREPARED_MATERIALIZE_SCHEMA: &str = "kin.prepared-state.materialize.v2";
+const PREPARED_MANIFEST_SCHEMA: &str = "kin.prepared-state.v2";
 const EMBEDDED_PREPARED_MANIFEST: &str = ".kin/bench/prepared-manifest.json";
 
 const VALIDATION_KEYS: &[&str] = &[
@@ -18,7 +18,7 @@ const VALIDATION_KEYS: &[&str] = &[
     "repo_identity",
     "git_head",
     "git_tree",
-    "init_pipeline_epoch",
+    "graph_build_pipeline_epoch",
     "parser_schema_epoch",
     "layout_schema_version",
     "graph_snapshot_version",
@@ -198,9 +198,18 @@ fn require_complete_prepared_embeddings(kin_dir: &Path) -> Result<()> {
     let snapshot = kin_db::SnapshotManager::open_read_only(&graph_path)
         .with_context(|| format!("open prepared graph {}", graph_path.display()))?;
     let graph = snapshot.graph();
-    graph
-        .load_vector_index(&vector_path)
-        .with_context(|| format!("load prepared vector index {}", vector_path.display()))?;
+    let loaded = kin_db::SnapshotManager::load_vector_index_into_graph_if_valid(
+        graph.as_ref(),
+        &graph_path,
+        None,
+    )
+    .with_context(|| format!("validate prepared vector index {}", vector_path.display()))?;
+    if !loaded {
+        bail!(
+            "prepared vector index {} is missing or incompatible with its graph/model metadata",
+            vector_path.display()
+        );
+    }
     let status = graph.embedding_status();
     if status.indexed != status.total || status.pending != 0 {
         bail!(

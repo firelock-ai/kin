@@ -83,7 +83,7 @@ pub fn make_change(
         message: message.to_string(),
         entity_deltas: entities.into_iter().map(EntityDelta::Added).collect(),
         relation_deltas: vec![],
-        artifact_deltas: vec![],
+        tree_deltas: vec![],
         projected_files: vec![],
         spec_link: None,
         evidence: vec![],

@@ -36,6 +36,9 @@ pub enum MigrateError {
     #[error("blob error: {0}")]
     Blob(String),
 
+    #[error("projection error: {0}")]
+    Projection(String),
+
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
 

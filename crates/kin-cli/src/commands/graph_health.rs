@@ -2,11 +2,10 @@
 // Copyright 2026 Firelock, LLC
 
 use anyhow::Result;
-use kin_model::{EntityStore, GraphStats};
+use kin_model::{EntityStore, GraphStats, TreeEntry};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
-
-use super::init::{collect_source_files, is_repo_owned_graph_path};
+use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GraphHealthReport {
@@ -15,7 +14,6 @@ pub struct GraphHealthReport {
     pub graph_empty_for_supported_inputs: bool,
     pub contaminated_entity_count: usize,
     pub contaminated_non_entity_count: usize,
-    pub contaminated_file_hash_count: usize,
     pub contaminated_path_count: usize,
     pub contaminated_paths_sample: Vec<String>,
     pub test_role_entity_count: usize,
@@ -37,17 +35,16 @@ struct SupportedInputCounts {
 struct ContaminationSummary {
     entity_count: usize,
     non_entity_count: usize,
-    file_hash_count: usize,
     path_count: usize,
     path_samples: Vec<String>,
 }
 
 pub(crate) fn inspect_graph(
-    layout: &kin_core::KinLayout,
+    _layout: &kin_core::KinLayout,
     graph: &kin_db::InMemoryGraph,
 ) -> Result<GraphHealthReport> {
     let stats = graph.graph_stats();
-    let supported_inputs = collect_supported_inputs(layout)?;
+    let supported_inputs = collect_supported_inputs(graph);
     let contamination = collect_contamination(graph)?;
     Ok(build_graph_health_report(
         &stats,
@@ -56,14 +53,18 @@ pub(crate) fn inspect_graph(
     ))
 }
 
-fn collect_supported_inputs(layout: &kin_core::KinLayout) -> Result<SupportedInputCounts> {
-    let source_root = kin_core::source_dir(layout);
-    let all_files = collect_source_files(&source_root)?;
+fn collect_supported_inputs(graph: &kin_db::InMemoryGraph) -> SupportedInputCounts {
     let mut entity_source = 0usize;
     let mut shallow_source = 0usize;
 
-    for file in all_files {
-        match kin_index::FileClassifier::classify(&file) {
+    for artifact in graph.resolved_tree().artifacts_by_path() {
+        if !matches!(artifact.entry, TreeEntry::Blob { .. }) {
+            continue;
+        }
+        let Some(path) = artifact.path.as_utf8() else {
+            continue;
+        };
+        match kin_index::FileClassifier::classify(Path::new(path)) {
             kin_index::FileClassification::EntitySource => entity_source += 1,
             kin_index::FileClassification::ShallowSyntax { language_hint } => {
                 if kin_parser::get_shallow_grammar(&language_hint).is_some() {
@@ -75,10 +76,10 @@ fn collect_supported_inputs(layout: &kin_core::KinLayout) -> Result<SupportedInp
         }
     }
 
-    Ok(SupportedInputCounts {
+    SupportedInputCounts {
         entity_source,
         shallow_source,
-    })
+    }
 }
 
 fn collect_contamination(graph: &kin_db::InMemoryGraph) -> Result<ContaminationSummary> {
@@ -88,7 +89,7 @@ fn collect_contamination(graph: &kin_db::InMemoryGraph) -> Result<ContaminationS
 
     for entity in graph.list_all_entities()? {
         if let Some(file_origin) = entity.file_origin {
-            if !is_repo_owned_graph_path(&file_origin.0) {
+            if !kin_index::should_index_repo_relative_path(Path::new(&file_origin.0)) {
                 contaminated_entity_count += 1;
                 path_set.insert(file_origin.0);
             }
@@ -96,39 +97,29 @@ fn collect_contamination(graph: &kin_db::InMemoryGraph) -> Result<ContaminationS
     }
 
     for shallow in graph.list_shallow_files()? {
-        if !is_repo_owned_graph_path(&shallow.file_id.0) {
+        if !kin_index::should_index_repo_relative_path(Path::new(&shallow.file_id.0)) {
             contaminated_non_entity_count += 1;
             path_set.insert(shallow.file_id.0);
         }
     }
 
     for artifact in graph.list_structured_artifacts()? {
-        if !is_repo_owned_graph_path(&artifact.file_id.0) {
+        if !kin_index::should_index_repo_relative_path(Path::new(&artifact.file_id.0)) {
             contaminated_non_entity_count += 1;
             path_set.insert(artifact.file_id.0);
         }
     }
 
     for artifact in graph.list_opaque_artifacts()? {
-        if !is_repo_owned_graph_path(&artifact.file_id.0) {
+        if !kin_index::should_index_repo_relative_path(Path::new(&artifact.file_id.0)) {
             contaminated_non_entity_count += 1;
             path_set.insert(artifact.file_id.0);
         }
     }
 
-    let contaminated_file_hash_paths: Vec<_> = graph
-        .indexed_file_paths()
-        .into_iter()
-        .filter(|path| !is_repo_owned_graph_path(path))
-        .collect();
-    for path in &contaminated_file_hash_paths {
-        path_set.insert(path.clone());
-    }
-
     Ok(ContaminationSummary {
         entity_count: contaminated_entity_count,
         non_entity_count: contaminated_non_entity_count,
-        file_hash_count: contaminated_file_hash_paths.len(),
         path_count: path_set.len(),
         path_samples: path_set.into_iter().take(8).collect(),
     })
@@ -217,7 +208,6 @@ fn build_graph_health_report(
         graph_empty_for_supported_inputs,
         contaminated_entity_count: contamination.entity_count,
         contaminated_non_entity_count: contamination.non_entity_count,
-        contaminated_file_hash_count: contamination.file_hash_count,
         contaminated_path_count: contamination.path_count,
         contaminated_paths_sample: contamination.path_samples.clone(),
         test_role_entity_count,
@@ -244,7 +234,7 @@ mod tests {
             structured_artifact_count: 0,
             opaque_artifact_count: 0,
             file_layout_count: 0,
-            file_hash_count: 0,
+            working_tree_entry_count: 0,
             text_indexed_entity_count: 0,
             text_index_coverage_percent: 0.0,
             indexed_embedding_count: 0,
@@ -270,7 +260,6 @@ mod tests {
         let contamination = ContaminationSummary {
             entity_count: 0,
             non_entity_count: 0,
-            file_hash_count: 0,
             path_count: 0,
             path_samples: Vec::new(),
         };
@@ -306,7 +295,6 @@ mod tests {
             &ContaminationSummary {
                 entity_count: 1,
                 non_entity_count: 2,
-                file_hash_count: 1,
                 path_count: 3,
                 path_samples: vec!["out/generated.rs".to_string()],
             },

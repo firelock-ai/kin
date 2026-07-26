@@ -40,7 +40,7 @@ pub fn apply_splices(original: &[u8], mut splices: Vec<Splice>) -> Result<Vec<u8
     }
 
     // Sort by start offset descending so we can splice from back to front.
-    splices.sort_by(|a, b| b.byte_range.start.cmp(&a.byte_range.start));
+    splices.sort_by_key(|splice| std::cmp::Reverse(splice.byte_range.start));
 
     // Check for overlapping splices. After sorting descending, splice[i] has
     // a higher start than splice[i+1]. Two splices overlap if the earlier one
