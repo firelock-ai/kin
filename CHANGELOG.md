@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.5] - 2026-07-26
+
+### Fixed
+
+- Locate's term-support gate no longer rejects bare method identifiers:
+  qualified names (`Type.method`) match through suffix passes, source support
+  is judged by the entity's own role rather than a directory-name allowlist,
+  and root-level `vendor/` trees are excluded like interior ones. Queries that
+  previously collapsed to generic prose terms keep their identifiers.
+- Opening a projection waits out a live exact-source projection holder under a
+  bounded deadline instead of failing on contention, and names the holder on
+  timeout.
+- Unserveable legacy registry index records are repaired at daemon startup, and
+  host assessment load is surfaced.
+
+### Added
+
+- Single locate queries carrying identifier-shaped tokens fan out automatically
+  into the broad and identifier-distilled variants, fused only when the primary
+  ranking is unsure: direct entity-ordered rankings always fuse, RRF-composed
+  rankings gate on top1/top2 separation
+  (`KIN_LOCATE_AUTO_FANOUT_CONFIDENCE_RATIO`, default 1.5).
+  `KIN_LOCATE_AUTO_QUERY_FANOUT=0` disables the automatic variant.
+- Explain output records per-identifier `query_identifier_gate` verdicts.
+
+### Changed
+
+- Automatically fused declarations stay within the primary query's declared
+  budget and, for adaptively sized declarations, within the confident prefix
+  (`KIN_LOCATE_FUSED_DECLARATION_CAP`, default 8). Explicit `--max-files`
+  widths are honored as-is.
+
 ## [0.3.4] - 2026-07-24
 
 ### Fixed
