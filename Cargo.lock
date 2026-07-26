@@ -3286,6 +3286,7 @@ dependencies = [
  "hex",
  "kin-blobs",
  "kin-db",
+ "kin-git",
  "kin-model",
  "kin-parser",
  "kin-projection",
@@ -3301,6 +3302,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tree-sitter",
+ "uuid",
 ]
 
 [[package]]
