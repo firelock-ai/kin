@@ -123,16 +123,14 @@ pub trait EntityStore: Send + Sync {
         &self,
     ) -> std::result::Result<Vec<crate::layout::OpaqueArtifact>, Self::Error>;
     fn delete_opaque_artifact(&self, file_id: &FilePathId) -> std::result::Result<(), Self::Error>;
-    /// Resolve a tracked file path to its graph-assigned `ArtifactId` via the
-    /// graph's artifact index, if the path is tracked. The default returns
-    /// `None` for stores that do not maintain an artifact index; the in-memory
-    /// graph overrides this with the real lookup so generic `GraphStore`
-    /// consumers obtain graph-assigned identity instead of re-deriving it from
-    /// the path (path derivation is deprecated — the graph owns artifact
-    /// identity).
-    fn artifact_id_for_path(&self, _path: &FilePathId) -> Option<crate::ArtifactId> {
-        None
-    }
+    /// Resolve a tracked path through the graph-owned artifact index.
+    fn artifact_id_for_path(&self, path: &FilePathId) -> Option<crate::ArtifactId>;
+    /// Return the graph-owned artifact identity for `path`, allocating and
+    /// persisting one when the path has not been assigned yet.
+    fn ensure_artifact_id(
+        &self,
+        path: &FilePathId,
+    ) -> std::result::Result<crate::ArtifactId, Self::Error>;
     fn upsert_file_layout(
         &self,
         layout: &crate::layout::FileLayout,
@@ -1219,6 +1217,15 @@ impl<G: EntityStore> EntityStore for &G {
     }
     fn delete_opaque_artifact(&self, file_id: &FilePathId) -> std::result::Result<(), Self::Error> {
         (**self).delete_opaque_artifact(file_id)
+    }
+    fn artifact_id_for_path(&self, path: &FilePathId) -> Option<crate::ArtifactId> {
+        (**self).artifact_id_for_path(path)
+    }
+    fn ensure_artifact_id(
+        &self,
+        path: &FilePathId,
+    ) -> std::result::Result<crate::ArtifactId, Self::Error> {
+        (**self).ensure_artifact_id(path)
     }
     fn upsert_file_layout(
         &self,

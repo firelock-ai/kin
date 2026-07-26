@@ -2,10 +2,8 @@
 // Copyright 2026 Firelock, LLC
 
 use schemars::JsonSchema;
-use serde::de::{MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fmt;
 
 use crate::ids::*;
 
@@ -60,7 +58,7 @@ pub enum EntityKind {
 
 /// Content-based fingerprint of an entity, used to detect what changed
 /// between revisions (structure, signature, and exact contents).
-#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SemanticFingerprint {
     pub algorithm: FingerprintAlgorithm,
     /// Hash of the normalized AST/source structure (insensitive to comments and whitespace).
@@ -72,125 +70,11 @@ pub struct SemanticFingerprint {
     /// Hash of the entity's behavior-equivalence class: the token stream with
     /// pure-no-op statements (e.g. docstrings) normalized away, so a
     /// behavior-preserving body edit leaves it unchanged while any real change
-    /// alters it. The zero hash (the serde default) means "not computed" and is
-    /// never treated as a match. Always serialized. The custom deserializer
-    /// accepts both the legacy five-field sequence and the current six-field
-    /// sequence because graph snapshots use a positional binary format.
+    /// alters it. The zero hash means "not computed" and is never treated as a
+    /// match. Always serialized and required.
     pub equivalence_hash: Hash256,
     /// Confidence in fingerprint stability (0.0 - 1.0).
     pub stability_score: f32,
-}
-
-/// Serde default for [`SemanticFingerprint::equivalence_hash`]: the zero hash,
-/// the sentinel for "equivalence class not computed".
-fn zero_equivalence_hash() -> Hash256 {
-    Hash256::from_bytes([0; 32])
-}
-
-#[derive(Deserialize)]
-struct CurrentSemanticFingerprint {
-    algorithm: FingerprintAlgorithm,
-    ast_hash: Hash256,
-    signature_hash: Hash256,
-    behavior_hash: Hash256,
-    #[serde(default = "zero_equivalence_hash")]
-    equivalence_hash: Hash256,
-    stability_score: f32,
-}
-
-impl<'de> Deserialize<'de> for SemanticFingerprint {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        struct SemanticFingerprintVisitor;
-
-        impl<'de> Visitor<'de> for SemanticFingerprintVisitor {
-            type Value = SemanticFingerprint;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str("a SemanticFingerprint map or five/six-field sequence")
-            }
-
-            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
-            where
-                A: SeqAccess<'de>,
-            {
-                let encoded_len = seq.size_hint().ok_or_else(|| {
-                    serde::de::Error::custom(
-                        "sequence length is required to distinguish legacy and current fingerprints",
-                    )
-                })?;
-                if !matches!(encoded_len, 5 | 6) {
-                    return Err(serde::de::Error::invalid_length(encoded_len, &self));
-                }
-
-                let algorithm = seq
-                    .next_element()?
-                    .ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
-                let ast_hash = seq
-                    .next_element()?
-                    .ok_or_else(|| serde::de::Error::invalid_length(1, &self))?;
-                let signature_hash = seq
-                    .next_element()?
-                    .ok_or_else(|| serde::de::Error::invalid_length(2, &self))?;
-                let behavior_hash = seq
-                    .next_element()?
-                    .ok_or_else(|| serde::de::Error::invalid_length(3, &self))?;
-
-                let (equivalence_hash, stability_score) = if encoded_len == 5 {
-                    let stability_score = seq
-                        .next_element()?
-                        .ok_or_else(|| serde::de::Error::invalid_length(4, &self))?;
-                    (zero_equivalence_hash(), stability_score)
-                } else {
-                    let equivalence_hash = seq
-                        .next_element()?
-                        .ok_or_else(|| serde::de::Error::invalid_length(4, &self))?;
-                    let stability_score = seq
-                        .next_element()?
-                        .ok_or_else(|| serde::de::Error::invalid_length(5, &self))?;
-                    (equivalence_hash, stability_score)
-                };
-
-                Ok(SemanticFingerprint {
-                    algorithm,
-                    ast_hash,
-                    signature_hash,
-                    behavior_hash,
-                    equivalence_hash,
-                    stability_score,
-                })
-            }
-
-            fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
-            where
-                A: MapAccess<'de>,
-            {
-                let current = CurrentSemanticFingerprint::deserialize(
-                    serde::de::value::MapAccessDeserializer::new(map),
-                )?;
-                Ok(SemanticFingerprint {
-                    algorithm: current.algorithm,
-                    ast_hash: current.ast_hash,
-                    signature_hash: current.signature_hash,
-                    behavior_hash: current.behavior_hash,
-                    equivalence_hash: current.equivalence_hash,
-                    stability_score: current.stability_score,
-                })
-            }
-        }
-
-        const FIELDS: &[&str] = &[
-            "algorithm",
-            "ast_hash",
-            "signature_hash",
-            "behavior_hash",
-            "equivalence_hash",
-            "stability_score",
-        ];
-        deserializer.deserialize_struct("SemanticFingerprint", FIELDS, SemanticFingerprintVisitor)
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
@@ -256,7 +140,7 @@ mod tests {
     use super::*;
 
     #[derive(Serialize)]
-    struct LegacySemanticFingerprintFixture {
+    struct FingerprintMissingEquivalenceFixture {
         algorithm: FingerprintAlgorithm,
         ast_hash: Hash256,
         signature_hash: Hash256,
@@ -290,8 +174,8 @@ mod tests {
     }
 
     #[test]
-    fn semantic_fingerprint_reads_legacy_msgpack_sequence() {
-        let fixture = LegacySemanticFingerprintFixture {
+    fn semantic_fingerprint_rejects_msgpack_without_equivalence_hash() {
+        let fixture = FingerprintMissingEquivalenceFixture {
             algorithm: FingerprintAlgorithm::V1TreeSitter,
             ast_hash: Hash256::from_bytes([0x11; 32]),
             signature_hash: Hash256::from_bytes([0x22; 32]),
@@ -299,25 +183,15 @@ mod tests {
             stability_score: 0.8,
         };
         let bytes = rmp_serde::to_vec(&fixture).unwrap();
-        let decoded: SemanticFingerprint = rmp_serde::from_slice(&bytes).unwrap();
-
-        assert_eq!(decoded.algorithm, fixture.algorithm);
-        assert_eq!(decoded.ast_hash, fixture.ast_hash);
-        assert_eq!(decoded.signature_hash, fixture.signature_hash);
-        assert_eq!(decoded.behavior_hash, fixture.behavior_hash);
-        assert_eq!(decoded.equivalence_hash, Hash256::from_bytes([0; 32]));
-        assert_eq!(decoded.stability_score, fixture.stability_score);
+        assert!(rmp_serde::from_slice::<SemanticFingerprint>(&bytes).is_err());
     }
 
     #[test]
-    fn semantic_fingerprint_reads_legacy_json_map() {
+    fn semantic_fingerprint_rejects_json_without_equivalence_hash() {
         let expected = fingerprint();
         let mut value = serde_json::to_value(&expected).unwrap();
         value.as_object_mut().unwrap().remove("equivalence_hash");
-        let decoded: SemanticFingerprint = serde_json::from_value(value).unwrap();
-
-        assert_eq!(decoded.equivalence_hash, Hash256::from_bytes([0; 32]));
-        assert_eq!(decoded.stability_score, expected.stability_score);
+        assert!(serde_json::from_value::<SemanticFingerprint>(value).is_err());
     }
 
     #[test]

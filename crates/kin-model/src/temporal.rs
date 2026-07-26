@@ -14,8 +14,8 @@ use crate::{
 
 /// Immutable entity state introduced by a semantic change.
 ///
-/// `EntityId` remains the stable anchor identity for migration compatibility.
-/// Each revision identifies one committed shape for that anchor.
+/// `EntityId` is the stable anchor identity; each revision identifies one
+/// committed shape for that anchor.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct EntityRevision {
     pub revision_id: EntityRevisionId,

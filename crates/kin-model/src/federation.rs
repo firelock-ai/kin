@@ -165,13 +165,8 @@ pub struct SessionLease {
     pub graph: GraphLocator,
     pub transport: SessionTransport,
     pub capabilities: SessionCapabilities,
-    #[serde(default = "default_fence_epoch")]
     pub fence_epoch: u64,
     pub expires_at: Timestamp,
-}
-
-fn default_fence_epoch() -> u64 {
-    1
 }
 
 /// Cross-graph relation categories.
@@ -416,7 +411,7 @@ mod tests {
     }
 
     #[test]
-    fn session_lease_defaults_fence_epoch_for_legacy_payloads() {
+    fn session_lease_requires_fence_epoch() {
         let lease_json = serde_json::json!({
             "session_id": SessionId::new(),
             "actor": {
@@ -433,8 +428,7 @@ mod tests {
             "expires_at": Timestamp::now(),
         });
 
-        let parsed: SessionLease = serde_json::from_value(lease_json).unwrap();
-        assert_eq!(parsed.fence_epoch, 1);
+        assert!(serde_json::from_value::<SessionLease>(lease_json).is_err());
     }
 
     #[test]

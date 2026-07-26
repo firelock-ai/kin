@@ -27,12 +27,9 @@ impl ArtifactId {
 
     /// Deterministic minting seed (UUIDv5 of the path) for artifact identity.
     ///
-    /// This is the low-level primitive the **graph assigner** and the **v7→v8
-    /// migration** use to mint / reproduce stable `ArtifactId`s. Ordinary code
-    /// must NOT mint or re-derive identity from a path — resolve the
-    /// graph-assigned id via `EntityStore::artifact_id_for_path` (the artifact
-    /// index) instead. Hidden from the public API surface; exposed only so the
-    /// assigner/migration in sibling crates can mint deterministically.
+    /// This is the low-level primitive used only by a graph's artifact-ID
+    /// allocator. Ordinary code must resolve or allocate identity through
+    /// `EntityStore`; it must not derive identity from a path itself.
     #[doc(hidden)]
     pub fn seed_from_path(path: &str) -> Self {
         Self(Uuid::new_v5(&ARTIFACT_NAMESPACE, path.as_bytes()))
@@ -42,17 +39,6 @@ impl ArtifactId {
     #[doc(hidden)]
     pub fn seed_from_file_id(file_id: &FilePathId) -> Self {
         Self::seed_from_path(&file_id.0)
-    }
-
-    /// DEPRECATED: Use graph-assigned IDs via the artifact index lookup.
-    #[deprecated(note = "use graph-assigned ArtifactId via artifact_index lookup")]
-    pub fn from_path(path: &str) -> Self {
-        Self::seed_from_path(path)
-    }
-
-    #[deprecated(note = "use graph-assigned ArtifactId via artifact_index lookup")]
-    pub fn from_file_id(file_id: &FilePathId) -> Self {
-        Self::seed_from_file_id(file_id)
     }
 }
 
