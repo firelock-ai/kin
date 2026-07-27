@@ -20,7 +20,7 @@ std::thread_local! {
         std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn set_after_recovery_before_open_hook(hook: impl FnOnce() + 'static) {
     AFTER_RECOVERY_BEFORE_OPEN_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
 }

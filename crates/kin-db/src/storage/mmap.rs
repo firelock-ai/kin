@@ -82,7 +82,7 @@ fn run_confirm_before_marker_claim_hook() {
 fn run_confirm_before_marker_claim_hook() {}
 
 #[cfg(test)]
-fn set_promotion_after_target_rename_hook(hook: impl FnOnce() + 'static) {
+pub(crate) fn set_promotion_after_target_rename_hook(hook: impl FnOnce() + 'static) {
     PROMOTION_AFTER_TARGET_RENAME_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
 }
 
@@ -109,18 +109,24 @@ struct RecoveryMarker {
 
 /// Result of the commit-point rename performed by an atomic write.
 ///
-/// `InstalledButNotSynced` is deliberately distinct from an ordinary error:
-/// the destination already contains the new bytes, but the parent directory
-/// has not yet confirmed that rename as durable. Authority callers must either
-/// confirm the directory sync or return without doing post-commit cleanup.
+/// `InstalledButUnconfirmed` is deliberately distinct from an ordinary error:
+/// the destination rename already crossed the commit point, but durability or
+/// exact post-install verification failed. Authority callers must report an
+/// indeterminate commit and return without doing post-commit cleanup.
 #[derive(Debug)]
 pub(crate) enum AtomicWriteOutcome {
     Durable,
-    InstalledButNotSynced(KinDbError),
+    InstalledButUnconfirmed(KinDbError),
 }
 
 const MAX_RECOVERY_MARKER_BYTES: u64 = 64 * 1024;
 const MAX_AUTHORITY_CONFIRMATION_BYTES: u64 = 1024 * 1024;
+const PORTABLE_FILESYSTEM_COMPONENT_BYTES: usize = 255;
+const HYPHENATED_UUID_BYTES: usize = 36;
+const LONGEST_EXACT_CLAIM_SUFFIX_BYTES: usize =
+    ".tmp.meta".len() + ".cas-claim-".len() + HYPHENATED_UUID_BYTES;
+pub(crate) const MAX_ATOMIC_DESTINATION_LEAF_BYTES: usize =
+    PORTABLE_FILESYSTEM_COMPONENT_BYTES - LONGEST_EXACT_CLAIM_SUFFIX_BYTES;
 
 /// Append a suffix to `path` without disturbing its existing extension.
 ///
@@ -202,6 +208,35 @@ pub(crate) fn sync_parent_dir(path: &Path) -> Result<(), KinDbError> {
     }
 }
 
+/// Reopen a directory beneath an already-pinned capability as a descriptor
+/// that carries a real access mode.
+///
+/// `Dir::open_dir` asks for a directory without readdir access, so cap-std adds
+/// `O_PATH` on the targets that have it. An `O_PATH` descriptor names a
+/// filesystem object without opening it, so it is accepted as an `openat`
+/// base but rejects every operation that needs an access mode. Both `fsync`
+/// and `flock` fail on one with `EBADF`, so durability confirmation and
+/// repository locking reopen through plain read access instead. The reopen
+/// stays relative to the pinned descriptor, so it does not reintroduce the
+/// ancestor-swap race a path-based reopen would.
+pub(crate) fn open_directory_handle_at(
+    directory: &cap_std::fs::Dir,
+    relative: &Path,
+    display_path: &Path,
+) -> Result<File, KinDbError> {
+    use cap_fs_ext::OpenOptionsMaybeDirExt;
+
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.read(true).maybe_dir(true);
+    let opened = directory.open_with(relative, &options).map_err(|error| {
+        KinDbError::StorageError(format!(
+            "failed to open retained directory {}: {error}",
+            display_path.display()
+        ))
+    })?;
+    Ok(opened.into_std())
+}
+
 /// Fsync an already-pinned directory handle. Capability-style storage paths
 /// use this instead of reopening a path after validation, which would
 /// reintroduce an ancestor-swap race.
@@ -226,10 +261,36 @@ pub(crate) fn sync_directory_handle(dir: &File, display_path: &Path) -> Result<(
             display_path.display()
         )));
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        let _ = (dir, display_path);
-        Ok(())
+        use std::os::windows::io::{AsRawHandle, FromRawHandle};
+        use windows_sys::Win32::Foundation::{GENERIC_WRITE, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::Storage::FileSystem::{
+            ReOpenFile, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+
+        let reopened = unsafe {
+            ReOpenFile(
+                dir.as_raw_handle(),
+                GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                FILE_FLAG_BACKUP_SEMANTICS,
+            )
+        };
+        if reopened == INVALID_HANDLE_VALUE {
+            return Err(KinDbError::StorageError(format!(
+                "failed to reopen retained parent directory {} for durable metadata flush: {}",
+                display_path.display(),
+                std::io::Error::last_os_error()
+            )));
+        }
+        let writable = unsafe { File::from_raw_handle(reopened) };
+        writable.sync_all().map_err(|error| {
+            KinDbError::StorageError(format!(
+                "failed to durably flush parent directory {}: {error}",
+                display_path.display()
+            ))
+        })
     }
     #[cfg(unix)]
     {
@@ -239,6 +300,14 @@ pub(crate) fn sync_directory_handle(dir: &File, display_path: &Path) -> Result<(
                 display_path.display()
             ))
         })
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = dir;
+        Err(KinDbError::StorageError(format!(
+            "durable parent-directory synchronization is unavailable for {} on this platform",
+            display_path.display()
+        )))
     }
 }
 
@@ -846,7 +915,7 @@ pub(crate) fn promote_recovery_candidate_with_magic(
 ) -> Result<(), KinDbError> {
     match promote_recovery_candidate_with_magic_outcome(path, expected_magic)? {
         AtomicWriteOutcome::Durable => Ok(()),
-        AtomicWriteOutcome::InstalledButNotSynced(error) => Err(error),
+        AtomicWriteOutcome::InstalledButUnconfirmed(error) => Err(error),
     }
 }
 
@@ -928,22 +997,31 @@ fn promote_recovery_candidate_with_magic_outcome(
         )));
     }
     run_promotion_after_target_rename_hook();
-    ensure_regular_path_entry(path, "promoted destination")?;
+    if let Err(error) = ensure_regular_path_entry(path, "promoted destination") {
+        return Ok(AtomicWriteOutcome::InstalledButUnconfirmed(error));
+    }
     if let Err(error) = sync_parent_dir(path) {
-        return Ok(AtomicWriteOutcome::InstalledButNotSynced(error));
+        return Ok(AtomicWriteOutcome::InstalledButUnconfirmed(error));
     }
 
-    let installed = read_regular_bounded(path, "promoted destination", marker.byte_len)?;
+    let installed = match read_regular_bounded(path, "promoted destination", marker.byte_len) {
+        Ok(installed) => installed,
+        Err(error) => return Ok(AtomicWriteOutcome::InstalledButUnconfirmed(error)),
+    };
     if installed.len() as u64 != marker.byte_len
         || <[u8; 32]>::from(Sha256::digest(&installed)) != marker.sha256
     {
-        return Err(KinDbError::StorageError(format!(
-            "promoted destination {} does not match the claimed recovery candidate",
-            path.display()
-        )));
+        return Ok(AtomicWriteOutcome::InstalledButUnconfirmed(
+            KinDbError::StorageError(format!(
+                "promoted destination {} does not match the claimed recovery candidate",
+                path.display()
+            )),
+        ));
     }
     if let Some(expected) = expected_magic {
-        verify_destination_magic(path, expected)?;
+        if let Err(error) = verify_destination_magic(path, expected) {
+            return Ok(AtomicWriteOutcome::InstalledButUnconfirmed(error));
+        }
     }
 
     match claim_exact_path(
@@ -1077,7 +1155,7 @@ pub fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<(), KinDbError> {
 pub(crate) fn atomic_write_bytes_no_magic(path: &Path, bytes: &[u8]) -> Result<(), KinDbError> {
     match atomic_write_bytes_no_magic_outcome(path, bytes)? {
         AtomicWriteOutcome::Durable => Ok(()),
-        AtomicWriteOutcome::InstalledButNotSynced(error) => Err(error),
+        AtomicWriteOutcome::InstalledButUnconfirmed(error) => Err(error),
     }
 }
 
@@ -1087,6 +1165,755 @@ pub(crate) fn atomic_write_bytes_no_magic_outcome(
 ) -> Result<AtomicWriteOutcome, KinDbError> {
     write_recovery_candidate_bytes(path, bytes)?;
     promote_recovery_candidate_with_magic_outcome(path, None)
+}
+
+fn capability_display_path(display_root: &Path, relative: &Path) -> PathBuf {
+    display_root.join(relative)
+}
+
+#[cfg(unix)]
+fn capability_atomic_leaf_units(name: &std::ffi::OsStr) -> usize {
+    use std::os::unix::ffi::OsStrExt;
+
+    name.as_bytes().len()
+}
+
+#[cfg(windows)]
+fn capability_atomic_leaf_units(name: &std::ffi::OsStr) -> usize {
+    use std::os::windows::ffi::OsStrExt;
+
+    name.encode_wide().count()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn capability_atomic_leaf_units(name: &std::ffi::OsStr) -> usize {
+    name.to_string_lossy().len()
+}
+
+fn validate_capability_atomic_destination(relative: &Path) -> Result<(), KinDbError> {
+    let mut components = relative.components();
+    let Some(std::path::Component::Normal(name)) = components.next() else {
+        return Err(KinDbError::StorageError(format!(
+            "capability-relative atomic destination must be one exact leaf: {}",
+            relative.display()
+        )));
+    };
+    if components.next().is_some() {
+        return Err(KinDbError::StorageError(format!(
+            "capability-relative atomic destination must be one exact leaf: {}",
+            relative.display()
+        )));
+    }
+    let units = capability_atomic_leaf_units(name);
+    if units > MAX_ATOMIC_DESTINATION_LEAF_BYTES {
+        return Err(KinDbError::StorageError(format!(
+            "capability-relative atomic destination {} uses {units} filename units, above the {}-unit portable recovery-staging limit",
+            relative.display(),
+            MAX_ATOMIC_DESTINATION_LEAF_BYTES
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn capability_metadata_is_reparse(metadata: &cap_std::fs::Metadata) -> bool {
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+    cap_fs_ext::OsMetadataExt::file_attributes(metadata) & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+fn capability_ensure_regular_path_entry(
+    directory: &cap_std::fs::Dir,
+    relative: &Path,
+    display_root: &Path,
+    role: &str,
+) -> Result<(), KinDbError> {
+    let display = capability_display_path(display_root, relative);
+    let metadata = directory.symlink_metadata(relative).map_err(|error| {
+        KinDbError::StorageError(format!(
+            "failed to inspect {role} {}: {error}",
+            display.display()
+        ))
+    })?;
+    #[cfg(windows)]
+    if capability_metadata_is_reparse(&metadata) {
+        return Err(KinDbError::StorageError(format!(
+            "refusing reparse-point {role} {}",
+            display.display()
+        )));
+    }
+    if !metadata.file_type().is_file() {
+        return Err(KinDbError::StorageError(format!(
+            "refusing non-regular {role} {}",
+            display.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Open one regular file relative to a retained directory capability without
+/// following the final path component.
+pub(crate) fn open_regular_nofollow_at(
+    directory: &cap_std::fs::Dir,
+    relative: &Path,
+    display_root: &Path,
+    role: &str,
+) -> Result<File, KinDbError> {
+    use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt, OpenOptionsMaybeDirExt};
+
+    let display = capability_display_path(display_root, relative);
+    let mut options = cap_std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .follow(FollowSymlinks::No)
+        .maybe_dir(false);
+    #[cfg(unix)]
+    {
+        use cap_std::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC);
+    }
+    #[cfg(windows)]
+    {
+        use cap_std::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = directory.open_with(relative, &options).map_err(|error| {
+        KinDbError::StorageError(format!(
+            "failed to open {role} {} through retained repository capability: {error}",
+            display.display()
+        ))
+    })?;
+    let metadata = file.metadata().map_err(|error| {
+        KinDbError::StorageError(format!(
+            "failed to inspect opened {role} {}: {error}",
+            display.display()
+        ))
+    })?;
+    #[cfg(windows)]
+    if capability_metadata_is_reparse(&metadata) {
+        return Err(KinDbError::StorageError(format!(
+            "refusing reparse-point {role} {}",
+            display.display()
+        )));
+    }
+    if !metadata.is_file() {
+        return Err(KinDbError::StorageError(format!(
+            "refusing non-regular {role} {}",
+            display.display()
+        )));
+    }
+    Ok(file.into_std())
+}
+
+/// Capability-relative counterpart of [`read_regular_bounded`].
+pub(crate) fn read_regular_bounded_at(
+    directory: &cap_std::fs::Dir,
+    relative: &Path,
+    display_root: &Path,
+    role: &str,
+    max_bytes: u64,
+) -> Result<Vec<u8>, KinDbError> {
+    let display = capability_display_path(display_root, relative);
+    let mut file = open_regular_nofollow_at(directory, relative, display_root, role)?;
+    let len = file
+        .metadata()
+        .map_err(|error| {
+            KinDbError::StorageError(format!(
+                "failed to inspect {role} {}: {error}",
+                display.display()
+            ))
+        })?
+        .len();
+    if len > max_bytes {
+        return Err(KinDbError::StorageError(format!(
+            "{role} {} is {len} bytes, above the {max_bytes}-byte safety limit",
+            display.display()
+        )));
+    }
+    run_read_regular_after_metadata_hook();
+    let capacity = usize::try_from(len).map_err(|_| {
+        KinDbError::StorageError(format!(
+            "{role} {} length does not fit in memory",
+            display.display()
+        ))
+    })?;
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(capacity).map_err(|error| {
+        KinDbError::StorageError(format!(
+            "failed to reserve {len} bytes for {role} {}: {error}",
+            display.display()
+        ))
+    })?;
+    bytes.resize(capacity, 0);
+    file.read_exact(&mut bytes).map_err(|error| {
+        KinDbError::StorageError(format!(
+            "{role} {} changed length while reading {len} bytes: {error}",
+            display.display()
+        ))
+    })?;
+    let mut trailing = [0u8; 1];
+    let trailing_len = file.read(&mut trailing).map_err(|error| {
+        KinDbError::StorageError(format!(
+            "failed to verify the final length of {role} {}: {error}",
+            display.display()
+        ))
+    })?;
+    let final_len = file
+        .metadata()
+        .map_err(|error| {
+            KinDbError::StorageError(format!(
+                "failed to reinspect {role} {} after reading: {error}",
+                display.display()
+            ))
+        })?
+        .len();
+    if trailing_len != 0 || final_len != len {
+        return Err(KinDbError::StorageError(format!(
+            "{role} {} changed length while reading: expected {len} bytes, found at least {final_len}; the {max_bytes}-byte allocation safety limit remains enforced",
+            display.display()
+        )));
+    }
+    Ok(bytes)
+}
+
+/// Capability-relative counterpart of [`read_regular_file`].
+pub(crate) fn read_regular_file_at(
+    directory: &cap_std::fs::Dir,
+    relative: &Path,
+    display_root: &Path,
+    role: &str,
+) -> Result<Vec<u8>, KinDbError> {
+    let display = capability_display_path(display_root, relative);
+    let mut file = open_regular_nofollow_at(directory, relative, display_root, role)?;
+    let len = file
+        .metadata()
+        .map_err(|error| {
+            KinDbError::StorageError(format!(
+                "failed to inspect {role} {}: {error}",
+                display.display()
+            ))
+        })?
+        .len();
+    let capacity = usize::try_from(len).map_err(|_| {
+        KinDbError::StorageError(format!(
+            "{role} {} length does not fit in memory",
+            display.display()
+        ))
+    })?;
+    let mut bytes = Vec::with_capacity(capacity);
+    file.read_to_end(&mut bytes).map_err(|error| {
+        KinDbError::StorageError(format!(
+            "failed to read {role} {}: {error}",
+            display.display()
+        ))
+    })?;
+    Ok(bytes)
+}
+
+/// Sync the parent directory selected beneath a retained repository
+/// capability, never by reopening its ambient path.
+pub(crate) fn sync_parent_dir_at(
+    directory: &cap_std::fs::Dir,
+    relative: &Path,
+    display_root: &Path,
+) -> Result<(), KinDbError> {
+    let Some(parent) = normalized_parent(relative) else {
+        return Ok(());
+    };
+    let display = capability_display_path(display_root, parent);
+    let parent_directory = open_directory_handle_at(directory, parent, &display)?;
+    sync_directory_handle(&parent_directory, &display)
+}
+
+fn capability_write_new_bytes_and_fsync(
+    directory: &cap_std::fs::Dir,
+    relative: &Path,
+    display_root: &Path,
+    bytes: &[u8],
+) -> Result<(), KinDbError> {
+    use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt, OpenOptionsMaybeDirExt};
+
+    let display = capability_display_path(display_root, relative);
+    let mut options = cap_std::fs::OpenOptions::new();
+    options
+        .write(true)
+        .create_new(true)
+        .follow(FollowSymlinks::No)
+        .maybe_dir(false);
+    let mut file = directory.open_with(relative, &options).map_err(|error| {
+        KinDbError::StorageError(format!(
+            "failed to create unique staged file {}: {error}",
+            display.display()
+        ))
+    })?;
+    file.write_all(bytes).map_err(|error| {
+        KinDbError::StorageError(format!("failed to write {}: {error}", display.display()))
+    })?;
+    file.sync_all().map_err(|error| {
+        KinDbError::StorageError(format!("failed to fsync {}: {error}", display.display()))
+    })
+}
+
+struct CapabilityExactPathClaim<'a> {
+    directory: &'a cap_std::fs::Dir,
+    display_root: &'a Path,
+    original: PathBuf,
+    held: Option<PathBuf>,
+}
+
+impl CapabilityExactPathClaim<'_> {
+    fn held_path(&self) -> Option<&Path> {
+        self.held.as_deref()
+    }
+
+    fn restore(self) -> Result<(), KinDbError> {
+        let Some(held) = self.held else {
+            return Ok(());
+        };
+        match self
+            .directory
+            .hard_link(&held, self.directory, &self.original)
+        {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(KinDbError::StorageError(format!(
+                    "failed to restore claimed path {} from {}: {error}",
+                    capability_display_path(self.display_root, &self.original).display(),
+                    capability_display_path(self.display_root, &held).display()
+                )))
+            }
+        }
+        match self.directory.remove_file(&held) {
+            Ok(()) => sync_parent_dir_at(self.directory, &self.original, self.display_root),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                sync_parent_dir_at(self.directory, &self.original, self.display_root)
+            }
+            Err(error) => Err(KinDbError::StorageError(format!(
+                "failed to release claimed path {}: {error}",
+                capability_display_path(self.display_root, &held).display()
+            ))),
+        }
+    }
+
+    fn release(self) -> Result<(), KinDbError> {
+        let Some(held) = self.held else {
+            return Ok(());
+        };
+        match self.directory.remove_file(&held) {
+            Ok(()) => sync_parent_dir_at(self.directory, &self.original, self.display_root),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                sync_parent_dir_at(self.directory, &self.original, self.display_root)
+            }
+            Err(error) => Err(KinDbError::StorageError(format!(
+                "failed to release claimed path {}: {error}",
+                capability_display_path(self.display_root, &held).display()
+            ))),
+        }
+    }
+}
+
+fn capability_claim_exact_path<'a>(
+    directory: &'a cap_std::fs::Dir,
+    relative: &Path,
+    display_root: &'a Path,
+    expected: Option<&[u8]>,
+    role: &str,
+) -> Result<CapabilityExactPathClaim<'a>, KinDbError> {
+    let display = capability_display_path(display_root, relative);
+    let exists = match directory.symlink_metadata(relative) {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => {
+            return Err(KinDbError::StorageError(format!(
+                "failed to inspect {role} {} before CAS claim: {error}",
+                display.display()
+            )))
+        }
+    };
+    if !exists {
+        if expected.is_some() {
+            return Err(KinDbError::StorageError(format!(
+                "{role} {} disappeared before CAS claim",
+                display.display()
+            )));
+        }
+        return Ok(CapabilityExactPathClaim {
+            directory,
+            display_root,
+            original: relative.to_path_buf(),
+            held: None,
+        });
+    }
+
+    capability_ensure_regular_path_entry(directory, relative, display_root, role)?;
+    let held = unique_staging_path(relative, "cas-claim");
+    directory
+        .rename(relative, directory, &held)
+        .map_err(|error| {
+            KinDbError::StorageError(format!(
+                "failed to claim {role} {}: {error}",
+                display.display()
+            ))
+        })?;
+    let claim = CapabilityExactPathClaim {
+        directory,
+        display_root,
+        original: relative.to_path_buf(),
+        held: Some(held.clone()),
+    };
+    if let Err(error) = sync_parent_dir_at(directory, relative, display_root) {
+        let _ = claim.restore();
+        return Err(error);
+    }
+    let actual = match read_regular_file_at(directory, &held, display_root, role) {
+        Ok(actual) => actual,
+        Err(error) => {
+            let _ = claim.restore();
+            return Err(error);
+        }
+    };
+    if expected != Some(actual.as_slice()) {
+        claim.restore()?;
+        return Err(KinDbError::StorageError(format!(
+            "{role} {} changed before its CAS claim",
+            display.display()
+        )));
+    }
+    Ok(claim)
+}
+
+fn capability_load_recovery_marker_with_bytes(
+    directory: &cap_std::fs::Dir,
+    relative: &Path,
+    display_root: &Path,
+) -> Result<(RecoveryMarker, Vec<u8>), KinDbError> {
+    let marker_path = recovery_marker_path(relative);
+    let marker_display = capability_display_path(display_root, &marker_path);
+    let marker_bytes = read_regular_bounded_at(
+        directory,
+        &marker_path,
+        display_root,
+        "recovery marker",
+        MAX_RECOVERY_MARKER_BYTES,
+    )?;
+    let marker = serde_json::from_slice(&marker_bytes).map_err(|error| {
+        KinDbError::StorageError(format!(
+            "failed to parse recovery marker {}: {error}",
+            marker_display.display()
+        ))
+    })?;
+    Ok((marker, marker_bytes))
+}
+
+/// Capability-relative counterpart of [`confirm_installed_write`].
+pub(crate) fn confirm_installed_write_at(
+    directory: &cap_std::fs::Dir,
+    relative: &Path,
+    display_root: &Path,
+) -> Result<bool, KinDbError> {
+    let display = capability_display_path(display_root, relative);
+    let marker_path = recovery_marker_path(relative);
+    let marker_display = capability_display_path(display_root, &marker_path);
+    match directory.symlink_metadata(&marker_path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(KinDbError::StorageError(format!(
+                "failed to inspect recovery marker {}: {error}",
+                marker_display.display()
+            )))
+        }
+    }
+
+    let tmp_path = recovery_tmp_path(relative);
+    match directory.symlink_metadata(&tmp_path) {
+        Ok(_) => {
+            return Err(KinDbError::StorageError(format!(
+                "recovery candidate {} is still staged; refusing to confirm {} as installed",
+                capability_display_path(display_root, &tmp_path).display(),
+                display.display()
+            )))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(KinDbError::StorageError(error.to_string())),
+    }
+
+    let (marker, marker_bytes) =
+        capability_load_recovery_marker_with_bytes(directory, relative, display_root)?;
+    if marker.version != RECOVERY_MARKER_VERSION {
+        return Err(KinDbError::StorageError(format!(
+            "recovery marker {} uses unsupported version {}",
+            marker_display.display(),
+            marker.version
+        )));
+    }
+    if marker.byte_len > MAX_AUTHORITY_CONFIRMATION_BYTES {
+        return Err(KinDbError::StorageError(format!(
+            "installed atomic authority {} claims {} bytes, above the {}-byte confirmation limit",
+            display.display(),
+            marker.byte_len,
+            MAX_AUTHORITY_CONFIRMATION_BYTES
+        )));
+    }
+    let installed = read_regular_bounded_at(
+        directory,
+        relative,
+        display_root,
+        "installed atomic authority",
+        marker.byte_len,
+    )?;
+    if installed.len() as u64 != marker.byte_len
+        || <[u8; 32]>::from(Sha256::digest(&installed)) != marker.sha256
+    {
+        return Err(KinDbError::StorageError(format!(
+            "installed atomic destination {} does not match retained marker {}",
+            display.display(),
+            marker_display.display()
+        )));
+    }
+    sync_parent_dir_at(directory, relative, display_root)?;
+    run_confirm_before_marker_claim_hook();
+    match capability_claim_exact_path(
+        directory,
+        &marker_path,
+        display_root,
+        Some(&marker_bytes),
+        "installed-write recovery marker cleanup",
+    ) {
+        Ok(marker_claim) => {
+            if let Err(error) = marker_claim.release() {
+                tracing::warn!(path = %marker_display.display(), error = %error, "installed atomic destination is durable; deferred exact recovery-marker cleanup");
+            }
+        }
+        Err(error) => {
+            tracing::warn!(path = %marker_display.display(), error = %error, "installed atomic destination is durable; preserved a racing recovery marker");
+        }
+    }
+    Ok(true)
+}
+
+fn capability_write_recovery_candidate_bytes(
+    directory: &cap_std::fs::Dir,
+    relative: &Path,
+    display_root: &Path,
+    bytes: &[u8],
+) -> Result<(), KinDbError> {
+    let tmp_path = recovery_tmp_path(relative);
+    let marker_path = recovery_marker_path(relative);
+    let unique_tmp_path = unique_staging_path(relative, "candidate");
+    let unique_marker_path = unique_staging_path(relative, "candidate-marker");
+    let marker = RecoveryMarker {
+        version: RECOVERY_MARKER_VERSION,
+        byte_len: bytes.len() as u64,
+        sha256: Sha256::digest(bytes).into(),
+    };
+    let marker_bytes = serde_json::to_vec(&marker).map_err(|error| {
+        KinDbError::StorageError(format!(
+            "failed to serialize recovery marker {}: {error}",
+            capability_display_path(display_root, &marker_path).display()
+        ))
+    })?;
+
+    let result = (|| {
+        capability_write_new_bytes_and_fsync(directory, &unique_tmp_path, display_root, bytes)?;
+        capability_write_new_bytes_and_fsync(
+            directory,
+            &unique_marker_path,
+            display_root,
+            &marker_bytes,
+        )?;
+        directory
+            .rename(&unique_tmp_path, directory, &tmp_path)
+            .map_err(|error| {
+                KinDbError::StorageError(format!(
+                    "failed to install recovery candidate {}: {error}",
+                    capability_display_path(display_root, &tmp_path).display()
+                ))
+            })?;
+        capability_ensure_regular_path_entry(
+            directory,
+            &tmp_path,
+            display_root,
+            "recovery candidate",
+        )?;
+        directory
+            .rename(&unique_marker_path, directory, &marker_path)
+            .map_err(|error| {
+                KinDbError::StorageError(format!(
+                    "failed to install recovery marker {}: {error}",
+                    capability_display_path(display_root, &marker_path).display()
+                ))
+            })?;
+        capability_ensure_regular_path_entry(
+            directory,
+            &marker_path,
+            display_root,
+            "recovery marker",
+        )?;
+        sync_parent_dir_at(directory, relative, display_root)
+    })();
+    if result.is_err() {
+        let _ = directory.remove_file(&unique_tmp_path);
+        let _ = directory.remove_file(&unique_marker_path);
+    }
+    result
+}
+
+fn capability_promote_recovery_candidate_outcome(
+    directory: &cap_std::fs::Dir,
+    relative: &Path,
+    display_root: &Path,
+) -> Result<AtomicWriteOutcome, KinDbError> {
+    let display = capability_display_path(display_root, relative);
+    let tmp_path = recovery_tmp_path(relative);
+    let marker_path = recovery_marker_path(relative);
+    let marker_display = capability_display_path(display_root, &marker_path);
+    let (marker, marker_bytes) =
+        capability_load_recovery_marker_with_bytes(directory, relative, display_root)?;
+    if marker.version != RECOVERY_MARKER_VERSION {
+        return Err(KinDbError::StorageError(format!(
+            "recovery marker {} uses unsupported version {}",
+            marker_display.display(),
+            marker.version
+        )));
+    }
+    let candidate = read_regular_bounded_at(
+        directory,
+        &tmp_path,
+        display_root,
+        "recovery candidate",
+        marker.byte_len,
+    )?;
+    if candidate.len() as u64 != marker.byte_len
+        || <[u8; 32]>::from(Sha256::digest(&candidate)) != marker.sha256
+    {
+        return Err(KinDbError::StorageError(format!(
+            "recovery candidate {} no longer matches marker {}",
+            capability_display_path(display_root, &tmp_path).display(),
+            marker_display.display()
+        )));
+    }
+    run_promotion_after_validation_hook();
+
+    let candidate_claim = capability_claim_exact_path(
+        directory,
+        &tmp_path,
+        display_root,
+        Some(&candidate),
+        "recovery candidate selected for promotion",
+    )?;
+    let claimed_candidate_path = candidate_claim
+        .held_path()
+        .expect("an existing recovery candidate must have a claimed path")
+        .to_path_buf();
+    let current_marker_bytes = match read_regular_bounded_at(
+        directory,
+        &marker_path,
+        display_root,
+        "recovery marker selected for promotion",
+        MAX_RECOVERY_MARKER_BYTES,
+    ) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            let _ = candidate_claim.restore();
+            return Err(error);
+        }
+    };
+    if current_marker_bytes != marker_bytes {
+        let _ = candidate_claim.restore();
+        return Err(KinDbError::StorageError(format!(
+            "recovery marker {} changed before candidate promotion",
+            marker_display.display()
+        )));
+    }
+
+    if let Err(error) = directory.rename(&claimed_candidate_path, directory, relative) {
+        let _ = candidate_claim.restore();
+        return Err(KinDbError::StorageError(format!(
+            "failed to rename {} to {}: {error}",
+            capability_display_path(display_root, &claimed_candidate_path).display(),
+            display.display()
+        )));
+    }
+    run_promotion_after_target_rename_hook();
+    if let Err(error) = capability_ensure_regular_path_entry(
+        directory,
+        relative,
+        display_root,
+        "promoted destination",
+    ) {
+        return Ok(AtomicWriteOutcome::InstalledButUnconfirmed(error));
+    }
+    if let Err(error) = sync_parent_dir_at(directory, relative, display_root) {
+        return Ok(AtomicWriteOutcome::InstalledButUnconfirmed(error));
+    }
+
+    let installed = match read_regular_bounded_at(
+        directory,
+        relative,
+        display_root,
+        "promoted destination",
+        marker.byte_len,
+    ) {
+        Ok(installed) => installed,
+        Err(error) => return Ok(AtomicWriteOutcome::InstalledButUnconfirmed(error)),
+    };
+    if installed.len() as u64 != marker.byte_len
+        || <[u8; 32]>::from(Sha256::digest(&installed)) != marker.sha256
+    {
+        return Ok(AtomicWriteOutcome::InstalledButUnconfirmed(
+            KinDbError::StorageError(format!(
+                "promoted destination {} does not match the claimed recovery candidate",
+                display.display()
+            )),
+        ));
+    }
+
+    match capability_claim_exact_path(
+        directory,
+        &marker_path,
+        display_root,
+        Some(&marker_bytes),
+        "durable recovery marker cleanup",
+    ) {
+        Ok(marker_claim) => {
+            if let Err(error) = marker_claim.release() {
+                tracing::warn!(path = %marker_display.display(), error = %error, "atomic destination is durable; deferred exact recovery-marker cleanup");
+            }
+        }
+        Err(error) => {
+            tracing::warn!(path = %marker_display.display(), error = %error, "atomic destination is durable; preserved a racing recovery marker");
+        }
+    }
+    Ok(AtomicWriteOutcome::Durable)
+}
+
+/// Atomically install bytes below a retained repository directory
+/// capability. All staging, claim, rename, cleanup, and fsync operations stay
+/// relative to that capability.
+pub(crate) fn atomic_write_bytes_no_magic_outcome_at(
+    directory: &cap_std::fs::Dir,
+    relative: &Path,
+    display_root: &Path,
+    bytes: &[u8],
+) -> Result<AtomicWriteOutcome, KinDbError> {
+    validate_capability_atomic_destination(relative)?;
+    capability_write_recovery_candidate_bytes(directory, relative, display_root, bytes)?;
+    capability_promote_recovery_candidate_outcome(directory, relative, display_root)
+}
+
+pub(crate) fn atomic_write_bytes_no_magic_at(
+    directory: &cap_std::fs::Dir,
+    relative: &Path,
+    display_root: &Path,
+    bytes: &[u8],
+) -> Result<(), KinDbError> {
+    match atomic_write_bytes_no_magic_outcome_at(directory, relative, display_root, bytes)? {
+        AtomicWriteOutcome::Durable => Ok(()),
+        AtomicWriteOutcome::InstalledButUnconfirmed(error) => Err(error),
+    }
 }
 
 #[cfg(test)]
@@ -1380,6 +2207,79 @@ mod tests {
             std::fs::read(&path).unwrap(),
             b"new",
             "the error is post-rename and must not be misreported as a pre-commit failure"
+        );
+    }
+
+    #[test]
+    fn capability_promotion_classifies_post_rename_digest_failure_as_unconfirmed() {
+        let directory = tempfile::tempdir().unwrap();
+        let capability =
+            cap_std::fs::Dir::open_ambient_dir(directory.path(), cap_std::ambient_authority())
+                .unwrap();
+        let relative = Path::new("authority.json");
+        let installed = b"new exact authority";
+        let target = directory.path().join(relative);
+        let replacement = vec![b'x'; installed.len()];
+        set_promotion_after_target_rename_hook(move || {
+            std::fs::write(&target, replacement).unwrap();
+        });
+
+        let outcome = atomic_write_bytes_no_magic_outcome_at(
+            &capability,
+            relative,
+            directory.path(),
+            installed,
+        )
+        .expect("the target rename crossed the commit point");
+        let AtomicWriteOutcome::InstalledButUnconfirmed(error) = outcome else {
+            panic!("a post-rename digest mismatch must never be reported durable");
+        };
+        assert!(
+            error.to_string().contains("does not match"),
+            "unexpected post-rename digest error: {error}"
+        );
+        assert!(
+            directory
+                .path()
+                .join(recovery_marker_path(relative))
+                .exists(),
+            "the marker must remain for later exact recovery"
+        );
+    }
+
+    #[test]
+    fn capability_promotion_classifies_post_rename_metadata_failure_as_unconfirmed() {
+        let directory = tempfile::tempdir().unwrap();
+        let capability =
+            cap_std::fs::Dir::open_ambient_dir(directory.path(), cap_std::ambient_authority())
+                .unwrap();
+        let relative = Path::new("authority.json");
+        let target = directory.path().join(relative);
+        set_promotion_after_target_rename_hook(move || {
+            std::fs::remove_file(&target).unwrap();
+            std::fs::create_dir(&target).unwrap();
+        });
+
+        let outcome = atomic_write_bytes_no_magic_outcome_at(
+            &capability,
+            relative,
+            directory.path(),
+            b"new exact authority",
+        )
+        .expect("the target rename crossed the commit point");
+        let AtomicWriteOutcome::InstalledButUnconfirmed(error) = outcome else {
+            panic!("a post-rename metadata failure must never be reported durable");
+        };
+        assert!(
+            error.to_string().contains("non-regular"),
+            "unexpected post-rename metadata error: {error}"
+        );
+        assert!(
+            directory
+                .path()
+                .join(recovery_marker_path(relative))
+                .exists(),
+            "the marker must remain for later diagnosis"
         );
     }
 

@@ -62,6 +62,21 @@ pub struct ChangeAdmissionPolicy {
     pub policy: Option<SharedAdmissionPolicy>,
 }
 
+/// One coherent workspace authority binding and its exact compiled admission
+/// behavior.
+///
+/// `binding.admission_policy` is the shared-plus-local policy stamp carried by
+/// the same authority lease that selected `case` and `matcher`. Rule bodies
+/// are loaded only from repository-owned immutable CAS and verified against
+/// the pinned shared policy and frozen local overlay before this value is
+/// returned.
+#[derive(Debug, Clone)]
+pub struct WorkspaceAdmissionSnapshot {
+    pub binding: WorkspaceSnapshotBinding,
+    pub case: crate::admission::AdmissionCase,
+    pub matcher: ResolvedAdmissionMatcher,
+}
+
 /// Complete repository-authority metadata stored inside one graph snapshot.
 ///
 /// Every vector with set semantics is kept in canonical sorted order.
@@ -794,6 +809,43 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
             &format!("repository authority {}", self.repository_id),
         )?;
         Ok(Some(data))
+    }
+
+    /// Resolve one workspace's exact graph-owned admission policy from one
+    /// coherent authority lease.
+    ///
+    /// This is the read-only authority boundary for daemon, VFS, editor, and
+    /// agent admission previews. It does not inspect Git configuration or raw
+    /// filesystem ignore files, and it never silently repairs missing or
+    /// tampered policy bodies.
+    pub fn workspace_admission_snapshot(
+        &self,
+        repository_id: &RepositoryId,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Option<WorkspaceAdmissionSnapshot>, KinDbError> {
+        self.require_repository(repository_id)?;
+        let lease = self.read_authority();
+        let Some(workspace) = lease
+            .metadata()
+            .workspaces
+            .iter()
+            .find(|workspace| &workspace.workspace_id == workspace_id)
+        else {
+            return Ok(None);
+        };
+        let binding = workspace.snapshot_binding(lease.roots().clone())?;
+        let overlay = local_overlay_for_workspace(lease.metadata(), workspace)?;
+        let matcher = resolve_admission_matcher(
+            self.backend.as_ref(),
+            repository_id,
+            &workspace.shared_admission_policy,
+            overlay,
+        )?;
+        Ok(Some(WorkspaceAdmissionSnapshot {
+            binding,
+            case: overlay.case,
+            matcher,
+        }))
     }
 
     /// Build one daemon/VFS wire snapshot from one coherent authority lease.
@@ -3733,10 +3785,10 @@ mod tests {
         ChangeOrigin, DefaultRefMutation, EffectiveAdmissionPolicyStamp, Entity, EntityDelta,
         EntityId, EntityKind, EntityMetadata, EntityRole, FilePathId, FingerprintAlgorithm,
         FrozenLocalOverlayDelta, GitExternalAuthorityDelta, GitObjectFormat, GitRawRef,
-        GitRawTarget, GraphNodeId, LanguageId, LocatedEntry, RefMutation, Relation, RelationDelta,
-        RelationId, RelationKind, RelationOrigin, RepoPath, ResolvedTree, SemanticChange,
-        SemanticFingerprint, SensitiveArtifactAllowance, SensitiveArtifactKind, TreeDelta,
-        Visibility, WorkspaceExpectation, WorkspaceMutation, WorkspaceSemanticDelta,
+        GitRawTarget, GraphNodeId, LanguageId, LocalAdmissionRuleSource, LocatedEntry, RefMutation,
+        Relation, RelationDelta, RelationId, RelationKind, RelationOrigin, RepoPath, ResolvedTree,
+        SemanticChange, SemanticFingerprint, SensitiveArtifactAllowance, SensitiveArtifactKind,
+        TreeDelta, Visibility, WorkspaceExpectation, WorkspaceMutation, WorkspaceSemanticDelta,
         REPOSITORY_TRANSACTION_SCHEMA_VERSION,
     };
     use parking_lot::Mutex;
@@ -3751,6 +3803,7 @@ mod tests {
         snapshot: Mutex<Option<(Vec<u8>, Generation)>>,
         blobs: Mutex<HashMap<[u8; 32], Vec<u8>>>,
         fail_next_snapshot: AtomicBool,
+        source_load_hook: Mutex<Option<Box<dyn FnOnce() + Send + 'static>>>,
     }
 
     impl StorageBackend for MemoryBackend {
@@ -3797,6 +3850,10 @@ mod tests {
             max_bytes: u64,
         ) -> Result<Option<Vec<u8>>, KinDbError> {
             let value = self.blobs.lock().get(&digest).cloned();
+            let hook = self.source_load_hook.lock().take();
+            if let Some(hook) = hook {
+                hook();
+            }
             if value
                 .as_ref()
                 .is_some_and(|value| value.len() as u64 > max_bytes)
@@ -4259,6 +4316,57 @@ mod tests {
         workspace.new_admission_policy = effective;
         transaction.ref_mutations[0].new_target = Some(RefTarget::change(change_id));
         transaction.local_overlay_delta = Some(FrozenLocalOverlayDelta::initialize(overlay));
+        transaction
+    }
+
+    fn refresh_workspace_admission_case(
+        manager: &RepositoryAuthorityManager<MemoryBackend>,
+        operation: u128,
+        case: AdmissionCase,
+    ) -> RepositoryTransaction {
+        let lease = manager.read_authority();
+        let current = lease.metadata().workspaces[0].clone();
+        let old_overlay = local_overlay_for_workspace(lease.metadata(), &current)
+            .unwrap()
+            .clone();
+        drop(lease);
+
+        let next_overlay = FrozenLocalOverlay::new(
+            current.workspace_id,
+            old_overlay.generation + 1,
+            case,
+            old_overlay.sources.clone(),
+        )
+        .unwrap();
+        let next_policy = EffectiveAdmissionPolicyStamp {
+            shared: current.shared_admission_policy.stamp(),
+            local: next_overlay.stamp(),
+        };
+        let mutation = WorkspaceMutation {
+            workspace_id: current.workspace_id,
+            expected: WorkspaceExpectation::MustEqual {
+                generation: current.generation,
+                head: current.head.clone(),
+                base_target: current.base_target.clone(),
+                base_tree_hash: current.base_tree_hash,
+                tree_hash: current.tree_hash,
+                semantic_overlay_hash: current.semantic_overlay_hash,
+                admission_policy: current.admission_policy,
+            },
+            new_generation: current.generation + 1,
+            new_head: current.head,
+            new_base_target: current.base_target,
+            new_base_tree_hash: current.base_tree_hash,
+            tree_deltas: Vec::new(),
+            new_tree_hash: current.tree_hash,
+            semantic_delta: WorkspaceSemanticDelta::default(),
+            new_shared_admission_policy: current.shared_admission_policy,
+            new_admission_policy: next_policy,
+        };
+        let mut transaction = transaction_shell(manager, operation);
+        transaction.workspace_mutation = Some(mutation);
+        transaction.local_overlay_delta =
+            Some(FrozenLocalOverlayDelta::update(old_overlay, next_overlay));
         transaction
     }
 
@@ -6297,6 +6405,422 @@ mod tests {
     }
 
     #[test]
+    fn workspace_admission_snapshot_is_one_exact_reopenable_case_frozen_lease() {
+        let backend = Arc::new(MemoryBackend::default());
+        let manager = initial_manager(Arc::clone(&backend));
+        let transaction = native_root_with_policy(
+            &manager,
+            AdmissionCase::Sensitive,
+            "src/main.rs",
+            b"fn main() {}\n",
+            Some(b"SECRETS/*\n"),
+            false,
+        );
+        let workspace_id = transaction
+            .workspace_mutation
+            .as_ref()
+            .unwrap()
+            .workspace_id;
+        manager.commit_repository_transaction(transaction).unwrap();
+
+        assert!(
+            manager
+                .workspace_admission_snapshot(
+                    &repository_id(),
+                    &WorkspaceId::from_uuid(Uuid::from_u128(0xdead)),
+                )
+                .unwrap()
+                .is_none(),
+            "an absent workspace must remain explicitly absent"
+        );
+
+        let lease = manager.read_authority();
+        let workspace = lease
+            .metadata()
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == workspace_id)
+            .unwrap();
+        let expected_binding = workspace.snapshot_binding(lease.roots().clone()).unwrap();
+        drop(lease);
+
+        let prepared = manager
+            .workspace_admission_snapshot(&repository_id(), &workspace_id)
+            .unwrap()
+            .expect("workspace admission authority exists");
+        assert_eq!(prepared.binding, expected_binding);
+        assert_eq!(
+            prepared.binding.admission_policy,
+            expected_binding.admission_policy
+        );
+        assert_eq!(prepared.case, AdmissionCase::Sensitive);
+        assert!(
+            prepared
+                .matcher
+                .decide(
+                    &RepoPath::from_utf8("secrets/value.txt").unwrap(),
+                    false,
+                    false,
+                )
+                .admitted,
+            "the frozen sensitive matcher must not fold ASCII case"
+        );
+        assert!(
+            prepared
+                .matcher
+                .decide(
+                    &RepoPath::from_utf8("SECRETS/value.txt").unwrap(),
+                    false,
+                    false,
+                )
+                .is_ignored(),
+            "the exact frozen pattern must remain active"
+        );
+
+        let reopened = RepositoryAuthorityManager::open(repository_id(), Arc::clone(&backend))
+            .expect("persisted authority reopens");
+        let reopened_prepared = reopened
+            .workspace_admission_snapshot(&repository_id(), &workspace_id)
+            .unwrap()
+            .expect("reopened workspace admission authority exists");
+        assert_eq!(reopened_prepared.binding, prepared.binding);
+        assert_eq!(reopened_prepared.case, prepared.case);
+        assert_eq!(
+            reopened_prepared.matcher.generation(),
+            prepared.matcher.generation()
+        );
+        assert_eq!(
+            reopened_prepared
+                .matcher
+                .decide(
+                    &RepoPath::from_utf8("secrets/value.txt").unwrap(),
+                    false,
+                    false,
+                )
+                .admitted,
+            prepared
+                .matcher
+                .decide(
+                    &RepoPath::from_utf8("secrets/value.txt").unwrap(),
+                    false,
+                    false,
+                )
+                .admitted
+        );
+
+        let folded_manager = initial_manager(Arc::new(MemoryBackend::default()));
+        let folded = native_root_with_policy(
+            &folded_manager,
+            AdmissionCase::FoldAscii,
+            "src/main.rs",
+            b"fn main() {}\n",
+            Some(b"SECRETS/*\n"),
+            false,
+        );
+        let folded_workspace = folded.workspace_mutation.as_ref().unwrap().workspace_id;
+        folded_manager
+            .commit_repository_transaction(folded)
+            .unwrap();
+        let folded_prepared = folded_manager
+            .workspace_admission_snapshot(&repository_id(), &folded_workspace)
+            .unwrap()
+            .expect("folded workspace admission authority exists");
+        assert_eq!(folded_prepared.case, AdmissionCase::FoldAscii);
+        assert!(
+            folded_prepared
+                .matcher
+                .decide(
+                    &RepoPath::from_utf8("secrets/value.txt").unwrap(),
+                    false,
+                    false,
+                )
+                .is_ignored(),
+            "the frozen folded matcher must preserve ASCII-folded behavior"
+        );
+    }
+
+    #[test]
+    fn workspace_admission_snapshot_preserves_global_shared_and_kin_local_precedence() {
+        let backend = Arc::new(MemoryBackend::default());
+        let manager = initial_manager(Arc::clone(&backend));
+        let shared_body = b"!global/keep.txt\nshared/*\n";
+        let mut transaction = native_root_with_policy(
+            &manager,
+            AdmissionCase::Sensitive,
+            "src/main.rs",
+            b"fn main() {}\n",
+            Some(shared_body),
+            false,
+        );
+        let workspace_id = transaction
+            .workspace_mutation
+            .as_ref()
+            .unwrap()
+            .workspace_id;
+        let global_body = b"global/*\n";
+        let kin_local_body = b"!shared/keep.txt\nhigh/*\n";
+        let global_hash = digest(global_body);
+        let kin_local_hash = digest(kin_local_body);
+        manager.save_source_blob(global_hash, global_body).unwrap();
+        manager
+            .save_source_blob(kin_local_hash, kin_local_body)
+            .unwrap();
+        let overlay = FrozenLocalOverlay::new(
+            workspace_id,
+            0,
+            AdmissionCase::Sensitive,
+            vec![
+                LocalAdmissionRuleSource {
+                    kind: LocalAdmissionRuleSourceKind::GitGlobalExclude,
+                    body_hash: global_hash,
+                    body_len: global_body.len() as u64,
+                    precedence: 0,
+                },
+                LocalAdmissionRuleSource {
+                    kind: LocalAdmissionRuleSourceKind::KinLocal,
+                    body_hash: kin_local_hash,
+                    body_len: kin_local_body.len() as u64,
+                    precedence: 1,
+                },
+            ],
+        )
+        .unwrap();
+        transaction
+            .workspace_mutation
+            .as_mut()
+            .unwrap()
+            .new_admission_policy
+            .local = overlay.stamp();
+        transaction.local_overlay_delta = Some(FrozenLocalOverlayDelta::initialize(overlay));
+        manager.commit_repository_transaction(transaction).unwrap();
+
+        let prepared = manager
+            .workspace_admission_snapshot(&repository_id(), &workspace_id)
+            .unwrap()
+            .expect("workspace admission authority exists");
+        let decide = |path: &str| {
+            prepared
+                .matcher
+                .decide(&RepoPath::from_utf8(path).unwrap(), false, false)
+        };
+
+        let global_drop = decide("global/drop.txt");
+        assert!(global_drop.is_ignored());
+        assert!(matches!(
+            global_drop.reason,
+            crate::admission::AdmissionDecisionReason::Rule(
+                crate::admission::AdmissionRuleProvenance {
+                    source: ResolvedAdmissionRuleSource::GlobalExclude,
+                    ..
+                }
+            )
+        ));
+
+        let shared_override = decide("global/keep.txt");
+        assert!(shared_override.admitted);
+        assert!(matches!(
+            shared_override.reason,
+            crate::admission::AdmissionDecisionReason::Rule(
+                crate::admission::AdmissionRuleProvenance {
+                    source: ResolvedAdmissionRuleSource::Shared { .. },
+                    ..
+                }
+            )
+        ));
+
+        let shared_drop = decide("shared/drop.txt");
+        assert!(shared_drop.is_ignored());
+        assert!(matches!(
+            shared_drop.reason,
+            crate::admission::AdmissionDecisionReason::Rule(
+                crate::admission::AdmissionRuleProvenance {
+                    source: ResolvedAdmissionRuleSource::Shared { .. },
+                    ..
+                }
+            )
+        ));
+
+        let kin_override = decide("shared/keep.txt");
+        assert!(kin_override.admitted);
+        assert!(matches!(
+            kin_override.reason,
+            crate::admission::AdmissionDecisionReason::Rule(
+                crate::admission::AdmissionRuleProvenance {
+                    source: ResolvedAdmissionRuleSource::KinLocal { ordinal: 1 },
+                    ..
+                }
+            )
+        ));
+
+        let kin_drop = decide("high/drop.txt");
+        assert!(kin_drop.is_ignored());
+        assert!(matches!(
+            kin_drop.reason,
+            crate::admission::AdmissionDecisionReason::Rule(
+                crate::admission::AdmissionRuleProvenance {
+                    source: ResolvedAdmissionRuleSource::KinLocal { ordinal: 1 },
+                    ..
+                }
+            )
+        ));
+    }
+
+    #[test]
+    fn workspace_admission_snapshot_fails_closed_on_missing_tampered_or_wrong_length_cas() {
+        fn committed_policy_fixture() -> (
+            Arc<MemoryBackend>,
+            RepositoryAuthorityManager<MemoryBackend>,
+            WorkspaceId,
+            Hash256,
+        ) {
+            let backend = Arc::new(MemoryBackend::default());
+            let manager = initial_manager(Arc::clone(&backend));
+            let transaction = native_root_with_policy(
+                &manager,
+                AdmissionCase::Sensitive,
+                "src/main.rs",
+                b"fn main() {}\n",
+                Some(b"target/\n"),
+                false,
+            );
+            let workspace = transaction
+                .workspace_mutation
+                .as_ref()
+                .unwrap()
+                .workspace_id;
+            let body_hash = transaction
+                .workspace_mutation
+                .as_ref()
+                .unwrap()
+                .new_shared_admission_policy
+                .sources[0]
+                .body_hash;
+            manager.commit_repository_transaction(transaction).unwrap();
+            (backend, manager, workspace, body_hash)
+        }
+
+        let (missing_backend, missing_manager, missing_workspace, missing_hash) =
+            committed_policy_fixture();
+        missing_backend.blobs.lock().remove(missing_hash.as_bytes());
+        let error = missing_manager
+            .workspace_admission_snapshot(&repository_id(), &missing_workspace)
+            .expect_err("missing policy CAS bytes must fail closed at the read API");
+        assert!(
+            error
+                .to_string()
+                .contains("absent from immutable source CAS"),
+            "unexpected missing policy error: {error}"
+        );
+
+        let (tampered_backend, tampered_manager, tampered_workspace, tampered_hash) =
+            committed_policy_fixture();
+        tampered_backend
+            .blobs
+            .lock()
+            .insert(*tampered_hash.as_bytes(), b"tamper!\n".to_vec());
+        let error = tampered_manager
+            .workspace_admission_snapshot(&repository_id(), &tampered_workspace)
+            .expect_err("same-length tampered policy CAS bytes must fail closed");
+        assert!(
+            error.to_string().contains("digest mismatch"),
+            "unexpected tampered policy error: {error}"
+        );
+
+        let (short_backend, short_manager, short_workspace, short_hash) =
+            committed_policy_fixture();
+        short_backend
+            .blobs
+            .lock()
+            .insert(*short_hash.as_bytes(), b"x".to_vec());
+        let error = short_manager
+            .workspace_admission_snapshot(&repository_id(), &short_workspace)
+            .expect_err("wrong-length policy CAS bytes must fail closed");
+        assert!(
+            error.to_string().contains("has length 1, expected 8"),
+            "unexpected wrong-length policy error: {error}"
+        );
+    }
+
+    #[test]
+    fn workspace_admission_snapshot_cannot_mix_authority_generations_during_cas_load() {
+        let backend = Arc::new(MemoryBackend::default());
+        let manager = Arc::new(initial_manager(Arc::clone(&backend)));
+        let transaction = native_root_with_policy(
+            manager.as_ref(),
+            AdmissionCase::Sensitive,
+            "src/main.rs",
+            b"fn main() {}\n",
+            Some(b"SECRETS/*\n"),
+            false,
+        );
+        let workspace_id = transaction
+            .workspace_mutation
+            .as_ref()
+            .unwrap()
+            .workspace_id;
+        manager.commit_repository_transaction(transaction).unwrap();
+
+        let old_lease = manager.read_authority();
+        let old_workspace = old_lease.metadata().workspaces[0].clone();
+        let old_binding = old_workspace
+            .snapshot_binding(old_lease.roots().clone())
+            .unwrap();
+        let old_repository_generation = old_lease.generation();
+        drop(old_lease);
+        let refresh =
+            refresh_workspace_admission_case(manager.as_ref(), 0xad10, AdmissionCase::FoldAscii);
+        let hook_manager = Arc::clone(&manager);
+        *backend.source_load_hook.lock() = Some(Box::new(move || {
+            hook_manager
+                .commit_repository_transaction(refresh)
+                .expect("concurrent local-overlay refresh commits");
+        }));
+
+        let raced = manager
+            .workspace_admission_snapshot(&repository_id(), &workspace_id)
+            .unwrap()
+            .expect("old leased workspace remains resolvable");
+        assert_eq!(raced.binding, old_binding);
+        assert_eq!(raced.case, AdmissionCase::Sensitive);
+        assert!(
+            raced
+                .matcher
+                .decide(
+                    &RepoPath::from_utf8("secrets/value.txt").unwrap(),
+                    false,
+                    false,
+                )
+                .admitted,
+            "the old binding must carry the old case and old matcher together"
+        );
+
+        let current = manager.read_authority();
+        assert!(current.generation() > old_repository_generation);
+        assert!(
+            current.metadata().workspaces[0].generation > old_workspace.generation,
+            "the hook must actually advance workspace authority"
+        );
+        drop(current);
+        let refreshed = manager
+            .workspace_admission_snapshot(&repository_id(), &workspace_id)
+            .unwrap()
+            .expect("refreshed workspace admission authority exists");
+        assert_eq!(refreshed.case, AdmissionCase::FoldAscii);
+        assert_ne!(refreshed.binding, old_binding);
+        assert!(
+            refreshed
+                .matcher
+                .decide(
+                    &RepoPath::from_utf8("secrets/value.txt").unwrap(),
+                    false,
+                    false,
+                )
+                .is_ignored(),
+            "a subsequent lease must see the complete refreshed matcher"
+        );
+    }
+
+    #[test]
     fn tracked_sensitive_artifact_remains_admitted_without_a_new_allowance() {
         let manager = initial_manager(Arc::new(MemoryBackend::default()));
         let initial = native_root_with_policy(
@@ -7517,11 +8041,11 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(2))
             .expect("blocked writer must wake after freeze release")
             .expect_err("a writer pinned before detach must not resurrect authority");
+        let message = error.to_string();
         assert!(
-            error.to_string().contains("namespace changed")
-                || error
-                    .to_string()
-                    .contains("unavailable for existing-authority access"),
+            message.contains("namespace changed")
+                || message.contains("was detached after this backend opened")
+                || message.contains("unavailable for existing-authority access"),
             "unexpected post-detach writer error: {error}"
         );
         writer.join().unwrap();

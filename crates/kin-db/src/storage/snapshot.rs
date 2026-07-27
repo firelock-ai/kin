@@ -510,7 +510,7 @@ fn validate_loaded_local_delta_artifacts(
                 authority.head_generation
             )));
         };
-        let digest = hex::encode(Sha256::digest(&bytes));
+        let digest = hex::encode(Sha256::digest(bytes));
         if digest != identity.sha256 {
             return Err(KinDbError::StorageError(format!(
                 "acknowledged local delta digest mismatch at generation {} while loading replay bytes from {}: expected {}, found {digest}; committed journal bytes changed",
@@ -532,7 +532,7 @@ fn validate_loaded_local_delta_artifacts(
             .iter()
             .find(|identity| identity.generation == *generation)
         {
-            let digest = hex::encode(Sha256::digest(&bytes));
+            let digest = hex::encode(Sha256::digest(bytes));
             if digest != identity.sha256 {
                 return Err(KinDbError::StorageError(format!(
                     "retired local delta digest mismatch at generation {generation}: expected {}, found {digest}; retired journal bytes changed after full promotion",
@@ -745,9 +745,9 @@ fn write_local_authority(
     let path = local_authority_path(snapshot_path);
     match mmap::atomic_write_bytes_no_magic_outcome(&path, &bytes)? {
         mmap::AtomicWriteOutcome::Durable => Ok(()),
-        mmap::AtomicWriteOutcome::InstalledButNotSynced(error) => {
+        mmap::AtomicWriteOutcome::InstalledButUnconfirmed(error) => {
             Err(KinDbError::StorageError(format!(
-                "local snapshot authority {} was installed but its parent-directory durability is unconfirmed: {error}",
+                "local snapshot authority {} was installed but its durability is unconfirmed or exact post-install verification could not be completed: {error}",
                 path.display()
             )))
         }

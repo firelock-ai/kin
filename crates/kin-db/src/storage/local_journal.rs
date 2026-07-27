@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 
 use crate::error::KinDbError;
 use crate::storage::backend::{Generation, GENERATION_INIT};
+use crate::storage::mmap;
 
 const QUARANTINE_PREFIX: &str = ".kin-journal-cleanup-";
 const QUARANTINE_HASH_BUFFER_BYTES: usize = 64 * 1024;
@@ -317,6 +318,229 @@ pub(super) fn delete_quarantined_delta_exact(
     sync_parent_directory(&stable_path)
 }
 
+fn hash_quarantined_delta_at(
+    directory: &cap_std::fs::Dir,
+    relative: &Path,
+    display_root: &Path,
+) -> Result<(u64, String), KinDbError> {
+    let display = display_root.join(relative);
+    let mut file =
+        mmap::open_regular_nofollow_at(directory, relative, display_root, "quarantined delta")?;
+    let expected_len = file
+        .metadata()
+        .map_err(|error| {
+            KinDbError::StorageError(format!(
+                "failed to inspect quarantined delta {}: {error}",
+                display.display()
+            ))
+        })?
+        .len();
+    let mut hasher = Sha256::new();
+    let mut total = 0u64;
+    let mut buffer = [0u8; QUARANTINE_HASH_BUFFER_BYTES];
+    loop {
+        let read = file.read(&mut buffer).map_err(|error| {
+            KinDbError::StorageError(format!(
+                "failed to read quarantined delta {}: {error}",
+                display.display()
+            ))
+        })?;
+        if read == 0 {
+            break;
+        }
+        total = total.checked_add(read as u64).ok_or_else(|| {
+            KinDbError::StorageError(format!(
+                "quarantined delta {} length overflowed during recovery",
+                display.display()
+            ))
+        })?;
+        if total > expected_len {
+            return Err(KinDbError::StorageError(format!(
+                "quarantined delta {} grew while being verified; recovery is fail-closed",
+                display.display()
+            )));
+        }
+        hasher.update(&buffer[..read]);
+    }
+    if total != expected_len {
+        return Err(KinDbError::StorageError(format!(
+            "quarantined delta {} changed length while being verified: expected {expected_len}, read {total}; recovery is fail-closed",
+            display.display()
+        )));
+    }
+    Ok((total, hex::encode(hasher.finalize())))
+}
+
+pub(super) fn quarantined_file_matches_at(
+    directory: &cap_std::fs::Dir,
+    relative: &Path,
+    display_root: &Path,
+    expected_sha256: &str,
+    expected_len: u64,
+) -> Result<bool, KinDbError> {
+    let (actual_len, actual_sha256) = hash_quarantined_delta_at(directory, relative, display_root)?;
+    Ok(actual_len == expected_len && actual_sha256 == expected_sha256)
+}
+
+/// Capability-relative journal discovery. Returned artifact paths remain
+/// relative to `directory` so subsequent cleanup cannot escape to a swapped
+/// ambient repository path.
+pub(super) fn load_quarantined_deltas_at(
+    directory: &cap_std::fs::Dir,
+    display_root: &Path,
+) -> Result<Vec<QuarantinedDelta>, KinDbError> {
+    let delta_dir = Path::new(".");
+    let display_dir = display_root;
+    match directory.symlink_metadata(delta_dir) {
+        Ok(metadata) if metadata.file_type().is_dir() => {}
+        Ok(_) => {
+            return Err(KinDbError::StorageError(format!(
+                "journal quarantine directory {} is not a real directory; recovery is fail-closed",
+                display_dir.display()
+            )))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(KinDbError::StorageError(format!(
+                "failed to inspect journal quarantine directory {}: {error}",
+                display_dir.display()
+            )))
+        }
+    }
+
+    let mut quarantined = Vec::new();
+    for entry in directory.read_dir(delta_dir).map_err(|error| {
+        KinDbError::StorageError(format!(
+            "failed to read journal directory {}: {error}",
+            display_dir.display()
+        ))
+    })? {
+        let entry = entry.map_err(|error| {
+            KinDbError::StorageError(format!(
+                "failed to read journal entry in {}: {error}",
+                display_dir.display()
+            ))
+        })?;
+        let name_os = entry.file_name();
+        if !name_os.to_string_lossy().starts_with(QUARANTINE_PREFIX) {
+            continue;
+        }
+        let relative = PathBuf::from(&name_os);
+        let display = display_root.join(&relative);
+        let name = name_os
+            .to_str()
+            .ok_or_else(|| invalid_quarantine_name(&display))?;
+        let file_type = entry.file_type().map_err(|error| {
+            KinDbError::StorageError(format!(
+                "failed to inspect quarantined delta {}: {error}",
+                display.display()
+            ))
+        })?;
+        if !file_type.is_file() {
+            return Err(KinDbError::StorageError(format!(
+                "quarantined delta {} is not a regular file; recovery is fail-closed",
+                display.display()
+            )));
+        }
+        let encoded = name
+            .strip_prefix(QUARANTINE_PREFIX)
+            .and_then(|name| name.strip_suffix(".kndd"))
+            .ok_or_else(|| invalid_quarantine_name(&display))?;
+        let mut fields = encoded.splitn(3, '-');
+        let generation_field = fields
+            .next()
+            .ok_or_else(|| invalid_quarantine_name(&display))?;
+        let sha256 = fields
+            .next()
+            .ok_or_else(|| invalid_quarantine_name(&display))?;
+        let nonce = fields
+            .next()
+            .ok_or_else(|| invalid_quarantine_name(&display))?;
+        let generation = generation_field
+            .parse::<Generation>()
+            .map_err(|_| invalid_quarantine_name(&display))?;
+        if generation == GENERATION_INIT
+            || generation_field != format!("{generation:020}")
+            || sha256.len() != 64
+            || sha256.to_ascii_lowercase() != sha256
+            || hex::decode(sha256).is_err()
+            || uuid::Uuid::parse_str(nonce).is_err()
+        {
+            return Err(invalid_quarantine_name(&display));
+        }
+        let (byte_len, actual_sha256) =
+            hash_quarantined_delta_at(directory, &relative, display_root)?;
+        if actual_sha256 != sha256 {
+            return Err(KinDbError::StorageError(format!(
+                "quarantined delta digest mismatch at {}: filename binds {sha256}, bytes contain {actual_sha256}; recovery is fail-closed",
+                display.display()
+            )));
+        }
+        quarantined.push(QuarantinedDelta {
+            generation,
+            sha256: sha256.to_string(),
+            path: relative,
+            byte_len,
+        });
+    }
+    quarantined.sort_by(|left, right| {
+        left.generation
+            .cmp(&right.generation)
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    Ok(quarantined)
+}
+
+pub(super) fn delete_quarantined_delta_exact_at(
+    directory: &cap_std::fs::Dir,
+    quarantined: &QuarantinedDelta,
+    display_root: &Path,
+) -> Result<(), KinDbError> {
+    let stable_path = quarantine_delta_path(
+        &quarantined.path,
+        quarantined.generation,
+        &quarantined.sha256,
+    );
+    match directory.rename(&quarantined.path, directory, &stable_path) {
+        Ok(()) => mmap::sync_parent_dir_at(directory, &stable_path, display_root)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return mmap::sync_parent_dir_at(directory, &quarantined.path, display_root)
+        }
+        Err(error) => {
+            return Err(KinDbError::StorageError(format!(
+                "failed to stabilize quarantined delta {} before cleanup: {error}",
+                display_root.join(&quarantined.path).display()
+            )))
+        }
+    }
+    if !quarantined_file_matches_at(
+        directory,
+        &stable_path,
+        display_root,
+        &quarantined.sha256,
+        quarantined.byte_len,
+    )? {
+        return Err(KinDbError::StorageError(format!(
+            "quarantined delta {} changed during recovery cleanup and was preserved at {}; recovery is fail-closed",
+            display_root.join(&quarantined.path).display(),
+            display_root.join(&stable_path).display()
+        )));
+    }
+    match directory.remove_file(&stable_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return mmap::sync_parent_dir_at(directory, &stable_path, display_root)
+        }
+        Err(error) => {
+            return Err(KinDbError::StorageError(format!(
+                "failed to remove verified quarantined delta {}: {error}",
+                display_root.join(&stable_path).display()
+            )))
+        }
+    }
+    mmap::sync_parent_dir_at(directory, &stable_path, display_root)
+}
+
 fn invalid_quarantine_name(path: &Path) -> KinDbError {
     KinDbError::StorageError(format!(
         "local delta quarantine {} has an invalid identity-bearing name; recovery is fail-closed",
@@ -328,6 +552,7 @@ fn invalid_quarantine_name(path: &Path) -> KinDbError {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     fn valid_quarantine_path(dir: &Path, bytes: &[u8]) -> PathBuf {
         let canonical = dir.join("00000000000000000001.kndd");
         quarantine_delta_path(&canonical, 1, &hex::encode(Sha256::digest(bytes)))

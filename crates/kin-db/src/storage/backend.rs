@@ -24,8 +24,8 @@ use sha2::{Digest, Sha256};
 use crate::error::KinDbError;
 use crate::storage::format::GraphSnapshot;
 use crate::storage::local_journal::{
-    delete_quarantined_delta_exact, is_quarantine_delta_name, load_quarantined_deltas,
-    quarantine_delta_path, quarantined_file_matches, sync_parent_directory,
+    delete_quarantined_delta_exact_at, is_quarantine_delta_name, load_quarantined_deltas_at,
+    quarantine_delta_path, quarantined_file_matches_at,
 };
 use crate::storage::mmap::{self, AtomicWriteOutcome};
 
@@ -99,6 +99,63 @@ fn run_source_file_after_metadata_hook() {
 #[cfg(all(not(test), unix))]
 fn run_source_file_after_metadata_hook() {}
 
+#[derive(Clone, Copy)]
+enum LocalDirectoryBindKind {
+    Repository,
+    Surface,
+    Staging,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static REPOSITORY_AFTER_PREOPEN_HOOK:
+        std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
+    static SURFACE_AFTER_PREOPEN_HOOK:
+        std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
+}
+
+#[cfg(all(test, unix))]
+fn set_local_directory_after_preopen_hook(
+    kind: LocalDirectoryBindKind,
+    hook: impl FnOnce() + 'static,
+) {
+    match kind {
+        LocalDirectoryBindKind::Repository => {
+            REPOSITORY_AFTER_PREOPEN_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+        }
+        LocalDirectoryBindKind::Surface => {
+            SURFACE_AFTER_PREOPEN_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+        }
+        LocalDirectoryBindKind::Staging => {
+            panic!("test hooks may not target private randomized staging directories")
+        }
+    }
+}
+
+#[cfg(test)]
+fn run_local_directory_after_preopen_hook(kind: LocalDirectoryBindKind) {
+    match kind {
+        LocalDirectoryBindKind::Repository => {
+            REPOSITORY_AFTER_PREOPEN_HOOK.with(|slot| {
+                if let Some(hook) = slot.borrow_mut().take() {
+                    hook();
+                }
+            });
+        }
+        LocalDirectoryBindKind::Surface => {
+            SURFACE_AFTER_PREOPEN_HOOK.with(|slot| {
+                if let Some(hook) = slot.borrow_mut().take() {
+                    hook();
+                }
+            });
+        }
+        LocalDirectoryBindKind::Staging => {}
+    }
+}
+
+#[cfg(not(test))]
+fn run_local_directory_after_preopen_hook(_kind: LocalDirectoryBindKind) {}
+
 #[cfg(all(test, unix))]
 fn fail_source_file_sync_once() {
     SOURCE_FILE_SYNC_FAILURE.with(|failure| failure.set(true));
@@ -146,6 +203,23 @@ pub(crate) fn validate_source_blob_repo_id(repo_id: &str) -> Result<(), KinDbErr
     {
         return Err(KinDbError::StorageError(format!(
             "invalid repo id {repo_id:?} for immutable source blob storage"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_local_storage_component(component: &str, role: &str) -> Result<(), KinDbError> {
+    if component.is_empty()
+        || component.len() > 255
+        || matches!(component, "." | "..")
+        || component.ends_with(['.', ' '])
+        || is_windows_reserved_source_component(component)
+        || !component
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err(KinDbError::StorageError(format!(
+            "{role} must be one portable filesystem component"
         )));
     }
     Ok(())
@@ -331,59 +405,35 @@ fn prepare_source_trust_root(
 }
 
 #[cfg(unix)]
-fn open_source_blob_capability(
-    base_path: &Path,
-    repo_id: &str,
+fn open_source_blob_capability_from_repository(
+    repository: &cap_std::fs::Dir,
+    repository_display: &Path,
     digest: [u8; 32],
     create: bool,
     confirm_durability: bool,
-    root_confirmed_for_process: &parking_lot::Mutex<bool>,
 ) -> Result<SourceBlobCapability, KinDbError> {
-    validate_source_blob_repo_id(repo_id)?;
-    if create {
-        prepare_source_trust_root(base_path, confirm_durability, root_confirmed_for_process)?;
-    }
-    let trusted_root = std::fs::canonicalize(base_path).map_err(|error| {
+    let repo_dir = mmap::open_directory_handle_at(repository, Path::new("."), repository_display)
+        .map_err(|error| {
         KinDbError::StorageError(format!(
-            "failed to resolve immutable source blob trust root {}: {error}",
-            base_path.display()
+            "failed to clone retained repository capability {}: {error}",
+            repository_display.display()
         ))
     })?;
-    let mut parent = std::fs::File::open(&trusted_root).map_err(|error| {
+    let mut parent = repo_dir.try_clone().map_err(|error| {
         KinDbError::StorageError(format!(
-            "failed to open immutable source blob trust root {}: {error}",
-            trusted_root.display()
+            "failed to clone retained repository directory {}: {error}",
+            repository_display.display()
         ))
     })?;
-    if !parent
-        .metadata()
-        .map_err(|error| KinDbError::StorageError(error.to_string()))?
-        .is_dir()
-    {
-        return Err(KinDbError::StorageError(format!(
-            "immutable source blob trust root {} is not a real directory",
-            trusted_root.display()
-        )));
-    }
-
     let digest_hex = hex::encode(digest);
-    let mut display = trusted_root;
-    let mut repo_dir = None;
-    for component in [repo_id, "source-blobs", "sha256", &digest_hex[..2]] {
+    let mut display = repository_display.to_path_buf();
+    for component in ["source-blobs", "sha256", &digest_hex[..2]] {
         display.push(component);
-        let child =
+        parent =
             open_source_directory_at(&parent, component, &display, create, confirm_durability)?;
-        if repo_dir.is_none() {
-            repo_dir = Some(
-                child
-                    .try_clone()
-                    .map_err(|error| KinDbError::StorageError(error.to_string()))?,
-            );
-        }
-        parent = child;
     }
     Ok(SourceBlobCapability {
-        repo_dir: repo_dir.expect("validated source path always contains repo component"),
+        repo_dir,
         leaf_dir: parent,
         leaf_path: display,
     })
@@ -401,26 +451,24 @@ fn same_directory(left: &std::fs::File, right: &std::fs::File) -> Result<bool, K
 }
 
 #[cfg(unix)]
-fn confirm_source_blob_namespace(
-    base_path: &Path,
-    repo_id: &str,
+fn confirm_source_blob_namespace_from_repository(
+    repository: &cap_std::fs::Dir,
+    repository_display: &Path,
     digest: [u8; 32],
     capability: &SourceBlobCapability,
-    root_confirmed_for_process: &parking_lot::Mutex<bool>,
 ) -> Result<(), KinDbError> {
-    let current = open_source_blob_capability(
-        base_path,
-        repo_id,
+    let current = open_source_blob_capability_from_repository(
+        repository,
+        repository_display,
         digest,
         false,
         false,
-        root_confirmed_for_process,
     )?;
     if !same_directory(&capability.repo_dir, &current.repo_dir)?
         || !same_directory(&capability.leaf_dir, &current.leaf_dir)?
     {
         return Err(KinDbError::StorageError(format!(
-            "immutable source blob trust root changed while accessing {}",
+            "immutable source blob repository namespace changed while accessing {}",
             capability.leaf_path.display()
         )));
     }
@@ -594,20 +642,48 @@ struct WindowsSourceBlobCapability {
     /// The handles intentionally omit `FILE_SHARE_DELETE`, pinning the whole
     /// namespace chain against rename or replacement for the operation.
     directories: Vec<cap_std::fs::Dir>,
-    repo_index: usize,
+    display_paths: Vec<PathBuf>,
     leaf_path: PathBuf,
 }
 
 #[cfg(windows)]
 impl WindowsSourceBlobCapability {
-    fn repo_dir(&self) -> &cap_std::fs::Dir {
-        &self.directories[self.repo_index]
-    }
-
     fn leaf_dir(&self) -> &cap_std::fs::Dir {
         self.directories
             .last()
             .expect("source capability always contains its digest-prefix directory")
+    }
+
+    fn sync_directory(&self, index: usize) -> Result<(), KinDbError> {
+        let directory = self.directories[index].open_dir(".").map_err(|error| {
+            KinDbError::StorageError(format!(
+                "failed to clone retained Windows source directory {} for durability confirmation: {error}",
+                self.display_paths[index].display()
+            ))
+        })?;
+        mmap::sync_directory_handle(
+            &directory.into_std_file(),
+            self.display_paths[index].as_path(),
+        )
+    }
+
+    /// Confirm every newly created ancestor entry child-before-parent. The
+    /// digest-prefix directory itself is flushed after the digest file is
+    /// installed.
+    fn sync_ancestor_publication(&self) -> Result<(), KinDbError> {
+        for index in (0..self.directories.len().saturating_sub(1)).rev() {
+            self.sync_directory(index)?;
+        }
+        Ok(())
+    }
+
+    fn sync_leaf_publication(&self) -> Result<(), KinDbError> {
+        self.sync_directory(
+            self.directories
+                .len()
+                .checked_sub(1)
+                .expect("source capability always retains a leaf directory"),
+        )
     }
 }
 
@@ -618,7 +694,7 @@ struct WindowsOpenedSourceBlob {
 }
 
 #[cfg(windows)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct WindowsSourceIdentity {
     volume_serial: u64,
     file_id: [u8; 16],
@@ -745,94 +821,22 @@ fn open_windows_source_directory_at(
 }
 
 #[cfg(windows)]
-fn windows_source_absolute_base(base_path: &Path) -> Result<PathBuf, KinDbError> {
-    let absolute = if base_path.is_absolute() {
-        base_path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .map_err(|error| {
-                KinDbError::StorageError(format!(
-                    "failed to resolve current directory for immutable source storage: {error}"
-                ))
-            })?
-            .join(base_path)
-    };
-    if absolute
-        .components()
-        .any(|component| matches!(component, std::path::Component::ParentDir))
-    {
-        return Err(KinDbError::StorageError(format!(
-            "immutable source blob trust root may not contain parent traversal: {}",
-            base_path.display()
-        )));
-    }
-    Ok(absolute)
-}
-
-#[cfg(windows)]
-fn open_windows_source_blob_capability(
-    base_path: &Path,
-    repo_id: &str,
+fn open_windows_source_blob_capability_from_repository(
+    repository: &cap_std::fs::Dir,
+    repository_display: &Path,
     digest: [u8; 32],
     create: bool,
 ) -> Result<WindowsSourceBlobCapability, KinDbError> {
-    validate_source_blob_repo_id(repo_id)?;
-    let absolute = windows_source_absolute_base(base_path)?;
-    let ambient_root = absolute
-        .ancestors()
-        .last()
-        .filter(|ancestor| !ancestor.as_os_str().is_empty())
-        .ok_or_else(|| {
-            KinDbError::StorageError(format!(
-                "immutable source blob trust root has no filesystem root: {}",
-                absolute.display()
-            ))
-        })?;
-    let relative = absolute.strip_prefix(ambient_root).map_err(|_| {
+    let mut directories = vec![repository.open_dir(".").map_err(|error| {
         KinDbError::StorageError(format!(
-            "immutable source blob trust root is not beneath its filesystem root: {}",
-            absolute.display()
+            "failed to clone retained Windows repository capability {}: {error}",
+            repository_display.display()
         ))
-    })?;
-    if relative
-        .components()
-        .any(|component| !matches!(component, std::path::Component::Normal(_)))
-    {
-        return Err(KinDbError::StorageError(format!(
-            "immutable source blob trust root contains an unsupported component: {}",
-            absolute.display()
-        )));
-    }
-
-    let root = cap_std::fs::Dir::open_ambient_dir(ambient_root, cap_std::ambient_authority())
-        .map_err(|error| {
-            KinDbError::StorageError(format!(
-                "failed to open immutable source filesystem root {}: {error}",
-                ambient_root.display()
-            ))
-        })?;
-    let mut directories = vec![root];
-    let mut display = ambient_root.to_path_buf();
-    for component in relative.components() {
-        let std::path::Component::Normal(name) = component else {
-            unreachable!("immutable source root components were validated")
-        };
-        display.push(name);
-        let next = open_windows_source_directory_at(
-            directories
-                .last()
-                .expect("filesystem root capability was inserted"),
-            name,
-            &display,
-            false,
-        )?;
-        directories.push(next);
-    }
-
+    })?];
+    let mut display_paths = vec![repository_display.to_path_buf()];
+    let mut display = repository_display.to_path_buf();
     let digest_hex = hex::encode(digest);
-    let repo_index = directories.len();
     for component in [
-        std::ffi::OsStr::new(repo_id),
         std::ffi::OsStr::new("source-blobs"),
         std::ffi::OsStr::new("sha256"),
         std::ffi::OsStr::new(&digest_hex[..2]),
@@ -841,19 +845,23 @@ fn open_windows_source_blob_capability(
         let next = open_windows_source_directory_at(
             directories
                 .last()
-                .expect("filesystem root capability was inserted"),
+                .expect("repository capability was inserted"),
             component,
             &display,
             create,
         )?;
         directories.push(next);
+        display_paths.push(display.clone());
     }
-
-    Ok(WindowsSourceBlobCapability {
+    let capability = WindowsSourceBlobCapability {
         directories,
-        repo_index,
+        display_paths,
         leaf_path: display,
-    })
+    };
+    if create {
+        capability.sync_ancestor_publication()?;
+    }
+    Ok(capability)
 }
 
 #[cfg(windows)]
@@ -877,7 +885,7 @@ fn windows_source_handle_identity(
     } == 0
     {
         return Err(KinDbError::StorageError(format!(
-            "failed to inspect immutable source Windows file identity: {}",
+            "failed to inspect Windows filesystem object identity: {}",
             std::io::Error::last_os_error()
         )));
     }
@@ -887,7 +895,7 @@ fn windows_source_handle_identity(
     };
     if identity.volume_serial == 0 || identity.file_id.iter().all(|byte| *byte == 0) {
         return Err(KinDbError::StorageError(
-            "immutable source Windows object returned a zero FILE_ID_128 identity".to_string(),
+            "Windows filesystem object returned a zero FILE_ID_128 identity".to_string(),
         ));
     }
     Ok(identity)
@@ -910,16 +918,21 @@ fn windows_source_file_identity(file: &std::fs::File) -> Result<WindowsSourceIde
 }
 
 #[cfg(windows)]
-fn confirm_windows_source_blob_namespace(
-    base_path: &Path,
-    repo_id: &str,
+fn confirm_windows_source_blob_namespace_from_repository(
+    repository: &cap_std::fs::Dir,
+    repository_display: &Path,
     digest: [u8; 32],
     capability: &WindowsSourceBlobCapability,
 ) -> Result<(), KinDbError> {
-    let current = open_windows_source_blob_capability(base_path, repo_id, digest, false)?;
+    let current = open_windows_source_blob_capability_from_repository(
+        repository,
+        repository_display,
+        digest,
+        false,
+    )?;
     if current.directories.len() != capability.directories.len() {
         return Err(KinDbError::StorageError(format!(
-            "immutable source blob trust root changed while accessing {}",
+            "immutable source blob repository namespace changed while accessing {}",
             capability.leaf_path.display()
         )));
     }
@@ -932,7 +945,7 @@ fn confirm_windows_source_blob_namespace(
             != windows_source_directory_identity(reopened)?
         {
             return Err(KinDbError::StorageError(format!(
-                "immutable source blob trust root changed while accessing {}",
+                "immutable source blob repository namespace changed while accessing {}",
                 capability.leaf_path.display()
             )));
         }
@@ -1230,6 +1243,7 @@ fn rename_windows_source_file_noreplace(
 #[cfg(windows)]
 fn publish_windows_source_file_at(
     directory: &cap_std::fs::Dir,
+    directory_display: &Path,
     digest_hex: &str,
     data: &[u8],
 ) -> Result<Option<WindowsSourceIdentity>, KinDbError> {
@@ -1254,14 +1268,20 @@ fn publish_windows_source_file_at(
     // retry; cleanup is only valid while the handle still names staging.
     staged.published = true;
 
-    // Flush the exact renamed file handle after the namespace transition.
-    // Windows has no supported directory-fsync equivalent; the write-through
-    // staging handle plus this post-rename flush is its strongest supported
-    // file/metadata durability boundary.
+    // Flush the exact renamed file and containing retained directory after the
+    // namespace transition. A failure keeps the no-clobber digest entry in
+    // place so an exact retry can re-confirm both boundaries.
     sync_source_file_for_ack(
         staged.file(),
         Path::new("pinned immutable Windows source object"),
     )?;
+    let retained_directory = directory.open_dir(".").map_err(|error| {
+        KinDbError::StorageError(format!(
+            "failed to clone retained immutable source directory {} after Windows publication: {error}",
+            directory_display.display()
+        ))
+    })?;
+    mmap::sync_directory_handle(&retained_directory.into_std_file(), directory_display)?;
     let identity = windows_source_file_identity(staged.file())?;
     Ok(Some(identity))
 }
@@ -1690,8 +1710,12 @@ pub trait StorageBackend: Send + Sync {
 /// complete base-to-head chain.
 pub struct LocalFileBackend {
     base_path: PathBuf,
-    #[cfg(any(unix, windows))]
-    storage_root_identity: parking_lot::Mutex<Option<LocalStorageRootIdentity>>,
+    storage_root_capability: parking_lot::Mutex<Option<std::sync::Arc<LocalStorageRootCapability>>>,
+    repository_namespaces: parking_lot::Mutex<
+        std::collections::HashMap<String, std::sync::Arc<LocalRepositoryCapability>>,
+    >,
+    poisoned_repository_namespaces:
+        parking_lot::Mutex<std::collections::HashMap<String, LocalStorageRootIdentity>>,
     #[cfg(unix)]
     source_root_confirmed_for_process: parking_lot::Mutex<bool>,
     #[cfg(test)]
@@ -1709,86 +1733,389 @@ pub struct LocalFileBackend {
     snapshot_before_authority_commit_hook:
         parking_lot::Mutex<Option<Box<dyn FnOnce() + Send + 'static>>>,
     #[cfg(test)]
+    snapshot_after_authority_commit_hook:
+        parking_lot::Mutex<Option<Box<dyn FnOnce() + Send + 'static>>>,
+    #[cfg(test)]
+    snapshot_retry_before_confirmation_hook:
+        parking_lot::Mutex<Option<Box<dyn FnOnce() + Send + 'static>>>,
+    #[cfg(test)]
+    snapshot_cleanup_before_confirmation_hook:
+        parking_lot::Mutex<Option<Box<dyn FnOnce() + Send + 'static>>>,
+    #[cfg(test)]
+    delta_before_authority_commit_hook:
+        parking_lot::Mutex<Option<Box<dyn FnOnce() + Send + 'static>>>,
+    #[cfg(test)]
+    overlay_after_write_hook: parking_lot::Mutex<Option<Box<dyn FnOnce() + Send + 'static>>>,
+    #[cfg(test)]
     source_blob_after_capability_hook:
         parking_lot::Mutex<Option<Box<dyn FnOnce() + Send + 'static>>>,
     #[cfg(test)]
     source_blob_before_publish_hook: parking_lot::Mutex<Option<Box<dyn FnOnce() + Send + 'static>>>,
 }
 
-#[cfg(any(unix, windows))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(not(windows))]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct LocalStorageRootIdentity {
-    #[cfg(unix)]
     device: u64,
-    #[cfg(unix)]
     inode: u64,
-    #[cfg(windows)]
-    volume_serial: u32,
-    #[cfg(windows)]
-    file_index: u64,
 }
 
-/// Read the exact `BY_HANDLE_FILE_INFORMATION` identity of a storage root.
-///
-/// Windows binds file identity to an open handle rather than to `Metadata`, and
-/// the `std` accessors for those fields are still unstable, so the root is
-/// reopened and its handle information is read through a stable wrapper. The
-/// reopen keeps exactly the reach `symlink_metadata` had: a zero access mask
-/// asks for identity without demanding read rights,
-/// `FILE_FLAG_BACKUP_SEMANTICS` admits a directory handle, and
-/// `FILE_FLAG_OPEN_REPARSE_POINT` leaves a final symlink unfollowed, so a root
-/// swapped for a link after the metadata call cannot redirect identity. A root
-/// that disappeared in that window is absent, exactly as a missing root is at
-/// the metadata call. A volume serial that does not fit the `DWORD` it is
-/// documented to be, and a filesystem that reports no file ID at all, both fail
-/// closed rather than pinning an identity that cannot tell two directories
-/// apart.
 #[cfg(windows)]
-fn windows_storage_root_identity(
-    path: &Path,
-) -> Result<Option<LocalStorageRootIdentity>, KinDbError> {
-    use std::os::windows::fs::OpenOptionsExt;
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-    };
+type LocalStorageRootIdentity = WindowsSourceIdentity;
 
-    let mut options = std::fs::OpenOptions::new();
-    options
-        .access_mode(0)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
-    let root = match options.open(path) {
-        Ok(root) => root,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
+struct LocalStorageRootCapability {
+    /// On Windows every ancestor handle deliberately omits DELETE sharing so
+    /// the process pins the complete canonical path. On Unix the retained
+    /// handles keep all subsequent IO rooted in the opened namespace.
+    directories: Vec<cap_std::fs::Dir>,
+    identity: LocalStorageRootIdentity,
+}
+
+impl LocalStorageRootCapability {
+    fn directory(&self) -> &cap_std::fs::Dir {
+        self.directories
+            .last()
+            .expect("local storage capability always retains its root directory")
+    }
+}
+
+struct LocalRepositoryCapability {
+    repo_id: String,
+    display_path: PathBuf,
+    directory: cap_std::fs::Dir,
+    identity: LocalStorageRootIdentity,
+    publication_sync_pending: std::sync::atomic::AtomicBool,
+    surface_directories: parking_lot::Mutex<
+        std::collections::HashMap<String, std::sync::Arc<LocalSurfaceCapability>>,
+    >,
+    poisoned_surfaces:
+        parking_lot::Mutex<std::collections::HashMap<String, LocalStorageRootIdentity>>,
+    lock_identity: parking_lot::Mutex<Option<LocalRepositoryLockIdentity>>,
+    lock_publication_sync_pending: std::sync::atomic::AtomicBool,
+}
+
+struct LocalSurfaceCapability {
+    name: String,
+    display_path: PathBuf,
+    directory: cap_std::fs::Dir,
+    identity: LocalStorageRootIdentity,
+    publication_sync_pending: std::sync::atomic::AtomicBool,
+}
+
+enum LocalDirectoryCreateOutcome {
+    Published(cap_std::fs::Dir, LocalStorageRootIdentity),
+    PublishedUnconfirmed {
+        directory: cap_std::fs::Dir,
+        identity: LocalStorageRootIdentity,
+        error: KinDbError,
+    },
+    CompetingTarget,
+    Displaced {
+        identity: LocalStorageRootIdentity,
+        error: KinDbError,
+    },
+}
+
+fn retained_local_directory_is_empty(
+    directory: &cap_std::fs::Dir,
+    display_path: &Path,
+) -> Result<bool, KinDbError> {
+    let mut entries = directory.entries().map_err(|error| {
+        KinDbError::StorageError(format!(
+            "failed to inspect retained local directory {}: {error}",
+            display_path.display()
+        ))
+    })?;
+    match entries.next() {
+        Some(Ok(_)) => Ok(false),
+        Some(Err(error)) => Err(KinDbError::StorageError(format!(
+            "failed to inspect an entry in retained local directory {}: {error}",
+            display_path.display()
+        ))),
+        None => Ok(true),
+    }
+}
+
+fn confirm_pending_local_directory_publication(
+    parent: &cap_std::fs::Dir,
+    parent_display_path: &Path,
+    child_display_path: &Path,
+    pending: &std::sync::atomic::AtomicBool,
+) -> Result<(), KinDbError> {
+    if !pending.load(std::sync::atomic::Ordering::SeqCst) {
+        return Ok(());
+    }
+    let parent_clone =
+        mmap::open_directory_handle_at(parent, Path::new("."), parent_display_path).map_err(
+            |error| {
+                KinDbError::StorageError(format!(
+                    "failed to clone retained parent directory {} while confirming publication of {}: {error}",
+                    parent_display_path.display(),
+                    child_display_path.display()
+                ))
+            },
+        )?;
+    mmap::sync_directory_handle(&parent_clone, parent_display_path)?;
+    pending.store(false, std::sync::atomic::Ordering::SeqCst);
+    Ok(())
+}
+
+#[cfg(unix)]
+type LocalRepositoryLockIdentity = LocalStorageRootIdentity;
+
+#[cfg(windows)]
+type LocalRepositoryLockIdentity = WindowsSourceIdentity;
+
+#[cfg(not(any(unix, windows)))]
+type LocalRepositoryLockIdentity = LocalStorageRootIdentity;
+
+impl std::fmt::Debug for LocalSurfaceCapability {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LocalSurfaceCapability")
+            .field("name", &self.name)
+            .field("display_path", &self.display_path)
+            .field("identity", &self.identity)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for LocalRepositoryCapability {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LocalRepositoryCapability")
+            .field("repo_id", &self.repo_id)
+            .field("display_path", &self.display_path)
+            .field("identity", &self.identity)
+            .finish_non_exhaustive()
+    }
+}
+
+impl LocalRepositoryCapability {
+    fn display(&self, relative: &Path) -> PathBuf {
+        self.display_path.join(relative)
+    }
+
+    fn is_empty(&self) -> Result<bool, KinDbError> {
+        retained_local_directory_is_empty(&self.directory, &self.display_path)
+    }
+
+    fn exists(&self, relative: &Path) -> Result<bool, KinDbError> {
+        match self.directory.symlink_metadata(relative) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(KinDbError::StorageError(format!(
+                "failed to inspect retained repository path {}: {error}",
+                self.display(relative).display()
+            ))),
+        }
+    }
+
+    fn read_regular_bounded(
+        &self,
+        relative: &Path,
+        role: &str,
+        max_bytes: u64,
+    ) -> Result<Vec<u8>, KinDbError> {
+        mmap::read_regular_bounded_at(
+            &self.directory,
+            relative,
+            &self.display_path,
+            role,
+            max_bytes,
+        )
+    }
+
+    fn sync_parent(&self, relative: &Path) -> Result<(), KinDbError> {
+        mmap::sync_parent_dir_at(&self.directory, relative, &self.display_path)
+    }
+
+    fn open_surface(&self, name: &str) -> Result<Option<LocalSurfaceCapability>, KinDbError> {
+        let display_path = self.display_path.join(name);
+        let Some((directory, identity)) = LocalFileBackend::bind_existing_local_directory_at(
+            &self.directory,
+            name.as_ref(),
+            &display_path,
+            LocalDirectoryBindKind::Surface,
+        )?
+        else {
+            return Ok(None);
+        };
+        let publication_sync_pending =
+            retained_local_directory_is_empty(&directory, &display_path)?;
+        Ok(Some(LocalSurfaceCapability {
+            name: name.to_string(),
+            display_path,
+            directory,
+            identity,
+            publication_sync_pending: std::sync::atomic::AtomicBool::new(publication_sync_pending),
+        }))
+    }
+
+    fn surface(
+        &self,
+        name: &str,
+        create: bool,
+    ) -> Result<Option<std::sync::Arc<LocalSurfaceCapability>>, KinDbError> {
+        validate_local_storage_component(name, "repository surface")?;
+        let mut surfaces = self.surface_directories.lock();
+        if self.poisoned_surfaces.lock().contains_key(name) {
             return Err(KinDbError::StorageError(format!(
-                "failed to inspect local storage root {}: {error}",
-                path.display()
+                "local repository surface {} was displaced during creation; this backend will not bind a replacement epoch",
+                self.display_path.join(name).display()
+            )));
+        }
+        if let Some(expected) = surfaces.get(name) {
+            let current = self.open_surface(name)?;
+            return match current {
+                Some(current) if current.identity == expected.identity => {
+                    confirm_pending_local_directory_publication(
+                        &self.directory,
+                        &self.display_path,
+                        &expected.display_path,
+                        &expected.publication_sync_pending,
+                    )?;
+                    Ok(Some(std::sync::Arc::clone(expected)))
+                }
+                Some(_) => Err(KinDbError::StorageError(format!(
+                    "local repository surface {} changed since this backend opened",
+                    expected.display_path.display()
+                ))),
+                None => Err(KinDbError::StorageError(format!(
+                    "local repository surface {} was detached after this backend opened",
+                    expected.display_path.display()
+                ))),
+            };
+        }
+
+        let mut current = self.open_surface(name)?;
+        if current.is_none() && create {
+            let display_path = self.display_path.join(name);
+            current = match LocalFileBackend::create_bound_local_directory_at(
+                &self.directory,
+                name.as_ref(),
+                &display_path,
+                LocalDirectoryBindKind::Surface,
+            )? {
+                LocalDirectoryCreateOutcome::Published(directory, identity) => {
+                    Some(LocalSurfaceCapability {
+                        name: name.to_string(),
+                        display_path,
+                        directory,
+                        identity,
+                        publication_sync_pending: std::sync::atomic::AtomicBool::new(false),
+                    })
+                }
+                LocalDirectoryCreateOutcome::PublishedUnconfirmed {
+                    directory,
+                    identity,
+                    error,
+                } => {
+                    let retained = std::sync::Arc::new(LocalSurfaceCapability {
+                        name: name.to_string(),
+                        display_path,
+                        directory,
+                        identity,
+                        publication_sync_pending: std::sync::atomic::AtomicBool::new(true),
+                    });
+                    surfaces.insert(name.to_string(), retained);
+                    return Err(error);
+                }
+                LocalDirectoryCreateOutcome::CompetingTarget => self.open_surface(name)?,
+                LocalDirectoryCreateOutcome::Displaced { identity, error } => {
+                    self.poisoned_surfaces
+                        .lock()
+                        .insert(name.to_string(), identity);
+                    return Err(error);
+                }
+            };
+        }
+        let Some(current) = current else {
+            return Ok(None);
+        };
+        let current = std::sync::Arc::new(current);
+        surfaces.insert(name.to_string(), std::sync::Arc::clone(&current));
+        if create {
+            confirm_pending_local_directory_publication(
+                &self.directory,
+                &self.display_path,
+                &current.display_path,
+                &current.publication_sync_pending,
+            )?;
+        }
+        Ok(Some(current))
+    }
+
+    fn confirm_surface_visible(&self, surface: &LocalSurfaceCapability) -> Result<(), KinDbError> {
+        let current = self.open_surface(&surface.name)?.ok_or_else(|| {
+            KinDbError::StorageError(format!(
+                "local repository surface {} was detached while capability was held",
+                surface.display_path.display()
+            ))
+        })?;
+        if current.identity != surface.identity {
+            return Err(KinDbError::StorageError(format!(
+                "local repository surface {} changed while capability was held",
+                surface.display_path.display()
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl LocalSurfaceCapability {
+    fn display(&self, leaf: &Path) -> PathBuf {
+        self.display_path.join(leaf)
+    }
+
+    fn require_leaf(leaf: &Path) -> Result<(), KinDbError> {
+        let mut components = leaf.components();
+        if matches!(components.next(), Some(std::path::Component::Normal(_)))
+            && components.next().is_none()
+        {
+            Ok(())
+        } else {
+            Err(KinDbError::StorageError(format!(
+                "local repository surface path must be one exact leaf: {}",
+                leaf.display()
             )))
         }
-    };
-    let information = winapi_util::file::information(&root).map_err(|error| {
-        KinDbError::StorageError(format!(
-            "failed to inspect local storage root {}: {error}",
-            path.display()
-        ))
-    })?;
-    let volume_serial = u32::try_from(information.volume_serial_number()).map_err(|_| {
-        KinDbError::StorageError(format!(
-            "local storage root {} has no stable volume identity",
-            path.display()
-        ))
-    })?;
-    let file_index = information.file_index();
-    if file_index == 0 {
-        return Err(KinDbError::StorageError(format!(
-            "local storage root {} has no stable file identity",
-            path.display()
-        )));
     }
-    Ok(Some(LocalStorageRootIdentity {
-        volume_serial,
-        file_index,
-    }))
+
+    fn exists(&self, leaf: &Path) -> Result<bool, KinDbError> {
+        Self::require_leaf(leaf)?;
+        match self.directory.symlink_metadata(leaf) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(KinDbError::StorageError(format!(
+                "failed to inspect retained repository surface path {}: {error}",
+                self.display(leaf).display()
+            ))),
+        }
+    }
+
+    fn atomic_write(&self, leaf: &Path, data: &[u8]) -> Result<(), KinDbError> {
+        Self::require_leaf(leaf)?;
+        mmap::atomic_write_bytes_no_magic_at(&self.directory, leaf, &self.display_path, data)
+    }
+
+    fn read_regular(&self, leaf: &Path, role: &str) -> Result<Vec<u8>, KinDbError> {
+        Self::require_leaf(leaf)?;
+        mmap::read_regular_file_at(&self.directory, leaf, &self.display_path, role)
+    }
+
+    fn sync(&self, leaf: &Path) -> Result<(), KinDbError> {
+        Self::require_leaf(leaf)?;
+        mmap::sync_parent_dir_at(&self.directory, leaf, &self.display_path)
+    }
+}
+
+#[derive(Debug)]
+struct LocalRepositoryLock {
+    namespace: std::sync::Arc<LocalRepositoryCapability>,
+    _file: std::fs::File,
+    #[cfg(unix)]
+    _marker_file: std::fs::File,
 }
 
 /// One existing local repository authority held beneath its exclusive
@@ -1801,7 +2128,7 @@ fn windows_storage_root_identity(
 pub(crate) struct LocalAuthorityFreezeLock {
     repo_id: String,
     authority: SnapshotAuthority,
-    _lock_file: std::fs::File,
+    lock: LocalRepositoryLock,
 }
 
 impl LocalAuthorityFreezeLock {
@@ -1818,6 +2145,10 @@ impl LocalAuthorityFreezeLock {
                 self.repo_id
             )))
         }
+    }
+
+    fn namespace(&self) -> &LocalRepositoryCapability {
+        &self.lock.namespace
     }
 }
 
@@ -1848,14 +2179,17 @@ impl LocalFileBackend {
     /// Create a new local backend rooted at `base_path`.
     pub fn new(base_path: impl Into<PathBuf>) -> Self {
         let base_path = base_path.into();
-        #[cfg(any(unix, windows))]
-        let storage_root_identity = Self::inspect_storage_root_identity(&base_path)
+        let storage_root_capability = Self::open_storage_root_capability(&base_path)
             .ok()
-            .flatten();
+            .flatten()
+            .map(std::sync::Arc::new);
         Self {
             base_path,
-            #[cfg(any(unix, windows))]
-            storage_root_identity: parking_lot::Mutex::new(storage_root_identity),
+            storage_root_capability: parking_lot::Mutex::new(storage_root_capability),
+            repository_namespaces: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            poisoned_repository_namespaces: parking_lot::Mutex::new(
+                std::collections::HashMap::new(),
+            ),
             #[cfg(unix)]
             source_root_confirmed_for_process: parking_lot::Mutex::new(false),
             #[cfg(test)]
@@ -1871,6 +2205,16 @@ impl LocalFileBackend {
             #[cfg(test)]
             snapshot_before_authority_commit_hook: parking_lot::Mutex::new(None),
             #[cfg(test)]
+            snapshot_after_authority_commit_hook: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            snapshot_retry_before_confirmation_hook: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            snapshot_cleanup_before_confirmation_hook: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            delta_before_authority_commit_hook: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            overlay_after_write_hook: parking_lot::Mutex::new(None),
+            #[cfg(test)]
             source_blob_after_capability_hook: parking_lot::Mutex::new(None),
             #[cfg(test)]
             source_blob_before_publish_hook: parking_lot::Mutex::new(None),
@@ -1882,11 +2226,531 @@ impl LocalFileBackend {
         &self.base_path
     }
 
-    #[cfg(any(unix, windows))]
-    fn inspect_storage_root_identity(
-        path: &Path,
+    #[cfg(not(windows))]
+    fn directory_identity(
+        directory: &cap_std::fs::Dir,
+    ) -> Result<LocalStorageRootIdentity, KinDbError> {
+        use cap_fs_ext::MetadataExt;
+
+        let metadata = directory.dir_metadata().map_err(|error| {
+            KinDbError::StorageError(format!(
+                "failed to inspect retained local directory capability: {error}"
+            ))
+        })?;
+        if !metadata.is_dir() {
+            return Err(KinDbError::StorageError(
+                "retained local namespace capability is not a directory".to_string(),
+            ));
+        }
+        Ok(LocalStorageRootIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+
+    #[cfg(windows)]
+    fn directory_identity(
+        directory: &cap_std::fs::Dir,
+    ) -> Result<LocalStorageRootIdentity, KinDbError> {
+        windows_source_directory_identity(directory)
+    }
+
+    #[cfg(not(windows))]
+    fn local_directory_entry_identity(
+        parent: &cap_std::fs::Dir,
+        component: &std::ffi::OsStr,
+        display_path: &Path,
     ) -> Result<Option<LocalStorageRootIdentity>, KinDbError> {
-        let metadata = match std::fs::symlink_metadata(path) {
+        use cap_fs_ext::MetadataExt;
+
+        let metadata = match parent.symlink_metadata(component) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(KinDbError::StorageError(format!(
+                    "failed to inspect local directory namespace {}: {error}",
+                    display_path.display()
+                )))
+            }
+        };
+        #[cfg(windows)]
+        if windows_source_metadata_is_reparse(&metadata) {
+            return Err(KinDbError::StorageError(format!(
+                "local directory namespace {} is a reparse point",
+                display_path.display()
+            )));
+        }
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(KinDbError::StorageError(format!(
+                "local directory namespace {} is not a real directory",
+                display_path.display()
+            )));
+        }
+        Ok(Some(LocalStorageRootIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }))
+    }
+
+    #[cfg(windows)]
+    fn local_directory_entry_identity(
+        parent: &cap_std::fs::Dir,
+        component: &std::ffi::OsStr,
+        display_path: &Path,
+    ) -> Result<Option<LocalStorageRootIdentity>, KinDbError> {
+        let metadata = match parent.symlink_metadata(component) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(KinDbError::StorageError(format!(
+                    "failed to inspect local directory namespace {}: {error}",
+                    display_path.display()
+                )))
+            }
+        };
+        if windows_source_metadata_is_reparse(&metadata) {
+            return Err(KinDbError::StorageError(format!(
+                "local directory namespace {} is a reparse point",
+                display_path.display()
+            )));
+        }
+        if !metadata.is_dir() {
+            return Err(KinDbError::StorageError(format!(
+                "local directory namespace {} is not a real directory",
+                display_path.display()
+            )));
+        }
+        let directory = Self::open_local_directory_at(parent, component, display_path)?;
+        Ok(Some(Self::directory_identity(&directory)?))
+    }
+
+    /// Open one existing descendant directory and prove that the entry seen
+    /// before the no-follow open, the retained handle, and the entry visible
+    /// afterwards are all the same namespace epoch.
+    fn bind_existing_local_directory_at(
+        parent: &cap_std::fs::Dir,
+        component: &std::ffi::OsStr,
+        display_path: &Path,
+        kind: LocalDirectoryBindKind,
+    ) -> Result<Option<(cap_std::fs::Dir, LocalStorageRootIdentity)>, KinDbError> {
+        let Some(before) = Self::local_directory_entry_identity(parent, component, display_path)?
+        else {
+            return Ok(None);
+        };
+        run_local_directory_after_preopen_hook(kind);
+        let directory = if matches!(kind, LocalDirectoryBindKind::Staging) {
+            Self::open_staging_local_directory_at(parent, component, display_path)?
+        } else {
+            Self::open_local_directory_at(parent, component, display_path)?
+        };
+        let opened = Self::directory_identity(&directory)?;
+        let after = Self::local_directory_entry_identity(parent, component, display_path)?
+            .ok_or_else(|| {
+                KinDbError::StorageError(format!(
+                    "local directory namespace {} was detached while its retained capability was opened",
+                    display_path.display()
+                ))
+            })?;
+        if before != opened || after != opened {
+            return Err(KinDbError::StorageError(format!(
+                "local directory namespace {} changed while its retained capability was opened",
+                display_path.display()
+            )));
+        }
+        Ok(Some((directory, opened)))
+    }
+
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "visionos"
+    ))]
+    fn rename_local_directory_no_replace(
+        parent: &cap_std::fs::Dir,
+        source: &std::ffi::OsStr,
+        target: &std::ffi::OsStr,
+    ) -> Result<bool, KinDbError> {
+        use std::os::unix::ffi::OsStrExt;
+
+        let source = CString::new(source.as_bytes()).map_err(|_| {
+            KinDbError::StorageError("staged local directory name contains NUL".to_string())
+        })?;
+        let target = CString::new(target.as_bytes()).map_err(|_| {
+            KinDbError::StorageError("local directory name contains NUL".to_string())
+        })?;
+        // SAFETY: both names are single NUL-terminated components and both
+        // directory descriptors are the same retained parent capability.
+        let result = unsafe {
+            libc::renameatx_np(
+                parent.as_raw_fd(),
+                source.as_ptr(),
+                parent.as_raw_fd(),
+                target.as_ptr(),
+                libc::RENAME_EXCL,
+            )
+        };
+        if result == 0 {
+            return Ok(true);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            Ok(false)
+        } else {
+            Err(KinDbError::StorageError(format!(
+                "failed to publish retained local directory without replacement: {error}"
+            )))
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn rename_local_directory_no_replace(
+        parent: &cap_std::fs::Dir,
+        source: &std::ffi::OsStr,
+        target: &std::ffi::OsStr,
+    ) -> Result<bool, KinDbError> {
+        use std::os::unix::ffi::OsStrExt;
+
+        let source = CString::new(source.as_bytes()).map_err(|_| {
+            KinDbError::StorageError("staged local directory name contains NUL".to_string())
+        })?;
+        let target = CString::new(target.as_bytes()).map_err(|_| {
+            KinDbError::StorageError("local directory name contains NUL".to_string())
+        })?;
+        // SAFETY: both names are single NUL-terminated components and both
+        // directory descriptors are the same retained parent capability.
+        let result = unsafe {
+            libc::renameat2(
+                parent.as_raw_fd(),
+                source.as_ptr(),
+                parent.as_raw_fd(),
+                target.as_ptr(),
+                libc::RENAME_NOREPLACE as libc::c_uint,
+            )
+        };
+        if result == 0 {
+            return Ok(true);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            Ok(false)
+        } else {
+            Err(KinDbError::StorageError(format!(
+                "failed to publish retained local directory without replacement: {error}"
+            )))
+        }
+    }
+
+    #[cfg(windows)]
+    fn rename_local_directory_no_replace(
+        parent: &cap_std::fs::Dir,
+        source: &std::ffi::OsStr,
+        target: &std::ffi::OsStr,
+    ) -> Result<bool, KinDbError> {
+        match parent.rename(source, parent, target) {
+            Ok(()) => Ok(true),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::AlreadyExists
+                        | std::io::ErrorKind::DirectoryNotEmpty
+                        | std::io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                // Windows rename does not replace an existing directory.
+                // PermissionDenied is also the result when a competing
+                // retained no-delete-share handle already owns the target.
+                Ok(false)
+            }
+            Err(error) => Err(KinDbError::StorageError(format!(
+                "failed to publish retained Windows local directory without replacement: {error}"
+            ))),
+        }
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "tvos",
+            target_os = "watchos",
+            target_os = "visionos",
+            target_os = "linux",
+            target_os = "android"
+        ))
+    ))]
+    fn rename_local_directory_no_replace(
+        _parent: &cap_std::fs::Dir,
+        _source: &std::ffi::OsStr,
+        _target: &std::ffi::OsStr,
+    ) -> Result<bool, KinDbError> {
+        Err(KinDbError::StorageError(
+            "secure no-replace local directory publication is unavailable on this platform; create the repository namespace out of band or use the GCS backend"
+                .to_string(),
+        ))
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn rename_local_directory_no_replace(
+        _parent: &cap_std::fs::Dir,
+        _source: &std::ffi::OsStr,
+        _target: &std::ffi::OsStr,
+    ) -> Result<bool, KinDbError> {
+        Err(KinDbError::StorageError(
+            "secure no-replace local directory publication is unavailable on this platform; use the GCS backend"
+                .to_string(),
+        ))
+    }
+
+    /// Create one descendant directory under an unpredictable staging name,
+    /// retain that exact handle, and atomically publish it without replacing a
+    /// competing target.
+    fn create_bound_local_directory_at(
+        parent: &cap_std::fs::Dir,
+        component: &std::ffi::OsStr,
+        display_path: &Path,
+        kind: LocalDirectoryBindKind,
+    ) -> Result<LocalDirectoryCreateOutcome, KinDbError> {
+        let staging_name = format!(".kin-create-{}", uuid::Uuid::new_v4().as_hyphenated());
+        let staging_display = display_path.with_file_name(&staging_name);
+        parent.create_dir(&staging_name).map_err(|error| {
+            KinDbError::StorageError(format!(
+                "failed to create randomized local directory staging namespace {}: {error}",
+                staging_display.display()
+            ))
+        })?;
+        let (directory, identity) = Self::bind_existing_local_directory_at(
+            parent,
+            staging_name.as_ref(),
+            &staging_display,
+            LocalDirectoryBindKind::Staging,
+        )?
+        .ok_or_else(|| {
+            KinDbError::StorageError(format!(
+                "randomized local directory staging namespace {} disappeared during creation",
+                staging_display.display()
+            ))
+        })?;
+        let staging_clone =
+            mmap::open_directory_handle_at(&directory, Path::new("."), &staging_display).map_err(
+                |error| {
+                    KinDbError::StorageError(format!(
+                        "failed to clone randomized local directory staging capability {}: {error}",
+                        staging_display.display()
+                    ))
+                },
+            )?;
+        mmap::sync_directory_handle(&staging_clone, &staging_display)?;
+        if !Self::rename_local_directory_no_replace(parent, staging_name.as_ref(), component)? {
+            tracing::warn!(
+                path = %staging_display.display(),
+                target = %display_path.display(),
+                "preserved an unlinked randomized directory stage after a competing namespace won publication"
+            );
+            return Ok(LocalDirectoryCreateOutcome::CompetingTarget);
+        }
+        let parent_display = display_path.parent().unwrap_or_else(|| Path::new("."));
+        let publication_sync_error =
+            match mmap::open_directory_handle_at(parent, Path::new("."), parent_display) {
+                Ok(parent_clone) => {
+                    mmap::sync_directory_handle(&parent_clone, parent_display).err()
+                }
+                Err(error) => Some(KinDbError::StorageError(format!(
+                    "failed to clone retained local parent directory for publication sync: {error}"
+                ))),
+            };
+        // Deterministic adversarial tests replace the just-published target
+        // here. Production has no hook.
+        run_local_directory_after_preopen_hook(kind);
+        let visible = match Self::local_directory_entry_identity(parent, component, display_path) {
+            Ok(Some(visible)) => visible,
+            Ok(None) => {
+                return Ok(LocalDirectoryCreateOutcome::Displaced {
+                    identity,
+                    error: KinDbError::StorageError(format!(
+                        "newly published local directory namespace {} was detached before admission",
+                        display_path.display()
+                    )),
+                })
+            }
+            Err(error) => {
+                return Ok(LocalDirectoryCreateOutcome::Displaced {
+                    identity,
+                    error: KinDbError::StorageError(format!(
+                        "newly published local directory namespace {} could not be confirmed before admission: {error}",
+                        display_path.display()
+                    )),
+                })
+            }
+        };
+        if visible != identity {
+            return Ok(LocalDirectoryCreateOutcome::Displaced {
+                identity,
+                error: KinDbError::StorageError(format!(
+                    "newly published local directory namespace {} was replaced before admission",
+                    display_path.display()
+                )),
+            });
+        }
+        let (retained, retained_identity) =
+            match Self::bind_existing_local_directory_at(parent, component, display_path, kind) {
+                Ok(Some(retained)) => retained,
+                Ok(None) => {
+                    return Ok(LocalDirectoryCreateOutcome::Displaced {
+                        identity,
+                        error: KinDbError::StorageError(format!(
+                            "newly published local directory namespace {} disappeared before its final retained handle was opened",
+                            display_path.display()
+                        )),
+                    })
+                }
+                Err(error) => {
+                    return Ok(LocalDirectoryCreateOutcome::Displaced {
+                        identity,
+                        error: KinDbError::StorageError(format!(
+                            "newly published local directory namespace {} could not be rebound to its final retained handle: {error}",
+                            display_path.display()
+                        )),
+                    })
+                }
+            };
+        if retained_identity != identity {
+            return Ok(LocalDirectoryCreateOutcome::Displaced {
+                identity,
+                error: KinDbError::StorageError(format!(
+                    "newly published local directory namespace {} changed before its final retained handle was opened",
+                    display_path.display()
+                )),
+            });
+        }
+        match publication_sync_error {
+            Some(error) => Ok(LocalDirectoryCreateOutcome::PublishedUnconfirmed {
+                directory: retained,
+                identity: retained_identity,
+                error,
+            }),
+            None => Ok(LocalDirectoryCreateOutcome::Published(
+                retained,
+                retained_identity,
+            )),
+        }
+    }
+
+    #[cfg(unix)]
+    fn visible_directory_identity(
+        metadata: &std::fs::Metadata,
+    ) -> Option<LocalStorageRootIdentity> {
+        use std::os::unix::fs::MetadataExt;
+
+        Some(LocalStorageRootIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+
+    #[cfg(windows)]
+    fn visible_directory_identity(
+        _metadata: &std::fs::Metadata,
+    ) -> Option<LocalStorageRootIdentity> {
+        // `MetadataExt::file_index` exposes only the legacy 64-bit file
+        // index. ReFS and other Windows filesystems may require the complete
+        // `FILE_ID_128`, so visible path metadata must never be treated as an
+        // authoritative namespace identity. Retained handles omit
+        // `FILE_SHARE_DELETE`, and every identity comparison uses
+        // `GetFileInformationByHandleEx(FileIdInfo)` instead.
+        None
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn visible_directory_identity(
+        _metadata: &std::fs::Metadata,
+    ) -> Option<LocalStorageRootIdentity> {
+        None
+    }
+
+    fn open_local_directory_at(
+        parent: &cap_std::fs::Dir,
+        component: &std::ffi::OsStr,
+        display_path: &Path,
+    ) -> Result<cap_std::fs::Dir, KinDbError> {
+        Self::open_local_directory_at_with_sharing(parent, component, display_path, false)
+    }
+
+    fn open_staging_local_directory_at(
+        parent: &cap_std::fs::Dir,
+        component: &std::ffi::OsStr,
+        display_path: &Path,
+    ) -> Result<cap_std::fs::Dir, KinDbError> {
+        // The randomized staging handle must permit its own same-process
+        // rename on Windows. It is never returned as the final retained
+        // capability: publication is followed by an identity-equal reopen
+        // that omits FILE_SHARE_DELETE.
+        Self::open_local_directory_at_with_sharing(parent, component, display_path, true)
+    }
+
+    fn open_local_directory_at_with_sharing(
+        parent: &cap_std::fs::Dir,
+        component: &std::ffi::OsStr,
+        display_path: &Path,
+        allow_delete_share: bool,
+    ) -> Result<cap_std::fs::Dir, KinDbError> {
+        use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt, OpenOptionsMaybeDirExt};
+
+        #[cfg(windows)]
+        validate_windows_source_component(component)?;
+        let mut options = cap_std::fs::OpenOptions::new();
+        options
+            .read(true)
+            .follow(FollowSymlinks::No)
+            .maybe_dir(true);
+        #[cfg(windows)]
+        {
+            use cap_std::fs::OpenOptionsExt;
+            use windows_sys::Win32::Storage::FileSystem::{
+                FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+            };
+            let mut share_mode = FILE_SHARE_READ | FILE_SHARE_WRITE;
+            if allow_delete_share {
+                share_mode |= FILE_SHARE_DELETE;
+            }
+            options.share_mode(share_mode);
+        }
+        #[cfg(not(windows))]
+        let _ = allow_delete_share;
+        let file = parent.open_with(component, &options).map_err(|error| {
+            KinDbError::StorageError(format!(
+                "failed to open retained local directory {} without following links: {error}",
+                display_path.display()
+            ))
+        })?;
+        let metadata = file.metadata().map_err(|error| {
+            KinDbError::StorageError(format!(
+                "failed to inspect retained local directory {}: {error}",
+                display_path.display()
+            ))
+        })?;
+        #[cfg(windows)]
+        if windows_source_metadata_is_reparse(&metadata) {
+            return Err(KinDbError::StorageError(format!(
+                "retained local directory {} is a reparse point",
+                display_path.display()
+            )));
+        }
+        if !metadata.is_dir() {
+            return Err(KinDbError::StorageError(format!(
+                "retained local namespace {} is not a directory",
+                display_path.display()
+            )));
+        }
+        Ok(cap_std::fs::Dir::from_std_file(file.into_std()))
+    }
+
+    fn open_storage_root_capability(
+        path: &Path,
+    ) -> Result<Option<LocalStorageRootCapability>, KinDbError> {
+        let visible = match std::fs::symlink_metadata(path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => {
@@ -1896,95 +2760,435 @@ impl LocalFileBackend {
                 )))
             }
         };
-        #[cfg(unix)]
-        {
-            if metadata.file_type().is_symlink() || !metadata.is_dir() {
-                return Err(KinDbError::StorageError(format!(
-                    "local storage root {} is not a real directory",
-                    path.display()
-                )));
-            }
-            Ok(Some(LocalStorageRootIdentity {
-                device: metadata.dev(),
-                inode: metadata.ino(),
-            }))
+        if visible.file_type().is_symlink() || !visible.is_dir() {
+            return Err(KinDbError::StorageError(format!(
+                "local storage root {} is not a real directory",
+                path.display()
+            )));
         }
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::MetadataExt;
-            use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
-
-            if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 || !metadata.is_dir()
-            {
+        let visible_identity = Self::visible_directory_identity(&visible);
+        let canonical = std::fs::canonicalize(path).map_err(|error| {
+            KinDbError::StorageError(format!(
+                "failed to resolve local storage root {}: {error}",
+                path.display()
+            ))
+        })?;
+        let ambient_root = canonical
+            .ancestors()
+            .last()
+            .filter(|ancestor| !ancestor.as_os_str().is_empty())
+            .ok_or_else(|| {
+                KinDbError::StorageError(format!(
+                    "local storage root has no filesystem root: {}",
+                    canonical.display()
+                ))
+            })?;
+        let relative = canonical.strip_prefix(ambient_root).map_err(|_| {
+            KinDbError::StorageError(format!(
+                "local storage root is not beneath its filesystem root: {}",
+                canonical.display()
+            ))
+        })?;
+        let root = cap_std::fs::Dir::open_ambient_dir(ambient_root, cap_std::ambient_authority())
+            .map_err(|error| {
+            KinDbError::StorageError(format!(
+                "failed to open local filesystem root {}: {error}",
+                ambient_root.display()
+            ))
+        })?;
+        let mut directories = vec![root];
+        let mut display = ambient_root.to_path_buf();
+        for component in relative.components() {
+            let std::path::Component::Normal(name) = component else {
                 return Err(KinDbError::StorageError(format!(
-                    "local storage root {} is not a real directory",
+                    "local storage root contains an unsupported component: {}",
+                    canonical.display()
+                )));
+            };
+            display.push(name);
+            let next = Self::open_local_directory_at(
+                directories
+                    .last()
+                    .expect("filesystem root capability was inserted"),
+                name,
+                &display,
+            )?;
+            directories.push(next);
+        }
+        let identity = Self::directory_identity(
+            directories
+                .last()
+                .expect("local storage capability retains its root"),
+        )?;
+        if visible_identity.is_some_and(|visible| visible != identity) {
+            return Err(KinDbError::StorageError(format!(
+                "local storage root {} changed while its retained capability was opened",
+                path.display()
+            )));
+        }
+
+        let absolute = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map_err(|error| {
+                    KinDbError::StorageError(format!(
+                        "failed to resolve current directory for local storage root: {error}"
+                    ))
+                })?
+                .join(path)
+        };
+        if let (Some(parent), Some(name)) = (absolute.parent(), absolute.file_name()) {
+            let canonical_parent = std::fs::canonicalize(parent).map_err(|error| {
+                KinDbError::StorageError(format!(
+                    "failed to resolve local storage root parent {}: {error}",
+                    parent.display()
+                ))
+            })?;
+            let parent_capability =
+                cap_std::fs::Dir::open_ambient_dir(&canonical_parent, cap_std::ambient_authority())
+                    .map_err(|error| {
+                        KinDbError::StorageError(format!(
+                            "failed to open local storage root parent {}: {error}",
+                            canonical_parent.display()
+                        ))
+                    })?;
+            let reopened = Self::open_local_directory_at(&parent_capability, name, &absolute)?;
+            if Self::directory_identity(&reopened)? != identity {
+                return Err(KinDbError::StorageError(format!(
+                    "local storage root {} changed before its retained capability was pinned",
                     path.display()
                 )));
             }
-            windows_storage_root_identity(path)
+        }
+        let post_visible = std::fs::symlink_metadata(path).map_err(|error| {
+            KinDbError::StorageError(format!(
+                "failed to recheck local storage root {} after pinning: {error}",
+                path.display()
+            ))
+        })?;
+        if post_visible.file_type().is_symlink() || !post_visible.is_dir() {
+            return Err(KinDbError::StorageError(format!(
+                "local storage root {} changed to a non-directory or link while being pinned",
+                path.display()
+            )));
+        }
+        if Self::visible_directory_identity(&post_visible)
+            .is_some_and(|visible| visible != identity)
+        {
+            return Err(KinDbError::StorageError(format!(
+                "local storage root {} changed while being pinned",
+                path.display()
+            )));
+        }
+        Ok(Some(LocalStorageRootCapability {
+            directories,
+            identity,
+        }))
+    }
+
+    /// Confirm and return the exact storage-root capability first observed by
+    /// this backend. A newly appearing root may be bound only if this process
+    /// has never observed an earlier root epoch.
+    fn storage_root_capability(
+        &self,
+    ) -> Result<Option<std::sync::Arc<LocalStorageRootCapability>>, KinDbError> {
+        let current = Self::open_storage_root_capability(&self.base_path)?;
+        let mut expected = self.storage_root_capability.lock();
+        match (expected.as_ref(), current) {
+            (Some(expected), Some(current)) if expected.identity == current.identity => {
+                Ok(Some(std::sync::Arc::clone(expected)))
+            }
+            (Some(_), Some(_)) => Err(KinDbError::StorageError(format!(
+                "local storage root {} changed since this backend opened; refusing to bind a replacement repository namespace",
+                self.base_path.display()
+            ))),
+            (Some(_), None) => Err(KinDbError::StorageError(format!(
+                "local storage root {} was detached after this backend opened",
+                self.base_path.display()
+            ))),
+            (None, Some(current)) => {
+                let current = std::sync::Arc::new(current);
+                *expected = Some(std::sync::Arc::clone(&current));
+                Ok(Some(current))
+            }
+            (None, None) => Ok(None),
         }
     }
 
-    /// Confirm that this backend still names the same storage-root directory it
-    /// first observed. A missing root is acceptable only for a backend that has
-    /// never observed one; writes still refuse to create it.
-    fn confirm_storage_root_identity(&self) -> Result<bool, KinDbError> {
-        #[cfg(any(unix, windows))]
-        {
-            let current = Self::inspect_storage_root_identity(&self.base_path)?;
-            let mut expected = self.storage_root_identity.lock();
-            match (*expected, current) {
-                (Some(expected), Some(current)) if expected == current => Ok(true),
-                (Some(_), Some(_)) => Err(KinDbError::StorageError(format!(
-                    "local storage root {} changed since this backend opened; refusing to bind a replacement repository namespace",
-                    self.base_path.display()
-                ))),
-                (Some(_), None) => Err(KinDbError::StorageError(format!(
-                    "local storage root {} was detached after this backend opened",
-                    self.base_path.display()
-                ))),
-                (None, Some(current)) => {
-                    *expected = Some(current);
-                    Ok(true)
-                }
-                (None, None) => Ok(false),
+    fn open_repository_from_root(
+        root: &LocalStorageRootCapability,
+        repo_id: &str,
+        base_path: &Path,
+    ) -> Result<Option<LocalRepositoryCapability>, KinDbError> {
+        let display_path = base_path.join(repo_id);
+        let Some((directory, identity)) = Self::bind_existing_local_directory_at(
+            root.directory(),
+            repo_id.as_ref(),
+            &display_path,
+            LocalDirectoryBindKind::Repository,
+        )?
+        else {
+            return Ok(None);
+        };
+        let publication_sync_pending =
+            retained_local_directory_is_empty(&directory, &display_path)?;
+        Ok(Some(LocalRepositoryCapability {
+            repo_id: repo_id.to_string(),
+            display_path,
+            directory,
+            identity,
+            publication_sync_pending: std::sync::atomic::AtomicBool::new(publication_sync_pending),
+            surface_directories: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            poisoned_surfaces: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            lock_identity: parking_lot::Mutex::new(None),
+            lock_publication_sync_pending: std::sync::atomic::AtomicBool::new(false),
+        }))
+    }
+
+    fn reject_repository_identity_alias(
+        root: &LocalStorageRootCapability,
+        repo_id: &str,
+        identity: LocalStorageRootIdentity,
+        base_path: &Path,
+    ) -> Result<(), KinDbError> {
+        for entry in root.directory().entries().map_err(|error| {
+            KinDbError::StorageError(format!(
+                "failed to scan local storage root {} for repository aliases: {error}",
+                base_path.display()
+            ))
+        })? {
+            let entry = entry.map_err(|error| {
+                KinDbError::StorageError(format!(
+                    "failed to inspect local repository alias candidate: {error}"
+                ))
+            })?;
+            let name = entry.file_name();
+            if name == std::ffi::OsStr::new(repo_id) {
+                continue;
             }
-        }
-        #[cfg(not(any(unix, windows)))]
-        {
-            let metadata = match std::fs::symlink_metadata(&self.base_path) {
-                Ok(metadata) => metadata,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            let file_type = entry.file_type().map_err(|error| {
+                KinDbError::StorageError(format!(
+                    "failed to inspect local repository alias candidate {}: {error}",
+                    base_path.join(&name).display()
+                ))
+            })?;
+            if !file_type.is_dir() {
+                continue;
+            }
+            let candidate_identity = match Self::bind_existing_local_directory_at(
+                root.directory(),
+                &name,
+                &base_path.join(&name),
+                LocalDirectoryBindKind::Repository,
+            ) {
+                Ok(Some((_candidate, identity))) => identity,
+                Ok(None) => continue,
                 Err(error) => {
                     return Err(KinDbError::StorageError(format!(
-                        "failed to inspect local storage root {}: {error}",
-                        self.base_path.display()
+                        "failed closed while checking repository alias candidate {}: {error}",
+                        base_path.join(&name).display()
                     )))
                 }
             };
-            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            if candidate_identity == identity {
                 return Err(KinDbError::StorageError(format!(
-                    "local storage root {} is not a real directory",
+                    "repository id {repo_id:?} aliases existing directory name {:?} on this filesystem; exact repository identities may not share one storage namespace",
+                    name
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn repository_capability(
+        &self,
+        repo_id: &str,
+        create: bool,
+    ) -> Result<Option<std::sync::Arc<LocalRepositoryCapability>>, KinDbError> {
+        validate_source_blob_repo_id(repo_id)?;
+        let Some(root) = self.storage_root_capability()? else {
+            if create {
+                return Err(KinDbError::StorageError(format!(
+                    "local storage root {} is unavailable; refusing to recreate a detached authority namespace",
                     self.base_path.display()
                 )));
             }
-            Ok(true)
+            return Ok(None);
+        };
+        let mut namespaces = self.repository_namespaces.lock();
+        if self
+            .poisoned_repository_namespaces
+            .lock()
+            .contains_key(repo_id)
+        {
+            return Err(KinDbError::StorageError(format!(
+                "local repository namespace {} was displaced during creation; this backend will not bind a replacement epoch",
+                self.base_path.join(repo_id).display()
+            )));
         }
+        if let Some(expected) = namespaces.get(repo_id) {
+            let current = Self::open_repository_from_root(&root, repo_id, &self.base_path)?;
+            match current {
+                Some(current) if current.identity == expected.identity => {
+                    confirm_pending_local_directory_publication(
+                        root.directory(),
+                        &self.base_path,
+                        &expected.display_path,
+                        &expected.publication_sync_pending,
+                    )?;
+                    return Ok(Some(std::sync::Arc::clone(expected)))
+                }
+                Some(_) => {
+                    return Err(KinDbError::StorageError(format!(
+                        "local repository namespace {} changed since this backend opened; refusing replacement authority",
+                        expected.display_path.display()
+                    )))
+                }
+                None => {
+                    return Err(KinDbError::StorageError(format!(
+                        "local repository namespace {} was detached after this backend opened",
+                        expected.display_path.display()
+                    )))
+                }
+            }
+        }
+
+        let mut current = Self::open_repository_from_root(&root, repo_id, &self.base_path)?;
+        if current.is_none() && create {
+            let display_path = self.base_path.join(repo_id);
+            current = match Self::create_bound_local_directory_at(
+                root.directory(),
+                repo_id.as_ref(),
+                &display_path,
+                LocalDirectoryBindKind::Repository,
+            )? {
+                LocalDirectoryCreateOutcome::Published(directory, identity) => {
+                    Some(LocalRepositoryCapability {
+                        repo_id: repo_id.to_string(),
+                        display_path,
+                        directory,
+                        identity,
+                        publication_sync_pending: std::sync::atomic::AtomicBool::new(false),
+                        surface_directories: parking_lot::Mutex::new(
+                            std::collections::HashMap::new(),
+                        ),
+                        poisoned_surfaces: parking_lot::Mutex::new(std::collections::HashMap::new()),
+                        lock_identity: parking_lot::Mutex::new(None),
+                        lock_publication_sync_pending: std::sync::atomic::AtomicBool::new(false),
+                    })
+                }
+                LocalDirectoryCreateOutcome::PublishedUnconfirmed {
+                    directory,
+                    identity,
+                    error,
+                } => {
+                    let retained = std::sync::Arc::new(LocalRepositoryCapability {
+                        repo_id: repo_id.to_string(),
+                        display_path,
+                        directory,
+                        identity,
+                        publication_sync_pending: std::sync::atomic::AtomicBool::new(true),
+                        surface_directories: parking_lot::Mutex::new(
+                            std::collections::HashMap::new(),
+                        ),
+                        poisoned_surfaces: parking_lot::Mutex::new(std::collections::HashMap::new()),
+                        lock_identity: parking_lot::Mutex::new(None),
+                        lock_publication_sync_pending: std::sync::atomic::AtomicBool::new(false),
+                    });
+                    namespaces.insert(repo_id.to_string(), retained);
+                    return Err(error);
+                }
+                LocalDirectoryCreateOutcome::CompetingTarget => {
+                    Self::open_repository_from_root(&root, repo_id, &self.base_path)?
+                }
+                LocalDirectoryCreateOutcome::Displaced { identity, error } => {
+                    self.poisoned_repository_namespaces
+                        .lock()
+                        .insert(repo_id.to_string(), identity);
+                    return Err(error);
+                }
+            };
+        }
+        let Some(current) = current else {
+            return Ok(None);
+        };
+        if let Some((existing_id, _)) = namespaces.iter().find(|(existing_id, expected)| {
+            existing_id.as_str() != repo_id && expected.identity == current.identity
+        }) {
+            return Err(KinDbError::StorageError(format!(
+                "repository ids {repo_id:?} and {existing_id:?} resolve to the same retained storage namespace"
+            )));
+        }
+        Self::reject_repository_identity_alias(&root, repo_id, current.identity, &self.base_path)?;
+        let current = std::sync::Arc::new(current);
+        namespaces.insert(repo_id.to_string(), std::sync::Arc::clone(&current));
+        if create {
+            confirm_pending_local_directory_publication(
+                root.directory(),
+                &self.base_path,
+                &current.display_path,
+                &current.publication_sync_pending,
+            )?;
+        }
+        Ok(Some(current))
     }
 
+    fn confirm_repository_visible(
+        &self,
+        namespace: &LocalRepositoryCapability,
+    ) -> Result<(), KinDbError> {
+        let root = self.storage_root_capability()?.ok_or_else(|| {
+            KinDbError::StorageError(format!(
+                "local storage root {} disappeared while repository capability was held",
+                self.base_path.display()
+            ))
+        })?;
+        let current = Self::open_repository_from_root(&root, &namespace.repo_id, &self.base_path)?
+            .ok_or_else(|| {
+                KinDbError::StorageError(format!(
+                    "local repository namespace {} was detached while capability was held",
+                    namespace.display_path.display()
+                ))
+            })?;
+        if current.identity != namespace.identity {
+            return Err(KinDbError::StorageError(format!(
+                "local repository namespace {} changed while capability was held",
+                namespace.display_path.display()
+            )));
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
     fn authority_path(&self, repo_id: &str) -> PathBuf {
         self.base_path.join(repo_id).join("authority.json")
     }
 
+    fn authority_relative_path() -> &'static Path {
+        Path::new("authority.json")
+    }
+
+    #[cfg(test)]
     fn snapshots_dir(&self, repo_id: &str) -> PathBuf {
         self.base_path.join(repo_id).join("snapshots")
     }
 
+    fn snapshots_surface_name() -> &'static str {
+        "snapshots"
+    }
+
+    #[cfg(test)]
     fn versioned_snapshot_path(&self, repo_id: &str, generation: Generation) -> PathBuf {
         self.snapshots_dir(repo_id)
             .join(format!("{generation:020}.kndb"))
     }
 
+    fn versioned_snapshot_leaf(generation: Generation) -> PathBuf {
+        PathBuf::from(format!("{generation:020}.kndb"))
+    }
+
+    #[cfg(all(test, unix))]
     fn overlay_path(&self, repo_id: &str, session_id: &str) -> PathBuf {
         self.base_path
             .join(repo_id)
@@ -2005,266 +3209,371 @@ impl LocalFileBackend {
             .join(digest))
     }
 
+    #[cfg(test)]
     fn deltas_dir(&self, repo_id: &str) -> PathBuf {
         self.base_path.join(repo_id).join("deltas")
     }
 
+    fn deltas_surface_name() -> &'static str {
+        "deltas"
+    }
+
+    #[cfg(test)]
     fn delta_path(&self, repo_id: &str, gen: Generation) -> PathBuf {
         self.deltas_dir(repo_id).join(format!("{gen:020}.kndd"))
     }
 
-    fn existing_repository_path(&self, repo_id: &str) -> Result<Option<PathBuf>, KinDbError> {
-        validate_source_blob_repo_id(repo_id)?;
-        if !self.confirm_storage_root_identity()? {
-            return Ok(None);
-        }
-        let repository_path = self.base_path.join(repo_id);
-        let metadata = match std::fs::symlink_metadata(&repository_path) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => {
-                return Err(KinDbError::StorageError(format!(
-                    "failed to inspect local repository authority directory {}: {error}",
-                    repository_path.display()
-                )))
-            }
-        };
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            return Err(KinDbError::StorageError(format!(
-                "local repository authority directory {} is not a real directory",
-                repository_path.display()
-            )));
-        }
-        Ok(Some(repository_path))
+    fn delta_leaf(generation: Generation) -> PathBuf {
+        PathBuf::from(format!("{generation:020}.kndd"))
     }
 
-    fn acquire_lock(&self, repo_id: &str) -> Result<std::fs::File, KinDbError> {
-        validate_source_blob_repo_id(repo_id)?;
-        if !self.confirm_storage_root_identity()? {
-            return Err(KinDbError::StorageError(format!(
-                "local storage root {} is unavailable; refusing to recreate a detached authority namespace",
-                self.base_path.display()
-            )));
+    fn overlays_surface_name() -> &'static str {
+        "overlays"
+    }
+
+    fn overlay_leaf(session_id: &str) -> Result<PathBuf, KinDbError> {
+        validate_local_storage_component(session_id, "overlay session id")?;
+        if session_id.bytes().any(|byte| byte.is_ascii_uppercase()) {
+            return Err(KinDbError::StorageError(
+                "overlay session id must use canonical lowercase ASCII".to_string(),
+            ));
         }
-        let repository_path = self.base_path.join(repo_id);
-        match std::fs::create_dir(&repository_path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => {
-                return Err(KinDbError::StorageError(format!(
-                    "failed to create local repository authority directory {}: {error}",
-                    repository_path.display()
-                )))
-            }
+        let leaf = format!("{session_id}.bin");
+        validate_local_storage_component(&leaf, "overlay session id")?;
+        if leaf.len() > mmap::MAX_ATOMIC_DESTINATION_LEAF_BYTES {
+            return Err(KinDbError::StorageError(
+                "overlay session id exceeds the portable atomic recovery-staging filename budget"
+                    .to_string(),
+            ));
         }
-        self.existing_repository_path(repo_id)?.ok_or_else(|| {
-            KinDbError::StorageError(format!(
-                "local repository authority directory {} disappeared during initialization",
-                repository_path.display()
-            ))
-        })?;
-        let lock_path = repository_path.join(".lock");
-        let mut options = std::fs::OpenOptions::new();
-        options.create(true).read(true).write(true).truncate(false);
+        Ok(PathBuf::from(leaf))
+    }
+
+    fn existing_repository_path(&self, repo_id: &str) -> Result<Option<PathBuf>, KinDbError> {
+        Ok(self
+            .repository_capability(repo_id, false)?
+            .map(|namespace| namespace.display_path.clone()))
+    }
+
+    fn open_repository_lock(
+        namespace: &LocalRepositoryCapability,
+        create: bool,
+    ) -> Result<std::fs::File, KinDbError> {
+        use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt, OpenOptionsMaybeDirExt};
+
+        let lock_path = namespace.display_path.join(".lock");
+        let mut options = cap_std::fs::OpenOptions::new();
+        options
+            .create(create)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .follow(FollowSymlinks::No)
+            .maybe_dir(false);
         #[cfg(unix)]
         {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+            use cap_std::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_CLOEXEC);
         }
         #[cfg(windows)]
         {
-            use std::os::windows::fs::OpenOptionsExt;
-            use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
-            options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+            use cap_std::fs::OpenOptionsExt;
+            use windows_sys::Win32::Storage::FileSystem::{
+                FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+            };
+            options
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
         }
-        let lock_file = options.open(&lock_path).map_err(|error| {
-            KinDbError::StorageError(format!(
-                "failed to open lock file {}: {error}",
-                lock_path.display()
-            ))
-        })?;
+        let lock_file = namespace
+            .directory
+            .open_with(".lock", &options)
+            .map_err(|error| {
+                KinDbError::StorageError(format!(
+                    "failed to open lock file {}: {error}",
+                    lock_path.display()
+                ))
+            })?;
         let opened_metadata = lock_file.metadata().map_err(|error| {
             KinDbError::StorageError(format!(
                 "failed to inspect opened local repository authority lock {}: {error}",
                 lock_path.display()
             ))
         })?;
+        #[cfg(windows)]
+        if windows_source_metadata_is_reparse(&opened_metadata) {
+            return Err(KinDbError::StorageError(format!(
+                "opened local repository authority lock {} is a reparse point",
+                lock_path.display()
+            )));
+        }
         if !opened_metadata.is_file() {
             return Err(KinDbError::StorageError(format!(
                 "opened local repository authority lock {} is not a regular file",
                 lock_path.display()
             )));
         }
+        Ok(lock_file.into_std())
+    }
+
+    #[cfg(unix)]
+    fn repository_lock_identity(
+        lock_file: &std::fs::File,
+    ) -> Result<LocalRepositoryLockIdentity, KinDbError> {
+        use std::os::unix::fs::MetadataExt;
+
+        let metadata = lock_file.metadata().map_err(|error| {
+            KinDbError::StorageError(format!(
+                "failed to inspect repository lock identity: {error}"
+            ))
+        })?;
+        Ok(LocalStorageRootIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+
+    #[cfg(windows)]
+    fn repository_lock_identity(
+        lock_file: &std::fs::File,
+    ) -> Result<LocalRepositoryLockIdentity, KinDbError> {
+        windows_source_file_identity(lock_file)
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn repository_lock_identity(
+        _lock_file: &std::fs::File,
+    ) -> Result<LocalRepositoryLockIdentity, KinDbError> {
+        Err(KinDbError::StorageError(
+            "secure local repository locking is unavailable on this platform; use the GCS backend"
+                .to_string(),
+        ))
+    }
+
+    fn pin_repository_lock_identity(
+        namespace: &LocalRepositoryCapability,
+        lock_file: &std::fs::File,
+    ) -> Result<(), KinDbError> {
+        let observed = Self::repository_lock_identity(lock_file)?;
+        let mut expected = namespace.lock_identity.lock();
+        match *expected {
+            Some(expected) if expected == observed => Ok(()),
+            Some(_) => Err(KinDbError::StorageError(format!(
+                "local repository authority lock {} changed since this repository namespace was retained",
+                namespace.display_path.join(".lock").display()
+            ))),
+            None => {
+                *expected = Some(observed);
+                namespace
+                    .lock_publication_sync_pending
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+        }
+    }
+
+    fn confirm_repository_lock_publication(
+        namespace: &LocalRepositoryCapability,
+    ) -> Result<(), KinDbError> {
+        if !namespace
+            .lock_publication_sync_pending
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Ok(());
+        }
+        mmap::sync_parent_dir_at(
+            &namespace.directory,
+            Path::new(".lock"),
+            &namespace.display_path,
+        )?;
+        namespace
+            .lock_publication_sync_pending
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn repository_lock_target(
+        namespace: &LocalRepositoryCapability,
+        _marker_file: &std::fs::File,
+    ) -> Result<std::fs::File, KinDbError> {
+        mmap::open_directory_handle_at(
+            &namespace.directory,
+            Path::new("."),
+            &namespace.display_path,
+        )
+        .map_err(|error| {
+            KinDbError::StorageError(format!(
+                "failed to clone retained repository directory {} for locking: {error}",
+                namespace.display_path.display()
+            ))
+        })
+    }
+
+    #[cfg(windows)]
+    fn repository_lock_target(
+        _namespace: &LocalRepositoryCapability,
+        marker_file: &std::fs::File,
+    ) -> Result<std::fs::File, KinDbError> {
+        marker_file.try_clone().map_err(|error| {
+            KinDbError::StorageError(format!(
+                "failed to clone retained repository lock handle: {error}"
+            ))
+        })
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn repository_lock_target(
+        _namespace: &LocalRepositoryCapability,
+        _marker_file: &std::fs::File,
+    ) -> Result<std::fs::File, KinDbError> {
+        Err(KinDbError::StorageError(
+            "secure local repository locking is unavailable on this platform; use the GCS backend"
+                .to_string(),
+        ))
+    }
+
+    fn acquire_lock(&self, repo_id: &str) -> Result<LocalRepositoryLock, KinDbError> {
+        let namespace = self.repository_capability(repo_id, true)?.ok_or_else(|| {
+            KinDbError::StorageError(format!(
+                "local repository authority directory {} disappeared during initialization",
+                self.base_path.join(repo_id).display()
+            ))
+        })?;
+        let lock_path = namespace.display_path.join(".lock");
+        let lock_file = Self::open_repository_lock(&namespace, true)?;
+        Self::pin_repository_lock_identity(&namespace, &lock_file)?;
+        Self::confirm_repository_lock_publication(&namespace)?;
+        let lock_target = Self::repository_lock_target(&namespace, &lock_file)?;
         use fs2::FileExt;
-        lock_file.lock_exclusive().map_err(|e| {
+        lock_target.lock_exclusive().map_err(|e| {
             KinDbError::StorageError(format!(
                 "failed to acquire exclusive lock on {}: {e}",
                 lock_path.display()
             ))
         })?;
-        self.confirm_existing_lock_visible(&lock_path, &lock_file)?;
-        if !self.confirm_storage_root_identity()? {
-            return Err(KinDbError::StorageError(format!(
-                "local storage root {} disappeared while Kin acquired its initialization lock",
-                self.base_path.display()
-            )));
-        }
-        Ok(lock_file)
+        self.confirm_existing_lock_visible(&namespace)?;
+        Ok(LocalRepositoryLock {
+            namespace,
+            _file: lock_target,
+            #[cfg(unix)]
+            _marker_file: lock_file,
+        })
     }
 
-    fn acquire_existing_lock(&self, repo_id: &str) -> Result<std::fs::File, KinDbError> {
-        let repository_path = self.existing_repository_path(repo_id)?.ok_or_else(|| {
-            KinDbError::StorageError(format!(
-                "local repository authority directory {} is unavailable for existing-authority access",
-                self.base_path.join(repo_id).display()
-            ))
-        })?;
-
-        let lock_path = repository_path.join(".lock");
-        let lock_metadata = std::fs::symlink_metadata(&lock_path).map_err(|error| {
-            KinDbError::StorageError(format!(
-                "existing local repository authority lock {} is unavailable: {error}",
-                lock_path.display()
-            ))
-        })?;
+    fn acquire_existing_lock(&self, repo_id: &str) -> Result<LocalRepositoryLock, KinDbError> {
+        let namespace = self
+            .repository_capability(repo_id, false)?
+            .ok_or_else(|| {
+                KinDbError::StorageError(format!(
+                    "local repository authority directory {} is unavailable for existing-authority access",
+                    self.base_path.join(repo_id).display()
+                ))
+            })?;
+        let lock_path = namespace.display_path.join(".lock");
+        let lock_metadata = namespace
+            .directory
+            .symlink_metadata(".lock")
+            .map_err(|error| {
+                KinDbError::StorageError(format!(
+                    "existing local repository authority lock {} is unavailable: {error}",
+                    lock_path.display()
+                ))
+            })?;
         if lock_metadata.file_type().is_symlink() || !lock_metadata.is_file() {
             return Err(KinDbError::StorageError(format!(
                 "existing local repository authority lock {} is not a regular file",
                 lock_path.display()
             )));
         }
-
-        let mut options = std::fs::OpenOptions::new();
-        options.read(true).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::OpenOptionsExt;
-            use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
-            options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-        }
-        let lock_file = options.open(&lock_path).map_err(|error| {
-            KinDbError::StorageError(format!(
-                "failed to open existing local repository authority lock {}: {error}",
-                lock_path.display()
-            ))
-        })?;
-        let opened_metadata = lock_file.metadata().map_err(|error| {
-            KinDbError::StorageError(format!(
-                "failed to inspect opened local repository authority lock {}: {error}",
-                lock_path.display()
-            ))
-        })?;
-        if !opened_metadata.is_file() {
-            return Err(KinDbError::StorageError(format!(
-                "opened local repository authority lock {} is not a regular file",
-                lock_path.display()
-            )));
-        }
-
+        let lock_file = Self::open_repository_lock(&namespace, false)?;
+        Self::pin_repository_lock_identity(&namespace, &lock_file)?;
+        Self::confirm_repository_lock_publication(&namespace)?;
+        let lock_target = Self::repository_lock_target(&namespace, &lock_file)?;
         use fs2::FileExt;
-        lock_file.lock_exclusive().map_err(|error| {
+        lock_target.lock_exclusive().map_err(|error| {
             KinDbError::StorageError(format!(
                 "failed to acquire existing local repository authority lock {}: {error}",
                 lock_path.display()
             ))
         })?;
-        self.confirm_existing_lock_visible(&lock_path, &lock_file)?;
-        if !self.confirm_storage_root_identity()? {
-            return Err(KinDbError::StorageError(format!(
-                "local storage root {} disappeared while Kin acquired its existing-authority lock",
-                self.base_path.display()
-            )));
+        self.confirm_existing_lock_visible(&namespace)?;
+        Ok(LocalRepositoryLock {
+            namespace,
+            _file: lock_target,
+            #[cfg(unix)]
+            _marker_file: lock_file,
+        })
+    }
+
+    fn acquire_lock_for_initialization(
+        &self,
+        repo_id: &str,
+    ) -> Result<LocalRepositoryLock, KinDbError> {
+        let initialize = match self.repository_capability(repo_id, false)? {
+            Some(namespace) => namespace.is_empty()?,
+            None => true,
+        };
+        if initialize {
+            self.acquire_lock(repo_id)
+        } else {
+            self.acquire_existing_lock(repo_id)
         }
-        Ok(lock_file)
     }
 
     fn confirm_existing_lock_visible(
         &self,
-        lock_path: &Path,
-        lock_file: &std::fs::File,
+        namespace: &LocalRepositoryCapability,
     ) -> Result<(), KinDbError> {
-        let visible = std::fs::symlink_metadata(lock_path).map_err(|error| {
-            KinDbError::StorageError(format!(
-                "local repository authority namespace changed while acquiring {}: {error}",
-                lock_path.display()
-            ))
-        })?;
+        let lock_path = namespace.display_path.join(".lock");
+        let visible = namespace
+            .directory
+            .symlink_metadata(".lock")
+            .map_err(|error| {
+                KinDbError::StorageError(format!(
+                    "local repository authority namespace changed while acquiring {}: {error}",
+                    lock_path.display()
+                ))
+            })?;
         if visible.file_type().is_symlink() || !visible.is_file() {
             return Err(KinDbError::StorageError(format!(
                 "local repository authority namespace replaced lock {}",
                 lock_path.display()
             )));
         }
-
-        #[cfg(unix)]
-        {
-            let opened = lock_file.metadata().map_err(|error| {
-                KinDbError::StorageError(format!(
-                    "failed to inspect held local repository authority lock {}: {error}",
-                    lock_path.display()
-                ))
-            })?;
-            if opened.dev() != visible.dev() || opened.ino() != visible.ino() {
-                return Err(KinDbError::StorageError(format!(
-                    "local repository authority lock {} changed while Kin waited",
-                    lock_path.display()
-                )));
-            }
-        }
-        #[cfg(windows)]
-        {
-            let mut options = std::fs::OpenOptions::new();
-            options.read(true).write(true);
-            use std::os::windows::fs::OpenOptionsExt;
-            use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
-            options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-            let visible_file = options.open(lock_path).map_err(|error| {
-                KinDbError::StorageError(format!(
-                    "failed to reopen visible local repository authority lock {}: {error}",
-                    lock_path.display()
-                ))
-            })?;
-            if windows_source_file_identity(lock_file)?
-                != windows_source_file_identity(&visible_file)?
-            {
-                return Err(KinDbError::StorageError(format!(
-                    "local repository authority lock {} changed while Kin waited",
-                    lock_path.display()
-                )));
-            }
-        }
-        Ok(())
+        let visible_file = Self::open_repository_lock(namespace, false)?;
+        Self::pin_repository_lock_identity(namespace, &visible_file).map_err(|_| {
+            KinDbError::StorageError(format!(
+                "local repository authority lock {} changed while Kin waited",
+                lock_path.display()
+            ))
+        })?;
+        self.confirm_repository_visible(namespace)
     }
 
     pub(crate) fn freeze_existing_authority(
         &self,
         repo_id: &str,
     ) -> Result<LocalAuthorityFreezeLock, KinDbError> {
-        let lock_file = self.acquire_existing_lock(repo_id)?;
-        let authority = self.load_authority_unlocked(repo_id)?.ok_or_else(|| {
-            KinDbError::StorageError(format!(
-                "repo {repo_id} has no existing local snapshot authority to freeze"
-            ))
-        })?;
+        let lock = self.acquire_existing_lock(repo_id)?;
+        let authority = self
+            .load_authority_unlocked(&lock.namespace)?
+            .ok_or_else(|| {
+                KinDbError::StorageError(format!(
+                    "repo {repo_id} has no existing local snapshot authority to freeze"
+                ))
+            })?;
         if authority.snapshot_generation != authority.head_generation {
             return Err(KinDbError::StorageError(format!(
                 "repo {repo_id} has incremental journal authority at generation {} above snapshot {}; repository freeze requires one complete full snapshot",
                 authority.head_generation, authority.snapshot_generation
             )));
         }
-        self.confirm_existing_lock_visible(
-            &self.base_path.join(repo_id).join(".lock"),
-            &lock_file,
-        )?;
+        self.confirm_existing_lock_visible(&lock.namespace)?;
         Ok(LocalAuthorityFreezeLock {
             repo_id: repo_id.to_string(),
             authority,
-            _lock_file: lock_file,
+            lock,
         })
     }
 
@@ -2287,9 +3596,20 @@ impl LocalFileBackend {
         }
         #[cfg(windows)]
         {
-            let capability =
-                open_windows_source_blob_capability(&self.base_path, repo_id, digest, false)?;
-            confirm_windows_source_blob_namespace(&self.base_path, repo_id, digest, &capability)?;
+            let namespace = freeze.namespace();
+            self.confirm_repository_visible(namespace)?;
+            let capability = open_windows_source_blob_capability_from_repository(
+                &namespace.directory,
+                &namespace.display_path,
+                digest,
+                false,
+            )?;
+            confirm_windows_source_blob_namespace_from_repository(
+                &namespace.directory,
+                &namespace.display_path,
+                digest,
+                &capability,
+            )?;
             let digest_hex = hex::encode(digest);
             let Some(data) = read_windows_source_file_at(
                 capability.leaf_dir(),
@@ -2298,6 +3618,7 @@ impl LocalFileBackend {
                 false,
             )?
             else {
+                self.confirm_repository_visible(namespace)?;
                 return Ok(None);
             };
             verify_source_blob_digest(
@@ -2305,29 +3626,36 @@ impl LocalFileBackend {
                 &data.data,
                 &capability.leaf_path.display().to_string(),
             )?;
-            confirm_windows_source_blob_namespace(&self.base_path, repo_id, digest, &capability)?;
+            confirm_windows_source_blob_namespace_from_repository(
+                &namespace.directory,
+                &namespace.display_path,
+                digest,
+                &capability,
+            )?;
+            self.confirm_repository_visible(namespace)?;
             return Ok(Some(data.data));
         }
         #[cfg(unix)]
         {
-            let capability = open_source_blob_capability(
-                &self.base_path,
-                repo_id,
+            let namespace = freeze.namespace();
+            self.confirm_repository_visible(namespace)?;
+            let capability = open_source_blob_capability_from_repository(
+                &namespace.directory,
+                &namespace.display_path,
                 digest,
                 false,
                 false,
-                &self.source_root_confirmed_for_process,
             )?;
-            confirm_source_blob_namespace(
-                &self.base_path,
-                repo_id,
+            confirm_source_blob_namespace_from_repository(
+                &namespace.directory,
+                &namespace.display_path,
                 digest,
                 &capability,
-                &self.source_root_confirmed_for_process,
             )?;
             let digest_hex = hex::encode(digest);
             let Some(data) = read_source_file_at(&capability.leaf_dir, &digest_hex, max_bytes)?
             else {
+                self.confirm_repository_visible(namespace)?;
                 return Ok(None);
             };
             verify_source_blob_digest(
@@ -2335,53 +3663,15 @@ impl LocalFileBackend {
                 &data.data,
                 &capability.leaf_path.display().to_string(),
             )?;
-            confirm_source_blob_namespace(
-                &self.base_path,
-                repo_id,
+            confirm_source_blob_namespace_from_repository(
+                &namespace.directory,
+                &namespace.display_path,
                 digest,
                 &capability,
-                &self.source_root_confirmed_for_process,
             )?;
+            self.confirm_repository_visible(namespace)?;
             Ok(Some(data.data))
         }
-    }
-
-    fn sync_parent(path: &Path) -> Result<(), KinDbError> {
-        let Some(parent) = path.parent() else {
-            return Ok(());
-        };
-        #[cfg(not(unix))]
-        {
-            let _ = parent;
-            return Ok(());
-        }
-        #[cfg(unix)]
-        {
-            let directory = std::fs::File::open(parent).map_err(|error| {
-                KinDbError::StorageError(format!(
-                    "failed to open directory {} for fsync: {error}",
-                    parent.display()
-                ))
-            })?;
-            directory.sync_all().map_err(|error| {
-                KinDbError::StorageError(format!(
-                    "failed to fsync directory {}: {error}",
-                    parent.display()
-                ))
-            })
-        }
-    }
-
-    fn atomic_write(path: &Path, data: &[u8]) -> Result<(), KinDbError> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|error| {
-                KinDbError::StorageError(format!(
-                    "failed to create directory {}: {error}",
-                    parent.display()
-                ))
-            })?;
-        }
-        mmap::atomic_write_bytes_no_magic(path, data)
     }
 
     fn snapshot_file_name(generation: Generation) -> String {
@@ -2392,15 +3682,35 @@ impl LocalFileBackend {
         hex::encode(Sha256::digest(bytes))
     }
 
-    fn file_digest(path: &Path) -> Result<String, KinDbError> {
-        let mut file = mmap::open_regular_nofollow(path, "digest source")?;
+    #[cfg(test)]
+    fn atomic_write(path: &Path, data: &[u8]) -> Result<(), KinDbError> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| {
+                KinDbError::StorageError(format!(
+                    "failed to create test directory {}: {error}",
+                    parent.display()
+                ))
+            })?;
+        }
+        mmap::atomic_write_bytes_no_magic(path, data)
+    }
+
+    fn file_digest(surface: &LocalSurfaceCapability, leaf: &Path) -> Result<String, KinDbError> {
+        LocalSurfaceCapability::require_leaf(leaf)?;
+        let display = surface.display(leaf);
+        let mut file = mmap::open_regular_nofollow_at(
+            &surface.directory,
+            leaf,
+            &surface.display_path,
+            "digest source",
+        )?;
         let mut hasher = Sha256::new();
         let mut buffer = [0u8; 64 * 1024];
         loop {
             let read = file.read(&mut buffer).map_err(|error| {
                 KinDbError::StorageError(format!(
                     "failed to read {} for digest verification: {error}",
-                    path.display()
+                    display.display()
                 ))
             })?;
             if read == 0 {
@@ -2492,19 +3802,34 @@ impl LocalFileBackend {
 
     fn validate_acknowledged_deltas_unlocked(
         &self,
-        repo_id: &str,
+        namespace: &LocalRepositoryCapability,
         record: &LocalAuthorityRecord,
     ) -> Result<(), KinDbError> {
+        let repo_id = &namespace.repo_id;
+        let deltas = namespace.surface(Self::deltas_surface_name(), false)?;
         for (index, identity) in record.acknowledged_deltas.iter().enumerate() {
-            let path = self.delta_path(repo_id, identity.generation);
-            if !path.exists() {
-                if let Some(next) = record.acknowledged_deltas[index + 1..]
-                    .iter()
-                    .find(|next| self.delta_path(repo_id, next.generation).exists())
-                {
+            let leaf = Self::delta_leaf(identity.generation);
+            let exists = match deltas.as_ref() {
+                Some(surface) => surface.exists(&leaf)?,
+                None => false,
+            };
+            if !exists {
+                let mut next_present = None;
+                for next in &record.acknowledged_deltas[index + 1..] {
+                    let next_leaf = Self::delta_leaf(next.generation);
+                    let next_exists = match deltas.as_ref() {
+                        Some(surface) => surface.exists(&next_leaf)?,
+                        None => false,
+                    };
+                    if next_exists {
+                        next_present = Some(next.generation);
+                        break;
+                    }
+                }
+                if let Some(next_generation) = next_present {
                     return Err(KinDbError::StorageError(format!(
                         "repo {repo_id} delta chain is incomplete: expected generation {}, found {}",
-                        identity.generation, next.generation
+                        identity.generation, next_generation
                     )));
                 }
                 return Err(KinDbError::StorageError(format!(
@@ -2513,7 +3838,10 @@ impl LocalFileBackend {
                     record.head_generation
                 )));
             }
-            let digest = Self::file_digest(&path).map_err(|error| {
+            let surface = deltas
+                .as_ref()
+                .expect("an acknowledged delta was confirmed present");
+            let digest = Self::file_digest(surface, &leaf).map_err(|error| {
                 KinDbError::StorageError(format!(
                     "acknowledged delta generation {} for repo {repo_id} is unavailable: {error}",
                     identity.generation
@@ -2525,6 +3853,9 @@ impl LocalFileBackend {
                     identity.generation, identity.sha256
                 )));
             }
+        }
+        if let Some(deltas) = deltas {
+            namespace.confirm_surface_visible(&deltas)?;
         }
         Ok(())
     }
@@ -2601,19 +3932,23 @@ impl LocalFileBackend {
 
     fn validate_residual_deltas_unlocked(
         &self,
-        repo_id: &str,
+        namespace: &LocalRepositoryCapability,
         record: &LocalAuthorityRecord,
     ) -> Result<(), KinDbError> {
-        let deltas = self.load_deltas_since_unlocked(repo_id, GENERATION_INIT)?;
-        Self::validate_loaded_residual_deltas(repo_id, record, &deltas)
+        let deltas = self.load_deltas_since_unlocked(namespace, GENERATION_INIT)?;
+        Self::validate_loaded_residual_deltas(&namespace.repo_id, record, &deltas)
     }
 
     fn finalize_retired_quarantines_unlocked(
         &self,
-        repo_id: &str,
+        namespace: &LocalRepositoryCapability,
         record: &LocalAuthorityRecord,
     ) -> Result<(), KinDbError> {
-        let quarantined = load_quarantined_deltas(&self.deltas_dir(repo_id))?;
+        let repo_id = &namespace.repo_id;
+        let Some(deltas) = namespace.surface(Self::deltas_surface_name(), false)? else {
+            return Ok(());
+        };
+        let quarantined = load_quarantined_deltas_at(&deltas.directory, &deltas.display_path)?;
         for artifact in &quarantined {
             let Some(identity) = record
                 .retired_deltas
@@ -2633,18 +3968,20 @@ impl LocalFileBackend {
             }
         }
         for artifact in &quarantined {
-            delete_quarantined_delta_exact(artifact)?;
+            delete_quarantined_delta_exact_at(&deltas.directory, artifact, &deltas.display_path)?;
         }
+        namespace.confirm_surface_visible(&deltas)?;
         Ok(())
     }
 
     fn reject_unbound_staged_deltas_unlocked(
         &self,
-        repo_id: &str,
+        namespace: &LocalRepositoryCapability,
         record: Option<&LocalAuthorityRecord>,
     ) -> Result<(), KinDbError> {
+        let repo_id = &namespace.repo_id;
         let head_generation = record.map_or(GENERATION_INIT, |record| record.head_generation);
-        let deltas = self.load_deltas_since_unlocked(repo_id, GENERATION_INIT)?;
+        let deltas = self.load_deltas_since_unlocked(namespace, GENERATION_INIT)?;
         if let Some((_, generation)) = deltas
             .iter()
             .find(|(_, generation)| *generation > head_generation)
@@ -2658,21 +3995,34 @@ impl LocalFileBackend {
 
     fn capture_delta_identities_unlocked(
         &self,
-        repo_id: &str,
+        namespace: &LocalRepositoryCapability,
         identities: &[LocalDeltaIdentity],
         required: bool,
     ) -> Result<Vec<PersistedDelta>, KinDbError> {
+        let repo_id = &namespace.repo_id;
+        let deltas = namespace.surface(Self::deltas_surface_name(), false)?;
         let mut captured = Vec::new();
         for identity in identities {
-            let path = self.delta_path(repo_id, identity.generation);
-            let bytes = match std::fs::symlink_metadata(&path) {
-                Ok(_) => mmap::read_regular_file(&path, "authority-bound delta")?,
-                Err(error) if !required && error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => {
+            let leaf = Self::delta_leaf(identity.generation);
+            let exists = match deltas.as_ref() {
+                Some(surface) => surface.exists(&leaf)?,
+                None => false,
+            };
+            let bytes = match exists {
+                true => deltas
+                    .as_ref()
+                    .expect("a present delta has a retained surface")
+                    .read_regular(&leaf, "authority-bound delta")?,
+                false if !required => continue,
+                false => {
                     return Err(KinDbError::StorageError(format!(
-                        "failed to capture authority-bound delta {} for repo {repo_id}: {error}",
-                        path.display()
-                    )));
+                        "failed to capture authority-bound delta {} for repo {repo_id}: object is missing",
+                        namespace
+                            .display_path
+                            .join(Self::deltas_surface_name())
+                            .join(&leaf)
+                            .display()
+                    )))
                 }
             };
             let digest = Self::snapshot_digest(&bytes);
@@ -2684,21 +4034,24 @@ impl LocalFileBackend {
             }
             captured.push((bytes, identity.generation));
         }
+        if let Some(deltas) = deltas {
+            namespace.confirm_surface_visible(&deltas)?;
+        }
         Ok(captured)
     }
 
     fn capture_authority_bound_deltas_unlocked(
         &self,
-        repo_id: &str,
+        namespace: &LocalRepositoryCapability,
         record: Option<&LocalAuthorityRecord>,
     ) -> Result<Vec<PersistedDelta>, KinDbError> {
         let Some(record) = record else {
             return Ok(Vec::new());
         };
         let mut captured =
-            self.capture_delta_identities_unlocked(repo_id, &record.acknowledged_deltas, true)?;
+            self.capture_delta_identities_unlocked(namespace, &record.acknowledged_deltas, true)?;
         captured.extend(self.capture_delta_identities_unlocked(
-            repo_id,
+            namespace,
             &record.retired_deltas,
             false,
         )?);
@@ -2717,15 +4070,40 @@ impl LocalFileBackend {
 
     fn clear_exact_captured_deltas_unlocked(
         &self,
-        repo_id: &str,
+        namespace: &LocalRepositoryCapability,
         captured: &[PersistedDelta],
     ) -> bool {
+        let repo_id = &namespace.repo_id;
+        let deltas = match namespace.surface(Self::deltas_surface_name(), false) {
+            Ok(Some(deltas)) => deltas,
+            Ok(None) if captured.is_empty() => {
+                return self
+                    .load_deltas_since_unlocked(namespace, GENERATION_INIT)
+                    .is_ok_and(|remaining| remaining.is_empty())
+            }
+            Ok(None) => {
+                tracing::warn!(
+                    repo_id,
+                    "journal promotion committed but the retained delta surface is missing"
+                );
+                return false;
+            }
+            Err(error) => {
+                tracing::warn!(repo_id, error = %error, "journal promotion committed but the retained delta surface is unavailable");
+                return false;
+            }
+        };
         let mut complete = true;
         for (captured_bytes, generation) in captured {
-            let path = self.delta_path(repo_id, *generation);
+            let leaf = Self::delta_leaf(*generation);
+            let path = deltas.display(&leaf);
             let captured_sha256 = Self::snapshot_digest(captured_bytes);
-            let quarantine_path = quarantine_delta_path(&path, *generation, &captured_sha256);
-            match std::fs::rename(&path, &quarantine_path) {
+            let quarantine_leaf = quarantine_delta_path(&leaf, *generation, &captured_sha256);
+            let quarantine_path = deltas.display(&quarantine_leaf);
+            match deltas
+                .directory
+                .rename(&leaf, &deltas.directory, &quarantine_leaf)
+            {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(error) => {
@@ -2734,7 +4112,7 @@ impl LocalFileBackend {
                     continue;
                 }
             }
-            if let Err(error) = sync_parent_directory(&quarantine_path) {
+            if let Err(error) = deltas.sync(&quarantine_leaf) {
                 complete = false;
                 tracing::warn!(repo_id, path = %quarantine_path.display(), error = %error, "journal promotion committed; quarantined delta rename could not be made durable");
                 continue;
@@ -2743,14 +4121,16 @@ impl LocalFileBackend {
             if let Some(hook) = self.cleanup_after_quarantine_hook.lock().take() {
                 hook();
             }
-            match quarantined_file_matches(
-                &quarantine_path,
+            match quarantined_file_matches_at(
+                &deltas.directory,
+                &quarantine_leaf,
+                &deltas.display_path,
                 &captured_sha256,
                 captured_bytes.len() as u64,
             ) {
-                Ok(true) => match std::fs::remove_file(&quarantine_path) {
+                Ok(true) => match deltas.directory.remove_file(&quarantine_leaf) {
                     Ok(()) => {
-                        if let Err(error) = Self::sync_parent(&quarantine_path) {
+                        if let Err(error) = deltas.sync(&quarantine_leaf) {
                             complete = false;
                             tracing::warn!(repo_id, path = %quarantine_path.display(), error = %error, "journal promotion committed; could not fsync captured-delta cleanup");
                         }
@@ -2770,7 +4150,11 @@ impl LocalFileBackend {
                 }
             }
         }
-        match self.load_deltas_since_unlocked(repo_id, GENERATION_INIT) {
+        if let Err(error) = namespace.confirm_surface_visible(&deltas) {
+            tracing::warn!(repo_id, error = %error, "journal promotion committed but the delta surface changed during cleanup");
+            complete = false;
+        }
+        match self.load_deltas_since_unlocked(namespace, GENERATION_INIT) {
             Ok(remaining) if remaining.is_empty() => complete,
             Ok(remaining) => {
                 tracing::warn!(repo_id, remaining = remaining.len(), "journal promotion committed with residual journal artifacts; recovery remains fail-closed");
@@ -2785,22 +4169,24 @@ impl LocalFileBackend {
 
     fn read_authority_record_raw_unlocked(
         &self,
-        repo_id: &str,
+        namespace: &LocalRepositoryCapability,
     ) -> Result<Option<LocalAuthorityRecord>, KinDbError> {
-        let path = self.authority_path(repo_id);
-        match std::fs::symlink_metadata(&path) {
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => {
-                return Err(KinDbError::StorageError(format!(
-                    "failed to inspect local authority {}: {error}",
-                    path.display()
-                )))
-            }
+        let relative = Self::authority_relative_path();
+        let path = namespace.display(relative);
+        if !namespace.exists(relative)? {
+            return Ok(None);
         }
-        mmap::confirm_installed_write(&path)?;
-        let bytes = mmap::read_regular_bounded(&path, "local authority", 1024 * 1024)?;
-        let record: LocalAuthorityRecord = serde_json::from_slice(&bytes).map_err(|error| {
+        mmap::confirm_installed_write_at(&namespace.directory, relative, &namespace.display_path)?;
+        let bytes = namespace.read_regular_bounded(relative, "local authority", 1024 * 1024)?;
+        Self::decode_authority_record(&namespace.repo_id, &path, &bytes).map(Some)
+    }
+
+    fn decode_authority_record(
+        repo_id: &str,
+        path: &Path,
+        bytes: &[u8],
+    ) -> Result<LocalAuthorityRecord, KinDbError> {
+        let record: LocalAuthorityRecord = serde_json::from_slice(bytes).map_err(|error| {
             KinDbError::StorageError(format!(
                 "invalid local authority {}: {error}",
                 path.display()
@@ -2827,29 +4213,37 @@ impl LocalFileBackend {
             )));
         }
         Self::validate_delta_identities(&record)?;
-        Ok(Some(record))
+        Ok(record)
     }
 
     fn read_authority_record_unlocked(
         &self,
-        repo_id: &str,
+        namespace: &LocalRepositoryCapability,
     ) -> Result<Option<LocalAuthorityRecord>, KinDbError> {
-        let record = self.read_authority_record_raw_unlocked(repo_id)?;
+        let record = self.read_authority_record_raw_unlocked(namespace)?;
         let Some(record) = record else {
             return Ok(None);
         };
-        self.validate_acknowledged_deltas_unlocked(repo_id, &record)?;
-        self.validate_residual_deltas_unlocked(repo_id, &record)?;
+        self.validate_acknowledged_deltas_unlocked(namespace, &record)?;
+        self.validate_residual_deltas_unlocked(namespace, &record)?;
         Ok(Some(record))
     }
 
     fn read_authoritative_snapshot_bytes_unlocked(
         &self,
-        repo_id: &str,
+        namespace: &LocalRepositoryCapability,
         record: &LocalAuthorityRecord,
     ) -> Result<Vec<u8>, KinDbError> {
-        let path = self.snapshots_dir(repo_id).join(&record.snapshot_file);
-        let snapshot_bytes = mmap::read_regular_file(&path, "authoritative snapshot")?;
+        let repo_id = &namespace.repo_id;
+        let snapshots = namespace
+            .surface(Self::snapshots_surface_name(), false)?
+            .ok_or_else(|| {
+                KinDbError::StorageError(format!(
+                    "authoritative snapshot surface is missing for repo {repo_id}"
+                ))
+            })?;
+        let leaf = Path::new(&record.snapshot_file);
+        let snapshot_bytes = snapshots.read_regular(leaf, "authoritative snapshot")?;
         let digest = Self::snapshot_digest(&snapshot_bytes);
         if digest != record.snapshot_sha256 {
             return Err(KinDbError::StorageError(format!(
@@ -2862,68 +4256,90 @@ impl LocalFileBackend {
                 "authoritative snapshot payload for repo {repo_id} is invalid: {error}"
             ))
         })?;
+        namespace.confirm_surface_visible(&snapshots)?;
         Ok(snapshot_bytes)
     }
 
     fn clear_superseded_snapshots_unlocked(
         &self,
-        repo_id: &str,
+        namespace: &LocalRepositoryCapability,
         keep_generation: Generation,
     ) -> Result<(), KinDbError> {
-        let dir = self.snapshots_dir(repo_id);
-        if !dir.exists() {
+        let Some(snapshots) = namespace.surface(Self::snapshots_surface_name(), false)? else {
             return Ok(());
-        }
-        for entry in std::fs::read_dir(&dir).map_err(|error| {
+        };
+        for entry in snapshots.directory.entries().map_err(|error| {
             KinDbError::StorageError(format!(
                 "failed to read local snapshot directory {}: {error}",
-                dir.display()
+                snapshots.display_path.display()
             ))
         })? {
             let entry = entry.map_err(|error| {
                 KinDbError::StorageError(format!(
                     "failed to read local snapshot entry in {}: {error}",
-                    dir.display()
+                    snapshots.display_path.display()
                 ))
             })?;
-            let path = entry.path();
-            let Some(generation) = path
+            let file_name = entry.file_name();
+            let leaf = PathBuf::from(&file_name);
+            let display = snapshots.display(&leaf);
+            let Some(generation) = Path::new(&file_name)
                 .file_stem()
                 .and_then(|stem| stem.to_str())
                 .and_then(|stem| stem.parse::<Generation>().ok())
             else {
                 continue;
             };
-            if path.extension().and_then(|extension| extension.to_str()) != Some("kndb")
-                || path.file_name().and_then(|name| name.to_str())
+            if Path::new(&file_name)
+                .extension()
+                .and_then(|extension| extension.to_str())
+                != Some("kndb")
+                || Path::new(&file_name)
+                    .file_name()
+                    .and_then(|name| name.to_str())
                     != Some(Self::snapshot_file_name(generation).as_str())
                 || generation >= keep_generation
             {
                 continue;
             }
-            std::fs::remove_file(&path).map_err(|error| {
+            snapshots.directory.remove_file(&leaf).map_err(|error| {
                 KinDbError::StorageError(format!(
                     "failed to remove superseded local snapshot {}: {error}",
-                    path.display()
+                    display.display()
                 ))
             })?;
         }
+        #[cfg(test)]
+        if let Some(hook) = self.snapshot_cleanup_before_confirmation_hook.lock().take() {
+            hook();
+        }
+        snapshots.sync(Path::new(&Self::snapshot_file_name(keep_generation)))?;
+        namespace.confirm_surface_visible(&snapshots)?;
         Ok(())
     }
 
     fn load_authority_unlocked(
         &self,
-        repo_id: &str,
+        namespace: &LocalRepositoryCapability,
     ) -> Result<Option<SnapshotAuthority>, KinDbError> {
-        let Some(record) = self.read_authority_record_unlocked(repo_id)? else {
-            let quarantines = load_quarantined_deltas(&self.deltas_dir(repo_id))?;
+        let repo_id = &namespace.repo_id;
+        let Some(record) = self.read_authority_record_unlocked(namespace)? else {
+            let quarantines = match namespace.surface(Self::deltas_surface_name(), false)? {
+                Some(deltas) => {
+                    let quarantines =
+                        load_quarantined_deltas_at(&deltas.directory, &deltas.display_path)?;
+                    namespace.confirm_surface_visible(&deltas)?;
+                    quarantines
+                }
+                None => Vec::new(),
+            };
             if !quarantines.is_empty() {
                 return Err(KinDbError::StorageError(format!(
                     "repo {repo_id} has {} quarantined deltas but no current snapshot authority; recovery is fail-closed",
                     quarantines.len()
                 )));
             }
-            let deltas = self.load_deltas_since_unlocked(repo_id, GENERATION_INIT)?;
+            let deltas = self.load_deltas_since_unlocked(namespace, GENERATION_INIT)?;
             if !deltas.is_empty() {
                 return Err(KinDbError::StorageError(format!(
                     "repo {repo_id} has {} deltas but no current snapshot authority; recovery is fail-closed",
@@ -2933,15 +4349,24 @@ impl LocalFileBackend {
             return Ok(None);
         };
 
-        let snapshot_bytes = self.read_authoritative_snapshot_bytes_unlocked(repo_id, &record)?;
+        let snapshot_bytes = self.read_authoritative_snapshot_bytes_unlocked(namespace, &record)?;
+        let snapshots = namespace
+            .surface(Self::snapshots_surface_name(), false)?
+            .ok_or_else(|| {
+                KinDbError::StorageError(format!(
+                    "authoritative snapshot surface is missing for repo {repo_id}"
+                ))
+            })?;
         // Cleanup is downstream of both authority-directory durability and
         // exact authoritative payload verification.
-        self.finalize_retired_quarantines_unlocked(repo_id, &record)?;
+        self.finalize_retired_quarantines_unlocked(namespace, &record)?;
         if let Err(error) =
-            self.clear_superseded_snapshots_unlocked(repo_id, record.snapshot_generation)
+            self.clear_superseded_snapshots_unlocked(namespace, record.snapshot_generation)
         {
             tracing::warn!(repo_id, error = %error, "deferred superseded local snapshot cleanup");
         }
+        namespace.confirm_surface_visible(&snapshots)?;
+        self.confirm_repository_visible(namespace)?;
         Ok(Some(SnapshotAuthority {
             snapshot_bytes,
             snapshot_generation: record.snapshot_generation,
@@ -2951,18 +4376,24 @@ impl LocalFileBackend {
 
     fn write_authority_unlocked(
         &self,
-        repo_id: &str,
+        namespace: &LocalRepositoryCapability,
         record: &LocalAuthorityRecord,
     ) -> Result<(), KinDbError> {
         let bytes = serde_json::to_vec(record).map_err(|error| {
             KinDbError::StorageError(format!("failed to encode local authority: {error}"))
         })?;
-        let path = self.authority_path(repo_id);
-        match mmap::atomic_write_bytes_no_magic_outcome(&path, &bytes)? {
+        let relative = Self::authority_relative_path();
+        let path = namespace.display(relative);
+        match mmap::atomic_write_bytes_no_magic_outcome_at(
+            &namespace.directory,
+            relative,
+            &namespace.display_path,
+            &bytes,
+        )? {
             AtomicWriteOutcome::Durable => Ok(()),
-            AtomicWriteOutcome::InstalledButNotSynced(error) => {
+            AtomicWriteOutcome::InstalledButUnconfirmed(error) => {
                 Err(KinDbError::SnapshotPersistenceIndeterminate(format!(
-                    "local authority {} was installed but its parent-directory durability is unconfirmed: {error}",
+                    "local authority {} was installed but its durability or exact post-install verification is unconfirmed: {error}",
                     path.display()
                 )))
             }
@@ -2971,67 +4402,80 @@ impl LocalFileBackend {
 
     fn load_deltas_since_unlocked(
         &self,
-        repo_id: &str,
+        namespace: &LocalRepositoryCapability,
         since_gen: Generation,
     ) -> Result<Vec<(Vec<u8>, Generation)>, KinDbError> {
-        let deltas_dir = self.deltas_dir(repo_id);
-        if !deltas_dir.exists() {
+        let Some(deltas) = namespace.surface(Self::deltas_surface_name(), false)? else {
             return Ok(Vec::new());
-        }
+        };
 
         let mut entries: Vec<(Generation, PathBuf)> = Vec::new();
-        for entry in std::fs::read_dir(&deltas_dir).map_err(|error| {
+        for entry in deltas.directory.entries().map_err(|error| {
             KinDbError::StorageError(format!(
                 "failed to read deltas directory {}: {error}",
-                deltas_dir.display()
+                deltas.display_path.display()
             ))
         })? {
             let entry = entry.map_err(|error| {
                 KinDbError::StorageError(format!("failed to read delta entry: {error}"))
             })?;
-            let path = entry.path();
-            if is_quarantine_delta_name(&path) {
+            let file_name = entry.file_name();
+            let leaf = PathBuf::from(&file_name);
+            let display = deltas.display(&leaf);
+            if is_quarantine_delta_name(Path::new(&file_name)) {
                 continue;
             }
-            if path.extension().and_then(|extension| extension.to_str()) != Some("kndd") {
+            if Path::new(&file_name)
+                .extension()
+                .and_then(|extension| extension.to_str())
+                != Some("kndd")
+            {
                 continue;
             }
-            let stem = path
+            let stem = Path::new(&file_name)
                 .file_stem()
                 .and_then(|stem| stem.to_str())
                 .ok_or_else(|| {
                     KinDbError::StorageError(format!(
                         "delta authority {} has a non-UTF8 generation",
-                        path.display()
+                        display.display()
                     ))
                 })?;
             let generation = stem.parse::<Generation>().map_err(|error| {
                 KinDbError::StorageError(format!(
                     "delta authority {} has an invalid generation: {error}",
-                    path.display()
+                    display.display()
                 ))
             })?;
             let canonical_name = format!("{generation:020}.kndd");
             if generation == GENERATION_INIT
-                || path.file_name().and_then(|name| name.to_str()) != Some(canonical_name.as_str())
+                || Path::new(&file_name)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    != Some(canonical_name.as_str())
             {
                 return Err(KinDbError::StorageError(format!(
                     "delta authority {} has a reserved or noncanonical generation",
-                    path.display()
+                    display.display()
                 )));
             }
             if generation > since_gen {
-                entries.push((generation, path));
+                entries.push((generation, leaf));
             }
         }
         entries.sort_by_key(|(generation, _)| *generation);
 
-        entries
+        let loaded: Result<Vec<_>, _> = entries
             .into_iter()
-            .map(|(generation, path)| {
-                mmap::read_regular_file(&path, "local delta").map(|bytes| (bytes, generation))
+            .map(|(generation, leaf)| {
+                deltas
+                    .read_regular(&leaf, "local delta")
+                    .map(|bytes| (bytes, generation))
             })
-            .collect()
+            .collect();
+        let loaded = loaded?;
+        namespace.confirm_surface_visible(&deltas)?;
+        Ok(loaded)
     }
 
     /// Persist one complete snapshot while the caller holds this repository's
@@ -3042,12 +4486,13 @@ impl LocalFileBackend {
     /// return the exact same lock as a held successor freeze.
     fn save_snapshot_unlocked(
         &self,
-        repo_id: &str,
+        namespace: &LocalRepositoryCapability,
         data: &[u8],
         expected_gen: Generation,
     ) -> Result<Generation, KinDbError> {
-        let current = self.load_authority_unlocked(repo_id)?;
-        let current_record = self.read_authority_record_raw_unlocked(repo_id)?;
+        let repo_id = &namespace.repo_id;
+        let current = self.load_authority_unlocked(namespace)?;
+        let current_record = self.read_authority_record_raw_unlocked(namespace)?;
         match (current.as_ref(), current_record.as_ref()) {
             (Some(authority), Some(record))
                 if authority.snapshot_generation == record.snapshot_generation
@@ -3078,17 +4523,45 @@ impl LocalFileBackend {
             {
                 // Exact serialized-content retries are idempotent after an
                 // authority rename whose directory sync result was uncertain.
-                // Re-sync the authority directory before accepting.
-                mmap::sync_parent_dir(&self.authority_path(repo_id)).map_err(|error| {
+                // Re-sync the authority directory and re-confirm both retained
+                // namespace epochs before accepting.
+                #[cfg(test)]
+                if let Some(hook) = self.snapshot_retry_before_confirmation_hook.lock().take() {
+                    hook();
+                }
+                let snapshots = namespace
+                    .surface(Self::snapshots_surface_name(), false)
+                    .map_err(|error| {
+                        KinDbError::SnapshotPersistenceIndeterminate(format!(
+                            "repo {repo_id} exact snapshot retry refers to an already-committed generation, but its retained snapshot surface could not be confirmed: {error}"
+                        ))
+                    })?
+                    .ok_or_else(|| {
+                        KinDbError::SnapshotPersistenceIndeterminate(format!(
+                            "repo {repo_id} exact snapshot retry refers to an already-committed generation, but its retained snapshot surface is missing"
+                        ))
+                    })?;
+                namespace
+                    .sync_parent(Self::authority_relative_path())
+                    .map_err(|error| {
                     KinDbError::SnapshotPersistenceIndeterminate(format!(
                         "local authority {} is installed but durability remains unconfirmed: {error}",
-                        self.authority_path(repo_id).display()
+                        namespace.display(Self::authority_relative_path()).display()
                     ))
                 })?;
+                if let Err(error) = namespace
+                    .confirm_surface_visible(&snapshots)
+                    .and_then(|()| self.confirm_repository_visible(namespace))
+                {
+                    return Err(KinDbError::SnapshotPersistenceIndeterminate(format!(
+                        "repo {repo_id} exact snapshot retry refers to committed generation {}, but final namespace confirmation failed: {error}",
+                        record.head_generation
+                    )));
+                }
                 return Ok(record.head_generation);
             }
         }
-        self.reject_unbound_staged_deltas_unlocked(repo_id, current_record.as_ref())?;
+        self.reject_unbound_staged_deltas_unlocked(namespace, current_record.as_ref())?;
         if current_gen != expected_gen {
             return Err(KinDbError::StorageError(format!(
                 "generation mismatch for repo {repo_id}: expected {expected_gen}, found {current_gen} \
@@ -3100,8 +4573,15 @@ impl LocalFileBackend {
         // data round-trips, then we write the *original* bytes to disk.
         let _snapshot = GraphSnapshot::from_bytes(data)?;
         let new_gen = checked_next_generation(current_gen, "local snapshot")?;
-        let versioned_path = self.versioned_snapshot_path(repo_id, new_gen);
-        Self::atomic_write(&versioned_path, data)?;
+        let snapshots = namespace
+            .surface(Self::snapshots_surface_name(), true)?
+            .ok_or_else(|| {
+                KinDbError::StorageError(format!(
+                    "snapshot surface disappeared while creating repo {repo_id}"
+                ))
+            })?;
+        let versioned_leaf = Self::versioned_snapshot_leaf(new_gen);
+        snapshots.atomic_write(&versioned_leaf, data)?;
 
         #[cfg(test)]
         if self
@@ -3119,16 +4599,17 @@ impl LocalFileBackend {
         }
 
         let captured_for_cleanup =
-            self.capture_authority_bound_deltas_unlocked(repo_id, current_record.as_ref())?;
-        self.reject_unbound_staged_deltas_unlocked(repo_id, current_record.as_ref())?;
-        if self.capture_authority_bound_deltas_unlocked(repo_id, current_record.as_ref())?
+            self.capture_authority_bound_deltas_unlocked(namespace, current_record.as_ref())?;
+        self.reject_unbound_staged_deltas_unlocked(namespace, current_record.as_ref())?;
+        if self.capture_authority_bound_deltas_unlocked(namespace, current_record.as_ref())?
             != captured_for_cleanup
-            || self.read_authority_record_raw_unlocked(repo_id)? != current_record
+            || self.read_authority_record_raw_unlocked(namespace)? != current_record
         {
             return Err(KinDbError::StorageError(format!(
                 "repo {repo_id} authority or journal changed during full promotion; authority was not committed"
             )));
         }
+        namespace.confirm_surface_visible(&snapshots)?;
 
         let record = LocalAuthorityRecord {
             version: LOCAL_AUTHORITY_VERSION,
@@ -3139,9 +4620,21 @@ impl LocalFileBackend {
             acknowledged_deltas: Vec::new(),
             retired_deltas: Self::delta_identities(&captured_for_cleanup),
         };
-        self.write_authority_unlocked(repo_id, &record)?;
-        if let Err(error) = self.clear_superseded_snapshots_unlocked(repo_id, new_gen) {
+        self.write_authority_unlocked(namespace, &record)?;
+        #[cfg(test)]
+        if let Some(hook) = self.snapshot_after_authority_commit_hook.lock().take() {
+            hook();
+        }
+        if let Err(error) = self.clear_superseded_snapshots_unlocked(namespace, new_gen) {
             tracing::warn!(repo_id, error = %error, "deferred superseded local snapshot cleanup");
+        }
+        if let Err(error) = namespace
+            .confirm_surface_visible(&snapshots)
+            .and_then(|()| self.confirm_repository_visible(namespace))
+        {
+            return Err(KinDbError::SnapshotPersistenceIndeterminate(format!(
+                "repo {repo_id} snapshot authority committed generation {new_gen}, but post-commit namespace confirmation failed: {error}"
+            )));
         }
         Ok(new_gen)
     }
@@ -3155,14 +4648,12 @@ impl LocalFileBackend {
         expected_cursor: SnapshotCursor,
     ) -> Result<(SnapshotCursor, LocalAuthorityFreezeLock), KinDbError> {
         let expected_gen = expected_cursor.backend_generation();
-        let lock_file = if expected_gen == GENERATION_INIT
-            && self.existing_repository_path(repo_id)?.is_none()
-        {
-            self.acquire_lock(repo_id)?
+        let lock = if expected_gen == GENERATION_INIT {
+            self.acquire_lock_for_initialization(repo_id)?
         } else {
             self.acquire_existing_lock(repo_id)?
         };
-        let generation = self.save_snapshot_unlocked(repo_id, data, expected_gen)?;
+        let generation = self.save_snapshot_unlocked(&lock.namespace, data, expected_gen)?;
         let cursor = SnapshotCursor::from_backend_generation(generation);
         let authority = SnapshotAuthority {
             snapshot_bytes: data.to_vec(),
@@ -3174,7 +4665,7 @@ impl LocalFileBackend {
             LocalAuthorityFreezeLock {
                 repo_id: repo_id.to_string(),
                 authority,
-                _lock_file: lock_file,
+                lock,
             },
         ))
     }
@@ -3223,7 +4714,32 @@ impl LocalFileBackend {
         *self.snapshot_before_authority_commit_hook.lock() = Some(Box::new(hook));
     }
 
+    #[cfg(all(test, unix))]
+    fn set_snapshot_after_authority_commit_hook(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.snapshot_after_authority_commit_hook.lock() = Some(Box::new(hook));
+    }
+
+    #[cfg(all(test, unix))]
+    fn set_snapshot_retry_before_confirmation_hook(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.snapshot_retry_before_confirmation_hook.lock() = Some(Box::new(hook));
+    }
+
+    #[cfg(all(test, unix))]
+    fn set_snapshot_cleanup_before_confirmation_hook(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.snapshot_cleanup_before_confirmation_hook.lock() = Some(Box::new(hook));
+    }
+
     #[cfg(test)]
+    fn set_delta_before_authority_commit_hook(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.delta_before_authority_commit_hook.lock() = Some(Box::new(hook));
+    }
+
+    #[cfg(all(test, unix))]
+    fn set_overlay_after_write_hook(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.overlay_after_write_hook.lock() = Some(Box::new(hook));
+    }
+
+    #[cfg(all(test, unix))]
     fn set_source_blob_after_capability_hook(&self, hook: impl FnOnce() + Send + 'static) {
         *self.source_blob_after_capability_hook.lock() = Some(Box::new(hook));
     }
@@ -3259,12 +4775,14 @@ impl StorageBackend for LocalFileBackend {
         })?;
         validate_source_blob_size(byte_len, &format!("repo {repo_id}"))?;
         verify_source_blob_digest(digest, data, &format!("repo {repo_id}"))?;
+        #[cfg(unix)]
+        prepare_source_trust_root(
+            &self.base_path,
+            true,
+            &self.source_root_confirmed_for_process,
+        )?;
         #[cfg(any(unix, windows))]
-        let _authority_lock = if self.existing_repository_path(repo_id)?.is_some() {
-            self.acquire_existing_lock(repo_id)?
-        } else {
-            self.acquire_lock(repo_id)?
-        };
+        let authority_lock = self.acquire_lock_for_initialization(repo_id)?;
         #[cfg(not(any(unix, windows)))]
         {
             let _ = (repo_id, digest, data);
@@ -3275,13 +4793,24 @@ impl StorageBackend for LocalFileBackend {
         }
         #[cfg(windows)]
         {
-            let capability =
-                open_windows_source_blob_capability(&self.base_path, repo_id, digest, true)?;
+            let namespace = &authority_lock.namespace;
+            self.confirm_repository_visible(namespace)?;
+            let capability = open_windows_source_blob_capability_from_repository(
+                &namespace.directory,
+                &namespace.display_path,
+                digest,
+                true,
+            )?;
             #[cfg(test)]
             if let Some(hook) = self.source_blob_after_capability_hook.lock().take() {
                 hook();
             }
-            confirm_windows_source_blob_namespace(&self.base_path, repo_id, digest, &capability)?;
+            confirm_windows_source_blob_namespace_from_repository(
+                &namespace.directory,
+                &namespace.display_path,
+                digest,
+                &capability,
+            )?;
             let digest_hex = hex::encode(digest);
 
             if let Some(existing) = read_windows_source_file_at(
@@ -3301,13 +4830,15 @@ impl StorageBackend for LocalFileBackend {
                         capability.leaf_path.display()
                     )));
                 }
-                confirm_windows_source_blob_namespace(
-                    &self.base_path,
-                    repo_id,
+                confirm_windows_source_blob_namespace_from_repository(
+                    &namespace.directory,
+                    &namespace.display_path,
                     digest,
                     &capability,
                 )?;
                 sync_source_file_for_ack(&existing.file, &capability.leaf_path.join(&digest_hex))?;
+                capability.sync_leaf_publication()?;
+                self.confirm_repository_visible(namespace)?;
                 return Ok(());
             }
 
@@ -3315,9 +4846,18 @@ impl StorageBackend for LocalFileBackend {
             if let Some(hook) = self.source_blob_before_publish_hook.lock().take() {
                 hook();
             }
-            confirm_windows_source_blob_namespace(&self.base_path, repo_id, digest, &capability)?;
-            let published_identity =
-                publish_windows_source_file_at(capability.leaf_dir(), &digest_hex, data)?;
+            confirm_windows_source_blob_namespace_from_repository(
+                &namespace.directory,
+                &namespace.display_path,
+                digest,
+                &capability,
+            )?;
+            let published_identity = publish_windows_source_file_at(
+                capability.leaf_dir(),
+                &capability.leaf_path,
+                &digest_hex,
+                data,
+            )?;
             let installed = read_windows_source_file_at(
                 capability.leaf_dir(),
                 std::ffi::OsStr::new(&digest_hex),
@@ -3350,19 +4890,27 @@ impl StorageBackend for LocalFileBackend {
                     )));
                 }
             }
-            confirm_windows_source_blob_namespace(&self.base_path, repo_id, digest, &capability)?;
+            confirm_windows_source_blob_namespace_from_repository(
+                &namespace.directory,
+                &namespace.display_path,
+                digest,
+                &capability,
+            )?;
             sync_source_file_for_ack(&installed.file, &capability.leaf_path.join(&digest_hex))?;
+            capability.sync_leaf_publication()?;
+            self.confirm_repository_visible(namespace)?;
             return Ok(());
         }
         #[cfg(unix)]
         {
-            let capability = open_source_blob_capability(
-                &self.base_path,
-                repo_id,
+            let namespace = &authority_lock.namespace;
+            self.confirm_repository_visible(namespace)?;
+            let capability = open_source_blob_capability_from_repository(
+                &namespace.directory,
+                &namespace.display_path,
                 digest,
                 true,
                 true,
-                &self.source_root_confirmed_for_process,
             )?;
             #[cfg(test)]
             if let Some(hook) = self.source_blob_after_capability_hook.lock().take() {
@@ -3384,15 +4932,15 @@ impl StorageBackend for LocalFileBackend {
                         capability.leaf_path.display()
                     )));
                 }
-                confirm_source_blob_namespace(
-                    &self.base_path,
-                    repo_id,
+                confirm_source_blob_namespace_from_repository(
+                    &namespace.directory,
+                    &namespace.display_path,
                     digest,
                     &capability,
-                    &self.source_root_confirmed_for_process,
                 )?;
                 sync_source_file_for_ack(&existing.file, &capability.leaf_path.join(&digest_hex))?;
                 mmap::sync_directory_handle(&capability.leaf_dir, &capability.leaf_path)?;
+                self.confirm_repository_visible(namespace)?;
                 return Ok(());
             }
 
@@ -3404,12 +4952,11 @@ impl StorageBackend for LocalFileBackend {
             // Re-walk without creating anything and compare the directory
             // identity to the pinned handle. A substituted ancestor is rejected
             // before publication; all writes remain relative to the old handle.
-            confirm_source_blob_namespace(
-                &self.base_path,
-                repo_id,
+            confirm_source_blob_namespace_from_repository(
+                &namespace.directory,
+                &namespace.display_path,
                 digest,
                 &capability,
-                &self.source_root_confirmed_for_process,
             )?;
 
             let _published = publish_source_file_at(&capability.leaf_dir, &digest_hex, data)?;
@@ -3437,6 +4984,7 @@ impl StorageBackend for LocalFileBackend {
             // reconfirm its directory entry in file-before-directory order.
             sync_source_file_for_ack(&installed.file, &capability.leaf_path.join(&digest_hex))?;
             mmap::sync_directory_handle(&capability.leaf_dir, &capability.leaf_path)?;
+            self.confirm_repository_visible(namespace)?;
             Ok(())
         }
     }
@@ -3460,7 +5008,7 @@ impl StorageBackend for LocalFileBackend {
             return Ok(None);
         }
         #[cfg(any(unix, windows))]
-        let _authority_lock = self.acquire_existing_lock(repo_id)?;
+        let authority_lock = self.acquire_existing_lock(repo_id)?;
         #[cfg(not(any(unix, windows)))]
         {
             let _ = (repo_id, digest, max_bytes);
@@ -3471,9 +5019,20 @@ impl StorageBackend for LocalFileBackend {
         }
         #[cfg(windows)]
         {
-            let capability =
-                open_windows_source_blob_capability(&self.base_path, repo_id, digest, true)?;
-            confirm_windows_source_blob_namespace(&self.base_path, repo_id, digest, &capability)?;
+            let namespace = &authority_lock.namespace;
+            self.confirm_repository_visible(namespace)?;
+            let capability = open_windows_source_blob_capability_from_repository(
+                &namespace.directory,
+                &namespace.display_path,
+                digest,
+                true,
+            )?;
+            confirm_windows_source_blob_namespace_from_repository(
+                &namespace.directory,
+                &namespace.display_path,
+                digest,
+                &capability,
+            )?;
             let digest_hex = hex::encode(digest);
             let Some(data) = read_windows_source_file_at(
                 capability.leaf_dir(),
@@ -3482,6 +5041,7 @@ impl StorageBackend for LocalFileBackend {
                 false,
             )?
             else {
+                self.confirm_repository_visible(namespace)?;
                 return Ok(None);
             };
             verify_source_blob_digest(
@@ -3489,24 +5049,32 @@ impl StorageBackend for LocalFileBackend {
                 &data.data,
                 &capability.leaf_path.display().to_string(),
             )?;
-            confirm_windows_source_blob_namespace(&self.base_path, repo_id, digest, &capability)?;
+            confirm_windows_source_blob_namespace_from_repository(
+                &namespace.directory,
+                &namespace.display_path,
+                digest,
+                &capability,
+            )?;
+            self.confirm_repository_visible(namespace)?;
             return Ok(Some(data.data));
         }
         #[cfg(unix)]
         {
             // Preserve the historical read contract (a missing object returns
             // None) while still opening every component capability-relatively.
-            let capability = open_source_blob_capability(
-                &self.base_path,
-                repo_id,
+            let namespace = &authority_lock.namespace;
+            self.confirm_repository_visible(namespace)?;
+            let capability = open_source_blob_capability_from_repository(
+                &namespace.directory,
+                &namespace.display_path,
                 digest,
                 true,
                 false,
-                &self.source_root_confirmed_for_process,
             )?;
             let digest_hex = hex::encode(digest);
             let Some(data) = read_source_file_at(&capability.leaf_dir, &digest_hex, max_bytes)?
             else {
+                self.confirm_repository_visible(namespace)?;
                 return Ok(None);
             };
             verify_source_blob_digest(
@@ -3514,6 +5082,13 @@ impl StorageBackend for LocalFileBackend {
                 &data.data,
                 &capability.leaf_path.display().to_string(),
             )?;
+            confirm_source_blob_namespace_from_repository(
+                &namespace.directory,
+                &namespace.display_path,
+                digest,
+                &capability,
+            )?;
+            self.confirm_repository_visible(namespace)?;
             Ok(Some(data.data))
         }
     }
@@ -3524,7 +5099,7 @@ impl StorageBackend for LocalFileBackend {
             return Ok(None);
         }
         #[cfg(any(unix, windows))]
-        let _authority_lock = self.acquire_existing_lock(repo_id)?;
+        let authority_lock = self.acquire_existing_lock(repo_id)?;
         #[cfg(not(any(unix, windows)))]
         {
             let _ = (repo_id, digest);
@@ -3535,9 +5110,20 @@ impl StorageBackend for LocalFileBackend {
         }
         #[cfg(windows)]
         {
-            let capability =
-                open_windows_source_blob_capability(&self.base_path, repo_id, digest, true)?;
-            confirm_windows_source_blob_namespace(&self.base_path, repo_id, digest, &capability)?;
+            let namespace = &authority_lock.namespace;
+            self.confirm_repository_visible(namespace)?;
+            let capability = open_windows_source_blob_capability_from_repository(
+                &namespace.directory,
+                &namespace.display_path,
+                digest,
+                true,
+            )?;
+            confirm_windows_source_blob_namespace_from_repository(
+                &namespace.directory,
+                &namespace.display_path,
+                digest,
+                &capability,
+            )?;
             let digest_hex = hex::encode(digest);
             let opened = open_windows_source_file_at(
                 capability.leaf_dir(),
@@ -3545,22 +5131,37 @@ impl StorageBackend for LocalFileBackend {
                 false,
             )?;
             let byte_len = opened.as_ref().map(|(_, byte_len)| *byte_len);
-            confirm_windows_source_blob_namespace(&self.base_path, repo_id, digest, &capability)?;
+            confirm_windows_source_blob_namespace_from_repository(
+                &namespace.directory,
+                &namespace.display_path,
+                digest,
+                &capability,
+            )?;
+            self.confirm_repository_visible(namespace)?;
             return Ok(byte_len);
         }
         #[cfg(unix)]
         {
-            let capability = open_source_blob_capability(
-                &self.base_path,
-                repo_id,
+            let namespace = &authority_lock.namespace;
+            self.confirm_repository_visible(namespace)?;
+            let capability = open_source_blob_capability_from_repository(
+                &namespace.directory,
+                &namespace.display_path,
                 digest,
                 true,
                 false,
-                &self.source_root_confirmed_for_process,
             )?;
             let digest_hex = hex::encode(digest);
-            Ok(open_source_file_at(&capability.leaf_dir, &digest_hex)?
-                .map(|(_, byte_len)| byte_len))
+            let byte_len = open_source_file_at(&capability.leaf_dir, &digest_hex)?
+                .map(|(_, byte_len)| byte_len);
+            confirm_source_blob_namespace_from_repository(
+                &namespace.directory,
+                &namespace.display_path,
+                digest,
+                &capability,
+            )?;
+            self.confirm_repository_visible(namespace)?;
+            Ok(byte_len)
         }
     }
 
@@ -3571,17 +5172,19 @@ impl StorageBackend for LocalFileBackend {
         if self.existing_repository_path(repo_id)?.is_none() {
             return Ok(None);
         }
-        let _lock = self.acquire_existing_lock(repo_id)?;
-        self.load_authority_unlocked(repo_id)
+        let lock = self.acquire_existing_lock(repo_id)?;
+        let authority = self.load_authority_unlocked(&lock.namespace)?;
+        self.confirm_repository_visible(&lock.namespace)?;
+        Ok(authority)
     }
 
     fn load_recovery_state(&self, repo_id: &str) -> Result<SnapshotRecoveryState, KinDbError> {
         if self.existing_repository_path(repo_id)?.is_none() {
             return Ok((None, Vec::new()));
         }
-        let _lock = self.acquire_existing_lock(repo_id)?;
-        let authority = self.load_authority_unlocked(repo_id)?;
-        let authority_record = self.read_authority_record_raw_unlocked(repo_id)?;
+        let lock = self.acquire_existing_lock(repo_id)?;
+        let authority = self.load_authority_unlocked(&lock.namespace)?;
+        let authority_record = self.read_authority_record_raw_unlocked(&lock.namespace)?;
         match (authority.as_ref(), authority_record.as_ref()) {
             (Some(authority), Some(record))
                 if authority.snapshot_generation == record.snapshot_generation
@@ -3600,9 +5203,9 @@ impl StorageBackend for LocalFileBackend {
             hook();
         }
         if let Some(record) = authority_record.as_ref() {
-            self.finalize_retired_quarantines_unlocked(repo_id, record)?;
+            self.finalize_retired_quarantines_unlocked(&lock.namespace, record)?;
         }
-        let all_deltas = self.load_deltas_since_unlocked(repo_id, GENERATION_INIT)?;
+        let all_deltas = self.load_deltas_since_unlocked(&lock.namespace, GENERATION_INIT)?;
         if let Some(record) = authority_record.as_ref() {
             Self::validate_loaded_residual_deltas(repo_id, record, &all_deltas)?;
             Self::validate_loaded_acknowledged_deltas(repo_id, record, &all_deltas)?;
@@ -3614,6 +5217,7 @@ impl StorageBackend for LocalFileBackend {
             .into_iter()
             .filter(|(_, generation)| *generation > since)
             .collect();
+        self.confirm_repository_visible(&lock.namespace)?;
         Ok((authority, deltas))
     }
 
@@ -3623,14 +5227,12 @@ impl StorageBackend for LocalFileBackend {
         data: &[u8],
         expected_gen: Generation,
     ) -> Result<Generation, KinDbError> {
-        let _lock = if expected_gen == GENERATION_INIT
-            && self.existing_repository_path(repo_id)?.is_none()
-        {
-            self.acquire_lock(repo_id)?
+        let lock = if expected_gen == GENERATION_INIT {
+            self.acquire_lock_for_initialization(repo_id)?
         } else {
             self.acquire_existing_lock(repo_id)?
         };
-        self.save_snapshot_unlocked(repo_id, data, expected_gen)
+        self.save_snapshot_unlocked(&lock.namespace, data, expected_gen)
     }
 
     fn save_snapshot_classified(
@@ -3656,9 +5258,10 @@ impl StorageBackend for LocalFileBackend {
         delta_data: &[u8],
         base_gen: Generation,
     ) -> Result<Generation, KinDbError> {
-        let _lock = self.acquire_existing_lock(repo_id)?;
-        let _ = self.load_authority_unlocked(repo_id)?;
-        let Some(mut record) = self.read_authority_record_unlocked(repo_id)? else {
+        let lock = self.acquire_existing_lock(repo_id)?;
+        let namespace = &lock.namespace;
+        let _ = self.load_authority_unlocked(namespace)?;
+        let Some(mut record) = self.read_authority_record_unlocked(namespace)? else {
             return Err(KinDbError::StorageError(format!(
                 "repo {repo_id} has no atomic local snapshot authority; persist a full snapshot before deltas"
             )));
@@ -3669,14 +5272,47 @@ impl StorageBackend for LocalFileBackend {
             && record.acknowledged_deltas.last().is_some_and(|identity| {
                 identity.generation == current_gen && identity.sha256 == requested_digest
             })
-            && mmap::read_regular_file(
-                &self.delta_path(repo_id, current_gen),
-                "idempotent local delta retry",
-            )
-            .is_ok_and(|bytes| bytes == delta_data)
         {
-            mmap::sync_parent_dir(&self.authority_path(repo_id))?;
-            return Ok(current_gen);
+            let deltas = namespace
+                .surface(Self::deltas_surface_name(), false)
+                .map_err(|error| {
+                    KinDbError::SnapshotPersistenceIndeterminate(format!(
+                        "repo {repo_id} exact delta retry refers to committed generation {current_gen}, but its retained delta surface could not be confirmed: {error}"
+                    ))
+                })?
+                .ok_or_else(|| {
+                    KinDbError::SnapshotPersistenceIndeterminate(format!(
+                        "repo {repo_id} acknowledged committed delta {current_gen} but its retained surface is missing"
+                    ))
+                })?;
+            let installed = deltas
+                .read_regular(
+                    &Self::delta_leaf(current_gen),
+                    "idempotent local delta retry",
+                )
+                .map_err(|error| {
+                    KinDbError::SnapshotPersistenceIndeterminate(format!(
+                        "repo {repo_id} committed delta {current_gen} could not be verified for an exact retry: {error}"
+                    ))
+                })?;
+            if installed == delta_data {
+                namespace
+                    .sync_parent(Self::authority_relative_path())
+                    .map_err(|error| {
+                        KinDbError::SnapshotPersistenceIndeterminate(format!(
+                            "repo {repo_id} committed delta {current_gen} is installed but authority durability remains unconfirmed: {error}"
+                        ))
+                    })?;
+                if let Err(error) = namespace
+                    .confirm_surface_visible(&deltas)
+                    .and_then(|()| self.confirm_repository_visible(namespace))
+                {
+                    return Err(KinDbError::SnapshotPersistenceIndeterminate(format!(
+                        "repo {repo_id} exact delta retry refers to committed generation {current_gen}, but final namespace confirmation failed: {error}"
+                    )));
+                }
+                return Ok(current_gen);
+            }
         }
         if current_gen != base_gen {
             return Err(KinDbError::StorageError(format!(
@@ -3692,8 +5328,19 @@ impl StorageBackend for LocalFileBackend {
             )));
         }
         let new_gen = checked_next_generation(current_gen, "local delta")?;
-        let delta_path = self.delta_path(repo_id, new_gen);
-        Self::atomic_write(&delta_path, delta_data)?;
+        let deltas = namespace
+            .surface(Self::deltas_surface_name(), true)?
+            .ok_or_else(|| {
+                KinDbError::StorageError(format!(
+                    "delta surface disappeared while writing repo {repo_id}"
+                ))
+            })?;
+        let delta_leaf = Self::delta_leaf(new_gen);
+        deltas.atomic_write(&delta_leaf, delta_data)?;
+        #[cfg(test)]
+        if let Some(hook) = self.delta_before_authority_commit_hook.lock().take() {
+            hook();
+        }
         record.version = LOCAL_AUTHORITY_VERSION;
         record
             .retired_deltas
@@ -3703,7 +5350,16 @@ impl StorageBackend for LocalFileBackend {
             sha256: requested_digest,
         });
         record.head_generation = new_gen;
-        self.write_authority_unlocked(repo_id, &record)?;
+        namespace.confirm_surface_visible(&deltas)?;
+        self.write_authority_unlocked(namespace, &record)?;
+        if let Err(error) = namespace
+            .confirm_surface_visible(&deltas)
+            .and_then(|()| self.confirm_repository_visible(namespace))
+        {
+            return Err(KinDbError::SnapshotPersistenceIndeterminate(format!(
+                "repo {repo_id} delta authority committed generation {new_gen}, but post-commit namespace confirmation failed: {error}"
+            )));
+        }
         Ok(new_gen)
     }
 
@@ -3715,25 +5371,28 @@ impl StorageBackend for LocalFileBackend {
         if self.existing_repository_path(repo_id)?.is_none() {
             return Ok(Vec::new());
         }
-        let _lock = self.acquire_existing_lock(repo_id)?;
-        let _ = self.load_authority_unlocked(repo_id)?;
-        self.load_deltas_since_unlocked(repo_id, since_gen)
+        let lock = self.acquire_existing_lock(repo_id)?;
+        let _ = self.load_authority_unlocked(&lock.namespace)?;
+        let deltas = self.load_deltas_since_unlocked(&lock.namespace, since_gen)?;
+        self.confirm_repository_visible(&lock.namespace)?;
+        Ok(deltas)
     }
 
     fn clear_deltas(&self, repo_id: &str) -> Result<(), KinDbError> {
         if self.existing_repository_path(repo_id)?.is_none() {
             return Ok(());
         }
-        let _lock = self.acquire_existing_lock(repo_id)?;
-        let _ = self.load_authority_unlocked(repo_id)?;
+        let lock = self.acquire_existing_lock(repo_id)?;
+        let namespace = &lock.namespace;
+        let _ = self.load_authority_unlocked(namespace)?;
         #[cfg(test)]
         if let Some(hook) = self.compaction_before_delta_cleanup_hook.lock().take() {
             hook();
         }
-        let record = self.read_authority_record_unlocked(repo_id)?;
+        let record = self.read_authority_record_unlocked(namespace)?;
         let Some(record) = record else {
             if self
-                .load_deltas_since_unlocked(repo_id, GENERATION_INIT)?
+                .load_deltas_since_unlocked(namespace, GENERATION_INIT)?
                 .is_empty()
             {
                 return Ok(());
@@ -3758,84 +5417,157 @@ impl StorageBackend for LocalFileBackend {
             ));
         }
         let captured =
-            self.capture_delta_identities_unlocked(repo_id, &record.retired_deltas, false)?;
-        if !self.clear_exact_captured_deltas_unlocked(repo_id, &captured) {
+            self.capture_delta_identities_unlocked(namespace, &record.retired_deltas, false)?;
+        if !self.clear_exact_captured_deltas_unlocked(namespace, &captured) {
             return Err(KinDbError::StorageError(format!(
                 "repo {repo_id} delta cleanup left residual journal artifacts; recovery remains fail-closed"
             )));
         }
+        self.confirm_repository_visible(namespace)?;
         Ok(())
     }
 
     fn save_overlay(&self, repo_id: &str, session_id: &str, data: &[u8]) -> Result<(), KinDbError> {
-        let _lock = self.acquire_existing_lock(repo_id)?;
-        let path = self.overlay_path(repo_id, session_id);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
+        let leaf = Self::overlay_leaf(session_id)?;
+        let lock = self.acquire_existing_lock(repo_id)?;
+        let overlays = lock
+            .namespace
+            .surface(Self::overlays_surface_name(), true)?
+            .ok_or_else(|| {
                 KinDbError::StorageError(format!(
-                    "failed to create overlay directory {}: {e}",
-                    parent.display()
+                    "overlay surface disappeared while writing repo {repo_id}"
                 ))
             })?;
+        overlays.atomic_write(&leaf, data)?;
+        #[cfg(test)]
+        if let Some(hook) = self.overlay_after_write_hook.lock().take() {
+            hook();
         }
-        std::fs::write(&path, data).map_err(|e| {
-            KinDbError::StorageError(format!("failed to write overlay {}: {e}", path.display()))
-        })
+        lock.namespace.confirm_surface_visible(&overlays)?;
+        self.confirm_repository_visible(&lock.namespace)
     }
 
     fn load_overlay(&self, repo_id: &str, session_id: &str) -> Result<Option<Vec<u8>>, KinDbError> {
+        let leaf = Self::overlay_leaf(session_id)?;
         if self.existing_repository_path(repo_id)?.is_none() {
             return Ok(None);
         }
-        let _lock = self.acquire_existing_lock(repo_id)?;
-        let path = self.overlay_path(repo_id, session_id);
-        if !path.exists() {
+        let lock = self.acquire_existing_lock(repo_id)?;
+        let Some(overlays) = lock
+            .namespace
+            .surface(Self::overlays_surface_name(), false)?
+        else {
+            self.confirm_repository_visible(&lock.namespace)?;
+            return Ok(None);
+        };
+        if !overlays.exists(&leaf)? {
+            lock.namespace.confirm_surface_visible(&overlays)?;
+            self.confirm_repository_visible(&lock.namespace)?;
             return Ok(None);
         }
-        let data = std::fs::read(&path).map_err(|e| {
-            KinDbError::StorageError(format!("failed to read overlay {}: {e}", path.display()))
-        })?;
+        let data = overlays.read_regular(&leaf, "local overlay")?;
+        lock.namespace.confirm_surface_visible(&overlays)?;
+        self.confirm_repository_visible(&lock.namespace)?;
         Ok(Some(data))
     }
 
     fn delete_overlay(&self, repo_id: &str, session_id: &str) -> Result<(), KinDbError> {
+        let leaf = Self::overlay_leaf(session_id)?;
         if self.existing_repository_path(repo_id)?.is_none() {
             return Ok(());
         }
-        let _lock = self.acquire_existing_lock(repo_id)?;
-        let path = self.overlay_path(repo_id, session_id);
-        if !path.exists() {
+        let lock = self.acquire_existing_lock(repo_id)?;
+        let Some(overlays) = lock
+            .namespace
+            .surface(Self::overlays_surface_name(), false)?
+        else {
+            self.confirm_repository_visible(&lock.namespace)?;
+            return Ok(());
+        };
+        if !overlays.exists(&leaf)? {
+            lock.namespace.confirm_surface_visible(&overlays)?;
+            self.confirm_repository_visible(&lock.namespace)?;
             return Ok(());
         }
-        std::fs::remove_file(&path).map_err(|e| {
-            KinDbError::StorageError(format!("failed to delete overlay {}: {e}", path.display()))
-        })
+        overlays.directory.remove_file(&leaf).map_err(|error| {
+            KinDbError::StorageError(format!(
+                "failed to delete overlay {}: {error}",
+                overlays.display(&leaf).display()
+            ))
+        })?;
+        overlays.sync(&leaf)?;
+        lock.namespace.confirm_surface_visible(&overlays)?;
+        self.confirm_repository_visible(&lock.namespace)
     }
 
     fn list_repos(&self) -> Result<Vec<String>, KinDbError> {
-        let mut repos = Vec::new();
-        if !self.confirm_storage_root_identity()? {
-            return Ok(repos);
-        }
-        let entries = std::fs::read_dir(&self.base_path).map_err(|e| {
+        let Some(root) = self.storage_root_capability()? else {
+            return Ok(Vec::new());
+        };
+        let entries = root.directory().entries().map_err(|e| {
             KinDbError::StorageError(format!(
                 "failed to read base directory {}: {e}",
                 self.base_path.display()
             ))
         })?;
+        let mut repos = Vec::new();
+        let mut seen_identities = std::collections::HashMap::new();
         for entry in entries {
             let entry = entry.map_err(|e| {
                 KinDbError::StorageError(format!("failed to read directory entry: {e}"))
             })?;
-            if entry.path().is_dir() {
-                let authority = entry.path().join("authority.json");
-                if authority.exists() {
-                    if let Some(name) = entry.file_name().to_str() {
-                        repos.push(name.to_string());
-                    }
-                }
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if validate_source_blob_repo_id(&name).is_err() {
+                continue;
             }
+            let Some(candidate) = Self::open_repository_from_root(&root, &name, &self.base_path)?
+            else {
+                continue;
+            };
+            if !candidate.exists(Self::authority_relative_path())? {
+                continue;
+            }
+            // Listing is visibility discovery only. In particular, do not run
+            // recovery confirmation here: that can remove an atomic-write
+            // marker and is authority mutation that belongs under the
+            // repository lock. The first real authority read performs that
+            // recovery before trusting the record.
+            let authority_path = candidate.display(Self::authority_relative_path());
+            let authority_bytes = candidate.read_regular_bounded(
+                Self::authority_relative_path(),
+                "local authority",
+                1024 * 1024,
+            )?;
+            Self::decode_authority_record(&name, &authority_path, &authority_bytes)?;
+
+            let namespaces = self.repository_namespaces.lock();
+            if let Some(expected) = namespaces.get(&name) {
+                if expected.identity != candidate.identity {
+                    return Err(KinDbError::StorageError(format!(
+                        "local repository namespace {} changed while listing repositories",
+                        expected.display_path.display()
+                    )));
+                }
+            } else if let Some((existing_id, _)) = namespaces
+                .iter()
+                .find(|(_, expected)| expected.identity == candidate.identity)
+            {
+                return Err(KinDbError::StorageError(format!(
+                    "repository ids {name:?} and {existing_id:?} resolve to the same retained storage namespace"
+                )));
+            }
+            drop(namespaces);
+            self.confirm_repository_visible(&candidate)?;
+            if let Some(existing_id) = seen_identities.insert(candidate.identity, name.clone()) {
+                return Err(KinDbError::StorageError(format!(
+                    "repository ids {name:?} and {existing_id:?} resolve to the same transiently discovered storage namespace"
+                )));
+            }
+            repos.push(name);
         }
+        repos.sort();
         Ok(repos)
     }
 }
@@ -3844,6 +5576,66 @@ impl StorageBackend for LocalFileBackend {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    fn copy_test_directory(source: &Path, destination: &Path) {
+        std::fs::create_dir(destination).unwrap();
+        for entry in std::fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            let source_path = entry.path();
+            let destination_path = destination.join(entry.file_name());
+            let file_type = entry.file_type().unwrap();
+            if file_type.is_dir() {
+                copy_test_directory(&source_path, &destination_path);
+            } else if file_type.is_file() {
+                std::fs::copy(&source_path, &destination_path).unwrap();
+            } else {
+                panic!(
+                    "test repository fixture contains unsupported entry {}",
+                    source_path.display()
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn test_directory_bytes(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+        fn collect(
+            root: &Path,
+            cursor: &Path,
+            files: &mut std::collections::BTreeMap<PathBuf, Vec<u8>>,
+        ) {
+            for entry in std::fs::read_dir(cursor).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                let file_type = entry.file_type().unwrap();
+                if file_type.is_dir() {
+                    collect(root, &path, files);
+                } else if file_type.is_file() {
+                    files.insert(
+                        path.strip_prefix(root).unwrap().to_path_buf(),
+                        std::fs::read(path).unwrap(),
+                    );
+                }
+            }
+        }
+
+        let mut files = std::collections::BTreeMap::new();
+        collect(root, root, &mut files);
+        files
+    }
+
+    #[cfg(unix)]
+    fn assert_repository_namespace_rejected<T: std::fmt::Debug>(result: Result<T, KinDbError>) {
+        let error = result.expect_err("a retained backend must reject a replacement repository");
+        assert!(
+            (error.to_string().contains("repository namespace")
+                || error.to_string().contains("repository surface"))
+                && (error.to_string().contains("changed")
+                    || error.to_string().contains("detached")),
+            "unexpected descendant-namespace error: {error}"
+        );
+    }
 
     struct UnboundedOnlyBackend;
 
@@ -4291,7 +6083,10 @@ mod tests {
         let error = backend
             .save_source_blob("repo-a", digest, data)
             .expect_err("a substituted repo ancestor must fail closed");
-        assert!(error.to_string().contains("symlinked or non-directory"));
+        assert!(
+            error.to_string().contains("not a real directory"),
+            "unexpected substituted-repository error: {error}"
+        );
         assert_eq!(
             std::fs::read_dir(outside.path()).unwrap().count(),
             0,
@@ -4322,7 +6117,10 @@ mod tests {
         let error = backend
             .save_source_blob("repo-a", digest, data)
             .expect_err("existing-object retry must revalidate its configured namespace");
-        assert!(error.to_string().contains("symlinked or non-directory"));
+        assert!(
+            error.to_string().contains("not a real directory"),
+            "unexpected existing-object displacement error: {error}"
+        );
         assert_eq!(
             std::fs::read_dir(outside.path()).unwrap().count(),
             0,
@@ -4467,9 +6265,9 @@ mod tests {
         prepare_source_trust_root(dir.path(), true, &backend.source_root_confirmed_for_process)
             .unwrap();
 
-        // Four source-directory ancestors are confirmed before publication;
-        // fail the following sync of the newly linked object entry.
-        mmap::fail_parent_sync_after(4);
+        // Repository staging/publication, lock publication, and three source
+        // ancestors are confirmed before the newly linked object entry.
+        mmap::fail_parent_sync_after(6);
         let first_error = backend
             .save_source_blob("repo-a", digest, data)
             .expect_err("an unconfirmed object link must not be acknowledged");
@@ -4480,7 +6278,7 @@ mod tests {
 
         // The object exists on retry, but that retry must still perform its
         // own directory confirmation rather than trusting path existence.
-        mmap::fail_parent_sync_after(4);
+        mmap::fail_parent_sync_after(3);
         let retry_error = backend
             .save_source_blob("repo-a", digest, data)
             .expect_err("retry must propagate its own directory sync failure");
@@ -4491,6 +6289,84 @@ mod tests {
         backend
             .save_source_blob("repo-a", digest, data)
             .expect("a retry may acknowledge only after directory confirmation");
+        assert_eq!(
+            backend.load_source_blob("repo-a", digest).unwrap(),
+            Some(data.to_vec())
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_source_blob_retries_failed_ancestor_directory_sync() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+        backend
+            .save_snapshot(
+                "repo-a",
+                &GraphSnapshot::empty().to_bytes().unwrap(),
+                GENERATION_INIT,
+            )
+            .unwrap();
+        let data = b"durable Windows source ancestors";
+        let digest = source_digest(data);
+
+        mmap::fail_parent_sync_after(0);
+        let error = backend
+            .save_source_blob("repo-a", digest, data)
+            .expect_err("new Windows source ancestors must be durable before publication");
+        assert!(error
+            .to_string()
+            .contains("injected parent-directory fsync failure"));
+
+        backend
+            .save_source_blob("repo-a", digest, data)
+            .expect("retry must confirm every visible ancestor child-before-parent");
+        assert_eq!(
+            backend.load_source_blob("repo-a", digest).unwrap(),
+            Some(data.to_vec())
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_source_blob_retries_failed_digest_entry_sync() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+        backend
+            .save_snapshot(
+                "repo-a",
+                &GraphSnapshot::empty().to_bytes().unwrap(),
+                GENERATION_INIT,
+            )
+            .unwrap();
+        let data = b"durable Windows digest entry";
+        let digest = source_digest(data);
+        let path = backend.source_blob_path("repo-a", digest).unwrap();
+
+        // Three ancestor-directory confirmations precede the final digest
+        // entry confirmation.
+        mmap::fail_parent_sync_after(3);
+        let error = backend
+            .save_source_blob("repo-a", digest, data)
+            .expect_err("a renamed digest without directory durability is unconfirmed");
+        assert!(error
+            .to_string()
+            .contains("injected parent-directory fsync failure"));
+        assert!(
+            path.exists(),
+            "the no-clobber digest remains available for an exact retry"
+        );
+
+        // A visible digest does not launder the failed confirmation: the
+        // existing-object retry must repeat the leaf-directory flush.
+        mmap::fail_parent_sync_after(3);
+        backend
+            .save_source_blob("repo-a", digest, data)
+            .expect_err("exact retry must propagate its own digest-entry sync failure");
+
+        backend
+            .save_source_blob("repo-a", digest, data)
+            .expect("exact retry may acknowledge only after the digest entry is durable");
         assert_eq!(
             backend.load_source_blob("repo-a", digest).unwrap(),
             Some(data.to_vec())
@@ -4560,7 +6436,10 @@ mod tests {
             error.to_string().contains("namespace changed")
                 || error
                     .to_string()
-                    .contains("unavailable for existing-authority access"),
+                    .contains("unavailable for existing-authority access")
+                || error
+                    .to_string()
+                    .contains("was detached after this backend opened"),
             "unexpected post-detach source-writer error: {error}"
         );
         writer.join().unwrap();
@@ -4591,7 +6470,7 @@ mod tests {
         assert!(
             source_error
                 .to_string()
-                .contains("refusing to recreate a detached authority namespace")
+                .contains("refusing to recreate a detached repository namespace")
                 || source_error
                     .to_string()
                     .contains("unavailable for existing-authority access")
@@ -4646,6 +6525,1078 @@ mod tests {
             !replacement.overlay_path("repo-a", "session-a").exists(),
             "stale backend must not add overlays to the replacement storage epoch"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_backend_rejects_repository_replacement_across_every_local_surface() {
+        let directory = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(directory.path());
+        let snapshot = GraphSnapshot::empty().to_bytes().unwrap();
+        let generation = backend
+            .save_snapshot("repo-a", &snapshot, GENERATION_INIT)
+            .unwrap();
+        backend
+            .save_snapshot("repo-b", &snapshot, GENERATION_INIT)
+            .unwrap();
+        let source = b"retained exact source";
+        backend
+            .save_source_blob("repo-a", source_digest(source), source)
+            .unwrap();
+        backend
+            .save_overlay("repo-a", "session-a", b"retained overlay")
+            .unwrap();
+        let delta = crate::storage::delta::GraphSnapshotDelta::empty(generation)
+            .to_bytes()
+            .unwrap();
+        let head = backend.save_delta("repo-a", &delta, generation).unwrap();
+
+        let visible = directory.path().join("repo-a");
+        let detached = directory.path().join("repo-a-detached");
+        let staged_replacement = directory.path().join("repo-a-replacement");
+        copy_test_directory(&visible, &staged_replacement);
+        std::fs::rename(&visible, &detached).unwrap();
+        std::fs::rename(&staged_replacement, &visible).unwrap();
+        let replacement_before = test_directory_bytes(&visible);
+        let detached_before = test_directory_bytes(&detached);
+
+        let error = backend
+            .load_snapshot("repo-a")
+            .expect_err("the retained reader must reject the replacement snapshot surface");
+        assert!(
+            error.to_string().contains("repository namespace")
+                && error.to_string().contains("changed"),
+            "unexpected replaced snapshot-reader error: {error}"
+        );
+        assert_repository_namespace_rejected(backend.load_recovery_state("repo-a"));
+        assert_repository_namespace_rejected(backend.save_snapshot("repo-a", &snapshot, head));
+        let next_delta = crate::storage::delta::GraphSnapshotDelta::empty(head)
+            .to_bytes()
+            .unwrap();
+        assert_repository_namespace_rejected(backend.save_delta("repo-a", &next_delta, head));
+        assert_repository_namespace_rejected(backend.load_deltas_since("repo-a", GENERATION_INIT));
+        assert_repository_namespace_rejected(backend.clear_deltas("repo-a"));
+        assert_repository_namespace_rejected(
+            backend.load_source_blob("repo-a", source_digest(source)),
+        );
+        assert_repository_namespace_rejected(
+            backend.source_blob_len("repo-a", source_digest(source)),
+        );
+        let new_source = b"must not enter replacement";
+        assert_repository_namespace_rejected(backend.save_source_blob(
+            "repo-a",
+            source_digest(new_source),
+            new_source,
+        ));
+        assert_repository_namespace_rejected(backend.load_overlay("repo-a", "session-a"));
+        assert_repository_namespace_rejected(backend.save_overlay(
+            "repo-a",
+            "session-b",
+            b"must not enter replacement",
+        ));
+        assert_repository_namespace_rejected(backend.delete_overlay("repo-a", "session-a"));
+        assert_repository_namespace_rejected(backend.freeze_existing_authority("repo-a"));
+        assert_repository_namespace_rejected(backend.list_repos());
+
+        assert_eq!(
+            test_directory_bytes(&visible),
+            replacement_before,
+            "stale backend operations must not touch the replacement namespace"
+        );
+        assert_eq!(
+            test_directory_bytes(&detached),
+            detached_before,
+            "rejected operations must not continue mutating the detached namespace"
+        );
+        assert!(
+            backend.load_snapshot("repo-b").unwrap().is_some(),
+            "repository capabilities are pinned independently"
+        );
+
+        let replacement_backend = LocalFileBackend::new(directory.path());
+        let recovered = replacement_backend
+            .load_recovery_state("repo-a")
+            .expect("a new process may bind the replacement epoch");
+        assert!(recovered.0.is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writer_blocked_on_old_repository_lock_cannot_touch_visible_replacement() {
+        let directory = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(directory.path());
+        let snapshot = GraphSnapshot::empty().to_bytes().unwrap();
+        backend
+            .save_snapshot("repo-a", &snapshot, GENERATION_INIT)
+            .unwrap();
+        let freeze = backend.freeze_existing_authority("repo-a").unwrap();
+
+        let competing = LocalFileBackend::new(directory.path());
+        let namespace = competing
+            .repository_capability("repo-a", false)
+            .unwrap()
+            .expect("competing backend pins the old repository before waiting");
+        let marker = LocalFileBackend::open_repository_lock(&namespace, false).unwrap();
+        LocalFileBackend::pin_repository_lock_identity(&namespace, &marker).unwrap();
+        let lock_target = LocalFileBackend::repository_lock_target(&namespace, &marker).unwrap();
+        use fs2::FileExt;
+        assert!(
+            lock_target.try_lock_exclusive().is_err(),
+            "the competing writer must contend on the exact old repository lock"
+        );
+
+        let visible = directory.path().join("repo-a");
+        let detached = directory.path().join("repo-a-detached");
+        let staged_replacement = directory.path().join("repo-a-replacement");
+        copy_test_directory(&visible, &staged_replacement);
+        std::fs::rename(&visible, &detached).unwrap();
+        std::fs::rename(&staged_replacement, &visible).unwrap();
+        let replacement_before = test_directory_bytes(&visible);
+
+        drop(freeze);
+        lock_target
+            .lock_exclusive()
+            .expect("the competing writer acquires the old lock after release");
+        let result = competing.confirm_existing_lock_visible(&namespace);
+        FileExt::unlock(&lock_target).unwrap();
+        assert_repository_namespace_rejected(result);
+        assert_eq!(
+            test_directory_bytes(&visible),
+            replacement_before,
+            "the post-wait visibility check must reject before replacement IO"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_snapshot_surface_rejects_swap_before_authority_publication() {
+        let directory = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(directory.path());
+        let initial = GraphSnapshot::empty().to_bytes().unwrap();
+        let generation = backend
+            .save_snapshot("repo-a", &initial, GENERATION_INIT)
+            .unwrap();
+        let mut next = GraphSnapshot::empty();
+        next.admit_artifact_for_test("next.rs".to_string(), crate::types::regular_tree_entry(1));
+        let next = next.to_bytes().unwrap();
+
+        let repo = directory.path().join("repo-a");
+        let visible = repo.join("snapshots");
+        let detached = repo.join("snapshots-detached");
+        let replacement = repo.join("snapshots-replacement");
+        copy_test_directory(&visible, &replacement);
+        backend.set_snapshot_before_authority_commit_hook(move || {
+            std::fs::rename(&visible, &detached).unwrap();
+            std::fs::rename(&replacement, &visible).unwrap();
+        });
+
+        let error = backend
+            .save_snapshot("repo-a", &next, generation)
+            .expect_err("a swapped snapshot surface must stop before authority publication");
+        assert!(
+            error.to_string().contains("repository surface")
+                && error.to_string().contains("changed"),
+            "unexpected snapshot-surface error: {error}"
+        );
+        assert_repository_namespace_rejected(backend.load_snapshot("repo-a"));
+
+        let reopened = LocalFileBackend::new(directory.path());
+        let (bytes, reopened_generation) = reopened
+            .load_snapshot("repo-a")
+            .unwrap()
+            .expect("old visible authority remains complete");
+        assert_eq!(reopened_generation, generation);
+        assert_eq!(bytes, initial);
+        assert!(
+            directory
+                .path()
+                .join("repo-a/snapshots-detached/00000000000000000002.kndb")
+                .exists(),
+            "the rejected write targets only the detached retained surface"
+        );
+        assert!(
+            !directory
+                .path()
+                .join("repo-a/snapshots/00000000000000000002.kndb")
+                .exists(),
+            "the replacement snapshot surface must remain untouched"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_delta_surface_rejects_swap_before_authority_publication() {
+        let directory = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(directory.path());
+        let initial = GraphSnapshot::empty().to_bytes().unwrap();
+        let generation = backend
+            .save_snapshot("repo-a", &initial, GENERATION_INIT)
+            .unwrap();
+        let delta = crate::storage::delta::GraphSnapshotDelta::empty(generation)
+            .to_bytes()
+            .unwrap();
+
+        let repo = directory.path().join("repo-a");
+        let visible = repo.join("deltas");
+        let detached = repo.join("deltas-detached");
+        let replacement = repo.join("deltas-replacement");
+        std::fs::create_dir(&replacement).unwrap();
+        backend.set_delta_before_authority_commit_hook(move || {
+            std::fs::rename(&visible, &detached).unwrap();
+            std::fs::rename(&replacement, &visible).unwrap();
+        });
+
+        let error = backend
+            .save_delta("repo-a", &delta, generation)
+            .expect_err("a swapped delta surface must stop before authority publication");
+        assert!(
+            error.to_string().contains("repository surface")
+                && error.to_string().contains("changed"),
+            "unexpected delta-surface error: {error}"
+        );
+        let error = backend
+            .load_deltas_since("repo-a", GENERATION_INIT)
+            .expect_err("the retained reader must reject the replacement delta surface");
+        assert!(
+            error.to_string().contains("repository surface")
+                && error.to_string().contains("changed"),
+            "unexpected replaced delta-reader error: {error}"
+        );
+
+        let reopened = LocalFileBackend::new(directory.path());
+        let (_, reopened_generation) = reopened
+            .load_snapshot("repo-a")
+            .unwrap()
+            .expect("old visible authority remains complete");
+        assert_eq!(reopened_generation, generation);
+        assert!(
+            directory
+                .path()
+                .join("repo-a/deltas-detached/00000000000000000002.kndd")
+                .exists(),
+            "the rejected delta targets only the detached retained surface"
+        );
+        assert!(
+            !directory
+                .path()
+                .join("repo-a/deltas/00000000000000000002.kndd")
+                .exists(),
+            "the replacement delta surface must remain untouched"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn post_commit_surface_swap_is_classified_indeterminate_not_uncommitted() {
+        let directory = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(directory.path());
+        let generation = backend
+            .save_snapshot(
+                "repo-a",
+                &GraphSnapshot::empty().to_bytes().unwrap(),
+                GENERATION_INIT,
+            )
+            .unwrap();
+        let mut next = GraphSnapshot::empty();
+        next.admit_artifact_for_test(
+            "committed.rs".to_string(),
+            crate::types::regular_tree_entry(2),
+        );
+        let next = next.to_bytes().unwrap();
+
+        let repo = directory.path().join("repo-a");
+        let visible = repo.join("snapshots");
+        let detached = repo.join("snapshots-detached");
+        let replacement = repo.join("snapshots-replacement");
+        backend.set_snapshot_after_authority_commit_hook(move || {
+            copy_test_directory(&visible, &replacement);
+            std::fs::rename(&visible, &detached).unwrap();
+            std::fs::rename(&replacement, &visible).unwrap();
+        });
+        let error = backend
+            .save_snapshot("repo-a", &next, generation)
+            .expect_err("post-commit surface confirmation must report uncertainty");
+        assert!(
+            matches!(error, KinDbError::SnapshotPersistenceIndeterminate(_)),
+            "committed authority must never be reported as not committed: {error}"
+        );
+
+        let reopened = LocalFileBackend::new(directory.path());
+        let (bytes, reopened_generation) = reopened
+            .load_snapshot("repo-a")
+            .unwrap()
+            .expect("replacement carries the committed exact snapshot");
+        assert_eq!(reopened_generation, generation + 1);
+        assert_eq!(bytes, next);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_snapshot_retry_never_returns_a_freeze_for_a_swapped_surface() {
+        let directory = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(directory.path());
+        let snapshot = GraphSnapshot::empty().to_bytes().unwrap();
+        let generation = backend
+            .save_snapshot("repo-a", &snapshot, GENERATION_INIT)
+            .unwrap();
+        assert_eq!(generation, 1);
+
+        let repo = directory.path().join("repo-a");
+        let visible = repo.join("snapshots");
+        let detached = repo.join("snapshots-detached");
+        let replacement = repo.join("snapshots-replacement");
+        copy_test_directory(&visible, &replacement);
+        backend.set_snapshot_retry_before_confirmation_hook(move || {
+            std::fs::rename(&visible, &detached).unwrap();
+            std::fs::rename(&replacement, &visible).unwrap();
+        });
+
+        let error = backend
+            .save_snapshot_and_freeze(
+                "repo-a",
+                &snapshot,
+                SnapshotCursor::from_backend_generation(GENERATION_INIT),
+            )
+            .expect_err("an exact retry must not return a freeze for a detached surface epoch");
+        assert!(
+            matches!(error, KinDbError::SnapshotPersistenceIndeterminate(_)),
+            "an already-committed exact retry must report uncertainty after a surface swap: {error}"
+        );
+
+        let reopened = LocalFileBackend::new(directory.path());
+        let (bytes, reopened_generation) = reopened
+            .load_snapshot("repo-a")
+            .unwrap()
+            .expect("a fresh backend may bind the still-complete visible epoch");
+        assert_eq!(reopened_generation, generation);
+        assert_eq!(bytes, snapshot);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authority_load_rejects_snapshot_surface_swapped_during_deferred_cleanup() {
+        let directory = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(directory.path());
+        let snapshot = GraphSnapshot::empty().to_bytes().unwrap();
+        let generation = backend
+            .save_snapshot("repo-a", &snapshot, GENERATION_INIT)
+            .unwrap();
+        let snapshots = directory.path().join("repo-a/snapshots");
+        std::fs::copy(
+            snapshots.join(format!("{generation:020}.kndb")),
+            snapshots.join("00000000000000000000.kndb"),
+        )
+        .unwrap();
+
+        let visible = snapshots;
+        let detached = directory.path().join("repo-a/snapshots-detached");
+        let replacement = directory.path().join("repo-a/snapshots-replacement");
+        backend.set_snapshot_cleanup_before_confirmation_hook(move || {
+            copy_test_directory(&visible, &replacement);
+            std::fs::rename(&visible, &detached).unwrap();
+            std::fs::rename(&replacement, &visible).unwrap();
+        });
+
+        let error = backend
+            .load_snapshot("repo-a")
+            .expect_err("authority bytes from a detached cleanup epoch must not be returned");
+        assert!(
+            error.to_string().contains("repository surface")
+                && error.to_string().contains("changed"),
+            "unexpected cleanup-swap error: {error}"
+        );
+
+        let reopened = LocalFileBackend::new(directory.path());
+        let (bytes, reopened_generation) = reopened
+            .load_snapshot("repo-a")
+            .unwrap()
+            .expect("a fresh backend may bind the replacement snapshot surface");
+        assert_eq!(reopened_generation, generation);
+        assert_eq!(bytes, snapshot);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authority_post_rename_verification_failure_is_classified_indeterminate() {
+        let directory = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(directory.path());
+        let generation = backend
+            .save_snapshot(
+                "repo-a",
+                &GraphSnapshot::empty().to_bytes().unwrap(),
+                GENERATION_INIT,
+            )
+            .unwrap();
+        let mut next = GraphSnapshot::empty();
+        next.admit_artifact_for_test(
+            "committed.rs".to_string(),
+            crate::types::regular_tree_entry(9),
+        );
+        let next = next.to_bytes().unwrap();
+        let authority_path = directory.path().join("repo-a/authority.json");
+        let installed_copy = directory.path().join("installed-authority.json");
+        backend.set_snapshot_before_authority_commit_hook(move || {
+            mmap::set_promotion_after_target_rename_hook(move || {
+                std::fs::copy(&authority_path, &installed_copy).unwrap();
+                std::fs::write(&authority_path, b"post-rename tamper").unwrap();
+            });
+        });
+
+        let outcome = backend.save_snapshot_classified(
+            "repo-a",
+            &next,
+            SnapshotCursor::from_backend_generation(generation),
+        );
+        assert!(
+            matches!(outcome, SnapshotSaveOutcome::Indeterminate(_)),
+            "no post-rename verification failure may be reported as not committed: {outcome:?}"
+        );
+        let installed: LocalAuthorityRecord = serde_json::from_slice(
+            &std::fs::read(directory.path().join("installed-authority.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(installed.head_generation, generation + 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_overlay_surface_rejects_swap_and_session_traversal() {
+        let directory = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(directory.path());
+        backend
+            .save_snapshot(
+                "repo-a",
+                &GraphSnapshot::empty().to_bytes().unwrap(),
+                GENERATION_INIT,
+            )
+            .unwrap();
+        backend
+            .save_overlay("repo-a", "session-a", b"retained")
+            .unwrap();
+        for invalid in [
+            "",
+            "..",
+            "../authority",
+            "nested/session",
+            "CON",
+            "trailing.",
+            "Upper",
+        ] {
+            let error = backend
+                .save_overlay("repo-a", invalid, b"invalid")
+                .expect_err("overlay identifiers must be one portable component");
+            assert!(
+                error.to_string().contains("overlay session id"),
+                "unexpected overlay validation error for {invalid:?}: {error}"
+            );
+        }
+        let oversized = "a".repeat(mmap::MAX_ATOMIC_DESTINATION_LEAF_BYTES - ".bin".len() + 1);
+        let error = backend
+            .save_overlay("repo-a", &oversized, b"invalid")
+            .expect_err("overlay names must reserve room for every atomic recovery suffix");
+        assert!(
+            error
+                .to_string()
+                .contains("recovery-staging filename budget"),
+            "unexpected oversized overlay error: {error}"
+        );
+
+        let repo = directory.path().join("repo-a");
+        let visible = repo.join("overlays");
+        let detached = repo.join("overlays-detached");
+        let replacement = repo.join("overlays-replacement");
+        copy_test_directory(&visible, &replacement);
+        backend.set_overlay_after_write_hook(move || {
+            std::fs::rename(&visible, &detached).unwrap();
+            std::fs::rename(&replacement, &visible).unwrap();
+        });
+        let error = backend
+            .save_overlay("repo-a", "session-b", b"detached only")
+            .expect_err("a swapped overlay surface must fail closed");
+        assert!(
+            error.to_string().contains("repository surface")
+                && error.to_string().contains("changed"),
+            "unexpected overlay-surface error: {error}"
+        );
+        let error = backend
+            .load_overlay("repo-a", "session-a")
+            .expect_err("the retained reader must reject the replacement overlay surface");
+        assert!(
+            error.to_string().contains("repository surface")
+                && error.to_string().contains("changed"),
+            "unexpected replaced overlay-reader error: {error}"
+        );
+
+        let reopened = LocalFileBackend::new(directory.path());
+        assert_eq!(
+            reopened.load_overlay("repo-a", "session-a").unwrap(),
+            Some(b"retained".to_vec())
+        );
+        assert_eq!(reopened.load_overlay("repo-a", "session-b").unwrap(), None);
+        assert!(
+            directory
+                .path()
+                .join("repo-a/overlays-detached/session-b.bin")
+                .exists(),
+            "the rejected overlay write targets only the detached retained surface"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repository_directory_lock_serializes_across_lock_marker_replacement() {
+        let directory = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(directory.path());
+        backend
+            .save_snapshot(
+                "repo-a",
+                &GraphSnapshot::empty().to_bytes().unwrap(),
+                GENERATION_INIT,
+            )
+            .unwrap();
+        let freeze = backend.freeze_existing_authority("repo-a").unwrap();
+
+        let repo = directory.path().join("repo-a");
+        std::fs::rename(repo.join(".lock"), repo.join(".lock-detached")).unwrap();
+        std::fs::write(repo.join(".lock"), b"replacement marker").unwrap();
+        let competing = LocalFileBackend::new(directory.path());
+        let namespace = competing
+            .repository_capability("repo-a", false)
+            .unwrap()
+            .unwrap();
+        let marker = LocalFileBackend::open_repository_lock(&namespace, false).unwrap();
+        LocalFileBackend::pin_repository_lock_identity(&namespace, &marker).unwrap();
+        let lock_target = LocalFileBackend::repository_lock_target(&namespace, &marker).unwrap();
+        use fs2::FileExt;
+        assert!(
+            lock_target.try_lock_exclusive().is_err(),
+            "a replacement lock marker must not create a second lock epoch"
+        );
+
+        drop(freeze);
+        lock_target
+            .lock_exclusive()
+            .expect("the replacement-marker backend acquires the repository lock after release");
+        FileExt::unlock(&lock_target).unwrap();
+        competing
+            .save_overlay("repo-a", "serialized", b"after freeze")
+            .unwrap();
+        let error = backend
+            .load_snapshot("repo-a")
+            .expect_err("the original backend must reject its replaced marker identity");
+        assert!(
+            error.to_string().contains("lock") && error.to_string().contains("changed since"),
+            "unexpected replaced-lock error: {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_lock_publication_sync_pins_the_first_marker_epoch() {
+        let directory = TempDir::new().unwrap();
+        let repository = directory.path().join("repo-a");
+        std::fs::create_dir(&repository).unwrap();
+        std::fs::write(repository.join("preexisting"), b"retain namespace").unwrap();
+        let backend = LocalFileBackend::new(directory.path());
+
+        mmap::fail_parent_sync_after(0);
+        let first_error = backend
+            .acquire_lock("repo-a")
+            .expect_err("the first lock marker publication sync is deliberately failed");
+        assert!(first_error
+            .to_string()
+            .contains("injected parent-directory fsync failure"));
+        assert!(backend
+            .repository_namespaces
+            .lock()
+            .get("repo-a")
+            .unwrap()
+            .lock_identity
+            .lock()
+            .is_some());
+
+        std::fs::rename(repository.join(".lock"), repository.join(".lock-detached")).unwrap();
+        std::fs::File::create(repository.join(".lock")).unwrap();
+        let retry_error = backend
+            .acquire_lock("repo-a")
+            .expect_err("same backend must not pin a replacement lock marker after sync failure");
+        assert!(
+            retry_error.to_string().contains("lock")
+                && retry_error.to_string().contains("changed since"),
+            "unexpected lock-publication retry error: {retry_error}"
+        );
+    }
+
+    #[test]
+    fn listing_does_not_retain_every_discovered_repository_or_stray_directory() {
+        let directory = TempDir::new().unwrap();
+        let writer = LocalFileBackend::new(directory.path());
+        writer
+            .save_snapshot(
+                "repo-a",
+                &GraphSnapshot::empty().to_bytes().unwrap(),
+                GENERATION_INIT,
+            )
+            .unwrap();
+        drop(writer);
+        for index in 0..128 {
+            std::fs::create_dir(directory.path().join(format!("stray-{index:03}"))).unwrap();
+        }
+
+        let lister = LocalFileBackend::new(directory.path());
+        assert_eq!(lister.list_repos().unwrap(), vec!["repo-a".to_string()]);
+        assert!(
+            lister.repository_namespaces.lock().is_empty(),
+            "read-only discovery must not pin every repository or stray child"
+        );
+    }
+
+    #[test]
+    fn listing_never_confirms_or_removes_an_authority_recovery_marker() {
+        let directory = TempDir::new().unwrap();
+        let writer = LocalFileBackend::new(directory.path());
+        writer.fail_next_snapshot_parent_sync_after_install();
+        let error = writer
+            .save_snapshot(
+                "repo-a",
+                &GraphSnapshot::empty().to_bytes().unwrap(),
+                GENERATION_INIT,
+            )
+            .expect_err("authority installation is deliberately left unconfirmed");
+        assert!(matches!(
+            error,
+            KinDbError::SnapshotPersistenceIndeterminate(_)
+        ));
+        let authority = directory.path().join("repo-a/authority.json");
+        let marker = mmap::recovery_marker_path(&authority);
+        assert!(marker.exists());
+
+        let lister = LocalFileBackend::new(directory.path());
+        assert_eq!(lister.list_repos().unwrap(), vec!["repo-a".to_string()]);
+        assert!(
+            marker.exists(),
+            "read-only repository discovery must not mutate authority recovery state"
+        );
+        assert!(lister.repository_namespaces.lock().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn initial_repository_bind_rejects_preopen_namespace_replacement() {
+        let directory = TempDir::new().unwrap();
+        let visible = directory.path().join("repo-a");
+        let detached = directory.path().join("repo-a-detached");
+        let replacement = directory.path().join("repo-a-replacement");
+        std::fs::create_dir(&visible).unwrap();
+        std::fs::create_dir(&replacement).unwrap();
+        let backend = LocalFileBackend::new(directory.path());
+        let visible_for_swap = visible.clone();
+        set_local_directory_after_preopen_hook(LocalDirectoryBindKind::Repository, move || {
+            std::fs::rename(&visible_for_swap, &detached).unwrap();
+            std::fs::rename(&replacement, &visible_for_swap).unwrap();
+        });
+
+        let error = backend
+            .existing_repository_path("repo-a")
+            .expect_err("initial repository admission must bind one pre/open/post identity");
+        assert!(
+            error.to_string().contains("local directory namespace")
+                && error.to_string().contains("changed"),
+            "unexpected initial repository-bind error: {error}"
+        );
+        assert!(
+            backend.repository_namespaces.lock().is_empty(),
+            "the replacement epoch must not become the backend's retained identity"
+        );
+        let fresh = LocalFileBackend::new(directory.path());
+        assert_eq!(
+            fresh.existing_repository_path("repo-a").unwrap(),
+            Some(visible)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn initial_surface_bind_rejects_preopen_namespace_replacement() {
+        let directory = TempDir::new().unwrap();
+        let writer = LocalFileBackend::new(directory.path());
+        let snapshot = GraphSnapshot::empty().to_bytes().unwrap();
+        writer
+            .save_snapshot("repo-a", &snapshot, GENERATION_INIT)
+            .unwrap();
+        drop(writer);
+
+        let backend = LocalFileBackend::new(directory.path());
+        backend
+            .existing_repository_path("repo-a")
+            .unwrap()
+            .expect("repository identity is pinned before the surface race");
+        let visible = directory.path().join("repo-a/snapshots");
+        let detached = directory.path().join("repo-a/snapshots-detached");
+        let replacement = directory.path().join("repo-a/snapshots-replacement");
+        copy_test_directory(&visible, &replacement);
+        set_local_directory_after_preopen_hook(LocalDirectoryBindKind::Surface, move || {
+            std::fs::rename(&visible, &detached).unwrap();
+            std::fs::rename(&replacement, &visible).unwrap();
+        });
+
+        let error = backend
+            .load_snapshot("repo-a")
+            .expect_err("initial surface admission must bind one pre/open/post identity");
+        assert!(
+            error.to_string().contains("local directory namespace")
+                && error.to_string().contains("changed"),
+            "unexpected initial surface-bind error: {error}"
+        );
+        let namespace = backend.repository_namespaces.lock();
+        let repo = namespace.get("repo-a").unwrap();
+        assert!(
+            repo.surface_directories.lock().is_empty(),
+            "the replacement surface epoch must not become retained"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repository_creation_retains_the_randomized_epoch_it_publishes() {
+        let directory = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(directory.path());
+        let visible = directory.path().join("repo-a");
+        let detached = directory.path().join("repo-a-detached");
+        let replacement = directory.path().join("repo-a-replacement");
+        std::fs::create_dir(&replacement).unwrap();
+        let visible_for_swap = visible.clone();
+        set_local_directory_after_preopen_hook(LocalDirectoryBindKind::Repository, move || {
+            std::fs::rename(&visible_for_swap, &detached).unwrap();
+            std::fs::rename(&replacement, &visible_for_swap).unwrap();
+        });
+
+        let error = backend
+            .save_snapshot(
+                "repo-a",
+                &GraphSnapshot::empty().to_bytes().unwrap(),
+                GENERATION_INIT,
+            )
+            .expect_err("repository creation must not admit a post-publication replacement");
+        assert!(
+            error
+                .to_string()
+                .contains("newly published local directory namespace")
+                && error.to_string().contains("replaced"),
+            "unexpected repository-creation race error: {error}"
+        );
+        assert!(
+            backend.repository_namespaces.lock().is_empty(),
+            "the replacement repository epoch must not be retained"
+        );
+        assert!(
+            backend
+                .poisoned_repository_namespaces
+                .lock()
+                .contains_key("repo-a"),
+            "the displaced published epoch must poison same-backend admission"
+        );
+        assert_eq!(
+            std::fs::read_dir(&visible).unwrap().count(),
+            0,
+            "the rejected creator must not write a lock or authority into the replacement"
+        );
+        let retry_error = backend
+            .save_snapshot(
+                "repo-a",
+                &GraphSnapshot::empty().to_bytes().unwrap(),
+                GENERATION_INIT,
+            )
+            .expect_err("same backend must never bind the replacement repository epoch");
+        assert!(
+            retry_error
+                .to_string()
+                .contains("displaced during creation")
+                && retry_error
+                    .to_string()
+                    .contains("will not bind a replacement epoch"),
+            "unexpected repository-creation retry error: {retry_error}"
+        );
+        assert_eq!(
+            std::fs::read_dir(&visible).unwrap().count(),
+            0,
+            "same-backend retry must not write into the replacement repository"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repository_publication_sync_is_retried_before_initialization() {
+        let directory = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(directory.path());
+        let snapshot = GraphSnapshot::empty().to_bytes().unwrap();
+        let repository = directory.path().join("repo-a");
+
+        mmap::fail_parent_sync_after(1);
+        let first_error = backend
+            .save_snapshot("repo-a", &snapshot, GENERATION_INIT)
+            .expect_err("repository publication must not proceed after its parent sync fails");
+        assert!(first_error
+            .to_string()
+            .contains("injected parent-directory fsync failure"));
+        assert!(repository.is_dir());
+        assert!(!repository.join(".lock").exists());
+        assert!(backend
+            .repository_namespaces
+            .lock()
+            .get("repo-a")
+            .unwrap()
+            .publication_sync_pending
+            .load(std::sync::atomic::Ordering::SeqCst));
+
+        mmap::fail_parent_sync_after(0);
+        let retry_error = backend
+            .save_snapshot("repo-a", &snapshot, GENERATION_INIT)
+            .expect_err("retry must repeat the failed repository publication sync");
+        assert!(retry_error
+            .to_string()
+            .contains("injected parent-directory fsync failure"));
+        assert!(
+            !repository.join(".lock").exists(),
+            "repository initialization must wait for publication durability"
+        );
+
+        assert_eq!(
+            backend
+                .save_snapshot("repo-a", &snapshot, GENERATION_INIT)
+                .unwrap(),
+            GENERATION_INIT + 1
+        );
+        assert!(repository.join(".lock").is_file());
+        assert!(!backend
+            .repository_namespaces
+            .lock()
+            .get("repo-a")
+            .unwrap()
+            .publication_sync_pending
+            .load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn empty_repository_publication_is_reconfirmed_after_backend_reopen() {
+        let directory = TempDir::new().unwrap();
+        let snapshot = GraphSnapshot::empty().to_bytes().unwrap();
+        let repository = directory.path().join("repo-a");
+        {
+            let backend = LocalFileBackend::new(directory.path());
+            mmap::fail_parent_sync_after(1);
+            backend
+                .save_snapshot("repo-a", &snapshot, GENERATION_INIT)
+                .expect_err("repository publication is deliberately left unconfirmed");
+        }
+        assert!(repository.is_dir());
+        assert!(!repository.join(".lock").exists());
+
+        let reopened = LocalFileBackend::new(directory.path());
+        mmap::fail_parent_sync_after(0);
+        let reopen_error = reopened
+            .save_snapshot("repo-a", &snapshot, GENERATION_INIT)
+            .expect_err("an empty visible repository must be conservatively reconfirmed");
+        assert!(reopen_error
+            .to_string()
+            .contains("injected parent-directory fsync failure"));
+        assert!(!repository.join(".lock").exists());
+
+        assert_eq!(
+            reopened
+                .save_snapshot("repo-a", &snapshot, GENERATION_INIT)
+                .unwrap(),
+            GENERATION_INIT + 1
+        );
+        assert!(repository.join(".lock").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn surface_creation_retains_the_randomized_epoch_it_publishes() {
+        let directory = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(directory.path());
+        initialize_local_repository_namespace(&backend, "repo-a");
+        let visible = directory.path().join("repo-a/snapshots");
+        let detached = directory.path().join("repo-a/snapshots-detached");
+        let replacement = directory.path().join("repo-a/snapshots-replacement");
+        std::fs::create_dir(&replacement).unwrap();
+        let visible_for_swap = visible.clone();
+        set_local_directory_after_preopen_hook(LocalDirectoryBindKind::Surface, move || {
+            std::fs::rename(&visible_for_swap, &detached).unwrap();
+            std::fs::rename(&replacement, &visible_for_swap).unwrap();
+        });
+
+        let error = backend
+            .save_snapshot(
+                "repo-a",
+                &GraphSnapshot::empty().to_bytes().unwrap(),
+                GENERATION_INIT,
+            )
+            .expect_err("surface creation must not admit a post-publication replacement");
+        assert!(
+            error
+                .to_string()
+                .contains("newly published local directory namespace")
+                && error.to_string().contains("replaced"),
+            "unexpected surface-creation race error: {error}"
+        );
+        assert_eq!(
+            std::fs::read_dir(&visible).unwrap().count(),
+            0,
+            "the rejected creator must not write snapshot bytes into the replacement surface"
+        );
+        let namespace = backend.repository_namespaces.lock();
+        assert!(
+            namespace
+                .get("repo-a")
+                .unwrap()
+                .surface_directories
+                .lock()
+                .is_empty(),
+            "the replacement surface epoch must not be retained"
+        );
+        assert!(
+            namespace
+                .get("repo-a")
+                .unwrap()
+                .poisoned_surfaces
+                .lock()
+                .contains_key("snapshots"),
+            "the displaced published surface epoch must poison same-backend admission"
+        );
+        drop(namespace);
+        let retry_error = backend
+            .save_snapshot(
+                "repo-a",
+                &GraphSnapshot::empty().to_bytes().unwrap(),
+                GENERATION_INIT,
+            )
+            .expect_err("same backend must never bind the replacement surface epoch");
+        assert!(
+            retry_error
+                .to_string()
+                .contains("displaced during creation")
+                && retry_error
+                    .to_string()
+                    .contains("will not bind a replacement epoch"),
+            "unexpected surface-creation retry error: {retry_error}"
+        );
+        assert_eq!(
+            std::fs::read_dir(&visible).unwrap().count(),
+            0,
+            "same-backend retry must not write into the replacement surface"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn surface_publication_sync_is_retried_before_use() {
+        let directory = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(directory.path());
+        initialize_local_repository_namespace(&backend, "repo-a");
+        let namespace = backend
+            .repository_capability("repo-a", false)
+            .unwrap()
+            .unwrap();
+        let surface_path = directory.path().join("repo-a/snapshots");
+
+        mmap::fail_parent_sync_after(1);
+        let first_error = namespace
+            .surface(LocalFileBackend::snapshots_surface_name(), true)
+            .expect_err("surface publication must not proceed after its parent sync fails");
+        assert!(first_error
+            .to_string()
+            .contains("injected parent-directory fsync failure"));
+        assert!(surface_path.is_dir());
+        assert_eq!(std::fs::read_dir(&surface_path).unwrap().count(), 0);
+        assert!(namespace
+            .surface_directories
+            .lock()
+            .get(LocalFileBackend::snapshots_surface_name())
+            .unwrap()
+            .publication_sync_pending
+            .load(std::sync::atomic::Ordering::SeqCst));
+
+        mmap::fail_parent_sync_after(0);
+        let retry_error = namespace
+            .surface(LocalFileBackend::snapshots_surface_name(), true)
+            .expect_err("retry must repeat the failed surface publication sync");
+        assert!(retry_error
+            .to_string()
+            .contains("injected parent-directory fsync failure"));
+        assert_eq!(
+            std::fs::read_dir(&surface_path).unwrap().count(),
+            0,
+            "surface payloads must wait for publication durability"
+        );
+
+        let surface = namespace
+            .surface(LocalFileBackend::snapshots_surface_name(), true)
+            .unwrap()
+            .unwrap();
+        assert!(!surface
+            .publication_sync_pending
+            .load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn case_alias_cannot_bind_one_directory_as_two_repository_ids() {
+        let directory = TempDir::new().unwrap();
+        let writer = LocalFileBackend::new(directory.path());
+        writer
+            .save_snapshot(
+                "Repo",
+                &GraphSnapshot::empty().to_bytes().unwrap(),
+                GENERATION_INIT,
+            )
+            .unwrap();
+        drop(writer);
+        if !directory.path().join("repo").is_dir() {
+            return;
+        }
+
+        let backend = LocalFileBackend::new(directory.path());
+        let error = backend
+            .load_snapshot("repo")
+            .expect_err("case aliases must not bind one directory as two repositories");
+        assert!(
+            error
+                .to_string()
+                .contains("aliases existing directory name"),
+            "unexpected repository-alias error: {error}"
+        );
+        assert!(backend.load_snapshot("Repo").unwrap().is_some());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn retained_windows_repository_handle_prevents_namespace_replacement() {
+        let directory = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(directory.path());
+        let snapshot = GraphSnapshot::empty().to_bytes().unwrap();
+        backend
+            .save_snapshot("repo-a", &snapshot, GENERATION_INIT)
+            .unwrap();
+        backend
+            .existing_repository_path("repo-a")
+            .unwrap()
+            .expect("repository handle is retained");
+
+        let error = std::fs::rename(
+            directory.path().join("repo-a"),
+            directory.path().join("detached"),
+        )
+        .expect_err("Windows capability omits DELETE sharing");
+        assert!(
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Other
+            ),
+            "unexpected Windows replacement error: {error}"
+        );
+        assert!(backend.load_snapshot("repo-a").unwrap().is_some());
     }
 
     #[test]
@@ -5262,7 +8213,9 @@ mod tests {
         let error = backend
             .save_snapshot(repo_id, &current.to_bytes().unwrap(), gen2)
             .expect_err("installed but unconfirmed authority must be reported");
-        assert!(error.to_string().contains("durability is unconfirmed"));
+        assert!(error
+            .to_string()
+            .contains("durability or exact post-install verification is unconfirmed"));
         assert!(mmap::recovery_marker_path(&backend.authority_path(repo_id)).exists());
         assert!(
             old_snapshot.exists(),
@@ -5294,15 +8247,18 @@ mod tests {
             .unwrap();
         let delta = crate::storage::delta::GraphSnapshotDelta::empty(gen1);
         let delta_bytes = delta.to_bytes().unwrap();
-        // The delta write consumes five syncs. Authority candidate install
-        // plus the exact candidate claim consume two more; fail its
-        // destination rename sync.
-        mmap::fail_parent_sync_after(7);
+        backend.set_delta_before_authority_commit_hook(|| {
+            // Authority candidate publication and exact candidate claim
+            // consume two syncs; fail the destination rename sync.
+            mmap::fail_parent_sync_after(2);
+        });
 
         let error = backend
             .save_delta(repo_id, &delta_bytes, gen1)
             .expect_err("installed but unconfirmed delta authority must be reported");
-        assert!(error.to_string().contains("durability is unconfirmed"));
+        assert!(error
+            .to_string()
+            .contains("durability or exact post-install verification is unconfirmed"));
         assert!(backend.delta_path(repo_id, gen1 + 1).exists());
         assert!(mmap::recovery_marker_path(&backend.authority_path(repo_id)).exists());
 
@@ -5416,8 +8372,9 @@ mod tests {
             .save_snapshot(repo_id, &base.to_bytes().unwrap(), gen1)
             .expect_err("full save must not commit over a staged next-generation delta");
         assert!(error.to_string().contains("staged unacknowledged delta"));
+        let lock = backend.acquire_existing_lock(repo_id).unwrap();
         let authority = backend
-            .read_authority_record_raw_unlocked(repo_id)
+            .read_authority_record_raw_unlocked(&lock.namespace)
             .unwrap()
             .unwrap();
         assert_eq!(authority.head_generation, gen1);
@@ -5448,8 +8405,9 @@ mod tests {
             .save_snapshot(repo_id, &base.to_bytes().unwrap(), gen1)
             .expect_err("the pre-commit rescan must catch a staged delta from a racing writer");
         assert!(error.to_string().contains("staged unacknowledged delta"));
+        let lock = backend.acquire_existing_lock(repo_id).unwrap();
         let authority = backend
-            .read_authority_record_raw_unlocked(repo_id)
+            .read_authority_record_raw_unlocked(&lock.namespace)
             .unwrap()
             .unwrap();
         assert_eq!(authority.head_generation, gen1);
@@ -5602,14 +8560,16 @@ mod tests {
             expected_replacement,
             "cleanup must preserve journal bytes installed after authority commit"
         );
+        let lock = backend.acquire_existing_lock(repo_id).unwrap();
         let authority = backend
-            .read_authority_record_raw_unlocked(repo_id)
+            .read_authority_record_raw_unlocked(&lock.namespace)
             .unwrap()
             .unwrap();
         assert!(authority
             .retired_deltas
             .iter()
             .any(|identity| identity.generation == delta_generation));
+        drop(lock);
         let error = load_recovered_snapshot(&backend, repo_id)
             .expect_err("replacement of retired journal bytes must fail closed");
         assert!(

@@ -43,7 +43,7 @@ pub use merkle::{
 };
 pub use repository::{
     ChangeAdmissionPolicy, LocalRepositoryAuthorityFreeze, PersistedRepositoryAuthority,
-    RepositoryAuthorityManager, RepositoryAuthorityState,
+    RepositoryAuthorityManager, RepositoryAuthorityState, WorkspaceAdmissionSnapshot,
 };
 pub use snapshot::SnapshotManager;
 #[cfg(feature = "vector")]
