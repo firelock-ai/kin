@@ -5404,13 +5404,21 @@ mod tests {
         #[cfg(not(unix))]
         let artifacts = blob_artifacts;
         let desired = ResolvedTree::from_artifacts(artifacts).unwrap();
-        crate::repository_commit::publish_workspace_tree(
-            &blobs,
-            &crate::local_repository_authority::LocalRepositoryAuthorityContext::from_layout_for_test(
+        let context =
+            crate::local_repository_authority::LocalRepositoryAuthorityContext::from_layout_for_test(
                 &init.layout,
             )
-            .unwrap(),
-            &desired,
+            .unwrap();
+        let admitted = crate::repository_commit::admitted_workspace_tree_for_test(
+            init.layout.working_dir(),
+            context.open().unwrap().read_authority().roots().clone(),
+            ResolvedTree::default(),
+            desired.clone(),
+        );
+        crate::repository_commit::publish_workspace_tree(
+            &blobs,
+            &context,
+            &admitted,
             kin_model::OperationId::new(),
             kin_model::AuthorId::new("authority-open-test"),
         )
@@ -6007,11 +6015,19 @@ mod tests {
             TreeEntry::blob(body_hash, false),
         );
         let desired = ResolvedTree::from_artifacts([artifact.clone()]).unwrap();
+        let context =
+            crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(&state)
+                .unwrap();
+        let admitted = crate::repository_commit::admitted_workspace_tree_for_test(
+            layout.working_dir(),
+            context.open().unwrap().read_authority().roots().clone(),
+            state.graph.resolved_tree(),
+            desired.clone(),
+        );
         let admission = crate::repository_commit::publish_workspace_tree(
             state.blobs.as_ref(),
-            &crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(&state)
-                .unwrap(),
-            &desired,
+            &context,
+            &admitted,
             kin_model::OperationId::new(),
             kin_model::AuthorId::new("dogfood"),
         )

@@ -11,8 +11,8 @@ use kin_index::{
     FileClassification, FileClassifier, FileEvent, FileWatcher, IndexPipeline, IndexedAny,
 };
 use kin_model::{
-    EntityFilter, EntityId, EntityStore, FilePathId, Hash256, RepoPath,
-    ShallowTrackedFile, TransactionDelta, TreeDelta, TreeEntry,
+    EntityFilter, EntityId, EntityStore, FilePathId, Hash256, RepoPath, ShallowTrackedFile,
+    TransactionDelta, TreeDelta, TreeEntry,
 };
 use tracing::{debug, error, info, warn};
 
@@ -545,7 +545,6 @@ fn exact_tree_admission(
         semantic_events: dedup_file_events(semantic_events),
     })
 }
-
 
 /// Classify one host event against exact repository-tree truth that has
 /// already been admitted, before attempting any enrichment.
@@ -1238,9 +1237,7 @@ pub async fn run_loop(
                     continue;
                 }
                 AdmittedFileEvent::Removed {
-                    repo_path,
-                    file_id,
-                    ..
+                    repo_path, file_id, ..
                 } => {
                     if !tree_changed {
                         continue;
@@ -2227,6 +2224,107 @@ mod tests {
         let batch = take_file_event_batch(&mut pending, 1);
         assert!(matches!(&batch[0], FileEvent::Removed(actual) if actual == &path));
         assert!(pending.is_empty());
+    }
+
+    /// A walk that cannot complete has no completion proof, so it has nothing
+    /// to publish with. Authority must be untouched rather than advanced from
+    /// whatever the partial walk happened to read.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn incomplete_host_walk_publishes_no_workspace_authority() {
+        use std::os::unix::net::UnixListener;
+
+        let repo = tempfile::tempdir().unwrap();
+        let tracked = repo.path().join("service.txt");
+        std::fs::write(&tracked, b"regular while it is admitted\n").unwrap();
+        let init = kin_core::init(repo.path()).unwrap();
+        let state = Arc::new(DaemonState::open(init.layout).unwrap());
+        sync_filesystem_with_graph(&state).await.unwrap();
+
+        let tree_before = authority_tree(&state);
+        assert!(tree_before
+            .artifact_at_path(&test_repo_path("service.txt"))
+            .is_some());
+
+        std::fs::remove_file(&tracked).unwrap();
+        let _listener = UnixListener::bind(&tracked).unwrap();
+
+        let error = sync_filesystem_with_graph(&state).await.unwrap_err();
+        assert!(
+            error.to_string().contains("repository scan incomplete"),
+            "{error}"
+        );
+        assert_eq!(
+            authority_tree(&state),
+            tree_before,
+            "a walk that never completed must not move workspace authority"
+        );
+    }
+
+    /// The mass-deletion guard refuses an observation, not a delta subset.
+    /// Anything else the same unconfirmed walk saw must stay unpublished too.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unconfirmed_mass_deletion_publishes_no_part_of_the_observation() {
+        let repo = tempfile::tempdir().unwrap();
+        for index in 0..20 {
+            std::fs::write(
+                repo.path().join(format!("member{index}.txt")),
+                format!("admitted {index}\n"),
+            )
+            .unwrap();
+        }
+        let init = kin_core::init(repo.path()).unwrap();
+        let state = Arc::new(DaemonState::open(init.layout).unwrap());
+        sync_filesystem_with_graph(&state).await.unwrap();
+
+        let tree_before = authority_tree(&state);
+        assert_eq!(tree_before.len(), 20);
+
+        let survivor_entry_before = tree_before
+            .artifact_at_path(&test_repo_path("member19.txt"))
+            .unwrap()
+            .entry;
+
+        for index in 0..18 {
+            std::fs::remove_file(repo.path().join(format!("member{index}.txt"))).unwrap();
+        }
+        // The same walk also carries an ordinary modification. It is a delta
+        // the operator never refused, which is exactly why the old behavior
+        // published it while suppressing the removals beside it.
+        std::fs::write(
+            repo.path().join("member19.txt"),
+            b"edited in the same observation as the deletion\n",
+        )
+        .unwrap();
+
+        let error = sync_filesystem_with_graph(&state).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("No part of an unconfirmed mass deletion is published"),
+            "{error}"
+        );
+        assert!(state.is_mass_deletion_blocked());
+
+        let tree_after = authority_tree(&state);
+        assert_eq!(
+            tree_after, tree_before,
+            "no part of a refused observation may cross authority"
+        );
+        assert_eq!(
+            tree_after
+                .artifact_at_path(&test_repo_path("member19.txt"))
+                .unwrap()
+                .entry,
+            survivor_entry_before,
+            "the modification carried by a refused observation must not publish"
+        );
+        assert_eq!(
+            tree_entry(&state, "member19.txt"),
+            Some(survivor_entry_before),
+            "graph state derived from a refused observation must not publish either"
+        );
     }
 
     #[test]

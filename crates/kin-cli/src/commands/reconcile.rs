@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 
 #[cfg(unix)]
 use super::repository_authority::ActiveRepositoryAuthority;
-use super::session_workspace::SessionWorkspaceBase;
+use crate::commands::session_workspace::SessionWorkspaceBase;
 
 pub const RECONCILE_SUMMARY_SCHEMA: &str = "kin.session-reconcile.v1";
 
@@ -1044,6 +1044,53 @@ mod tests {
         assert_eq!(
             ReconcilePath::from(&raw),
             ReconcilePath::Hex("6173736574732f706f6c6963792dff".to_string())
+        );
+    }
+
+    /// The scanner returns, and the observation still holds the no-follow
+    /// directory capability the walk was taken through. Swapping the session
+    /// out from under a completed observation is therefore still detected at
+    /// the moment publication asks, not only while the scanner was running.
+    #[cfg(unix)]
+    #[test]
+    fn observation_retains_its_session_capability_after_the_scanner_returns() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join("member.txt"), b"admitted\n").unwrap();
+        let init = kin_core::init(repo.path()).unwrap();
+        let layout = init.layout;
+        let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&layout).unwrap();
+        let blobs = kin_blobs::BlobStore::new(layout.ingest_cas_dir()).unwrap();
+
+        let session_dir = layout.runs_dir().join("session-capability-probe");
+        let request = crate::commands::session_workspace::SessionWorkspaceRequest {
+            session_dir: session_dir.display().to_string(),
+            strategy: None,
+            scope: None,
+        };
+        crate::commands::session_workspace::materialize_session_workspace(
+            &layout, &binding, &request,
+        )
+        .unwrap();
+
+        let observation =
+            observe_session_workspace(&layout, &binding, &session_dir, &blobs, false).unwrap();
+        observation
+            .revalidate_retained_capability(&layout)
+            .expect("an untouched session must still satisfy its retained capability");
+
+        // Swap the observed session directory for a different directory of the
+        // same name, exactly as a racing writer or a symlink swap would.
+        let displaced = layout.runs_dir().join("session-capability-probe-displaced");
+        std::fs::rename(&session_dir, &displaced).unwrap();
+        std::fs::create_dir(&session_dir).unwrap();
+        std::fs::create_dir(session_dir.join(".kin-session")).unwrap();
+
+        let error = observation
+            .revalidate_retained_capability(&layout)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("retained session capability"),
+            "{error:#}"
         );
     }
 

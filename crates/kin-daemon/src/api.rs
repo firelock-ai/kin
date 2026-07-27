@@ -10690,10 +10690,16 @@ mod tests {
         let authority_context =
             crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(&state)
                 .unwrap();
+        let admitted = crate::repository_commit::admitted_workspace_tree_for_test(
+            state.layout.working_dir(),
+            roots_before.clone(),
+            state.graph.resolved_tree(),
+            desired.clone(),
+        );
         let publication_error = crate::repository_commit::publish_workspace_tree(
             state.blobs.as_ref(),
             &authority_context,
-            &desired,
+            &admitted,
             kin_model::OperationId::new(),
             AuthorId::new("kindb-root-swap-background-test"),
         )

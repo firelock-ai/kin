@@ -1074,7 +1074,8 @@ mod tests {
         )
         .map_err(kin_index::IndexError::from)?;
         let observed = observed_tree_from_complete_scan(blobs, &scan, &previous)?;
-        let tree_deltas = kin_core::plan_observed_tree_deltas(&previous, observed)?;
+        let tree_deltas =
+            kin_core::plan_observed_tree_deltas(&previous, observed.entries().clone())?;
         graph.apply_transaction_delta(&kin_model::TransactionDelta {
             entity_deltas: Vec::new(),
             relation_deltas: Vec::new(),
