@@ -210,6 +210,7 @@ fn validate_prepared_state(prepared_dir: &Path, expected_manifest: &Value) -> Re
 struct PreparedRepositoryAuthority {
     repository_id: String,
     generation: u64,
+    #[cfg(feature = "vector")]
     graph: kin_db::InMemoryGraph,
 }
 
@@ -243,11 +244,16 @@ fn open_prepared_repository_authority(kin_dir: &Path) -> Result<PreparedReposito
                 kin_dir.display()
             )
         })?;
+    // Decoding stays unconditional: it is the digest check that proves the
+    // authority snapshot is intact, even when no vector validation retains it.
     let graph = kin_db::InMemoryGraph::from_snapshot(workspace_snapshot)
         .map_err(|error| anyhow!("decode repository graph at {}: {error}", kin_dir.display()))?;
+    #[cfg(not(feature = "vector"))]
+    let _ = graph;
     Ok(PreparedRepositoryAuthority {
         repository_id: binding.repository_id().to_string(),
         generation,
+        #[cfg(feature = "vector")]
         graph,
     })
 }
