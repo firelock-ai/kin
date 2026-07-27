@@ -77,9 +77,32 @@ fn clone_same_repo_identity(source_repo: &Path, repo: &Path, remote: &str) {
     git(repo, &["remote", "set-url", "origin", remote]);
 }
 
-fn seed_local_vectors(cache_graph_path: &Path) {
-    let snapshot = kin_db::SnapshotManager::open(cache_graph_path).expect("open graph");
-    let graph = snapshot.graph();
+/// Seed a complete vector sidecar for a repository-v6 store.
+///
+/// The graph is read through the retained repository authority, because
+/// repository-v6 keeps it under `.kin/kindb/<repository-id>/snapshots/` and
+/// never writes the retired `.kin/kindb/graph.kndb`. The sidecar itself is a
+/// derived index and still lives at the layout-derived `.kin/kindb/graph.kvec`,
+/// written through the same bundle writer the daemon uses so its metadata
+/// carries the graph's real retrieval-authority hash.
+fn seed_local_vectors(kin_dir: &Path) {
+    let layout = kin_core::KinLayout::new(kin_dir.to_path_buf());
+    let binding =
+        kin_core::LocalRepositoryAuthorityBinding::from_layout(&layout).expect("bind authority");
+    let manager = binding.open_manager().expect("open repository authority");
+    let workspace_snapshot = manager
+        .read_authority()
+        .workspace_graph_snapshot(&binding.workspace_id())
+        .expect("resolve workspace graph")
+        .expect("manifest workspace is present in repository authority");
+    // Open with the persistent text index at the layout-derived location, the
+    // same way the daemon loads its query graph, so the prepared state carries
+    // the derived text index a reuse expects alongside the vector sidecar.
+    let graph = kin_db::InMemoryGraph::from_snapshot_with_text_index(
+        workspace_snapshot,
+        layout.text_index_dir(),
+    )
+    .expect("decode repository graph");
     let entities = graph
         .query_entities(&kin_model::EntityFilter::default())
         .expect("query entities");
@@ -97,7 +120,7 @@ fn seed_local_vectors(cache_graph_path: &Path) {
         .map(|artifact| artifact.artifact_id)
         .collect::<Vec<_>>();
 
-    let vector_path = cache_graph_path.with_extension("kvec.seed");
+    let vector_path = layout.kindb_vector_index_path().with_extension("kvec.seed");
     let vectors = kin_db::VectorIndex::new(4).expect("create vector index");
     for (idx, entity) in entities.iter().enumerate() {
         let embedding = match idx % 3 {
@@ -142,8 +165,26 @@ fn seed_local_vectors(cache_graph_path: &Path) {
         graph.load_vector_index_compatible(&vector_path, &descriptor),
         kin_db::VectorIndexLoad::Loaded(_)
     ));
-    snapshot.save().expect("persist seeded vectors");
+    // Stamp the same embedder identity the daemon writes and demands on load,
+    // so a reopened repo accepts this sidecar instead of treating it as one
+    // produced by a different build.
+    let embedder_identity = kin_buildinfo::sha_with_dirty(kin_buildinfo::get());
+    kin_db::SnapshotManager::save_vector_index_for_graph(
+        layout.kindb_snapshot_path(),
+        &graph,
+        Some(embedder_identity.as_str()),
+    )
+    .expect("persist seeded vector sidecar");
     fs::remove_file(vector_path).expect("remove temp vector file");
+    assert!(
+        kin_db::SnapshotManager::load_vector_index_into_graph_if_valid(
+            &graph,
+            &layout.kindb_snapshot_path(),
+            Some(embedder_identity.as_str()),
+        )
+        .expect("validate seeded vector sidecar"),
+        "seeded sidecar must validate against the repository graph it was built from"
+    );
 }
 
 fn parse_json_output(output: &Output, context: &str) -> Value {
@@ -188,7 +229,7 @@ fn prepared_state_publish_and_materialize_preserve_indexed_state() {
     let init_payload = parse_json_output(&init, "kin init --json");
     assert_eq!(init_payload["schema"], "kin.init-result.v4");
 
-    seed_local_vectors(&repo1.join(".kin/kindb/graph.kndb"));
+    seed_local_vectors(&repo1.join(".kin"));
 
     let publish = kin(&repo1, &kin_home)
         .args([
@@ -310,7 +351,7 @@ fn prepared_state_materialize_rejects_repo_state_mismatch() {
         .expect("run kin init");
     let _ = parse_json_output(&init, "kin init --json");
 
-    seed_local_vectors(&repo1.join(".kin/kindb/graph.kndb"));
+    seed_local_vectors(&repo1.join(".kin"));
 
     let publish = kin(&repo1, &kin_home)
         .args([

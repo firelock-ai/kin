@@ -1483,6 +1483,11 @@ impl DaemonState {
 
         // The repository snapshot above is authoritative. Vector/text
         // structures built from it are derived query surfaces only.
+        //
+        // `from_snapshot_with_text_index` restores the text index but not the
+        // vector sidecar, so without this the reopened repository reports every
+        // entity as unembedded and re-derives an index it already has on disk.
+        Self::load_validated_vector_index(&layout, graph.as_ref());
 
         let mut reconciler = Reconciler::new(layout.working_dir().to_path_buf());
         // Seed LKG from persisted graph so the first reconcile after daemon
