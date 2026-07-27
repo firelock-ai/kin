@@ -23,7 +23,7 @@ use sha2::{Digest, Sha256};
 
 use crate::error::DaemonError;
 use crate::local_repository_authority::{
-    require_fresh_daemon_workspace, ActiveLocalRepositoryAuthority,
+    require_fresh_daemon_workspace, ActiveLocalRepositoryAuthority, RepositoryAuthorityBindRefusal,
 };
 use crate::state::{DaemonEvent, DaemonState};
 
@@ -205,7 +205,8 @@ fn plan_and_commit(
     let layout = &state.layout;
     let selected = parse_checkout_path(request.path.as_deref(), request.path_hex.as_deref())
         .map_err(CheckoutCommandError::bad_request)?;
-    let authority = ActiveLocalRepositoryAuthority::open(state)?;
+    let authority = ActiveLocalRepositoryAuthority::open_bound(state)
+        .map_err(classify_authority_bind_refusal)?;
     let lease = authority.manager.read_authority();
     let roots = lease.roots().clone();
     let workspace = lease
@@ -680,6 +681,22 @@ fn plan_and_commit(
         daemon_delta,
         authority_freeze,
     ))
+}
+
+/// A pinned-namespace refusal is a conflict, not an internal fault: the request
+/// is well formed and the daemon is healthy, but the repository authority it
+/// pinned is no longer the one at that path, so there is no coherent truth left
+/// to check out from.
+fn classify_authority_bind_refusal(
+    refusal: RepositoryAuthorityBindRefusal,
+) -> CheckoutCommandError {
+    let identity = refusal.is_identity_refusal();
+    let error = refusal.into_error();
+    if identity {
+        CheckoutCommandError::Conflict(error)
+    } else {
+        CheckoutCommandError::Internal(error)
+    }
 }
 
 fn classify_model_checkout_error(

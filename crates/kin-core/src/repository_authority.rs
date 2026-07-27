@@ -72,7 +72,7 @@ impl LocalRepositoryAuthorityBinding {
             WorkspaceId::from_uuid(workspace_uuid),
             Arc::new(LocalFileBackend::new(layout.kindb_dir())),
         );
-        binding.pin_local_namespace().map_err(|error| {
+        binding.revalidate_pinned_namespace().map_err(|error| {
             KinError::Other(format!(
                 "cannot pin repository authority namespace at startup: {error}"
             ))
@@ -88,33 +88,57 @@ impl LocalRepositoryAuthorityBinding {
         self.workspace_id
     }
 
-    /// Pin and validate the exact local storage root and repository namespace
-    /// without decoding the full graph snapshot.
+    /// Revalidate the retained storage root and per-repository authority
+    /// namespace without decoding the full graph snapshot.
     ///
-    /// KinDB's capability-backed repository listing retains both identities;
-    /// later `open_manager` calls therefore reject a root or per-repository
-    /// directory that was swapped after process startup.
-    pub fn pin_local_namespace(&self) -> std::result::Result<(), kin_db::KinDbError> {
-        let repositories = self.backend.list_repos()?;
-        if repositories
-            .iter()
-            .any(|repository| repository == self.repository_id.as_str())
-        {
-            Ok(())
-        } else {
-            Err(kin_db::KinDbError::StorageError(format!(
-                "local storage authority has no repository namespace {}",
-                self.repository_id
-            )))
-        }
+    /// See [`revalidate_pinned_local_namespace`] for the exact property this
+    /// refuses on.
+    pub fn revalidate_pinned_namespace(&self) -> std::result::Result<(), kin_db::KinDbError> {
+        revalidate_pinned_local_namespace(&self.backend, &self.repository_id)
     }
 
     /// Open a coherent authority manager through the retained storage
-    /// capability. KinDB revalidates the pinned storage-root identity here.
+    /// capability.
+    ///
+    /// KinDB revalidates both the pinned storage-root identity and the
+    /// retained per-repository namespace identity here, and retains the
+    /// per-repository capability on the first successful call.
     pub fn open_manager(
         &self,
     ) -> std::result::Result<RepositoryAuthorityManager<LocalFileBackend>, kin_db::KinDbError> {
         RepositoryAuthorityManager::open(self.repository_id.clone(), Arc::clone(&self.backend))
+    }
+}
+
+/// Refuse `repository_id` unless `backend` still reaches the exact storage root
+/// and per-repository authority namespace it has already pinned.
+///
+/// KinDB retains a per-repository storage capability the first time repository
+/// authority is read through a backend, keyed on the namespace directory's
+/// filesystem identity, and revalidates that identity on every later access.
+/// Reading authority identity through the same retained backend therefore
+/// refuses a repository directory replaced at the same ambient path, a detached
+/// namespace, and a store that does not hold this repository at all.
+///
+/// This deliberately addresses the one repository by name rather than
+/// enumerating the storage root. `.kin/kindb/` also holds snapshot, vector,
+/// index, and generation files beside the repository namespaces, so a listing
+/// pass answers for entries that carry no authority and are not this caller's
+/// concern.
+///
+/// Ordering is load-bearing. The first read on a fresh backend is what takes
+/// the pin, so a long-lived process must take it once at startup and revalidate
+/// on every later authority bind; a swap that lands before the first read
+/// becomes the baseline rather than a refusal.
+pub fn revalidate_pinned_local_namespace(
+    backend: &LocalFileBackend,
+    repository_id: &RepositoryId,
+) -> std::result::Result<(), kin_db::KinDbError> {
+    match backend.load_snapshot_authority(repository_id.as_str())? {
+        Some(_) => Ok(()),
+        None => Err(kin_db::KinDbError::StorageError(format!(
+            "local storage authority does not hold repository namespace {repository_id}"
+        ))),
     }
 }
 
@@ -161,6 +185,106 @@ mod tests {
                 .to_string()
                 .contains("changed since this backend opened"),
             "unexpected root-replacement error: {error}"
+        );
+    }
+
+    #[test]
+    fn retained_binding_rejects_identical_repository_namespace_replacement() {
+        let directory = tempfile::tempdir().unwrap();
+        let initialized = crate::init(directory.path()).unwrap();
+        let binding = LocalRepositoryAuthorityBinding::from_layout(&initialized.layout).unwrap();
+        // The pin is taken before the swap, which is what makes the replacement
+        // detectable at all rather than becoming the new baseline.
+        binding.open_manager().unwrap();
+
+        let namespace = initialized
+            .layout
+            .kindb_dir()
+            .join(binding.repository_id().as_str());
+        let replacement = initialized.layout.root().join("namespace-replacement");
+        let original = initialized.layout.root().join("namespace-original");
+        copy_directory(&namespace, &replacement);
+        std::fs::rename(&namespace, &original).unwrap();
+        std::fs::rename(&replacement, &namespace).unwrap();
+
+        let error = binding
+            .revalidate_pinned_namespace()
+            .expect_err("retained binding must refuse a replaced repository namespace");
+        assert!(
+            error.to_string().contains("refusing replacement authority"),
+            "unexpected namespace-replacement revalidation error: {error}"
+        );
+
+        let error = match binding.open_manager() {
+            Ok(_) => panic!("retained binding must refuse authority from a replaced namespace"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("refusing replacement authority"),
+            "unexpected namespace-replacement authority error: {error}"
+        );
+    }
+
+    #[test]
+    fn retained_binding_rejects_detached_repository_namespace() {
+        let directory = tempfile::tempdir().unwrap();
+        let initialized = crate::init(directory.path()).unwrap();
+        let binding = LocalRepositoryAuthorityBinding::from_layout(&initialized.layout).unwrap();
+        binding.open_manager().unwrap();
+
+        let namespace = initialized
+            .layout
+            .kindb_dir()
+            .join(binding.repository_id().as_str());
+        std::fs::rename(
+            &namespace,
+            initialized.layout.root().join("namespace-detached"),
+        )
+        .unwrap();
+
+        let error = binding
+            .revalidate_pinned_namespace()
+            .expect_err("retained binding must refuse a detached repository namespace");
+        assert!(
+            error.to_string().contains("detached after this backend"),
+            "unexpected detached-namespace revalidation error: {error}"
+        );
+
+        let error = match binding.open_manager() {
+            Ok(_) => panic!("retained binding must refuse authority from a detached namespace"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("detached after this backend"),
+            "unexpected detached-namespace authority error: {error}"
+        );
+    }
+
+    #[test]
+    fn binding_refuses_a_store_that_does_not_hold_its_repository() {
+        let directory = tempfile::tempdir().unwrap();
+        let mine_root = directory.path().join("mine");
+        let other_root = directory.path().join("other");
+        std::fs::create_dir_all(&mine_root).unwrap();
+        std::fs::create_dir_all(&other_root).unwrap();
+        let mine = crate::init(&mine_root).unwrap();
+        let other = crate::init(&other_root).unwrap();
+        let mine_binding = LocalRepositoryAuthorityBinding::from_layout(&mine.layout).unwrap();
+
+        let wrong_store = LocalRepositoryAuthorityBinding::from_parts(
+            mine_binding.repository_id().clone(),
+            mine_binding.workspace_id(),
+            Arc::new(LocalFileBackend::new(other.layout.kindb_dir())),
+        );
+
+        let error = wrong_store
+            .revalidate_pinned_namespace()
+            .expect_err("a binding must refuse a store that does not hold its repository");
+        assert!(
+            error
+                .to_string()
+                .contains("does not hold repository namespace"),
+            "unexpected wrong-store error: {error}"
         );
     }
 }

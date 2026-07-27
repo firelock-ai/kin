@@ -10724,9 +10724,18 @@ mod tests {
             .iter()
             .all(|repository_ref| repository_ref.name != branch);
 
+        // A replaced storage root is the same refusal as a replaced repository
+        // namespace under it: the pinned authority is no longer at that path.
+        // Both answer with a conflict rather than an internal fault.
         assert_eq!(
             branch_status,
-            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::CONFLICT,
+            "{}",
+            String::from_utf8_lossy(&branch_body)
+        );
+        assert!(
+            String::from_utf8_lossy(&branch_body)
+                .contains("pinned at startup is no longer the one at that path"),
             "{}",
             String::from_utf8_lossy(&branch_body)
         );
@@ -11636,6 +11645,155 @@ mod tests {
         );
         let authority = ActiveApiRepositoryAuthority::open(&reopened).unwrap();
         assert_eq!(authority.manager.read_authority().roots(), &roots_before);
+    }
+
+    #[cfg(unix)]
+    fn copy_directory_tree(source: &FsPath, target: &FsPath) {
+        std::fs::create_dir(target).unwrap();
+        for entry in std::fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            let source_path = entry.path();
+            let target_path = target.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_directory_tree(&source_path, &target_path);
+            } else {
+                std::fs::copy(source_path, target_path).unwrap();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn pinned_repository_namespace(state: &DaemonState) -> PathBuf {
+        let manifest =
+            kin_core::manifest::KinManifest::load(&state.layout.manifest_path()).unwrap();
+        state.layout.kindb_dir().join(manifest.repo_id)
+    }
+
+    /// Prove the retained per-repository capability, not only the storage root,
+    /// is what checkout answers from: a byte-identical repository namespace
+    /// copied over the same ambient path mid-daemon-lifetime is refused.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_checkout_refuses_replaced_repository_namespace_without_mutation() {
+        let state = committed_test_state();
+        let checkout = |operation_id| kin_cli::commands::checkout::CheckoutRequest {
+            path: Some("README.md".to_string()),
+            path_hex: None,
+            change_id: None,
+            operation_id,
+            actor: AuthorId::new("checkout-namespace-replacement-test"),
+        };
+
+        // Establish the baseline: the same request succeeds while the pinned
+        // namespace is intact, so the later refusal cannot be blamed on an
+        // unrelated defect in the request itself.
+        let accepted = router(Arc::clone(&state))
+            .oneshot(
+                Request::post("/commands/checkout")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&checkout(kin_model::OperationId::new())).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(accepted.status(), StatusCode::OK);
+        let generation_before = state
+            .snapshot_generation
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let roots_before = state.graph.compute_root_hash();
+
+        // Stage both halves of the swap outside the storage root: a spare
+        // namespace directory inside it would be listed as a second repository
+        // resolving onto the retained identity, which is a different refusal.
+        let namespace = pinned_repository_namespace(&state);
+        let replacement = state.layout.root().join("namespace-replacement");
+        let displaced = state.layout.root().join("namespace-displaced");
+        copy_directory_tree(&namespace, &replacement);
+        std::fs::rename(&namespace, &displaced).unwrap();
+        std::fs::rename(&replacement, &namespace).unwrap();
+
+        let refused = router(Arc::clone(&state))
+            .oneshot(
+                Request::post("/commands/checkout")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&checkout(kin_model::OperationId::new())).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = refused.status();
+        let body = axum::body::to_bytes(refused.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(
+            body.contains("pinned at startup is no longer the one at that path"),
+            "refusal must name the pinned-namespace mismatch: {body}"
+        );
+        assert_eq!(
+            state
+                .snapshot_generation
+                .load(std::sync::atomic::Ordering::SeqCst),
+            generation_before,
+            "a refused checkout must not advance repository authority"
+        );
+        assert_eq!(state.graph.compute_root_hash(), roots_before);
+    }
+
+    /// A repository namespace detached from under a live daemon must fail
+    /// closed rather than fall back to the storage root or a fresh namespace.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_checkout_refuses_detached_repository_namespace_without_mutation() {
+        let state = committed_test_state();
+        let generation_before = state
+            .snapshot_generation
+            .load(std::sync::atomic::Ordering::SeqCst);
+
+        let namespace = pinned_repository_namespace(&state);
+        std::fs::rename(&namespace, state.layout.root().join("namespace-detached")).unwrap();
+
+        let request = kin_cli::commands::checkout::CheckoutRequest {
+            path: Some("README.md".to_string()),
+            path_hex: None,
+            change_id: None,
+            operation_id: kin_model::OperationId::new(),
+            actor: AuthorId::new("checkout-namespace-detach-test"),
+        };
+        let refused = router(Arc::clone(&state))
+            .oneshot(
+                Request::post("/commands/checkout")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = refused.status();
+        let body = axum::body::to_bytes(refused.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(
+            body.contains("pinned at startup is no longer the one at that path"),
+            "refusal must name the pinned-namespace mismatch: {body}"
+        );
+        assert!(
+            body.contains("detached after this backend"),
+            "refusal must name the detachment rather than a generic miss: {body}"
+        );
+        assert_eq!(
+            state
+                .snapshot_generation
+                .load(std::sync::atomic::Ordering::SeqCst),
+            generation_before
+        );
     }
 
     #[tokio::test]

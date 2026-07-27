@@ -78,4 +78,6 @@ pub use ranking::{
     normalize_symbol_hint, normalize_trace_name, qualifier_hint_from_query, select_best_match,
 };
 pub use ref_view::{build_graph_at_ref, collect_changes_at_ref, filter_vector_results_to_scope};
-pub use repository_authority::LocalRepositoryAuthorityBinding;
+pub use repository_authority::{
+    revalidate_pinned_local_namespace, LocalRepositoryAuthorityBinding,
+};

@@ -50,6 +50,48 @@ impl LocalRepositoryAuthorityContext {
     ) -> std::result::Result<RepositoryAuthorityManager<LocalFileBackend>, kin_db::KinDbError> {
         self.binding.open_manager()
     }
+
+    pub(crate) fn revalidate_pinned_namespace(
+        &self,
+    ) -> std::result::Result<(), kin_db::KinDbError> {
+        self.binding.revalidate_pinned_namespace()
+    }
+}
+
+/// Why a command refused to bind this daemon's local repository authority.
+///
+/// Command boundaries answer an identity refusal with a typed conflict rather
+/// than a generic internal error: the request is coherent, but the storage
+/// namespace this daemon pinned is no longer the one on disk, so there is no
+/// authority left to answer from.
+pub(crate) enum RepositoryAuthorityBindRefusal {
+    /// This daemon never completed a startup repository binding.
+    Unbound(DaemonError),
+    /// The retained capability no longer reaches the exact per-repository
+    /// namespace this daemon pinned: replaced at the same ambient path,
+    /// detached, or a store that does not hold this repository.
+    Identity(kin_db::KinDbError),
+    /// The pinned namespace is intact but its authority could not be opened.
+    Unavailable(kin_db::KinDbError),
+}
+
+impl RepositoryAuthorityBindRefusal {
+    pub(crate) fn is_identity_refusal(&self) -> bool {
+        matches!(self, Self::Identity(_))
+    }
+
+    pub(crate) fn into_error(self) -> anyhow::Error {
+        match self {
+            Self::Unbound(error) => anyhow::Error::new(error),
+            Self::Identity(error) => anyhow::anyhow!(
+                "refusing repository-v6 authority: the storage namespace this daemon pinned at \
+                 startup is no longer the one at that path: {error}"
+            ),
+            Self::Unavailable(error) => anyhow::anyhow!(
+                "open repository-v6 authority through startup-pinned storage capability: {error}"
+            ),
+        }
+    }
 }
 
 /// Local repository authority bound to the identities the daemon validated at
@@ -64,18 +106,35 @@ pub(crate) struct ActiveLocalRepositoryAuthority {
 }
 
 impl ActiveLocalRepositoryAuthority {
-    pub(crate) fn open(state: &DaemonState) -> Result<Self> {
-        let context = LocalRepositoryAuthorityContext::from_state(state)?;
-        let manager = context.open().map_err(|error| {
-            anyhow::anyhow!(
-                "open repository-v6 authority through startup-pinned storage capability: {error}"
-            )
-        })?;
+    /// Bind the startup-pinned authority, revalidating the retained
+    /// per-repository namespace identity before any planning reads it.
+    ///
+    /// The revalidation is deliberately ahead of the authority open so a
+    /// replaced or detached namespace is named as such, instead of surfacing as
+    /// whatever the authority decode happens to fail on.
+    pub(crate) fn open_bound(
+        state: &DaemonState,
+    ) -> std::result::Result<Self, RepositoryAuthorityBindRefusal> {
+        let context = LocalRepositoryAuthorityContext::from_state(state)
+            .map_err(RepositoryAuthorityBindRefusal::Unbound)?;
+        context
+            .revalidate_pinned_namespace()
+            .map_err(RepositoryAuthorityBindRefusal::Identity)?;
+        let manager = context
+            .open()
+            .map_err(RepositoryAuthorityBindRefusal::Unavailable)?;
         Ok(Self {
             manager,
             repository_id: context.repository_id().clone(),
             workspace_id: context.workspace_id(),
         })
+    }
+
+    /// Bind for assertions that only need the refusal text. Command paths must
+    /// use [`Self::open_bound`] so they can answer with a typed status.
+    #[cfg(test)]
+    pub(crate) fn open(state: &DaemonState) -> Result<Self> {
+        Self::open_bound(state).map_err(RepositoryAuthorityBindRefusal::into_error)
     }
 }
 

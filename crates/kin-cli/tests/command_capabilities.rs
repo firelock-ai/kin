@@ -37,10 +37,10 @@ fn capability_json_keeps_the_bounded_dogfood_bar_explicit() {
     assert_eq!(report["schema"], "kin.git-replacement-capabilities.v1");
     assert_eq!(report["substrate"], "repository-v6");
     assert_eq!(report["bounded_dogfood_ready"], false);
-    assert_eq!(report["bounded_dogfood_required_ready"], 10);
+    assert_eq!(report["bounded_dogfood_required_ready"], 11);
     assert_eq!(report["bounded_dogfood_required_total"], 12);
     assert_eq!(report["full_git_replacement_ready"], false);
-    assert_eq!(report["ready_commands"], 12);
+    assert_eq!(report["ready_commands"], 13);
     assert_eq!(report["command_total"], 32);
 
     let commands = report["commands"]
@@ -124,15 +124,21 @@ fn remaining_open_gate_commands_fail_before_repository_discovery() {
     assert!(stderr.contains("`kin reconcile` is fail-closed on repository-v6"));
     assert!(stderr.contains("kin capabilities --json"));
 
+    // Checkout is exposed now, so it must fail on repository discovery rather
+    // than on the capability gate. Asserting the gate message is absent keeps a
+    // silent re-seal from passing as a discovery failure.
     let output = kin_command(&home)
         .args(["checkout", "src/lib.rs"])
         .current_dir(root.path())
         .output()
-        .expect("run gated checkout");
+        .expect("run exposed checkout outside a repository");
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("`kin checkout` is fail-closed on repository-v6"));
-    assert!(stderr.contains("kin capabilities --json"));
+    assert!(
+        !stderr.contains("is fail-closed on repository-v6"),
+        "checkout must no longer answer from the capability gate: {stderr}"
+    );
+    assert!(stderr.contains("not a Kin repository"), "{stderr}");
 }
 
 #[test]
