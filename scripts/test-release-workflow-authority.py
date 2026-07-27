@@ -250,9 +250,9 @@ def main() -> None:
 
     for policy in (
         "Reopen a fresh Windows graph through the daemon",
-        "kin.exe status --json > kin-status.json",
-        "test -s .kin/kindb/head-generation",
-        "test -s .kin/kindb/graph.kidx",
+        'grep -q "byte-exact executable-mode proof is unsupported"',
+        'grep -q "atomic repository config replacement is unsupported"',
+        'test ! -e "$boot_dir/.kin/kindb/head-generation"',
     ):
         require(ci_workflow, policy, "Windows daemon reopen regression")
 

@@ -4,13 +4,13 @@
 //! Phase 7 acceptance tests: sessions, intents, traffic-aware context,
 //! collision enforcement, contract/artifact scopes, orphan sweep.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use kin_daemon::session_registry::SessionCoordinator;
-use kin_db::SnapshotManager;
+use kin_db::{LocalFileBackend, RepositoryAuthorityManager};
 use kin_model::*;
-use kin_reconcile::{CollisionCheck, ReconcileError, Reconciler, TrafficChecker};
 
 use crate::helpers::*;
 
@@ -217,238 +217,194 @@ fn traffic_aware_context_pack_includes_traffic() {
 }
 
 // -----------------------------------------------------------------------
-// 11. Brownfield: create Git repo -> kin migrate --shallow -> verify entities
+// 11. Brownfield Git admission: exact full history, refs, membership and bytes
 // -----------------------------------------------------------------------
 
-#[test]
-fn brownfield_shallow_migration() {
-    let dir = tempfile::tempdir().unwrap();
-
-    // Create a minimal Git repo.
-    let git_init = std::process::Command::new("git")
-        .args(["init"])
-        .current_dir(dir.path())
-        .output();
-
-    match git_init {
-        Ok(output) if output.status.success() => {}
-        _ => {
-            eprintln!("git not available, skipping brownfield migration test");
-            return;
-        }
-    }
-
-    // Configure git user (needed for commits).
-    let _ = std::process::Command::new("git")
-        .args(["config", "user.email", "test@test.com"])
-        .current_dir(dir.path())
-        .output();
-    let _ = std::process::Command::new("git")
-        .args(["config", "user.name", "Test"])
-        .current_dir(dir.path())
-        .output();
-
-    // Write a source file and commit it.
-    write_rust_file(
-        dir.path(),
-        "src/lib.rs",
-        "pub fn hello() -> &'static str { \"hello\" }\n",
+fn run_git(repo: &Path, args: &[&str]) {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .current_dir(repo)
+        .output()
+        .expect("run Git");
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
-    let _ = std::process::Command::new("git")
-        .args(["add", "."])
-        .current_dir(dir.path())
-        .output();
-    let _ = std::process::Command::new("git")
-        .args(["commit", "-m", "initial commit"])
-        .current_dir(dir.path())
-        .output();
-
-    // Scan the repo to verify it's valid.
-    let scan = kin_migrate::scan_repo(dir.path());
-    match scan {
-        Ok(scan) => {
-            // commit_count is populated by a deeper scan, not scan_repo itself,
-            // so we only assert on source files here.
-            assert!(!scan.source_files.is_empty(), "should find source files");
-
-            // Plan a shallow migration to a separate target directory.
-            let target = tempfile::tempdir().unwrap();
-            let plan = kin_migrate::plan_migration(
-                &scan,
-                kin_migrate::MigrationStrategy::Shallow,
-                Some(target.path().to_path_buf()),
-                0,
-            );
-
-            let result = kin_migrate::execute_migration_persisted(&plan);
-
-            match result {
-                Ok(migration_result) => {
-                    assert!(migration_result.files_indexed > 0);
-                    // Verify .kin/ was created.
-                    assert!(target.path().join(".kin").exists());
-                    assert_eq!(migration_result.default_branch, scan.default_branch.clone());
-
-                    let layout = kin_core::KinLayout::new(target.path().join(".kin"));
-                    let snapshot = SnapshotManager::open(layout.kindb_snapshot_path()).unwrap();
-                    let graph = snapshot.graph();
-                    let branch = graph
-                        .get_branch(&BranchName::new(
-                            scan.default_branch.as_deref().unwrap_or("main"),
-                        ))
-                        .unwrap();
-                    assert!(
-                        branch.is_some(),
-                        "persisted migration should keep a live branch"
-                    );
-                    assert!(
-                        graph.entity_count() > 0,
-                        "persisted migration should materialize indexed entities"
-                    );
-                }
-                Err(e) => {
-                    // Migration may fail if git history parsing encounters issues,
-                    // which is expected in some environments.
-                    eprintln!("migration error (may be expected): {}", e);
-                }
-            }
-        }
-        Err(e) => {
-            eprintln!(
-                "scan_repo error (may be expected without full git setup): {}",
-                e
-            );
-        }
-    }
 }
 
-// -----------------------------------------------------------------------
-// 11b. Brownfield: mixed-language repo -> shallow migrate -> keep docs/config
-// -----------------------------------------------------------------------
+fn open_migrated_authority(root: &Path) -> RepositoryAuthorityManager<LocalFileBackend> {
+    let layout = kin_core::KinLayout::discover(root).expect("discover migrated Kin repository");
+    let manifest =
+        kin_core::KinManifest::load(&layout.manifest_path()).expect("load migrated manifest");
+    let repository_id =
+        RepositoryId::new(manifest.repo_id).expect("manifest repository identity is valid");
+    RepositoryAuthorityManager::open(
+        repository_id,
+        Arc::new(LocalFileBackend::new(layout.kindb_dir())),
+    )
+    .expect("reopen repository authority")
+}
+
+fn assert_workspace_blob(
+    authority: &RepositoryAuthorityManager<LocalFileBackend>,
+    path: &str,
+    expected: &[u8],
+) {
+    let lease = authority.read_authority();
+    let workspace = lease
+        .metadata()
+        .workspaces
+        .first()
+        .expect("migrated workspace");
+    let repo_path = RepoPath::from_utf8(path).expect("test path");
+    let artifact = workspace
+        .tree
+        .artifact_at_path(&repo_path)
+        .unwrap_or_else(|| panic!("{path} is absent from exact workspace authority"));
+    let digest = artifact
+        .entry
+        .blob_identity()
+        .unwrap_or_else(|| panic!("{path} is not backed by immutable source bytes"));
+    drop(lease);
+    assert_eq!(
+        authority
+            .load_source_blob(digest)
+            .expect("load source body")
+            .unwrap_or_else(|| panic!("{path} body is absent from immutable source CAS")),
+        expected
+    );
+}
 
 #[test]
-fn brownfield_shallow_migration_preserves_mixed_repo_shape() {
+fn brownfield_full_migration_publishes_repository_authority() {
     let dir = tempfile::tempdir().unwrap();
+    run_git(dir.path(), &["init", "-b", "main"]);
+    run_git(dir.path(), &["config", "user.email", "test@test.com"]);
+    run_git(dir.path(), &["config", "user.name", "Test"]);
 
-    let git_init = std::process::Command::new("git")
-        .args(["init"])
-        .current_dir(dir.path())
-        .output();
-
-    match git_init {
-        Ok(output) if output.status.success() => {}
-        _ => {
-            eprintln!("git not available, skipping mixed brownfield migration test");
-            return;
-        }
-    }
-
-    let _ = std::process::Command::new("git")
-        .args(["config", "user.email", "test@test.com"])
-        .current_dir(dir.path())
-        .output();
-    let _ = std::process::Command::new("git")
-        .args(["config", "user.name", "Test"])
-        .current_dir(dir.path())
-        .output();
-
+    let source = b"pub fn hello() -> &'static str { \"hello\" }\n";
     write_rust_file(
         dir.path(),
         "src/lib.rs",
-        "pub fn hello() -> &'static str { \"hello\" }\n",
+        std::str::from_utf8(source).unwrap(),
     );
-    write_ts_file(
-        dir.path(),
-        "frontend/app.tsx",
-        "export const App = () => 'hello';\n",
+    run_git(dir.path(), &["add", "--all"]);
+    run_git(dir.path(), &["commit", "-m", "initial commit"]);
+
+    let scan = kin_migrate::scan_repo(dir.path()).expect("scan Git repository");
+    let plan = kin_migrate::plan_migration(&scan, kin_migrate::MigrationStrategy::Full, None);
+    let result =
+        kin_migrate::execute_migration_persisted(&plan).expect("admit exact Git repository");
+
+    assert_eq!(result.strategy, kin_migrate::MigrationStrategy::Full);
+    assert_eq!(result.commits_imported, 1);
+    assert_eq!(result.artifacts_admitted, 1);
+    assert_eq!(
+        result.files_indexed, 0,
+        "semantic enrichment is a later phase"
     );
-    std::fs::write(
-        dir.path().join("package.json"),
-        r#"{"name":"mixed-repo","private":true}"#,
-    )
-    .unwrap();
-    std::fs::write(dir.path().join("README.md"), "# Mixed Repo\n").unwrap();
-    std::fs::write(
-        dir.path().join("Dockerfile"),
-        "FROM rust:1.89\nWORKDIR /app\nCOPY . .\n",
-    )
-    .unwrap();
+    assert_eq!(result.default_branch.as_deref(), Some("main"));
+    assert!(result.authority_generation > 0);
 
-    let _ = std::process::Command::new("git")
-        .args(["add", "."])
-        .current_dir(dir.path())
-        .output();
-    let _ = std::process::Command::new("git")
-        .args(["commit", "-m", "initial mixed commit"])
-        .current_dir(dir.path())
-        .output();
+    let authority = open_migrated_authority(dir.path());
+    let lease = authority.read_authority();
+    assert_eq!(
+        lease.metadata().ref_state.default_ref,
+        Some(RefName::branch(b"main").unwrap())
+    );
+    assert_eq!(lease.metadata().workspaces[0].tree.len(), 1);
+    drop(lease);
+    assert_workspace_blob(&authority, "src/lib.rs", source);
+}
 
-    let scan = kin_migrate::scan_repo(dir.path());
-    match scan {
-        Ok(scan) => {
-            assert!(
-                scan.source_files
-                    .iter()
-                    .any(|path| path == &PathBuf::from("src/lib.rs")),
-                "migration scan should keep Rust files in a mixed repo"
-            );
-            assert!(
-                scan.source_files
-                    .iter()
-                    .any(|path| path == &PathBuf::from("frontend/app.tsx")),
-                "migration scan should keep TypeScript files in a mixed repo"
-            );
+#[test]
+fn brownfield_full_migration_preserves_mixed_repo_shape_and_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    run_git(dir.path(), &["init", "-b", "main"]);
+    run_git(dir.path(), &["config", "user.email", "test@test.com"]);
+    run_git(dir.path(), &["config", "user.name", "Test"]);
 
-            let target = tempfile::tempdir().unwrap();
-            let plan = kin_migrate::plan_migration(
-                &scan,
-                kin_migrate::MigrationStrategy::Shallow,
-                Some(target.path().to_path_buf()),
-                0,
-            );
+    let files: &[(&str, &[u8])] = &[
+        (
+            "src/lib.rs",
+            b"pub fn hello() -> &'static str { \"hello\" }\n",
+        ),
+        ("frontend/app.tsx", b"export const App = () => 'hello';\n"),
+        ("package.json", br#"{"name":"mixed-repo","private":true}"#),
+        ("README.md", b"# Mixed Repo\n"),
+        ("Dockerfile", b"FROM rust:1.89\nWORKDIR /app\nCOPY . .\n"),
+        (
+            "compose.yaml",
+            b"services:\n  api:\n    build: .\n    command: ./run-tool\n",
+        ),
+        ("notes.mystery", b"unsupported-language bytes\n"),
+        ("assets/data.bin", &[0_u8, 0xff, 0x10, 0x00]),
+    ];
+    for (path, bytes) in files {
+        let full_path = dir.path().join(path);
+        if let Some(parent) = full_path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(full_path, bytes).unwrap();
+    }
 
-            let result = kin_migrate::execute_migration_persisted(&plan);
-            match result {
-                Ok(migration_result) => {
-                    assert!(
-                        migration_result.files_indexed >= 2,
-                        "mixed migration should index both code roots"
-                    );
-                    assert_eq!(migration_result.default_branch, scan.default_branch.clone());
-                    assert!(target.path().join(".kin").exists());
-                    assert!(target.path().join("README.md").exists());
-                    assert!(target.path().join("package.json").exists());
-                    assert!(target.path().join("Dockerfile").exists());
-                    assert!(target.path().join("frontend/app.tsx").exists());
+    // The executable mode bit and the symlink are Unix-only artifacts.
+    #[cfg(unix)]
+    let expected_artifacts = {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(dir.path().join("run-tool"), b"#!/bin/sh\nexit 0\n").unwrap();
+        let mut permissions = std::fs::metadata(dir.path().join("run-tool"))
+            .unwrap()
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(dir.path().join("run-tool"), permissions).unwrap();
+        std::os::unix::fs::symlink("compose.yaml", dir.path().join("compose-link")).unwrap();
+        files.len() + 2
+    };
+    #[cfg(not(unix))]
+    let expected_artifacts = files.len();
 
-                    let layout = kin_core::KinLayout::new(target.path().join(".kin"));
-                    let snapshot = SnapshotManager::open(layout.kindb_snapshot_path()).unwrap();
-                    let graph = snapshot.graph();
-                    let branch = graph
-                        .get_branch(&BranchName::new(
-                            scan.default_branch.as_deref().unwrap_or("main"),
-                        ))
-                        .unwrap();
-                    assert!(
-                        branch.is_some(),
-                        "mixed migration should keep a live branch"
-                    );
-                    assert!(
-                        graph.entity_count() > 0,
-                        "mixed migration should materialize indexed entities"
-                    );
-                }
-                Err(e) => {
-                    eprintln!("mixed migration error (may be expected): {}", e);
-                }
+    run_git(dir.path(), &["add", "--all"]);
+    run_git(dir.path(), &["commit", "-m", "initial mixed commit"]);
+
+    let scan = kin_migrate::scan_repo(dir.path()).expect("scan mixed Git repository");
+    let plan = kin_migrate::plan_migration(&scan, kin_migrate::MigrationStrategy::Full, None);
+    let result =
+        kin_migrate::execute_migration_persisted(&plan).expect("admit mixed Git repository");
+
+    assert_eq!(result.commits_imported, 1);
+    assert_eq!(result.artifacts_admitted, expected_artifacts);
+    assert_eq!(result.files_indexed, 0, "authority is language-independent");
+    let authority = open_migrated_authority(dir.path());
+    for (path, bytes) in files {
+        assert_workspace_blob(&authority, path, bytes);
+    }
+
+    #[cfg(unix)]
+    {
+        assert_workspace_blob(&authority, "run-tool", b"#!/bin/sh\nexit 0\n");
+        assert_workspace_blob(&authority, "compose-link", b"compose.yaml");
+        let lease = authority.read_authority();
+        let workspace = &lease.metadata().workspaces[0];
+        let executable = workspace
+            .tree
+            .artifact_at_path(&RepoPath::from_utf8("run-tool").unwrap())
+            .unwrap();
+        assert!(matches!(
+            executable.entry,
+            TreeEntry::Blob {
+                executable: true,
+                ..
             }
-        }
-        Err(e) => {
-            eprintln!(
-                "scan_repo error (may be expected without full git setup): {}",
-                e
-            );
-        }
+        ));
+        let symlink = workspace
+            .tree
+            .artifact_at_path(&RepoPath::from_utf8("compose-link").unwrap())
+            .unwrap();
+        assert!(matches!(symlink.entry, TreeEntry::Symlink { .. }));
     }
 }
 
@@ -500,64 +456,6 @@ fn orphan_sweep_reaps_stale_sessions() {
         session.is_none(),
         "stale session should be gone after sweep"
     );
-}
-
-// -----------------------------------------------------------------------
-// 13. Reconciler blocks on collision: set TrafficChecker -> attempt mutation
-//     on locked scope -> verify blocked with CollisionBlocked error
-// -----------------------------------------------------------------------
-
-/// Mock traffic checker that always returns a hard-lock collision.
-struct BlockingTrafficChecker;
-
-impl TrafficChecker for BlockingTrafficChecker {
-    fn check_collisions(
-        &self,
-        _scope: &IntentScope,
-        _requesting_session: Option<&SessionId>,
-    ) -> std::result::Result<CollisionCheck, String> {
-        Ok(CollisionCheck::Blocked {
-            conflict: IntentConflict::HardCollision,
-            blocking_intents: vec![IntentSummary {
-                intent_id: IntentId::new(),
-                session_id: SessionId::new(),
-                vendor: "rival-agent".to_string(),
-                task_description: "hard lock on target".to_string(),
-                lock_type: LockType::Hard,
-                registered_at: Timestamp::now(),
-            }],
-        })
-    }
-}
-
-#[test]
-fn reconciler_blocks_on_collision() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut reconciler = Reconciler::new(dir.path().to_path_buf());
-    reconciler.set_traffic_checker(Box::new(BlockingTrafficChecker));
-    reconciler.set_session_id(SessionId::new());
-
-    // Create an overlay with a modified entity to trigger projection.
-    let entity = make_entity("locked_fn", "src/locked.rs", EntityKind::Function);
-    let mut overlay = GraphOverlay::default();
-    overlay.entity_mods.insert(entity.id, entity);
-
-    // Attempting to project should fail with CollisionBlocked.
-    let result = reconciler.project_overlay_to_files(&overlay);
-    assert!(result.is_err(), "expected collision to block projection");
-
-    match result.unwrap_err() {
-        ReconcileError::CollisionBlocked {
-            reason,
-            blocking_intents,
-        } => {
-            assert!(reason.contains("Hard collision"));
-            assert_eq!(blocking_intents.len(), 1);
-            assert_eq!(blocking_intents[0].vendor, "rival-agent");
-            assert_eq!(blocking_intents[0].lock_type, LockType::Hard);
-        }
-        other => panic!("expected CollisionBlocked, got: {:?}", other),
-    }
 }
 
 // -----------------------------------------------------------------------

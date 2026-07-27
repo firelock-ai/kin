@@ -6,7 +6,8 @@ Windows (via WSL2):
 1. **Install** the binaries with the one-line installer.
 2. **`kin setup`** — answer a couple of questions; the guided wizard configures your
    shell, PATH, daemon, and AI clients.
-3. **`kin init`** + **`kin embed`** — build the semantic graph and the vector index.
+3. **`kin init`** — atomically admit repository authority; semantic enrichment
+   and embeddings are separate graph-native stages.
 4. **Verify** with `kin setup status` and read the health checklist.
 
 Manual / per-tool configuration is available in the
@@ -123,14 +124,14 @@ Start a brand-new Kin-native repository:
 
 ```sh
 mkdir my-app
-kin init my-app --git-history off
+kin init my-app
 cd my-app
 ```
 
-In a directory with no `.git/`, `kin init` creates the native `.kin/` graph store and a
-managed `AGENTS.md` before the first snapshot. Agents that open the folder immediately see
-the Kin-native workflow: graph tools first, session workspaces for execution, `kin commit`
-for graph history, and `kin git export` only as an interoperability escape hatch.
+In an empty directory with no `.git/`, `kin init` creates an unborn native
+repository-v6 authority with an empty exact workspace and no synthetic commit.
+It refuses a non-empty non-Git directory rather than silently treating
+filesystem contents as graph truth.
 
 Convert an existing Git repository or folder:
 
@@ -142,24 +143,21 @@ kin init
 kin init path/to/project
 ```
 
-In a detected Git repository, `kin init` bootstraps the current tree as semantic truth and
-imports recent Git history by default. Git stays in place; Kin adds the semantic graph and
-agent/runtime surfaces beside it.
+In a clean detected Git repository, `kin init` imports complete reachable
+history, refs, raw objects, the exact workspace tree, and admission policy into
+graph-owned authority. Git stays in place as an explicit interoperability
+boundary; Kin runtime queries do not fall back to it. Repositories with remotes
+currently fail closed until exact Kin remote mapping is available.
 
 *Flags:*
-- `--git-history <off|recent|full>`: how much Git history to import into the graph on init
-  (default: `recent`, a deterministic HEAD-connected window of at most 50 commits;
-  `full` imports complete reachable ancestry).
-- `--force`: initialize even if a `.git/` directory is already present.
-- `--no-lsp`: skip LSP enrichment (faster, tree-sitter-only init).
+- `--json`: report the exact committed repository/workspace authority result.
 
 ---
 
 ## 4. Add embeddings for semantic search
 
-`kin init` builds the graph instantly **without** embeddings. To enable semantic
-(vector) search, `kin locate`, and the MCP `semantic_locate` tool, build the vector
-index:
+Repository admission does not run semantic enrichment. Once graph-native
+semantic entities exist, build their vector index with:
 
 ```sh
 kin embed
@@ -216,7 +214,7 @@ venv-like execution contract, so you never need to know which files are
 materialized before running the repo:
 
 ```sh
-kin exec -- npm test          # one-shot command (alias: kin run)
+kin exec -- npm test          # one-shot command
 kin shell                     # interactive shell in a session workspace
 kin with --session claude -- "fix the failing test"   # agent inside a session
 ```
@@ -456,31 +454,47 @@ normal use. The escape hatches:
 
 ## 10. Removing Kin
 
-Kin is ejectable — there is no data lock-in. There are two modes, and they
-do different things:
+Kin is ejectable — there is no data lock-in. Eject remains graph-first all the
+way through the exit:
 
 ```sh
-kin eject                 # safe default
+kin eject
 ```
 
-Stops the Kin daemon and removes the `.kin/` directory (the graph and all Kin
-metadata). **Your working files are left exactly as they are** — whatever is on
-disk right now stays on disk. This is the everyday "walk away with my files"
-path.
+Kin resolves the current branch from graph history, verifies every referenced
+blob and every projected file byte, kind, symlink target, and executable mode,
+then builds and strictly verifies a complete ordinary Git replacement off to
+the side. Every replacement Git object, ref, config, directory, and index when
+one exists is flushed before Kin authority is detached, as are the publication
+parent entries. It stops the daemon and checks the persisted graph and working
+projection again before changing either authority namespace. If anything is
+missing, locally edited, unsupported (including a Gitlink/submodule), or raced
+during shutdown, eject refuses before detaching Kin.
+
+On success, working files are not rewritten. The exact graph-derived Git
+repository is durably installed at `.git/` first, then the locked `.kin/`
+namespace is atomically detached with a no-replace rename. The detached
+metadata and the pre-eject repository-local `.git` entry are retained in a
+private sibling archive as `kin/` and `previous-git/`. Credential-free remote
+URLs, refspecs, branch tracking, and push defaults sealed during Git import are
+restored; credentials and ambient Git configuration are never copied. The
+command prints the exact archive path. Kin intentionally leaves irreversible
+archive deletion to the operator after an independent backup; the eject
+transaction never follows an ambient path to recursively delete detached
+authority. The capability-anchored transaction is currently supported on Unix
+hosts. Windows eject fails before namespace mutation until the same durable
+retained-handle guarantees are implemented there. Kin never restores an
+initialization-time filesystem snapshot or treats the old `.git/` as authority.
+
+To keep Kin attached and instead create a standalone interoperability
+projection, export one exact authority generation to a new bare repository:
 
 ```sh
-kin eject --revert-files  # destructive: restore the pre-init snapshot
+kin git export --output ../project-export.git
 ```
 
-Additionally overwrites every working file with the copy Kin snapshotted at
-`kin init`, discarding changes made since. It asks you to type `revert` to
-confirm (use `--yes` to skip the prompt in scripts), and it writes a timestamped
-backup of your current files to `.kin-backup-eject-<timestamp>/` first, so
-nothing is lost. If the snapshot is missing or incomplete, eject refuses and
-touches nothing rather than half-restoring.
-
-**What eject never touches: `.git`.** Kin snapshots your *working tree* at init
-(excluding `.git`, `.kin*`, and ignored paths) and restores those files only. It
-never reads, rewrites, or restores Git history — your commit history is owned by
-Git the entire time. After eject, the directory is a plain Git repository with
-its history intact; `git log`, `git status`, and `git fsck` all work unchanged.
+The destination parent must already exist. The destination itself must not
+exist and cannot be inside the Kin working repository. Working-file edits and
+the ambient `.git/` object store are not export inputs. Exact publication is
+currently supported on Unix hosts; other hosts refuse before creating the
+export until an equivalent retained-handle namespace transaction is available.

@@ -3,66 +3,43 @@
 
 //! Reconstructive commit-delta computation for `command_commit`.
 //!
-//! Computes entity / relation / artifact deltas by diffing current graph
+//! Computes entity, relation, and exact tree deltas by diffing current graph
 //! state against the last-committed change-DAG node.  This approach is
 //! robust regardless of when the reconcile loop drained the working-copy
 //! overlay — the overlay is never consulted here.
 //!
 //! ## Algorithm
 //!
-//! 1. Walk the change DAG from genesis to `branch_head` via
-//!    `get_changes_since`, reconstructing the committed entity map,
-//!    relation set, and file tree.
-//! 2. Read current state from the live graph (`list_all_entities`,
-//!    `get_all_relations_for_entity`) and scan working-directory files.
+//! 1. Resolve the exact repository-authority parent state.
+//! 2. Take one coherent snapshot of the live admitted graph workspace.
 //! 3. Diff current vs committed to produce typed `EntityDelta`,
-//!    `RelationDelta`, and `ArtifactDelta` slices.
+//!    `RelationDelta`, and `TreeDelta` slices.
 //!
 //! Because `apply_overlay_to_graph` folds reconcile mutations into the
 //! primary graph before clearing the overlay, `graph.list_all_entities()`
 //! already reflects the current working state — diffing against the DAG
 //! baseline captures exactly what changed since the last commit.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
-use kin_db::InMemoryGraph;
+use kin_db::{GraphSnapshot, InMemoryGraph};
 use kin_model::{
-    relation::GraphNodeId, ArtifactDelta, ArtifactDeltaKind, ChangeStore, Entity, EntityDelta,
-    EntityId, EntityStore, FilePathId, Hash256, RelationDelta, RelationId, SemanticChangeId,
-    SourceEntryKind,
+    graph::ResolvedGraphState, ArtifactId, ChangeStore, Entity, EntityDelta, EntityId, EntityStore,
+    GraphNodeId, Hash256, Relation, RelationDelta, RelationId, RepoPath, ResolvedTree,
+    SemanticChangeId, TransactionDelta, TreeDelta, TreeEntry,
 };
+use sha2::{Digest, Sha256};
 
 use crate::error::{DaemonError, Result};
 
 /// The three delta slices that constitute a semantic commit.
+#[derive(Debug)]
 pub struct CommitDeltas {
     pub entity_deltas: Vec<EntityDelta>,
     pub relation_deltas: Vec<RelationDelta>,
-    pub artifact_deltas: Vec<ArtifactDelta>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct CommittedSourceEntry {
-    hash: Hash256,
-    /// `None` identifies pre-0.3 mode-unknown history. An unchanged working
-    /// entry then emits an exact modification to backfill its mode.
-    kind: Option<SourceEntryKind>,
-}
-
-fn added_artifact_kind(kind: SourceEntryKind) -> ArtifactDeltaKind {
-    match kind {
-        SourceEntryKind::File { executable: false } => ArtifactDeltaKind::AddedRegularFile,
-        SourceEntryKind::File { executable: true } => ArtifactDeltaKind::AddedExecutableFile,
-        SourceEntryKind::Symlink => ArtifactDeltaKind::AddedSymlink,
-    }
-}
-
-fn modified_artifact_kind(kind: SourceEntryKind) -> ArtifactDeltaKind {
-    match kind {
-        SourceEntryKind::File { executable: false } => ArtifactDeltaKind::ModifiedRegularFile,
-        SourceEntryKind::File { executable: true } => ArtifactDeltaKind::ModifiedExecutableFile,
-        SourceEntryKind::Symlink => ArtifactDeltaKind::ModifiedSymlink,
-    }
+    pub tree_deltas: Vec<TreeDelta>,
+    /// Exact graph-owned tree that the change must resolve to.
+    pub expected_tree: ResolvedTree,
 }
 
 /// Compute commit deltas by diffing current graph state against the
@@ -72,299 +49,638 @@ fn modified_artifact_kind(kind: SourceEntryKind) -> ArtifactDeltaKind {
 /// and non-empty slices when entities, relations, or files have been modified.
 pub fn compute_deltas_vs_last_commit(
     graph: &InMemoryGraph,
-    blobs: &kin_blobs::BlobStore,
-    layout: &kin_core::KinLayout,
     branch_head: &SemanticChangeId,
 ) -> Result<CommitDeltas> {
-    // ── Reconstruct the committed baseline from the change DAG ───────────
-    let genesis = kin_core::build_genesis_change();
-    let committed_changes = graph
-        .get_changes_since(&genesis.id, branch_head)
+    let committed = graph
+        .resolve_graph_at(branch_head)
         .map_err(DaemonError::Graph)?;
+    compute_deltas_from_resolved_state(graph, committed)
+}
 
-    // entity_id → Entity (state at last commit)
-    let mut committed_entities: HashMap<EntityId, Entity> = HashMap::new();
-    // file_id → content hash + exact source kind (state at last commit)
-    let mut committed_files: HashMap<FilePathId, CommittedSourceEntry> = HashMap::new();
-    // relation IDs present at last commit
-    let mut committed_relation_ids: HashSet<RelationId> = HashSet::new();
+/// Diff the live admitted graph against one repository-v6 authority lease.
+///
+/// The baseline comes exclusively from the persisted semantic history. The
+/// live side is the already-admitted graph workspace; no checkout is read and
+/// no artifact identity is inferred here. `None` is an unborn repository and
+/// therefore has an exact empty baseline.
+pub fn compute_deltas_vs_repository_authority(
+    graph: &InMemoryGraph,
+    authority_snapshot: &GraphSnapshot,
+    parent: Option<&SemanticChangeId>,
+) -> Result<CommitDeltas> {
+    let committed = match parent {
+        Some(parent) => {
+            let mut snapshot = authority_snapshot.clone();
+            snapshot.repository_authority = None;
+            InMemoryGraph::from_snapshot(snapshot)
+                .map_err(DaemonError::Graph)?
+                .resolve_graph_at(parent)
+                .map_err(DaemonError::Graph)?
+        }
+        None => ResolvedGraphState {
+            entities: Default::default(),
+            relations: Default::default(),
+            entity_revisions: Default::default(),
+            tree: ResolvedTree::default(),
+            entity_tombstones: Default::default(),
+            relation_tombstones: Default::default(),
+        },
+    };
+    compute_deltas_from_resolved_state(graph, committed)
+}
 
-    for change in &committed_changes {
-        for delta in &change.entity_deltas {
-            match delta {
-                EntityDelta::Added(entity) => {
-                    committed_entities.insert(entity.id, entity.clone());
-                }
-                EntityDelta::Modified { new, .. } => {
-                    committed_entities.insert(new.id, new.clone());
-                }
-                EntityDelta::Removed(id) => {
-                    committed_entities.remove(id);
-                }
-            }
+/// Build the complete derived-graph transition for one selected-path checkout.
+///
+/// Exact tree membership comes from the repository checkout plan. Semantic
+/// entities and every relation touching a selected entity or artifact are
+/// spliced from the immutable target change. Unsupported/config/binary members
+/// naturally carry only tree deltas. This makes a missing semantic parser an
+/// honest absence of enrichment rather than permission to leave stale entities
+/// attached to replaced bytes.
+pub fn compute_selected_checkout_delta(
+    graph: &InMemoryGraph,
+    selected: &RepoPath,
+    target: &ResolvedGraphState,
+    expected_previous_tree: &ResolvedTree,
+    desired_tree: &ResolvedTree,
+) -> Result<TransactionDelta> {
+    let current = graph.to_snapshot();
+    if current.resolved_tree != *expected_previous_tree && current.resolved_tree != *desired_tree {
+        return Err(DaemonError::IncompatibleRepo(format!(
+            "daemon query tree matches neither checkout base nor desired authority for {selected}"
+        )));
+    }
+
+    let current_selected_entities = selected_entity_ids(current.entities.values(), selected)?;
+    let target_selected_entities = selected_entity_ids(target.entities.values(), selected)?;
+    let current_selected_artifacts = selected_artifact_ids(&current.resolved_tree, selected);
+    let target_selected_artifacts = selected_artifact_ids(&target.tree, selected);
+
+    let mut desired_entities = current.entities.clone();
+    for entity_id in &current_selected_entities {
+        desired_entities.remove(entity_id);
+    }
+    let mut occupied_entity_ids = desired_entities.keys().copied().collect::<HashSet<_>>();
+    let mut entity_remap = HashMap::new();
+    let mut ordered_target_entities = target_selected_entities.iter().copied().collect::<Vec<_>>();
+    ordered_target_entities.sort_unstable();
+    for entity_id in &ordered_target_entities {
+        let entity = target
+            .entities
+            .get(entity_id)
+            .expect("selected entity IDs come from target entity map");
+        let desired_id = if occupied_entity_ids.contains(entity_id) {
+            collision_copy_entity_id(entity, &occupied_entity_ids)
+        } else {
+            *entity_id
+        };
+        occupied_entity_ids.insert(desired_id);
+        entity_remap.insert(*entity_id, desired_id);
+    }
+    for entity_id in &ordered_target_entities {
+        let mut entity = target
+            .entities
+            .get(entity_id)
+            .expect("selected entity IDs come from target entity map")
+            .clone();
+        entity.id = *entity_remap
+            .get(entity_id)
+            .expect("every selected target entity has a remap");
+        entity.lineage_parent = remap_retained_entity_reference(
+            entity.lineage_parent,
+            &entity_remap,
+            &occupied_entity_ids,
+        );
+        entity.superseded_by = remap_retained_entity_reference(
+            entity.superseded_by,
+            &entity_remap,
+            &occupied_entity_ids,
+        );
+        desired_entities.insert(entity.id, entity);
+    }
+
+    let artifact_remap = selected_artifact_remap(&target.tree, desired_tree, selected)?;
+    let mut desired_relations = current.relations.clone();
+    desired_relations.retain(|_, relation| {
+        !relation_touches_selected(
+            relation,
+            &current_selected_entities,
+            &current_selected_artifacts,
+        )
+    });
+
+    let mut occupied_relation_ids = desired_relations.keys().copied().collect::<HashSet<_>>();
+    let mut target_relations = target
+        .relations
+        .values()
+        .filter(|relation| {
+            relation_touches_selected(
+                relation,
+                &target_selected_entities,
+                &target_selected_artifacts,
+            )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    target_relations.sort_by_key(|relation| relation.id);
+    for mut relation in target_relations {
+        let original_id = relation.id;
+        let original_src = relation.src;
+        let original_dst = relation.dst;
+        relation.src = remap_checkout_node(relation.src, &entity_remap, &artifact_remap);
+        relation.dst = remap_checkout_node(relation.dst, &entity_remap, &artifact_remap);
+        if !checkout_node_exists(relation.src, &desired_entities, desired_tree, &current)
+            || !checkout_node_exists(relation.dst, &desired_entities, desired_tree, &current)
+        {
+            // A selected historical edge may point outside the selected
+            // subtree to a node that is absent from the current mixed graph.
+            // Omitting that stale edge is truthful; inventing or resurrecting
+            // the unselected endpoint is not.
+            continue;
         }
-        for delta in &change.artifact_deltas {
-            if delta.kind.is_removed() {
-                committed_files.remove(&delta.file_id);
-            } else if let Some(hash) = delta.new_hash {
-                committed_files.insert(
-                    delta.file_id.clone(),
-                    CommittedSourceEntry {
-                        hash,
-                        kind: delta.kind.source_entry_kind(),
-                    },
-                );
-            }
+        if relation.src != original_src || relation.dst != original_dst {
+            relation.id =
+                collision_copy_relation_id(&relation, original_id, &occupied_relation_ids);
+        } else if desired_relations
+            .get(&relation.id)
+            .is_some_and(|retained| retained != &relation)
+        {
+            relation.id =
+                collision_copy_relation_id(&relation, original_id, &occupied_relation_ids);
         }
-        for delta in &change.relation_deltas {
-            match delta {
-                RelationDelta::Added(rel) => {
-                    committed_relation_ids.insert(rel.id);
-                }
-                RelationDelta::Removed(id) => {
-                    committed_relation_ids.remove(id);
-                }
+        if let Some(retained) = desired_relations.get(&relation.id) {
+            if retained != &relation {
+                return Err(DaemonError::IncompatibleRepo(format!(
+                    "checkout of {selected} would reuse relation identity {} across the selection boundary",
+                    relation.id
+                )));
             }
+        } else {
+            occupied_relation_ids.insert(relation.id);
+            desired_relations.insert(relation.id, relation);
         }
     }
 
-    // ── Current entity state from live graph ─────────────────────────────
-    let current_entities = graph.list_all_entities().map_err(DaemonError::Graph)?;
+    let semantic_delta = kin_core::diff_workspace_semantics(
+        &current.entities,
+        &current.relations,
+        &desired_entities,
+        &desired_relations,
+    )?;
+    let delta = TransactionDelta {
+        entity_deltas: semantic_delta.entity_deltas().to_vec(),
+        relation_deltas: semantic_delta.relation_deltas().to_vec(),
+        tree_deltas: kin_core::exact_tree_correction(&current.resolved_tree, desired_tree)?,
+        admission_policy_delta: None,
+    };
 
-    // ── Entity deltas ─────────────────────────────────────────────────────
+    let preflight = InMemoryGraph::from_snapshot(current).map_err(DaemonError::Graph)?;
+    preflight
+        .apply_transaction_delta(&delta)
+        .map_err(DaemonError::Graph)?;
+    if preflight.resolved_tree() != *desired_tree {
+        return Err(DaemonError::IncompatibleRepo(format!(
+            "checkout preflight for {selected} did not resolve to exact desired tree"
+        )));
+    }
+    Ok(delta)
+}
+
+fn selected_entity_ids<'a>(
+    entities: impl Iterator<Item = &'a Entity>,
+    selected: &RepoPath,
+) -> Result<HashSet<EntityId>> {
+    let mut selected_ids = HashSet::new();
+    for entity in entities {
+        let Some(file_origin) = &entity.file_origin else {
+            continue;
+        };
+        let path = RepoPath::from_utf8(file_origin.0.clone()).map_err(|error| {
+            DaemonError::IncompatibleRepo(format!(
+                "entity {} has invalid repository file origin '{}': {error}",
+                entity.id, file_origin
+            ))
+        })?;
+        if checkout_path_contains(selected, &path) {
+            selected_ids.insert(entity.id);
+        }
+    }
+    Ok(selected_ids)
+}
+
+fn selected_artifact_ids(tree: &ResolvedTree, selected: &RepoPath) -> HashSet<ArtifactId> {
+    tree.artifacts_by_path()
+        .filter(|artifact| checkout_path_contains(selected, &artifact.path))
+        .map(|artifact| artifact.artifact_id)
+        .collect()
+}
+
+fn selected_artifact_remap(
+    target: &ResolvedTree,
+    desired: &ResolvedTree,
+    selected: &RepoPath,
+) -> Result<HashMap<ArtifactId, ArtifactId>> {
+    let mut remap = HashMap::new();
+    for artifact in target
+        .artifacts_by_path()
+        .filter(|artifact| checkout_path_contains(selected, &artifact.path))
+    {
+        let desired_artifact = desired.artifact_at_path(&artifact.path).ok_or_else(|| {
+            DaemonError::IncompatibleRepo(format!(
+                "desired checkout tree lost selected target artifact {}",
+                artifact.path
+            ))
+        })?;
+        if desired_artifact.entry != artifact.entry {
+            return Err(DaemonError::IncompatibleRepo(format!(
+                "desired checkout entry at {} differs from target history",
+                artifact.path
+            )));
+        }
+        remap.insert(artifact.artifact_id, desired_artifact.artifact_id);
+    }
+    Ok(remap)
+}
+
+fn relation_touches_selected(
+    relation: &Relation,
+    entities: &HashSet<EntityId>,
+    artifacts: &HashSet<ArtifactId>,
+) -> bool {
+    [relation.src, relation.dst]
+        .into_iter()
+        .any(|node| match node {
+            GraphNodeId::Entity(entity_id) => entities.contains(&entity_id),
+            GraphNodeId::Artifact(artifact_id) => artifacts.contains(&artifact_id),
+            _ => false,
+        })
+}
+
+fn remap_checkout_node(
+    node: GraphNodeId,
+    entity_remap: &HashMap<EntityId, EntityId>,
+    artifact_remap: &HashMap<ArtifactId, ArtifactId>,
+) -> GraphNodeId {
+    match node {
+        GraphNodeId::Entity(entity_id) => entity_remap
+            .get(&entity_id)
+            .copied()
+            .map(GraphNodeId::Entity)
+            .unwrap_or(node),
+        GraphNodeId::Artifact(artifact_id) => artifact_remap
+            .get(&artifact_id)
+            .copied()
+            .map(GraphNodeId::Artifact)
+            .unwrap_or(node),
+        _ => node,
+    }
+}
+
+fn remap_retained_entity_reference(
+    reference: Option<EntityId>,
+    remap: &HashMap<EntityId, EntityId>,
+    occupied: &HashSet<EntityId>,
+) -> Option<EntityId> {
+    reference.and_then(|entity_id| {
+        remap
+            .get(&entity_id)
+            .copied()
+            .or_else(|| occupied.contains(&entity_id).then_some(entity_id))
+    })
+}
+
+fn collision_copy_entity_id(entity: &Entity, occupied: &HashSet<EntityId>) -> EntityId {
+    for counter in 0_u64.. {
+        let mut hasher = Sha256::new();
+        hasher.update(b"kin.checkout-collision-copy-entity.v1\0");
+        hasher.update(entity.id.0.as_bytes());
+        if let Some(path) = &entity.file_origin {
+            hasher.update(path.0.as_bytes());
+        }
+        hasher.update(counter.to_le_bytes());
+        let digest = hasher.finalize();
+        let mut bytes = [0_u8; 16];
+        bytes.copy_from_slice(&digest[..16]);
+        bytes[6] = (bytes[6] & 0x0f) | 0x40;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        let candidate = EntityId(uuid::Uuid::from_bytes(bytes));
+        if !occupied.contains(&candidate) {
+            return candidate;
+        }
+    }
+    unreachable!("u64 entity remap namespace exhausted")
+}
+
+fn collision_copy_relation_id(
+    relation: &Relation,
+    original_id: RelationId,
+    occupied: &HashSet<RelationId>,
+) -> RelationId {
+    for counter in 0_u64.. {
+        let mut hasher = Sha256::new();
+        hasher.update(b"kin.checkout-collision-copy-relation.v1\0");
+        hasher.update(original_id.0.as_bytes());
+        hasher.update(relation.src.to_string().as_bytes());
+        hasher.update([0]);
+        hasher.update(relation.dst.to_string().as_bytes());
+        hasher.update([0]);
+        hasher.update(format!("{:?}", relation.kind).as_bytes());
+        hasher.update(counter.to_le_bytes());
+        let digest = hasher.finalize();
+        let mut bytes = [0_u8; 16];
+        bytes.copy_from_slice(&digest[..16]);
+        bytes[6] = (bytes[6] & 0x0f) | 0x40;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        let candidate = RelationId::from_bytes(bytes);
+        if !occupied.contains(&candidate) {
+            return candidate;
+        }
+    }
+    unreachable!("u64 relation remap namespace exhausted")
+}
+
+fn checkout_node_exists(
+    node: GraphNodeId,
+    desired_entities: &HashMap<EntityId, Entity>,
+    desired_tree: &ResolvedTree,
+    current: &GraphSnapshot,
+) -> bool {
+    match node {
+        GraphNodeId::Entity(entity_id) => desired_entities.contains_key(&entity_id),
+        GraphNodeId::Artifact(artifact_id) => desired_tree.get(&artifact_id).is_some(),
+        GraphNodeId::Test(test_id) => current.test_cases.contains_key(&test_id),
+        GraphNodeId::Contract(contract_id) => current.contracts.contains_key(&contract_id),
+        GraphNodeId::Work(work_id) => current.work_items.contains_key(&work_id),
+        GraphNodeId::VerificationRun(run_id) => current.verification_runs.contains_key(&run_id),
+    }
+}
+
+fn checkout_path_contains(selected: &RepoPath, path: &RepoPath) -> bool {
+    path == selected
+        || path
+            .as_bytes()
+            .strip_prefix(selected.as_bytes())
+            .is_some_and(|suffix| suffix.starts_with(b"/"))
+}
+
+fn compute_deltas_from_resolved_state(
+    graph: &InMemoryGraph,
+    committed: ResolvedGraphState,
+) -> Result<CommitDeltas> {
+    // One coherent live snapshot keeps entity, relation, and exact-tree deltas
+    // on the same graph generation.
+    let current = graph.to_snapshot();
+
     let mut entity_deltas = Vec::new();
-    let mut current_entity_ids: HashSet<EntityId> = HashSet::with_capacity(current_entities.len());
-
-    for entity in &current_entities {
-        current_entity_ids.insert(entity.id);
-        match committed_entities.get(&entity.id) {
+    for entity in current.entities.values() {
+        match committed.entities.get(&entity.id) {
             None => {
-                // Not in last commit → Added
-                entity_deltas.push(EntityDelta::Added(entity.clone()));
+                entity_deltas.push(EntityDelta::Added {
+                    new: entity.clone(),
+                });
             }
             Some(committed) if kin_index::entity_semantics_changed(committed, entity) => {
-                // Fingerprint changed → Modified (old from DAG, new from graph)
                 entity_deltas.push(EntityDelta::Modified {
                     old: committed.clone(),
                     new: entity.clone(),
                 });
             }
-            _ => {} // Unchanged
+            _ => {}
         }
     }
-
-    // Entities in committed baseline but absent from live graph → Removed
-    for id in committed_entities.keys() {
-        if !current_entity_ids.contains(id) {
-            entity_deltas.push(EntityDelta::Removed(*id));
+    for (entity_id, entity) in &committed.entities {
+        if !current.entities.contains_key(entity_id) {
+            entity_deltas.push(EntityDelta::Removed {
+                old: entity.clone(),
+            });
         }
     }
+    entity_deltas.sort_by_key(EntityDelta::target_id);
 
-    // ── Relation deltas ───────────────────────────────────────────────────
     let mut relation_deltas = Vec::new();
-    let mut current_relation_ids: HashSet<RelationId> = HashSet::new();
-
-    for entity in &current_entities {
-        let relations = graph
-            .get_all_relations_for_entity(&entity.id)
-            .map_err(DaemonError::Graph)?;
-        for rel in relations {
-            // Only track outgoing relations to avoid double-counting.
-            if rel.src == GraphNodeId::Entity(entity.id)
-                && current_relation_ids.insert(rel.id)
-                && !committed_relation_ids.contains(&rel.id)
-            {
-                relation_deltas.push(RelationDelta::Added(rel));
+    for relation in current.relations.values() {
+        match committed.relations.get(&relation.id) {
+            None => relation_deltas.push(RelationDelta::Added {
+                new: relation.clone(),
+            }),
+            Some(old) if old != relation => {
+                relation_deltas.push(RelationDelta::Modified {
+                    old: old.clone(),
+                    new: relation.clone(),
+                });
             }
+            _ => {}
         }
     }
-
-    // Relations in committed baseline but absent from live graph → Removed
-    for id in &committed_relation_ids {
-        if !current_relation_ids.contains(id) {
-            relation_deltas.push(RelationDelta::Removed(*id));
+    for (relation_id, relation) in &committed.relations {
+        if !current.relations.contains_key(relation_id) {
+            relation_deltas.push(RelationDelta::Removed {
+                old: relation.clone(),
+            });
         }
     }
+    relation_deltas.sort_by_key(RelationDelta::target_id);
 
-    // ── Artifact deltas (file content hashes) ────────────────────────────
-    let artifact_deltas = compute_artifact_deltas(layout, blobs, committed_files)?;
+    let expected_tree = current.resolved_tree;
+    let tree_deltas = kin_core::exact_tree_correction(&committed.tree, &expected_tree)?;
 
     Ok(CommitDeltas {
         entity_deltas,
         relation_deltas,
-        artifact_deltas,
+        tree_deltas,
+        expected_tree,
     })
 }
 
-/// Compare working-directory source entries against the committed tree,
-/// producing mode-faithful artifact deltas. A mode-only change and an exact
-/// backfill over legacy mode-unknown history both produce a modification.
-fn compute_artifact_deltas(
-    layout: &kin_core::KinLayout,
+/// Turn one complete host scan into exact graph entries.
+///
+/// Graph-only entries (currently Gitlinks) are copied from the parent tree:
+/// their host checkout is neither membership evidence nor an identity source.
+pub(crate) fn observed_tree_from_complete_scan(
     blobs: &kin_blobs::BlobStore,
-    committed_files: HashMap<FilePathId, CommittedSourceEntry>,
-) -> Result<Vec<ArtifactDelta>> {
-    let source_root = kin_core::source_dir(layout);
-    let mut artifact_deltas = Vec::new();
-    let mut current_file_ids: HashSet<FilePathId> = HashSet::new();
+    scan: &kin_index::CompleteRepositoryScan,
+    previous: &ResolvedTree,
+) -> Result<BTreeMap<RepoPath, TreeEntry>> {
+    let mut observed = previous
+        .artifacts_by_path()
+        .filter(|artifact| matches!(artifact.entry, TreeEntry::Gitlink { .. }))
+        .map(|artifact| (artifact.path.clone(), artifact.entry))
+        .collect::<BTreeMap<_, _>>();
 
-    for abs_path in collect_tracked_files(&source_root)? {
-        let rel = match abs_path.strip_prefix(&source_root) {
-            Ok(path) => path.to_str().ok_or_else(|| {
-                DaemonError::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("source path is not valid UTF-8: {}", path.display()),
-                ))
-            })?,
-            Err(error) => {
-                return Err(DaemonError::Io(std::io::Error::other(format!(
-                    "tracked source path {} escaped source root {}: {error}",
-                    abs_path.display(),
-                    source_root.display()
-                ))))
-            }
-        };
-        let file_id = FilePathId::new(rel);
-        current_file_ids.insert(file_id.clone());
-
-        let metadata = std::fs::symlink_metadata(&abs_path).map_err(DaemonError::Io)?;
-        let (content, source_kind) = if metadata.file_type().is_symlink() {
-            let target = std::fs::read_link(&abs_path).map_err(DaemonError::Io)?;
-            let target = target.to_str().ok_or_else(|| {
-                DaemonError::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!(
-                        "symbolic link target is not valid UTF-8: {}",
-                        abs_path.display()
-                    ),
-                ))
-            })?;
-            (target.as_bytes().to_vec(), SourceEntryKind::Symlink)
-        } else if metadata.is_file() {
-            #[cfg(unix)]
-            let executable = {
-                use std::os::unix::fs::PermissionsExt;
-                metadata.permissions().mode() & 0o111 != 0
-            };
-            #[cfg(not(unix))]
-            let executable = false;
-            (
-                std::fs::read(&abs_path).map_err(DaemonError::Io)?,
-                SourceEntryKind::File { executable },
-            )
-        } else {
-            continue;
-        };
-
-        // A graph delta must never name bytes that failed to enter the local
-        // object store: the backend persistence path relies on this object.
+    for scanned in scan.entries() {
+        let content = read_scanned_entry(scanned)?;
         let blob_digest = blobs.write(&content).map_err(DaemonError::from)?;
-        let new_hash = Hash256::from_bytes(blob_digest.0);
-
-        match committed_files.get(&file_id).copied() {
-            None => {
-                artifact_deltas.push(ArtifactDelta {
-                    file_id,
-                    kind: added_artifact_kind(source_kind),
-                    old_hash: None,
-                    new_hash: Some(new_hash),
-                });
-            }
-            Some(committed)
-                if committed.hash != new_hash || committed.kind != Some(source_kind) =>
-            {
-                artifact_deltas.push(ArtifactDelta {
-                    file_id,
-                    kind: modified_artifact_kind(source_kind),
-                    old_hash: Some(committed.hash),
-                    new_hash: Some(new_hash),
-                });
-            }
-            _ => {} // Unchanged
+        if blob_digest.0 != scanned.content_hash {
+            return Err(DaemonError::Io(std::io::Error::other(format!(
+                "repository entry changed after complete scan: {}",
+                scanned.repo_path
+            ))));
         }
+        let entry = match scanned.kind {
+            kin_index::ScannedEntryKind::Regular { executable } => {
+                TreeEntry::blob(Hash256::from_bytes(blob_digest.0), executable)
+            }
+            kin_index::ScannedEntryKind::Symlink => {
+                TreeEntry::symlink(Hash256::from_bytes(blob_digest.0))
+            }
+        };
+        observed.insert(scanned.repo_path.clone(), entry);
     }
 
-    // Files in committed tree but missing from working directory → Removed
-    for (file_id, committed) in &committed_files {
-        if !current_file_ids.contains(file_id) {
-            artifact_deltas.push(ArtifactDelta {
-                file_id: file_id.clone(),
-                kind: ArtifactDeltaKind::Removed,
-                old_hash: Some(committed.hash),
-                new_hash: None,
-            });
-        }
-    }
-
-    Ok(artifact_deltas)
+    Ok(observed)
 }
 
-/// Recursively collect all tracked (non-skip) files under `root`.
-/// Uses `kin_index::should_skip_dir` for directory filtering, mirroring
-/// the same skip rules applied by the reconcile loop.
-fn collect_tracked_files(root: &std::path::Path) -> Result<Vec<std::path::PathBuf>> {
-    let mut files = Vec::new();
-    collect_tracked_files_recursive(root, &mut files)?;
-    files.sort();
-    Ok(files)
-}
-
-fn collect_tracked_files_recursive(
-    dir: &std::path::Path,
-    files: &mut Vec<std::path::PathBuf>,
-) -> Result<()> {
-    let entries = std::fs::read_dir(dir).map_err(DaemonError::Io)?;
-    for entry in entries {
-        let entry = entry.map_err(DaemonError::Io)?;
-        let path = entry.path();
-        let name = entry.file_name();
-        let name_str = name.to_str().ok_or_else(|| {
-            DaemonError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "source path component is not valid UTF-8: {}",
-                    path.display()
-                ),
-            ))
-        })?;
-        let file_type = entry.file_type().map_err(DaemonError::Io)?;
-        if file_type.is_dir() {
-            if kin_index::should_skip_dir(name_str) {
-                continue;
-            }
-            collect_tracked_files_recursive(&path, files)?;
-        } else if file_type.is_file() || file_type.is_symlink() {
-            files.push(path);
-        }
-    }
-    Ok(())
+fn read_scanned_entry(scanned: &kin_index::ScannedRepositoryEntry) -> Result<Vec<u8>> {
+    kin_index::read_verified_scanned_entry(scanned).map_err(DaemonError::Io)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kin_model::{ArtifactId, EntityStore, FilePathId, LocatedEntry};
 
     use std::sync::Arc;
 
     use kin_blobs::BlobStore;
     use kin_model::{
-        ArtifactDeltaKind, AuthorId, EntityKind, EntityMetadata, FingerprintAlgorithm, LanguageId,
-        SemanticFingerprint, Timestamp, Visibility,
+        AuthorId, EntityKind, EntityMetadata, FingerprintAlgorithm, LanguageId, RelationKind,
+        RelationOrigin, ResolvedArtifact, SemanticFingerprint, Timestamp, Visibility,
     };
 
     #[test]
-    fn tracked_file_scan_fails_loud_when_root_is_missing() {
+    fn exact_tree_scan_fails_loud_when_root_is_missing() {
         let temp = tempfile::tempdir().unwrap();
         let missing = temp.path().join("missing");
-        assert!(collect_tracked_files(&missing).is_err());
+        assert!(kin_index::scan_repository(
+            &missing,
+            &kin_index::RepositoryIgnore::default(),
+            std::iter::empty()
+        )
+        .is_err());
+    }
+
+    fn resolved_tree(artifacts: Vec<(ArtifactId, RepoPath, TreeEntry)>) -> ResolvedTree {
+        ResolvedTree::from_artifacts(
+            artifacts
+                .into_iter()
+                .map(|(artifact_id, path, entry)| ResolvedArtifact::new(artifact_id, path, entry)),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn exact_tree_planner_preserves_artifact_identity_across_a_unique_move() {
+        let artifact_id = ArtifactId::new();
+        let entry = TreeEntry::blob(Hash256::from_bytes([0x11; 32]), false);
+        let old_path = RepoPath::from_utf8("src/old.rs").unwrap();
+        let new_path = RepoPath::from_utf8("src/new.rs").unwrap();
+        let previous = resolved_tree(vec![(artifact_id, old_path.clone(), entry)]);
+
+        let deltas = kin_core::plan_observed_tree_deltas(
+            &previous,
+            BTreeMap::from([(new_path.clone(), entry)]),
+        )
+        .unwrap();
+
+        assert_eq!(
+            deltas,
+            vec![TreeDelta::Updated {
+                artifact_id,
+                old: LocatedEntry::new(old_path, entry),
+                new: LocatedEntry::new(new_path.clone(), entry),
+            }]
+        );
+        let next = previous.apply(&deltas).unwrap();
+        assert_eq!(next.get(&artifact_id).unwrap().path, new_path);
+    }
+
+    #[test]
+    fn exact_tree_planner_handles_move_plus_path_reuse_atomically() {
+        let moved_id = ArtifactId::new();
+        let moved_entry = TreeEntry::blob(Hash256::from_bytes([0x22; 32]), false);
+        let replacement_entry = TreeEntry::blob(Hash256::from_bytes([0x33; 32]), true);
+        let reused_path = RepoPath::from_utf8("compose.yaml").unwrap();
+        let destination = RepoPath::from_utf8("deploy/compose.yaml").unwrap();
+        let previous = resolved_tree(vec![(moved_id, reused_path.clone(), moved_entry)]);
+
+        let deltas = kin_core::plan_observed_tree_deltas(
+            &previous,
+            BTreeMap::from([
+                (reused_path.clone(), replacement_entry),
+                (destination.clone(), moved_entry),
+            ]),
+        )
+        .unwrap();
+        let next = previous.apply(&deltas).unwrap();
+
+        assert_eq!(next.get(&moved_id).unwrap().path, destination);
+        let replacement = next.artifact_at_path(&reused_path).unwrap();
+        assert_ne!(replacement.artifact_id, moved_id);
+        assert_eq!(replacement.entry, replacement_entry);
+    }
+
+    #[test]
+    fn exact_tree_planner_supports_swaps_and_non_utf8_paths() {
+        let left_id = ArtifactId::new();
+        let right_id = ArtifactId::new();
+        let left_entry = TreeEntry::blob(Hash256::from_bytes([0x44; 32]), false);
+        let right_entry = TreeEntry::symlink(Hash256::from_bytes([0x55; 32]));
+        let left_path = RepoPath::from_bytes(b"left-\xff".to_vec()).unwrap();
+        let right_path = RepoPath::from_utf8("right-link").unwrap();
+        let previous = resolved_tree(vec![
+            (left_id, left_path.clone(), left_entry),
+            (right_id, right_path.clone(), right_entry),
+        ]);
+
+        let deltas = kin_core::plan_observed_tree_deltas(
+            &previous,
+            BTreeMap::from([
+                (left_path.clone(), right_entry),
+                (right_path.clone(), left_entry),
+            ]),
+        )
+        .unwrap();
+        let next = previous.apply(&deltas).unwrap();
+
+        assert_eq!(next.get(&left_id).unwrap().path, right_path);
+        assert_eq!(next.get(&right_id).unwrap().path, left_path);
+    }
+
+    #[test]
+    fn exact_tree_planner_fails_closed_on_duplicate_move_candidates() {
+        let artifact_id = ArtifactId::new();
+        let entry = TreeEntry::blob(Hash256::from_bytes([0x66; 32]), false);
+        let previous = resolved_tree(vec![(
+            artifact_id,
+            RepoPath::from_utf8("old").unwrap(),
+            entry,
+        )]);
+        let observed = BTreeMap::from([
+            (RepoPath::from_utf8("copy-a").unwrap(), entry),
+            (RepoPath::from_utf8("copy-b").unwrap(), entry),
+        ]);
+
+        let error = kin_core::plan_observed_tree_deltas(&previous, observed)
+            .expect_err("ambiguous move identity must never be guessed");
+        assert!(error.to_string().contains("ambiguous repository identity"));
     }
 
     fn make_entity(name: &str, file_path: &str, ast_hash: [u8; 32]) -> kin_model::entity::Entity {
+        make_entity_with_id(EntityId::new(), name, file_path, LanguageId::Rust, ast_hash)
+    }
+
+    fn make_entity_with_id(
+        id: EntityId,
+        name: &str,
+        file_path: &str,
+        language: LanguageId,
+        ast_hash: [u8; 32],
+    ) -> kin_model::entity::Entity {
         kin_model::entity::Entity {
-            id: kin_model::EntityId::new(),
+            id,
             kind: EntityKind::Function,
             name: name.to_string(),
-            language: LanguageId::Rust,
+            language,
             fingerprint: SemanticFingerprint {
                 algorithm: FingerprintAlgorithm::V1TreeSitter,
                 ast_hash: Hash256::from_bytes(ast_hash),
@@ -386,37 +702,349 @@ mod tests {
         }
     }
 
-    /// Record a SemanticChange in the graph and advance the branch head.
+    fn relation(
+        id: RelationId,
+        src: GraphNodeId,
+        dst: GraphNodeId,
+        kind: RelationKind,
+    ) -> Relation {
+        Relation {
+            id,
+            kind,
+            src,
+            dst,
+            confidence: 1.0,
+            origin: RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn selected_checkout_remaps_entity_artifact_and_relation_collisions() {
+        let selected = RepoPath::from_utf8("selected").unwrap();
+        let shared_entity_id = EntityId::new();
+        let current_selected_id = EntityId::new();
+        let python_id = EntityId::new();
+        let shared_artifact_id = ArtifactId::new();
+        let current_selected_artifact_id = ArtifactId::new();
+        let python_artifact_id = ArtifactId::new();
+        let remapped_artifact_id = ArtifactId::new();
+        let relation_id = RelationId::new();
+        let retained = make_entity_with_id(
+            shared_entity_id,
+            "retained",
+            "outside.rs",
+            LanguageId::Rust,
+            [0x11; 32],
+        );
+        let current_selected = make_entity_with_id(
+            current_selected_id,
+            "old",
+            "selected/old.rs",
+            LanguageId::Rust,
+            [0x12; 32],
+        );
+        let target_rust = make_entity_with_id(
+            shared_entity_id,
+            "replacement",
+            "selected/new.rs",
+            LanguageId::Rust,
+            [0x13; 32],
+        );
+        let target_python = make_entity_with_id(
+            python_id,
+            "helper",
+            "selected/tool.py",
+            LanguageId::Python,
+            [0x14; 32],
+        );
+        let retained_relation = relation(
+            relation_id,
+            GraphNodeId::Entity(shared_entity_id),
+            GraphNodeId::Entity(shared_entity_id),
+            RelationKind::DependsOn,
+        );
+        let target_relation = relation(
+            relation_id,
+            GraphNodeId::Entity(shared_entity_id),
+            GraphNodeId::Entity(python_id),
+            RelationKind::Calls,
+        );
+        let outside_entry = TreeEntry::blob(Hash256::from_bytes([0x21; 32]), false);
+        let old_entry = TreeEntry::blob(Hash256::from_bytes([0x22; 32]), false);
+        let rust_entry = TreeEntry::blob(Hash256::from_bytes([0x23; 32]), false);
+        let python_entry = TreeEntry::blob(Hash256::from_bytes([0x24; 32]), false);
+        let current_tree = resolved_tree(vec![
+            (
+                shared_artifact_id,
+                RepoPath::from_utf8("outside.rs").unwrap(),
+                outside_entry,
+            ),
+            (
+                current_selected_artifact_id,
+                RepoPath::from_utf8("selected/old.rs").unwrap(),
+                old_entry,
+            ),
+        ]);
+        let target_tree = resolved_tree(vec![
+            (
+                shared_artifact_id,
+                RepoPath::from_utf8("selected/new.rs").unwrap(),
+                rust_entry,
+            ),
+            (
+                python_artifact_id,
+                RepoPath::from_utf8("selected/tool.py").unwrap(),
+                python_entry,
+            ),
+        ]);
+        let desired_tree = resolved_tree(vec![
+            (
+                shared_artifact_id,
+                RepoPath::from_utf8("outside.rs").unwrap(),
+                outside_entry,
+            ),
+            (
+                remapped_artifact_id,
+                RepoPath::from_utf8("selected/new.rs").unwrap(),
+                rust_entry,
+            ),
+            (
+                python_artifact_id,
+                RepoPath::from_utf8("selected/tool.py").unwrap(),
+                python_entry,
+            ),
+        ]);
+        let graph = InMemoryGraph::new();
+        graph
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: vec![
+                    EntityDelta::Added {
+                        new: retained.clone(),
+                    },
+                    EntityDelta::Added {
+                        new: current_selected,
+                    },
+                ],
+                relation_deltas: vec![RelationDelta::Added {
+                    new: retained_relation.clone(),
+                }],
+                tree_deltas: kin_core::exact_tree_correction(
+                    &ResolvedTree::default(),
+                    &current_tree,
+                )
+                .unwrap(),
+                admission_policy_delta: None,
+            })
+            .unwrap();
+        let target = ResolvedGraphState {
+            entities: HashMap::from([
+                (target_rust.id, target_rust),
+                (target_python.id, target_python.clone()),
+            ]),
+            relations: HashMap::from([(target_relation.id, target_relation)]),
+            entity_revisions: Default::default(),
+            tree: target_tree,
+            entity_tombstones: Default::default(),
+            relation_tombstones: Default::default(),
+        };
+
+        let delta = compute_selected_checkout_delta(
+            &graph,
+            &selected,
+            &target,
+            &current_tree,
+            &desired_tree,
+        )
+        .unwrap();
+        graph.apply_transaction_delta(&delta).unwrap();
+        let installed = graph.to_snapshot();
+        assert_eq!(installed.resolved_tree, desired_tree);
+        assert_eq!(
+            installed.entities.get(&shared_entity_id),
+            Some(&retained),
+            "the retained entity keeps its original identity"
+        );
+        let copied = installed
+            .entities
+            .values()
+            .find(|entity| entity.name == "replacement")
+            .unwrap();
+        assert_ne!(copied.id, shared_entity_id);
+        assert_eq!(installed.entities.get(&python_id), Some(&target_python));
+        assert_eq!(
+            installed.relations.get(&relation_id),
+            Some(&retained_relation),
+            "the retained edge keeps its original identity"
+        );
+        let copied_relation = installed
+            .relations
+            .values()
+            .find(|candidate| candidate.kind == RelationKind::Calls)
+            .unwrap();
+        assert_ne!(copied_relation.id, relation_id);
+        assert_eq!(copied_relation.src, GraphNodeId::Entity(copied.id));
+        assert_eq!(copied_relation.dst, GraphNodeId::Entity(python_id));
+    }
+
+    #[test]
+    fn selected_checkout_omits_stale_cross_boundary_relation_without_losing_semantics() {
+        let selected = RepoPath::from_utf8("src").unwrap();
+        let selected_id = EntityId::new();
+        let absent_outside_id = EntityId::new();
+        let artifact_id = ArtifactId::new();
+        let entry = TreeEntry::blob(Hash256::from_bytes([0x31; 32]), false);
+        let tree = resolved_tree(vec![(
+            artifact_id,
+            RepoPath::from_utf8("src/lib.rs").unwrap(),
+            entry,
+        )]);
+        let target_entity = make_entity_with_id(
+            selected_id,
+            "selected",
+            "src/lib.rs",
+            LanguageId::Rust,
+            [0x32; 32],
+        );
+        let stale = relation(
+            RelationId::new(),
+            GraphNodeId::Entity(selected_id),
+            GraphNodeId::Entity(absent_outside_id),
+            RelationKind::Calls,
+        );
+        let graph = InMemoryGraph::new();
+        graph
+            .apply_transaction_delta(&TransactionDelta {
+                tree_deltas: kin_core::exact_tree_correction(&ResolvedTree::default(), &tree)
+                    .unwrap(),
+                ..TransactionDelta::default()
+            })
+            .unwrap();
+        let target = ResolvedGraphState {
+            entities: HashMap::from([(selected_id, target_entity.clone())]),
+            relations: HashMap::from([(stale.id, stale)]),
+            entity_revisions: Default::default(),
+            tree: tree.clone(),
+            entity_tombstones: Default::default(),
+            relation_tombstones: Default::default(),
+        };
+
+        let delta =
+            compute_selected_checkout_delta(&graph, &selected, &target, &tree, &tree).unwrap();
+        assert!(delta.tree_deltas.is_empty());
+        assert_eq!(delta.entity_deltas.len(), 1);
+        assert!(delta.relation_deltas.is_empty());
+        graph.apply_transaction_delta(&delta).unwrap();
+        assert_eq!(graph.get_entity(&selected_id).unwrap(), Some(target_entity));
+        assert!(graph.to_snapshot().relations.is_empty());
+    }
+
+    fn genesis_change() -> kin_model::SemanticChange {
+        let mut change = kin_model::SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+            origin: kin_model::ChangeOrigin::Native,
+            parents: vec![],
+            author: AuthorId::new("test"),
+            message: "test genesis".to_string(),
+            timestamp: Timestamp::now(),
+            entity_deltas: vec![],
+            relation_deltas: vec![],
+            tree_deltas: vec![],
+            admission_policy_delta: None,
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+        };
+        change.id = kin_core::compute_semantic_change_id(&change).unwrap();
+        change
+    }
+
+    /// Record a SemanticChange in the graph.
     fn record_commit(
         graph: &InMemoryGraph,
         entity_deltas: Vec<EntityDelta>,
         relation_deltas: Vec<RelationDelta>,
-        artifact_deltas: Vec<ArtifactDelta>,
+        tree_deltas: Vec<TreeDelta>,
         parent: &SemanticChangeId,
-        branch: &str,
+        _branch: &str,
     ) -> SemanticChangeId {
         let mut change = kin_model::SemanticChange {
             id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+            origin: kin_model::ChangeOrigin::Native,
             parents: vec![*parent],
             author: AuthorId::new("test".to_string()),
             message: "test commit".to_string(),
             timestamp: Timestamp::now(),
             entity_deltas,
             relation_deltas,
-            artifact_deltas,
+            tree_deltas,
+            admission_policy_delta: None,
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],
             risk_summary: None,
-            authored_on: None,
         };
         change.id = kin_core::compute_semantic_change_id(&change).unwrap();
         let change_id = change.id;
         graph.create_change(&change).expect("create_change");
+        let desired = graph
+            .resolve_tree_at(&change_id)
+            .expect("resolve committed tree");
+        let correction = kin_core::exact_tree_correction(&graph.resolved_tree(), &desired)
+            .expect("align live tree with committed test head");
         graph
-            .update_branch_head(&kin_model::BranchName::new(branch), &change_id)
-            .expect("update_branch_head");
+            .apply_transaction_delta(&kin_model::TransactionDelta {
+                entity_deltas: Vec::new(),
+                relation_deltas: Vec::new(),
+                tree_deltas: correction,
+                admission_policy_delta: None,
+            })
+            .expect("publish committed tree as live test authority");
         change_id
+    }
+
+    /// Simulate the serialized exact-tree admission that production performs
+    /// before commit-delta construction.
+    fn admit_working_tree(
+        graph: &InMemoryGraph,
+        blobs: &BlobStore,
+        layout: &kin_core::KinLayout,
+    ) -> Result<()> {
+        let previous = graph.resolved_tree();
+        let tracked_paths = previous
+            .artifacts_by_path()
+            .map(|artifact| artifact.path.clone())
+            .collect::<Vec<_>>();
+        let mut graph_only_paths = Vec::new();
+        for artifact in previous.artifacts_by_path() {
+            if kin_core::source_projection_disposition(&artifact.path, artifact.entry)?
+                != kin_core::SourceProjectionDisposition::Materialized
+            {
+                graph_only_paths.push(artifact.path.clone());
+            }
+        }
+        let source = layout.working_dir();
+        let ignore =
+            kin_index::RepositoryIgnore::load(&source).map_err(kin_index::IndexError::from)?;
+        let scan = kin_index::scan_repository_preserving_graph_only(
+            &source,
+            &ignore,
+            tracked_paths.iter(),
+            graph_only_paths.iter(),
+        )
+        .map_err(kin_index::IndexError::from)?;
+        let observed = observed_tree_from_complete_scan(blobs, &scan, &previous)?;
+        let tree_deltas = kin_core::plan_observed_tree_deltas(&previous, observed)?;
+        graph.apply_transaction_delta(&kin_model::TransactionDelta {
+            entity_deltas: Vec::new(),
+            relation_deltas: Vec::new(),
+            tree_deltas,
+            admission_policy_delta: None,
+        })?;
+        Ok(())
     }
 
     // ── Entity delta tests ───────────────────────────────────────────────
@@ -426,28 +1054,17 @@ mod tests {
     /// exactly one Added delta for that entity.
     #[test]
     fn entity_added_since_genesis_appears_in_deltas() {
-        let tmp = tempfile::tempdir().unwrap();
-        let init = kin_core::init(tmp.path()).unwrap();
-        let layout = init.layout;
         let graph = Arc::new(kin_db::InMemoryGraph::new());
-        let blobs = BlobStore::new(layout.objects_dir()).unwrap();
 
-        // Bootstrap genesis + branch so get_changes_since works.
-        let genesis = kin_core::build_genesis_change();
+        let genesis = genesis_change();
         graph.create_change(&genesis).unwrap();
-        graph
-            .create_branch(&kin_model::Branch {
-                name: kin_model::BranchName::new("main"),
-                head: genesis.id,
-            })
-            .unwrap();
 
         // Simulate reconcile: entity upserted into primary graph (overlay cleared).
         let entity = make_entity("my_fn", "src/lib.rs", [1; 32]);
         graph.upsert_entity(&entity).unwrap();
 
-        // No files on disk; artifact deltas will be empty.
-        let deltas = compute_deltas_vs_last_commit(&graph, &blobs, &layout, &genesis.id).unwrap();
+        // No files on disk; tree deltas will be empty.
+        let deltas = compute_deltas_vs_last_commit(&graph, &genesis.id).unwrap();
 
         assert_eq!(
             deltas.entity_deltas.len(),
@@ -455,7 +1072,10 @@ mod tests {
             "expected one entity Added delta"
         );
         assert!(
-            matches!(&deltas.entity_deltas[0], EntityDelta::Added(e) if e.id == entity.id),
+            matches!(
+                &deltas.entity_deltas[0],
+                EntityDelta::Added { new } if new.id == entity.id
+            ),
             "delta must be Added for the new entity"
         );
         assert!(deltas.relation_deltas.is_empty());
@@ -465,20 +1085,10 @@ mod tests {
     /// against the new head produces zero entity deltas (idempotent).
     #[test]
     fn no_deltas_after_commit_records_current_entity() {
-        let tmp = tempfile::tempdir().unwrap();
-        let init = kin_core::init(tmp.path()).unwrap();
-        let layout = init.layout;
         let graph = Arc::new(kin_db::InMemoryGraph::new());
-        let blobs = BlobStore::new(layout.objects_dir()).unwrap();
 
-        let genesis = kin_core::build_genesis_change();
+        let genesis = genesis_change();
         graph.create_change(&genesis).unwrap();
-        graph
-            .create_branch(&kin_model::Branch {
-                name: kin_model::BranchName::new("main"),
-                head: genesis.id,
-            })
-            .unwrap();
 
         let entity = make_entity("stable_fn", "src/lib.rs", [42; 32]);
         graph.upsert_entity(&entity).unwrap();
@@ -486,7 +1096,9 @@ mod tests {
         // Record a commit that contains this entity.
         let head = record_commit(
             &graph,
-            vec![EntityDelta::Added(entity.clone())],
+            vec![EntityDelta::Added {
+                new: entity.clone(),
+            }],
             vec![],
             vec![],
             &genesis.id,
@@ -494,40 +1106,32 @@ mod tests {
         );
 
         // Now compute deltas against the new head: entity is committed, nothing changed.
-        let deltas = compute_deltas_vs_last_commit(&graph, &blobs, &layout, &head).unwrap();
+        let deltas = compute_deltas_vs_last_commit(&graph, &head).unwrap();
 
         assert!(
             deltas.entity_deltas.is_empty(),
             "no entity changes since the commit — deltas must be empty"
         );
-        assert!(deltas.artifact_deltas.is_empty());
+        assert!(deltas.tree_deltas.is_empty());
     }
 
     /// A fingerprint change on an existing committed entity produces a Modified
     /// delta with the correct old (from DAG) and new (from graph) entity.
     #[test]
     fn modified_entity_fingerprint_produces_modified_delta() {
-        let tmp = tempfile::tempdir().unwrap();
-        let init = kin_core::init(tmp.path()).unwrap();
-        let layout = init.layout;
         let graph = Arc::new(kin_db::InMemoryGraph::new());
-        let blobs = BlobStore::new(layout.objects_dir()).unwrap();
 
-        let genesis = kin_core::build_genesis_change();
+        let genesis = genesis_change();
         graph.create_change(&genesis).unwrap();
-        graph
-            .create_branch(&kin_model::Branch {
-                name: kin_model::BranchName::new("main"),
-                head: genesis.id,
-            })
-            .unwrap();
 
         // Commit the entity with hash [1;32].
         let old_entity = make_entity("changing_fn", "src/lib.rs", [1; 32]);
         graph.upsert_entity(&old_entity).unwrap();
         let head = record_commit(
             &graph,
-            vec![EntityDelta::Added(old_entity.clone())],
+            vec![EntityDelta::Added {
+                new: old_entity.clone(),
+            }],
             vec![],
             vec![],
             &genesis.id,
@@ -539,7 +1143,7 @@ mod tests {
         new_entity.fingerprint.ast_hash = Hash256::from_bytes([2; 32]);
         graph.upsert_entity(&new_entity).unwrap();
 
-        let deltas = compute_deltas_vs_last_commit(&graph, &blobs, &layout, &head).unwrap();
+        let deltas = compute_deltas_vs_last_commit(&graph, &head).unwrap();
 
         assert_eq!(deltas.entity_deltas.len(), 1);
         match &deltas.entity_deltas[0] {
@@ -554,26 +1158,18 @@ mod tests {
     /// Removing an entity from the graph after it was committed produces a Removed delta.
     #[test]
     fn removed_entity_produces_removed_delta() {
-        let tmp = tempfile::tempdir().unwrap();
-        let init = kin_core::init(tmp.path()).unwrap();
-        let layout = init.layout;
         let graph = Arc::new(kin_db::InMemoryGraph::new());
-        let blobs = BlobStore::new(layout.objects_dir()).unwrap();
 
-        let genesis = kin_core::build_genesis_change();
+        let genesis = genesis_change();
         graph.create_change(&genesis).unwrap();
-        graph
-            .create_branch(&kin_model::Branch {
-                name: kin_model::BranchName::new("main"),
-                head: genesis.id,
-            })
-            .unwrap();
 
         let entity = make_entity("doomed_fn", "src/lib.rs", [7; 32]);
         graph.upsert_entity(&entity).unwrap();
         let head = record_commit(
             &graph,
-            vec![EntityDelta::Added(entity.clone())],
+            vec![EntityDelta::Added {
+                new: entity.clone(),
+            }],
             vec![],
             vec![],
             &genesis.id,
@@ -583,90 +1179,115 @@ mod tests {
         // Simulate reconcile removing the entity from the primary graph.
         graph.remove_entity(&entity.id).unwrap();
 
-        let deltas = compute_deltas_vs_last_commit(&graph, &blobs, &layout, &head).unwrap();
+        let deltas = compute_deltas_vs_last_commit(&graph, &head).unwrap();
 
         assert_eq!(deltas.entity_deltas.len(), 1);
         assert!(
-            matches!(&deltas.entity_deltas[0], EntityDelta::Removed(id) if *id == entity.id),
+            matches!(
+                &deltas.entity_deltas[0],
+                EntityDelta::Removed { old } if old.id == entity.id
+            ),
             "expected Removed delta for the deleted entity"
         );
     }
 
-    // ── Artifact delta tests ─────────────────────────────────────────────
+    // ── Exact tree delta tests ───────────────────────────────────────────
 
     /// A new file on disk that was not in the last commit appears as Added.
     #[test]
-    fn new_file_on_disk_appears_as_added_artifact_delta() {
+    fn new_file_on_disk_appears_as_added_tree_delta() {
         let tmp = tempfile::tempdir().unwrap();
         let init = kin_core::init(tmp.path()).unwrap();
         let layout = init.layout;
         let graph = Arc::new(kin_db::InMemoryGraph::new());
-        let blobs = BlobStore::new(layout.objects_dir()).unwrap();
+        let blobs = BlobStore::new(layout.ingest_cas_dir()).unwrap();
 
-        let genesis = kin_core::build_genesis_change();
+        let genesis = genesis_change();
         graph.create_change(&genesis).unwrap();
-        graph
-            .create_branch(&kin_model::Branch {
-                name: kin_model::BranchName::new("main"),
-                head: genesis.id,
-            })
-            .unwrap();
 
         // Write a file to the working directory.
-        let src_dir = kin_core::source_dir(&layout);
+        let src_dir = layout.working_dir();
         std::fs::create_dir_all(src_dir.join("src")).unwrap();
         std::fs::write(src_dir.join("src/new.rs"), b"pub fn new_fn() {}\n").unwrap();
 
-        let deltas = compute_deltas_vs_last_commit(&graph, &blobs, &layout, &genesis.id).unwrap();
+        admit_working_tree(&graph, &blobs, &layout).unwrap();
+        let live_tree = graph.resolved_tree();
+        let live_artifact = live_tree
+            .artifact_at_path(&RepoPath::from_utf8("src/new.rs").unwrap())
+            .unwrap();
+        let deltas = compute_deltas_vs_last_commit(&graph, &genesis.id).unwrap();
 
+        assert_eq!(deltas.expected_tree, live_tree);
         assert!(
-            !deltas.artifact_deltas.is_empty(),
-            "new file must produce artifact delta"
+            !deltas.tree_deltas.is_empty(),
+            "new file must produce a tree delta"
         );
         let added = deltas
-            .artifact_deltas
+            .tree_deltas
             .iter()
-            .filter(|d| d.kind == ArtifactDeltaKind::AddedRegularFile)
+            .filter_map(|delta| match delta {
+                TreeDelta::Added {
+                    new:
+                        LocatedEntry {
+                            entry:
+                                TreeEntry::Blob {
+                                    executable: false, ..
+                                },
+                            ..
+                        },
+                    ..
+                } => Some(()),
+                _ => None,
+            })
             .count();
-        assert!(added >= 1, "at least one Added artifact delta expected");
+        assert!(added >= 1, "at least one Added tree delta expected");
+        assert!(deltas.tree_deltas.iter().any(|delta| {
+            matches!(
+                delta,
+                TreeDelta::Added { artifact_id, new }
+                    if *artifact_id == live_artifact.artifact_id
+                        && new.path == live_artifact.path
+            )
+        }));
+        assert_eq!(
+            graph
+                .resolve_tree_at(&genesis.id)
+                .unwrap()
+                .apply(&deltas.tree_deltas)
+                .unwrap(),
+            live_tree
+        );
     }
 
     /// A file whose content changed since the last commit appears as Modified.
     #[test]
-    fn changed_file_appears_as_modified_artifact_delta() {
+    fn changed_file_appears_as_modified_tree_delta() {
         let tmp = tempfile::tempdir().unwrap();
         let init = kin_core::init(tmp.path()).unwrap();
         let layout = init.layout;
         let graph = Arc::new(kin_db::InMemoryGraph::new());
-        let blobs = BlobStore::new(layout.objects_dir()).unwrap();
+        let blobs = BlobStore::new(layout.ingest_cas_dir()).unwrap();
 
-        let genesis = kin_core::build_genesis_change();
+        let genesis = genesis_change();
         graph.create_change(&genesis).unwrap();
-        graph
-            .create_branch(&kin_model::Branch {
-                name: kin_model::BranchName::new("main"),
-                head: genesis.id,
-            })
-            .unwrap();
 
         // Simulate a prior commit that recorded the file with old content.
-        let src_dir = kin_core::source_dir(&layout);
+        let src_dir = layout.working_dir();
         std::fs::create_dir_all(src_dir.join("src")).unwrap();
         let old_content = b"pub fn old() {}\n";
         std::fs::write(src_dir.join("src/lib.rs"), old_content).unwrap();
         let old_digest = blobs.write(old_content).unwrap();
         let old_hash = Hash256::from_bytes(old_digest.0);
-        let file_id = FilePathId::new("src/lib.rs");
+        let path = RepoPath::from_utf8("src/lib.rs").unwrap();
+        let artifact_id = ArtifactId::new();
 
         let head = record_commit(
             &graph,
             vec![],
             vec![],
-            vec![ArtifactDelta {
-                file_id: file_id.clone(),
-                kind: ArtifactDeltaKind::AddedRegularFile,
-                old_hash: None,
-                new_hash: Some(old_hash),
+            vec![TreeDelta::Added {
+                artifact_id,
+                new: LocatedEntry::new(path.clone(), TreeEntry::blob(old_hash, false)),
             }],
             &genesis.id,
             "main",
@@ -675,95 +1296,162 @@ mod tests {
         // Change the file on disk.
         std::fs::write(src_dir.join("src/lib.rs"), b"pub fn new() {}\n").unwrap();
 
-        let deltas = compute_deltas_vs_last_commit(&graph, &blobs, &layout, &head).unwrap();
+        admit_working_tree(&graph, &blobs, &layout).unwrap();
+        let deltas = compute_deltas_vs_last_commit(&graph, &head).unwrap();
 
-        let modified: Vec<_> = deltas
-            .artifact_deltas
+        let (old_entry, new_entry) = deltas
+            .tree_deltas
             .iter()
-            .filter(|d| d.kind == ArtifactDeltaKind::ModifiedRegularFile && d.file_id == file_id)
-            .collect();
-        assert!(
-            !modified.is_empty(),
-            "changed file must produce a Modified artifact delta"
+            .find_map(|delta| match delta {
+                TreeDelta::Updated {
+                    artifact_id: delta_artifact_id,
+                    old,
+                    new,
+                } if *delta_artifact_id == artifact_id && new.path == path => {
+                    Some((&old.entry, &new.entry))
+                }
+                _ => None,
+            })
+            .expect("changed file must produce an Updated tree delta");
+        assert_eq!(*old_entry, TreeEntry::blob(old_hash, false));
+        assert_ne!(new_entry.blob_identity(), Some(old_hash));
+        assert!(matches!(
+            new_entry,
+            TreeEntry::Blob {
+                executable: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn commit_preserves_live_identity_after_admitted_move_then_edit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let init = kin_core::init(tmp.path()).unwrap();
+        let layout = init.layout;
+        let graph = Arc::new(kin_db::InMemoryGraph::new());
+        let blobs = BlobStore::new(layout.ingest_cas_dir()).unwrap();
+        let genesis = genesis_change();
+        graph.create_change(&genesis).unwrap();
+
+        let source = layout.working_dir();
+        std::fs::create_dir_all(source.join("src")).unwrap();
+        let old_path = RepoPath::from_utf8("src/old.rs").unwrap();
+        let new_path = RepoPath::from_utf8("src/new.rs").unwrap();
+        let old_bytes = b"pub fn value() -> u8 { 1 }\n";
+        let old_hash = Hash256::from_bytes(blobs.write(old_bytes).unwrap().0);
+        let artifact_id = ArtifactId::new();
+        std::fs::write(source.join("src/old.rs"), old_bytes).unwrap();
+        let head = record_commit(
+            &graph,
+            vec![],
+            vec![],
+            vec![TreeDelta::Added {
+                artifact_id,
+                new: LocatedEntry::new(old_path.clone(), TreeEntry::blob(old_hash, false)),
+            }],
+            &genesis.id,
+            "main",
         );
+
+        std::fs::rename(source.join("src/old.rs"), source.join("src/new.rs")).unwrap();
+        admit_working_tree(&graph, &blobs, &layout).unwrap();
         assert_eq!(
-            modified[0].old_hash,
-            Some(old_hash),
-            "old hash must be the previously committed hash"
+            graph
+                .resolved_tree()
+                .artifact_at_path(&new_path)
+                .unwrap()
+                .artifact_id,
+            artifact_id
+        );
+
+        std::fs::write(source.join("src/new.rs"), b"pub fn value() -> u8 { 2 }\n").unwrap();
+        admit_working_tree(&graph, &blobs, &layout).unwrap();
+        let live_tree = graph.resolved_tree();
+        let deltas = compute_deltas_vs_last_commit(&graph, &head).unwrap();
+
+        assert_eq!(deltas.expected_tree, live_tree);
+        assert_eq!(deltas.tree_deltas.len(), 1);
+        assert!(matches!(
+            &deltas.tree_deltas[0],
+            TreeDelta::Updated {
+                artifact_id: id,
+                old,
+                new,
+            } if *id == artifact_id && old.path == old_path && new.path == new_path
+        ));
+        assert_eq!(
+            graph
+                .resolve_tree_at(&head)
+                .unwrap()
+                .apply(&deltas.tree_deltas)
+                .unwrap(),
+            live_tree
         );
     }
 
     /// A file that was committed but no longer exists on disk appears as Removed.
     #[test]
-    fn deleted_file_appears_as_removed_artifact_delta() {
+    fn deleted_file_appears_as_removed_tree_delta() {
         let tmp = tempfile::tempdir().unwrap();
         let init = kin_core::init(tmp.path()).unwrap();
         let layout = init.layout;
         let graph = Arc::new(kin_db::InMemoryGraph::new());
-        let blobs = BlobStore::new(layout.objects_dir()).unwrap();
+        let blobs = BlobStore::new(layout.ingest_cas_dir()).unwrap();
 
-        let genesis = kin_core::build_genesis_change();
+        let genesis = genesis_change();
         graph.create_change(&genesis).unwrap();
-        graph
-            .create_branch(&kin_model::Branch {
-                name: kin_model::BranchName::new("main"),
-                head: genesis.id,
-            })
-            .unwrap();
 
         let content = b"pub fn gone() {}\n";
         let digest = blobs.write(content).unwrap();
         let committed_hash = Hash256::from_bytes(digest.0);
-        let file_id = FilePathId::new("src/deleted.rs");
+        let path = RepoPath::from_utf8("src/deleted.rs").unwrap();
+        let artifact_id = ArtifactId::new();
 
         let head = record_commit(
             &graph,
             vec![],
             vec![],
-            vec![ArtifactDelta {
-                file_id: file_id.clone(),
-                kind: ArtifactDeltaKind::AddedRegularFile,
-                old_hash: None,
-                new_hash: Some(committed_hash),
+            vec![TreeDelta::Added {
+                artifact_id,
+                new: LocatedEntry::new(path.clone(), TreeEntry::blob(committed_hash, false)),
             }],
             &genesis.id,
             "main",
         );
 
         // File is NOT present on disk — simulate deletion.
-        let deltas = compute_deltas_vs_last_commit(&graph, &blobs, &layout, &head).unwrap();
+        admit_working_tree(&graph, &blobs, &layout).unwrap();
+        let deltas = compute_deltas_vs_last_commit(&graph, &head).unwrap();
 
-        let removed: Vec<_> = deltas
-            .artifact_deltas
+        let old_entry = deltas
+            .tree_deltas
             .iter()
-            .filter(|d| d.kind == ArtifactDeltaKind::Removed && d.file_id == file_id)
-            .collect();
-        assert!(
-            !removed.is_empty(),
-            "deleted file must produce a Removed artifact delta"
-        );
+            .find_map(|delta| match delta {
+                TreeDelta::Removed {
+                    artifact_id: delta_artifact_id,
+                    old,
+                } if *delta_artifact_id == artifact_id && old.path == path => Some(&old.entry),
+                _ => None,
+            })
+            .expect("deleted file must produce a Removed tree delta");
+        assert_eq!(*old_entry, TreeEntry::blob(committed_hash, false));
     }
 
     #[cfg(unix)]
     #[test]
-    fn artifact_deltas_preserve_modes_symlinks_and_mode_only_changes() {
+    fn tree_deltas_preserve_modes_symlinks_and_mode_only_changes() {
         use std::os::unix::fs::{symlink, PermissionsExt};
 
         let tmp = tempfile::tempdir().unwrap();
         let init = kin_core::init(tmp.path()).unwrap();
         let layout = init.layout;
         let graph = Arc::new(kin_db::InMemoryGraph::new());
-        let blobs = BlobStore::new(layout.objects_dir()).unwrap();
-        let genesis = kin_core::build_genesis_change();
+        let blobs = BlobStore::new(layout.ingest_cas_dir()).unwrap();
+        let genesis = genesis_change();
         graph.create_change(&genesis).unwrap();
-        graph
-            .create_branch(&kin_model::Branch {
-                name: kin_model::BranchName::new("main"),
-                head: genesis.id,
-            })
-            .unwrap();
 
-        let source = kin_core::source_dir(&layout);
+        let source = layout.working_dir();
         std::fs::create_dir_all(source.join("bin")).unwrap();
         let regular = source.join("plain.txt");
         let executable = source.join("bin/run");
@@ -774,29 +1462,51 @@ mod tests {
         std::fs::set_permissions(&executable, permissions).unwrap();
         symlink("plain.txt", source.join("current")).unwrap();
 
-        let initial = compute_deltas_vs_last_commit(&graph, &blobs, &layout, &genesis.id).unwrap();
-        let kinds: std::collections::BTreeMap<_, _> = initial
-            .artifact_deltas
+        admit_working_tree(&graph, &blobs, &layout).unwrap();
+        let initial = compute_deltas_vs_last_commit(&graph, &genesis.id).unwrap();
+        let entries: std::collections::BTreeMap<_, _> = initial
+            .tree_deltas
             .iter()
-            .map(|delta| (delta.file_id.0.as_str(), delta.kind))
+            .filter_map(|delta| match delta {
+                TreeDelta::Added { new, .. } => {
+                    Some((new.path.as_utf8().expect("UTF-8 fixture path"), new.entry))
+                }
+                _ => None,
+            })
             .collect();
         assert_eq!(
-            kinds.get("plain.txt"),
-            Some(&ArtifactDeltaKind::AddedRegularFile)
+            entries.get("plain.txt"),
+            Some(&TreeEntry::blob(
+                Hash256::from_bytes(blobs.write(b"plain\n").unwrap().0),
+                false
+            ))
         );
-        assert_eq!(
-            kinds.get("bin/run"),
-            Some(&ArtifactDeltaKind::AddedExecutableFile)
-        );
-        assert_eq!(kinds.get("current"), Some(&ArtifactDeltaKind::AddedSymlink));
+        assert!(matches!(
+            entries.get("bin/run"),
+            Some(TreeEntry::Blob {
+                executable: true,
+                ..
+            })
+        ));
+        assert!(matches!(
+            entries.get("current"),
+            Some(TreeEntry::Symlink { .. })
+        ));
         let link = initial
-            .artifact_deltas
+            .tree_deltas
             .iter()
-            .find(|delta| delta.file_id.0 == "current")
+            .find_map(|delta| match delta {
+                TreeDelta::Added { new, .. } if new.path.as_utf8() == Some("current") => {
+                    Some(new.entry)
+                }
+                _ => None,
+            })
             .unwrap();
         assert_eq!(
             blobs
-                .read(&kin_blobs::Hash256(link.new_hash.unwrap().0))
+                .read(&kin_blobs::Hash256(
+                    link.blob_identity().expect("symlink blob").0
+                ))
                 .unwrap(),
             b"plain.txt"
         );
@@ -805,7 +1515,7 @@ mod tests {
             &graph,
             vec![],
             vec![],
-            initial.artifact_deltas,
+            initial.tree_deltas,
             &genesis.id,
             "main",
         );
@@ -814,66 +1524,207 @@ mod tests {
         permissions.set_mode(0o755);
         std::fs::set_permissions(&regular, permissions).unwrap();
 
-        let mode_only = compute_deltas_vs_last_commit(&graph, &blobs, &layout, &head).unwrap();
-        assert_eq!(mode_only.artifact_deltas.len(), 1);
+        admit_working_tree(&graph, &blobs, &layout).unwrap();
+        let mode_only = compute_deltas_vs_last_commit(&graph, &head).unwrap();
+        assert_eq!(mode_only.tree_deltas.len(), 1);
+        let TreeDelta::Updated {
+            artifact_id: _,
+            old,
+            new,
+        } = &mode_only.tree_deltas[0]
+        else {
+            panic!("mode-only change must be Updated");
+        };
+        assert_eq!(old.path.as_utf8(), Some("plain.txt"));
+        assert_eq!(new.path, old.path);
         assert_eq!(
-            mode_only.artifact_deltas[0].kind,
-            ArtifactDeltaKind::ModifiedExecutableFile
+            old.entry,
+            TreeEntry::blob(Hash256::from_bytes(plain_hash.0), false)
         );
-        assert_eq!(mode_only.artifact_deltas[0].file_id.0, "plain.txt");
         assert_eq!(
-            mode_only.artifact_deltas[0].old_hash,
-            Some(Hash256::from_bytes(plain_hash.0))
-        );
-        assert_eq!(
-            mode_only.artifact_deltas[0].old_hash,
-            mode_only.artifact_deltas[0].new_hash
+            new.entry,
+            TreeEntry::blob(Hash256::from_bytes(plain_hash.0), true)
         );
     }
 
     #[test]
-    fn unchanged_legacy_file_emits_exact_mode_backfill() {
+    fn commit_admits_mixed_codebase_membership_independent_of_language_support() {
         let tmp = tempfile::tempdir().unwrap();
         let init = kin_core::init(tmp.path()).unwrap();
         let layout = init.layout;
         let graph = Arc::new(kin_db::InMemoryGraph::new());
-        let blobs = BlobStore::new(layout.objects_dir()).unwrap();
-        let genesis = kin_core::build_genesis_change();
+        let blobs = BlobStore::new(layout.ingest_cas_dir()).unwrap();
+        let genesis = genesis_change();
         graph.create_change(&genesis).unwrap();
-        graph
-            .create_branch(&kin_model::Branch {
-                name: kin_model::BranchName::new("main"),
-                head: genesis.id,
-            })
-            .unwrap();
 
-        let source = kin_core::source_dir(&layout);
-        std::fs::create_dir_all(&source).unwrap();
-        let content = b"legacy bytes\n";
-        std::fs::write(source.join("legacy.txt"), content).unwrap();
-        let hash = Hash256::from_bytes(blobs.write(content).unwrap().0);
+        let source = layout.working_dir();
+        let files: &[(&str, &[u8])] = &[
+            ("Dockerfile", b"FROM scratch"),
+            ("compose.yaml", b"services: {}"),
+            ("Cargo.lock", b"version = 4"),
+            ("src/main.rs", b"fn main() {}"),
+            ("web/app.ts", b"export const app = true"),
+            ("tools/job.py", b"print('job')"),
+            ("unsupported/program.xyzzy", b"opaque source"),
+            ("assets/logo.bin", b"\x00\xff\x10"),
+            ("vendor/lib/source.c", b"int vendored(void) { return 1; }"),
+            ("generated/schema.pb", b"\x01\x02generated"),
+            ("node_modules/pkg/index.js", b"export default 1"),
+            ("target/debug/build.log", b"built"),
+        ];
+        for (relative, bytes) in files {
+            let path = source.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        }
+
+        admit_working_tree(&graph, &blobs, &layout).unwrap();
+        let deltas = compute_deltas_vs_last_commit(&graph, &genesis.id).unwrap();
+        let admitted = deltas
+            .tree_deltas
+            .iter()
+            .filter_map(|delta| match delta {
+                TreeDelta::Added { new, .. } => new.path.as_utf8(),
+                _ => None,
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        for (relative, _) in files {
+            assert!(
+                admitted.contains(*relative),
+                "missing exact member {relative}"
+            );
+        }
+    }
+
+    #[test]
+    fn commit_preserves_gitlink_without_expanding_materialized_checkout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let init = kin_core::init(tmp.path()).unwrap();
+        let layout = init.layout;
+        let graph = Arc::new(kin_db::InMemoryGraph::new());
+        let blobs = BlobStore::new(layout.ingest_cas_dir()).unwrap();
+        let genesis = genesis_change();
+        graph.create_change(&genesis).unwrap();
+        let gitlink = TreeEntry::gitlink(kin_model::GitObjectId::sha1([0x61; 20]));
         let head = record_commit(
             &graph,
             vec![],
             vec![],
-            vec![ArtifactDelta {
-                file_id: FilePathId::new("legacy.txt"),
-                kind: ArtifactDeltaKind::Added,
-                old_hash: None,
-                new_hash: Some(hash),
+            vec![TreeDelta::Added {
+                artifact_id: ArtifactId::new(),
+                new: LocatedEntry::new(RepoPath::from_utf8("submodule").unwrap(), gitlink),
+            }],
+            &genesis.id,
+            "main",
+        );
+        let checkout_file = layout.working_dir().join("submodule/src/lib.rs");
+        std::fs::create_dir_all(checkout_file.parent().unwrap()).unwrap();
+        std::fs::write(checkout_file, b"materialized checkout").unwrap();
+
+        admit_working_tree(&graph, &blobs, &layout).unwrap();
+        let deltas = compute_deltas_vs_last_commit(&graph, &head).unwrap();
+        assert!(
+            deltas.tree_deltas.is_empty(),
+            "host checkout cannot update, remove, or expand graph-owned Gitlink truth"
+        );
+    }
+
+    #[test]
+    fn commit_ignore_hides_only_untracked_paths_and_retains_tracked_updates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let init = kin_core::init(tmp.path()).unwrap();
+        let layout = init.layout;
+        let graph = Arc::new(kin_db::InMemoryGraph::new());
+        let blobs = BlobStore::new(layout.ingest_cas_dir()).unwrap();
+        let genesis = genesis_change();
+        graph.create_change(&genesis).unwrap();
+
+        let source = layout.working_dir();
+        std::fs::create_dir_all(source.join("target")).unwrap();
+        std::fs::create_dir_all(source.join("node_modules/pkg")).unwrap();
+        std::fs::write(source.join(".kinignore"), b"target/\nnode_modules/\n.env\n").unwrap();
+        std::fs::write(source.join("target/retained.bin"), b"new tracked bytes").unwrap();
+        std::fs::write(source.join("target/untracked.bin"), b"build output").unwrap();
+        std::fs::write(source.join("node_modules/pkg/index.js"), b"generated").unwrap();
+        std::fs::write(source.join(".env"), b"SECRET=never-admit").unwrap();
+
+        let old_hash = Hash256::from_bytes(blobs.write(b"old tracked bytes").unwrap().0);
+        let retained = RepoPath::from_utf8("target/retained.bin").unwrap();
+        let artifact_id = ArtifactId::new();
+        let head = record_commit(
+            &graph,
+            vec![],
+            vec![],
+            vec![TreeDelta::Added {
+                artifact_id,
+                new: LocatedEntry::new(retained.clone(), TreeEntry::blob(old_hash, false)),
             }],
             &genesis.id,
             "main",
         );
 
-        let backfill = compute_deltas_vs_last_commit(&graph, &blobs, &layout, &head).unwrap();
-        assert_eq!(backfill.artifact_deltas.len(), 1);
-        assert_eq!(
-            backfill.artifact_deltas[0].kind,
-            ArtifactDeltaKind::ModifiedRegularFile
+        admit_working_tree(&graph, &blobs, &layout).unwrap();
+        let deltas = compute_deltas_vs_last_commit(&graph, &head).unwrap();
+        assert!(deltas.tree_deltas.iter().any(|delta| {
+            matches!(
+                delta,
+                TreeDelta::Updated {
+                    artifact_id: id,
+                    new,
+                    ..
+                } if *id == artifact_id && new.path == retained
+            )
+        }));
+        for ignored in [".env", "target/untracked.bin", "node_modules/pkg/index.js"] {
+            assert!(
+                !deltas.tree_deltas.iter().any(|delta| {
+                    delta
+                        .new_state()
+                        .is_some_and(|entry| entry.path.as_utf8() == Some(ignored))
+                }),
+                "untracked ignored path entered commit truth: {ignored}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tracked_special_entry_blocks_commit_before_missing_paths_become_removals() {
+        use std::os::unix::net::UnixListener;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let init = kin_core::init(tmp.path()).unwrap();
+        let layout = init.layout;
+        let graph = Arc::new(kin_db::InMemoryGraph::new());
+        let blobs = BlobStore::new(layout.ingest_cas_dir()).unwrap();
+        let genesis = genesis_change();
+        graph.create_change(&genesis).unwrap();
+
+        let missing = RepoPath::from_utf8("missing.txt").unwrap();
+        let special = RepoPath::from_utf8("tracked.sock").unwrap();
+        let old_hash = Hash256::from_bytes(blobs.write(b"old").unwrap().0);
+        let _head = record_commit(
+            &graph,
+            vec![],
+            vec![],
+            vec![
+                TreeDelta::Added {
+                    artifact_id: ArtifactId::new(),
+                    new: LocatedEntry::new(missing, TreeEntry::blob(old_hash, false)),
+                },
+                TreeDelta::Added {
+                    artifact_id: ArtifactId::new(),
+                    new: LocatedEntry::new(special, TreeEntry::blob(old_hash, false)),
+                },
+            ],
+            &genesis.id,
+            "main",
         );
-        assert_eq!(backfill.artifact_deltas[0].old_hash, Some(hash));
-        assert_eq!(backfill.artifact_deltas[0].new_hash, Some(hash));
+        let _listener = UnixListener::bind(layout.working_dir().join("tracked.sock")).unwrap();
+
+        let error = admit_working_tree(&graph, &blobs, &layout)
+            .expect_err("an incomplete exact scan cannot authorize any inferred removal");
+        assert!(error.to_string().contains("tracked path changed"));
     }
 
     // ── End-to-end: zero deltas after recording current state ─────────────
@@ -888,25 +1739,19 @@ mod tests {
         let init = kin_core::init(tmp.path()).unwrap();
         let layout = init.layout;
         let graph = Arc::new(kin_db::InMemoryGraph::new());
-        let blobs = BlobStore::new(layout.objects_dir()).unwrap();
+        let blobs = BlobStore::new(layout.ingest_cas_dir()).unwrap();
 
-        let genesis = kin_core::build_genesis_change();
+        let genesis = genesis_change();
         graph.create_change(&genesis).unwrap();
-        graph
-            .create_branch(&kin_model::Branch {
-                name: kin_model::BranchName::new("main"),
-                head: genesis.id,
-            })
-            .unwrap();
 
         // Write a file and add an entity.
-        let src_dir = kin_core::source_dir(&layout);
+        let src_dir = layout.working_dir();
         std::fs::create_dir_all(src_dir.join("src")).unwrap();
         let content = b"pub fn stable() {}\n";
         std::fs::write(src_dir.join("src/lib.rs"), content).unwrap();
         let digest = blobs.write(content).unwrap();
         let hash = Hash256::from_bytes(digest.0);
-        let file_id = FilePathId::new("src/lib.rs");
+        let path = RepoPath::from_utf8("src/lib.rs").unwrap();
 
         let entity = make_entity("stable", "src/lib.rs", [99; 32]);
         graph.upsert_entity(&entity).unwrap();
@@ -914,20 +1759,20 @@ mod tests {
         // First commit: record the current state.
         let head1 = record_commit(
             &graph,
-            vec![EntityDelta::Added(entity.clone())],
+            vec![EntityDelta::Added {
+                new: entity.clone(),
+            }],
             vec![],
-            vec![ArtifactDelta {
-                file_id,
-                kind: ArtifactDeltaKind::AddedRegularFile,
-                old_hash: None,
-                new_hash: Some(hash),
+            vec![TreeDelta::Added {
+                artifact_id: ArtifactId::new(),
+                new: LocatedEntry::new(path, TreeEntry::blob(hash, false)),
             }],
             &genesis.id,
             "main",
         );
 
         // Second compute: nothing changed → all deltas empty.
-        let deltas = compute_deltas_vs_last_commit(&graph, &blobs, &layout, &head1).unwrap();
+        let deltas = compute_deltas_vs_last_commit(&graph, &head1).unwrap();
 
         assert!(
             deltas.entity_deltas.is_empty(),
@@ -935,9 +1780,9 @@ mod tests {
             deltas.entity_deltas.len()
         );
         assert!(
-            deltas.artifact_deltas.is_empty(),
+            deltas.tree_deltas.is_empty(),
             "no file changes: expected 0, got {}",
-            deltas.artifact_deltas.len()
+            deltas.tree_deltas.len()
         );
         assert!(
             deltas.relation_deltas.is_empty(),

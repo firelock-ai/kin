@@ -1,18 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use anyhow::{anyhow, bail, Context, Result};
-use kin_model::{BranchName, ChangeStore, Entity, EntityFilter, GraphStore};
-use kin_model::{Hash256, SemanticChangeId};
-use std::collections::HashSet;
+use anyhow::{anyhow, bail, Result};
+use kin_model::{Entity, EntityFilter, GraphStore, Hash256, SemanticChangeId};
 
-/// A reference did not resolve to a semantic change — unknown ref syntax, a
-/// ref that legitimately does not exist, or a relative-ref hop (`^N`/`~N`)
-/// that runs past the start of history.
-///
-/// Distinguished from other failure modes (graph/backend faults) so callers
-/// can report it as a client-input error (e.g. HTTP 400) rather than an
-/// internal server error, without matching on message text.
+use super::repository_authority::{parse_git_object_id, parse_ref_name, ActiveRepositoryAuthority};
+
+/// A reference did not resolve through repository-v6 authority.
 #[derive(Debug)]
 pub struct RefResolutionError {
     reference: String,
@@ -20,9 +14,9 @@ pub struct RefResolutionError {
 }
 
 impl std::fmt::Display for RefResolutionError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
-            f,
+            formatter,
             "cannot resolve ref '{}': {}",
             self.reference, self.reason
         )
@@ -38,314 +32,38 @@ fn ref_error(reference: impl Into<String>, reason: impl Into<String>) -> anyhow:
     })
 }
 
-/// True when `err` is, or wraps via added context, a [`RefResolutionError`].
-/// Lets callers outside this crate classify a failure as a client-input
-/// problem (bad ref) without depending on `anyhow` themselves or matching on
-/// message text — they only need to name the error type, which they can
-/// reach through their existing dependency on this crate.
-pub fn is_ref_resolution_error(err: &anyhow::Error) -> bool {
-    err.chain()
+pub fn is_ref_resolution_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
         .any(|cause| cause.downcast_ref::<RefResolutionError>().is_some())
-}
-
-/// A ref that resolves, but whose ancestry is in the graph without the
-/// per-commit semantic deltas that `history`, `blame`, and `review` read.
-///
-/// This is a graph gap, not bad client input: the ref names real, present
-/// history. Reporting it is what keeps an unhydrated negative distinguishable
-/// from a real one — the alternative is a confident, well-formed empty answer
-/// that a caller cannot tell apart from "this entity genuinely has no history
-/// at this ref".
-#[derive(Debug)]
-pub struct HydrationDepthGapError {
-    reference: String,
-    change: SemanticChangeId,
-    tip: String,
-}
-
-impl std::fmt::Display for HydrationDepthGapError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "ref '{}' resolves to change {}, which this repository imported at artifact-only depth while hydrating Git commit {}: its per-commit entity and relation deltas were never replayed, so semantic history at this ref would read as empty rather than as an answer. Re-import semantic history with `kin init --git-history full` to upgrade it.",
-            self.reference, self.change, self.tip
-        )
-    }
-}
-
-impl std::error::Error for HydrationDepthGapError {}
-
-/// True when `err` is, or wraps via added context, a
-/// [`HydrationDepthGapError`]. Kept separate from
-/// [`is_ref_resolution_error`] so a transport owner can report a graph gap
-/// distinctly from a client-input error without matching on message text.
-pub fn is_hydration_depth_gap_error(err: &anyhow::Error) -> bool {
-    err.chain()
-        .any(|cause| cause.downcast_ref::<HydrationDepthGapError>().is_some())
-}
-
-fn hydration_depth_gap_error(
-    reference: Option<&str>,
-    change: SemanticChangeId,
-    tip: impl Into<String>,
-) -> anyhow::Error {
-    anyhow::Error::new(HydrationDepthGapError {
-        reference: reference.unwrap_or("HEAD").to_string(),
-        change,
-        tip: tip.into(),
-    })
 }
 
 pub(crate) fn parse_change_id(input: &str) -> Result<SemanticChangeId> {
     Ok(SemanticChangeId::from_hash(
-        Hash256::from_hex(input).map_err(|err| anyhow!("invalid change hash: {}", err))?,
+        Hash256::from_hex(input).map_err(|error| anyhow!("invalid change hash: {error}"))?,
     ))
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct ResolvedRef {
-    pub head: SemanticChangeId,
-    /// Whether resolving this ref lazily imported Git ancestry into the graph.
-    /// Derived from `hydrated_changes > 0`; kept for callers that only need
-    /// the yes/no signal.
-    pub hydrated_git_history: bool,
-    /// Count of historical changes hydration actually inserted into the
-    /// graph (0 when the ref was already present and no import ran). Distinct
-    /// from `hydrated_git_history`: a caller reporting on hydration should
-    /// show this count rather than collapse it to a boolean.
-    pub hydrated_changes: usize,
-}
-
-/// A ref-resolution attempt separated from the mutation owner's publication
-/// boundary.
-///
-/// Hydrating a Git ref can successfully insert its ancestry and then fail
-/// while applying a trailing relative hop (for example `<oid>^2` on a
-/// single-parent commit). Keeping that final resolution error beside the real
-/// insertion count lets daemon owners persist or retain the graph growth
-/// before surfacing the caller's invalid ref.
-#[derive(Debug)]
-pub struct PreparedRefResolution {
-    resolution: Result<SemanticChangeId>,
-    pub hydrated_changes: usize,
-}
-
-impl PreparedRefResolution {
-    pub fn into_result(self) -> Result<ResolvedRef> {
-        let head = self.resolution?;
-        Ok(ResolvedRef {
-            head,
-            hydrated_git_history: self.hydrated_changes > 0,
-            hydrated_changes: self.hydrated_changes,
-        })
-    }
 }
 
 pub fn resolve_ref<G>(
     graph: &G,
-    layout: &kin_core::KinLayout,
+    binding: &kin_core::LocalRepositoryAuthorityBinding,
     reference: Option<&str>,
 ) -> Result<SemanticChangeId>
 where
     G: GraphStore,
     <G as GraphStore>::Error: std::fmt::Display + Send + Sync + 'static,
 {
-    match reference {
-        Some(reference) => resolve_explicit_ref(graph, layout, reference),
-        None => {
-            let current = kin_core::read_current_branch(layout)?;
-            let branch = graph
-                .get_branch(&current)
-                .map_err(|err| anyhow!(err.to_string()))?
-                .ok_or_else(|| anyhow!("branch '{}' not found", current))?;
-            Ok(branch.head)
-        }
+    let reference = reference.unwrap_or("HEAD");
+    if reference.contains("@{") {
+        return Err(ref_error(
+            reference,
+            "reflog/upstream '@{...}' syntax is not supported",
+        ));
     }
-}
 
-/// How much semantic work a lazy Git-ref hydration performs on the ancestry it
-/// imports. Both depths import the same commits and the same artifact deltas;
-/// they differ only in whether the per-commit semantic replay runs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HydrationDepth {
-    /// Replay per-commit entity and relation deltas across the whole imported
-    /// ancestry.
-    ///
-    /// Required by every caller that reads semantic truth *at* the ref rather
-    /// than a tree state derived from it: `history` and `blame` resolve the
-    /// target entity through `resolve_graph_at`, which replays exactly these
-    /// deltas, and `review` diffs them between two refs.
-    Semantic,
-    /// Import artifact deltas only, skipping the per-commit semantic replay.
-    ///
-    /// Retrieval does not read those deltas. `kin_core::build_graph_at_ref*`
-    /// takes the ref's file tree from the replayed *artifact* deltas (or from
-    /// the Git tree directly) and rebuilds the scoped entity set by re-parsing
-    /// that tree through `IndexPipeline`, so scope-for-retrieval and
-    /// `locate --ref` get the same answer either way. Co-change mining also
-    /// reads artifact deltas only.
-    ///
-    /// The replay it skips re-parses and re-links every ancestor commit — the
-    /// "Hydrating History: [n/26747]" pass, minutes of work on a deep
-    /// base_commit — which is pure cost on these two paths.
-    ArtifactOnly,
-}
-
-/// The first candidate this graph is holding exactly as some artifact-only
-/// hydration left it.
-///
-/// Two facts have to agree, and neither decides alone.
-///
-/// The record is necessary: no property of a stored change identifies an
-/// unreplayed import, because a whitespace-only commit replays to no semantic
-/// deltas either. Treating "present but empty" as unhydrated would refuse refs
-/// that are perfectly answerable.
-///
-/// The graph is confirmatory, and only ever narrows what the record claims. A
-/// record describes a hydration, not a graph: hydration into an ephemeral
-/// session graph records and then discards its growth, and a later import can
-/// insert the same change *with* its replay. So a recorded change is a gap only
-/// while this graph still holds it in the shape the record describes.
-fn first_live_artifact_only_gap(
-    graph: &kin_db::InMemoryGraph,
-    layout: &kin_core::KinLayout,
-    candidates: &HashSet<SemanticChangeId>,
-) -> Result<Option<(SemanticChangeId, String)>> {
-    if candidates.is_empty() {
-        return Ok(None);
-    }
-    for hydration in crate::commands::hydration_depth::artifact_only_hydrations(layout)? {
-        for change_id in &hydration.changes {
-            if !candidates.contains(change_id) {
-                continue;
-            }
-            let Some(change) = graph.get_change(change_id)? else {
-                continue;
-            };
-            if change.entity_deltas.is_empty() && change.relation_deltas.is_empty() {
-                return Ok(Some((*change_id, hydration.tip.clone())));
-            }
-        }
-    }
-    Ok(None)
-}
-
-pub fn resolve_ref_importing_git_if_needed(
-    graph: &kin_db::InMemoryGraph,
-    layout: &kin_core::KinLayout,
-    reference: Option<&str>,
-) -> Result<SemanticChangeId> {
-    Ok(
-        prepare_ref_importing_git_if_needed(graph, layout, reference, HydrationDepth::Semantic)
-            .into_result()?
-            .head,
-    )
-}
-
-pub fn resolve_ref_importing_git_if_needed_for_locate(
-    graph: &kin_db::InMemoryGraph,
-    layout: &kin_core::KinLayout,
-    reference: Option<&str>,
-) -> Result<SemanticChangeId> {
-    Ok(
-        prepare_ref_importing_git_if_needed(graph, layout, reference, HydrationDepth::ArtifactOnly)
-            .into_result()?
-            .head,
-    )
-}
-
-pub fn resolve_ref_importing_git_if_needed_with_report(
-    graph: &kin_db::InMemoryGraph,
-    layout: &kin_core::KinLayout,
-    reference: Option<&str>,
-) -> Result<ResolvedRef> {
-    prepare_ref_importing_git_if_needed(graph, layout, reference, HydrationDepth::Semantic)
-        .into_result()
-}
-
-pub fn resolve_ref_importing_git_if_needed_for_locate_with_report(
-    graph: &kin_db::InMemoryGraph,
-    layout: &kin_core::KinLayout,
-    reference: Option<&str>,
-) -> Result<ResolvedRef> {
-    prepare_ref_importing_git_if_needed(graph, layout, reference, HydrationDepth::ArtifactOnly)
-        .into_result()
-}
-
-pub fn prepare_ref_importing_git_if_needed_with_report(
-    graph: &kin_db::InMemoryGraph,
-    layout: &kin_core::KinLayout,
-    reference: Option<&str>,
-) -> PreparedRefResolution {
-    prepare_ref_importing_git_if_needed(graph, layout, reference, HydrationDepth::Semantic)
-}
-
-fn prepare_ref_importing_git_if_needed(
-    graph: &kin_db::InMemoryGraph,
-    layout: &kin_core::KinLayout,
-    reference: Option<&str>,
-    depth: HydrationDepth,
-) -> PreparedRefResolution {
-    match resolve_ref(graph, layout, reference) {
-        // A ref that already resolves never re-enters hydration, so this is the
-        // only place a semantic caller can learn that the history it is about to
-        // read was imported without its semantic replay. Answering here is what
-        // the old code did, and what made an unhydrated ancestry indistinguishable
-        // from an entity that genuinely has no history at this ref.
-        Ok(head) => PreparedRefResolution {
-            resolution: semantic_depth_is_available(graph, layout, reference, depth, head)
-                .map(|()| head),
-            hydrated_changes: 0,
-        },
-        Err(original_err) => {
-            let Some(reference) = reference else {
-                return PreparedRefResolution {
-                    resolution: Err(original_err),
-                    hydrated_changes: 0,
-                };
-            };
-            let Some(git_oid) = extract_git_ref(reference) else {
-                return PreparedRefResolution {
-                    resolution: Err(original_err),
-                    hydrated_changes: 0,
-                };
-            };
-            match hydrate_imported_git_ref(graph, layout, git_oid, depth) {
-                Ok(hydrated_changes) => PreparedRefResolution {
-                    // Preserve a relative-hop error until the graph owner has
-                    // acknowledged the successful ancestry insertion.
-                    resolution: resolve_ref(graph, layout, Some(reference)),
-                    hydrated_changes,
-                },
-                Err(error) => PreparedRefResolution {
-                    resolution: Err(error),
-                    hydrated_changes: 0,
-                },
-            }
-        }
-    }
-}
-
-/// Confirm the resolved ref can answer at the depth the caller resolves for.
-///
-/// Retrieval reads the ref's tree state and is complete at artifact-only depth,
-/// so it never consults the records. `history`, `blame`, and `review` read the
-/// per-commit deltas the artifact-only import skipped, and get the gap reported
-/// instead of an empty answer.
-fn semantic_depth_is_available(
-    graph: &kin_db::InMemoryGraph,
-    layout: &kin_core::KinLayout,
-    reference: Option<&str>,
-    depth: HydrationDepth,
-    head: SemanticChangeId,
-) -> Result<()> {
-    if depth == HydrationDepth::ArtifactOnly {
-        return Ok(());
-    }
-    match first_live_artifact_only_gap(graph, layout, &HashSet::from([head]))? {
-        Some((change, tip)) => Err(hydration_depth_gap_error(reference, change, tip)),
-        None => Ok(()),
-    }
+    let (core, hops) = split_relative_hops(reference)?;
+    let head = resolve_ref_core(graph, binding, reference, core)?;
+    apply_parent_hops(graph, reference, head, &hops)
 }
 
 pub(crate) fn resolve_entity_query<G>(graph: &G, entity_query: &str) -> Result<Entity>
@@ -359,11 +77,11 @@ where
     };
     let entities = graph
         .query_entities(&filter)
-        .map_err(|err| anyhow!(err.to_string()))?;
+        .map_err(|error| anyhow!(error.to_string()))?;
     choose_entity_match(entities, entity_query).or_else(|_| {
         let all = graph
             .list_all_entities()
-            .map_err(|err| anyhow!(err.to_string()))?;
+            .map_err(|error| anyhow!(error.to_string()))?;
         choose_entity_match(all, entity_query)
     })
 }
@@ -379,7 +97,7 @@ where
 {
     let state = graph
         .resolve_graph_at(head)
-        .map_err(|err| anyhow!(err.to_string()))?;
+        .map_err(|error| anyhow!(error.to_string()))?;
     let entities = state
         .entities
         .into_values()
@@ -388,20 +106,9 @@ where
     choose_entity_match(entities, entity_query)
 }
 
-/// One relative-ref hop applied after a base ref resolves: select the Nth
-/// parent (1-indexed) of the commit reached so far.
 #[derive(Debug, Clone, Copy)]
 struct ParentHop(usize);
 
-/// Split trailing `^`, `^N`, `~`, `~N` operators off the end of `reference`,
-/// returning the remaining base-ref text and the hops to apply, in
-/// application order (closest to the base first). Mirrors git's own suffix
-/// grammar (see `git-rev-parse(1)`, "Specifying Revisions"): bare `^`/`~` is
-/// one first-parent hop, `~N` desugars to N repeated first-parent hops, and
-/// `^N` selects the Nth parent directly (relevant only at merge commits,
-/// where parent order matters). Branch/tag names cannot themselves contain
-/// `^` or `~` under Git's own ref-name rules, so peeling trailing operators
-/// never misreads a legitimate name.
 fn split_relative_hops(reference: &str) -> Result<(&str, Vec<ParentHop>)> {
     let mut hops = Vec::new();
     let mut rest = reference;
@@ -413,30 +120,26 @@ fn split_relative_hops(reference: &str) -> Result<(&str, Vec<ParentHop>)> {
         }
         if last.is_ascii_digit() {
             let digits_start = rest
-                .rfind(|c: char| !c.is_ascii_digit())
-                .map(|i| i + 1)
+                .rfind(|character: char| !character.is_ascii_digit())
+                .map(|index| index + 1)
                 .unwrap_or(0);
             if digits_start == 0 {
-                // The whole remaining string is digits (e.g. a bare numeric
-                // ref) — not a `^N`/`~N` suffix, stop peeling.
                 break;
             }
             let marker = rest.as_bytes()[digits_start - 1];
             if marker != b'^' && marker != b'~' {
                 break;
             }
-            let n: usize = rest[digits_start..]
+            let count: usize = rest[digits_start..]
                 .parse()
                 .map_err(|_| ref_error(reference, "parent index is out of range"))?;
             if marker == b'^' {
-                if n == 0 {
-                    // `^0` names the commit itself, not a parent hop — stop
-                    // peeling and let core resolution handle (or reject) it.
+                if count == 0 {
                     break;
                 }
-                hops.push(ParentHop(n));
+                hops.push(ParentHop(count));
             } else {
-                hops.extend(std::iter::repeat_n(ParentHop(1), n));
+                hops.extend(std::iter::repeat_n(ParentHop(1), count));
             }
             rest = &rest[..digits_start - 1];
             continue;
@@ -446,7 +149,6 @@ fn split_relative_hops(reference: &str) -> Result<(&str, Vec<ParentHop>)> {
     Ok((rest, hops))
 }
 
-/// Walk `hops` from `head`, following recorded parents in the graph.
 fn apply_parent_hops<G>(
     graph: &G,
     original: &str,
@@ -460,14 +162,13 @@ where
     for hop in hops {
         let change = graph
             .get_change(&head)
-            .map_err(|err| anyhow!(err.to_string()))?
-            .ok_or_else(|| ref_error(original, format!("change {} not found in history", head)))?;
+            .map_err(|error| anyhow!(error.to_string()))?
+            .ok_or_else(|| ref_error(original, format!("change {head} not found in history")))?;
         head = *change.parents.get(hop.0 - 1).ok_or_else(|| {
             ref_error(
                 original,
                 format!(
-                    "{} has {} parent(s), no parent #{}",
-                    head,
+                    "{head} has {} parent(s), no parent #{}",
                     change.parents.len(),
                     hop.0
                 ),
@@ -477,35 +178,9 @@ where
     Ok(head)
 }
 
-fn resolve_explicit_ref<G>(
-    graph: &G,
-    layout: &kin_core::KinLayout,
-    reference: &str,
-) -> Result<SemanticChangeId>
-where
-    G: GraphStore,
-    <G as GraphStore>::Error: std::fmt::Display + Send + Sync + 'static,
-{
-    if reference.contains("@{") {
-        return Err(ref_error(
-            reference,
-            "reflog/upstream '@{...}' ref syntax is not supported",
-        ));
-    }
-
-    let (core, hops) = split_relative_hops(reference)?;
-    let head = resolve_ref_core(graph, layout, reference, core)?;
-    apply_parent_hops(graph, reference, head, &hops)
-}
-
-/// Resolve the non-relative "core" of a reference: exactly `HEAD`, a
-/// `branch:`/`git:`/`kin:`/`change:`-prefixed form, a bare branch name, a
-/// 40-character Git commit hash, or a Kin change id. `original` is the full,
-/// pre-peel reference text the caller supplied, threaded through only so
-/// error messages point at what was actually typed.
 fn resolve_ref_core<G>(
     graph: &G,
-    layout: &kin_core::KinLayout,
+    binding: &kin_core::LocalRepositoryAuthorityBinding,
     original: &str,
     core: &str,
 ) -> Result<SemanticChangeId>
@@ -513,23 +188,6 @@ where
     G: GraphStore,
     <G as GraphStore>::Error: std::fmt::Display + Send + Sync + 'static,
 {
-    if core == "HEAD" {
-        let current = kin_core::read_current_branch(layout)?;
-        let branch = graph
-            .get_branch(&current)
-            .map_err(|err| anyhow!(err.to_string()))?
-            .ok_or_else(|| ref_error(original, format!("branch '{}' not found", current)))?;
-        return Ok(branch.head);
-    }
-
-    if let Some(branch_name) = core.strip_prefix("branch:") {
-        return resolve_branch_head(graph, original, branch_name);
-    }
-
-    if let Some(git_oid) = core.strip_prefix("git:") {
-        return resolve_imported_git_ref(graph, original, git_oid);
-    }
-
     if let Some(change_ref) = core
         .strip_prefix("kin:")
         .or_else(|| core.strip_prefix("change:"))
@@ -537,376 +195,120 @@ where
         return resolve_semantic_change(graph, original, change_ref);
     }
 
-    if let Some(branch) = graph
-        .get_branch(&BranchName::new(core))
-        .map_err(|err| anyhow!(err.to_string()))?
-    {
-        return Ok(branch.head);
-    }
-
-    if core.len() == 40 {
-        if let Ok(imported_change_id) = resolve_imported_git_ref(graph, original, core) {
-            return Ok(imported_change_id);
-        }
-    }
-
-    if is_abbreviated_git_hex(core) {
-        match kin_git::expand_git_commit_prefix(layout.working_dir(), core) {
-            kin_git::GitOidPrefixExpansion::Commit(full_oid) => {
-                if let Ok(imported_change_id) = resolve_imported_git_ref(graph, original, &full_oid)
-                {
-                    return Ok(imported_change_id);
-                }
-                return Err(ref_error(
-                    original,
-                    format!(
-                        "git commit '{}' (full id {}) is not imported into this repository's history; use the full 40-character id to hydrate it",
-                        core, full_oid
-                    ),
-                ));
-            }
-            kin_git::GitOidPrefixExpansion::Ambiguous => {
-                return Err(ref_error(
-                    original,
-                    format!(
-                        "git commit prefix '{}' is ambiguous; use more characters or the full 40-character id",
-                        core
-                    ),
-                ));
-            }
-            kin_git::GitOidPrefixExpansion::NotFound => {}
-        }
-    }
-
-    if parse_change_id(core).is_ok() {
-        return resolve_semantic_change(graph, original, core);
-    }
-
-    Err(ref_error(original, format!("unknown ref '{}'", core)))
-}
-
-/// True for a plausible abbreviated Git commit hash: 4–39 hex characters.
-/// Full 40-character ids resolve through the exact-id path instead, and
-/// anything shorter than Git's 4-character minimum never expands.
-fn is_abbreviated_git_hex(core: &str) -> bool {
-    (4..40).contains(&core.len()) && core.bytes().all(|b| b.is_ascii_hexdigit())
-}
-
-fn resolve_branch_head<G>(graph: &G, original: &str, branch_name: &str) -> Result<SemanticChangeId>
-where
-    G: GraphStore,
-    <G as GraphStore>::Error: std::fmt::Display + Send + Sync + 'static,
-{
-    if let Some(branch) = graph
-        .get_branch(&BranchName::new(branch_name))
-        .map_err(|err| anyhow!(err.to_string()))?
-    {
-        return Ok(branch.head);
-    }
-
-    Err(ref_error(
-        original,
-        format!("branch '{}' not found", branch_name),
-    ))
-}
-
-fn resolve_imported_git_ref<G>(graph: &G, original: &str, git_oid: &str) -> Result<SemanticChangeId>
-where
-    G: GraphStore,
-    <G as GraphStore>::Error: std::fmt::Display + Send + Sync + 'static,
-{
-    let imported_change_id = kin_git::semantic_change_id_from_git_oid_hex(git_oid)?;
-    if graph
-        .get_change(&imported_change_id)
-        .map_err(|err| anyhow!(err.to_string()))?
-        .is_some()
-    {
-        Ok(imported_change_id)
-    } else {
-        Err(ref_error(
-            original,
-            format!("imported Git commit '{}' not found", git_oid),
-        ))
-    }
-}
-
-/// Extract the bare Git commit oid a reference names, if any, peeling any
-/// trailing `^`/`~N` relative-ref hops first so a not-yet-imported commit
-/// referenced as e.g. `<oid>~2` is still recognized as needing hydration for
-/// its `<oid>` core. Returns a slice of `reference`, so hydrating the
-/// returned oid and then re-resolving the original (unpeeled) string
-/// resolves the hop against the now-present history.
-pub fn extract_git_ref(reference: &str) -> Option<&str> {
-    if reference.contains("@{") {
-        return None;
-    }
-    let (core, _hops) = split_relative_hops(reference).ok()?;
-    if let Some(git_oid) = core.strip_prefix("git:") {
-        return Some(git_oid);
-    }
-    if core.len() == 40 {
-        return Some(core);
-    }
-    None
-}
-
-/// Returns true when resolving `reference` would import a full Git ancestry that
-/// is not yet present in `graph`. Callers use this to decide whether a request
-/// must take a serialized hydration gate before resolving: already-imported or
-/// non-Git refs stay on the lock-free fast path. Conservative on lookup error —
-/// an unresolved presence check reports `true` so a real import is never left
-/// unserialized.
-pub fn git_ref_requires_hydration(graph: &kin_db::InMemoryGraph, reference: &str) -> bool {
-    let Some(git_oid) = extract_git_ref(reference) else {
-        return false;
-    };
-    let Ok(imported_change_id) = kin_git::semantic_change_id_from_git_oid_hex(git_oid) else {
-        return false;
-    };
-    !matches!(graph.get_change(&imported_change_id), Ok(Some(_)))
-}
-
-/// Lazily import the Git ancestry of `git_oid` into `graph`, returning the
-/// count of changes actually inserted (0 when the ref was already present and
-/// no import ran). Callers report this count directly rather than collapsing
-/// it to a boolean, so a cold multi-thousand-change import is never described
-/// the same way as a no-op.
-///
-/// `depth` selects whether the imported ancestry also gets its per-commit
-/// semantic replay; see [`HydrationDepth`] for which callers need it.
-fn hydrate_imported_git_ref(
-    graph: &kin_db::InMemoryGraph,
-    layout: &kin_core::KinLayout,
-    git_oid: &str,
-    depth: HydrationDepth,
-) -> Result<usize> {
-    match depth {
-        HydrationDepth::Semantic => {
-            hydrate_imported_git_ref_with(graph, layout, git_oid, depth, replay_imported_semantics)
-        }
-        HydrationDepth::ArtifactOnly => {
-            hydrate_imported_git_ref_with(graph, layout, git_oid, depth, skip_imported_semantics)
-        }
-    }
-}
-
-/// [`HydrationDepth::Semantic`] replay: reconstruct per-commit entity and
-/// relation deltas across the imported ancestry, resuming from and writing
-/// hydration checkpoints.
-fn replay_imported_semantics(
-    imported: &mut [kin_git::ImportedChange],
-    blob_store: &kin_blobs::BlobStore,
-    kin_root: &std::path::Path,
-) -> Result<()> {
-    crate::commands::init::enrich_imported_changes_with_semantics_checkpointed(
-        imported,
-        blob_store,
-        kin_root,
-        kin_core::build_genesis_change().id,
-        // Lazy-ref hydration for review / history / blame reads arbitrary,
-        // uncertified repositories. It hydrates best-effort: a compatibility
-        // hydration facet degrades rather than failing the read. Certification
-        // (`kin init`) is the strict path.
-        true,
-    )
-    .map(|_| ())
-}
-
-/// [`HydrationDepth::ArtifactOnly`] replay: none. The imported changes keep the
-/// artifact deltas the Git import produced, which is what the ref view and
-/// co-change mining read.
-fn skip_imported_semantics(
-    _imported: &mut [kin_git::ImportedChange],
-    _blob_store: &kin_blobs::BlobStore,
-    _kin_root: &std::path::Path,
-) -> Result<()> {
-    Ok(())
-}
-
-/// Reject an imported window before any of it is written to the graph unless
-/// every change lands on an already-known parent.
-///
-/// A change is admitted when each of its parents is the import's boundary root
-/// (canonical genesis), a change already present in `graph`, or a change
-/// admitted earlier in this same pass. Because admission is evaluated in the
-/// order kin-git emits — a parent-first Kahn traversal — that single rule
-/// rejects a parentless change, a parent outside the imported window, and a
-/// parent cycle alike: no member of a cycle can ever be admitted first.
-///
-/// This guards the graph write itself, so it holds for every hydration depth.
-/// The semantic replay performs its own richer validation before it mutates
-/// deltas; this check is what keeps an artifact-only import, which runs no
-/// replay, from inserting an ancestry the graph cannot resolve.
-fn admit_imported_changes_for_insert(
-    graph: &kin_db::InMemoryGraph,
-    imported: &[kin_git::ImportedChange],
-    boundary_root: SemanticChangeId,
-) -> Result<()> {
-    let mut admitted = std::collections::HashSet::with_capacity(imported.len());
-    for imported_change in imported {
-        let change = &imported_change.change;
-        if change.parents.is_empty() {
-            bail!(
-                "imported change {} has no parent; Git roots must reference canonical genesis {}",
-                change.id,
-                boundary_root
-            );
-        }
-        for parent in &change.parents {
-            if *parent == boundary_root
-                || admitted.contains(parent)
-                || graph.get_change(parent)?.is_some()
+    // A full semantic change id is unambiguous when that change is present.
+    if core.len() == 64 {
+        if let Ok(change_id) = parse_change_id(core) {
+            if graph
+                .get_change(&change_id)
+                .map_err(|error| anyhow!(error.to_string()))?
+                .is_some()
             {
-                continue;
+                return Ok(change_id);
             }
-            bail!(
-                "imported change {} names parent {} that is neither canonical genesis {}, already in the graph, nor an earlier change in the imported window",
-                change.id,
-                parent,
-                boundary_root
-            );
-        }
-        admitted.insert(change.id);
-    }
-    Ok(())
-}
-
-fn hydrate_imported_git_ref_with<F>(
-    graph: &kin_db::InMemoryGraph,
-    layout: &kin_core::KinLayout,
-    git_oid: &str,
-    depth: HydrationDepth,
-    enrich_semantics: F,
-) -> Result<usize>
-where
-    F: FnOnce(
-        &mut [kin_git::ImportedChange],
-        &kin_blobs::BlobStore,
-        &std::path::Path,
-    ) -> Result<()>,
-{
-    let imported_change_id = kin_git::semantic_change_id_from_git_oid_hex(git_oid)?;
-    if graph.get_change(&imported_change_id)?.is_some() {
-        return Ok(0);
-    }
-
-    let blob_store = kin_blobs::BlobStore::new(layout.objects_dir())
-        .context("open blob store for imported Git ref hydration")?;
-    let genesis_id = kin_core::build_genesis_change().id;
-    let mut imported = kin_git::import_git_history_to_commit_with_blobs(
-        layout.working_dir(),
-        git_oid,
-        genesis_id,
-        Some(&blob_store),
-    )
-    .with_context(|| format!("hydrate imported Git commit '{}'", git_oid))?;
-
-    // Split the window before any replay or graph write. kin-db's
-    // `create_change` is an insertion primitive, not an upsert, so a change
-    // already in the graph keeps whatever depth it was imported at and the
-    // enriched copy this pass would produce for it is discarded.
-    let mut absent = Vec::with_capacity(imported.len());
-    let mut present = HashSet::new();
-    for imported_change in &imported {
-        let change_id = imported_change.change.id;
-        if graph.get_change(&change_id)?.is_some() {
-            present.insert(change_id);
-        } else {
-            absent.push(change_id);
         }
     }
 
-    // Semantics for the already-present part of this ancestry cannot be
-    // published from here, so completing the import would leave history reading
-    // silently through an unreplayed prefix. Report the gap instead — before the
-    // replay this would waste, and before anything is written.
-    if depth == HydrationDepth::Semantic {
-        if let Some((change, tip)) = first_live_artifact_only_gap(graph, layout, &present)? {
-            return Err(hydration_depth_gap_error(Some(git_oid), change, tip));
-        }
-    }
-
-    enrich_semantics(&mut imported, &blob_store, layout.root()).with_context(|| {
-        format!(
-            "semantically hydrate imported Git history for ref '{}'",
-            git_oid
+    let authority = ActiveRepositoryAuthority::open(binding).map_err(|error| {
+        ref_error(
+            original,
+            format!("repository-v6 authority is unavailable: {error:#}"),
         )
     })?;
 
-    admit_imported_changes_for_insert(graph, &imported, genesis_id)?;
-
-    match depth {
-        HydrationDepth::Semantic => {
-            // Everything this pass is about to insert carries replayed deltas,
-            // so no earlier record still describes it.
-            crate::commands::hydration_depth::forget_replayed(layout, &absent)?;
-        }
-        HydrationDepth::ArtifactOnly => {
-            crate::commands::hydration_depth::record_artifact_only(
-                layout,
-                imported_change_id,
-                git_oid,
-                &absent,
-            )?;
-        }
-    }
-
-    // The canonical genesis ID is the admitted boundary for every imported Git
-    // root, but a request-scoped or freshly constructed graph may not have had
-    // repository bootstrap applied. Graph replay requires every reachable
-    // parent record, so materialize the deterministic boundary before
-    // inserting children instead of leaving an accepted but unresolvable
-    // ancestry.
-    if graph.get_change(&genesis_id)?.is_none() {
-        graph.create_change(&kin_core::build_genesis_change())?;
-    }
-
-    let mut pending: HashSet<SemanticChangeId> = absent.iter().copied().collect();
-    let mut inserted = 0usize;
-    for imported_change in &imported {
-        if pending.remove(&imported_change.change.id) {
-            graph.create_change(&imported_change.change)?;
-            inserted += 1;
-        }
-    }
-
-    if graph.get_change(&imported_change_id)?.is_none() {
+    let resolved = if core == "HEAD" {
+        authority
+            .current_change_id()
+            .map_err(|error| {
+                ref_error(
+                    original,
+                    format!("repository-v6 workspace head is invalid: {error:#}"),
+                )
+            })?
+            .ok_or_else(|| ref_error(original, "repository-v6 workspace head is unborn"))?
+    } else if let Some(branch_name) = core.strip_prefix("branch:") {
+        resolve_named_authority_ref(&authority, original, branch_name)?
+    } else if let Some(git_oid) = core.strip_prefix("git:") {
+        resolve_imported_git_ref(&authority, original, git_oid)?
+    } else if matches!(core.len(), 40 | 64) && core.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        resolve_imported_git_ref(&authority, original, core)?
+    } else if is_abbreviated_git_hex(core) {
         return Err(ref_error(
-            git_oid,
-            "imported Git commit not found after hydration",
+            original,
+            format!(
+                "Git commit prefix '{core}' cannot be resolved from exact alias authority; use a full object ID"
+            ),
+        ));
+    } else {
+        resolve_named_authority_ref(&authority, original, core)?
+    };
+
+    if graph
+        .get_change(&resolved)
+        .map_err(|error| anyhow!(error.to_string()))?
+        .is_none()
+    {
+        return Err(ref_error(
+            original,
+            format!(
+                "repository-v6 authority resolves to semantic change {resolved}, but the active graph projection does not contain it"
+            ),
         ));
     }
-
-    Ok(inserted)
+    Ok(resolved)
 }
 
-fn resolve_semantic_change<G>(
-    graph: &G,
+fn resolve_named_authority_ref(
+    authority: &ActiveRepositoryAuthority,
     original: &str,
-    change_ref: &str,
-) -> Result<SemanticChangeId>
+    value: &str,
+) -> Result<SemanticChangeId> {
+    let name = parse_ref_name(value)
+        .map_err(|error| ref_error(original, format!("invalid repository ref: {error:#}")))?;
+    authority
+        .resolve_named_ref(&name)
+        .map_err(|error| ref_error(original, error.to_string()))
+}
+
+fn resolve_imported_git_ref(
+    authority: &ActiveRepositoryAuthority,
+    original: &str,
+    value: &str,
+) -> Result<SemanticChangeId> {
+    let oid = parse_git_object_id(value)
+        .map_err(|error| ref_error(original, format!("invalid Git object ID: {error:#}")))?;
+    authority
+        .resolve_git_oid(&oid)
+        .map_err(|error| ref_error(original, error.to_string()))
+}
+
+fn resolve_semantic_change<G>(graph: &G, original: &str, value: &str) -> Result<SemanticChangeId>
 where
     G: GraphStore,
     <G as GraphStore>::Error: std::fmt::Display + Send + Sync + 'static,
 {
-    let change_id = parse_change_id(change_ref)?;
+    let change_id =
+        parse_change_id(value).map_err(|error| ref_error(original, error.to_string()))?;
     if graph
         .get_change(&change_id)
-        .map_err(|err| anyhow!(err.to_string()))?
+        .map_err(|error| anyhow!(error.to_string()))?
         .is_some()
     {
         Ok(change_id)
     } else {
         Err(ref_error(
             original,
-            format!("change {} not found", change_id),
+            format!("change {change_id} not found in graph authority"),
         ))
     }
 }
 
+fn is_abbreviated_git_hex(value: &str) -> bool {
+    (4..40).contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 fn choose_entity_match(mut entities: Vec<Entity>, entity_query: &str) -> Result<Entity> {
     if entities.is_empty() {
-        bail!("No entity matching '{}' found.", entity_query);
+        bail!("No entity matching '{entity_query}' found.");
     }
 
     entities.sort_by(|left, right| {
@@ -914,21 +316,18 @@ fn choose_entity_match(mut entities: Vec<Entity>, entity_query: &str) -> Result<
             .cmp(&right.name)
             .then_with(|| left.id.to_string().cmp(&right.id.to_string()))
     });
-
     if let Some(exact) = entities
         .iter()
         .find(|entity| entity.id.to_string() == entity_query || entity.name == entity_query)
     {
         return Ok(exact.clone());
     }
-
     if let Some(case_insensitive) = entities
         .iter()
         .find(|entity| entity.name.eq_ignore_ascii_case(entity_query))
     {
         return Ok(case_insensitive.clone());
     }
-
     match entities.as_slice() {
         [entity] => Ok(entity.clone()),
         many => {
@@ -938,11 +337,7 @@ fn choose_entity_match(mut entities: Vec<Entity>, entity_query: &str) -> Result<
                 .map(|entity| entity.name.as_str())
                 .collect::<Vec<_>>()
                 .join(", ");
-            bail!(
-                "Multiple entities match '{}': {}. Use a more exact name.",
-                entity_query,
-                preview
-            );
+            bail!("Multiple entities match '{entity_query}': {preview}. Use a more exact name.")
         }
     }
 }
@@ -966,725 +361,37 @@ fn name_matches_pattern(name: &str, pattern: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kin_db::InMemoryGraph;
-    use kin_model::{AuthorId, Branch, ChangeStore, SemanticChange, Timestamp};
+    use std::sync::Arc;
 
-    fn git_ok(cwd: &std::path::Path, args: &[&str]) -> Option<String> {
-        let output = std::process::Command::new("git")
-            .args(args)
-            .current_dir(cwd)
-            .output()
-            .ok()?;
-        output
-            .status
-            .success()
-            .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+    use kin_db::LocalFileBackend;
+    use kin_model::{AuthorId, ChangeOrigin, ChangeStore, SemanticChange, Timestamp};
+
+    /// Build a change whose declared identity matches its immutable payload.
+    ///
+    /// Repository authority rejects a change whose id does not recompute from
+    /// its own content, so the identity is derived rather than invented.
+    fn change(parents: Vec<SemanticChangeId>) -> SemanticChange {
+        let mut change = change_with_id(change_id(0), parents);
+        change.id = kin_core::compute_semantic_change_id(&change).unwrap();
+        change
     }
 
-    fn checkpoint_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
-        fn walk(path: &std::path::Path, files: &mut Vec<std::path::PathBuf>) {
-            let Ok(entries) = std::fs::read_dir(path) else {
-                return;
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    walk(&path, files);
-                } else if path.is_file() {
-                    files.push(path);
-                }
-            }
-        }
-        let mut files = Vec::new();
-        walk(root, &mut files);
-        files.sort();
-        files
-    }
-
-    fn temp_layout() -> kin_core::KinLayout {
-        let temp = tempfile::tempdir().unwrap();
-        let kin_dir = temp.path().join(".kin");
-        std::fs::create_dir_all(&kin_dir).unwrap();
-        // Keep the tempdir alive by leaking it for the test process lifetime.
-        let leaked = temp.keep();
-        kin_core::KinLayout::new(leaked.join(".kin"))
-    }
-
-    #[test]
-    fn lazy_git_ref_hydration_resumes_checkpoint_and_refuses_corruption_before_insert() {
-        let repo = tempfile::tempdir().unwrap();
-        if git_ok(repo.path(), &["init", "-q"]).is_none() {
-            return;
-        }
-        assert!(git_ok(repo.path(), &["config", "user.email", "test@kin.dev"]).is_some());
-        assert!(git_ok(repo.path(), &["config", "user.name", "Kin Test"]).is_some());
-        std::fs::write(
-            repo.path().join("main.py"),
-            "def answer():\n    return 42\n",
-        )
-        .unwrap();
-        assert!(git_ok(repo.path(), &["add", "main.py"]).is_some());
-        assert!(git_ok(repo.path(), &["commit", "-q", "-m", "initial"]).is_some());
-        let git_oid = git_ok(repo.path(), &["rev-parse", "HEAD"]).unwrap();
-        let imported_id = kin_git::semantic_change_id_from_git_oid_hex(&git_oid).unwrap();
-        let layout = kin_core::init(repo.path()).unwrap().layout;
-
-        let first_resumed = std::cell::Cell::new(usize::MAX);
-        let first_graph = InMemoryGraph::new();
-        let first_inserted = hydrate_imported_git_ref_with(
-            &first_graph,
-            &layout,
-            &git_oid,
-            HydrationDepth::Semantic,
-            |imported, blob_store, kin_root| {
-                let stats =
-                    crate::commands::init::enrich_imported_changes_with_semantics_test_checkpoint(
-                        imported,
-                        blob_store,
-                        kin_root,
-                        "lazy-ref-clean-sha",
-                        kin_core::build_genesis_change().id,
-                    )?;
-                first_resumed.set(stats.resumed_from());
-                Ok(())
-            },
-        )
-        .unwrap();
-        assert!(first_inserted > 0);
-        assert_eq!(first_resumed.get(), 0);
-        assert!(first_graph.get_change(&imported_id).unwrap().is_some());
-
-        let second_resumed = std::cell::Cell::new(0usize);
-        let second_graph = InMemoryGraph::new();
-        hydrate_imported_git_ref_with(
-            &second_graph,
-            &layout,
-            &git_oid,
-            HydrationDepth::Semantic,
-            |imported, blob_store, kin_root| {
-                let stats =
-                    crate::commands::init::enrich_imported_changes_with_semantics_test_checkpoint(
-                        imported,
-                        blob_store,
-                        kin_root,
-                        "lazy-ref-clean-sha",
-                        kin_core::build_genesis_change().id,
-                    )?;
-                second_resumed.set(stats.resumed_from());
-                Ok(())
-            },
-        )
-        .unwrap();
-        assert!(second_resumed.get() > 0, "lazy ref path did not resume");
-        assert!(second_graph.get_change(&imported_id).unwrap().is_some());
-
-        let checkpoint_root = layout.root().join("checkpoints/history-hydration");
-        let files = checkpoint_files(&checkpoint_root);
-        for component in ["/segments/", "/parser-frontiers/", "/linker-frontiers/"] {
-            assert!(
-                files
-                    .iter()
-                    .any(|path| path.to_string_lossy().contains(component)),
-                "lazy ref checkpoint did not persist {component}"
-            );
-        }
-        let manifest = files
-            .into_iter()
-            .find(|path| path.to_string_lossy().ends_with(".manifest.json"))
-            .unwrap();
-        std::fs::write(&manifest, b"corrupt").unwrap();
-
-        let refused_graph = InMemoryGraph::new();
-        let error = hydrate_imported_git_ref_with(
-            &refused_graph,
-            &layout,
-            &git_oid,
-            HydrationDepth::Semantic,
-            |imported, blob_store, kin_root| {
-                crate::commands::init::enrich_imported_changes_with_semantics_test_checkpoint(
-                    imported,
-                    blob_store,
-                    kin_root,
-                    "lazy-ref-clean-sha",
-                    kin_core::build_genesis_change().id,
-                )
-                .map(|_| ())
-            },
-        )
-        .unwrap_err();
-        assert!(
-            error.to_string().contains("semantically hydrate"),
-            "lazy ref error lost its semantic hydration context: {error:#}"
-        );
-        assert!(
-            error
-                .chain()
-                .any(|cause| cause.to_string().contains("REFUSED hydration checkpoint")),
-            "lazy ref corruption did not fail through the checkpoint wrapper: {error:#}"
-        );
-        assert!(refused_graph.get_change(&imported_id).unwrap().is_none());
-    }
-
-    #[test]
-    fn lazy_git_ref_dangling_parent_refuses_before_store_or_graph_write() {
-        let repo = tempfile::tempdir().unwrap();
-        if git_ok(repo.path(), &["init", "-q"]).is_none() {
-            return;
-        }
-        assert!(git_ok(repo.path(), &["config", "user.email", "test@kin.dev"]).is_some());
-        assert!(git_ok(repo.path(), &["config", "user.name", "Kin Test"]).is_some());
-        std::fs::write(
-            repo.path().join("main.py"),
-            "def answer():\n    return 42\n",
-        )
-        .unwrap();
-        assert!(git_ok(repo.path(), &["add", "main.py"]).is_some());
-        assert!(git_ok(repo.path(), &["commit", "-q", "-m", "initial"]).is_some());
-        let git_oid = git_ok(repo.path(), &["rev-parse", "HEAD"]).unwrap();
-        let imported_id = kin_git::semantic_change_id_from_git_oid_hex(&git_oid).unwrap();
-        let layout = kin_core::init(repo.path()).unwrap().layout;
-        let graph = InMemoryGraph::new();
-        let dangling = SemanticChangeId::from_hash(kin_model::Hash256::from_bytes([0xee; 32]));
-
-        let error = hydrate_imported_git_ref_with(
-            &graph,
-            &layout,
-            &git_oid,
-            HydrationDepth::Semantic,
-            |imported, blob_store, kin_root| {
-                imported[0].change.parents = vec![dangling];
-                crate::commands::init::enrich_imported_changes_with_semantics_test_checkpoint(
-                    imported,
-                    blob_store,
-                    kin_root,
-                    "lazy-ref-clean-sha",
-                    kin_core::build_genesis_change().id,
-                )
-                .map(|_| ())
-            },
-        )
-        .unwrap_err();
-        assert!(
-            error
-                .chain()
-                .any(|cause| cause.to_string().contains("dangling parent")),
-            "lazy ref lost dangling-parent cause: {error:#}"
-        );
-        assert!(graph.get_change(&imported_id).unwrap().is_none());
-        assert!(
-            !layout.root().join("checkpoints/history-hydration").exists(),
-            "lazy parent preflight must precede checkpoint-store creation"
-        );
-    }
-
-    /// A one-commit Git repo with a real source file, initialized for Kin, plus
-    /// an empty graph and the commit's oid. Returns `None` when Git is
-    /// unavailable so these tests skip the same way the others do.
-    fn single_commit_repo_for_hydration() -> Option<(InMemoryGraph, kin_core::KinLayout, String)> {
-        let repo = tempfile::tempdir().unwrap();
-        git_ok(repo.path(), &["init", "-q"])?;
-        assert!(git_ok(repo.path(), &["config", "user.email", "test@kin.dev"]).is_some());
-        assert!(git_ok(repo.path(), &["config", "user.name", "Kin Test"]).is_some());
-        std::fs::write(
-            repo.path().join("lib.rs"),
-            "pub fn answer() -> i32 {\n    42\n}\n",
-        )
-        .unwrap();
-        assert!(git_ok(repo.path(), &["add", "lib.rs"]).is_some());
-        assert!(git_ok(repo.path(), &["commit", "-q", "-m", "initial"]).is_some());
-        let git_oid = git_ok(repo.path(), &["rev-parse", "HEAD"]).unwrap();
-        let layout = kin_core::init(repo.path()).unwrap().layout;
-        // Keep the repo alive for the test process lifetime; the layout and the
-        // blob store both keep reading from it after this function returns.
-        let _kept = repo.keep();
-        Some((InMemoryGraph::new(), layout, git_oid))
-    }
-
-    /// A two-commit Git repo initialized for Kin, plus an empty graph and both
-    /// commits' oids, oldest first. Returns `None` when Git is unavailable.
-    fn two_commit_repo_for_hydration(
-    ) -> Option<(InMemoryGraph, kin_core::KinLayout, String, String)> {
-        let repo = tempfile::tempdir().unwrap();
-        git_ok(repo.path(), &["init", "-q"])?;
-        assert!(git_ok(repo.path(), &["config", "user.email", "test@kin.dev"]).is_some());
-        assert!(git_ok(repo.path(), &["config", "user.name", "Kin Test"]).is_some());
-        std::fs::write(
-            repo.path().join("lib.rs"),
-            "pub fn answer() -> i32 {\n    42\n}\n",
-        )
-        .unwrap();
-        assert!(git_ok(repo.path(), &["add", "lib.rs"]).is_some());
-        assert!(git_ok(repo.path(), &["commit", "-q", "-m", "initial"]).is_some());
-        let base_oid = git_ok(repo.path(), &["rev-parse", "HEAD"]).unwrap();
-        std::fs::write(
-            repo.path().join("lib.rs"),
-            "pub fn answer() -> i32 {\n    43\n}\n\npub fn extra() -> i32 {\n    1\n}\n",
-        )
-        .unwrap();
-        assert!(git_ok(repo.path(), &["add", "lib.rs"]).is_some());
-        assert!(git_ok(repo.path(), &["commit", "-q", "-m", "follow-up"]).is_some());
-        let head_oid = git_ok(repo.path(), &["rev-parse", "HEAD"]).unwrap();
-        let layout = kin_core::init(repo.path()).unwrap().layout;
-        let _kept = repo.keep();
-        Some((InMemoryGraph::new(), layout, base_oid, head_oid))
-    }
-
-    /// The reported defect: `locate --ref` hydrates at artifact-only depth and
-    /// persists it, and nothing upgrades it, so a later `history`/`blame`/
-    /// `review` at the same ref used to resolve successfully into an ancestry
-    /// with no semantic deltas and report an empty answer that is
-    /// indistinguishable from a real negative.
-    #[test]
-    fn a_semantic_caller_reports_the_gap_a_persisted_artifact_only_hydration_left() {
-        let Some((graph, layout, git_oid)) = single_commit_repo_for_hydration() else {
-            return;
-        };
-
-        resolve_ref_importing_git_if_needed_for_locate(&graph, &layout, Some(&git_oid)).unwrap();
-        assert!(
-            hydrated_tip_change(&graph, &git_oid)
-                .entity_deltas
-                .is_empty(),
-            "fixture must leave the artifact-only history the semantic caller then meets"
-        );
-
-        let error =
-            prepare_ref_importing_git_if_needed_with_report(&graph, &layout, Some(&git_oid))
-                .into_result()
-                .expect_err("a semantic caller must not answer out of artifact-only history");
-        assert!(
-            is_hydration_depth_gap_error(&error),
-            "the gap must be reported as its own failure, not as a bad ref: {error:#}"
-        );
-        assert!(
-            !is_ref_resolution_error(&error),
-            "a present, valid ref is not client-input error: {error:#}"
-        );
-        assert!(
-            format!("{error:#}").contains(&git_oid),
-            "the report must name the import that produced the gap: {error:#}"
-        );
-    }
-
-    /// Retrieval reads the ref's tree state, not the per-commit deltas, so it
-    /// stays answerable at artifact-only depth. Refusing here would trade the
-    /// silent wrong answer for a wrong refusal on the path the depth exists for.
-    #[test]
-    fn recorded_artifact_only_depth_never_refuses_the_retrieval_path() {
-        let Some((graph, layout, git_oid)) = single_commit_repo_for_hydration() else {
-            return;
-        };
-
-        resolve_ref_importing_git_if_needed_for_locate(&graph, &layout, Some(&git_oid)).unwrap();
-        let repeat = resolve_ref_importing_git_if_needed_for_locate_with_report(
-            &graph,
-            &layout,
-            Some(&git_oid),
-        )
-        .expect("locate must keep answering at the depth it hydrated");
-        assert_eq!(repeat.hydrated_changes, 0);
-    }
-
-    /// A record is evidence that some hydration ran at artifact-only depth —
-    /// never that this graph is still holding the result. Daemon session graphs
-    /// hydrate and then discard the growth by design, so a record whose changes
-    /// are absent here must not refuse anything.
-    #[test]
-    fn a_record_whose_changes_this_graph_never_received_refuses_nothing() {
-        let Some((discarded_graph, layout, git_oid)) = single_commit_repo_for_hydration() else {
-            return;
-        };
-
-        resolve_ref_importing_git_if_needed_for_locate(&discarded_graph, &layout, Some(&git_oid))
-            .unwrap();
-        assert!(
-            !crate::commands::hydration_depth::recorded_change_ids(&layout)
-                .unwrap()
-                .is_empty(),
-            "fixture must leave a record behind"
-        );
-
-        let fresh_graph = InMemoryGraph::new();
-        let resolved =
-            resolve_ref_importing_git_if_needed_with_report(&fresh_graph, &layout, Some(&git_oid))
-                .expect("a record without matching graph state must not block hydration");
-        assert!(resolved.hydrated_changes > 0);
-        assert!(
-            !hydrated_tip_change(&fresh_graph, &git_oid)
-                .entity_deltas
-                .is_empty(),
-            "the semantic entry point must still replay"
-        );
-        assert!(
-            crate::commands::hydration_depth::recorded_change_ids(&layout)
-                .unwrap()
-                .is_empty(),
-            "history replayed at semantic depth is no longer a recorded gap"
-        );
-    }
-
-    /// A record describes a hydration, not a graph. A later import can insert
-    /// the same change with its replay — a re-`init` after the graph was
-    /// rebuilt, say — and history that this graph did replay must answer
-    /// normally no matter what an older record still names.
-    #[test]
-    fn a_recorded_change_this_graph_replayed_is_not_reported_as_a_gap() {
-        let Some((graph, layout, git_oid)) = single_commit_repo_for_hydration() else {
-            return;
-        };
-
-        resolve_ref_importing_git_if_needed_with_report(&graph, &layout, Some(&git_oid))
-            .expect("semantic hydration replays the ancestry it imports");
-        let tip = kin_git::semantic_change_id_from_git_oid_hex(&git_oid).unwrap();
-        crate::commands::hydration_depth::record_artifact_only(&layout, tip, &git_oid, &[tip])
-            .unwrap();
-
-        prepare_ref_importing_git_if_needed_with_report(&graph, &layout, Some(&git_oid))
-            .into_result()
-            .expect("replayed history must answer, whatever an older record names");
-    }
-
-    /// The descendant case. Hydrating a child ref imports its whole ancestry,
-    /// but kin-db cannot re-publish the ancestors already sitting in the graph
-    /// at artifact-only depth, so their replayed copies are dropped. Completing
-    /// that import would answer through an unreplayed prefix; it is refused
-    /// before anything is written instead.
-    #[test]
-    fn semantic_hydration_refuses_an_ancestry_it_cannot_replay_before_writing_it() {
-        let Some((graph, layout, base_oid, head_oid)) = two_commit_repo_for_hydration() else {
-            return;
-        };
-        let head_id = kin_git::semantic_change_id_from_git_oid_hex(&head_oid).unwrap();
-
-        resolve_ref_importing_git_if_needed_for_locate(&graph, &layout, Some(&base_oid)).unwrap();
-        assert!(
-            graph.get_change(&head_id).unwrap().is_none(),
-            "fixture must leave the descendant unimported"
-        );
-
-        let error =
-            prepare_ref_importing_git_if_needed_with_report(&graph, &layout, Some(&head_oid))
-                .into_result()
-                .expect_err("an unreplayable prefix must be reported, not imported over");
-        assert!(
-            is_hydration_depth_gap_error(&error),
-            "expected a hydration-depth gap: {error:#}"
-        );
-        assert!(
-            graph.get_change(&head_id).unwrap().is_none(),
-            "the refusal must precede the graph write"
-        );
-    }
-
-    fn hydrated_tip_change(graph: &InMemoryGraph, git_oid: &str) -> kin_model::SemanticChange {
-        let imported_id = kin_git::semantic_change_id_from_git_oid_hex(git_oid).unwrap();
-        graph
-            .get_change(&imported_id)
-            .unwrap()
-            .expect("hydration must insert the requested commit")
-    }
-
-    /// The perf contract: an artifact-only hydration imports the same commits
-    /// and the same artifact deltas but runs no per-commit semantic replay, so
-    /// it writes no entity deltas and never opens a hydration checkpoint store.
-    /// The semantic hydration does replay.
-    #[test]
-    fn artifact_only_hydration_skips_the_semantic_replay_that_full_hydration_runs() {
-        let Some((semantic_graph, semantic_layout, semantic_oid)) =
-            single_commit_repo_for_hydration()
-        else {
-            return;
-        };
-        let Some((artifact_graph, artifact_layout, artifact_oid)) =
-            single_commit_repo_for_hydration()
-        else {
-            return;
-        };
-
-        let semantic_inserted = hydrate_imported_git_ref(
-            &semantic_graph,
-            &semantic_layout,
-            &semantic_oid,
-            HydrationDepth::Semantic,
-        )
-        .unwrap();
-        let artifact_inserted = hydrate_imported_git_ref(
-            &artifact_graph,
-            &artifact_layout,
-            &artifact_oid,
-            HydrationDepth::ArtifactOnly,
-        )
-        .unwrap();
-
-        assert!(semantic_inserted > 0);
-        assert_eq!(
-            artifact_inserted, semantic_inserted,
-            "both depths must import the same ancestry; only the replay differs"
-        );
-
-        let semantic_change = hydrated_tip_change(&semantic_graph, &semantic_oid);
-        let artifact_change = hydrated_tip_change(&artifact_graph, &artifact_oid);
-
-        assert!(
-            !semantic_change.entity_deltas.is_empty(),
-            "semantic hydration must replay per-commit entity deltas"
-        );
-        assert!(
-            artifact_change.entity_deltas.is_empty(),
-            "artifact-only hydration must not run the per-commit semantic replay"
-        );
-        assert!(
-            !artifact_change.artifact_deltas.is_empty(),
-            "artifact-only hydration must still import artifact deltas: the ref view and co-change mining read them"
-        );
-        assert!(
-            !artifact_layout
-                .root()
-                .join("checkpoints/history-hydration")
-                .exists(),
-            "artifact-only hydration must not open a hydration checkpoint store"
-        );
-    }
-
-    /// The regression this guards: the four public entry points must stay
-    /// distinct. `_for_locate*` resolves at artifact-only depth for scope and
-    /// `locate --ref`; the plain variants stay semantic for `history`, `blame`,
-    /// and `review`, which read the deltas the replay produces.
-    #[test]
-    fn locate_entry_points_resolve_at_artifact_only_depth_and_others_stay_semantic() {
-        let Some((locate_graph, locate_layout, locate_oid)) = single_commit_repo_for_hydration()
-        else {
-            return;
-        };
-        let Some((locate_report_graph, locate_report_layout, locate_report_oid)) =
-            single_commit_repo_for_hydration()
-        else {
-            return;
-        };
-        let Some((standard_graph, standard_layout, standard_oid)) =
-            single_commit_repo_for_hydration()
-        else {
-            return;
-        };
-        let Some((prepared_graph, prepared_layout, prepared_oid)) =
-            single_commit_repo_for_hydration()
-        else {
-            return;
-        };
-
-        resolve_ref_importing_git_if_needed_for_locate(
-            &locate_graph,
-            &locate_layout,
-            Some(&locate_oid),
-        )
-        .unwrap();
-        let locate_report = resolve_ref_importing_git_if_needed_for_locate_with_report(
-            &locate_report_graph,
-            &locate_report_layout,
-            Some(&locate_report_oid),
-        )
-        .unwrap();
-        let standard_report = resolve_ref_importing_git_if_needed_with_report(
-            &standard_graph,
-            &standard_layout,
-            Some(&standard_oid),
-        )
-        .unwrap();
-        let prepared = prepare_ref_importing_git_if_needed_with_report(
-            &prepared_graph,
-            &prepared_layout,
-            Some(&prepared_oid),
-        );
-
-        assert!(locate_report.hydrated_changes > 0);
-        assert!(standard_report.hydrated_changes > 0);
-        assert!(prepared.hydrated_changes > 0);
-        prepared.into_result().unwrap();
-
-        for (graph, oid, label) in [
-            (&locate_graph, &locate_oid, "resolve_..._for_locate"),
-            (
-                &locate_report_graph,
-                &locate_report_oid,
-                "resolve_..._for_locate_with_report",
-            ),
-        ] {
-            assert!(
-                hydrated_tip_change(graph, oid).entity_deltas.is_empty(),
-                "{label} must hydrate at artifact-only depth; otherwise it runs the deep per-commit replay whose deltas scope and locate --ref never read"
-            );
-        }
-
-        for (graph, oid, label) in [
-            (&standard_graph, &standard_oid, "resolve_..._with_report"),
-            (&prepared_graph, &prepared_oid, "prepare_..._with_report"),
-        ] {
-            assert!(
-                !hydrated_tip_change(graph, oid).entity_deltas.is_empty(),
-                "{label} must keep full semantic hydration; history, blame, and review read these deltas"
-            );
-        }
-    }
-
-    /// Graph-integrity parity: the artifact-only path runs no semantic replay,
-    /// so the replay's own preflight cannot be what protects it. A corrupt
-    /// imported window must still be refused before anything is written.
-    #[test]
-    fn artifact_only_hydration_still_refuses_a_dangling_parent_before_graph_write() {
-        let Some((graph, layout, git_oid)) = single_commit_repo_for_hydration() else {
-            return;
-        };
-        let imported_id = kin_git::semantic_change_id_from_git_oid_hex(&git_oid).unwrap();
-        let dangling = SemanticChangeId::from_hash(kin_model::Hash256::from_bytes([0xee; 32]));
-
-        let error = hydrate_imported_git_ref_with(
-            &graph,
-            &layout,
-            &git_oid,
-            HydrationDepth::ArtifactOnly,
-            |imported, blob_store, kin_root| {
-                imported[0].change.parents = vec![dangling];
-                skip_imported_semantics(imported, blob_store, kin_root)
-            },
-        )
-        .unwrap_err();
-
-        assert!(
-            error.to_string().contains("names parent"),
-            "artifact-only hydration lost its parent-admission guard: {error:#}"
-        );
-        assert!(
-            graph.get_change(&imported_id).unwrap().is_none(),
-            "a refused imported window must leave the graph untouched"
-        );
-    }
-
-    #[test]
-    fn resolve_ref_accepts_imported_git_commit_sha() {
-        let graph = InMemoryGraph::new();
-        let layout = temp_layout();
-        let git_oid = "1111111111111111111111111111111111111111";
-        let imported_id = kin_git::semantic_change_id_from_git_oid_hex(git_oid).unwrap();
-        graph
-            .create_change(&SemanticChange {
-                id: imported_id,
-                parents: vec![],
-                timestamp: Timestamp::now(),
-                author: AuthorId::new("test"),
-                message: "imported git commit".to_string(),
-                entity_deltas: vec![],
-                relation_deltas: vec![],
-                artifact_deltas: vec![],
-                projected_files: vec![],
-                spec_link: None,
-                evidence: vec![],
-                risk_summary: None,
-                authored_on: None,
-            })
-            .unwrap();
-
-        let resolved = resolve_ref(&graph, &layout, Some(git_oid)).unwrap();
-        assert_eq!(resolved, imported_id);
-    }
-
-    #[test]
-    fn resolve_ref_accepts_prefixed_git_commit_sha() {
-        let graph = InMemoryGraph::new();
-        let layout = temp_layout();
-        let git_oid = "1111111111111111111111111111111111111111";
-        let imported_id = kin_git::semantic_change_id_from_git_oid_hex(git_oid).unwrap();
-        graph
-            .create_change(&SemanticChange {
-                id: imported_id,
-                parents: vec![],
-                timestamp: Timestamp::now(),
-                author: AuthorId::new("test"),
-                message: "imported git commit".to_string(),
-                entity_deltas: vec![],
-                relation_deltas: vec![],
-                artifact_deltas: vec![],
-                projected_files: vec![],
-                spec_link: None,
-                evidence: vec![],
-                risk_summary: None,
-                authored_on: None,
-            })
-            .unwrap();
-
-        let resolved = resolve_ref(&graph, &layout, Some(&format!("git:{git_oid}"))).unwrap();
-        assert_eq!(resolved, imported_id);
-    }
-
-    #[test]
-    fn resolve_ref_accepts_prefixed_change_id() {
-        let graph = InMemoryGraph::new();
-        let layout = temp_layout();
-        let change = SemanticChange {
-            id: SemanticChangeId::from_hash(Hash256::from_bytes([0x41; 32])),
-            parents: vec![],
-            timestamp: Timestamp::now(),
-            author: AuthorId::new("test"),
-            message: "kin change".to_string(),
-            entity_deltas: vec![],
-            relation_deltas: vec![],
-            artifact_deltas: vec![],
-            projected_files: vec![],
-            spec_link: None,
-            evidence: vec![],
-            risk_summary: None,
-            authored_on: None,
-        };
-        graph.create_change(&change).unwrap();
-
-        let resolved = resolve_ref(&graph, &layout, Some(&format!("kin:{}", change.id))).unwrap();
-        assert_eq!(resolved, change.id);
-    }
-
-    #[test]
-    fn resolve_ref_accepts_prefixed_branch_name() {
-        let graph = InMemoryGraph::new();
-        let layout = temp_layout();
-        let change = SemanticChange {
-            id: SemanticChangeId::from_hash(Hash256::from_bytes([0x52; 32])),
-            parents: vec![],
-            timestamp: Timestamp::now(),
-            author: AuthorId::new("test"),
-            message: "branch tip".to_string(),
-            entity_deltas: vec![],
-            relation_deltas: vec![],
-            artifact_deltas: vec![],
-            projected_files: vec![],
-            spec_link: None,
-            evidence: vec![],
-            risk_summary: None,
-            authored_on: None,
-        };
-        graph.create_change(&change).unwrap();
-        let branch = Branch {
-            name: BranchName::new("feature/history"),
-            head: change.id,
-        };
-        graph.create_branch(&branch).unwrap();
-
-        let resolved = resolve_ref(&graph, &layout, Some("branch:feature/history")).unwrap();
-        assert_eq!(resolved, branch.head);
-    }
-
-    fn make_change(id: SemanticChangeId, parents: Vec<SemanticChangeId>) -> SemanticChange {
+    fn change_with_id(id: SemanticChangeId, parents: Vec<SemanticChangeId>) -> SemanticChange {
         SemanticChange {
             id,
+            origin: ChangeOrigin::Native,
             parents,
             timestamp: Timestamp::now(),
             author: AuthorId::new("test"),
             message: "test change".to_string(),
-            entity_deltas: vec![],
-            relation_deltas: vec![],
-            artifact_deltas: vec![],
-            projected_files: vec![],
+            entity_deltas: Vec::new(),
+            relation_deltas: Vec::new(),
+            tree_deltas: Vec::new(),
+            admission_policy_delta: None,
+            projected_files: Vec::new(),
             spec_link: None,
-            evidence: vec![],
+            evidence: Vec::new(),
             risk_summary: None,
-            authored_on: None,
         }
     }
 
@@ -1692,188 +399,61 @@ mod tests {
         SemanticChangeId::from_hash(Hash256::from_bytes([byte; 32]))
     }
 
-    /// A layout with `main` checked out as the current branch, backed by a
-    /// native chain `grandparent <- parent <- head`, where `head` is a merge
-    /// of `parent` and `other_parent` (so `^2`-style parent selection has
-    /// something real to select).
-    fn temp_layout_on_main(graph: &InMemoryGraph) -> (kin_core::KinLayout, [SemanticChangeId; 4]) {
-        let layout = temp_layout();
-        kin_core::write_current_branch(&layout, &BranchName::new("main")).unwrap();
-
-        let grandparent = change_id(0x01);
-        let parent = change_id(0x02);
-        let other_parent = change_id(0x03);
-        let head = change_id(0x04);
-
-        graph
-            .create_change(&make_change(grandparent, vec![]))
-            .unwrap();
-        graph
-            .create_change(&make_change(parent, vec![grandparent]))
-            .unwrap();
-        graph
-            .create_change(&make_change(other_parent, vec![]))
-            .unwrap();
-        graph
-            .create_change(&make_change(head, vec![parent, other_parent]))
-            .unwrap();
-        graph
-            .create_branch(&Branch {
-                name: BranchName::new("main"),
-                head,
-            })
-            .unwrap();
-
-        (layout, [grandparent, parent, other_parent, head])
-    }
-
-    // ── Caret/tilde/relative-ref peeling ──
-
-    #[test]
-    fn resolve_ref_head_caret_matches_head_tilde_one() {
-        let graph = InMemoryGraph::new();
-        let (layout, [_grandparent, parent, _other_parent, _head]) = temp_layout_on_main(&graph);
-
-        let caret = resolve_ref(&graph, &layout, Some("HEAD^")).unwrap();
-        let tilde = resolve_ref(&graph, &layout, Some("HEAD~1")).unwrap();
-        assert_eq!(caret, parent, "HEAD^ must select the first parent");
-        assert_eq!(caret, tilde, "HEAD^ and HEAD~1 must agree");
+    fn absent_binding(layout: &kin_core::KinLayout) -> kin_core::LocalRepositoryAuthorityBinding {
+        kin_core::LocalRepositoryAuthorityBinding::from_parts(
+            kin_model::RepositoryId::new("absent-ref-lookup").unwrap(),
+            kin_model::WorkspaceId::new(),
+            Arc::new(LocalFileBackend::new(layout.kindb_dir())),
+        )
     }
 
     #[test]
-    fn resolve_ref_caret_n_selects_that_parent_by_position() {
-        let graph = InMemoryGraph::new();
-        let (layout, [_grandparent, parent, other_parent, _head]) = temp_layout_on_main(&graph);
+    fn explicit_semantic_change_and_parent_hops_need_no_file_or_git_fallback() {
+        let graph = kin_db::InMemoryGraph::new();
+        let parent_change = change(Vec::new());
+        let head_change = change(vec![parent_change.id]);
+        let parent = parent_change.id;
+        let head = head_change.id;
+        graph.create_change(&parent_change).unwrap();
+        graph.create_change(&head_change).unwrap();
+        let layout = kin_core::KinLayout::new(std::path::PathBuf::from("/absent/.kin"));
+        let binding = absent_binding(&layout);
 
-        let first = resolve_ref(&graph, &layout, Some("HEAD^1")).unwrap();
-        let second = resolve_ref(&graph, &layout, Some("HEAD^2")).unwrap();
         assert_eq!(
-            first, parent,
-            "HEAD^1 must select the first recorded parent"
-        );
-        assert_eq!(
-            second, other_parent,
-            "HEAD^2 must select the second recorded parent (the merged-in side)"
+            resolve_ref(&graph, &binding, Some(&format!("kin:{head}^"))).unwrap(),
+            parent
         );
     }
 
     #[test]
-    fn resolve_ref_chained_hops_walk_in_order() {
-        let graph = InMemoryGraph::new();
-        let (layout, [grandparent, _parent, _other_parent, _head]) = temp_layout_on_main(&graph);
-
-        let resolved = resolve_ref(&graph, &layout, Some("HEAD^1~1")).unwrap();
-        assert_eq!(
-            resolved, grandparent,
-            "HEAD^1~1 is first-parent then first-parent again"
-        );
-
-        let resolved_bare = resolve_ref(&graph, &layout, Some("HEAD^^")).unwrap();
-        assert_eq!(
-            resolved_bare, grandparent,
-            "HEAD^^ is two first-parent hops, same as HEAD^1~1 here"
-        );
+    fn head_without_repository_authority_is_a_classified_failure() {
+        let graph = kin_db::InMemoryGraph::new();
+        let layout = kin_core::KinLayout::new(std::path::PathBuf::from("/absent/.kin"));
+        let binding = absent_binding(&layout);
+        let error = resolve_ref(&graph, &binding, None).unwrap_err();
+        assert!(is_ref_resolution_error(&error));
+        assert!(error.to_string().contains("repository-v6 authority"));
     }
 
     #[test]
-    fn resolve_ref_tilde_n_desugars_to_n_first_parent_hops() {
-        let graph = InMemoryGraph::new();
-        let (layout, [grandparent, _parent, _other_parent, _head]) = temp_layout_on_main(&graph);
-
-        let resolved = resolve_ref(&graph, &layout, Some("HEAD~2")).unwrap();
-        assert_eq!(resolved, grandparent);
-    }
-
-    #[test]
-    fn resolve_ref_hop_past_history_start_fails_cleanly_not_opaque() {
-        let graph = InMemoryGraph::new();
-        let (layout, _ids) = temp_layout_on_main(&graph);
-
-        let err = resolve_ref(&graph, &layout, Some("HEAD~50")).unwrap_err();
+    fn full_git_oid_is_not_converted_into_a_synthetic_change_id() {
+        let graph = kin_db::InMemoryGraph::new();
+        let layout = kin_core::KinLayout::new(std::path::PathBuf::from("/absent/.kin"));
+        let binding = absent_binding(&layout);
+        let error = resolve_ref(
+            &graph,
+            &binding,
+            Some("1111111111111111111111111111111111111111"),
+        )
+        .unwrap_err();
+        assert!(is_ref_resolution_error(&error));
+        // The object ID must reach exact alias authority and be refused there.
+        // Silently widening it into a semantic change id would invent history.
         assert!(
-            is_ref_resolution_error(&err),
-            "a hop past the start of history must be a RefResolutionError, not an opaque error: {err:#}"
+            error
+                .to_string()
+                .contains("has no imported repository-v6 alias"),
+            "{error:#}"
         );
-    }
-
-    #[test]
-    fn resolve_ref_rejects_reflog_upstream_syntax_cleanly() {
-        let graph = InMemoryGraph::new();
-        let (layout, _ids) = temp_layout_on_main(&graph);
-
-        let err = resolve_ref(&graph, &layout, Some("HEAD@{upstream}")).unwrap_err();
-        assert!(
-            is_ref_resolution_error(&err),
-            "unsupported '@{{...}}' syntax must fail as a clean ref-resolution error, not panic or 500: {err:#}"
-        );
-    }
-
-    #[test]
-    fn resolve_ref_unknown_ref_is_classified_as_ref_resolution_error() {
-        let graph = InMemoryGraph::new();
-        let layout = temp_layout();
-
-        let err = resolve_ref(&graph, &layout, Some("this-branch-does-not-exist")).unwrap_err();
-        assert!(
-            is_ref_resolution_error(&err),
-            "an unknown ref must be classified as a client-input error: {err:#}"
-        );
-    }
-
-    #[test]
-    fn resolve_ref_caret_applies_after_any_core_form_not_just_head() {
-        let graph = InMemoryGraph::new();
-        let layout = temp_layout();
-        let git_oid = "2222222222222222222222222222222222222222";
-        let imported_id = kin_git::semantic_change_id_from_git_oid_hex(git_oid).unwrap();
-        let parent_id = change_id(0x09);
-        graph
-            .create_change(&make_change(parent_id, vec![]))
-            .unwrap();
-        graph
-            .create_change(&make_change(imported_id, vec![parent_id]))
-            .unwrap();
-
-        let resolved = resolve_ref(&graph, &layout, Some(&format!("{git_oid}^"))).unwrap();
-        assert_eq!(
-            resolved, parent_id,
-            "relative hops must apply after any resolved core ref, not just HEAD"
-        );
-    }
-
-    #[test]
-    fn split_relative_hops_parses_caret_and_tilde_chains() {
-        let (core, hops) = split_relative_hops("HEAD").unwrap();
-        assert_eq!(core, "HEAD");
-        assert!(hops.is_empty());
-
-        let (core, hops) = split_relative_hops("HEAD^").unwrap();
-        assert_eq!(core, "HEAD");
-        assert_eq!(hops.len(), 1);
-        assert_eq!(hops[0].0, 1);
-
-        let (core, hops) = split_relative_hops("HEAD^2").unwrap();
-        assert_eq!(core, "HEAD");
-        assert_eq!(hops.len(), 1);
-        assert_eq!(hops[0].0, 2);
-
-        let (core, hops) = split_relative_hops("HEAD~3").unwrap();
-        assert_eq!(core, "HEAD");
-        assert_eq!(hops.len(), 3);
-        assert!(hops.iter().all(|h| h.0 == 1));
-
-        let (core, hops) = split_relative_hops("HEAD~2^").unwrap();
-        assert_eq!(core, "HEAD");
-        assert_eq!(hops.len(), 3);
-        assert!(hops.iter().all(|h| h.0 == 1));
-    }
-
-    #[test]
-    fn extract_git_ref_recognizes_hop_suffixed_sha() {
-        let sha = "3333333333333333333333333333333333333333";
-        assert_eq!(extract_git_ref(&format!("{sha}~2")), Some(sha));
-        assert_eq!(extract_git_ref(&format!("git:{sha}^")), Some(sha));
-        assert_eq!(extract_git_ref("HEAD^"), None);
-        assert_eq!(extract_git_ref("HEAD@{upstream}"), None);
     }
 }

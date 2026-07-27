@@ -3,13 +3,16 @@
 
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
 
+use kin_model::change::TreeEntry;
 use kin_model::entity::{Entity, EntityKind, SourceSpan};
 use kin_model::graph::{EntityFilter, GraphStore};
-use kin_model::ids::{EntityId, Hash256, IntentId, LanguageId, SemanticChangeId, SessionId};
+use kin_model::ids::{
+    EntityId, Hash256, IntentId, LanguageId, RepoPath, SemanticChangeId, SessionId,
+};
 use kin_model::relation::{GraphNodeId, RelationKind};
 use kin_model::session::{IntentScope, LockType, SessionCapabilities, SessionTransport};
+use kin_model::ArtifactId;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub static GRAPH_MISS_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -20,6 +23,7 @@ thread_local! {
 }
 
 use crate::error::{McpError, Result};
+use kin_core::LocalRepositoryAuthorityBinding;
 use kin_spine::{classify_spine_probe, SpineProbe, SpineQuery};
 
 // ── Parameter extraction helpers ──
@@ -167,10 +171,9 @@ pub async fn fetch_spine_impact_typed(
         Err(e) => return SpineQuery::Unavailable(format!("failed to build reqwest client: {e}")),
     };
 
-    let resp = match crate::daemon_delegate::with_auth(client.get(format!(
-        "{}/v1/spine/impact",
-        daemon_url.trim_end_matches('/')
-    )))
+    let resp = match crate::daemon_delegate::with_auth(
+        client.get(format!("{}/spine/impact", daemon_url.trim_end_matches('/'))),
+    )
     .query(&[
         ("repo", repo_id),
         ("entity", &entity_id.to_string()),
@@ -213,10 +216,9 @@ pub async fn fetch_spine_xref(
         Err(e) => return SpineQuery::Unavailable(format!("failed to build reqwest client: {e}")),
     };
 
-    let resp = match crate::daemon_delegate::with_auth(client.get(format!(
-        "{}/v1/spine/xref",
-        daemon_url.trim_end_matches('/')
-    )))
+    let resp = match crate::daemon_delegate::with_auth(
+        client.get(format!("{}/spine/xref", daemon_url.trim_end_matches('/'))),
+    )
     .query(&[("repo", repo_id), ("entity", &entity_id.to_string())])
     .send()
     .await
@@ -415,9 +417,21 @@ pub fn collect_primary_trace_chain<G: GraphStore>(
     Ok(chain)
 }
 
-pub fn trace_body<G: GraphStore>(store: &G, entity: &Entity) -> String {
-    read_entity_source_excerpt_detailed(store, entity, MCP_SOURCE_MAX_LINES, MCP_SOURCE_MAX_CHARS)
-        .unwrap_or_else(|| entity.signature.clone())
+pub fn trace_body<G: GraphStore>(
+    store: &G,
+    entity: &Entity,
+    repository_authority: Option<&LocalRepositoryAuthorityBinding>,
+) -> Result<String> {
+    Ok(read_entity_source_excerpt_detailed(
+        store,
+        entity,
+        MCP_SOURCE_MAX_LINES,
+        MCP_SOURCE_MAX_CHARS,
+        repository_authority,
+        EntitySourceScope::WorkspaceHead,
+    )?
+    .map(|source| source.body)
+    .unwrap_or_else(|| entity.signature.clone()))
 }
 
 pub fn looks_like_constant_identifier(token: &str) -> bool {
@@ -784,12 +798,15 @@ pub fn evaluate_trace_chain<G: GraphStore>(
     store: &G,
     chain: &[Entity],
     input_literal: i64,
+    repository_authority: Option<&LocalRepositoryAuthorityBinding>,
 ) -> Result<Option<Vec<TraceEvaluationStep>>> {
     let mut constant_values = HashMap::new();
     for step in chain {
-        let body = trace_body(store, step);
+        let body = trace_body(store, step, repository_authority)?;
         for constant in trace_constants_for_step(store, step, &body)? {
-            if let Some(value) = parse_trace_constant_value(&trace_body(store, &constant)) {
+            if let Some(value) =
+                parse_trace_constant_value(&trace_body(store, &constant, repository_authority)?)
+            {
                 constant_values
                     .entry(constant.name.clone())
                     .or_insert(value);
@@ -801,7 +818,7 @@ pub fn evaluate_trace_chain<G: GraphStore>(
     let mut evaluation = Vec::new();
 
     for step in chain.iter().rev() {
-        let body = trace_body(store, step);
+        let body = trace_body(store, step, repository_authority)?;
         let Some((value, detail)) =
             evaluate_trace_step_body(&body, input_literal, &function_values, &constant_values)
         else {
@@ -914,6 +931,7 @@ pub fn collect_graph_reference_rows<G: GraphStore>(
     store: &G,
     entity_id: &EntityId,
     relation_kinds: &[RelationKind],
+    repository_authority: Option<&LocalRepositoryAuthorityBinding>,
 ) -> Result<Vec<ReferenceRow>> {
     let allowed: std::collections::HashSet<_> = relation_kinds.iter().copied().collect();
     let mut grouped: HashMap<String, ReferenceRow> = HashMap::new();
@@ -937,6 +955,12 @@ pub fn collect_graph_reference_rows<G: GraphStore>(
 
         let file_path = entity.file_origin.as_ref().map(|path| path.0.clone());
         let key = reference_row_key(file_path.as_deref(), &entity.name);
+        let snippet = read_bounded_entity_snippet(
+            store,
+            &entity,
+            repository_authority,
+            EntitySourceScope::WorkspaceHead,
+        )?;
         let entry = grouped.entry(key).or_insert_with(|| ReferenceRow {
             entity_id: Some(source_entity_id.to_string()),
             name: entity.name.clone(),
@@ -947,7 +971,7 @@ pub fn collect_graph_reference_rows<G: GraphStore>(
             // Project the caller's bounded body once, where the entity is in
             // hand, so `find_references` hands back act-on-able code per caller
             // without a follow-up id→body round-trip.
-            snippet: read_bounded_entity_snippet(store, &entity),
+            snippet,
             relation_kinds: Vec::new(),
         });
         if entry.file_path.is_none() {
@@ -984,25 +1008,6 @@ pub fn push_reference_kind(kinds: &mut Vec<RelationKind>, kind: RelationKind) {
     }
 }
 
-pub fn candidate_source_roots() -> Vec<PathBuf> {
-    let mut roots = Vec::new();
-
-    if let Some(root) = std::env::var_os("KIN_SOURCE_ROOT") {
-        let root = PathBuf::from(root);
-        if root.is_dir() {
-            roots.push(root);
-        }
-    }
-
-    if let Ok(cwd) = std::env::current_dir() {
-        if cwd.is_dir() && !roots.iter().any(|root| root == &cwd) {
-            roots.push(cwd);
-        }
-    }
-
-    roots
-}
-
 pub fn display_read_path(rel_path: &str) -> String {
     if std::env::var_os("KIN_SOURCE_ROOT").is_some() {
         format!(".kin/source-root/{rel_path}")
@@ -1018,63 +1023,244 @@ pub fn entity_read_path(entity: &Entity) -> Option<String> {
         .map(|path| display_read_path(path.0.as_str()))
 }
 
+#[derive(Debug)]
+pub struct ExactEntitySource {
+    pub body: String,
+    pub source_change_id: SemanticChangeId,
+    pub artifact_id: ArtifactId,
+    pub path: RepoPath,
+    pub entry: TreeEntry,
+}
+
+fn record_graph_source_gap(error: McpError) -> McpError {
+    GRAPH_MISS_COUNT.fetch_add(1, Ordering::SeqCst);
+    LAST_READ_SOURCE.with(|source| source.set("graph-miss"));
+    error
+}
+
+fn graph_source_gap(message: impl Into<String>) -> McpError {
+    record_graph_source_gap(McpError::Context(format!(
+        "graph authority gap: {}",
+        message.into()
+    )))
+}
+
+/// The committed repository change a source projection resolves against.
+///
+/// `EntitySourceScope::WorkspaceHead` reads the active workspace head and is
+/// what every HEAD-scoped surface wants.
+///
+/// `EntitySourceScope::At(change)` reads a specific committed change and is
+/// mandatory whenever `store` is a ref-scoped historical view: such a view holds
+/// only the changes reachable from its ref, so resolving an entity revision or a
+/// tree against the workspace head is both the wrong history and a hard
+/// graph-store miss for any ref that is not the head itself.
+/// Deliberately has no `Default`: a caller that has not decided which change it
+/// reads at has not decided whether its answer is history or head.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntitySourceScope {
+    WorkspaceHead,
+    At(SemanticChangeId),
+}
+
+impl EntitySourceScope {
+    /// Resolve the change this scope names, consulting repository authority only
+    /// for the workspace-head case.
+    fn resolve(
+        self,
+        authority: &super::repository_authority::ActiveRepositoryAuthority,
+    ) -> Result<SemanticChangeId> {
+        match self {
+            EntitySourceScope::WorkspaceHead => authority.current_source_change_id(),
+            EntitySourceScope::At(change_id) => Ok(change_id),
+        }
+    }
+}
+
+fn resolve_entity_source_authority<G: GraphStore>(
+    store: &G,
+    entity: &Entity,
+    repository_authority: Option<&LocalRepositoryAuthorityBinding>,
+    scope: EntitySourceScope,
+) -> Result<Option<(ExactEntitySource, Vec<u8>, SourceSpan)>> {
+    LAST_READ_STALE.with(|f| f.set(false));
+    LAST_READ_SOURCE.with(|f| f.set("unknown"));
+
+    let Some(recorded_span) = entity.span.as_ref() else {
+        return Ok(None);
+    };
+    let Some(recorded_origin) = entity.file_origin.as_ref() else {
+        return Ok(None);
+    };
+    if &recorded_span.file != recorded_origin {
+        return Err(graph_source_gap(format!(
+            "entity {} has divergent file_origin '{}' and span file '{}'",
+            entity.id, recorded_origin.0, recorded_span.file.0
+        )));
+    }
+
+    let authority = super::repository_authority::ActiveRepositoryAuthority::open(
+        repository_authority.ok_or_else(|| {
+            graph_source_gap(
+                "this MCP runtime has no startup-pinned local repository authority binding",
+            )
+        })?,
+    )
+    .map_err(record_graph_source_gap)?;
+    let source_change_id = scope.resolve(&authority)?;
+    // Replay the COMPLETE first-parent history at the source change, then read
+    // this entity's active revision out of that state. `resolve_entity_revision_at`
+    // is not usable here: it replays only the changes that mention this entity,
+    // yet validates every delta those changes carry. A change that introduces
+    // this entity while removing or modifying another one is then checked
+    // against a state the other entity's own history was filtered out of, and a
+    // sound repository reports a false history conflict. Resolving the whole
+    // state also yields the tree at the same change, so this replaces the
+    // separate tree resolution below rather than adding to it.
+    let committed = store.resolve_graph_at(&source_change_id).map_err(|error| {
+        graph_source_gap(format!(
+            "cannot resolve committed repository state at {source_change_id}: {error}"
+        ))
+    })?;
+    let revision = committed
+        .entity_revisions
+        .get(&entity.id)
+        .and_then(|revisions| {
+            revisions
+                .iter()
+                .rev()
+                .find(|revision| revision.ended_by.is_none())
+        })
+        .cloned()
+        .ok_or_else(|| {
+            graph_source_gap(format!(
+                "entity {} has no active committed revision at {}",
+                entity.id, source_change_id
+            ))
+        })?;
+    if revision.entity.file_origin != entity.file_origin || revision.entity.span != entity.span {
+        return Err(graph_source_gap(format!(
+            "retrieval entity {} is not the active committed revision at {}",
+            entity.id, source_change_id
+        )));
+    }
+
+    let path = RepoPath::from_utf8(recorded_origin.0.clone()).map_err(|error| {
+        graph_source_gap(format!(
+            "entity {} has an invalid repository path '{}': {error}",
+            entity.id, recorded_origin.0
+        ))
+    })?;
+    let current_tree = committed.tree;
+    let current_artifact = current_tree.artifact_at_path(&path).ok_or_else(|| {
+        graph_source_gap(format!(
+            "entity {} points at '{}' but that path is absent at {}",
+            entity.id, recorded_origin.0, source_change_id
+        ))
+    })?;
+
+    // Bind the entity revision to the artifact identity that occupied its path
+    // when that revision was introduced. A later path reuse must not make an
+    // old entity read bytes from a different artifact.
+    let introduced_tree = store
+        .resolve_tree_at(&revision.introduced_by)
+        .map_err(|error| {
+            graph_source_gap(format!(
+                "cannot resolve entity {} introduction tree at {}: {error}",
+                entity.id, revision.introduced_by
+            ))
+        })?;
+    let introduced_artifact = introduced_tree.artifact_at_path(&path).ok_or_else(|| {
+        graph_source_gap(format!(
+            "entity {} revision {} was introduced without an artifact at '{}'",
+            entity.id, revision.revision_id, recorded_origin.0
+        ))
+    })?;
+    if introduced_artifact.artifact_id != current_artifact.artifact_id {
+        return Err(graph_source_gap(format!(
+            "path '{}' was reused: entity {} is bound to artifact {:?}, current artifact is {:?}",
+            recorded_origin.0,
+            entity.id,
+            introduced_artifact.artifact_id,
+            current_artifact.artifact_id
+        )));
+    }
+
+    let TreeEntry::Blob { hash, .. } = current_artifact.entry else {
+        return Err(graph_source_gap(format!(
+            "entity {} resolves to non-source tree entry {:?} for artifact {:?}",
+            entity.id, current_artifact.entry, current_artifact.artifact_id
+        )));
+    };
+    let bytes = authority.load_source_blob(hash).map_err(|error| {
+        graph_source_gap(format!(
+            "blob {hash} for entity {} artifact {:?} is unavailable or corrupt: {error}",
+            entity.id, current_artifact.artifact_id
+        ))
+    })?;
+    let span = revision
+        .entity
+        .span
+        .clone()
+        .expect("active source revision was checked for a span");
+    if span.start_byte >= span.end_byte || span.end_byte > bytes.len() {
+        return Err(graph_source_gap(format!(
+            "entity {} span {}..{} is invalid for artifact {:?} ({} bytes)",
+            entity.id,
+            span.start_byte,
+            span.end_byte,
+            current_artifact.artifact_id,
+            bytes.len()
+        )));
+    }
+    LAST_READ_SOURCE.with(|f| f.set("graph"));
+    Ok(Some((
+        ExactEntitySource {
+            body: String::new(),
+            source_change_id,
+            artifact_id: current_artifact.artifact_id,
+            path,
+            entry: current_artifact.entry,
+        },
+        bytes,
+        span,
+    )))
+}
+
 pub fn read_entity_source_excerpt_detailed<G: GraphStore>(
     store: &G,
     entity: &Entity,
     max_lines: usize,
     max_chars: usize,
-) -> Option<String> {
-    LAST_READ_STALE.with(|f| f.set(false));
-    LAST_READ_SOURCE.with(|f| f.set("unknown"));
-
-    let span = entity.span.as_ref()?;
-
-    // Retrieve graph hash
-    let graph_hash = if let Some(ref file_origin) = entity.file_origin {
-        store.get_file_hash(file_origin).ok().flatten()
-    } else {
-        None
+    repository_authority: Option<&LocalRepositoryAuthorityBinding>,
+    scope: EntitySourceScope,
+) -> Result<Option<ExactEntitySource>> {
+    let Some((mut source, bytes, span)) =
+        resolve_entity_source_authority(store, entity, repository_authority, scope)?
+    else {
+        return Ok(None);
     };
-
-    let mut blob_bytes = None;
-    if let Some(ref hash) = graph_hash {
-        // Look through candidate source roots for a KinLayout
-        for root in candidate_source_roots() {
-            if let Some(layout) = kin_core::KinLayout::discover(&root) {
-                if let Some(bytes) = kin_core::read_blob_from_layout(&layout, hash) {
-                    let actual_hash = kin_blobs::digest(&bytes);
-                    if actual_hash == *hash {
-                        blob_bytes = Some(bytes);
-                        break;
-                    } else {
-                        tracing::warn!(
-                            "Hash mismatch for blob in layout at {:?}: expected {}, got {}",
-                            layout.objects_dir(),
-                            hash,
-                            actual_hash
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    if let Some(bytes) = blob_bytes {
-        LAST_READ_SOURCE.with(|f| f.set("graph"));
-        let excerpt = excerpt_from_span_bytes(&bytes, span, max_lines, max_chars);
-        if let Some(ref excerpt) = excerpt {
-            if !should_expand_excerpt(entity, excerpt) {
-                return Some(excerpt.clone());
-            }
-        }
-        let text = String::from_utf8_lossy(&bytes);
-        return expand_entity_source_excerpt(entity, &text, span.start_byte, max_lines, max_chars)
-            .or(excerpt);
-    }
-
-    GRAPH_MISS_COUNT.fetch_add(1, Ordering::SeqCst);
-    LAST_READ_SOURCE.with(|f| f.set("graph-miss"));
-    None
+    let text = std::str::from_utf8(&bytes).map_err(|error| {
+        graph_source_gap(format!(
+            "artifact {:?} at {} is not valid UTF-8 for semantic source: {error}",
+            source.artifact_id, source.path
+        ))
+    })?;
+    let excerpt = excerpt_from_span_bytes(&bytes, &span, max_lines, max_chars);
+    let body = if excerpt
+        .as_ref()
+        .is_some_and(|excerpt| !should_expand_excerpt(entity, excerpt))
+    {
+        excerpt
+    } else {
+        expand_entity_source_excerpt(entity, text, span.start_byte, max_lines, max_chars)
+            .or(excerpt)
+    };
+    let Some(body) = body else {
+        return Ok(None);
+    };
+    source.body = body;
+    Ok(Some(source))
 }
 
 /// Caps for the inline snippet surfaced on a retrieval hit (`kin locate --json`
@@ -1092,15 +1278,24 @@ pub const RETRIEVAL_SNIPPET_MAX_CHARS: usize = 800;
 /// ([`read_entity_source_excerpt_detailed`]) that backs `get_entity_source` and
 /// `get_context_pack`, capped to
 /// [`RETRIEVAL_SNIPPET_MAX_LINES`]/[`RETRIEVAL_SNIPPET_MAX_CHARS`] for inline use
-/// on retrieval hits. Returns `None` on a graph/blob miss so callers surface the
-/// coordinates without a snippet rather than reading the working tree.
-pub fn read_bounded_entity_snippet<G: GraphStore>(store: &G, entity: &Entity) -> Option<String> {
-    read_entity_source_excerpt_detailed(
+/// on retrieval hits. Returns `None` only when the entity has no source
+/// coordinates. A tree, identity, span, UTF-8, or blob authority gap is an
+/// error; callers must surface it rather than reading the working tree.
+pub fn read_bounded_entity_snippet<G: GraphStore>(
+    store: &G,
+    entity: &Entity,
+    repository_authority: Option<&LocalRepositoryAuthorityBinding>,
+    scope: EntitySourceScope,
+) -> Result<Option<String>> {
+    Ok(read_entity_source_excerpt_detailed(
         store,
         entity,
         RETRIEVAL_SNIPPET_MAX_LINES,
         RETRIEVAL_SNIPPET_MAX_CHARS,
-    )
+        repository_authority,
+        scope,
+    )?
+    .map(|source| source.body))
 }
 
 pub fn excerpt_from_span_bytes(
@@ -1364,6 +1559,7 @@ pub fn clip_rendered_text_with_cap(text: &str, max_lines: usize, max_chars: usiz
 pub fn entity_response_json<G: GraphStore>(
     store: &G,
     entity: &Entity,
+    repository_authority: Option<&LocalRepositoryAuthorityBinding>,
 ) -> Result<serde_json::Value> {
     let mut value = serde_json::to_value(entity).map_err(McpError::Json)?;
     let Some(obj) = value.as_object_mut() else {
@@ -1377,13 +1573,22 @@ pub fn entity_response_json<G: GraphStore>(
         obj.insert("start_line".into(), serde_json::json!(span.start_line));
         obj.insert("end_line".into(), serde_json::json!(span.end_line));
     }
-    if let Some(source_excerpt) = read_entity_source_excerpt_detailed(
+    if let Some(source) = read_entity_source_excerpt_detailed(
         store,
         entity,
         MCP_SOURCE_MAX_LINES,
         MCP_SOURCE_MAX_CHARS,
-    ) {
-        obj.insert("source_excerpt".into(), serde_json::json!(source_excerpt));
+        repository_authority,
+        EntitySourceScope::WorkspaceHead,
+    )? {
+        obj.insert("source_excerpt".into(), serde_json::json!(source.body));
+        obj.insert(
+            "source_change_id".into(),
+            serde_json::json!(source.source_change_id),
+        );
+        obj.insert("artifact_id".into(), serde_json::json!(source.artifact_id));
+        obj.insert("artifact_path".into(), serde_json::json!(source.path));
+        obj.insert("artifact_entry".into(), serde_json::json!(source.entry));
     }
 
     let is_stale = LAST_READ_STALE.with(|f| f.get());
@@ -1399,7 +1604,8 @@ pub fn focal_context_json<G: GraphStore>(
     entry: &kin_model::ContextEntry,
     entity: &Entity,
     compact: bool,
-) -> serde_json::Value {
+    repository_authority: Option<&LocalRepositoryAuthorityBinding>,
+) -> Result<serde_json::Value> {
     let start_line = entity.span.as_ref().map(|span| span.start_line);
     let end_line = entity.span.as_ref().map(|span| span.end_line);
     let source_excerpt = read_entity_source_excerpt_detailed(
@@ -1407,7 +1613,9 @@ pub fn focal_context_json<G: GraphStore>(
         entity,
         MCP_SOURCE_MAX_LINES,
         MCP_SOURCE_MAX_CHARS,
-    );
+        repository_authority,
+        EntitySourceScope::WorkspaceHead,
+    )?;
     let is_stale = LAST_READ_STALE.with(|f| f.get());
     let source = LAST_READ_SOURCE.with(|f| f.get());
 
@@ -1425,10 +1633,19 @@ pub fn focal_context_json<G: GraphStore>(
     });
 
     if !compact {
-        obj["body"] = serde_json::json!(source_excerpt.unwrap_or_else(|| entry.content.clone()));
+        obj["body"] = serde_json::json!(source_excerpt
+            .as_ref()
+            .map(|source| source.body.clone())
+            .unwrap_or_else(|| entry.content.clone()));
+    }
+    if let Some(source) = source_excerpt {
+        obj["source_change_id"] = serde_json::json!(source.source_change_id);
+        obj["artifact_id"] = serde_json::json!(source.artifact_id);
+        obj["artifact_path"] = serde_json::json!(source.path);
+        obj["artifact_entry"] = serde_json::json!(source.entry);
     }
 
-    obj
+    Ok(obj)
 }
 
 // ── Scope/intent parsing ──

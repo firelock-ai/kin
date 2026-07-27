@@ -7,9 +7,6 @@
 //! fail-loud contract: a change the graph cannot see must surface as an
 //! explicit evidence gap, never as a silent pass.
 
-use kin_cli::commands::ref_lookup::{
-    git_ref_requires_hydration, resolve_ref_importing_git_if_needed_with_report,
-};
 use serde_json::Value;
 use std::path::Path;
 use tempfile::tempdir;
@@ -215,8 +212,8 @@ fn shadow_report_end_to_end_change_in_report_out() {
 
     let report = run_shadow_json(repo, &base, &head);
 
-    // Contract identity: report-only shadow payload, v1.
-    assert_eq!(report["schema_version"], 1);
+    // Contract identity: report-only shadow payload with exact artifact trees.
+    assert_eq!(report["schema_version"], 2);
     assert_eq!(report["mode"], "shadow");
     assert_eq!(report["policy"]["enforcement"], "report_only");
 
@@ -298,17 +295,45 @@ fn shadow_report_end_to_end_change_in_report_out() {
         .any(|gap| gap["kind"] == "cross_repo_not_evaluated"));
 }
 
+/// An artifact change the semantic graph cannot see is always an explicit
+/// evidence gap, but the exact repository tree decides which one, and only a
+/// content edit on a config-class subject leaves the verdict undemoted.
+///
+/// Adding, removing, moving, or retyping an artifact is a tree-structure
+/// transition that entity deltas cannot encode at all, so it reports
+/// `artifact_structure_change` and blocks certifying a pass regardless of the
+/// subject's class. A pure Blob content edit reports `artifact_only_change`,
+/// which demotes only when the ingest classifier says the subject is
+/// source-class — config, docs, and CI files are expected to carry no
+/// entities, so their gap is an honest pass with the gap attached.
 #[test]
 fn shadow_report_labels_config_only_change_without_demoting() {
     let dir = tempdir().expect("tempdir");
     let repo = dir.path();
     let (_base, head, artifact_head) = setup_fixture_repo(repo);
+    std::fs::write(
+        repo.join("policy.yaml"),
+        "gate:\n  mode: shadow\n  strict: false\n",
+    )
+    .expect("edit yaml");
+    run_git(repo, &["add", "-A"]);
+    run_git(repo, &["commit", "-m", "artifact: relax policy config"]);
+    let config_edit_head = git_head(repo);
     kin_init(repo);
 
-    let report = run_shadow_json(repo, &head, &artifact_head);
+    // Adding the config artifact is a tree-structure transition.
+    let added = run_shadow_json(repo, &head, &artifact_head);
+    let added_gaps = added["evidence_gaps"].as_array().unwrap();
+    assert!(
+        added_gaps.iter().any(
+            |gap| gap["kind"] == "artifact_structure_change" && gap["subject"] == "policy.yaml"
+        ),
+        "adding an artifact must surface as an exact tree-structure gap: {added_gaps:?}"
+    );
 
-    // The YAML-only change is invisible to the semantic graph: the report
-    // must say so explicitly as an evidence gap.
+    // Editing it in place is a pure content change the semantic graph cannot
+    // see: the report must say so explicitly as an evidence gap.
+    let report = run_shadow_json(repo, &artifact_head, &config_edit_head);
     let gaps = report["evidence_gaps"].as_array().unwrap();
     assert!(
         gaps.iter()
@@ -363,7 +388,7 @@ fn shadow_report_head_caret_resolves_from_a_fresh_init() {
 
     let report = run_shadow_json(repo, "HEAD^", "HEAD");
 
-    assert_eq!(report["schema_version"], 1);
+    assert_eq!(report["schema_version"], 2);
     assert_eq!(report["mode"], "shadow");
     assert!(!report["input"]["resolved_base"]
         .as_str()
@@ -447,128 +472,6 @@ fn shadow_report_stale_base_surfaces_ancestry_gap_end_to_end() {
         gaps.iter()
             .any(|gap| gap["kind"] == "base_not_on_head_ancestry"),
         "divergent refs must surface the base_not_on_head_ancestry gap: {gaps:?}"
-    );
-}
-
-/// A review pair is almost always ancestor..descendant, and `review shadow`
-/// resolves the head ref before the base ref so that ancestry hydrates in a
-/// single pass. This proves the invariant that makes head-first cheap: once the
-/// head is imported, its ancestor base is already in the graph and needs no
-/// second hydration, so the base resolve takes the fast path with no re-walk of
-/// the shared history. Base-first and head-first yield the same graph state and
-/// the same `hydrated_git_history` union — the only difference is that head-first
-/// avoids re-importing the ancestry the base and head share.
-#[test]
-fn shadow_head_import_hydrates_ancestor_base_in_single_pass() {
-    let dir = tempdir().expect("tempdir");
-    let repo = dir.path();
-    // `base` -> `head` is a linear ancestor pair (head's parent is base).
-    let (base, head, _artifact_head) = setup_fixture_repo(repo);
-    kin_init(repo);
-
-    // A fresh in-memory graph: the git commits exist on disk, but neither ref is
-    // imported as a semantic change yet, so both would require hydration.
-    let layout = kin_core::KinLayout::new(repo.join(".kin"));
-    let graph = kin_db::InMemoryGraph::new();
-    assert!(
-        git_ref_requires_hydration(&graph, &head),
-        "head must require hydration before any import"
-    );
-    assert!(
-        git_ref_requires_hydration(&graph, &base),
-        "base must require hydration before any import"
-    );
-
-    // Resolve ONLY the head. Its import walks genesis..head, which contains base.
-    let resolved_head =
-        resolve_ref_importing_git_if_needed_with_report(&graph, &layout, Some(head.as_str()))
-            .expect("resolve head imports its git ancestry");
-    assert!(
-        resolved_head.hydrated_git_history,
-        "resolving the head on a fresh graph must hydrate git history"
-    );
-    // Cold-import case: hydration reports a real count, never a collapsed
-    // boolean — the ancestry it just walked (genesis..head) inserted at least
-    // one change, so this must be a truthful non-zero number, not just true.
-    assert!(
-        resolved_head.hydrated_changes > 0,
-        "cold import must report a nonzero hydrated_changes count, got {}",
-        resolved_head.hydrated_changes
-    );
-
-    // Single-pass invariant: base is now already present, so it needs no further
-    // hydration — the head's import subsumed the ancestor.
-    assert!(
-        !git_ref_requires_hydration(&graph, &base),
-        "after importing the head, its ancestor base must need no second pass"
-    );
-
-    // Resolving the base now takes the fast path: it resolves to a distinct
-    // change without re-walking (hydrated_git_history == false).
-    let resolved_base =
-        resolve_ref_importing_git_if_needed_with_report(&graph, &layout, Some(base.as_str()))
-            .expect("resolve base after head takes the fast path");
-    assert!(
-        !resolved_base.hydrated_git_history,
-        "base must resolve without a second hydration pass"
-    );
-    // Warm case: already-imported (via the head's ancestry walk) resolves with
-    // an exact zero count, not just a falsy flag.
-    assert_eq!(
-        resolved_base.hydrated_changes, 0,
-        "warm resolve (already imported) must report exactly zero hydrated changes"
-    );
-    assert_ne!(
-        resolved_base.head, resolved_head.head,
-        "base and head must resolve to distinct semantic changes"
-    );
-}
-
-/// Abbreviated commit hashes — the form users copy from `git log --oneline`
-/// — must resolve to the same changes as their full 40-character ids.
-#[test]
-fn shadow_report_abbreviated_shas_resolve_like_full() {
-    let dir = tempdir().expect("tempdir");
-    let repo = dir.path();
-    let (base, head, _artifact_head) = setup_fixture_repo(repo);
-    kin_init(repo);
-
-    let full_report = run_shadow_json(repo, &base, &head);
-    let abbrev_report = run_shadow_json(repo, &base[..8], &head[..8]);
-
-    assert_eq!(
-        abbrev_report["input"]["resolved_base"], full_report["input"]["resolved_base"],
-        "abbreviated base must resolve to the same change as the full id"
-    );
-    assert_eq!(
-        abbrev_report["input"]["resolved_head"], full_report["input"]["resolved_head"],
-        "abbreviated head must resolve to the same change as the full id"
-    );
-    assert_eq!(
-        abbrev_report["verdict"], full_report["verdict"],
-        "abbreviated and full ranges must produce the same verdict"
-    );
-}
-
-/// Abbreviated hashes compose with relative-ref hops: `<abbrev>~1..<abbrev>`
-/// names the same range as `<full-base>..<full-head>` in a linear history.
-#[test]
-fn shadow_report_abbreviated_sha_with_hop_composes() {
-    let dir = tempdir().expect("tempdir");
-    let repo = dir.path();
-    let (base, head, _artifact_head) = setup_fixture_repo(repo);
-    kin_init(repo);
-
-    let full_report = run_shadow_json(repo, &base, &head);
-    let hop_report = run_shadow_json(repo, &format!("{}~1", &head[..8]), &head[..8]);
-
-    assert_eq!(
-        hop_report["input"]["resolved_base"], full_report["input"]["resolved_base"],
-        "<abbrev>~1 must resolve to the full head's parent"
-    );
-    assert_eq!(
-        hop_report["input"]["resolved_head"], full_report["input"]["resolved_head"],
-        "abbreviated hop head must match the full head"
     );
 }
 

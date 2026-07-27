@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-//! Workspace runs, validation, and evidence capture for Kin.
+//! Graph-backed session execution, validation, and evidence capture for Kin.
 //!
 //! This crate provides the runtime layer for executing validation commands,
-//! capturing evidence (stdout, stderr, test results), and managing workspace
-//! snapshots for reproducibility.
+//! capturing evidence (stdout, stderr, test results), and materializing
+//! graph-owned repository state for isolated command execution.
 
 pub mod error;
 pub mod evidence;
@@ -16,10 +16,7 @@ pub mod workspace;
 
 pub use error::{Result, RuntimeError};
 pub use evidence::{parse_test_output, store_evidence, CapturedEvidence};
-pub use exec::{cleanup_workspace, exec_in_workspace, ExecContext, ExecResult, MaterializeConfig};
+pub use exec::{ExecContext, ExecResult};
 pub use replay::{extract_replay_metadata, ReplayMetadata};
 pub use run::{create_run, execute_run, RunOptions, RunStatus, ValidationRun};
-pub use workspace::{
-    create_workspace, snapshot_workspace, MaterializeStrategy, MaterializedWorkspace, Workspace,
-    WorkspaceSnapshot,
-};
+pub use workspace::{MaterializeStrategy, MaterializedWorkspace};

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 use std::time::Instant;
 
@@ -9,14 +9,6 @@ use tracing::info;
 
 use crate::error::{Result, RuntimeError};
 use crate::workspace::{MaterializeStrategy, MaterializedWorkspace};
-
-/// Configuration for materializing a workspace.
-#[derive(Debug, Clone, Default)]
-pub struct MaterializeConfig {
-    pub strategy: Option<MaterializeStrategy>,
-    pub keep: bool,
-    pub scope: Option<String>,
-}
 
 /// Result of an execution run.
 #[derive(Debug, Clone)]
@@ -40,6 +32,9 @@ pub struct ExecContext {
 impl ExecContext {
     /// Run the command in the materialized workspace directory.
     pub fn run(&self) -> Result<ExecResult> {
+        self.workspace
+            .revalidate()
+            .map_err(|error| RuntimeError::Other(format!("revalidate exact workspace: {error}")))?;
         let full_command = if self.args.is_empty() {
             self.command.clone()
         } else {
@@ -48,24 +43,32 @@ impl ExecContext {
 
         info!(
             command = %full_command,
-            workspace = %self.workspace.root.display(),
+            workspace = %self.workspace.root().display(),
             "executing in materialized workspace"
         );
 
         let start = Instant::now();
 
-        let output = if cfg!(target_os = "windows") {
-            Command::new("cmd")
-                .args(["/C", &full_command])
-                .current_dir(&self.workspace.root)
-                .output()
-        } else {
-            Command::new("sh")
-                .args(["-c", &full_command])
-                .current_dir(&self.workspace.root)
-                .output()
-        }
-        .map_err(|e| RuntimeError::CommandFailed(e.to_string()))?;
+        #[cfg(target_os = "windows")]
+        let mut command = {
+            let mut command = Command::new("cmd");
+            command.args(["/C", &full_command]);
+            command
+        };
+        #[cfg(not(target_os = "windows"))]
+        let mut command = {
+            let mut command = Command::new("sh");
+            command.args(["-c", &full_command]);
+            command
+        };
+        self.workspace
+            .configure_command_current_dir(&mut command)
+            .map_err(|error| {
+                RuntimeError::Other(format!("bind command to exact workspace: {error}"))
+            })?;
+        let output = command
+            .output()
+            .map_err(|e| RuntimeError::CommandFailed(e.to_string()))?;
 
         let duration_ms = start.elapsed().as_millis() as u64;
 
@@ -74,132 +77,56 @@ impl ExecContext {
             stdout: String::from_utf8_lossy(&output.stdout).to_string(),
             stderr: String::from_utf8_lossy(&output.stderr).to_string(),
             duration_ms,
-            workspace_path: self.workspace.root.clone(),
-            strategy_used: self.workspace.strategy,
+            workspace_path: self.workspace.root().to_path_buf(),
+            strategy_used: self.workspace.strategy(),
         })
     }
-}
-
-/// Materialize a workspace and execute a command in it.
-///
-/// This is the high-level entry point combining workspace materialization + execution.
-pub fn exec_in_workspace(
-    working_dir: &Path,
-    command: &str,
-    config: &MaterializeConfig,
-) -> Result<ExecResult> {
-    let workspace_dir = tempfile::tempdir().map_err(|e| RuntimeError::io(working_dir, e))?;
-    let workspace_path = workspace_dir.path().to_path_buf();
-
-    // Prevent tempdir from being dropped (we manage cleanup ourselves)
-    std::mem::forget(workspace_dir);
-
-    if let Some(ref scope) = config.scope {
-        info!(scope = %scope, "exec scope filter active");
-    }
-
-    let workspace = MaterializedWorkspace::create(
-        working_dir,
-        &workspace_path,
-        config.strategy,
-        config.scope.as_deref(),
-    )?;
-
-    let ctx = ExecContext {
-        workspace,
-        command: command.to_string(),
-        args: Vec::new(),
-    };
-
-    ctx.run()
-}
-
-/// Clean up a workspace directory. Call this after `exec_in_workspace` if `keep` is false.
-pub fn cleanup_workspace(path: &Path) -> Result<()> {
-    if path.exists() {
-        std::fs::remove_dir_all(path).map_err(|e| RuntimeError::io(path, e))?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
 
-    #[test]
-    fn exec_in_workspace_runs_command() {
-        let src = tempfile::tempdir().unwrap();
-        fs::write(src.path().join("data.txt"), "hello world").unwrap();
-
-        let config = MaterializeConfig::default();
-
-        let result = exec_in_workspace(src.path(), "cat data.txt", &config).unwrap();
-
-        assert_eq!(result.exit_code, 0);
-        assert_eq!(result.stdout.trim(), "hello world");
-        assert!(result.stderr.is_empty());
-        assert_ne!(result.workspace_path, src.path());
-        assert!(result.duration_ms < 10_000); // sanity: under 10s
-
-        let _ = cleanup_workspace(&result.workspace_path);
-    }
-
-    #[test]
-    fn exec_in_workspace_captures_exit_code() {
-        let src = tempfile::tempdir().unwrap();
-
-        let config = MaterializeConfig::default();
-
-        let result = exec_in_workspace(src.path(), "exit 42", &config).unwrap();
-
-        assert_eq!(result.exit_code, 42);
-
-        let _ = cleanup_workspace(&result.workspace_path);
-    }
-
-    #[test]
-    fn exec_in_workspace_captures_stderr() {
-        let src = tempfile::tempdir().unwrap();
-
-        let config = MaterializeConfig::default();
-
-        let result = exec_in_workspace(src.path(), "echo err_msg >&2", &config).unwrap();
-
-        assert!(result.stderr.contains("err_msg"));
-
-        let _ = cleanup_workspace(&result.workspace_path);
-    }
-
-    #[test]
-    fn exec_in_workspace_measures_duration() {
-        let src = tempfile::tempdir().unwrap();
-
-        let config = MaterializeConfig::default();
-
-        let result = exec_in_workspace(src.path(), "true", &config).unwrap();
-
-        assert_eq!(result.exit_code, 0);
-        // Duration should be non-negative (it's u64, so always >= 0)
-        assert!(result.duration_ms < 10_000);
-
-        let _ = cleanup_workspace(&result.workspace_path);
+    fn exact_workspace(files: &[(&str, &[u8])]) -> (tempfile::TempDir, MaterializedWorkspace) {
+        let repository = tempfile::tempdir().unwrap();
+        kin_core::init(repository.path()).unwrap();
+        let paths = files
+            .iter()
+            .map(|(path, _)| kin_model::RepoPath::from_utf8((*path).to_string()).unwrap())
+            .collect::<Vec<_>>();
+        let entries = paths
+            .iter()
+            .zip(files.iter())
+            .map(|(path, (_, body))| {
+                (
+                    path,
+                    kin_model::TreeEntry::blob(
+                        kin_model::Hash256::from_bytes(kin_blobs::digest_bytes(body)),
+                        false,
+                    ),
+                    *body,
+                )
+            })
+            .collect::<Vec<_>>();
+        let freeze = kin_core::ExactProjectionFreeze::acquire_existing(repository.path()).unwrap();
+        let (projection, _) = freeze
+            .materialize_session_source_tree(
+                "session-runtime-exec",
+                br#"{"schema":1}"#,
+                entries
+                    .iter()
+                    .map(|(path, entry, body)| (*path, *entry, *body)),
+            )
+            .unwrap();
+        (
+            repository,
+            MaterializedWorkspace::from_exact_session(projection, MaterializeStrategy::Copy),
+        )
     }
 
     #[test]
     fn exec_context_with_args() {
-        let src = tempfile::tempdir().unwrap();
-        fs::write(src.path().join("a.txt"), "aaa").unwrap();
-        fs::write(src.path().join("b.txt"), "bbb").unwrap();
-
-        let dst = tempfile::tempdir().unwrap();
-        let workspace = MaterializedWorkspace::create(
-            src.path(),
-            dst.path(),
-            Some(MaterializeStrategy::Copy),
-            None,
-        )
-        .unwrap();
+        let (_repository, workspace) = exact_workspace(&[("a.txt", b"aaa"), ("b.txt", b"bbb")]);
 
         let ctx = ExecContext {
             workspace,
@@ -215,17 +142,7 @@ mod tests {
 
     #[test]
     fn exec_context_reports_strategy() {
-        let src = tempfile::tempdir().unwrap();
-        fs::write(src.path().join("x.txt"), "x").unwrap();
-
-        let dst = tempfile::tempdir().unwrap();
-        let workspace = MaterializedWorkspace::create(
-            src.path(),
-            dst.path(),
-            Some(MaterializeStrategy::Copy),
-            None,
-        )
-        .unwrap();
+        let (_repository, workspace) = exact_workspace(&[("x.txt", b"x")]);
 
         let ctx = ExecContext {
             workspace,
@@ -237,21 +154,24 @@ mod tests {
         assert_eq!(result.strategy_used, MaterializeStrategy::Copy);
     }
 
+    #[cfg(unix)]
     #[test]
-    fn cleanup_workspace_removes_dir() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.keep(); // prevent auto-cleanup
-        fs::write(path.join("file.txt"), "data").unwrap();
+    fn configured_command_cannot_be_redirected_by_session_path_replacement() {
+        let (_repository, workspace) = exact_workspace(&[("marker.txt", b"authority\n")]);
+        let display_root = workspace.root().to_path_buf();
+        let parked = display_root.with_extension("retained");
+        let mut command = Command::new("sh");
+        command.args(["-c", "cat marker.txt"]);
+        workspace
+            .configure_command_current_dir(&mut command)
+            .unwrap();
 
-        assert!(path.exists());
-        cleanup_workspace(&path).unwrap();
-        assert!(!path.exists());
-    }
+        std::fs::rename(&display_root, &parked).unwrap();
+        std::fs::create_dir(&display_root).unwrap();
+        std::fs::write(display_root.join("marker.txt"), b"replacement\n").unwrap();
 
-    #[test]
-    fn cleanup_nonexistent_is_ok() {
-        let path = PathBuf::from("/tmp/kin-test-nonexistent-cleanup-path");
-        assert!(!path.exists());
-        cleanup_workspace(&path).unwrap(); // should not error
+        let output = command.output().unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"authority\n");
     }
 }

@@ -17,36 +17,6 @@ pub struct BlameResponse {
     pub lines: Vec<String>,
 }
 
-pub struct BlameExecution {
-    pub response: BlameResponse,
-    /// Count of historical changes resolving this request's ref lazily
-    /// hydrated into the graph (0 when the ref was already present, or when
-    /// no ref was supplied and the current head resolved with no import).
-    /// Reported as a real count rather than a swallowed "did anything
-    /// hydrate" boolean, so a cold multi-thousand-change import is never
-    /// described the same way as a no-op: daemon owners persist the hydrated
-    /// state and broadcast the growth on this count being non-zero.
-    pub hydrated_changes: usize,
-}
-
-/// Ref-resolution result prepared before blame rendering begins.
-///
-/// Resolving an unimported Git ref mutates the supplied graph. Daemon callers
-/// must acknowledge `hydrated_changes` (persisting HEAD-owned graphs, or
-/// retaining the mutation only in a scoped session graph) before calling
-/// [`render_prepared_blame_request`], because entity lookup and rendering can
-/// still fail after hydration has succeeded.
-#[derive(Debug)]
-pub struct PreparedBlameRequest {
-    resolution: crate::commands::ref_lookup::PreparedRefResolution,
-}
-
-impl PreparedBlameRequest {
-    pub fn hydrated_changes(&self) -> usize {
-        self.resolution.hydrated_changes
-    }
-}
-
 /// `kin blame <entity>` — Show who/when each version of an entity was committed.
 pub async fn run(entity: String, reference: Option<String>) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
@@ -75,38 +45,12 @@ async fn run_daemon_blame(
 }
 
 pub fn execute_blame_request(
-    layout: &kin_core::KinLayout,
+    binding: &kin_core::LocalRepositoryAuthorityBinding,
     graph: &kin_db::InMemoryGraph,
     request: &BlameRequest,
-) -> Result<BlameExecution> {
-    let prepared = prepare_blame_request(layout, graph, request)?;
-    let hydrated_changes = prepared.hydrated_changes();
-    let response = render_prepared_blame_request(graph, request, prepared)?;
-    Ok(BlameExecution {
-        response,
-        hydrated_changes,
-    })
-}
-
-pub fn prepare_blame_request(
-    layout: &kin_core::KinLayout,
-    graph: &kin_db::InMemoryGraph,
-    request: &BlameRequest,
-) -> Result<PreparedBlameRequest> {
-    let resolution = crate::commands::ref_lookup::prepare_ref_importing_git_if_needed_with_report(
-        graph,
-        layout,
-        request.reference.as_deref(),
-    );
-    Ok(PreparedBlameRequest { resolution })
-}
-
-pub fn render_prepared_blame_request(
-    graph: &kin_db::InMemoryGraph,
-    request: &BlameRequest,
-    prepared: PreparedBlameRequest,
 ) -> Result<BlameResponse> {
-    let head = prepared.resolution.into_result()?.head;
+    let head =
+        crate::commands::ref_lookup::resolve_ref(graph, binding, request.reference.as_deref())?;
     let target = match request.reference.as_deref() {
         Some(_) => {
             crate::commands::ref_lookup::resolve_entity_query_at_ref(graph, &request.entity, &head)?

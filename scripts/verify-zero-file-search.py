@@ -160,6 +160,7 @@ BOUNDARY_DIRS = [
     "crates/kin-core/src/dependencies.rs",
     "crates/kin-core/src/env_registry.rs",
     "crates/kin-core/src/federation.rs",
+    "crates/kin-core/src/git_init.rs",
     "crates/kin-core/src/init.rs",
     "crates/kin-core/src/layout.rs",
     "crates/kin-core/src/lib.rs",
@@ -169,6 +170,18 @@ BOUNDARY_DIRS = [
     "crates/kin-core/src/shims.rs",
     "crates/kin-core/src/sync_state.rs",
     "crates/kin-core/src/tree.rs",
+    # kin-git is scanned by default because it also carries answer-adjacent
+    # logic (co-change, blame-style history) that must come from graph truth.
+    # These three modules are the Git format boundary itself: capturing a Git
+    # repository, proving a checkout matches its committed seed before
+    # admission, and materializing graph-owned history back out as Git. Reading
+    # a Git repository from disk is the entire point of an import boundary, and
+    # none of these modules answers a locate/search/context/trace/review/xref
+    # query. Enumerated file by file so every other kin-git module, including
+    # any newly added one, keeps being scanned.
+    "crates/kin-git/src/lossless.rs",
+    "crates/kin-git/src/preflight.rs",
+    "crates/kin-git/src/repository_export.rs",
     "crates/kin-runtime/",
     "crates/kin-parser/",
     "crates/kin-ranking/src/ltr.rs",

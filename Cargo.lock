@@ -1868,6 +1868,7 @@ dependencies = [
  "faster-hex",
  "gix-features",
  "sha1-checked",
+ "sha2 0.11.0",
  "thiserror 2.0.18",
 ]
 
@@ -3161,6 +3162,7 @@ dependencies = [
  "gix",
  "kin-blobs",
  "kin-db",
+ "kin-git",
  "kin-index",
  "kin-model",
  "kin-parser",
@@ -3176,6 +3178,7 @@ dependencies = [
  "tracing",
  "unicode-normalization",
  "uuid",
+ "winapi-util",
  "windows-sys 0.61.2",
 ]
 
@@ -3183,13 +3186,13 @@ dependencies = [
 name = "kin-daemon"
 version = "0.3.6"
 dependencies = [
+ "anyhow",
  "async-stream",
  "axum",
  "base64 0.22.1",
  "chrono",
  "flate2",
  "fs2",
- "gix",
  "hex",
  "http-body",
  "kin-blobs",
@@ -3207,6 +3210,7 @@ dependencies = [
  "kin-projection",
  "kin-reconcile",
  "kin-registry",
+ "kin-remote",
  "kin-review",
  "kin-spine",
  "libc",
@@ -3233,15 +3237,19 @@ dependencies = [
 
 [[package]]
 name = "kin-db"
-version = "0.4.0"
+version = "0.6.1"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "ee9c3698de4a37b34577a1fa0b88ca4829af4858d17b6b4f6304d900eaae8b9a"
+checksum = "aebd1093ec20ec38a52fc39c074240ad96af63aa9a574e2173014e9bdb590bd8"
 dependencies = [
  "bincode",
+ "bstr",
  "bytes",
+ "cap-fs-ext",
+ "cap-std",
  "chrono",
  "directories 6.0.0",
  "fs2",
+ "gix-ignore",
  "half",
  "hashbrown 0.15.5",
  "hex",
@@ -3270,24 +3278,30 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "winapi-util",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "kin-git"
 version = "0.3.6"
 dependencies = [
+ "cap-std",
  "chrono",
  "gix",
  "hex",
  "kin-blobs",
- "kin-db",
  "kin-model",
  "pretty_assertions",
  "rayon",
+ "rustix",
+ "serde_json",
  "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.18",
  "tracing",
+ "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3297,6 +3311,7 @@ dependencies = [
  "hex",
  "kin-blobs",
  "kin-db",
+ "kin-git",
  "kin-model",
  "kin-parser",
  "kin-projection",
@@ -3304,6 +3319,7 @@ dependencies = [
  "notify",
  "pretty_assertions",
  "rayon",
+ "rustix",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -3312,6 +3328,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tree-sitter",
+ "uuid",
 ]
 
 [[package]]
@@ -3343,33 +3360,24 @@ name = "kin-integration-tests"
 version = "0.3.6"
 dependencies = [
  "kin-blobs",
- "kin-cli",
  "kin-context",
  "kin-core",
  "kin-daemon",
  "kin-db",
- "kin-git",
  "kin-index",
  "kin-migrate",
  "kin-model",
  "kin-parser",
  "kin-projection",
  "kin-reconcile",
- "kin-review",
- "kin-runtime",
- "pretty_assertions",
- "serde_json",
- "sha2 0.11.0",
  "tempfile",
- "tokio",
- "uuid",
 ]
 
 [[package]]
 name = "kin-lsp"
-version = "0.4.0"
+version = "0.6.0"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "eac57c8501983212e1923efdf64c76ad5e61dce24dd62d714cb1b15f71b2ce54"
+checksum = "5b754e534fd4aa0f82b7e4af738d27e55967ccd4dfeaf9956c0321b4425a058e"
 dependencies = [
  "kin-model",
  "serde",
@@ -3384,6 +3392,8 @@ dependencies = [
 name = "kin-mcp"
 version = "0.3.6"
 dependencies = [
+ "base64 0.22.1",
+ "hex",
  "kin-blobs",
  "kin-context",
  "kin-core",
@@ -3420,8 +3430,8 @@ dependencies = [
  "kin-infer",
  "kin-model",
  "kin-parser",
+ "kin-projection",
  "pretty_assertions",
- "rayon",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -3433,17 +3443,20 @@ dependencies = [
 
 [[package]]
 name = "kin-model"
-version = "0.4.0"
+version = "0.6.0"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "56123029e2cc463a2acc85d00bb4ae2146db7c5088097cadcc92a60d6d1a1b03"
+checksum = "41dd393ac2ce6fb40d662fcc0d816db8d0b536c8856c2c62bbb705e3ccbbca59"
 dependencies = [
  "chrono",
+ "gix-hash",
+ "gix-object",
  "hex",
  "kin-blobs",
  "kin-vector",
  "schemars",
  "serde",
  "serde_json",
+ "sha1 0.10.6",
  "sha2 0.10.9",
  "thiserror 2.0.18",
  "uuid",
@@ -3583,11 +3596,16 @@ dependencies = [
 name = "kin-remote"
 version = "0.3.6"
 dependencies = [
+ "base64 0.22.1",
  "chrono",
+ "kin-db",
  "kin-model",
  "pretty_assertions",
  "serde",
  "serde_json",
+ "sha1 0.10.6",
+ "sha2 0.11.0",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -3616,13 +3634,12 @@ name = "kin-runtime"
 version = "0.3.6"
 dependencies = [
  "chrono",
- "hex",
  "kin-blobs",
+ "kin-core",
  "kin-model",
  "pretty_assertions",
  "serde",
  "serde_json",
- "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.18",
  "tracing",
@@ -4553,9 +4570,9 @@ dependencies = [
 
 [[package]]
 name = "quinn-proto"
-version = "0.11.14"
+version = "0.11.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "434b42fec591c96ef50e21e886936e66d3cc3f737104fdb9b737c40ffb94c098"
+checksum = "4fcb935c5bec503c2f0e306bdd3e58bb9029dcb14fa8d9ac76e3a5256ac0763e"
 dependencies = [
  "aws-lc-rs",
  "bytes",
@@ -6567,7 +6584,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]

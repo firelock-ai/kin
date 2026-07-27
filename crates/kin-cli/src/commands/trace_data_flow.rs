@@ -188,7 +188,7 @@ async fn run_daemon_trace_data_flow(
 /// This is the single substrate primitive used by both the CLI route and the
 /// MCP tool dispatcher so the chain construction stays in one place.
 pub fn build_trace_data_flow_response(
-    layout: &kin_core::KinLayout,
+    binding: &kin_core::LocalRepositoryAuthorityBinding,
     graph: &kin_db::InMemoryGraph,
     request: &TraceDataFlowRequest,
 ) -> Result<TraceDataFlowResponse> {
@@ -210,7 +210,7 @@ pub fn build_trace_data_flow_response(
 
     // Try to load the focal source record. Failures (missing span, OOB blob)
     // degrade gracefully to the identity-only payload — the chain still works.
-    let focal_record = source_record_or_none(layout, graph, &focal_entity);
+    let focal_record = source_record_or_none(binding, graph, &focal_entity);
 
     let reference_kinds = [
         RelationKind::Calls,
@@ -312,7 +312,7 @@ pub fn build_trace_data_flow_response(
                     Some(entity) => entity,
                     None => continue,
                 };
-                let next_record = source_record_or_none(layout, graph, &next_entity);
+                let next_record = source_record_or_none(binding, graph, &next_entity);
                 let next_depth = parent_depth + 1;
                 let step_index = chain.len() + 1;
 
@@ -381,24 +381,25 @@ fn resolve_trace_focal(graph: &kin_db::InMemoryGraph, query: &str) -> Result<Opt
 /// Try to read an entity's source record; fall back to None for entities
 /// without a readable span / blob so the chain still includes their identity.
 fn source_record_or_none(
-    layout: &kin_core::KinLayout,
+    binding: &kin_core::LocalRepositoryAuthorityBinding,
     graph: &kin_db::InMemoryGraph,
     entity: &Entity,
 ) -> Option<GraphSourceRecord> {
-    let response = build_graph_source_response(layout, graph, &entity.id.to_string()).ok()?;
+    let response = build_graph_source_response(binding, graph, &entity.id.to_string()).ok()?;
     response.source
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kin_db::InMemoryGraph;
+    use kin_db::{InMemoryGraph, LocalFileBackend};
     use kin_model::entity::{
         Entity, EntityKind, EntityMetadata, EntityRole, FingerprintAlgorithm, SemanticFingerprint,
         Visibility,
     };
-    use kin_model::ids::{FilePathId, Hash256, LanguageId, RelationId};
+    use kin_model::ids::{FilePathId, Hash256, LanguageId, RelationId, RepositoryId, WorkspaceId};
     use kin_model::relation::{Relation, RelationOrigin};
+    use std::sync::Arc;
 
     fn make_entity(name: &str, file: &str) -> Entity {
         Entity {
@@ -441,23 +442,27 @@ mod tests {
         }
     }
 
-    /// Synthesize an empty layout in a tempdir so `build_graph_source_response`
-    /// has somewhere to look for blobs. The body itself isn't required for the
-    /// chain-shape tests; we only assert on identity fields.
-    fn empty_layout() -> (tempfile::TempDir, kin_core::KinLayout) {
+    /// Synthesize an absent repository authority. The body itself isn't
+    /// required for the chain-shape tests; we only assert on identity fields.
+    fn empty_binding() -> (tempfile::TempDir, kin_core::LocalRepositoryAuthorityBinding) {
         let temp = tempfile::tempdir().unwrap();
         let kin_root = temp.path().join(".kin");
         std::fs::create_dir_all(kin_root.join("objects")).unwrap();
         let layout = kin_core::KinLayout::new(kin_root);
-        (temp, layout)
+        let binding = kin_core::LocalRepositoryAuthorityBinding::from_parts(
+            RepositoryId::new("trace-data-flow-test").unwrap(),
+            WorkspaceId::new(),
+            Arc::new(LocalFileBackend::new(layout.kindb_dir())),
+        );
+        (temp, binding)
     }
 
     #[test]
     fn rejects_empty_focal() {
         let graph = InMemoryGraph::new();
-        let (_t, layout) = empty_layout();
+        let (_t, binding) = empty_binding();
         let err = build_trace_data_flow_response(
-            &layout,
+            &binding,
             &graph,
             &TraceDataFlowRequest {
                 focal: "   ".to_string(),
@@ -476,9 +481,9 @@ mod tests {
     #[test]
     fn rejects_missing_focal_entity() {
         let graph = InMemoryGraph::new();
-        let (_t, layout) = empty_layout();
+        let (_t, binding) = empty_binding();
         let err = build_trace_data_flow_response(
-            &layout,
+            &binding,
             &graph,
             &TraceDataFlowRequest {
                 focal: "does_not_exist".to_string(),
@@ -497,7 +502,7 @@ mod tests {
     #[test]
     fn callee_direction_walks_outgoing_calls() {
         let graph = InMemoryGraph::new();
-        let (_t, layout) = empty_layout();
+        let (_t, binding) = empty_binding();
 
         let focal = make_entity("focal", "src/focal.rs");
         let callee_a = make_entity("callee_a", "src/a.rs");
@@ -525,7 +530,7 @@ mod tests {
             .unwrap();
 
         let response = build_trace_data_flow_response(
-            &layout,
+            &binding,
             &graph,
             &TraceDataFlowRequest {
                 focal: focal_id.to_string(),
@@ -558,7 +563,7 @@ mod tests {
     #[test]
     fn caller_direction_walks_incoming_calls() {
         let graph = InMemoryGraph::new();
-        let (_t, layout) = empty_layout();
+        let (_t, binding) = empty_binding();
 
         let focal = make_entity("target", "src/target.rs");
         let caller_a = make_entity("caller_a", "src/a.rs");
@@ -580,7 +585,7 @@ mod tests {
             .unwrap();
 
         let response = build_trace_data_flow_response(
-            &layout,
+            &binding,
             &graph,
             &TraceDataFlowRequest {
                 focal: focal_id.to_string(),
@@ -609,7 +614,7 @@ mod tests {
     #[test]
     fn limit_per_step_truncates_branching() {
         let graph = InMemoryGraph::new();
-        let (_t, layout) = empty_layout();
+        let (_t, binding) = empty_binding();
 
         let focal = make_entity("hub", "src/hub.rs");
         let focal_id = focal.id;
@@ -624,7 +629,7 @@ mod tests {
         }
 
         let response = build_trace_data_flow_response(
-            &layout,
+            &binding,
             &graph,
             &TraceDataFlowRequest {
                 focal: focal_id.to_string(),

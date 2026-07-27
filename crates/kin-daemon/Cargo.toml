@@ -41,7 +41,7 @@ kin-cli = { workspace = true }
 kin-buildinfo = { workspace = true }
 kin-mcp = { workspace = true }
 kin-review = { workspace = true }
-gix = { workspace = true }
+kin-remote = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
@@ -59,6 +59,7 @@ tar = { workspace = true }
 flate2 = { workspace = true }
 zip = { workspace = true }
 reqwest = { workspace = true }
+anyhow = { workspace = true }
 which = "8"
 fs2 = { workspace = true }
 sysinfo = "0.39"

@@ -1,38 +1,41 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-//! Eject conviction suite: "you can always leave".
+//! End-to-end acceptance for leaving a graph-authoritative Kin repository.
 //!
-//! These tests drive the real `kin` binary end-to-end over a real Git repo to
-//! prove the load-bearing adoption promise — a team can remove Kin any day and
-//! be left with a plain, intact Git repository.
-//!
-//! What is proven here:
-//! - `kin eject` (default) removes Kin and leaves every working file and the
-//!   entire `.git` directory byte-for-byte intact.
-//! - `kin eject --revert-files` restores the working tree to its exact pre-init
-//!   bytes (a faithful round-trip), backs up the pre-eject files first, and
-//!   leaves `.git` intact.
-//! - A corrupt or partial snapshot fails loudly and mutates nothing — Kin never
-//!   silently strands files.
-//!
-//! Honest scope: Kin never reads, rewrites, or restores Git history. It
-//! snapshots the working tree at init (excluding `.git`, `.kin*`, and ignored
-//! paths) and restores those files only. Commit history is owned by Git the
-//! whole time, which is exactly why these tests assert `.git` is untouched
-//! rather than re-imported.
+//! Eject is an export boundary, not a return to pre-init file authority. These
+//! tests prove that the real binary:
+//! - leaves exact graph-projected code, config, lockfile, binary, executable,
+//!   and symlink state in place;
+//! - reconstructs imported Git objects from repository CAS without consulting
+//!   drifted working files;
+//! - refuses a working tree that diverges from the current graph ref;
+//! - preserves exact graph-owned gitlink pointers without flattening or
+//!   traversing independently owned directory contents;
+//! - keeps host-unrepresentable byte paths in exact graph/Git history without
+//!   inventing a lossy working-copy alias;
+//! - keeps metadata recoverable outside the repository by default; and
+//! - has no legacy initialization-snapshot restore surface.
 
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Output;
+
 use tempfile::tempdir;
 
 mod common;
 
 use common::Command;
 
-/// Run a git command in `dir` and assert it succeeds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EntryState {
+    kind: &'static str,
+    bytes: Vec<u8>,
+    executable: bool,
+}
+
 fn git(dir: &Path, args: &[&str]) -> Output {
     let output = Command::new("git")
         .args(args)
@@ -48,27 +51,29 @@ fn git(dir: &Path, args: &[&str]) -> Output {
     output
 }
 
-/// Run a git command in `dir` and return its exit status without asserting.
-fn git_status_code(dir: &Path, args: &[&str]) -> i32 {
-    Command::new("git")
+#[cfg(target_os = "macos")]
+fn git_os(dir: &Path, args: &[OsString]) -> Output {
+    let output = Command::new("git")
         .args(args)
         .current_dir(dir)
         .output()
-        .expect("run git command")
-        .status
-        .code()
-        .unwrap_or(-1)
+        .expect("run byte-exact git command");
+    assert!(
+        output.status.success(),
+        "git byte arguments failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
 }
 
-/// Run the real `kin` binary in `dir` with a fully hermetic environment:
-/// an isolated registry file and the warm-init cache disabled, so the test
-/// never touches `~/.kin` or any other global state.
+/// Run the real `kin` binary in `dir` with an isolated registry so the test
+/// never touches shared repository state.
 fn run_kin(dir: &Path, registry: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_kin"))
         .args(args)
         .current_dir(dir)
         .env("KIN_REGISTRY_PATH", registry)
-        .env("KIN_INIT_WARM_CACHE", "0")
         .output()
         .expect("run kin binary")
 }
@@ -84,29 +89,7 @@ fn run_kin_ok(dir: &Path, registry: &Path, args: &[&str]) -> Output {
     output
 }
 
-/// `git rev-parse HEAD`.
-fn head_sha(repo: &Path) -> String {
-    String::from_utf8_lossy(&git(repo, &["rev-parse", "HEAD"]).stdout)
-        .trim()
-        .to_string()
-}
-
-/// The set of Git-tracked files mapped to their exact on-disk bytes. This is
-/// the "original git checkout" baseline we round-trip against.
-fn tracked_file_bytes(repo: &Path) -> BTreeMap<String, Vec<u8>> {
-    let listing = git(repo, &["ls-files"]).stdout;
-    let listing = String::from_utf8(listing).expect("git ls-files is utf-8 paths");
-    let mut map = BTreeMap::new();
-    for rel in listing.lines().filter(|line| !line.trim().is_empty()) {
-        let bytes = fs::read(repo.join(rel)).unwrap_or_else(|e| panic!("read tracked {rel}: {e}"));
-        map.insert(rel.to_string(), bytes);
-    }
-    assert!(!map.is_empty(), "seed repo should have tracked files");
-    map
-}
-
-/// Build a small, real Git repo with text and binary content, all committed.
-fn seed_repo(repo: &Path) {
+fn seed_git_repo(repo: &Path) {
     fs::create_dir_all(repo).expect("create repo dir");
     git(repo, &["init", "-q"]);
     git(repo, &["config", "user.email", "kin@example.com"]);
@@ -121,247 +104,614 @@ fn seed_repo(repo: &Path) {
     )
     .unwrap();
     fs::write(
-        repo.join("src/main.rs"),
-        "fn main() {\n    println!(\"{}\", demo::greet(\"world\"));\n}\n",
+        repo.join("compose.yaml"),
+        "services:\n  app:\n    image: example/demo:1\n",
     )
     .unwrap();
-    fs::create_dir_all(repo.join("docs")).unwrap();
-    fs::write(repo.join("docs/guide.md"), "Guide.\n\n- one\n- two\n").unwrap();
-
-    // A binary file with non-UTF-8 bytes proves byte-fidelity beyond text.
+    fs::write(repo.join("Dockerfile"), "FROM scratch\n").unwrap();
+    fs::create_dir_all(repo.join("tools")).unwrap();
+    fs::write(repo.join("tools/build.py"), "print('polyglot')\n").unwrap();
+    fs::create_dir_all(repo.join("config")).unwrap();
+    fs::write(
+        repo.join("config/policy.unrecognized"),
+        "arbitrary = true\n",
+    )
+    .unwrap();
+    fs::write(repo.join("unrelated.payload"), "not source code\n").unwrap();
+    fs::write(
+        repo.join("Cargo.lock"),
+        "# generated lockfile\nversion = 4\n",
+    )
+    .unwrap();
     fs::create_dir_all(repo.join("assets")).unwrap();
-    let mut blob: Vec<u8> = (0u8..=255).collect();
-    blob.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x10]);
-    fs::write(repo.join("assets/blob.bin"), &blob).unwrap();
+    let mut binary: Vec<u8> = (0u8..=255).collect();
+    binary.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef, 0, 0x80]);
+    fs::write(repo.join("assets/blob.bin"), binary).unwrap();
+    fs::write(repo.join("run-demo"), "#!/bin/sh\nexec echo demo\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
+        fs::set_permissions(repo.join("run-demo"), fs::Permissions::from_mode(0o755)).unwrap();
+        symlink("compose.yaml", repo.join("current-compose")).unwrap();
+    }
 
     git(repo, &["add", "-A"]);
     git(repo, &["commit", "-q", "-m", "seed repo"]);
     git(repo, &["branch", "-M", "main"]);
+    git(
+        repo,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://example.invalid/firelock/fixture.git",
+        ],
+    );
+    git(
+        repo,
+        &[
+            "config",
+            "--add",
+            "remote.origin.pushurl",
+            "https://push.example.invalid/firelock/fixture.git",
+        ],
+    );
+    git(repo, &["config", "branch.main.remote", "origin"]);
+    git(
+        repo,
+        &["config", "--add", "branch.main.merge", "refs/heads/main"],
+    );
+    git(repo, &["config", "remote.pushDefault", "origin"]);
+    git(repo, &["config", "push.default", "current"]);
 }
 
-/// Assert `.git` is structurally intact and on the same commit as `before`.
-fn assert_git_intact(repo: &Path, before_head: &str) {
-    assert_eq!(
-        head_sha(repo),
-        before_head,
-        "HEAD must be unchanged — Kin never rewrites Git history"
-    );
-    assert_eq!(
-        git_status_code(repo, &["fsck", "--full", "--strict"]),
-        0,
-        "git fsck must pass — .git must be untouched and intact"
-    );
-    // The commit and its log are still readable as a plain Git repo.
-    let log = git(repo, &["log", "--oneline"]).stdout;
-    assert!(
-        String::from_utf8_lossy(&log).contains("seed repo"),
-        "commit history must survive eject"
-    );
+fn git_head(repo: &Path) -> String {
+    String::from_utf8_lossy(&git(repo, &["rev-parse", "HEAD"]).stdout)
+        .trim()
+        .to_string()
 }
 
-/// Default `kin eject` removes Kin and leaves the working tree and `.git`
-/// byte-for-byte intact.
-#[test]
-fn default_eject_preserves_git_history_and_working_tree() {
-    let root = tempdir().expect("temp root");
-    let repo = root.path().join("repo");
-    let registry = root.path().join("registry.toml");
-    seed_repo(&repo);
-
-    let head_before = head_sha(&repo);
-    let bytes_before = tracked_file_bytes(&repo);
-
-    run_kin_ok(&repo, &registry, &["init", "--no-lsp", "."]);
-    assert!(repo.join(".kin").is_dir(), "init must create .kin/");
-    assert!(
-        repo.join(".kin/snapshot/manifest.json").is_file(),
-        "init must write the pre-init snapshot manifest"
-    );
-
-    run_kin_ok(&repo, &registry, &["eject"]);
-
-    assert!(
-        !repo.join(".kin").exists(),
-        ".kin/ must be removed by eject"
-    );
-    assert!(
-        no_kin_residue(&repo),
-        "no .kin* residue may remain after eject"
-    );
-    assert_eq!(
-        tracked_file_bytes(&repo),
-        bytes_before,
-        "every working file must be byte-identical after default eject"
-    );
-    assert_git_intact(&repo, &head_before);
-    // A clean working tree: default eject creates no backup and no stray files.
-    assert!(
-        git(&repo, &["status", "--porcelain"]).stdout.is_empty(),
-        "working tree must be clean after default eject"
-    );
+fn git_object_ids(repo: &Path) -> Vec<String> {
+    let mut objects = String::from_utf8(
+        git(
+            repo,
+            &[
+                "cat-file",
+                "--batch-all-objects",
+                "--batch-check=%(objectname)",
+            ],
+        )
+        .stdout,
+    )
+    .unwrap()
+    .lines()
+    .map(str::to_string)
+    .collect::<Vec<_>>();
+    objects.sort();
+    objects
 }
 
-/// `kin eject --revert-files` restores the working tree to its exact pre-init
-/// bytes even after edits, backs up the pre-eject files, and leaves `.git`
-/// intact.
-#[test]
-fn revert_files_round_trips_to_pre_init_bytes() {
-    let root = tempdir().expect("temp root");
-    let repo = root.path().join("repo");
-    let registry = root.path().join("registry.toml");
-    seed_repo(&repo);
-
-    let head_before = head_sha(&repo);
-    let bytes_before = tracked_file_bytes(&repo);
-
-    run_kin_ok(&repo, &registry, &["init", "--no-lsp", "."]);
-
-    // Simulate real work done while living in Kin: edit tracked files on disk.
-    let edited_lib = "pub fn greet(name: &str) -> String {\n    format!(\"HELLO {name}!!!\")\n}\n";
-    fs::write(repo.join("src/lib.rs"), edited_lib).unwrap();
-    fs::write(repo.join("README.md"), "# Demo (edited under Kin)\n").unwrap();
-    assert_ne!(
-        fs::read(repo.join("src/lib.rs")).unwrap(),
-        bytes_before["src/lib.rs"],
-        "precondition: file was actually edited"
-    );
-
-    run_kin_ok(&repo, &registry, &["eject", "--revert-files", "--yes"]);
-
-    assert!(
-        !repo.join(".kin").exists(),
-        ".kin/ must be removed by eject"
-    );
-    assert_eq!(
-        tracked_file_bytes(&repo),
-        bytes_before,
-        "every working file must round-trip to its exact pre-init bytes"
-    );
-    assert_git_intact(&repo, &head_before);
-
-    // The pre-eject (edited) content is preserved in a backup, never lost.
-    let backup = find_backup_dir(&repo).expect("a backup dir must be created");
-    assert_eq!(
-        fs::read_to_string(backup.join("src/lib.rs")).unwrap(),
-        edited_lib,
-        "backup must hold the pre-eject edited content"
-    );
+fn git_config_values(repo: &Path, key: &str) -> Vec<String> {
+    String::from_utf8(git(repo, &["config", "--get-all", key]).stdout)
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect()
 }
 
-/// A missing snapshot directory fails loudly and mutates nothing.
-#[test]
-fn revert_files_fails_loud_on_missing_snapshot() {
-    let (root, repo, registry) = init_repo();
-    fs::remove_dir_all(repo.join(".kin/snapshot")).unwrap();
-    let head_before = head_sha(&repo);
-    let bytes_before = tracked_file_bytes(&repo);
-
-    let out = run_kin(&repo, &registry, &["eject", "--revert-files", "--yes"]);
-    assert_refused(&out, "No snapshot found");
-    assert!(
-        repo.join(".kin").exists(),
-        ".kin/ must remain after refusal"
-    );
-    assert_eq!(tracked_file_bytes(&repo), bytes_before, "files untouched");
-    assert_git_intact(&repo, &head_before);
-    drop(root);
+fn tracked_state(repo: &Path) -> BTreeMap<PathBuf, EntryState> {
+    let listing = git(repo, &["ls-files", "-z"]).stdout;
+    listing
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|relative| {
+            let relative = PathBuf::from(String::from_utf8(relative.to_vec()).unwrap());
+            let state = entry_state(&repo.join(&relative));
+            (relative, state)
+        })
+        .collect()
 }
 
-/// A missing manifest fails loudly and mutates nothing.
-#[test]
-fn revert_files_fails_loud_on_missing_manifest() {
-    let (root, repo, registry) = init_repo();
-    fs::remove_file(repo.join(".kin/snapshot/manifest.json")).unwrap();
-    let head_before = head_sha(&repo);
-    let bytes_before = tracked_file_bytes(&repo);
-
-    let out = run_kin(&repo, &registry, &["eject", "--revert-files", "--yes"]);
-    assert_refused(&out, "manifest missing");
-    assert!(
-        repo.join(".kin").exists(),
-        ".kin/ must remain after refusal"
-    );
-    assert_eq!(tracked_file_bytes(&repo), bytes_before, "files untouched");
-    assert_git_intact(&repo, &head_before);
-    drop(root);
+fn entry_state(path: &Path) -> EntryState {
+    let metadata = fs::symlink_metadata(path).unwrap();
+    if metadata.file_type().is_symlink() {
+        return EntryState {
+            kind: "symlink",
+            bytes: os_string_bytes(fs::read_link(path).unwrap().into_os_string()),
+            executable: false,
+        };
+    }
+    #[cfg(unix)]
+    let executable = {
+        use std::os::unix::fs::PermissionsExt as _;
+        metadata.permissions().mode() & 0o111 != 0
+    };
+    #[cfg(not(unix))]
+    let executable = false;
+    EntryState {
+        kind: "blob",
+        bytes: fs::read(path).unwrap(),
+        executable,
+    }
 }
 
-/// A truncated/partial snapshot (fewer files than the manifest records) fails
-/// loudly before any mutation: nothing restored, nothing deleted, no backup.
-#[test]
-fn revert_files_fails_loud_on_partial_snapshot() {
-    let (root, repo, registry) = init_repo();
-    // Delete one file's snapshot copy so the manifest count no longer matches.
-    fs::remove_file(repo.join(".kin/snapshot/src/lib.rs")).unwrap();
-    let head_before = head_sha(&repo);
-    let bytes_before = tracked_file_bytes(&repo);
-
-    let out = run_kin(&repo, &registry, &["eject", "--revert-files", "--yes"]);
-    assert_refused(&out, "incomplete");
-    assert!(
-        repo.join(".kin").exists(),
-        ".kin/ must remain after refusal"
-    );
-    assert_eq!(tracked_file_bytes(&repo), bytes_before, "files untouched");
-    assert!(
-        find_backup_dir(&repo).is_none(),
-        "no backup may be created when revert is refused pre-mutation"
-    );
-    assert_git_intact(&repo, &head_before);
-    drop(root);
+#[cfg(unix)]
+fn os_string_bytes(value: OsString) -> Vec<u8> {
+    use std::os::unix::ffi::OsStringExt as _;
+    value.into_vec()
 }
 
-// ── shared helpers ──────────────────────────────────────────────────────────
-
-/// Seed a repo and run `kin init`, returning (tempdir, repo, registry).
-/// The tempdir is returned so it outlives the test body.
-fn init_repo() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
-    let root = tempdir().expect("temp root");
-    let repo = root.path().join("repo");
-    let registry = root.path().join("registry.toml");
-    seed_repo(&repo);
-    run_kin_ok(&repo, &registry, &["init", "--no-lsp", "."]);
-    (root, repo, registry)
+#[cfg(not(unix))]
+fn os_string_bytes(value: OsString) -> Vec<u8> {
+    value.to_string_lossy().into_owned().into_bytes()
 }
 
-/// Assert an eject invocation was refused (non-zero exit) with a clear message.
-fn assert_refused(out: &Output, expect_substr: &str) {
+fn metadata_archives(repo: &Path) -> Vec<PathBuf> {
+    let parent = repo.parent().expect("repo has parent");
+    let mut archives: Vec<_> = fs::read_dir(parent)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".kin-ejected-")
+        })
+        .map(|entry| entry.path())
+        .collect();
+    archives.sort();
+    archives
+}
+
+fn assert_refused(output: &Output, expected: &str) {
     assert!(
-        !out.status.success(),
-        "eject should have failed but succeeded: stdout={} stderr={}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
+        !output.status.success(),
+        "command unexpectedly succeeded: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
     let combined = format!(
         "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        combined
-            .to_lowercase()
-            .contains(&expect_substr.to_lowercase()),
-        "error message should mention {expect_substr:?}; got: {combined}"
+        combined.to_lowercase().contains(&expected.to_lowercase()),
+        "expected {expected:?} in refusal, got: {combined}"
     );
 }
 
-/// True when no `.kin*` entry remains in the repo root.
-fn no_kin_residue(repo: &Path) -> bool {
-    fs::read_dir(repo)
-        .expect("read repo dir")
-        .filter_map(|e| e.ok())
-        .all(|e| !e.file_name().to_string_lossy().starts_with(".kin"))
+#[test]
+fn brownfield_eject_preserves_exact_files_and_git_with_recoverable_metadata() {
+    let root = tempdir().unwrap();
+    let repo = root.path().join("repo");
+    let registry = root.path().join("registry.toml");
+    seed_git_repo(&repo);
+
+    let head_before = git_head(&repo);
+    let objects_before = git_object_ids(&repo);
+    let tracked_before = tracked_state(&repo);
+
+    run_kin_ok(&repo, &registry, &["init", "."]);
+    assert!(repo.join(".kin").is_dir());
+    assert!(
+        !repo.join(".kin/snapshot").exists(),
+        "graph-first init must not retain a raw filesystem snapshot"
+    );
+
+    run_kin_ok(&repo, &registry, &["eject", "--yes"]);
+
+    assert!(!repo.join(".kin").exists());
+    assert_eq!(tracked_state(&repo), tracked_before);
+    assert_eq!(git_head(&repo), head_before);
+    assert_eq!(
+        git_object_ids(&repo),
+        objects_before,
+        "eject must not omit or invent imported Git objects"
+    );
+    git(&repo, &["fsck", "--strict"]);
+    assert_eq!(
+        git_config_values(&repo, "remote.origin.url"),
+        ["https://example.invalid/firelock/fixture.git"]
+    );
+    assert_eq!(
+        git_config_values(&repo, "remote.origin.pushurl"),
+        ["https://push.example.invalid/firelock/fixture.git"]
+    );
+    assert_eq!(
+        git_config_values(&repo, "remote.origin.fetch"),
+        ["+refs/heads/*:refs/remotes/origin/*"]
+    );
+    assert_eq!(git_config_values(&repo, "branch.main.remote"), ["origin"]);
+    assert_eq!(
+        git_config_values(&repo, "branch.main.merge"),
+        ["refs/heads/main"]
+    );
+    assert_eq!(git_config_values(&repo, "remote.pushDefault"), ["origin"]);
+    assert_eq!(git_config_values(&repo, "push.default"), ["current"]);
+    assert!(
+        git(&repo, &["status", "--porcelain"]).stdout.is_empty(),
+        "recovery metadata must live outside the plain Git working tree"
+    );
+
+    let archives = metadata_archives(&repo);
+    assert_eq!(archives.len(), 1);
+    assert!(archives[0].join("kin").is_dir());
+    assert!(archives[0].join("previous-git").exists());
 }
 
-/// Find the single `.kin-backup-eject-*` directory, if any.
-fn find_backup_dir(repo: &Path) -> Option<std::path::PathBuf> {
-    fs::read_dir(repo)
-        .ok()?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| {
-            p.file_name()
-                .map(|n| n.to_string_lossy().starts_with(".kin-backup-eject-"))
-                .unwrap_or(false)
-        })
+#[test]
+fn eject_refuses_a_projection_that_differs_from_current_graph_ref() {
+    let root = tempdir().unwrap();
+    let repo = root.path().join("repo");
+    let registry = root.path().join("registry.toml");
+    seed_git_repo(&repo);
+    let original = fs::read(repo.join("compose.yaml")).unwrap();
+    run_kin_ok(&repo, &registry, &["init", "."]);
+
+    fs::write(
+        repo.join("compose.yaml"),
+        b"services:\n  unexpected:\n    image: local-only\n",
+    )
+    .unwrap();
+    let output = run_kin(&repo, &registry, &["eject", "--yes"]);
+    assert_refused(&output, "exact projection");
+    assert!(repo.join(".kin").exists());
+    assert_eq!(
+        fs::read(repo.join("compose.yaml")).unwrap(),
+        b"services:\n  unexpected:\n    image: local-only\n"
+    );
+    assert!(metadata_archives(&repo).is_empty());
+
+    fs::write(repo.join("compose.yaml"), original).unwrap();
+    run_kin_ok(&repo, &registry, &["eject", "--yes"]);
+    let archives = metadata_archives(&repo);
+    assert_eq!(archives.len(), 1);
+    assert!(archives[0].join("kin").is_dir());
+    assert!(archives[0].join("previous-git").exists());
+}
+
+#[test]
+fn git_export_reads_repository_authority_when_working_files_drift() {
+    let root = tempdir().unwrap();
+    let repo = root.path().join("repo");
+    let exported = root.path().join("export.git");
+    let checkout = root.path().join("checkout");
+    let registry = root.path().join("registry.toml");
+    seed_git_repo(&repo);
+    let expected = tracked_state(&repo);
+    let head = git_head(&repo);
+    run_kin_ok(&repo, &registry, &["init", "."]);
+
+    fs::write(
+        repo.join("compose.yaml"),
+        b"services:\n  drift:\n    image: working-tree-only\n",
+    )
+    .unwrap();
+    fs::remove_file(repo.join("assets/blob.bin")).unwrap();
+
+    run_kin_ok(
+        &repo,
+        &registry,
+        &["git", "export", "--output", exported.to_str().unwrap()],
+    );
+    assert!(exported.join("HEAD").is_file());
+    let exported_arg = exported.to_str().unwrap();
+    git(
+        root.path(),
+        &["--git-dir", exported_arg, "fsck", "--strict"],
+    );
+    git(
+        root.path(),
+        &["clone", "-q", exported_arg, checkout.to_str().unwrap()],
+    );
+
+    assert_eq!(git_head(&checkout), head);
+    assert_eq!(
+        tracked_state(&checkout),
+        expected,
+        "export must come from repository-v6 source CAS, not drifted working files"
+    );
+}
+
+#[test]
+fn git_export_refuses_to_publish_inside_the_kin_working_repository() {
+    let root = tempdir().unwrap();
+    let repo = root.path().join("repo");
+    let registry = root.path().join("registry.toml");
+    seed_git_repo(&repo);
+    run_kin_ok(&repo, &registry, &["init", "."]);
+    fs::create_dir(repo.join("nested")).unwrap();
+
+    let output = run_kin(
+        &repo,
+        &registry,
+        &["git", "export", "--output", "nested/export.git"],
+    );
+    assert_refused(&output, "inside the Kin working repository");
+    assert!(!repo.join("nested/export.git").exists());
+}
+
+#[test]
+fn native_unborn_repository_ejects_to_an_unborn_ordinary_git_repository() {
+    let root = tempdir().unwrap();
+    let repo = root.path().join("repo");
+    let registry = root.path().join("registry.toml");
+    fs::create_dir(&repo).unwrap();
+
+    run_kin_ok(&repo, &registry, &["init", "."]);
+    run_kin_ok(&repo, &registry, &["eject", "--yes"]);
+
+    assert!(!repo.join(".kin").exists());
+    assert!(repo.join(".git").is_dir());
+    assert_eq!(
+        String::from_utf8(git(&repo, &["symbolic-ref", "HEAD"]).stdout)
+            .unwrap()
+            .trim(),
+        "refs/heads/main"
+    );
+    let head = Command::new("git")
+        .args(["rev-parse", "--verify", "HEAD"])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    assert!(
+        !head.status.success(),
+        "unborn eject must not invent a commit"
+    );
+    git(&repo, &["fsck", "--strict"]);
+    assert!(git(&repo, &["status", "--porcelain"]).stdout.is_empty());
+    assert!(
+        !repo.join(".git/index").exists(),
+        "unborn eject must preserve the canonical absent-index state"
+    );
+    let object_counts = String::from_utf8(git(&repo, &["count-objects", "-v"]).stdout).unwrap();
+    assert!(
+        object_counts.lines().any(|line| line == "count: 0")
+            && object_counts.lines().any(|line| line == "in-pack: 0"),
+        "unborn eject must not invent unreachable Git objects:\n{object_counts}"
+    );
+    let archives = metadata_archives(&repo);
+    assert_eq!(archives.len(), 1);
+    assert!(archives[0].join("kin").is_dir());
+}
+
+#[test]
+fn exact_git_repo_ejects_without_language_support() {
+    let root = tempdir().unwrap();
+    let repo = root.path().join("repo");
+    let registry = root.path().join("registry.toml");
+    fs::create_dir_all(&repo).unwrap();
+    fs::write(
+        repo.join("compose.yaml"),
+        b"services:\n  db:\n    image: postgres:17\n",
+    )
+    .unwrap();
+    fs::write(repo.join("vendor.lock"), b"opaque lock syntax\n").unwrap();
+    fs::write(repo.join("firmware.bin"), [0, 0xff, 0x42, 0x80]).unwrap();
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["config", "user.email", "kin@example.invalid"]);
+    git(&repo, &["config", "user.name", "Kin Test"]);
+    git(&repo, &["add", "--all"]);
+    git(&repo, &["commit", "-q", "-m", "exact non-code tree"]);
+    let before = ["compose.yaml", "vendor.lock", "firmware.bin"]
+        .into_iter()
+        .map(|path| (path, entry_state(&repo.join(path))))
+        .collect::<BTreeMap<_, _>>();
+
+    run_kin_ok(&repo, &registry, &["init", "."]);
+    run_kin_ok(&repo, &registry, &["eject", "--yes"]);
+
+    assert!(!repo.join(".kin").exists());
+    assert!(repo.join(".git").exists());
+    let archives = metadata_archives(&repo);
+    assert_eq!(archives.len(), 1);
+    assert!(archives[0].join("kin").is_dir());
+    assert!(archives[0].join("previous-git").exists());
+    for (path, expected) in before {
+        assert_eq!(entry_state(&repo.join(path)), expected);
+    }
+}
+
+#[test]
+fn eject_preserves_gitlink_pointer_and_independently_owned_directory() {
+    let root = tempdir().unwrap();
+    let repo = root.path().join("repo");
+    let dependency = repo.join("vendor/dependency");
+    let exported = root.path().join("export.git");
+    let registry = root.path().join("registry.toml");
+
+    fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["config", "user.email", "kin@example.invalid"]);
+    git(&repo, &["config", "user.name", "Kin Test"]);
+    fs::write(repo.join("README.md"), "gitlink fixture\n").unwrap();
+    git(&repo, &["add", "README.md"]);
+    git(&repo, &["commit", "-q", "-m", "gitlink base"]);
+    let dependency_target = git_head(&repo);
+    fs::create_dir_all(&dependency).unwrap();
+    let cache_info = format!("160000,{dependency_target},vendor/dependency");
+    git(
+        &repo,
+        &["update-index", "--add", "--cacheinfo", &cache_info],
+    );
+    git(&repo, &["commit", "-q", "-m", "track dependency gitlink"]);
+    let head_before = git_head(&repo);
+
+    run_kin_ok(&repo, &registry, &["init", "."]);
+    fs::create_dir(dependency.join("nested")).unwrap();
+    fs::write(
+        dependency.join("owned.txt"),
+        b"independent submodule bytes\n",
+    )
+    .unwrap();
+    fs::write(
+        dependency.join("nested/config"),
+        b"not part of the parent repository\n",
+    )
+    .unwrap();
+    run_kin_ok(
+        &repo,
+        &registry,
+        &[
+            "git",
+            "export",
+            "--output",
+            exported.to_str().expect("UTF-8 temp path"),
+        ],
+    );
+    let exported_tree = git(
+        root.path(),
+        &[
+            "--git-dir",
+            exported.to_str().expect("UTF-8 temp path"),
+            "ls-tree",
+            "HEAD",
+            "vendor/dependency",
+        ],
+    );
+    assert_eq!(
+        String::from_utf8(exported_tree.stdout).unwrap(),
+        format!("160000 commit {dependency_target}\tvendor/dependency\n"),
+        "bare Git export must preserve the exact gitlink pointer"
+    );
+
+    run_kin_ok(&repo, &registry, &["eject", "--yes"]);
+
+    assert!(!repo.join(".kin").exists());
+    let installed_git = fs::symlink_metadata(repo.join(".git")).unwrap();
+    assert!(
+        installed_git.is_dir() && !installed_git.file_type().is_symlink(),
+        "eject must install a real ordinary Git directory"
+    );
+    assert_eq!(git_head(&repo), head_before);
+    let installed_tree = git(&repo, &["ls-tree", "HEAD", "vendor/dependency"]);
+    assert_eq!(
+        String::from_utf8(installed_tree.stdout).unwrap(),
+        format!("160000 commit {dependency_target}\tvendor/dependency\n"),
+        "installed Git must retain the exact graph-owned gitlink pointer"
+    );
+    assert_eq!(
+        fs::read(dependency.join("owned.txt")).unwrap(),
+        b"independent submodule bytes\n"
+    );
+    assert_eq!(
+        fs::read(dependency.join("nested/config")).unwrap(),
+        b"not part of the parent repository\n"
+    );
+    let archives = metadata_archives(&repo);
+    assert_eq!(archives.len(), 1);
+    assert!(archives[0].join("kin").is_dir());
+    assert!(archives[0].join("previous-git").is_dir());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn eject_preserves_host_unrepresentable_byte_path_in_exact_git_history() {
+    use std::os::unix::ffi::OsStringExt as _;
+
+    let root = tempdir().unwrap();
+    let repo = root.path().join("repo");
+    let exported = root.path().join("export.git");
+    let registry = root.path().join("registry.toml");
+    fs::create_dir(&repo).unwrap();
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["config", "user.email", "kin@example.invalid"]);
+    git(&repo, &["config", "user.name", "Kin Test"]);
+    fs::write(repo.join("README.md"), b"materialized source\n").unwrap();
+    git(&repo, &["add", "README.md"]);
+
+    fs::write(repo.join("raw-body.tmp"), b"graph-only source bytes\n").unwrap();
+    let blob_oid = String::from_utf8(git(&repo, &["hash-object", "-w", "raw-body.tmp"]).stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+    fs::remove_file(repo.join("raw-body.tmp")).unwrap();
+    let raw_path = b"opaque-\xff.bin";
+    let mut cache_info = format!("100644,{blob_oid},").into_bytes();
+    cache_info.extend_from_slice(raw_path);
+    git_os(
+        &repo,
+        &[
+            OsString::from("update-index"),
+            OsString::from("--add"),
+            OsString::from("--cacheinfo"),
+            OsString::from_vec(cache_info),
+        ],
+    );
+    git(
+        &repo,
+        &["commit", "-q", "-m", "host-unrepresentable exact path"],
+    );
+    let head_before = git_head(&repo);
+
+    let mut expected_entry = format!("100644 blob {blob_oid}\t").into_bytes();
+    expected_entry.extend_from_slice(raw_path);
+    let exact_tree_contains_path = |listing: &[u8]| {
+        listing
+            .split(|byte| *byte == 0)
+            .any(|entry| entry == expected_entry)
+    };
+
+    run_kin_ok(&repo, &registry, &["init", "."]);
+    run_kin_ok(
+        &repo,
+        &registry,
+        &[
+            "git",
+            "export",
+            "--output",
+            exported.to_str().expect("UTF-8 temp path"),
+        ],
+    );
+    let exported_tree = git(
+        root.path(),
+        &[
+            "--git-dir",
+            exported.to_str().expect("UTF-8 temp path"),
+            "ls-tree",
+            "-rz",
+            "HEAD",
+        ],
+    );
+    assert!(
+        exact_tree_contains_path(&exported_tree.stdout),
+        "bare export lost the host-unrepresentable byte-exact path"
+    );
+
+    run_kin_ok(&repo, &registry, &["eject", "--yes"]);
+
+    assert!(!repo.join(".kin").exists());
+    assert!(repo.join(".git").is_dir());
+    assert_eq!(git_head(&repo), head_before);
+    let installed_tree = git(&repo, &["ls-tree", "-rz", "HEAD"]);
+    assert!(
+        exact_tree_contains_path(&installed_tree.stdout),
+        "installed ordinary Git lost the host-unrepresentable byte-exact path"
+    );
+    git(&repo, &["fsck", "--strict"]);
+    let archives = metadata_archives(&repo);
+    assert_eq!(archives.len(), 1);
+    assert!(archives[0].join("kin").is_dir());
+    assert!(archives[0].join("previous-git").is_dir());
+}
+
+#[test]
+fn legacy_snapshot_restore_flag_is_not_a_product_surface() {
+    let root = tempdir().unwrap();
+    let repo = root.path().join("repo");
+    let registry = root.path().join("registry.toml");
+    seed_git_repo(&repo);
+    run_kin_ok(&repo, &registry, &["init", "."]);
+
+    let output = run_kin(&repo, &registry, &["eject", "--revert-files", "--yes"]);
+    assert_refused(&output, "unexpected argument");
+    assert!(repo.join(".kin").exists());
+
+    let output = run_kin(&repo, &registry, &["eject", "--purge-metadata", "--yes"]);
+    assert_refused(&output, "unexpected argument");
+    assert!(repo.join(".kin").exists());
+    assert!(metadata_archives(&repo).is_empty());
+
+    run_kin_ok(&repo, &registry, &["eject", "--yes"]);
 }

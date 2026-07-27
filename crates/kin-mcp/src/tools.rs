@@ -8,6 +8,54 @@ pub fn tool_definitions() -> ToolsListResult {
     ToolsListResult {
         tools: vec![
             ToolDefinition {
+                name: "kin_artifact_list".into(),
+                description: crate::handlers::artifacts::ARTIFACT_LIST_DESC.into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "source_change_id": {
+                            "type": "string",
+                            "pattern": "^[0-9a-f]{64}$",
+                            "description": "Exact semantic change ID. Defaults to the current branch head."
+                        },
+                        "offset": { "type": "integer", "minimum": 0, "default": 0 },
+                        "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 200 }
+                    },
+                    "additionalProperties": false
+                }),
+            },
+            ToolDefinition {
+                name: "kin_artifact_read".into(),
+                description: crate::handlers::artifacts::ARTIFACT_READ_DESC.into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "artifact_id": { "type": "string", "format": "uuid" },
+                        "path": {
+                            "type": "object",
+                            "properties": {
+                                "bytes_hex": {
+                                    "type": "string",
+                                    "pattern": "^(?:[0-9a-f]{2})+$"
+                                }
+                            },
+                            "required": ["bytes_hex"],
+                            "additionalProperties": false
+                        },
+                        "source_change_id": {
+                            "type": "string",
+                            "pattern": "^[0-9a-f]{64}$",
+                            "description": "Exact semantic change ID. Defaults to the current branch head."
+                        }
+                    },
+                    "anyOf": [
+                        { "required": ["artifact_id"] },
+                        { "required": ["path"] }
+                    ],
+                    "additionalProperties": false
+                }),
+            },
+            ToolDefinition {
                 name: "semantic_search".into(),
                 description: crate::handlers::entities::SEMANTIC_SEARCH_DESC.into(),
                 input_schema: serde_json::json!({
@@ -462,7 +510,7 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "kin_transaction_begin".into(),
-                description: "Begin a new semantic graph mutation transaction. Transactions allow you to stage multiple mutations (inserts, updates, deletes) and commit them atomically. Returns a unique transaction_id.".into(),
+                description: "Begin an exact repository mutation transaction. Product commits currently support full-body edits of existing source entities and relation add/upsert/remove operations; unsupported source insertion/deletion fails before repository mutation. Returns a unique transaction_id.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -474,7 +522,7 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "kin_transaction_stage".into(),
-                description: "Stage one or more mutation operations onto an active transaction. Operations are queued in memory and can be validated or committed together.".into(),
+                description: "Stage one or more exact repository mutation operations onto an active transaction. Existing source entity edits require the exact entity ID as target plus a full UTF-8 replacement body. Relation operations use an empty target and omit body.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -486,19 +534,19 @@ pub fn tool_definitions() -> ToolsListResult {
                             "items": {
                                 "type": "object",
                                 "properties": {
-                                    "verb": { "type": "string", "description": "Operation verb: create, update, delete, upsert" },
-                                    "target": { "type": "string", "description": "Legacy compat target (optional)", "default": "" },
+                                    "verb": { "type": "string", "description": "Entity: update or modify. Relation: create/add/upsert/insert or delete/remove." },
+                                    "target": { "type": "string", "description": "Exact repository entity UUID for an Entity payload; empty string for a Relation payload." },
                                     "payload": {
                                         "type": "object",
-                                        "description": "Detailed mutation payload: {\"Entity\": { ... }} or {\"Relation\": {\"from\": \"...\", \"to\": \"...\", \"kind\": \"...\"}} or {\"Blob\": [...]}"
+                                        "description": "Exact mutation payload: {\"Entity\": { ...existing entity identity... }} or {\"Relation\": {\"from\": \"...\", \"to\": \"...\", \"kind\": \"...\"}}"
                                     },
                                     "body": {
                                         "type": "string",
-                                        "description": "New full UTF-8 source text for the entity. Supply this on an entity update to project an entity-body edit into the working file so the graph mutation actually reaches disk (graph and file agree). Omit for metadata-only edits, relation/blob ops, or creates with no file placement yet."
+                                        "description": "Required full UTF-8 replacement source text for an existing Entity body. Omit only for Relation operations; metadata-only source edits are rejected."
                                     },
                                     "description": { "type": "string", "description": "Human-readable explanation of this change" }
                                 },
-                                "required": ["verb", "description"]
+                                "required": ["verb", "target", "payload", "description"]
                             }
                         }
                     },
@@ -507,7 +555,7 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "kin_transaction_validate".into(),
-                description: "Validate staged mutations on an active transaction. Runs semantic and structural schema validation on the staged deltas without committing them.".into(),
+                description: "Validate the intrinsic shape and supported verb/payload combinations of staged mutations without committing them. Repository-entity existence, exact spans, source bytes, tree cleanliness, and semantic reparse are validated against authority at commit time.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -519,7 +567,7 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "kin_transaction_commit".into(),
-                description: "Commit all staged mutations in the transaction atomically to the graph. On success returns an object with: `status` (\"committed\"), `ops_applied` (count of entity+relation deltas actually applied), `empty` (true when ops_applied is 0 — a no-op commit), `new_root_hash` (the graph's Merkle root after the commit), `modified_files` (working-directory files the projection wrote — entity-body edits reach disk here), `collision_warnings`, and `conflicts` (entities skipped due to a concurrent file edit). A non-empty `conflicts` set is surfaced as an error instead. You can optionally provide an 'operations' array to stage and commit in a single call.".into(),
+                description: "Publish staged mutations through exact repository authority. The daemon requires a clean exact workspace, loads source from repository CAS, splices existing entity body edits in memory, reparses final bytes, and journals exact working-tree projection with semantic change + workspace + ref publication. Relation-only transactions are supported. New/source-deleted entities, metadata-only source edits, ambiguous or overlapping spans, non-UTF-8 source, gitlinks, and dirty/mismatched authority fail before mutation. On success returns `status`, `ops_applied`, `change_id`, `repository_generation`, `new_root_hash`, and `modified_files`. An optional `operations` array may be staged and committed in one call.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -527,23 +575,23 @@ pub fn tool_definitions() -> ToolsListResult {
                         "session_id": { "type": "string", "description": "Optional owning session UUID mirror; when present in enforce mode it must match the authenticated caller and transaction owner" },
                         "operations": {
                             "type": "array",
-                            "description": "Optional array of mutation operations to stage immediately before committing (solves stage+commit HTTP persistence gaps)",
+                            "description": "Optional exact mutation operations to stage atomically in this commit request",
                             "items": {
                                 "type": "object",
                                 "properties": {
-                                    "verb": { "type": "string", "description": "Operation verb: create, update, delete, upsert" },
-                                    "target": { "type": "string", "description": "Legacy compat target (optional)", "default": "" },
+                                    "verb": { "type": "string", "description": "Entity: update or modify. Relation: create/add/upsert/insert or delete/remove." },
+                                    "target": { "type": "string", "description": "Exact repository entity UUID for an Entity payload; empty string for a Relation payload." },
                                     "payload": {
                                         "type": "object",
-                                        "description": "Detailed mutation payload: {\"Entity\": { ... }} or {\"Relation\": {\"from\": \"...\", \"to\": \"...\", \"kind\": \"...\"}} or {\"Blob\": [...]}"
+                                        "description": "Exact mutation payload: {\"Entity\": { ...existing entity identity... }} or {\"Relation\": {\"from\": \"...\", \"to\": \"...\", \"kind\": \"...\"}}"
                                     },
                                     "body": {
                                         "type": "string",
-                                        "description": "New full UTF-8 source text for the entity."
+                                        "description": "Required full UTF-8 replacement source text for an existing Entity body; omit for Relation operations."
                                     },
                                     "description": { "type": "string", "description": "Human-readable explanation of this change" }
                                 },
-                                "required": ["verb", "description"]
+                                "required": ["verb", "target", "payload", "description"]
                             }
                         }
                     },
@@ -980,6 +1028,8 @@ pub fn benchmark_tool_names() -> &'static [&'static str] {
 /// Tool names for the small default agent profile.
 pub fn agent_default_tool_names() -> &'static [&'static str] {
     &[
+        "kin_artifact_list",
+        "kin_artifact_read",
         "kin_graph_status",
         "semantic_locate",
         "semantic_search",
@@ -1008,6 +1058,8 @@ pub fn agent_default_tool_names() -> &'static [&'static str] {
 /// `get_entity_source`/`get_context_pack` — all without ever touching a file.
 pub fn context_bench_tool_names() -> &'static [&'static str] {
     &[
+        "kin_artifact_list",
+        "kin_artifact_read",
         "kin_graph_status",
         "semantic_locate",
         "semantic_search",
@@ -1066,8 +1118,8 @@ mod tests {
     fn expected_tool_count() {
         let list = tool_definitions();
         // 54 + 5 transaction tools + 1 semantic_locate + 1 shadow_gate_report
-        // + 1 get_entity_sources = 62
-        assert_eq!(list.tools.len(), 62);
+        // + 1 get_entity_sources + 2 exact artifact tools = 64
+        assert_eq!(list.tools.len(), 64);
     }
 
     #[test]

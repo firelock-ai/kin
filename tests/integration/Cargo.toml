@@ -20,18 +20,9 @@ kin-parser = { workspace = true }
 kin-index = { workspace = true }
 kin-projection = { workspace = true }
 kin-reconcile = { workspace = true }
-kin-git = { workspace = true }
 kin-context = { workspace = true }
-kin-review = { workspace = true }
 kin-migrate = { workspace = true }
 kin-daemon = { workspace = true }
-kin-runtime = { workspace = true }
-kin-cli = { workspace = true }
 
 # External
-tokio = { workspace = true }
 tempfile = { workspace = true }
-pretty_assertions = { workspace = true }
-serde_json = { workspace = true }
-uuid = { workspace = true }
-sha2 = { workspace = true }

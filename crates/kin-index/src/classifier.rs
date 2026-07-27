@@ -125,6 +125,31 @@ impl FileClassifier {
             mime_hint: mime_hint_from_extension(extension),
         }
     }
+
+    /// Classify a file using both its path and exact bytes.
+    ///
+    /// A parser-capable extension is only an enrichment hint. Bytes that are
+    /// not text must remain valid repository content and are therefore routed
+    /// to the opaque facet instead of being forced through a language parser.
+    pub fn classify_with_content(path: &Path, content: &[u8]) -> FileClassification {
+        if is_binary_content(content) {
+            return FileClassification::OpaqueArtifact {
+                mime_hint: Some("application/octet-stream".to_string()),
+            };
+        }
+        Self::classify(path)
+    }
+}
+
+/// Conservative binary detection for semantic-enrichment routing.
+///
+/// This does not decide whether a file belongs in the repository tree: every
+/// admitted regular file is tree truth. It only prevents arbitrary bytes from
+/// being interpreted as source text. UTF-16 and other NUL-bearing encodings
+/// remain available exactly through their blob/tree entry and may gain a
+/// dedicated enrichment adapter later.
+fn is_binary_content(content: &[u8]) -> bool {
+    content.contains(&0) || std::str::from_utf8(content).is_err()
 }
 
 /// Check if a file is a CI configuration file.
@@ -244,6 +269,27 @@ mod tests {
     #[test]
     fn entity_source_rs() {
         assert_eq!(classify("src/lib.rs"), FileClassification::EntitySource);
+    }
+
+    #[test]
+    fn binary_bytes_override_a_parser_supported_extension() {
+        assert_eq!(
+            FileClassifier::classify_with_content(Path::new("src/lib.rs"), b"\0\xff\x01"),
+            FileClassification::OpaqueArtifact {
+                mime_hint: Some("application/octet-stream".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn valid_utf8_keeps_path_based_classification() {
+        assert_eq!(
+            FileClassifier::classify_with_content(
+                Path::new("compose.yaml"),
+                b"services:\n  web:\n    image: nginx\n"
+            ),
+            FileClassification::StructuredArtifact(ArtifactKind::ComposeFile)
+        );
     }
 
     // ── StructuredArtifact: Dockerfile ──────────────────────────────

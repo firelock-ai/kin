@@ -1,387 +1,182 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
+//! Exact repository-v6 projection into a new Git repository.
+//!
+//! Git is an interoperability projection, never an authority fallback. The
+//! command captures one immutable repository-authority lease, loads every
+//! object body from repository-owned source CAS, and delegates publication to
+//! `kin-git`'s staged, self-verifying exporter. The working directory and any
+//! pre-existing Git object store are not consulted.
+
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
+use kin_db::RepositoryAuthorityState;
+use kin_model::{
+    GitObjectBodyLoader, Hash256, RepositoryId, RootBundle, WorkspaceId, WorkspaceState,
+};
 
-fn default_export_path(layout: &kin_core::KinLayout) -> PathBuf {
-    layout.working_dir().join(".git-export")
+use super::repository_authority::ActiveRepositoryAuthority;
+
+/// One coherent repository-v6 export input.
+///
+/// All graph, ref, alias, workspace-head, and Git-authority state is cloned
+/// from one lease.
+pub(crate) struct AuthorityExportSnapshot {
+    pub(crate) roots: RootBundle,
+    pub(crate) workspace: WorkspaceState,
+    pub(crate) plan: kin_git::RepositoryGitExportPlan,
 }
 
-fn checked_out_git_repo_path(layout: &kin_core::KinLayout) -> PathBuf {
-    layout.working_dir().to_path_buf()
+pub(crate) struct RepositorySource<'a> {
+    authority: &'a ActiveRepositoryAuthority,
 }
 
-pub(crate) fn sync_export_path(layout: &kin_core::KinLayout) -> PathBuf {
-    default_export_path(layout)
-}
-
-fn git_output(repo_path: &Path, args: &[&str]) -> Result<std::process::Output> {
-    Command::new("git")
-        .args(args)
-        .current_dir(repo_path)
-        .output()
-        .map_err(|e| anyhow::anyhow!("failed to run `git {}`: {}", args.join(" "), e))
-}
-
-fn is_git_repo(repo_path: &Path) -> bool {
-    Command::new("git")
-        .args(["rev-parse", "--git-dir"])
-        .current_dir(repo_path)
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
-}
-
-fn is_bare_git_repo(repo_path: &Path) -> Result<bool> {
-    let output = git_output(repo_path, &["rev-parse", "--is-bare-repository"])?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "failed to inspect git repo mode at {}: {}",
-            repo_path.display(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim() == "true")
-}
-
-fn init_transport_repo(repo_path: &Path, bootstrap_source: Option<&Path>) -> Result<()> {
-    if repo_path.exists() {
-        std::fs::remove_dir_all(repo_path)
-            .map_err(|e| anyhow::anyhow!("failed to reset {}: {}", repo_path.display(), e))?;
-    }
-    if let Some(source) = bootstrap_source.filter(|path| path.join(".git").exists()) {
-        let clone = Command::new("git")
-            .args([
-                "clone",
-                source.to_string_lossy().as_ref(),
-                repo_path.to_string_lossy().as_ref(),
-            ])
-            .output()
-            .map_err(|e| anyhow::anyhow!("failed to clone git transport repo: {}", e))?;
-        if !clone.status.success() {
-            anyhow::bail!(
-                "failed to clone git transport repo from {}: {}",
-                source.display(),
-                String::from_utf8_lossy(&clone.stderr).trim()
-            );
-        }
-        return Ok(());
-    }
-
-    std::fs::create_dir_all(repo_path)
-        .map_err(|e| anyhow::anyhow!("failed to create {}: {}", repo_path.display(), e))?;
-    let init = git_output(repo_path, &["init"])?;
-    if !init.status.success() {
-        anyhow::bail!(
-            "failed to init git transport repo at {}: {}",
-            repo_path.display(),
-            String::from_utf8_lossy(&init.stderr).trim()
-        );
-    }
-    Ok(())
-}
-
-pub(crate) fn ensure_transport_repo(
-    repo_path: &Path,
-    bootstrap_source: Option<&Path>,
-    remote_url: Option<&str>,
-) -> Result<()> {
-    if !is_git_repo(repo_path) || is_bare_git_repo(repo_path)? {
-        init_transport_repo(repo_path, bootstrap_source)?;
-    }
-
-    if let Some(url) = remote_url.filter(|value| !value.trim().is_empty()) {
-        let trimmed = url.trim();
-        let add_remote = git_output(repo_path, &["remote", "add", "origin", trimmed])?;
-        if !add_remote.status.success() {
-            let set_url = git_output(repo_path, &["remote", "set-url", "origin", trimmed])?;
-            if !set_url.status.success() {
-                anyhow::bail!(
-                    "failed to configure git remote origin in {}: {}",
-                    repo_path.display(),
-                    String::from_utf8_lossy(&set_url.stderr).trim()
-                );
-            }
-        }
-    }
-
-    Ok(())
-}
-
-pub(crate) fn git_ref_exists(repo_path: &Path, ref_name: &str) -> Result<bool> {
-    let status = Command::new("git")
-        .args(["show-ref", "--verify", "--quiet", ref_name])
-        .current_dir(repo_path)
-        .status()
-        .map_err(|e| anyhow::anyhow!("failed to inspect git ref {}: {}", ref_name, e))?;
-
-    match status.code() {
-        Some(0) => Ok(true),
-        Some(1) => Ok(false),
-        _ => anyhow::bail!(
-            "failed to inspect git ref {} in {}",
-            ref_name,
-            repo_path.display()
-        ),
+impl<'a> RepositorySource<'a> {
+    pub(crate) fn new(authority: &'a ActiveRepositoryAuthority) -> Self {
+        Self { authority }
     }
 }
 
-// Reserved for the deferred inbound git-transport pull re-import path (see
-// `commands::pull`): updates a transport-mirror branch to a fetched ref before
-// re-import. Kept (with test coverage) so the path can be re-enabled in a later
-// alpha without re-deriving it.
-#[allow(dead_code)]
-pub(crate) fn set_transport_branch_head(
-    repo_path: &Path,
-    branch_name: &str,
-    target_ref: &str,
-) -> Result<()> {
-    let update_ref = git_output(
-        repo_path,
-        &[
-            "update-ref",
-            &format!("refs/heads/{branch_name}"),
-            target_ref,
-        ],
-    )?;
-    if !update_ref.status.success() {
-        anyhow::bail!(
-            "failed to update git transport branch '{}' in {}: {}",
-            branch_name,
-            repo_path.display(),
-            String::from_utf8_lossy(&update_ref.stderr).trim()
-        );
-    }
+impl GitObjectBodyLoader for RepositorySource<'_> {
+    type Error = String;
 
-    let head = git_output(
-        repo_path,
-        &["symbolic-ref", "HEAD", &format!("refs/heads/{branch_name}")],
-    )
-    .map_err(|e| anyhow::anyhow!("failed to set transport branch '{}': {}", branch_name, e))?;
-    if !head.status.success() {
-        anyhow::bail!(
-            "failed to set git transport HEAD to '{}' in {}: {}",
-            branch_name,
-            repo_path.display(),
-            String::from_utf8_lossy(&head.stderr).trim()
-        );
+    fn load_body(
+        &mut self,
+        body_hash: &Hash256,
+    ) -> std::result::Result<Option<Vec<u8>>, Self::Error> {
+        self.authority
+            .manager()
+            .load_source_blob(*body_hash)
+            .map_err(|error| error.to_string())
     }
-
-    Ok(())
 }
 
-fn resolve_export_path(
-    layout: &kin_core::KinLayout,
-    output: Option<String>,
-    in_place: bool,
-) -> Result<PathBuf> {
-    let output_path = output
-        .map(PathBuf::from)
-        .unwrap_or_else(|| default_export_path(layout));
-
-    if output_path == checked_out_git_repo_path(layout) && !in_place {
-        anyhow::bail!(
-            "refusing to export directly into the checked-out Git repository at {}. Re-run with `--in-place` if you intentionally want Kin export to rewrite local Git refs, or omit `--output` to use {} instead.",
-            output_path.display(),
-            default_export_path(layout).display(),
-        );
-    }
-
-    Ok(output_path)
+pub(crate) fn capture_export_snapshot(
+    authority: &ActiveRepositoryAuthority,
+) -> Result<AuthorityExportSnapshot> {
+    let lease = authority.manager().read_authority();
+    capture_export_snapshot_from_state(&authority.repository_id, &authority.workspace_id, &lease)
 }
 
-pub async fn export(output: Option<String>, in_place: bool) -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let snap =
-        crate::backend::open_snapshot_explicit_admin_read_only(&layout, "kin git export").await?;
-    let graph = &*snap.graph();
-    let blob_store = kin_blobs::BlobStore::new(layout.objects_dir())
-        .map_err(|e| anyhow::anyhow!("failed to open blob store: {}", e))?;
-
-    let branch_name = kin_core::read_current_branch(&layout)?;
-    let ensured_branch =
-        crate::commands::branch_bootstrap::ensure_current_branch(graph, &branch_name)?;
-    if ensured_branch.bootstrapped {
-        eprintln!(
-            "warning: branch '{}' is missing from daemon graph state; exporting from an in-memory genesis branch",
-            branch_name
-        );
-    }
-    let genesis = kin_core::build_genesis_change();
-
-    let output_path = resolve_export_path(&layout, output, in_place)?;
-
-    println!(
-        "Exporting Kin state to Git at '{}'...",
-        output_path.display()
-    );
-
-    let result =
-        kin_git::export_to_git(&graph, &blob_store, genesis.id, &branch_name, &output_path)
-            .map_err(|e| anyhow::anyhow!("git export failed: {}", e))?;
-
-    println!("  Commits exported: {}", result.commits_exported);
-    println!("  Branches updated: {}", result.branches_updated);
-    println!("  Commits skipped: {}", result.commits_skipped);
-    println!("  Git repo: {}", result.git_repo_path);
-
-    Ok(())
-}
-
-pub async fn import(_path: Option<String>) -> Result<()> {
-    anyhow::bail!(
-        "`kin git import` is disabled because it mutates local graph snapshots. \
-         Use `kin init --git-history ...` for bootstrap imports or `kin migrate` for explicit offline migration."
-    );
-}
-
-pub async fn sync(in_place: bool) -> Result<()> {
-    println!("Syncing Kin <-> Git...");
-
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-
-    // Step 1: Import from Git -> Kin (if a .git directory exists)
-    let git_dir = layout.working_dir().join(".git");
-    if git_dir.exists() {
-        println!("  Importing from Git -> Kin...");
-        import(None).await?;
-    } else {
-        println!("  No .git directory found, skipping import.");
-    }
-
-    // Step 2: Export Kin -> Git
-    let export_target = if in_place {
-        checked_out_git_repo_path(&layout)
-    } else {
-        sync_export_path(&layout)
+/// Capture a coherent export input from an already-held authority state.
+///
+/// Eject uses this with the freshly reloaded state carried by the exclusive
+/// local freeze rather than opening a second lease after the writer lock has
+/// been acquired.
+pub(crate) fn capture_export_snapshot_from_state(
+    repository_id: &RepositoryId,
+    workspace_id: &WorkspaceId,
+    state: &RepositoryAuthorityState,
+) -> Result<AuthorityExportSnapshot> {
+    let metadata = state.metadata();
+    let workspace = metadata
+        .workspaces
+        .iter()
+        .find(|workspace| &workspace.workspace_id == workspace_id)
+        .cloned()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "repository {} has no workspace {} in repository-v6 authority",
+                repository_id,
+                workspace_id
+            )
+        })?;
+    let plan = kin_git::RepositoryGitExportPlan {
+        repository_id: metadata.repository_id.clone(),
+        changes: state.snapshot().changes.values().cloned().collect(),
+        aliases: metadata.aliases.clone(),
+        refs: metadata.ref_state.clone(),
+        head: workspace.head.clone(),
+        git_authority: metadata.git_external_authority.clone(),
     };
-    println!("  Exporting Kin -> Git at '{}'...", export_target.display());
-    export(Some(export_target.to_string_lossy().into_owned()), in_place).await?;
 
-    println!("Sync complete (bidirectional).");
+    Ok(AuthorityExportSnapshot {
+        roots: state.roots().clone(),
+        workspace,
+        plan,
+    })
+}
+
+/// Project repository-v6 authority into a new bare Git repository.
+pub fn export(output: PathBuf) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let layout = kin_core::KinLayout::discover(&cwd)
+        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&layout)?;
+    let output = validate_export_destination(&layout, &cwd, &output)?;
+    let authority = ActiveRepositoryAuthority::open(&binding)?;
+    let captured = capture_export_snapshot(&authority)?;
+    let mut source = RepositorySource::new(&authority);
+    let result = kin_git::export_repository_to_git(&captured.plan, &mut source, &output)
+        .context("project repository-v6 authority to Git")?;
+
+    // A read lease remains immutable, but a distinct writer can publish a new
+    // generation while export is running. Report the exact generation that
+    // produced this repository instead of implying it is an ambient latest
+    // view.
+    println!(
+        "Exported repository {} authority generation {} to {}",
+        captured.plan.repository_id,
+        captured.roots.generation,
+        result.git_repo_path.display()
+    );
+    println!(
+        "{} imported commits reused, {} native commits written, {} refs written",
+        result.imported_commits_reused, result.native_commits_written, result.refs_written
+    );
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::fs;
-
-    fn configure_identity(repo_path: &Path) {
-        Command::new("git")
-            .args(["config", "user.email", "test@kin.dev"])
-            .current_dir(repo_path)
-            .output()
-            .unwrap();
-        Command::new("git")
-            .args(["config", "user.name", "Kin Test"])
-            .current_dir(repo_path)
-            .output()
-            .unwrap();
+fn validate_export_destination(
+    layout: &kin_core::KinLayout,
+    cwd: &Path,
+    requested: &Path,
+) -> Result<PathBuf> {
+    if requested.as_os_str().is_empty() {
+        bail!("Git export destination cannot be empty");
     }
-
-    #[test]
-    fn default_export_uses_git_export_dir() {
-        let dir = tempfile::tempdir().unwrap();
-        let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
-
-        assert_eq!(default_export_path(&layout), dir.path().join(".git-export"));
-    }
-
-    #[test]
-    fn sync_export_uses_git_export_dir_even_when_git_exists() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
-        let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
-
-        assert_eq!(sync_export_path(&layout), dir.path().join(".git-export"));
-    }
-
-    #[test]
-    fn sync_export_falls_back_when_git_is_missing() {
-        let dir = tempfile::tempdir().unwrap();
-        let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
-
-        assert_eq!(sync_export_path(&layout), dir.path().join(".git-export"));
-    }
-
-    #[test]
-    fn resolve_export_path_blocks_checked_out_repo_without_in_place_flag() {
-        let dir = tempfile::tempdir().unwrap();
-        let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
-
-        let error = resolve_export_path(
-            &layout,
-            Some(dir.path().to_string_lossy().into_owned()),
-            false,
+    let requested = if requested.is_absolute() {
+        requested.to_path_buf()
+    } else {
+        cwd.join(requested)
+    };
+    let name = requested
+        .file_name()
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!("Git export destination must name a repository directory")
+        })?;
+    let parent = requested.parent().ok_or_else(|| {
+        anyhow::anyhow!(
+            "Git export destination {} has no parent",
+            requested.display()
         )
-        .unwrap_err();
-
-        assert!(error
-            .to_string()
-            .contains("refusing to export directly into the checked-out Git repository"));
-    }
-
-    #[test]
-    fn resolve_export_path_allows_checked_out_repo_with_in_place_flag() {
-        let dir = tempfile::tempdir().unwrap();
-        let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
-
-        let path = resolve_export_path(
-            &layout,
-            Some(dir.path().to_string_lossy().into_owned()),
-            true,
+    })?;
+    let canonical_parent = parent.canonicalize().with_context(|| {
+        format!(
+            "Git export destination parent {} must already exist",
+            parent.display()
         )
-        .unwrap();
-
-        assert_eq!(path, dir.path());
-    }
-
-    #[test]
-    fn ensure_transport_repo_initializes_repo_and_sets_origin() {
-        let dir = tempfile::tempdir().unwrap();
-        let transport = dir.path().join(".git-export");
-
-        ensure_transport_repo(
-            &transport,
-            None,
-            Some("https://example.com/firelock/kin.git"),
-        )
-        .unwrap();
-
-        let bare = git_output(&transport, &["rev-parse", "--is-bare-repository"]).unwrap();
-        assert!(bare.status.success());
-        assert_eq!(String::from_utf8_lossy(&bare.stdout).trim(), "false");
-        let remote = git_output(&transport, &["remote", "get-url", "origin"]).unwrap();
-        assert!(remote.status.success());
-        assert_eq!(
-            String::from_utf8_lossy(&remote.stdout).trim(),
-            "https://example.com/firelock/kin.git"
+    })?;
+    let destination = canonical_parent.join(name);
+    let repository_root = layout
+        .working_dir()
+        .canonicalize()
+        .context("resolve Kin repository root before Git export")?;
+    if destination.starts_with(&repository_root) {
+        bail!(
+            "Git export destination {} is inside the Kin working repository; \
+             choose a new sibling path or use `kin eject` to leave Kin in place",
+            destination.display()
         );
     }
-
-    #[test]
-    fn set_transport_branch_head_switches_to_requested_branch() {
-        let dir = tempfile::tempdir().unwrap();
-        let repo = dir.path().join("repo");
-        std::fs::create_dir_all(&repo).unwrap();
-        git_output(&repo, &["init"]).unwrap();
-        configure_identity(&repo);
-        fs::write(repo.join("hello.txt"), "world\n").unwrap();
-        git_output(&repo, &["add", "."]).unwrap();
-        git_output(&repo, &["commit", "-m", "init"]).unwrap();
-        git_output(&repo, &["branch", "-M", "master"]).unwrap();
-        git_output(&repo, &["branch", "main"]).unwrap();
-
-        set_transport_branch_head(&repo, "main", "refs/heads/main").unwrap();
-
-        let branch = git_output(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap();
-        assert!(branch.status.success());
-        assert_eq!(String::from_utf8_lossy(&branch.stdout).trim(), "main");
+    if destination.exists() {
+        bail!(
+            "Git export destination {} already exists; refusing to merge with ambient Git state",
+            destination.display()
+        );
     }
+    Ok(destination)
 }

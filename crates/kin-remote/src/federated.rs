@@ -108,7 +108,7 @@ impl FederatedIntentLock {
 pub struct FederatedSemanticDelta {
     pub scope: ScopeRef,
     pub before_hash: Option<Hash256>,
-    pub after_hash: Hash256,
+    pub after_hash: Option<Hash256>,
     pub change_set: Vec<FieldDiff>,
     pub timestamp: DateTime<Utc>,
     pub actor: ActorRef,
@@ -121,7 +121,7 @@ impl FederatedSemanticDelta {
             actor: ActorRef::new(scope.graph().authority.clone(), delta.actor_id.clone()),
             scope,
             before_hash: delta.before_hash.as_deref().map(parse_hash),
-            after_hash: parse_hash(&delta.after_hash),
+            after_hash: delta.after_hash.as_deref().map(parse_hash),
             change_set: delta.change_set.clone(),
             timestamp: delta.timestamp,
             cursor,
@@ -143,7 +143,7 @@ pub struct FederatedLocalMutation {
     pub mutation_id: Uuid,
     pub change_set: Vec<FieldDiff>,
     pub base_hash: Option<Hash256>,
-    pub new_hash: Hash256,
+    pub new_hash: Option<Hash256>,
     pub timestamp: DateTime<Utc>,
     pub actor: ActorRef,
 }
@@ -156,7 +156,7 @@ impl FederatedLocalMutation {
             mutation_id: mutation.mutation_id,
             change_set: mutation.change_set.clone(),
             base_hash: mutation.base_hash.as_deref().map(parse_hash),
-            new_hash: parse_hash(&mutation.new_hash),
+            new_hash: mutation.new_hash.as_deref().map(parse_hash),
             timestamp: mutation.timestamp,
         }
     }
@@ -165,7 +165,7 @@ impl FederatedLocalMutation {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FederatedPushConflict {
     pub scope: ScopeRef,
-    pub local_hash: Hash256,
+    pub local_hash: Option<Hash256>,
     pub remote_hash: Hash256,
     pub remote_actor: ActorRef,
 }
@@ -175,7 +175,7 @@ impl FederatedPushConflict {
         Self {
             remote_actor: ActorRef::new(scope.graph().authority.clone(), &conflict.remote_actor_id),
             scope,
-            local_hash: parse_hash(&conflict.local_hash),
+            local_hash: conflict.local_hash.as_deref().map(parse_hash),
             remote_hash: parse_hash(&conflict.remote_hash),
         }
     }
@@ -238,7 +238,11 @@ mod tests {
     use kin_model::{ContractId, EntityId, FilePathId, WorkId};
 
     fn graph() -> GraphLocator {
-        GraphLocator::new("https://kinlab.example.com", "kin-open-core", "kin")
+        GraphLocator::new(
+            "https://kinlab.example.com",
+            "kin-open-core",
+            kin_model::RepositoryId::new("kin").expect("test repository id must be valid"),
+        )
     }
 
     #[test]
@@ -272,7 +276,9 @@ mod tests {
             before_hash: Some(
                 "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f".into(),
             ),
-            after_hash: "1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100".into(),
+            after_hash: Some(
+                "1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100".into(),
+            ),
             change_set: vec![FieldDiff {
                 field: "name".into(),
                 old_value: Some("old".into()),
@@ -291,9 +297,41 @@ mod tests {
         assert_eq!(parsed.actor.actor_id, "agent-1");
         assert_eq!(
             parsed.after_hash,
-            Hash256::from_hex("1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100")
+            Some(
+                Hash256::from_hex(
+                    "1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100"
+                )
                 .unwrap()
+            )
         );
+    }
+
+    #[test]
+    fn federated_removal_preserves_absent_after_state() {
+        let scope = ScopeRef::Entity {
+            graph: graph(),
+            entity_id: EntityId::new(),
+        };
+        let delta = SemanticDelta {
+            entity_id: "entity:removed".into(),
+            before_hash: Some(
+                "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f".into(),
+            ),
+            after_hash: None,
+            change_set: vec![FieldDiff {
+                field: "_removed".into(),
+                old_value: Some("false".into()),
+                new_value: Some("true".into()),
+            }],
+            timestamp: Utc::now(),
+            actor_id: "agent-1".into(),
+        };
+
+        let federated =
+            FederatedSemanticDelta::from_local(scope, &delta, DeltaCursor::new(graph(), 8, None));
+
+        assert!(federated.before_hash.is_some());
+        assert!(federated.after_hash.is_none());
     }
 
     #[test]
@@ -313,7 +351,9 @@ mod tests {
             base_hash: Some(
                 "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f".into(),
             ),
-            new_hash: "1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100".into(),
+            new_hash: Some(
+                "1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100".into(),
+            ),
             timestamp: Utc::now(),
         };
 
@@ -324,8 +364,12 @@ mod tests {
         assert_eq!(parsed.mutation_id, mutation.mutation_id);
         assert_eq!(
             parsed.new_hash,
-            Hash256::from_hex("1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100")
+            Some(
+                Hash256::from_hex(
+                    "1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100"
+                )
                 .unwrap()
+            )
         );
     }
 
@@ -360,7 +404,9 @@ mod tests {
         };
         let conflict = PushConflict {
             entity_id: "entity:123".into(),
-            local_hash: "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f".into(),
+            local_hash: Some(
+                "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f".into(),
+            ),
             remote_hash: "1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100".into(),
             remote_actor_id: "agent-3".into(),
         };

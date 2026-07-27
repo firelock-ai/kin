@@ -1459,6 +1459,7 @@ fn should_reexec_self(
 #[cfg(any(unix, test))]
 #[derive(Debug, Clone)]
 struct DaemonObservation {
+    #[cfg(unix)]
     pid: u32,
     repo_root: String,
     /// Reparented to init (ppid == 1): its launching CLI has exited.
@@ -2354,6 +2355,7 @@ mod tests {
     /// `registry` to exercise the unregistered/stale/twin paths.
     fn observation(health: DaemonHealth, orphaned: bool) -> DaemonObservation {
         DaemonObservation {
+            #[cfg(unix)]
             pid: 4242,
             repo_root: "/tmp/demo".to_string(),
             orphaned,

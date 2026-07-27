@@ -16,6 +16,7 @@ doctest = false
 kin-model = { workspace = true }
 kin-db = { workspace = true }
 kin-blobs = { workspace = true }
+kin-git = { workspace = true }
 kin-index = { path = "../kin-index" }
 kin-parser = { workspace = true }
 serde = { workspace = true }
@@ -30,6 +31,7 @@ gix = { workspace = true }
 directories = "5"
 fs2 = { workspace = true }
 unicode-normalization = "=0.1.25"
+tempfile = { workspace = true }
 
 [target.'cfg(any(unix, windows))'.dependencies]
 cap-std = "=4.0.2"
@@ -44,7 +46,9 @@ windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Storage_FileSystem",
 ] }
+# Stable access to the `BY_HANDLE_FILE_INFORMATION` identity pair; the `std`
+# accessors for it remain unstable (`windows_by_handle`).
+winapi-util = "0.1"
 
 [dev-dependencies]
-tempfile = { workspace = true }
 pretty_assertions = { workspace = true }

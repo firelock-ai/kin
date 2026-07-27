@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-//! Integration tests for lease/intent enforcement on write paths.
+//! Integration tests for graph-owned lease and intent enforcement.
 //!
 //! These tests verify the concurrency invariants from the
 //! high-parallelism-concurrency ADR:
@@ -16,11 +16,10 @@ use kin_daemon::session_registry::IntentRegistrationResult;
 use kin_daemon::traffic_adapter::CoordinatorTrafficChecker;
 use kin_daemon::SessionCoordinator;
 use kin_model::session::{IntentScope, LockType, SessionCapabilities, SessionTransport};
-use kin_model::{EntityId, EntityKind, GraphOverlay, SessionId};
+use kin_model::{EntityId, SessionId};
 use kin_reconcile::collision::{CollisionCheck, TrafficChecker};
-use kin_reconcile::{ReconcileError, Reconciler};
 
-use crate::helpers::{init_kin_repo, make_entity};
+use crate::helpers::init_kin_repo;
 
 fn writable_capabilities() -> SessionCapabilities {
     SessionCapabilities {
@@ -247,101 +246,5 @@ fn coordinator_checker_warns_on_soft_lease() {
             assert_eq!(warnings[0].lock_type, LockType::Soft);
         }
         other => panic!("expected Warnings, got: {:?}", other),
-    }
-}
-
-// -----------------------------------------------------------------------
-// 5. Reconciler with CoordinatorTrafficChecker rejects hard-locked scope
-// -----------------------------------------------------------------------
-
-#[test]
-fn reconciler_with_coordinator_checker_blocks_hard_lock() {
-    let (_dir, graph, _genesis_id) = init_kin_repo();
-    let dir = tempfile::tempdir().unwrap();
-    let coord = SessionCoordinator::new(graph.clone());
-
-    let s1 = coord
-        .register_session(
-            "claude",
-            "agent-alpha",
-            SessionTransport::Mcp,
-            None,
-            PathBuf::from("/project"),
-            writable_capabilities(),
-        )
-        .unwrap();
-
-    let entity = make_entity("locked_fn", "src/locked.rs", EntityKind::Function);
-    let entity_id = entity.id;
-
-    // Session 1 hard-locks the entity.
-    let registration = coord
-        .register_intent(
-            &s1,
-            vec![IntentScope::Entity(entity_id)],
-            LockType::Hard,
-            "exclusive refactor",
-            None,
-        )
-        .unwrap();
-    assert!(matches!(
-        registration,
-        IntentRegistrationResult::Registered { .. }
-    ));
-
-    // Set up reconciler with the coordinator-backed traffic checker.
-    let checker = CoordinatorTrafficChecker::new(graph.clone());
-    let mut reconciler = Reconciler::new(dir.path().to_path_buf());
-    reconciler.set_traffic_checker(Box::new(checker));
-    // Use a DIFFERENT session ID so the lock from s1 applies.
-    reconciler.set_session_id(SessionId::new());
-
-    // Create an overlay with a modified entity matching the locked scope.
-    let mut overlay = GraphOverlay::default();
-    overlay.entity_mods.insert(entity_id, entity);
-
-    // project_overlay_to_files should fail with CollisionBlocked.
-    let result = reconciler.project_overlay_to_files(&overlay);
-    assert!(result.is_err(), "expected collision to block projection");
-
-    match result.unwrap_err() {
-        ReconcileError::CollisionBlocked {
-            blocking_intents, ..
-        } => {
-            assert_eq!(blocking_intents.len(), 1);
-            assert_eq!(blocking_intents[0].session_id, s1);
-        }
-        other => panic!("expected CollisionBlocked, got: {:?}", other),
-    }
-}
-
-// -----------------------------------------------------------------------
-// 6. Reconciler allows mutation when no intents exist
-// -----------------------------------------------------------------------
-
-#[test]
-fn reconciler_with_coordinator_checker_allows_uncontested() {
-    let (_dir, graph, _genesis_id) = init_kin_repo();
-    let dir = tempfile::tempdir().unwrap();
-
-    // No intents registered — checker should return Clear for any scope.
-    let checker = CoordinatorTrafficChecker::new(graph.clone());
-    let mut reconciler = Reconciler::new(dir.path().to_path_buf());
-    reconciler.set_traffic_checker(Box::new(checker));
-    reconciler.set_session_id(SessionId::new());
-
-    let entity = make_entity("free_fn", "src/free.rs", EntityKind::Function);
-    let mut overlay = GraphOverlay::default();
-    overlay.entity_mods.insert(entity.id, entity);
-
-    // project_overlay_to_files may fail for other reasons (no actual file),
-    // but it should NOT fail with CollisionBlocked.
-    let result = reconciler.project_overlay_to_files(&overlay);
-    match result {
-        Ok(_) => {} // success
-        Err(ReconcileError::CollisionBlocked { .. }) => {
-            panic!("should not be blocked when no intents exist")
-        }
-        Err(_) => {} // other errors are fine (missing file, etc.)
     }
 }
