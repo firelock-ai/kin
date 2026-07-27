@@ -15819,17 +15819,19 @@ mod tests {
 
     use kin_db::{LocalFileBackend, RepositoryAuthorityManager};
     use kin_model::ArtifactId;
+    #[cfg(unix)]
+    use kin_model::ChangeStore;
     use kin_model::{
-        AdmissionCase, AdmissionPolicyDelta, AuthorId, ChangeOrigin, ChangeStore,
-        DefaultRefExpectation, DefaultRefMutation, EffectiveAdmissionPolicyStamp, Entity,
-        EntityDelta, EntityId, EntityMetadata, EntityStore, FilePathId, FingerprintAlgorithm,
-        FrozenLocalOverlay, FrozenLocalOverlayDelta, Hash256, LanguageId, LocatedEntry,
-        OpaqueArtifact, OperationId, RefExpectation, RefMutation, RefName, RefTarget,
-        RefUpdatePolicy, Relation, RelationDelta, RelationEvidence, RelationId, RelationKind,
-        RelationOrigin, RepoPath, RepositoryId, RepositoryTransaction, ResolvedTree,
-        SemanticChange, SemanticChangeId, SemanticFingerprint, SharedAdmissionPolicy, SourceSpan,
-        Timestamp, TransactionDelta, TreeDelta, TreeEntry, Visibility, WorkspaceExpectation,
-        WorkspaceHead, WorkspaceId, WorkspaceMutation, REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+        AdmissionCase, AdmissionPolicyDelta, AuthorId, ChangeOrigin, DefaultRefExpectation,
+        DefaultRefMutation, EffectiveAdmissionPolicyStamp, Entity, EntityDelta, EntityId,
+        EntityMetadata, EntityStore, FilePathId, FingerprintAlgorithm, FrozenLocalOverlay,
+        FrozenLocalOverlayDelta, Hash256, LanguageId, LocatedEntry, OpaqueArtifact, OperationId,
+        RefExpectation, RefMutation, RefName, RefTarget, RefUpdatePolicy, Relation, RelationDelta,
+        RelationEvidence, RelationId, RelationKind, RelationOrigin, RepoPath, RepositoryId,
+        RepositoryTransaction, ResolvedTree, SemanticChange, SemanticChangeId, SemanticFingerprint,
+        SharedAdmissionPolicy, SourceSpan, Timestamp, TransactionDelta, TreeDelta, TreeEntry,
+        Visibility, WorkspaceExpectation, WorkspaceHead, WorkspaceId, WorkspaceMutation,
+        REPOSITORY_TRANSACTION_SCHEMA_VERSION,
     };
 
     fn located(path: &str, hash: Hash256) -> LocatedEntry {
