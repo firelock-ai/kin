@@ -149,40 +149,82 @@ struct ExactTreeAdmission {
     semantic_events: Vec<FileEvent>,
 }
 
-fn repo_path(path: &Path, working_dir: &Path) -> Result<Option<RepoPath>> {
-    // `KinLayout` holds a canonical repository root, while macOS file events
-    // can retain the `/var` spelling of the same `/private/var` path. Resolve
-    // only the parent directory so a dangling symlink or removed entry keeps
-    // its own identity instead of being dereferenced (or rejected as missing).
-    let comparable_path;
-    let path = if path.strip_prefix(working_dir).is_ok() {
-        path
-    } else {
-        let parent = path.parent().ok_or_else(|| {
-            DaemonError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("filesystem event has no parent: {}", path.display()),
-            ))
-        })?;
-        let name = path.file_name().ok_or_else(|| {
-            DaemonError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("filesystem event has no entry name: {}", path.display()),
-            ))
-        })?;
-        comparable_path = parent.canonicalize().map_err(DaemonError::Io)?.join(name);
-        comparable_path.as_path()
-    };
-    let relative = path.strip_prefix(working_dir).map_err(|error| {
-        DaemonError::Io(std::io::Error::new(
+fn canonicalize_host_parent_preserving_leaf(path: &Path) -> std::io::Result<PathBuf> {
+    let leaf = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!(
-                "filesystem event {} escaped repository root {}: {error}",
-                path.display(),
-                working_dir.display()
+                "filesystem event has no repository entry name: {}",
+                path.display()
             ),
-        ))
+        )
     })?;
+    let mut unresolved = vec![leaf.to_os_string()];
+    let mut ancestor = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "filesystem event has no parent directory: {}",
+                path.display()
+            ),
+        )
+    })?;
+
+    loop {
+        match ancestor.canonicalize() {
+            Ok(mut canonical) => {
+                for component in unresolved.iter().rev() {
+                    canonical.push(component);
+                }
+                return Ok(canonical);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let component = ancestor.file_name().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!(
+                            "filesystem event has no existing ancestor to establish repository containment: {}",
+                            path.display()
+                        ),
+                    )
+                })?;
+                unresolved.push(component.to_os_string());
+                ancestor = ancestor.parent().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!(
+                            "filesystem event has no existing ancestor to establish repository containment: {}",
+                            path.display()
+                        ),
+                    )
+                })?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn repo_path(path: &Path, working_dir: &Path) -> Result<Option<RepoPath>> {
+    // Normalize the repository root and the event's nearest existing parent.
+    // This treats macOS aliases such as /var and /private/var as the same
+    // directory without dereferencing the final entry (which may itself be a
+    // dangling symlink, or already removed). Resolving the parent also rejects
+    // events that appear lexically beneath the repository but traverse a
+    // directory symlink out of it.
+    let canonical_root = working_dir.canonicalize().map_err(DaemonError::Io)?;
+    let canonical_path = canonicalize_host_parent_preserving_leaf(path).map_err(DaemonError::Io)?;
+    let relative = canonical_path
+        .strip_prefix(&canonical_root)
+        .map_err(|error| {
+            DaemonError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "filesystem event {} escaped repository root {}: {error}",
+                    path.display(),
+                    working_dir.display()
+                ),
+            ))
+        })?;
     let repo_path = kin_index::repo_path_from_host_relative(relative).map_err(DaemonError::Io)?;
     if kin_index::is_repository_control_path(&repo_path) {
         return Ok(None);
@@ -989,7 +1031,7 @@ pub async fn run_loop(
         let mut graph_changed = false;
         let mut projection_changed = ProjectionChangedSet::default();
 
-        let mut lsp_changed: Vec<(PathBuf, Vec<kin_model::EntityId>)> = Vec::new();
+        let mut lsp_changed: Vec<(kin_model::FilePathId, Vec<kin_model::EntityId>)> = Vec::new();
         let graph_mutation = state.begin_graph_authority_mutation();
 
         // One complete observation produces one exact tree transaction. This
@@ -1315,6 +1357,7 @@ pub async fn run_loop(
                     }
 
                     if let ReconcileOutcome::Updated {
+                        file_id,
                         added,
                         modified,
                         removed,
@@ -1368,7 +1411,7 @@ pub async fn run_loop(
                             "reconcile entity counts for LSP enrichment"
                         );
                         if !changed_ids.is_empty() {
-                            lsp_changed.push((path.clone(), changed_ids));
+                            lsp_changed.push((file_id.clone(), changed_ids));
                         }
                     } else if let ReconcileOutcome::FileRemoved {
                         removed, file_id, ..
@@ -1434,9 +1477,9 @@ pub async fn run_loop(
         drop(coordination);
 
         // Queue only changed entities for LSP enrichment.
-        for (path, entity_ids) in lsp_changed {
+        for (file_id, entity_ids) in lsp_changed {
             state.queue_lsp_enrichment(LspEnrichmentRequest {
-                file_path: path,
+                file_id,
                 changed_entity_ids: entity_ids,
             });
         }
@@ -1537,6 +1580,62 @@ mod tests {
     fn open_test_state(repo: &tempfile::TempDir) -> Arc<DaemonState> {
         let init = kin_core::init(repo.path()).unwrap();
         Arc::new(DaemonState::open(init.layout).unwrap())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repo_path_accepts_a_host_alias_without_dereferencing_the_leaf() {
+        use std::os::unix::fs::symlink;
+
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        let aliases = tempfile::tempdir().unwrap();
+        let alias = aliases.path().join("repo-alias");
+        symlink(repo.path(), &alias).unwrap();
+        symlink("missing-target", repo.path().join("current")).unwrap();
+
+        assert_eq!(
+            repo_path(&alias.join("current"), state.layout.working_dir()).unwrap(),
+            Some(test_repo_path("current")),
+            "host-root aliases must normalize while a dangling symlink remains the repository entry"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repo_path_rejects_a_directory_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        let outside = tempfile::tempdir().unwrap();
+        symlink(outside.path(), repo.path().join("escape")).unwrap();
+
+        // Build the event from the canonical root so the path is already a
+        // lexical child of the repository. Containment must then be decided by
+        // resolving the parent, not by the string prefix alone.
+        let root = state.layout.working_dir().to_path_buf();
+        let error = repo_path(&root.join("escape/secret.txt"), &root)
+            .expect_err("a lexical child that resolves outside the repository must be rejected");
+        assert!(error.to_string().contains("escaped repository root"));
+    }
+
+    #[test]
+    fn repo_path_keeps_identity_for_an_entry_whose_parent_is_already_gone() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        let root = state.layout.working_dir().to_path_buf();
+        std::fs::create_dir_all(root.join("removed")).unwrap();
+        std::fs::write(root.join("removed/module.rs"), b"fn gone() {}\n").unwrap();
+        std::fs::remove_dir_all(root.join("removed")).unwrap();
+
+        // Removal events arrive after the directory is gone. Resolving the
+        // nearest existing ancestor keeps the entry admissible instead of
+        // dropping its removal on a missing-parent error.
+        assert_eq!(
+            repo_path(&root.join("removed/module.rs"), &root).unwrap(),
+            Some(test_repo_path("removed/module.rs"))
+        );
     }
 
     fn test_repo_path(path: &str) -> RepoPath {

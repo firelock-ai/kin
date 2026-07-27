@@ -1322,6 +1322,16 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
             .unwrap_or_else(|_| state.layout.working_dir().to_path_buf());
         let _lsp_handle = tokio::spawn(async move {
             info!("LSP enrichment worker started");
+            let source_view = match lsp_state.graph_owned_source_view() {
+                Ok(view) => view,
+                Err(error) => {
+                    error!(
+                        error = %error,
+                        "LSP enrichment worker cannot open graph-owned source authority"
+                    );
+                    return;
+                }
+            };
 
             // Lazily start LSP servers on first use per language.
             let mut servers: std::collections::HashMap<
@@ -1356,11 +1366,10 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
 
                 match message {
                     LspEnrichmentMessage::Incremental(request) => {
-                        // Canonicalize to match the rootUri sent to RA.
-                        let path = request
-                            .file_path
-                            .canonicalize()
-                            .unwrap_or_else(|_| request.file_path.clone());
+                        // The URI is a compatibility projection of the
+                        // graph-owned repository path. didOpen content is
+                        // loaded separately from repository authority below.
+                        let path = lsp_root.join(&request.file_id.0);
                         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
                         let language = match ext {
                             "rs" => Some(kin_model::LanguageId::Rust),
@@ -1473,10 +1482,20 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
                             .collect();
                         let index = kin_lsp::EntityIndex::new(entity_refs);
 
-                        // Open the file in the LSP server so it can be queried.
-                        let file_content = match std::fs::read_to_string(&path) {
-                            Ok(c) => c,
-                            Err(_) => continue,
+                        // Open exact graph/CAS bytes in the LSP server. A
+                        // missing body or authority mismatch fails this
+                        // enrichment request loudly; the working tree is never
+                        // allowed to repair or answer it.
+                        let file_content = match source_view.load_text(&request.file_id) {
+                            Ok(content) => content,
+                            Err(error) => {
+                                warn!(
+                                    file = %request.file_id,
+                                    error = %error,
+                                    "LSP enrichment skipped because graph-owned source could not be loaded"
+                                );
+                                continue;
+                            }
                         };
                         let file_uri = kin_lsp::protocol::path_to_uri(&path);
                         let lang_str = match lang {
@@ -1510,11 +1529,7 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
                             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                         }
 
-                        let rel_path = path
-                            .strip_prefix(&lsp_root)
-                            .unwrap_or(&path)
-                            .to_string_lossy()
-                            .to_string();
+                        let rel_path = request.file_id.0.clone();
 
                         // Cap: if too many entities changed, it's a full re-parse — skip
                         // this batch to avoid flooding the LSP server. Incremental changes
@@ -1599,12 +1614,12 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
 
                         // Group entities by file.
                         let mut by_file: std::collections::HashMap<
-                            String,
+                            kin_model::FilePathId,
                             Vec<&kin_model::Entity>,
                         > = std::collections::HashMap::new();
                         for entity in &entities {
                             if let Some(ref fo) = entity.file_origin {
-                                by_file.entry(fo.0.clone()).or_default().push(entity);
+                                by_file.entry(fo.clone()).or_default().push(entity);
                             }
                         }
 
@@ -1637,11 +1652,8 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
                             .collect();
                         let index = kin_lsp::EntityIndex::new(entity_refs);
 
-                        for (file_path, file_entities) in &by_file {
-                            let abs_path = lsp_root.join(file_path);
-                            if !abs_path.exists() {
-                                continue;
-                            }
+                        for (file_id, file_entities) in &by_file {
+                            let abs_path = lsp_root.join(&file_id.0);
 
                             // Determine language from file extension.
                             let ext = abs_path.extension().and_then(|e| e.to_str()).unwrap_or("");
@@ -1710,10 +1722,19 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
                                 continue;
                             };
 
-                            // didOpen the file.
-                            let file_content = match std::fs::read_to_string(&abs_path) {
-                                Ok(c) => c,
-                                Err(_) => continue,
+                            // didOpen exact graph/CAS content. The compatibility
+                            // path may not exist on the host; that must not
+                            // affect graph-owned semantic enrichment.
+                            let file_content = match source_view.load_text(file_id) {
+                                Ok(content) => content,
+                                Err(error) => {
+                                    warn!(
+                                        file = %file_id,
+                                        error = %error,
+                                        "LSP sweep skipped graph source that could not be loaded from authority"
+                                    );
+                                    continue;
+                                }
                             };
                             let uri = kin_lsp::protocol::path_to_uri(&abs_path);
                             let lang_str = match lang {
@@ -1748,7 +1769,7 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
                                     Some(kin_lsp::EntityRef {
                                         id: e.id,
                                         name: e.name.clone(),
-                                        file_path: file_path.clone(),
+                                        file_path: file_id.0.clone(),
                                         start_line: span.start_line as u32,
                                         start_col: span.start_col as u32,
                                         end_line: span.end_line as u32,
@@ -1798,7 +1819,7 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
 
                             if file_relations > 0 {
                                 info!(
-                                    file = %file_path,
+                                    file = %file_id,
                                     relations = file_relations,
                                     progress = format!("{}/{}", files_processed, total_files),
                                     "sweep enriched file"
