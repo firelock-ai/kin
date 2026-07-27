@@ -36,8 +36,8 @@
     },
     {
       "command": "commit",
-      "status": "open_gate",
-      "exposure": "fail_closed",
+      "status": "ready",
+      "exposure": "enabled",
       "authority": "sealed exact-workspace observation consumed by repository-v6 transaction and compare-and-swap ref publication",
       "required_for_bounded_dogfood": true,
       "acceptance_spec": [
@@ -53,9 +53,13 @@
         "kin_daemon::repository_commit::tests::native_commit_preserves_host_unrepresentable_byte_exact_path",
         "kin_daemon::api::tests::command_commit_preserves_complete_arbitrary_repository_tree",
         "kin_core::tree::tests::repository_projection_covers_materializable_entries_and_preserves_gitlinks",
-        "kin_core::tree::tests::repository_projection_rejects_gitlink_transition_before_namespace_mutation"
+        "kin_core::tree::tests::repository_projection_rejects_gitlink_transition_before_namespace_mutation",
+        "kin_daemon::loop_runner::tests::incomplete_host_walk_publishes_no_workspace_authority",
+        "kin_daemon::loop_runner::tests::unconfirmed_mass_deletion_publishes_no_part_of_the_observation",
+        "kin_daemon::repository_commit::tests::stale_desired_tree_is_refused_against_newer_authority",
+        "kin_daemon::repository_commit::tests::desired_tree_planned_against_a_foreign_prior_tree_is_refused"
       ],
-      "note": "Exact artifact representation and repository transaction publication are implemented, but the ambient scanner currently drops its completion proof before publication, can replan a stale desired tree against newer authority, and can partially publish around the mass-deletion guard."
+      "note": "Commit consumes one complete host observation that carries the scanner's completion proof into publication, binds the observed manifest to the authority roots and prior workspace tree it was planned against, and refuses rather than replans when authority moved. An unconfirmed mass deletion refuses the whole observation, so no addition, modification, or derived admission-policy state published beside it."
     },
     {
       "command": "log",
@@ -289,8 +293,8 @@
     },
     {
       "command": "reconcile",
-      "status": "open_gate",
-      "exposure": "fail_closed",
+      "status": "ready",
+      "exposure": "enabled",
       "authority": "sealed exact-session observation consumed by repository-v6 explicit ingestion boundary",
       "required_for_bounded_dogfood": false,
       "acceptance_spec": [
@@ -302,9 +306,10 @@
       ],
       "evidence_tests": [
         "api::tests::reconcile_endpoint_admits_complete_exact_session_tree_and_replays",
-        "api::tests::reconcile_rejects_control_aliases_special_members_and_stale_bases"
+        "api::tests::reconcile_rejects_control_aliases_special_members_and_stale_bases",
+        "kin_cli::commands::reconcile::tests::observation_retains_its_session_capability_after_the_scanner_returns"
       ],
-      "note": "The session scanner already performs retained-root double observation and authority-root CAS, but its public observation DTO drops the retained capability before planning and remains fabricable outside the scanner."
+      "note": "The session scanner performs retained-root double observation and authority-root CAS, and its observation now owns the retained no-follow directory capability it was taken through. Every field is private, so the observation cannot be built outside the scanner, and planning re-proves the retained capability before anything is planned against it."
     },
     {
       "command": "conflicts",
