@@ -2065,6 +2065,59 @@ mod tests {
     }
 
     #[test]
+    fn independent_initializations_hold_an_equal_change_set() {
+        let first_directory = tempfile::tempdir().unwrap();
+        let second_directory = tempfile::tempdir().unwrap();
+        let first = init(first_directory.path()).unwrap();
+        let second = init(second_directory.path()).unwrap();
+
+        // Replication between two repositories that were initialized separately
+        // compares the changes each side holds. Initialization admits no
+        // history, so neither side carries a synthesized root whose payload
+        // could differ. A synthetic root stamped at initialization time would
+        // make these sets unequal and first contact unreconcilable.
+        let first_changes = held_change_ids(&first);
+        let second_changes = held_change_ids(&second);
+        assert!(first_changes.is_empty());
+        assert_eq!(first_changes, second_changes);
+
+        assert_eq!(first.authority.initial_change_id, None);
+        assert_eq!(second.authority.initial_change_id, None);
+        assert_eq!(first.head, second.head);
+        assert_eq!(
+            first.authority.workspace.base_target,
+            second.authority.workspace.base_target
+        );
+        assert_eq!(
+            first.authority.workspace.base_tree_hash,
+            second.authority.workspace.base_tree_hash
+        );
+        assert_eq!(
+            first.authority.workspace.workspace_tree_hash,
+            second.authority.workspace.workspace_tree_hash
+        );
+        assert_eq!(
+            first.authority.workspace.workspace_semantic_overlay_hash,
+            second.authority.workspace.workspace_semantic_overlay_hash
+        );
+
+        // Repository and workspace identity stay per-repository. Only history
+        // is shared across a replication boundary.
+        assert_ne!(first.repository_id, second.repository_id);
+        assert_ne!(first.workspace_id, second.workspace_id);
+    }
+
+    fn held_change_ids(result: &InitResult) -> std::collections::BTreeSet<SemanticChangeId> {
+        let authority = RepositoryAuthorityManager::open(
+            result.repository_id.clone(),
+            Arc::new(LocalFileBackend::new(result.layout.kindb_dir())),
+        )
+        .unwrap();
+        let lease = authority.read_authority();
+        lease.snapshot().changes.keys().copied().collect()
+    }
+
+    #[test]
     fn init_writes_valid_config() {
         let directory = tempfile::tempdir().unwrap();
         let result = init(directory.path()).unwrap();
