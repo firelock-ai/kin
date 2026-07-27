@@ -907,11 +907,13 @@ pub async fn sessions(remote: Option<String>, json: bool) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::upsert_remote_config;
     use super::{
         ensure_git_remote, evaluate_push_plan, explicit_native_remote_target, format_push_decision,
         map_to_remote_ref, native_remote_endpoint, resolve_native_remote_bearer_token_with,
-        resolve_native_remote_target, resolve_remote, upsert_remote_config,
-        workspace_branch_short_name, NativeRemoteTarget, PushPlanContext,
+        resolve_native_remote_target, resolve_remote, workspace_branch_short_name,
+        NativeRemoteTarget, PushPlanContext,
     };
     use kin_core::{
         GitBranchTrackingConfig, GitRemoteTransportConfig, KinConfig, RemoteHostKind,
