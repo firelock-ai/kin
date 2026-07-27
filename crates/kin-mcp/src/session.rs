@@ -52,10 +52,14 @@ pub struct McpMutationOperation {
 
 /// A payload-less operation that expresses "this entity's new source is
 /// `body`": verb update/modify, `target` naming the entity (name or id), and a
-/// non-empty `body`. The graph delta is a same-entity modification resolved
-/// fail-closed server-side, and the post-commit projection writes the body to
-/// the entity's working-directory file. This is the minimal write surface for
-/// agents, which know names and source text but not Kin's entity structs.
+/// non-empty `body`. This is the minimal write surface for agents, which know
+/// names and source text but not Kin's entity structs.
+///
+/// Only the daemon commit path can honor it: the daemon resolves the target
+/// fail-closed against repository authority, plans the exact span edit, and
+/// projects the new source into the entity's working-directory file. The
+/// in-process commit path has no projection and refuses the shape rather than
+/// committing a same-entity no-op that would discard the body.
 pub fn is_target_body_update(op: &McpMutationOperation) -> bool {
     op.payload.is_none()
         && matches!(op.verb.trim().to_lowercase().as_str(), "update" | "modify")
@@ -266,6 +270,11 @@ pub fn validate_staged_operations(
 /// yet), plus the intrinsic problems stage-time validation already guards.
 /// No graph access is required, so it is safe to run in any runtime; existence
 /// checks (does the relation/entity actually exist) stay graph-side.
+///
+/// Runtime-independent by design, so a payload-less source update is `None`
+/// here: the daemon commits it. The in-process commit path layers its own
+/// offline-only refusal for that shape on top of this check; see
+/// `handlers::sessions::handle_transaction_commit`.
 pub fn uncommittable_reason(op: &McpMutationOperation) -> Option<String> {
     let verb = op.verb.trim().to_lowercase();
     if verb.is_empty() {

@@ -729,6 +729,40 @@ fn transaction_touched_scopes<G: GraphStore>(
     scopes
 }
 
+/// Indexed reasons for every staged operation the in-process commit path must
+/// refuse even though staging and the daemon planner accept it.
+///
+/// Today that is exactly the payload-less source update (verb update/modify
+/// with a `target` and a `body`). Turning that shape into a real change means
+/// planning the exact span edit and projecting the new source into the working
+/// file, and both live in the daemon (`kin-daemon`'s `plan_exact_transaction`).
+/// The in-process path has no projection, so committing it here can only
+/// produce a same-entity no-op delta while reporting success, discarding the
+/// agent's body. Refuse instead.
+///
+/// Deliberately private and applied only after the daemon-delegate early
+/// return in [`handle_transaction_commit`]: the daemon commits through
+/// `kin-daemon`'s own entry point and the staging validation it shares with
+/// this crate (`validate_staged_operations`, `uncommittable_operations`) is
+/// untouched, so the daemon keeps accepting the shape.
+fn offline_only_uncommittable_operations(operations: &[McpMutationOperation]) -> Vec<String> {
+    operations
+        .iter()
+        .enumerate()
+        .filter(|(_, op)| crate::session::is_target_body_update(op))
+        .map(|(idx, op)| {
+            format!(
+                "operation #{idx} ('{}'): a payload-less source update (target '{}' plus body) \
+                 requires the daemon commit path, which plans the exact span edit and projects \
+                 the new source into the working file; the in-process commit path has no \
+                 projection and would report success while discarding the body",
+                op.verb,
+                op.target.trim()
+            )
+        })
+        .collect()
+}
+
 pub async fn handle_transaction_commit<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
@@ -806,6 +840,22 @@ pub async fn handle_transaction_commit<G: GraphStore>(
         )));
     }
 
+    // Everything from here down is the in-process path: the daemon returned
+    // above. Refuse the operation shapes only the daemon can honor rather than
+    // applying a delta that reports success and changes nothing. Rejected
+    // atomically and before any graph apply, so the transaction stays active.
+    let daemon_only = offline_only_uncommittable_operations(&tx.staged_operations);
+    if !daemon_only.is_empty() {
+        return Ok(ToolCallResult::error(format!(
+            "Cannot commit transaction {}: {} staged operation(s) require the daemon commit \
+             path:\n  - {}\nCommit through a running Kin daemon, or restage the change as an \
+             entity payload. The transaction is left active.",
+            transaction_id,
+            daemon_only.len(),
+            daemon_only.join("\n  - ")
+        )));
+    }
+
     // Load-bearing ordering: run coordination enforcement against the fully
     // staged operation set before constructing or applying any graph delta.
     // A denied transaction remains active and graph truth is unchanged.
@@ -824,26 +874,8 @@ pub async fn handle_transaction_commit<G: GraphStore>(
 
     for op in tx.staged_operations {
         let verb = op.verb.to_lowercase();
-        if crate::session::is_target_body_update(&op) {
-            // The body carries the change: the graph delta is a same-entity
-            // modification and the post-commit projection writes the new
-            // source into the working file. Resolution is fail-closed so a
-            // typo or an ambiguous name cannot modify the wrong entity.
-            match resolve_target_entity(store, &op.target) {
-                Ok(existing) => {
-                    entity_deltas.push(kin_model::change::EntityDelta::Modified {
-                        old: existing.clone(),
-                        new: existing,
-                    });
-                }
-                Err(error) => {
-                    return Ok(ToolCallResult::error(format!(
-                        "Cannot commit transaction {transaction_id}: {error}"
-                    )));
-                }
-            }
-            continue;
-        }
+        // Payload-less source updates were refused above, so every operation
+        // reaching here carries a payload this path can turn into a real delta.
         if let Some(payload) = op.payload {
             match payload {
                 McpMutationPayload::Entity(entity) => {
