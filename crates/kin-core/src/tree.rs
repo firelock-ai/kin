@@ -3596,10 +3596,16 @@ fn validate_projection_proof_paths<'a>(
             let key = if let Some(path) = path.as_utf8() {
                 projection_path_comparison_key(path).into_bytes()
             } else {
-                let mut key = path.as_bytes().to_vec();
                 #[cfg(any(windows, target_os = "macos"))]
-                key.make_ascii_lowercase();
-                key
+                {
+                    let mut key = path.as_bytes().to_vec();
+                    key.make_ascii_lowercase();
+                    key
+                }
+                #[cfg(not(any(windows, target_os = "macos")))]
+                {
+                    path.as_bytes().to_vec()
+                }
             };
             Ok((key, path))
         })
