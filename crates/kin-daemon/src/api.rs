@@ -5684,9 +5684,21 @@ fn collect_pre_commit_entities(
         return (vec![], HashMap::new());
     };
 
+    // Operations may arrive pre-staged on the transaction or inline on the
+    // commit call itself; both are applied by the commit, so both must be
+    // projected. Mirrors the merge in `transaction_coordination_context`.
+    let mut staged = transaction.staged_operations;
+    if let Some(inline) = arguments.get("operations") {
+        if let Ok(mut parsed) =
+            serde_json::from_value::<Vec<kin_mcp::McpMutationOperation>>(inline.clone())
+        {
+            staged.append(&mut parsed);
+        }
+    }
+
     let mut entities = Vec::new();
     let mut supplied_bodies: HashMap<kin_model::EntityId, Vec<u8>> = HashMap::new();
-    for op in &transaction.staged_operations {
+    for op in &staged {
         if kin_mcp::session::is_target_body_update(op) {
             if let Ok(existing) =
                 kin_mcp::handlers::sessions::resolve_target_entity(state.graph.as_ref(), &op.target)
@@ -22098,5 +22110,46 @@ mod tests {
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json["status"], "reconciled");
+    }
+
+    #[test]
+    fn collect_pre_commit_entities_includes_inline_target_body_operations() {
+        let state = test_state();
+        let entity = test_entity("inline_projected_fn", "src/inline.rs");
+        state.graph.upsert_entity(&entity).unwrap();
+
+        let sessions = kin_mcp::SessionRegistry::new();
+        sessions.register("sess-inline", "test");
+        let tx = sessions
+            .begin_transaction("sess-inline", "entity:inline_projected_fn")
+            .unwrap();
+
+        let new_body = "def inline_projected_fn():\n    return 2";
+        let mut arguments: HashMap<String, serde_json::Value> = HashMap::new();
+        arguments.insert(
+            "transaction_id".into(),
+            serde_json::json!(tx.transaction_id),
+        );
+        arguments.insert(
+            "operations".into(),
+            serde_json::json!([{
+                "verb": "update",
+                "target": "inline_projected_fn",
+                "body": new_body,
+                "description": "inline body update"
+            }]),
+        );
+
+        let (entities, bodies) = collect_pre_commit_entities(&state, &sessions, &arguments);
+        assert_eq!(
+            entities.len(),
+            1,
+            "operations passed inline on commit must be collected for projection"
+        );
+        assert_eq!(entities[0].name, "inline_projected_fn");
+        assert_eq!(
+            bodies.get(&entities[0].id).map(Vec::as_slice),
+            Some(new_body.as_bytes())
+        );
     }
 }
