@@ -44,6 +44,32 @@ pub(crate) fn clear_daemon_url_override() {
     }
 }
 
+/// Serializes daemon revival so concurrent failing calls start one daemon, not
+/// one each. See [`revive_mcp_daemon`].
+static REVIVAL_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// The revival-path daemon URL currently installed, if any.
+fn current_daemon_url_override() -> Option<String> {
+    DAEMON_URL_OVERRIDE.lock().ok()?.clone()
+}
+
+/// Does a daemon answer `/health` at `base` right now?
+///
+/// Deliberately does not use the cached delegate client: this runs on the
+/// revival path to decide whether a daemon another caller just started is
+/// usable, so it wants a short, self-contained probe rather than the delegate's
+/// 60 s request budget.
+async fn daemon_is_healthy(base: &str) -> bool {
+    let Ok(probe) = reqwest::Client::builder()
+        .connect_timeout(Duration::from_millis(300))
+        .timeout(Duration::from_secs(3))
+        .build()
+    else {
+        return false;
+    };
+    matches!(probe.get(format!("{base}/health")).send().await, Ok(resp) if resp.status().is_success())
+}
+
 /// Base URL for the daemon HTTP API.
 ///
 /// Checks the revival-path override first; falls back to the `KIN_DAEMON_URL`
@@ -69,6 +95,42 @@ fn daemon_base_url() -> Option<String> {
 /// an agent session is truly abandoned.  An explicit
 /// `KIN_DAEMON_IDLE_TIMEOUT_SECS` env var always overrides this at runtime.
 const MCP_IDLE_TIMEOUT_SECS: &str = "1800";
+
+/// Idle timeout to inject into a revival-spawned daemon, or `None` to inject
+/// nothing.
+///
+/// Mirrors `kin_cli::daemon_client::resolve_idle_timeout_env` and
+/// `kin_daemon::lifecycle::resolve_idle_timeout_env`: a user-set
+/// `KIN_DAEMON_IDLE_TIMEOUT_SECS` propagates to the child on its own and must
+/// never be overwritten, so this returns `None` in that case. Factored out of
+/// the spawn path so the precedence is unit-testable without spawning a
+/// process.
+fn mcp_spawn_idle_timeout(user_env_is_set: bool) -> Option<&'static str> {
+    (!user_env_is_set).then_some(MCP_IDLE_TIMEOUT_SECS)
+}
+
+// ── Unrecoverable-daemon error class ────────────────────────────────────
+
+/// Prefix marking the "the repo daemon is gone and could not be brought back"
+/// error class.
+///
+/// Every delegate failure that leaves the session unable to reach a daemon is
+/// tagged with this, so an agent (or a wrapping client) can tell an
+/// unrecoverable lifecycle failure apart from an ordinary tool error such as a
+/// bad argument or an HTTP 4xx from a live daemon. The two are handled
+/// completely differently: the first needs an operator restart, the second
+/// needs a corrected call.
+pub const DAEMON_EXITED_RESTART_REQUIRED: &str = "repo daemon exited; restart required";
+
+/// Does this delegate error mean the repo daemon is gone rather than that the
+/// call itself was rejected?
+///
+/// Callers that retry, degrade, or prompt for an operator restart need the two
+/// apart: only this class is fixed by restarting a daemon, and restarting one
+/// over an ordinary tool error is wasted work.
+pub fn is_daemon_exited_error(message: &str) -> bool {
+    message.starts_with(DAEMON_EXITED_RESTART_REQUIRED)
+}
 
 /// Bearer token the daemon expects on non-public routes.
 ///
@@ -418,6 +480,30 @@ pub(crate) enum DaemonCallError {
     DaemonError(String),
 }
 
+/// Classify a `reqwest` send failure.
+///
+/// Connect/timeout failures mean the request never reached a live daemon and
+/// warrant the retry-then-revive path; everything else is a protocol-level
+/// failure from a daemon that did respond.
+fn classify_send_error(operation: &str, error: reqwest::Error) -> DaemonCallError {
+    if error.is_connect() || error.is_timeout() {
+        DaemonCallError::ConnectionLost(error.to_string())
+    } else {
+        DaemonCallError::DaemonError(format!("daemon {operation} failed: {error}"))
+    }
+}
+
+/// Ability to restart a dead repo daemon and report its new base URL.
+///
+/// Split from [`DaemonCallSeam`] so every forwarded request — session, intent,
+/// traffic, status, and MCP tool calls alike — shares one revival policy
+/// through [`attempt_with_revival`], rather than revival being a property of
+/// the tool-call path only.
+pub(crate) trait DaemonReviver: Sync {
+    /// Attempt to revive a dead daemon and return its new base URL.
+    async fn revive(&self) -> Result<String, String>;
+}
+
 /// Abstraction over daemon communication and revival used by
 /// [`forward_mcp_with_seam`].
 ///
@@ -425,12 +511,12 @@ pub(crate) enum DaemonCallError {
 /// and can spawn a new daemon process via `std::process::Command`.  Tests
 /// inject a controlled stub to exercise the revival state machine without
 /// touching the network or spawning any processes.
-pub(crate) trait DaemonCallSeam: Sync {
+pub(crate) trait DaemonCallSeam: DaemonReviver {
     /// Attempt a single MCP tool call against the daemon at `base`.
     ///
     /// Returns:
     /// - `Ok(Some(result))` on success.
-    /// - `Ok(None)` when the daemon URL is not configured (graceful no-op).
+    /// - `Ok(None)` when no HTTP client can be built at all (graceful no-op).
     /// - `Err(ConnectionLost(_))` for transport failures — warrants revival.
     /// - `Err(DaemonError(_))` for HTTP/protocol failures — no revival.
     async fn call_tool(
@@ -439,13 +525,16 @@ pub(crate) trait DaemonCallSeam: Sync {
         name: &str,
         args: &HashMap<String, serde_json::Value>,
     ) -> Result<Option<ToolCallResult>, DaemonCallError>;
-
-    /// Attempt to revive a dead daemon and return its new base URL.
-    async fn revive(&self) -> Result<String, String>;
 }
 
 /// Production implementation of [`DaemonCallSeam`].
 pub(crate) struct RealDaemonSeam;
+
+impl DaemonReviver for RealDaemonSeam {
+    async fn revive(&self) -> Result<String, String> {
+        revive_mcp_daemon().await
+    }
+}
 
 impl DaemonCallSeam for RealDaemonSeam {
     async fn call_tool(
@@ -461,13 +550,10 @@ impl DaemonCallSeam for RealDaemonSeam {
             .post(format!("{}/mcp/tools/call", base))
             .json(&serde_json::json!({ "name": name, "arguments": args }));
         let request = with_session_header(with_auth(request), args);
-        let resp = request.send().await.map_err(|e| {
-            if e.is_connect() || e.is_timeout() {
-                DaemonCallError::ConnectionLost(e.to_string())
-            } else {
-                DaemonCallError::DaemonError(format!("daemon MCP tool call failed: {e}"))
-            }
-        })?;
+        let resp = request
+            .send()
+            .await
+            .map_err(|e| classify_send_error("MCP tool call", e))?;
         if !resp.status().is_success() {
             return Err(DaemonCallError::DaemonError(format!(
                 "daemon MCP tool call failed: HTTP {}",
@@ -478,10 +564,6 @@ impl DaemonCallSeam for RealDaemonSeam {
             DaemonCallError::DaemonError(format!("daemon MCP tool call response parse failed: {e}"))
         })?;
         Ok(Some(result))
-    }
-
-    async fn revive(&self) -> Result<String, String> {
-        revive_mcp_daemon().await
     }
 }
 
@@ -543,6 +625,21 @@ fn find_mcp_free_port() -> Option<u16> {
 /// base URL into [`DAEMON_URL_OVERRIDE`] so all subsequent delegate calls
 /// are routed to the revived daemon automatically.
 async fn revive_mcp_daemon() -> Result<String, String> {
+    // Serialize revival across concurrent tool calls. Every forwarded request
+    // now reaches this path, so a dead daemon can be observed by several calls
+    // at once; without this each would spawn its own daemon and all but one
+    // would lose the race for the repo lock and exit, turning one recoverable
+    // outage into a burst of doomed processes.
+    let _revival_guard = REVIVAL_LOCK.lock().await;
+    // A concurrent caller may have already revived the daemon while we waited
+    // for the guard. Reuse a healthy one rather than starting a second.
+    if let Some(existing) = current_daemon_url_override() {
+        if daemon_is_healthy(&existing).await {
+            tracing::debug!(url = %existing, "MCP revival: reusing daemon revived concurrently");
+            return Ok(existing);
+        }
+    }
+
     let kin_dir =
         discover_kin_dir().ok_or_else(|| "MCP revival: cannot find .kin directory".to_string())?;
     let working_dir = kin_dir
@@ -572,8 +669,10 @@ async fn revive_mcp_daemon() -> Result<String, String> {
     cmd.stderr(std::process::Stdio::null());
     // Inject the MCP-path idle timeout unless the user has an explicit
     // override in the environment — user's value always wins.
-    if std::env::var_os("KIN_DAEMON_IDLE_TIMEOUT_SECS").is_none() {
-        cmd.env("KIN_DAEMON_IDLE_TIMEOUT_SECS", MCP_IDLE_TIMEOUT_SECS);
+    if let Some(timeout) =
+        mcp_spawn_idle_timeout(std::env::var_os("KIN_DAEMON_IDLE_TIMEOUT_SECS").is_some())
+    {
+        cmd.env("KIN_DAEMON_IDLE_TIMEOUT_SECS", timeout);
     }
     #[cfg(unix)]
     unsafe {
@@ -617,36 +716,46 @@ async fn revive_mcp_daemon() -> Result<String, String> {
 
 // ── Seam-based MCP tool dispatch ────────────────────────────────────────
 
-/// Core MCP-tool-call dispatch with one-shot daemon revival.
+/// Run one daemon request with one-shot revival, shared by every forwarded
+/// call.
 ///
 /// On a connection-class failure ([`DaemonCallError::ConnectionLost`]) the
-/// call is retried once against the **same** URL before revival is considered:
-/// a transport error is just as often a stale kept-alive socket or a request
-/// landing inside the daemon's post-boot stall as it is a dead daemon, and
-/// revival against a live daemon cannot succeed (the repo lock is held), so
-/// misclassifying costs the whole call. Only when the same-URL retry also
-/// fails is the seam's `revive` method called **exactly once**. If revival
-/// succeeds the original request is retried against the new URL.
-/// Non-connection failures bypass retry and revival entirely.
+/// request is retried once against the **same** URL before revival is
+/// considered: a transport error is just as often a stale kept-alive socket or
+/// a request landing inside the daemon's post-boot stall as it is a dead
+/// daemon, and revival against a live daemon cannot succeed (the repo lock is
+/// held), so misclassifying costs the whole call. Only when the same-URL retry
+/// also fails is `revive` called **exactly once**. If revival succeeds the
+/// request is retried against the new URL.  Non-connection failures bypass
+/// retry and revival entirely.
+///
+/// `attempt` receives the base URL to use, so the post-revival retry addresses
+/// the new daemon rather than the dead one.
 ///
 /// Invariants:
 /// - `revive` is called at most once per invocation.
-/// - `call_tool` is called at most three times (attempt, same-URL retry,
+/// - `attempt` is called at most three times (attempt, same-URL retry,
 ///   post-revival retry).
 /// - Non-connection errors are never silently discarded.
-async fn forward_mcp_with_seam(
-    name: &str,
-    args: &HashMap<String, serde_json::Value>,
-    seam: &impl DaemonCallSeam,
+/// - Every failure that ends with no reachable daemon is tagged
+///   [`DAEMON_EXITED_RESTART_REQUIRED`].
+async fn attempt_with_revival<T, A, Fut>(
+    operation: &str,
     daemon_url: &str,
-) -> Result<Option<ToolCallResult>, String> {
-    let first_err = match seam.call_tool(daemon_url, name, args).await {
+    reviver: &impl DaemonReviver,
+    attempt: A,
+) -> Result<T, String>
+where
+    A: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = Result<T, DaemonCallError>>,
+{
+    let first_err = match attempt(daemon_url.to_string()).await {
         Ok(result) => return Ok(result),
         Err(DaemonCallError::DaemonError(e)) => return Err(e),
         Err(DaemonCallError::ConnectionLost(e)) => e,
     };
     tokio::time::sleep(Duration::from_millis(250)).await;
-    match seam.call_tool(daemon_url, name, args).await {
+    match attempt(daemon_url.to_string()).await {
         Ok(result) => Ok(result),
         Err(DaemonCallError::DaemonError(e)) => Err(e),
         Err(DaemonCallError::ConnectionLost(retry_err)) => {
@@ -654,15 +763,15 @@ async fn forward_mcp_with_seam(
             // dead-daemon read is earned. Single revival attempt before
             // giving up.
             let first_err = format!("{first_err}; retry: {retry_err}");
-            match seam.revive().await {
+            match reviver.revive().await {
                 Err(revive_err) => Err(format!(
-                    "tool {name}: daemon at {daemon_url} is not responding \
-                     ({first_err}); revival failed: {revive_err}. \
+                    "{DAEMON_EXITED_RESTART_REQUIRED}: {operation}: daemon at {daemon_url} \
+                     is not responding ({first_err}); revival failed: {revive_err}. \
                      Restart `kin mcp start` to recover."
                 )),
                 Ok(new_url) => {
                     // Retry exactly once on the post-revival URL.
-                    match seam.call_tool(&new_url, name, args).await {
+                    match attempt(new_url.clone()).await {
                         Ok(result) => Ok(result),
                         Err(e) => {
                             let detail = match e {
@@ -670,8 +779,8 @@ async fn forward_mcp_with_seam(
                                 | DaemonCallError::DaemonError(s) => s,
                             };
                             Err(format!(
-                                "tool {name}: daemon was revived at {new_url} but \
-                                 the retry still failed: {detail}. \
+                                "{DAEMON_EXITED_RESTART_REQUIRED}: {operation}: daemon was \
+                                 revived at {new_url} but the retry still failed: {detail}. \
                                  Check `kin daemon status`."
                             ))
                         }
@@ -682,6 +791,19 @@ async fn forward_mcp_with_seam(
     }
 }
 
+/// Core MCP-tool-call dispatch, layered on [`attempt_with_revival`].
+async fn forward_mcp_with_seam(
+    name: &str,
+    args: &HashMap<String, serde_json::Value>,
+    seam: &impl DaemonCallSeam,
+    daemon_url: &str,
+) -> Result<Option<ToolCallResult>, String> {
+    attempt_with_revival(&format!("tool {name}"), daemon_url, seam, |base| async move {
+        seam.call_tool(&base, name, args).await
+    })
+    .await
+}
+
 async fn forward_mcp_tool_call(
     name: &str,
     arguments: &HashMap<String, serde_json::Value>,
@@ -690,6 +812,59 @@ async fn forward_mcp_tool_call(
         return Ok(None);
     };
     forward_mcp_with_seam(name, arguments, &RealDaemonSeam, &base).await
+}
+
+/// Issue a JSON daemon request under the shared retry/revive policy.
+///
+/// `build` is invoked once per attempt with the base URL for **that** attempt,
+/// so the post-revival retry addresses the revived daemon rather than the dead
+/// one. This is the single entry point for the session, intent, traffic, and
+/// status forwards: before it existed each of them issued a bare one-shot
+/// request, so an idle-shutdown between two tool calls took every one of them
+/// down permanently while `/mcp/tools/call` recovered.
+///
+/// An empty response body (the daemon answers some mutations with `204 No
+/// Content`) parses as `Value::Null` rather than failing.
+async fn daemon_json_request<B>(
+    operation: &str,
+    base: &str,
+    build: B,
+) -> Result<serde_json::Value, String>
+where
+    B: Fn(&reqwest::Client, &str) -> reqwest::RequestBuilder,
+{
+    attempt_with_revival(operation, base, &RealDaemonSeam, |url| {
+        let build = &build;
+        async move {
+            let Some(client) = daemon_client().await else {
+                return Err(DaemonCallError::DaemonError(format!(
+                    "daemon {operation} failed: could not build an HTTP client"
+                )));
+            };
+            let resp = build(&client, &url)
+                .send()
+                .await
+                .map_err(|e| classify_send_error(operation, e))?;
+            if !resp.status().is_success() {
+                return Err(DaemonCallError::DaemonError(format!(
+                    "daemon {operation} failed: HTTP {}",
+                    resp.status()
+                )));
+            }
+            let body = resp.text().await.map_err(|e| {
+                DaemonCallError::DaemonError(format!("daemon {operation} response read failed: {e}"))
+            })?;
+            if body.trim().is_empty() {
+                return Ok(serde_json::Value::Null);
+            }
+            serde_json::from_str(&body).map_err(|e| {
+                DaemonCallError::DaemonError(format!(
+                    "daemon {operation} response parse failed: {e}"
+                ))
+            })
+        }
+    })
+    .await
 }
 
 /// Forward any product-mode MCP tool call to the daemon-owned implementation.
@@ -821,30 +996,16 @@ fn validate_stage_arguments(arguments: &HashMap<String, serde_json::Value>) -> R
 async fn forward_graph_status(
     arguments: &HashMap<String, serde_json::Value>,
 ) -> Result<Option<ToolCallResult>, String> {
-    let Some(client) = daemon_client().await else {
-        return Ok(None);
-    };
     let Some(base) = daemon_base_url() else {
         return Ok(None);
     };
-    let request = client
-        .post(format!("{}/commands/status", base))
-        .json(&serde_json::json!({ "json": false }));
-    let request = with_session_header(with_auth(request), arguments);
-    let resp = request
-        .send()
-        .await
-        .map_err(|e| format!("daemon graph status failed: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!(
-            "daemon graph status failed: HTTP {}",
-            resp.status()
-        ));
-    }
-    let value: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("daemon graph status response parse failed: {e}"))?;
+    let value = daemon_json_request("graph status", &base, |client, base| {
+        let request = client
+            .post(format!("{base}/commands/status"))
+            .json(&serde_json::json!({ "json": false }));
+        with_session_header(with_auth(request), arguments)
+    })
+    .await?;
     let summary = value.get("summary").unwrap_or(&value);
     let field_u64 = |key: &str| summary.get(key).and_then(serde_json::Value::as_u64);
     let result = serde_json::json!({
@@ -903,8 +1064,18 @@ pub async fn fetch_health_snapshot() -> Option<serde_json::Value> {
     resp.json::<serde_json::Value>().await.ok()
 }
 
-/// Get or initialize the daemon client. Returns `None` if the daemon is not
-/// reachable right now; daemon-required callers turn that into a hard error.
+/// Get or initialize the daemon HTTP client. Returns `None` only when a client
+/// cannot be constructed at all.
+///
+/// This deliberately does **not** probe the daemon for liveness. It used to:
+/// a `/health` probe gated every call and a failed probe returned `None`, which
+/// callers read as "no daemon configured" and turned into a graceful no-op.
+/// That silently swallowed the exact signal the revival path exists to act on,
+/// so a daemon that idled out was never restarted and the whole MCP session
+/// stayed dead. Liveness now belongs to the request itself: a transport failure
+/// classifies as [`DaemonCallError::ConnectionLost`] and drives retry and
+/// revival, while "no daemon configured" is a `None` from [`daemon_base_url`]
+/// alone. The probe was also a wasted round-trip in front of every call.
 pub async fn daemon_client() -> Option<reqwest::Client> {
     if let Some(client) = DAEMON_CLIENT.get() {
         return Some(client.clone());
@@ -935,28 +1106,8 @@ pub async fn daemon_client() -> Option<reqwest::Client> {
         .build()
         .ok()?;
 
-    let Some(base) = daemon_base_url() else {
-        debug!("daemon delegate: KIN_DAEMON_URL is not set");
-        return None;
-    };
-    let probe_url = format!("{}/health", base);
-    let ok = client
-        .get(&probe_url)
-        .send()
-        .await
-        .ok()?
-        .status()
-        .is_success();
-
-    if ok {
-        debug!("daemon delegate: connected to {}", base);
-        let cached = client.clone();
-        let _ = DAEMON_CLIENT.set(cached.clone());
-        Some(cached)
-    } else {
-        debug!("daemon delegate: daemon not reachable");
-        None
-    }
+    let _ = DAEMON_CLIENT.set(client.clone());
+    Some(client)
 }
 
 /// Forward a session start to the daemon.
@@ -970,9 +1121,6 @@ pub async fn forward_session_start(
     cwd: &str,
     capabilities: &SessionCapabilities,
 ) -> Result<Option<serde_json::Value>, String> {
-    let Some(client) = daemon_client().await else {
-        return Ok(None);
-    };
     let Some(base) = daemon_base_url() else {
         return Ok(None);
     };
@@ -986,20 +1134,10 @@ pub async fn forward_session_start(
     if let Some(p) = pid {
         body["pid"] = serde_json::json!(p);
     }
-    let resp = with_auth(client.post(format!("{}/session", base)).json(&body))
-        .send()
-        .await
-        .map_err(|e| format!("daemon session start failed: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!(
-            "daemon session start failed: HTTP {}",
-            resp.status()
-        ));
-    }
-    let value = resp
-        .json()
-        .await
-        .map_err(|e| format!("daemon session start response parse failed: {e}"))?;
+    let value = daemon_json_request("session start", &base, |client, base| {
+        with_auth(client.post(format!("{base}/session")).json(&body))
+    })
+    .await?;
     Ok(Some(value))
 }
 
@@ -1007,45 +1145,25 @@ pub async fn forward_session_start(
 pub async fn forward_session_heartbeat(
     session_id: &str,
 ) -> Result<Option<serde_json::Value>, String> {
-    let Some(client) = daemon_client().await else {
-        return Ok(None);
-    };
     let Some(base) = daemon_base_url() else {
         return Ok(None);
     };
-    let resp = with_auth(client.post(format!("{}/session/{}/heartbeat", base, session_id)))
-        .send()
-        .await
-        .map_err(|e| format!("daemon heartbeat failed: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("daemon heartbeat failed: HTTP {}", resp.status()));
-    }
-    let value = resp
-        .json()
-        .await
-        .map_err(|e| format!("daemon heartbeat response parse failed: {e}"))?;
+    let value = daemon_json_request("heartbeat", &base, |client, base| {
+        with_auth(client.post(format!("{base}/session/{session_id}/heartbeat")))
+    })
+    .await?;
     Ok(Some(value))
 }
 
 /// Forward a session end to the daemon.
 pub async fn forward_session_end(session_id: &str) -> Result<Option<serde_json::Value>, String> {
-    let Some(client) = daemon_client().await else {
-        return Ok(None);
-    };
     let Some(base) = daemon_base_url() else {
         return Ok(None);
     };
-    let resp = with_auth(client.delete(format!("{}/session/{}", base, session_id)))
-        .send()
-        .await
-        .map_err(|e| format!("daemon session end failed: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("daemon session end failed: HTTP {}", resp.status()));
-    }
-    let value = resp
-        .json()
-        .await
-        .map_err(|e| format!("daemon session end response parse failed: {e}"))?;
+    let value = daemon_json_request("session end", &base, |client, base| {
+        with_auth(client.delete(format!("{base}/session/{session_id}")))
+    })
+    .await?;
     Ok(Some(value))
 }
 
@@ -1057,9 +1175,6 @@ pub async fn forward_register_intent(
     task_description: &str,
     expires_at: Option<&str>,
 ) -> Result<Option<serde_json::Value>, String> {
-    let Some(client) = daemon_client().await else {
-        return Ok(None);
-    };
     let Some(base) = daemon_base_url() else {
         return Ok(None);
     };
@@ -1076,20 +1191,10 @@ pub async fn forward_register_intent(
     } else {
         body
     };
-    let resp = with_auth(client.post(format!("{}/intent/register", base)).json(&body))
-        .send()
-        .await
-        .map_err(|e| format!("daemon intent register failed: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!(
-            "daemon intent register failed: HTTP {}",
-            resp.status()
-        ));
-    }
-    let value = resp
-        .json()
-        .await
-        .map_err(|e| format!("daemon intent register response parse failed: {e}"))?;
+    let value = daemon_json_request("intent register", &base, |client, base| {
+        with_auth(client.post(format!("{base}/intent/register")).json(&body))
+    })
+    .await?;
     Ok(Some(value))
 }
 
@@ -1101,22 +1206,14 @@ pub async fn forward_release_intent(
     session_id: &str,
     intent_id: &str,
 ) -> Result<Option<serde_json::Value>, String> {
-    let Some(client) = daemon_client().await else {
-        return Ok(None);
-    };
     let Some(base) = daemon_base_url() else {
         return Ok(None);
     };
-    let resp = with_auth(client.delete(format!("{}/intent/{}", base, intent_id)))
-        .send()
-        .await
-        .map_err(|e| format!("daemon release intent failed: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!(
-            "daemon release intent failed: HTTP {}",
-            resp.status()
-        ));
-    }
+    // The 204 body is empty, so the shared request helper yields `Null` here.
+    daemon_json_request("release intent", &base, |client, base| {
+        with_auth(client.delete(format!("{base}/intent/{intent_id}")))
+    })
+    .await?;
     // Daemon returns 204 No Content; synthesize a result for the MCP handler.
     Ok(Some(serde_json::json!({
         "intent_id": intent_id,
@@ -1132,29 +1229,16 @@ pub async fn forward_release_intent(
 pub async fn forward_check_traffic(
     scope_strings: &[String],
 ) -> Result<Option<serde_json::Value>, String> {
-    let Some(client) = daemon_client().await else {
-        return Ok(None);
-    };
     let Some(base) = daemon_base_url() else {
         return Ok(None);
     };
     let mut reports = Vec::new();
     for scope in scope_strings {
         let encoded = scope.replace(':', "%3A");
-        let resp = with_auth(client.get(format!("{}/traffic/{}", base, encoded)))
-            .send()
-            .await
-            .map_err(|e| format!("daemon check traffic failed: {e}"))?;
-        if !resp.status().is_success() {
-            return Err(format!(
-                "daemon check traffic failed: HTTP {}",
-                resp.status()
-            ));
-        }
-        let value: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| format!("daemon check traffic response parse failed: {e}"))?;
+        let value = daemon_json_request("check traffic", &base, |client, base| {
+            with_auth(client.get(format!("{base}/traffic/{encoded}")))
+        })
+        .await?;
         reports.push(value);
     }
     Ok(Some(serde_json::json!({
@@ -1222,12 +1306,269 @@ mod tests {
                 .pop_front()
                 .expect("FakeSeam: unexpected extra call_tool invocation")
         }
+    }
 
+    impl DaemonReviver for FakeSeam {
         async fn revive(&self) -> Result<String, String> {
             self.revive_count
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.revive_result.clone()
         }
+    }
+
+    /// Reviver-only stub for the non-tool-call forwards, which drive
+    /// [`attempt_with_revival`] directly.
+    struct FakeReviver {
+        result: Result<String, String>,
+        count: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FakeReviver {
+        fn new(result: Result<String, String>) -> Self {
+            Self {
+                result,
+                count: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn revives(&self) -> usize {
+            self.count.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl DaemonReviver for FakeReviver {
+        async fn revive(&self) -> Result<String, String> {
+            self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.result.clone()
+        }
+    }
+
+    // ── Session-path revival over real sockets ─────────────────────────────
+    //
+    // The regression FIR-1575 reports: only `/mcp/tools/call` had a revival
+    // path, so a repo daemon that idled out between two tool calls left every
+    // session/intent/traffic/status forward failing forever. These drive the
+    // shared state machine those forwards now use, against real loopback
+    // sockets, so reqwest's own error classification is exercised rather than
+    // assumed. No daemon process is ever spawned.
+
+    /// A loopback URL whose port is closed: what an exited daemon leaves behind.
+    async fn exited_daemon_url() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        format!("http://127.0.0.1:{port}")
+    }
+
+    /// Minimal HTTP responder answering every request with `200 OK` and `body`.
+    /// Abort the returned handle to take it down.
+    async fn stub_daemon(body: &'static str) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 8192];
+                    let _ = socket.read(&mut buf).await;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                         content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        (format!("http://127.0.0.1:{port}"), handle)
+    }
+
+    fn probe_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .connect_timeout(Duration::from_millis(300))
+            .timeout(Duration::from_secs(3))
+            .pool_max_idle_per_host(0)
+            .build()
+            .unwrap()
+    }
+
+    /// One `POST {base}/session` attempt, classified the way the real session
+    /// forward classifies it.
+    async fn post_session(
+        client: &reqwest::Client,
+        base: &str,
+    ) -> Result<serde_json::Value, DaemonCallError> {
+        let resp = client
+            .post(format!("{base}/session"))
+            .json(&serde_json::json!({ "vendor": "test" }))
+            .send()
+            .await
+            .map_err(|e| classify_send_error("session start", e))?;
+        if !resp.status().is_success() {
+            return Err(DaemonCallError::DaemonError(format!(
+                "daemon session start failed: HTTP {}",
+                resp.status()
+            )));
+        }
+        resp.json().await.map_err(|e| {
+            DaemonCallError::DaemonError(format!("daemon session start response parse failed: {e}"))
+        })
+    }
+
+    /// (a) The daemon exits between calls; the next session forward transparently
+    /// respawns and succeeds. Before this change the same call returned a hard
+    /// error and every later one did too, for the life of the agent process.
+    #[tokio::test]
+    async fn session_forward_survives_daemon_exit_by_reviving() {
+        let dead = exited_daemon_url().await;
+        let (revived, revived_handle) = stub_daemon(r#"{"session_id":"s-1"}"#).await;
+        let reviver = FakeReviver::new(Ok(revived.clone()));
+        let client = probe_client();
+
+        let value: serde_json::Value =
+            attempt_with_revival("session start", &dead, &reviver, |base| {
+                let client = client.clone();
+                async move { post_session(&client, &base).await }
+            })
+            .await
+            .expect("session start must recover through revival");
+
+        assert_eq!(
+            value["session_id"], "s-1",
+            "the response must come from the revived daemon"
+        );
+        assert_eq!(reviver.revives(), 1, "revive runs exactly once");
+        revived_handle.abort();
+    }
+
+    /// A live daemon is never disturbed: no retry, no revival, one request.
+    #[tokio::test]
+    async fn healthy_daemon_never_triggers_revival() {
+        let (live, live_handle) = stub_daemon(r#"{"session_id":"s-live"}"#).await;
+        let reviver = FakeReviver::new(Err("revival must not run".to_string()));
+        let client = probe_client();
+
+        let value: serde_json::Value =
+            attempt_with_revival("session start", &live, &reviver, |base| {
+                let client = client.clone();
+                async move { post_session(&client, &base).await }
+            })
+            .await
+            .expect("healthy daemon must answer directly");
+
+        assert_eq!(value["session_id"], "s-live");
+        assert_eq!(reviver.revives(), 0);
+        live_handle.abort();
+    }
+
+    /// (b) When respawn cannot succeed, the caller gets the distinguishable
+    /// "daemon exited" class rather than a generic delegate failure.
+    #[tokio::test]
+    async fn unrecoverable_respawn_surfaces_the_daemon_exited_class() {
+        let dead = exited_daemon_url().await;
+        let reviver = FakeReviver::new(Err("kin-daemon binary not found".to_string()));
+        let client = probe_client();
+
+        let err = attempt_with_revival("session start", &dead, &reviver, |base| {
+            let client = client.clone();
+            async move { post_session(&client, &base).await }
+        })
+        .await
+        .expect_err("a dead daemon that cannot be revived must fail");
+
+        assert!(
+            is_daemon_exited_error(&err),
+            "must carry the unrecoverable-daemon class: {err}"
+        );
+        assert!(
+            err.contains("kin-daemon binary not found"),
+            "must preserve why revival failed: {err}"
+        );
+        assert!(
+            err.contains("kin mcp start"),
+            "must state the recovery action: {err}"
+        );
+    }
+
+    /// An error from a *live* daemon must not be mistaken for the daemon being
+    /// gone: an agent that restarts its MCP server over a bad argument has
+    /// misread the failure.
+    #[tokio::test]
+    async fn live_daemon_errors_are_not_the_daemon_exited_class() {
+        let seam = FakeSeam::new(vec![Err(daemon_err())], Ok("http://127.0.0.1:9".to_string()));
+        let err = forward_mcp_with_seam("tool", &HashMap::new(), &seam, "http://127.0.0.1:4219")
+            .await
+            .unwrap_err();
+        assert!(
+            !is_daemon_exited_error(&err),
+            "an HTTP 500 from a live daemon is not a lifecycle failure: {err}"
+        );
+    }
+
+    /// A revived daemon that still fails is equally unrecoverable, and says so
+    /// in the same class.
+    #[tokio::test]
+    async fn failure_after_revival_is_also_the_daemon_exited_class() {
+        let seam = FakeSeam::new(
+            vec![Err(conn_lost()), Err(conn_lost()), Err(conn_lost())],
+            Ok("http://127.0.0.1:9999".to_string()),
+        );
+        let err = forward_mcp_with_seam("tool", &HashMap::new(), &seam, "http://127.0.0.1:4219")
+            .await
+            .unwrap_err();
+        assert!(is_daemon_exited_error(&err), "{err}");
+    }
+
+    // ── Idle-timeout injection ─────────────────────────────────────────────
+
+    /// (c) `KIN_DAEMON_IDLE_TIMEOUT_SECS` override behaviour: a user value
+    /// propagates to the child on its own and must never be overwritten;
+    /// otherwise the revival path injects the 30-minute MCP window.
+    #[test]
+    fn revival_spawn_injects_mcp_idle_timeout_unless_user_set_one() {
+        assert_eq!(
+            mcp_spawn_idle_timeout(false),
+            Some(MCP_IDLE_TIMEOUT_SECS),
+            "with no user override the revived daemon gets the MCP window"
+        );
+        assert_eq!(
+            mcp_spawn_idle_timeout(true),
+            None,
+            "a user-set KIN_DAEMON_IDLE_TIMEOUT_SECS must never be overwritten"
+        );
+    }
+
+    // ── Revival single-flight ──────────────────────────────────────────────
+
+    /// Every forward now reaches revival, so a dead daemon can be observed by
+    /// several calls at once. The first caller's daemon must be reused rather
+    /// than each caller starting its own and losing the repo-lock race.
+    #[tokio::test]
+    async fn revival_reuses_a_daemon_another_caller_already_started() {
+        let (already_revived, handle) = stub_daemon(r#"{"status":"ok"}"#).await;
+        if let Ok(mut guard) = DAEMON_URL_OVERRIDE.lock() {
+            *guard = Some(already_revived.clone());
+        }
+
+        // No .kin discovery, no binary lookup, no spawn: the healthy override
+        // short-circuits before any of that.
+        let revived = revive_mcp_daemon().await.expect("must reuse the live daemon");
+        assert_eq!(revived, already_revived);
+
+        clear_daemon_url_override();
+        handle.abort();
+    }
+
+    /// The delegate client must not gate calls on a liveness probe. Returning
+    /// `None` for an unreachable daemon is what made the delegate swallow the
+    /// signal revival exists to act on.
+    #[tokio::test]
+    async fn daemon_client_is_available_without_a_reachable_daemon() {
+        assert!(
+            daemon_client().await.is_some(),
+            "client construction must not depend on a live daemon"
+        );
     }
 
     fn conn_lost() -> DaemonCallError {
