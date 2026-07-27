@@ -355,6 +355,34 @@ impl Drop for PreparedRepositoryInit {
 ///
 /// Returns `KinError::AlreadyInitialized` if `.kin/` already exists.
 pub fn init(working_dir: &Path) -> Result<InitResult> {
+    init_with_config(working_dir, KinConfig::default())
+}
+
+/// Initialize a repository that will adopt a remote's history over a native
+/// clone.
+///
+/// A clone learns the remote's default ref from the ref advertisement before
+/// any history arrives, so the replica is created against that ref rather than
+/// the local configuration default. Synthesizing `main` for a remote that does
+/// not publish it would leave a ghost ref no import can ever reconcile.
+///
+/// Like [`init`], this admits no history. The replica holds no changes until
+/// the caller imports them, so it stays byte-comparable with the remote at
+/// first contact.
+///
+/// # Errors
+///
+/// Returns `KinError::AlreadyInitialized` if `.kin/` already exists, and fails
+/// loud if `default_branch` is not a valid ref name.
+pub fn init_replica(working_dir: &Path, default_branch: &str) -> Result<InitResult> {
+    let config = KinConfig {
+        default_branch: default_branch.to_string(),
+        ..KinConfig::default()
+    };
+    init_with_config(working_dir, config)
+}
+
+fn init_with_config(working_dir: &Path, config: KinConfig) -> Result<InitResult> {
     let canonical_working_dir = working_dir
         .canonicalize()
         .map_err(|error| KinError::io(working_dir, error))?;
@@ -369,7 +397,6 @@ pub fn init(working_dir: &Path) -> Result<InitResult> {
         Err(error) => return Err(KinError::io(&kin_dir, error)),
     }
 
-    let config = KinConfig::default();
     let manifest = KinManifest::new();
     let staging_parent = canonical_working_dir.parent().ok_or_else(|| {
         KinError::Other(format!(
@@ -2110,6 +2137,121 @@ mod tests {
         assert_eq!(result.repository_id.as_str(), loaded.repo_id);
         assert_eq!(result.workspace_id.to_string(), loaded.workspace_id);
         assert_ne!(loaded.repo_id, loaded.workspace_id);
+    }
+
+    #[test]
+    fn independent_initializations_hold_an_equal_change_set() {
+        let first_directory = tempfile::tempdir().unwrap();
+        let second_directory = tempfile::tempdir().unwrap();
+        let first = init(first_directory.path()).unwrap();
+        let second = init(second_directory.path()).unwrap();
+
+        // Replication between two repositories that were initialized separately
+        // compares the changes each side holds. Initialization admits no
+        // history, so neither side carries a synthesized root whose payload
+        // could differ. A synthetic root stamped at initialization time would
+        // make these sets unequal and first contact unreconcilable.
+        let first_changes = held_change_ids(&first);
+        let second_changes = held_change_ids(&second);
+        assert!(first_changes.is_empty());
+        assert_eq!(first_changes, second_changes);
+
+        assert_eq!(first.authority.initial_change_id, None);
+        assert_eq!(second.authority.initial_change_id, None);
+        assert_eq!(first.head, second.head);
+        assert_eq!(
+            first.authority.workspace.base_target,
+            second.authority.workspace.base_target
+        );
+        assert_eq!(
+            first.authority.workspace.base_tree_hash,
+            second.authority.workspace.base_tree_hash
+        );
+        assert_eq!(
+            first.authority.workspace.workspace_tree_hash,
+            second.authority.workspace.workspace_tree_hash
+        );
+        assert_eq!(
+            first.authority.workspace.workspace_semantic_overlay_hash,
+            second.authority.workspace.workspace_semantic_overlay_hash
+        );
+
+        // Repository and workspace identity stay per-repository. Only history
+        // is shared across a replication boundary.
+        assert_ne!(first.repository_id, second.repository_id);
+        assert_ne!(first.workspace_id, second.workspace_id);
+    }
+
+    #[test]
+    fn replica_adopts_the_remote_default_ref_without_inventing_main() {
+        let directory = tempfile::tempdir().unwrap();
+        let result = init_replica(directory.path(), "trunk").unwrap();
+
+        assert_eq!(
+            result.head,
+            WorkspaceHead::Symbolic {
+                target: RefName::branch(b"trunk").unwrap()
+            }
+        );
+        assert_ne!(
+            result.head,
+            WorkspaceHead::Symbolic {
+                target: RefName::branch(b"main").unwrap()
+            }
+        );
+        let loaded = KinConfig::load(&result.layout.config_path()).unwrap();
+        assert_eq!(loaded.default_branch, "trunk");
+
+        // A replica carries no history of its own. Import supplies it, so the
+        // replica is comparable with the remote at first contact.
+        assert_eq!(result.authority.initial_change_id, None);
+        assert!(held_change_ids(&result).is_empty());
+        assert_eq!(result.authority.workspace.base_target, None);
+    }
+
+    #[test]
+    fn replica_and_plain_init_differ_only_in_the_adopted_ref() {
+        let replica_directory = tempfile::tempdir().unwrap();
+        let init_directory = tempfile::tempdir().unwrap();
+        let replica = init_replica(replica_directory.path(), "main").unwrap();
+        let plain = init(init_directory.path()).unwrap();
+
+        assert_eq!(replica.head, plain.head);
+        assert_eq!(held_change_ids(&replica), held_change_ids(&plain));
+        assert_eq!(
+            replica.authority.workspace.workspace_tree_hash,
+            plain.authority.workspace.workspace_tree_hash
+        );
+        assert_eq!(
+            replica.authority.workspace.workspace_semantic_overlay_hash,
+            plain.authority.workspace.workspace_semantic_overlay_hash
+        );
+    }
+
+    #[test]
+    fn replica_rejects_an_invalid_remote_default_ref() {
+        let parent = tempfile::tempdir().unwrap();
+        let repository = parent.path().join("replica");
+        std::fs::create_dir(&repository).unwrap();
+
+        assert!(init_replica(&repository, "").is_err());
+        assert!(!repository.join(".kin").exists());
+        let leftovers = std::fs::read_dir(parent.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name.to_string_lossy().starts_with(".kin.init-"))
+            .collect::<Vec<_>>();
+        assert!(leftovers.is_empty(), "staging leftovers: {leftovers:?}");
+    }
+
+    fn held_change_ids(result: &InitResult) -> std::collections::BTreeSet<SemanticChangeId> {
+        let authority = RepositoryAuthorityManager::open(
+            result.repository_id.clone(),
+            Arc::new(LocalFileBackend::new(result.layout.kindb_dir())),
+        )
+        .unwrap();
+        let lease = authority.read_authority();
+        lease.snapshot().changes.keys().copied().collect()
     }
 
     #[test]
