@@ -103,11 +103,18 @@ pub fn execute_history_request(
 ) -> Result<HistoryResponse> {
     let head =
         crate::commands::ref_lookup::resolve_ref(graph, binding, request.reference.as_deref())?;
-    let target = match request.reference.as_deref() {
-        Some(_) => {
-            crate::commands::ref_lookup::resolve_entity_query_at_ref(graph, &request.entity, &head)?
+    let (target, revisions) = match request.reference.as_deref() {
+        Some(_) => crate::commands::ref_lookup::resolve_entity_with_revisions_at(
+            graph,
+            &request.entity,
+            &head,
+        )?,
+        None => {
+            let target = crate::commands::ref_lookup::resolve_entity_query(graph, &request.entity)?;
+            let revisions =
+                crate::commands::ref_lookup::resolve_entity_revisions_at(graph, &target.id, &head)?;
+            (target, revisions)
         }
-        None => crate::commands::ref_lookup::resolve_entity_query(graph, &request.entity)?,
     };
     // Identifiers are abbreviated and messages are reduced to their subject
     // line, the way `git log --oneline` does. Printing two full 64-character
@@ -121,7 +128,6 @@ pub fn execute_history_request(
         abbreviate_id(&head.to_string())
     )];
 
-    let revisions = graph.get_entity_revisions_at(&target.id, &head)?;
     if revisions.is_empty() {
         lines.push("  No history recorded".to_string());
     } else {
