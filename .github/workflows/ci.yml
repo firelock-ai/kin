@@ -286,26 +286,20 @@ jobs:
             exit 1
           fi
           grep -q "byte-exact executable-mode proof is unsupported" "$RUNNER_TEMP/kin-init-git.txt"
-          # The daemon reopen smoke needs a graph, not a Git migration:
-          # bootstrap a fresh non-Git repository, which has no mode proof
-          # to carry.
+          # Fresh non-Git bootstrap is also gated off Windows today: repository
+          # config publication requires capability-owned atomic replacement,
+          # a unix capability. The refusal must be loud and name that gate;
+          # daemon reopen assertions live in the Linux daemon smoke until the
+          # Windows ports land.
           boot_dir="$RUNNER_TEMP/kin-windows-daemon-boot"
           mkdir -p "$boot_dir"
           cd "$boot_dir"
-          kin.exe init > "$RUNNER_TEMP/kin-init.txt"
-          kin.exe status --json > "$RUNNER_TEMP/kin-status.json"
-          node <<'NODE'
-          const fs = require("fs");
-          const status = JSON.parse(fs.readFileSync(`${process.env.RUNNER_TEMP}/kin-status.json`, "utf8"));
-          if (status.build?.daemon_source_known !== true) {
-            throw new Error("Windows status did not return known daemon build provenance");
-          }
-          if (status.semantic_coverage?.supported !== false) {
-            throw new Error("Windows vector-free daemon reported semantic vectors as supported");
-          }
-          NODE
-          test -s .kin/kindb/head-generation
-          test -s .kin/kindb/graph.kidx
+          if kin.exe init > "$RUNNER_TEMP/kin-init.txt" 2>&1; then
+            echo "::error::Windows non-Git bootstrap unexpectedly succeeded"
+            exit 1
+          fi
+          grep -q "atomic repository config replacement is unsupported" "$RUNNER_TEMP/kin-init.txt"
+          test ! -e "$boot_dir/.kin/kindb/head-generation"
 
   # Classify the PR diff so documentation-only and workflow-only changes can
   # satisfy the heavy required checks without a toolchain or registry
