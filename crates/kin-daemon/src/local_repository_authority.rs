@@ -130,6 +130,9 @@ impl ActiveLocalRepositoryAuthority {
         })
     }
 
+    /// Bind for assertions that only need the refusal text. Command paths must
+    /// use [`Self::open_bound`] so they can answer with a typed status.
+    #[cfg(test)]
     pub(crate) fn open(state: &DaemonState) -> Result<Self> {
         Self::open_bound(state).map_err(RepositoryAuthorityBindRefusal::into_error)
     }

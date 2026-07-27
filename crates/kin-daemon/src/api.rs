@@ -10724,9 +10724,18 @@ mod tests {
             .iter()
             .all(|repository_ref| repository_ref.name != branch);
 
+        // A replaced storage root is the same refusal as a replaced repository
+        // namespace under it: the pinned authority is no longer at that path.
+        // Both answer with a conflict rather than an internal fault.
         assert_eq!(
             branch_status,
-            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::CONFLICT,
+            "{}",
+            String::from_utf8_lossy(&branch_body)
+        );
+        assert!(
+            String::from_utf8_lossy(&branch_body)
+                .contains("pinned at startup is no longer the one at that path"),
             "{}",
             String::from_utf8_lossy(&branch_body)
         );
