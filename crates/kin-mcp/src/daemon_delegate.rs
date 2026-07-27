@@ -798,9 +798,12 @@ async fn forward_mcp_with_seam(
     seam: &impl DaemonCallSeam,
     daemon_url: &str,
 ) -> Result<Option<ToolCallResult>, String> {
-    attempt_with_revival(&format!("tool {name}"), daemon_url, seam, |base| async move {
-        seam.call_tool(&base, name, args).await
-    })
+    attempt_with_revival(
+        &format!("tool {name}"),
+        daemon_url,
+        seam,
+        |base| async move { seam.call_tool(&base, name, args).await },
+    )
     .await
 }
 
@@ -852,7 +855,9 @@ where
                 )));
             }
             let body = resp.text().await.map_err(|e| {
-                DaemonCallError::DaemonError(format!("daemon {operation} response read failed: {e}"))
+                DaemonCallError::DaemonError(format!(
+                    "daemon {operation} response read failed: {e}"
+                ))
             })?;
             if body.trim().is_empty() {
                 return Ok(serde_json::Value::Null);
@@ -1496,7 +1501,10 @@ mod tests {
     /// misread the failure.
     #[tokio::test]
     async fn live_daemon_errors_are_not_the_daemon_exited_class() {
-        let seam = FakeSeam::new(vec![Err(daemon_err())], Ok("http://127.0.0.1:9".to_string()));
+        let seam = FakeSeam::new(
+            vec![Err(daemon_err())],
+            Ok("http://127.0.0.1:9".to_string()),
+        );
         let err = forward_mcp_with_seam("tool", &HashMap::new(), &seam, "http://127.0.0.1:4219")
             .await
             .unwrap_err();
@@ -1553,7 +1561,9 @@ mod tests {
 
         // No .kin discovery, no binary lookup, no spawn: the healthy override
         // short-circuits before any of that.
-        let revived = revive_mcp_daemon().await.expect("must reuse the live daemon");
+        let revived = revive_mcp_daemon()
+            .await
+            .expect("must reuse the live daemon");
         assert_eq!(revived, already_revived);
 
         clear_daemon_url_override();
