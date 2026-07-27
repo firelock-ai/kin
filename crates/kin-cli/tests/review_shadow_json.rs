@@ -295,17 +295,45 @@ fn shadow_report_end_to_end_change_in_report_out() {
         .any(|gap| gap["kind"] == "cross_repo_not_evaluated"));
 }
 
+/// An artifact change the semantic graph cannot see is always an explicit
+/// evidence gap, but the exact repository tree decides which one, and only a
+/// content edit on a config-class subject leaves the verdict undemoted.
+///
+/// Adding, removing, moving, or retyping an artifact is a tree-structure
+/// transition that entity deltas cannot encode at all, so it reports
+/// `artifact_structure_change` and blocks certifying a pass regardless of the
+/// subject's class. A pure Blob content edit reports `artifact_only_change`,
+/// which demotes only when the ingest classifier says the subject is
+/// source-class — config, docs, and CI files are expected to carry no
+/// entities, so their gap is an honest pass with the gap attached.
 #[test]
 fn shadow_report_labels_config_only_change_without_demoting() {
     let dir = tempdir().expect("tempdir");
     let repo = dir.path();
     let (_base, head, artifact_head) = setup_fixture_repo(repo);
+    std::fs::write(
+        repo.join("policy.yaml"),
+        "gate:\n  mode: shadow\n  strict: false\n",
+    )
+    .expect("edit yaml");
+    run_git(repo, &["add", "-A"]);
+    run_git(repo, &["commit", "-m", "artifact: relax policy config"]);
+    let config_edit_head = git_head(repo);
     kin_init(repo);
 
-    let report = run_shadow_json(repo, &head, &artifact_head);
+    // Adding the config artifact is a tree-structure transition.
+    let added = run_shadow_json(repo, &head, &artifact_head);
+    let added_gaps = added["evidence_gaps"].as_array().unwrap();
+    assert!(
+        added_gaps.iter().any(
+            |gap| gap["kind"] == "artifact_structure_change" && gap["subject"] == "policy.yaml"
+        ),
+        "adding an artifact must surface as an exact tree-structure gap: {added_gaps:?}"
+    );
 
-    // The YAML-only change is invisible to the semantic graph: the report
-    // must say so explicitly as an evidence gap.
+    // Editing it in place is a pure content change the semantic graph cannot
+    // see: the report must say so explicitly as an evidence gap.
+    let report = run_shadow_json(repo, &artifact_head, &config_edit_head);
     let gaps = report["evidence_gaps"].as_array().unwrap();
     assert!(
         gaps.iter()

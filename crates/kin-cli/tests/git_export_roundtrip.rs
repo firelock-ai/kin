@@ -5,11 +5,17 @@
 //! leave": `kin git export`.
 //!
 //! It drives the real lifecycle through the public CLI and the daemon runtime —
-//! `kin init` → an edit through the reconcile path → `kin commit` →
-//! `kin git export` — then proves, with no Kin tooling present, that the export
+//! a repository whose history Kin admitted exactly at `kin init`, then
+//! `kin git export` — and proves, with no Kin tooling present, that the export
 //! is a plain Git repository whose history and file contents are usable with
 //! stock `git` and `rustc` alone: a stock `git clone` of the export builds and
 //! its tests pass.
+//!
+//! The exported change is authored in the migration source rather than through
+//! `kin commit`, which is fail-closed on repository-v6 (see `kin capabilities
+//! --json`). What is under test is the export half of "you can always leave":
+//! every byte it carries comes from admitted repository authority, so the
+//! seam that authored the change does not change what export must prove.
 //!
 //! The semantic graph (entities, relations, reviews, provenance, work items,
 //! annotations, verification links, sessions, intents, and the per-change
@@ -20,7 +26,6 @@
 use serial_test::serial;
 use std::fs;
 use std::path::Path;
-use std::time::Duration;
 use tempfile::tempdir;
 
 mod common;
@@ -240,14 +245,15 @@ fn git_export_round_trips_to_plain_git() {
     fs::create_dir_all(&build).expect("create build dir");
 
     seed_repo(&repo);
-    run_kin(&repo, &["init", "."]);
-
     fs::write(repo.join("src/lib.rs"), LIB_V1).expect("edit lib.rs");
-    std::thread::sleep(Duration::from_millis(400));
-    run_kin(
+    git(&repo, &["add", "."]);
+    git(
         &repo,
-        &["commit", "-m", "edit greet and add farewell", "--quiet"],
+        &["commit", "-q", "-m", "edit greet and add farewell"],
     );
+
+    // Admit the complete exact history as graph-owned repository authority.
+    run_kin(&repo, &["init", "."]);
 
     // Export Kin's semantic history out to a plain Git repository.
     run_kin(
@@ -321,7 +327,7 @@ fn git_export_round_trips_to_plain_git() {
     write_proof(
         "git_export_round_trip.json",
         &serde_json::json!({
-            "scenario": "init -> edit -> commit -> git export -> plain git clone",
+            "scenario": "exact git history -> init -> git export -> plain git clone",
             "exported_commit_count": commits,
             "commit_messages_round_tripped": true,
             "file_bytes_round_tripped": ["src/lib.rs", "src/main.rs"],
