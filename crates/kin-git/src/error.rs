@@ -48,6 +48,20 @@ pub struct GitCheckoutFilterFact {
     pub required_present: bool,
 }
 
+/// One admitted entry whose content the graph cannot answer for.
+///
+/// Paths and identities are carried as plain bytes and text so a gap report
+/// survives into an error without depending on repository model types.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsealedContentGap {
+    pub path: Vec<u8>,
+    /// Content identity the admitted tree requires.
+    pub expected: String,
+    /// Why the body could not be sealed: absent, unreadable, or not matching
+    /// the identity the tree recorded.
+    pub detail: String,
+}
+
 /// Errors from the kin-git adapter.
 #[derive(Debug, Error)]
 pub enum GitError {
@@ -101,6 +115,15 @@ pub enum GitError {
         filter_count: usize,
         hooks: Vec<LocalGitHookFact>,
         filters: Vec<GitCheckoutFilterFact>,
+    },
+
+    #[error(
+        "sealed all-content observation failed: {total_gaps} admitted entr(ies) have no byte-exact graph-owned body, so this repository cannot answer for its own content without reading the filesystem"
+    )]
+    UnsealedContent {
+        total_gaps: usize,
+        /// A bounded sample of the gaps. `total_gaps` is always the exact count.
+        reported: Vec<UnsealedContentGap>,
     },
 
     #[error("Git object format {0} is not supported for exact rehydration")]
