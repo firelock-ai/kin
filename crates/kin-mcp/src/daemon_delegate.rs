@@ -844,32 +844,45 @@ where
                     "daemon {operation} failed: could not build an HTTP client"
                 )));
             };
-            let resp = build(&client, &url)
-                .send()
-                .await
-                .map_err(|e| classify_send_error(operation, e))?;
-            if !resp.status().is_success() {
-                return Err(DaemonCallError::DaemonError(format!(
-                    "daemon {operation} failed: HTTP {}",
-                    resp.status()
-                )));
-            }
-            let body = resp.text().await.map_err(|e| {
-                DaemonCallError::DaemonError(format!(
-                    "daemon {operation} response read failed: {e}"
-                ))
-            })?;
-            if body.trim().is_empty() {
-                return Ok(serde_json::Value::Null);
-            }
-            serde_json::from_str(&body).map_err(|e| {
-                DaemonCallError::DaemonError(format!(
-                    "daemon {operation} response parse failed: {e}"
-                ))
-            })
+            send_daemon_json(operation, build(&client, &url)).await
         }
     })
     .await
+}
+
+/// Send one already-built daemon request and read its JSON body.
+///
+/// Split out of [`daemon_json_request`] so the response handling is testable
+/// without the revival wrapper: a test that drove the wrapper would, on any
+/// hiccup against its stub, reach the real revival path and spawn an actual
+/// `kin-daemon` against whatever repository the test process is sitting in.
+///
+/// An empty body is `Value::Null`, not an error. Some daemon mutations answer
+/// `204 No Content`, and the callers that expect it (intent release) synthesize
+/// their own result.
+async fn send_daemon_json(
+    operation: &str,
+    request: reqwest::RequestBuilder,
+) -> Result<serde_json::Value, DaemonCallError> {
+    let resp = request
+        .send()
+        .await
+        .map_err(|e| classify_send_error(operation, e))?;
+    if !resp.status().is_success() {
+        return Err(DaemonCallError::DaemonError(format!(
+            "daemon {operation} failed: HTTP {}",
+            resp.status()
+        )));
+    }
+    let body = resp.text().await.map_err(|e| {
+        DaemonCallError::DaemonError(format!("daemon {operation} response read failed: {e}"))
+    })?;
+    if body.trim().is_empty() {
+        return Ok(serde_json::Value::Null);
+    }
+    serde_json::from_str(&body).map_err(|e| {
+        DaemonCallError::DaemonError(format!("daemon {operation} response parse failed: {e}"))
+    })
 }
 
 /// Forward any product-mode MCP tool call to the daemon-owned implementation.
@@ -1374,6 +1387,16 @@ mod tests {
     /// Minimal HTTP responder answering every request with `200 OK` and `body`.
     /// Abort the returned handle to take it down.
     async fn stub_daemon(body: &'static str) -> (String, tokio::task::JoinHandle<()>) {
+        stub_daemon_raw(200, "OK", body).await
+    }
+
+    /// As [`stub_daemon`], with an explicit status line. `content-length` always
+    /// matches `body`, so a `204` carries a genuinely empty body.
+    async fn stub_daemon_raw(
+        status: u16,
+        reason: &'static str,
+        body: &'static str,
+    ) -> (String, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let handle = tokio::spawn(async move {
@@ -1383,7 +1406,7 @@ mod tests {
                     let mut buf = [0u8; 8192];
                     let _ = socket.read(&mut buf).await;
                     let response = format!(
-                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                        "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\n\
                          content-length: {}\r\nconnection: close\r\n\r\n{body}",
                         body.len()
                     );
@@ -1393,6 +1416,57 @@ mod tests {
             }
         });
         (format!("http://127.0.0.1:{port}"), handle)
+    }
+
+    /// The intent-release forward reads its response through the shared JSON
+    /// helper, but the daemon answers `DELETE /intent/{id}` with `204 No
+    /// Content`. An empty body must read as `Null`, not as a parse failure that
+    /// would report a successful release as an error.
+    #[tokio::test]
+    async fn empty_204_body_reads_as_null_rather_than_a_parse_failure() {
+        let (base, handle) = stub_daemon_raw(204, "No Content", "").await;
+        let client = probe_client();
+        let value = send_daemon_json(
+            "release intent",
+            client.delete(format!("{base}/intent/intent-1")),
+        )
+        .await
+        .expect("204 No Content must not be an error");
+        assert!(value.is_null(), "empty body must read as Null: {value:?}");
+        handle.abort();
+    }
+
+    /// A non-empty body that is not JSON is still a loud failure: the empty-body
+    /// allowance must not become a general "ignore the body" path.
+    #[tokio::test]
+    async fn non_json_body_is_still_an_error() {
+        let (base, handle) = stub_daemon_raw(200, "OK", "not json at all").await;
+        let client = probe_client();
+        let err = send_daemon_json("session start", client.get(format!("{base}/session")))
+            .await
+            .expect_err("a non-JSON body must fail");
+        assert!(
+            matches!(err, DaemonCallError::DaemonError(ref m) if m.contains("parse failed")),
+            "expected a parse failure, got: {err:?}"
+        );
+        handle.abort();
+    }
+
+    /// An HTTP error from a live daemon must classify as `DaemonError`, never
+    /// `ConnectionLost`: only the latter triggers revival, and restarting a
+    /// daemon that just answered is wasted work.
+    #[tokio::test]
+    async fn http_error_from_a_live_daemon_is_not_a_connection_loss() {
+        let (base, handle) = stub_daemon_raw(500, "Internal Server Error", "{}").await;
+        let client = probe_client();
+        let err = send_daemon_json("session start", client.get(format!("{base}/session")))
+            .await
+            .expect_err("HTTP 500 must fail");
+        assert!(
+            matches!(err, DaemonCallError::DaemonError(ref m) if m.contains("HTTP 500")),
+            "expected a DaemonError naming the status, got: {err:?}"
+        );
+        handle.abort();
     }
 
     fn probe_client() -> reqwest::Client {
