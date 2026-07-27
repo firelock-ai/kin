@@ -213,35 +213,48 @@ async fn open_snapshot_daemon_first_with_mode(
         ));
     }
 
-    let graph = graph_from_bootstrap_snapshot(layout, snapshot, true);
+    let graph = graph_from_bootstrap_snapshot(layout, snapshot, true)?;
     let snap =
         kin_db::SnapshotManager::from_bootstrap_graph_read_only(kindb_snapshot_path(layout), graph);
     load_vector_index_if_exists(&snap, layout);
     Ok(snap)
 }
 
-/// Load the persisted HNSW vector index into the graph if available.
-/// Non-fatal: if the file doesn't exist or fails to load, semantic search
-/// gracefully returns empty results.
+/// Load the persisted HNSW vector index only when its sidecar metadata proves
+/// that the model and graph root match this daemon bootstrap.
+///
+/// Non-fatal: absence or incompatibility leaves semantic search without an ANN
+/// index. The unchecked loader is intentionally unavailable outside KinDB
+/// tests because accepting a stale sidecar would return silently-wrong
+/// neighbors.
 #[cfg(feature = "vector")]
 fn load_vector_index_if_exists(snap: &kin_db::SnapshotManager, layout: &kin_core::KinLayout) {
     let _span = tracing::info_span!(
         "kindb.load_vector_index_if_exists",
-        path = %vector_index_path(layout).display()
+        path = %kindb_snapshot_path(layout).display()
     )
     .entered();
-    let path = vector_index_path(layout);
-    if path.exists() {
-        let graph = snap.graph();
-        match graph.load_vector_index(&path) {
-            Ok(count) => {
-                if count > 0 {
-                    tracing::debug!(count, path = %path.display(), "loaded vector index from disk");
-                }
-            }
-            Err(e) => {
-                tracing::debug!(error = %e, "failed to load vector index (non-fatal)");
-            }
+    let snapshot_path = kindb_snapshot_path(layout);
+    let graph = snap.graph();
+    match kin_db::SnapshotManager::load_vector_index_into_graph_if_valid(
+        graph.as_ref(),
+        &snapshot_path,
+        None,
+    ) {
+        Ok(true) => {
+            tracing::debug!(
+                path = %vector_index_path(layout).display(),
+                "loaded validated vector index from disk"
+            );
+        }
+        Ok(false) => {
+            tracing::debug!(
+                path = %vector_index_path(layout).display(),
+                "no compatible vector index available"
+            );
+        }
+        Err(error) => {
+            tracing::debug!(%error, "failed to validate vector index (non-fatal)");
         }
     }
 }
@@ -255,7 +268,7 @@ fn graph_from_bootstrap_snapshot(
     layout: &kin_core::KinLayout,
     snapshot: kin_db::GraphSnapshot,
     read_only: bool,
-) -> kin_db::InMemoryGraph {
+) -> std::result::Result<kin_db::InMemoryGraph, kin_db::KinDbError> {
     // Prefer the on-disk text index's stored root hash so the hash check
     // passes without an expensive Merkle recomputation.  Falls back to
     // computing the hash from the snapshot when no text index exists.
@@ -705,10 +718,7 @@ pub async fn get_spine_impact(
         .build()?;
 
     let resp = with_daemon_auth(
-        client.get(format!(
-            "{}/v1/spine/impact",
-            daemon_url.trim_end_matches('/')
-        )),
+        client.get(format!("{}/spine/impact", daemon_url.trim_end_matches('/'))),
         layout,
     )
     .query(&[
@@ -754,10 +764,7 @@ pub async fn get_spine_xref(
         .build()?;
 
     let resp = with_daemon_auth(
-        client.get(format!(
-            "{}/v1/spine/xref",
-            daemon_url.trim_end_matches('/')
-        )),
+        client.get(format!("{}/spine/xref", daemon_url.trim_end_matches('/'))),
         layout,
     )
     .query(&[("repo", repo_id), ("entity", &entity_id.to_string())])
@@ -1056,16 +1063,24 @@ mod tests {
         source.upsert_entity(&entity).unwrap();
         let snapshot = source.to_snapshot();
         let expected_root = kin_db::compute_graph_root_hash(&snapshot);
+        // The sidecar records the retrieval-authority digest, not the legacy
+        // graph root. The legacy root covers entity and relation topology only,
+        // so it cannot detect an exact repository-tree or artifact-enrichment
+        // change that moves retrieval results. Bind the identity the sidecar
+        // actually carries.
+        let expected_sidecar_identity =
+            kin_db::storage::compute_retrieval_authority_hash(&snapshot);
 
         let graph = kin_db::InMemoryGraph::from_snapshot_with_text_index_and_root_hash(
             snapshot,
             layout.text_index_dir(),
             expected_root,
-        );
+        )
+        .unwrap();
         kin_db::SnapshotManager::save_graph(layout.kindb_snapshot_path(), &graph).unwrap();
 
         let persisted = kin_db::TextIndex::open_read_only(Some(&layout.text_index_dir())).unwrap();
-        assert_eq!(persisted.graph_root_hash(), Some(expected_root));
+        assert_eq!(persisted.graph_root_hash(), Some(expected_sidecar_identity));
         let reopened_hits = persisted.fuzzy_search("bootstrap_entity", 10).unwrap();
         assert!(
             reopened_hits

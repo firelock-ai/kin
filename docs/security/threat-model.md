@@ -2,8 +2,8 @@
 
 This document describes the security model of the parts of Kin that run as
 long-lived local processes or interpose on the operating system: the **Kin
-daemon** (its control API and the command-execution endpoint) and the
-**filesystem projection** that serves graph-backed content to ordinary tools. It
+daemon** (its graph and coordination control API) and the **filesystem
+projection** that serves graph-backed content to ordinary tools. It
 describes behavior as it exists today, including the cases where a protection is
 provisioned but not enforced by default. Where a boundary is owned by another
 repository in the ecosystem, that is called out so the authority for the
@@ -26,8 +26,7 @@ The following are therefore **in scope** for this document:
 
 - the daemon's network exposure, request authentication, and cross-origin
   defenses;
-- the daemon's command-execution capability and the conditions under which it
-  can run a shell;
+- the daemon's graph, session, reconcile, and coordination control surfaces;
 - the trust boundary of the filesystem projection (library interposition);
 - the integrity properties of the content-addressed blob store.
 
@@ -108,31 +107,6 @@ permissions, and remote/browser access is blocked by the loopback bind and the
 Host/Origin guard. Operators on shared or multi-tenant hosts should raise this
 boundary explicitly (see [Residual Risks](#residual-risks-and-hardening)).
 
-## Command Execution (`POST /commands/exec`)
-
-The daemon can run a shell command inside a graph-materialized workspace via the
-`POST /commands/exec` endpoint. This is the highest-risk capability the daemon
-exposes: if an unauthorized caller can reach the loopback daemon, an enabled exec
-endpoint is local remote-code-execution. It is therefore **disabled by default**
-and gated behind an explicit opt-in.
-
-The handler applies two checks before doing any work:
-
-1. If the daemon is not fully initialized, it returns `503 Service Unavailable`.
-2. If the exec capability is not enabled, it returns `403 Forbidden` with a
-   message instructing the operator to set `KIN_DAEMON_ALLOW_EXEC=1` to opt in.
-
-The capability is enabled only when `KIN_DAEMON_ALLOW_EXEC` is set to a truthy
-value (`1`, `true`, `yes`, or `on`); it is disabled in every other case,
-including when the variable is unset. When enabled, the request runs the supplied
-command through the system shell (`sh -c` on Unix) inside a per-request workspace
-materialized from the graph.
-
-**Operator guidance.** Leave exec disabled unless a specific workflow requires
-it. When it must be enabled, pair it with `KIN_DAEMON_REQUIRE_TOKEN` so the
-endpoint is also behind bearer authentication, and never enable exec on a daemon
-bound to a non-loopback address that local-network peers can reach.
-
 ## Filesystem Projection (Library Interposition)
 
 Kin's transparent filesystem projection (the `kin-vfs` repository) serves
@@ -189,14 +163,13 @@ addresses are re-verified.
 - **Shared and multi-tenant hosts.** The default same-user trust boundary means
   any process running as your user can reach the loopback daemon. On hosts where
   that is not an acceptable assumption, enable `KIN_DAEMON_REQUIRE_TOKEN` (or set
-  an explicit `KIN_DAEMON_AUTH_TOKEN`) and keep `KIN_DAEMON_ALLOW_EXEC` unset.
+  an explicit `KIN_DAEMON_AUTH_TOKEN`).
 - **Provisioned-but-unenforced token.** Because the per-install token is
   provisioned but not enforced by default, do not assume bearer authentication is
   active unless one of the enforcement variables above is set.
 - **Off-host exposure.** Binding the daemon to a non-loopback address requires a
   token, but exposing it to a network still widens the attack surface
-  considerably; treat it as a deliberate, audited deployment choice and never
-  combine it with command execution.
+  considerably; treat it as a deliberate, audited deployment choice.
 
 ## Reporting
 

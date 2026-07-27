@@ -1,0 +1,1978 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Firelock, LLC
+
+//! Exact, bounded repository-v6 fast-forward transfer.
+//!
+//! This protocol never reads a checkout, Git object directory, or legacy
+//! semantic-delta stream. A sender builds a pack from one coherent repository
+//! authority lease and its immutable CAS. A receiver validates the complete
+//! change closure, exact tree identities, body identities, destination
+//! ref/root lease, and protocol features before publishing one repository
+//! transaction. CAS writes that precede publication are immutable and carry no
+//! authority by themselves.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use kin_db::{
+    KinDbError, PersistedRepositoryAuthority, RepositoryAuthorityManager, RepositoryAuthorityState,
+    StorageBackend,
+};
+use kin_model::{
+    compute_resolved_tree_hash, validate_semantic_change_id, AuthorId, ChangeOrigin, ChangeStore,
+    DefaultRefExpectation, DefaultRefMutation, ExternalChangeAlias, ExternalObjectId,
+    ExternalObjectKind, ExternalObjectRecord, GitExternalAuthority, Hash256, ModelError,
+    OperationId, RefExpectation, RefMutation, RefName, RefTarget, RefUpdatePolicy,
+    RepositoryCommitOutcome, RepositoryCommitReceipt, RepositoryId, RepositoryTransaction,
+    RootBundle, SemanticChange, SemanticChangeId, TreeEntry, REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use thiserror::Error;
+
+/// Read repository-v6 authority metadata under a name that cannot be mistaken
+/// for filesystem metadata.
+///
+/// `AuthorityReadLease` exposes this state as `metadata()`, which reads at a
+/// call site exactly like `std::fs::Metadata` access and trips the zero
+/// file-search guard's filesystem heuristic. The guard is deliberately blunt,
+/// so the fix is to make authority reads unmistakable rather than to teach the
+/// guard an exception that a real filesystem probe could later hide behind.
+pub(crate) trait RepositoryAuthorityMetadata {
+    fn authority_metadata(&self) -> &PersistedRepositoryAuthority;
+}
+
+impl RepositoryAuthorityMetadata for RepositoryAuthorityState {
+    fn authority_metadata(&self) -> &PersistedRepositoryAuthority {
+        self.snapshot()
+            .repository_authority
+            .as_ref()
+            .expect("repository authority lease always carries authority metadata")
+    }
+}
+
+pub const REPOSITORY_TRANSFER_PROTOCOL: &str = "kin-repository-v6-fast-forward";
+pub const REPOSITORY_TRANSFER_SCHEMA_VERSION: u32 = 1;
+pub const FEATURE_EXACT_TREES: &str = "exact-trees-v1";
+pub const FEATURE_IMMUTABLE_SOURCE_CAS: &str = "immutable-source-cas-v1";
+pub const FEATURE_REF_CAS: &str = "ref-cas-v1";
+pub const FEATURE_RAW_REPOSITORY_PATHS: &str = "raw-repository-paths-v1";
+
+pub const MAX_TRANSFER_CHANGES: usize = 512;
+pub const MAX_TRANSFER_TREES: usize = MAX_TRANSFER_CHANGES;
+pub const MAX_TRANSFER_BODIES: usize = 4096;
+pub const MAX_TRANSFER_EXTERNAL_OBJECTS: usize = 4096;
+pub const MAX_TRANSFER_ALIASES: usize = 512;
+pub const MAX_TRANSFER_DECODED_BODY_BYTES: u64 = 16 * 1024 * 1024;
+pub const MAX_TRANSFER_BODY_BYTES: u64 = 8 * 1024 * 1024;
+
+const REQUIRED_FEATURES: [&str; 4] = [
+    FEATURE_EXACT_TREES,
+    FEATURE_IMMUTABLE_SOURCE_CAS,
+    FEATURE_REF_CAS,
+    FEATURE_RAW_REPOSITORY_PATHS,
+];
+
+#[derive(Debug, Error)]
+pub enum RepositoryTransferError {
+    #[error("invalid repository transfer: {0}")]
+    Invalid(String),
+    #[error("repository transfer conflict: {0}")]
+    Conflict(String),
+    #[error("repository transfer storage failed: {0}")]
+    Storage(String),
+}
+
+pub type Result<T> = std::result::Result<T, RepositoryTransferError>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepositoryTransferLimits {
+    pub max_changes: u32,
+    pub max_trees: u32,
+    pub max_bodies: u32,
+    pub max_external_objects: u32,
+    pub max_aliases: u32,
+    pub max_decoded_body_bytes: u64,
+    pub max_single_body_bytes: u64,
+}
+
+impl Default for RepositoryTransferLimits {
+    fn default() -> Self {
+        Self {
+            max_changes: MAX_TRANSFER_CHANGES as u32,
+            max_trees: MAX_TRANSFER_TREES as u32,
+            max_bodies: MAX_TRANSFER_BODIES as u32,
+            max_external_objects: MAX_TRANSFER_EXTERNAL_OBJECTS as u32,
+            max_aliases: MAX_TRANSFER_ALIASES as u32,
+            max_decoded_body_bytes: MAX_TRANSFER_DECODED_BODY_BYTES,
+            max_single_body_bytes: MAX_TRANSFER_BODY_BYTES,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepositoryTransferStatus {
+    pub schema_version: u32,
+    pub protocol: String,
+    pub repository_id: RepositoryId,
+    pub destination_ref: RefName,
+    pub destination_target: Option<RefTarget>,
+    pub destination_head: Option<SemanticChangeId>,
+    pub destination_tree_hash: Option<Hash256>,
+    pub roots: RootBundle,
+    pub default_ref: Option<RefName>,
+    pub git_authority_hash: Option<Hash256>,
+    pub supported_features: Vec<String>,
+    pub limits: RepositoryTransferLimits,
+    /// False until deterministic continuation packs make per-envelope limits
+    /// independent of repository history/blob size. Do not expose this
+    /// bounded primitive as general `kin push`.
+    pub push_apply_ready: bool,
+    /// The server can export this bounded exact seam. The name deliberately
+    /// avoids advertising a general pull capability.
+    pub bounded_envelope_export_ready: bool,
+    pub pull_apply_ready: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepositoryTransferExpectation {
+    pub repository_id: RepositoryId,
+    pub destination_ref: RefName,
+    pub destination_target: Option<RefTarget>,
+    pub destination_head: Option<SemanticChangeId>,
+    pub roots: RootBundle,
+    pub default_ref: Option<RefName>,
+    pub git_authority_hash: Option<Hash256>,
+    pub supported_features: Vec<String>,
+    pub limits: RepositoryTransferLimits,
+}
+
+impl TryFrom<RepositoryTransferStatus> for RepositoryTransferExpectation {
+    type Error = RepositoryTransferError;
+
+    fn try_from(status: RepositoryTransferStatus) -> Result<Self> {
+        validate_status(&status)?;
+        Ok(Self {
+            repository_id: status.repository_id,
+            destination_ref: status.destination_ref,
+            destination_target: status.destination_target,
+            destination_head: status.destination_head,
+            roots: status.roots,
+            default_ref: status.default_ref,
+            git_authority_hash: status.git_authority_hash,
+            supported_features: status.supported_features,
+            limits: status.limits,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepositoryTransferTreeIdentity {
+    pub change_id: SemanticChangeId,
+    pub tree_hash: Hash256,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepositoryTransferBody {
+    pub hash: Hash256,
+    pub byte_len: u64,
+    pub bytes_base64: String,
+}
+
+impl RepositoryTransferBody {
+    pub fn from_bytes(hash: Hash256, bytes: &[u8]) -> Result<Self> {
+        verify_body(hash, bytes)?;
+        let byte_len = u64::try_from(bytes.len())
+            .map_err(|_| invalid("source body length does not fit u64"))?;
+        Ok(Self {
+            hash,
+            byte_len,
+            bytes_base64: BASE64.encode(bytes),
+        })
+    }
+
+    pub fn decode(&self) -> Result<Vec<u8>> {
+        if self.byte_len > MAX_TRANSFER_BODY_BYTES {
+            return Err(invalid(format!(
+                "source body {} declares {} bytes, over the {} byte limit",
+                self.hash, self.byte_len, MAX_TRANSFER_BODY_BYTES
+            )));
+        }
+        let bytes = BASE64.decode(&self.bytes_base64).map_err(|error| {
+            invalid(format!(
+                "source body {} is not canonical base64: {error}",
+                self.hash
+            ))
+        })?;
+        if BASE64.encode(&bytes) != self.bytes_base64 {
+            return Err(invalid(format!(
+                "source body {} base64 encoding is not canonical",
+                self.hash
+            )));
+        }
+        let actual_len = u64::try_from(bytes.len())
+            .map_err(|_| invalid("decoded source body length does not fit u64"))?;
+        if actual_len != self.byte_len {
+            return Err(invalid(format!(
+                "source body {} declares {} bytes but decodes to {}",
+                self.hash, self.byte_len, actual_len
+            )));
+        }
+        verify_body(self.hash, &bytes)?;
+        Ok(bytes)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepositoryTransferPack {
+    pub schema_version: u32,
+    pub protocol: String,
+    pub transfer_id: Hash256,
+    pub operation_id: OperationId,
+    pub repository_id: RepositoryId,
+    pub source_ref: RefName,
+    pub destination_ref: RefName,
+    pub source_head: SemanticChangeId,
+    pub source_tree_hash: Hash256,
+    pub expected_destination_target: Option<RefTarget>,
+    pub expected_destination_head: Option<SemanticChangeId>,
+    pub expected_destination_roots: RootBundle,
+    pub expected_destination_default_ref: Option<RefName>,
+    /// Clean-slate v1 supports native fast-forwards over an identical imported
+    /// Git baseline. A changed Git authority is rejected rather than adapted.
+    pub source_git_authority_hash: Option<Hash256>,
+    pub expected_destination_git_authority_hash: Option<Hash256>,
+    pub required_features: Vec<String>,
+    /// Parent-before-child exact semantic closure.
+    pub changes: Vec<SemanticChange>,
+    /// One independently recomputed resolved-tree identity per included change.
+    pub trees: Vec<RepositoryTransferTreeIdentity>,
+    /// Exact external records needed by included Git-origin changes.
+    pub external_objects: Vec<ExternalObjectRecord>,
+    pub aliases: Vec<ExternalChangeAlias>,
+    /// Deduplicated immutable bytes needed by new tree states and external
+    /// records. Gitlinks deliberately have no body.
+    pub bodies: Vec<RepositoryTransferBody>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepositoryTransferApplyOutcome {
+    Committed,
+    IdempotentReplay,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepositoryTransferReceipt {
+    pub schema_version: u32,
+    pub protocol: String,
+    pub transfer_id: Hash256,
+    pub repository_id: RepositoryId,
+    pub destination_ref: RefName,
+    pub destination_head: SemanticChangeId,
+    pub outcome: RepositoryTransferApplyOutcome,
+    pub authority_receipt: RepositoryCommitReceipt,
+}
+
+pub fn repository_transfer_status<B: StorageBackend + ?Sized + 'static>(
+    authority: &RepositoryAuthorityManager<B>,
+    repository_id: &RepositoryId,
+    destination_ref: &RefName,
+) -> Result<RepositoryTransferStatus> {
+    let lease = authority.read_authority();
+    if &lease.authority_metadata().repository_id != repository_id {
+        return Err(invalid(format!(
+            "authority belongs to {}, not requested repository {}",
+            lease.authority_metadata().repository_id,
+            repository_id
+        )));
+    }
+    let destination_target = lease
+        .authority_metadata()
+        .ref_state
+        .refs
+        .iter()
+        .find(|entry| &entry.name == destination_ref)
+        .map(|entry| entry.target.clone());
+    let destination_head = destination_target
+        .as_ref()
+        .map(|target| lease.resolve_target_change_id(target).map_err(storage))
+        .transpose()?;
+    let destination_tree_hash = destination_head
+        .map(|head| {
+            let store = TransferChangeStore::new(lease.snapshot().changes.values().cloned());
+            store
+                .resolve_tree_at(&head)
+                .map_err(model)
+                .and_then(|tree| compute_resolved_tree_hash(&tree).map_err(model))
+        })
+        .transpose()?;
+    let git_authority_hash =
+        hash_git_authority(lease.authority_metadata().git_external_authority.as_ref())?;
+
+    Ok(RepositoryTransferStatus {
+        schema_version: REPOSITORY_TRANSFER_SCHEMA_VERSION,
+        protocol: REPOSITORY_TRANSFER_PROTOCOL.to_string(),
+        repository_id: repository_id.clone(),
+        destination_ref: destination_ref.clone(),
+        destination_target,
+        destination_head,
+        destination_tree_hash,
+        roots: lease.roots().clone(),
+        default_ref: lease.authority_metadata().ref_state.default_ref.clone(),
+        git_authority_hash,
+        supported_features: required_features(),
+        limits: RepositoryTransferLimits::default(),
+        push_apply_ready: false,
+        bounded_envelope_export_ready: true,
+        pull_apply_ready: false,
+    })
+}
+
+pub fn build_repository_transfer_pack<B: StorageBackend + ?Sized + 'static>(
+    authority: &RepositoryAuthorityManager<B>,
+    source_ref: &RefName,
+    expectation: &RepositoryTransferExpectation,
+) -> Result<RepositoryTransferPack> {
+    validate_expectation(expectation)?;
+    let lease = authority.read_authority();
+    if lease.authority_metadata().repository_id != expectation.repository_id {
+        return Err(invalid(format!(
+            "source repository {} does not match destination repository {}",
+            lease.authority_metadata().repository_id,
+            expectation.repository_id
+        )));
+    }
+    require_negotiated_features(&expectation.supported_features)?;
+
+    let source_target = lease
+        .resolve_ref_target(source_ref)
+        .map_err(storage)?
+        .ok_or_else(|| invalid(format!("source ref {source_ref} is absent")))?;
+    let source_head = lease
+        .resolve_target_change_id(&source_target)
+        .map_err(storage)?;
+    let source_git_authority_hash =
+        hash_git_authority(lease.authority_metadata().git_external_authority.as_ref())?;
+    if source_git_authority_hash != expectation.git_authority_hash {
+        return Err(RepositoryTransferError::Conflict(
+            "repository-v6 transfer v1 requires identical imported-Git authority on both replicas; Git-authority bootstrap/divergence is not adapted"
+                .to_string(),
+        ));
+    }
+
+    let all_changes = lease.snapshot().changes.clone();
+    let ordered_ids =
+        collect_fast_forward_closure(&all_changes, source_head, expectation.destination_head)?;
+    enforce_count("changes", ordered_ids.len(), expectation.limits.max_changes)?;
+    let store = TransferChangeStore::new(all_changes.values().cloned());
+    let source_tree = store.resolve_tree_at(&source_head).map_err(model)?;
+    let source_tree_hash = compute_resolved_tree_hash(&source_tree).map_err(model)?;
+    let mut source_tree_bodies = BTreeSet::new();
+    for artifact in source_tree.artifacts() {
+        if let Some(hash) = artifact.entry.blob_identity() {
+            source_tree_bodies.insert(hash);
+        } else if !matches!(artifact.entry, TreeEntry::Gitlink { .. }) {
+            return Err(invalid(format!(
+                "source tree entry at {} has neither CAS body nor Gitlink identity",
+                artifact.path
+            )));
+        }
+    }
+    for hash in source_tree_bodies {
+        let bytes = authority
+            .load_source_blob(hash)
+            .map_err(storage)?
+            .ok_or_else(|| invalid(format!("source tree CAS body {hash} is absent")))?;
+        verify_body(hash, &bytes)?;
+    }
+
+    let mut changes = Vec::with_capacity(ordered_ids.len());
+    let mut trees = Vec::with_capacity(ordered_ids.len());
+    let mut required_body_hashes = BTreeSet::new();
+    let included = ordered_ids.iter().copied().collect::<BTreeSet<_>>();
+    let mut required_git_oids = BTreeSet::new();
+    for change_id in ordered_ids {
+        let change = all_changes
+            .get(&change_id)
+            .cloned()
+            .ok_or_else(|| invalid(format!("source closure is missing change {change_id}")))?;
+        validate_semantic_change_id(&change).map_err(model)?;
+        for delta in &change.tree_deltas {
+            if let Some(new) = delta.new_state() {
+                if let Some(hash) = new.entry.blob_identity() {
+                    required_body_hashes.insert(hash);
+                }
+            }
+        }
+        if let ChangeOrigin::GitCommit { oid } = change.origin {
+            required_git_oids.insert(oid);
+        }
+        let tree = store.resolve_tree_at(&change.id).map_err(model)?;
+        trees.push(RepositoryTransferTreeIdentity {
+            change_id: change.id,
+            tree_hash: compute_resolved_tree_hash(&tree).map_err(model)?,
+        });
+        changes.push(change);
+    }
+
+    let aliases = lease
+        .authority_metadata()
+        .aliases
+        .iter()
+        .filter(|alias| {
+            included.contains(&alias.change_id) || required_git_oids.contains(&alias.oid)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let external_objects = lease
+        .authority_metadata()
+        .external_objects
+        .iter()
+        .filter(|record| required_git_oids.contains(&record.object.oid))
+        .cloned()
+        .collect::<Vec<_>>();
+    for record in &external_objects {
+        required_body_hashes.insert(record.body_hash);
+    }
+
+    enforce_count("trees", trees.len(), expectation.limits.max_trees)?;
+    enforce_count(
+        "external objects",
+        external_objects.len(),
+        expectation.limits.max_external_objects,
+    )?;
+    enforce_count("aliases", aliases.len(), expectation.limits.max_aliases)?;
+    enforce_count(
+        "source bodies",
+        required_body_hashes.len(),
+        expectation.limits.max_bodies,
+    )?;
+
+    let mut total_bytes = 0_u64;
+    let mut bodies = Vec::with_capacity(required_body_hashes.len());
+    for hash in required_body_hashes {
+        let bytes = authority
+            .load_source_blob(hash)
+            .map_err(storage)?
+            .ok_or_else(|| invalid(format!("source CAS body {hash} is absent")))?;
+        let byte_len = u64::try_from(bytes.len())
+            .map_err(|_| invalid("source body length does not fit u64"))?;
+        if byte_len > expectation.limits.max_single_body_bytes {
+            return Err(invalid(format!(
+                "source body {hash} is {byte_len} bytes, over negotiated limit {}",
+                expectation.limits.max_single_body_bytes
+            )));
+        }
+        total_bytes = total_bytes
+            .checked_add(byte_len)
+            .ok_or_else(|| invalid("source body byte total overflow"))?;
+        if total_bytes > expectation.limits.max_decoded_body_bytes {
+            return Err(invalid(format!(
+                "source body closure is {total_bytes} bytes, over negotiated limit {}",
+                expectation.limits.max_decoded_body_bytes
+            )));
+        }
+        bodies.push(RepositoryTransferBody::from_bytes(hash, &bytes)?);
+    }
+
+    let mut pack = RepositoryTransferPack {
+        schema_version: REPOSITORY_TRANSFER_SCHEMA_VERSION,
+        protocol: REPOSITORY_TRANSFER_PROTOCOL.to_string(),
+        transfer_id: Hash256::from_bytes([0; 32]),
+        operation_id: OperationId::new(),
+        repository_id: expectation.repository_id.clone(),
+        source_ref: source_ref.clone(),
+        destination_ref: expectation.destination_ref.clone(),
+        source_head,
+        source_tree_hash,
+        expected_destination_target: expectation.destination_target.clone(),
+        expected_destination_head: expectation.destination_head,
+        expected_destination_roots: expectation.roots.clone(),
+        expected_destination_default_ref: expectation.default_ref.clone(),
+        source_git_authority_hash,
+        expected_destination_git_authority_hash: expectation.git_authority_hash,
+        required_features: required_features(),
+        changes,
+        trees,
+        external_objects,
+        aliases,
+        bodies,
+    };
+    pack.transfer_id = compute_transfer_id(&pack)?;
+    validate_pack(&pack)?;
+    Ok(pack)
+}
+
+pub fn apply_repository_transfer_pack<B: StorageBackend + ?Sized + 'static>(
+    authority: &RepositoryAuthorityManager<B>,
+    expected_repository_id: &RepositoryId,
+    expected_destination_ref: &RefName,
+    actor: AuthorId,
+    pack: &RepositoryTransferPack,
+) -> Result<RepositoryTransferReceipt> {
+    validate_pack(pack)?;
+    if &pack.repository_id != expected_repository_id {
+        return Err(invalid(format!(
+            "pack repository {} does not match receiver repository {}",
+            pack.repository_id, expected_repository_id
+        )));
+    }
+    if &pack.destination_ref != expected_destination_ref {
+        return Err(invalid(format!(
+            "pack destination ref {} does not match route ref {}",
+            pack.destination_ref, expected_destination_ref
+        )));
+    }
+
+    let transaction = transfer_transaction(pack, actor)?;
+    let transaction_hash = transaction.transaction_hash().map_err(model)?;
+    let lease = authority.read_authority();
+    if let Some(receipt) = lease
+        .authority_metadata()
+        .receipts
+        .iter()
+        .find(|receipt| receipt.operation_id == pack.operation_id)
+    {
+        if receipt.transaction_hash != transaction_hash {
+            return Err(RepositoryTransferError::Conflict(format!(
+                "operation {} was already committed with a different exact transaction",
+                pack.operation_id
+            )));
+        }
+        return Ok(transfer_receipt(
+            pack,
+            receipt.clone(),
+            RepositoryTransferApplyOutcome::IdempotentReplay,
+        ));
+    }
+
+    if lease.roots() != &pack.expected_destination_roots {
+        return Err(RepositoryTransferError::Conflict(
+            "destination repository roots/generation moved from the pack lease".to_string(),
+        ));
+    }
+    if lease.authority_metadata().ref_state.default_ref != pack.expected_destination_default_ref {
+        return Err(RepositoryTransferError::Conflict(
+            "destination default ref moved from the pack lease".to_string(),
+        ));
+    }
+    let current_target = lease
+        .authority_metadata()
+        .ref_state
+        .refs
+        .iter()
+        .find(|entry| entry.name == pack.destination_ref)
+        .map(|entry| entry.target.clone());
+    if current_target != pack.expected_destination_target {
+        return Err(RepositoryTransferError::Conflict(
+            "destination ref target moved from the pack lease".to_string(),
+        ));
+    }
+    let current_head = current_target
+        .as_ref()
+        .map(|target| lease.resolve_target_change_id(target).map_err(storage))
+        .transpose()?;
+    if current_head != pack.expected_destination_head {
+        return Err(RepositoryTransferError::Conflict(
+            "destination semantic head moved from the pack lease".to_string(),
+        ));
+    }
+    let current_git_hash =
+        hash_git_authority(lease.authority_metadata().git_external_authority.as_ref())?;
+    if current_git_hash != pack.expected_destination_git_authority_hash
+        || current_git_hash != pack.source_git_authority_hash
+    {
+        return Err(RepositoryTransferError::Conflict(
+            "imported-Git authority differs from the exact baseline bound by transfer v1"
+                .to_string(),
+        ));
+    }
+
+    let required_source_bodies =
+        validate_change_and_tree_closure(lease.snapshot().changes.values(), pack)?;
+    let decoded = decode_and_validate_bodies(pack)?;
+    validate_body_coverage(authority, &required_source_bodies, &decoded)?;
+    drop(lease);
+
+    // Immutable CAS prewrites intentionally precede the authority transaction.
+    // A conflict after this point leaves only unreachable, content-addressed
+    // bytes and never advances a ref or root bundle.
+    for (hash, bytes) in decoded {
+        authority.save_source_blob(hash, &bytes).map_err(storage)?;
+    }
+    let receipt = authority
+        .commit_repository_transaction(transaction)
+        .map_err(repository_commit)?;
+    let outcome = match receipt.outcome {
+        RepositoryCommitOutcome::Committed => RepositoryTransferApplyOutcome::Committed,
+        RepositoryCommitOutcome::IdempotentReplay => {
+            RepositoryTransferApplyOutcome::IdempotentReplay
+        }
+    };
+    Ok(transfer_receipt(pack, receipt, outcome))
+}
+
+pub fn validate_pack(pack: &RepositoryTransferPack) -> Result<()> {
+    if pack.schema_version != REPOSITORY_TRANSFER_SCHEMA_VERSION {
+        return Err(invalid(format!(
+            "unsupported schema version {}; expected {}",
+            pack.schema_version, REPOSITORY_TRANSFER_SCHEMA_VERSION
+        )));
+    }
+    if pack.protocol != REPOSITORY_TRANSFER_PROTOCOL {
+        return Err(invalid(format!("unsupported protocol {:?}", pack.protocol)));
+    }
+    pack.expected_destination_roots.validate().map_err(model)?;
+    if pack.source_git_authority_hash != pack.expected_destination_git_authority_hash {
+        return Err(RepositoryTransferError::Conflict(
+            "transfer v1 cannot carry imported-Git authority divergence".to_string(),
+        ));
+    }
+    validate_required_features(&pack.required_features)?;
+    enforce_count("changes", pack.changes.len(), MAX_TRANSFER_CHANGES as u32)?;
+    enforce_count("trees", pack.trees.len(), MAX_TRANSFER_TREES as u32)?;
+    enforce_count("bodies", pack.bodies.len(), MAX_TRANSFER_BODIES as u32)?;
+    enforce_count(
+        "external objects",
+        pack.external_objects.len(),
+        MAX_TRANSFER_EXTERNAL_OBJECTS as u32,
+    )?;
+    enforce_count("aliases", pack.aliases.len(), MAX_TRANSFER_ALIASES as u32)?;
+
+    let expected_id = compute_transfer_id(pack)?;
+    if expected_id != pack.transfer_id {
+        return Err(invalid(format!(
+            "transfer identity {} recomputes to {}",
+            pack.transfer_id, expected_id
+        )));
+    }
+
+    let mut known = pack
+        .expected_destination_head
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let mut change_ids = BTreeSet::new();
+    for change in &pack.changes {
+        validate_semantic_change_id(change).map_err(model)?;
+        if !change_ids.insert(change.id) {
+            return Err(invalid(format!("duplicate semantic change {}", change.id)));
+        }
+        for parent in &change.parents {
+            if !known.contains(parent) {
+                return Err(invalid(format!(
+                    "change {} appears before or without parent {}",
+                    change.id, parent
+                )));
+            }
+        }
+        known.insert(change.id);
+    }
+    if !known.contains(&pack.source_head) {
+        return Err(invalid(format!(
+            "source head {} is absent from the transferred/boundary closure",
+            pack.source_head
+        )));
+    }
+
+    if pack.trees.len() != pack.changes.len() {
+        return Err(invalid(
+            "tree identity count must equal semantic change count",
+        ));
+    }
+    for (change, tree) in pack.changes.iter().zip(&pack.trees) {
+        if tree.change_id != change.id {
+            return Err(invalid(format!(
+                "tree identity {} is out of order for change {}",
+                tree.change_id, change.id
+            )));
+        }
+    }
+
+    let mut body_hashes = BTreeSet::new();
+    let mut total = 0_u64;
+    for body in &pack.bodies {
+        if !body_hashes.insert(body.hash) {
+            return Err(invalid(format!("duplicate source body {}", body.hash)));
+        }
+        let bytes = body.decode()?;
+        total = total
+            .checked_add(body.byte_len)
+            .ok_or_else(|| invalid("decoded body byte total overflow"))?;
+        if total > MAX_TRANSFER_DECODED_BODY_BYTES {
+            return Err(invalid(format!(
+                "decoded body closure exceeds {} bytes",
+                MAX_TRANSFER_DECODED_BODY_BYTES
+            )));
+        }
+        drop(bytes);
+    }
+
+    let mut external_ids = BTreeSet::<ExternalObjectId>::new();
+    for record in &pack.external_objects {
+        if !external_ids.insert(record.object) {
+            return Err(invalid(format!(
+                "duplicate external object {}",
+                record.object.oid
+            )));
+        }
+        if !body_hashes.contains(&record.body_hash) {
+            return Err(invalid(format!(
+                "external object {} body {} is absent from the pack",
+                record.object.oid, record.body_hash
+            )));
+        }
+    }
+    let mut alias_oids = BTreeSet::new();
+    for alias in &pack.aliases {
+        if alias.repository_id != pack.repository_id {
+            return Err(invalid(format!(
+                "alias {} belongs to repository {}, not {}",
+                alias.oid, alias.repository_id, pack.repository_id
+            )));
+        }
+        if !alias_oids.insert(alias.oid) {
+            return Err(invalid(format!("duplicate external alias {}", alias.oid)));
+        }
+    }
+    for change in &pack.changes {
+        if let ChangeOrigin::GitCommit { oid } = change.origin {
+            if !external_ids.contains(&ExternalObjectId::new(ExternalObjectKind::Commit, oid)) {
+                return Err(invalid(format!(
+                    "Git-origin change {} lacks commit object {}",
+                    change.id, oid
+                )));
+            }
+            if !pack
+                .aliases
+                .iter()
+                .any(|alias| alias.oid == oid && alias.change_id == change.id)
+            {
+                return Err(invalid(format!(
+                    "Git-origin change {} lacks exact alias {}",
+                    change.id, oid
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_status(status: &RepositoryTransferStatus) -> Result<()> {
+    if status.schema_version != REPOSITORY_TRANSFER_SCHEMA_VERSION
+        || status.protocol != REPOSITORY_TRANSFER_PROTOCOL
+    {
+        return Err(invalid("unsupported repository transfer status protocol"));
+    }
+    status.roots.validate().map_err(model)?;
+    require_negotiated_features(&status.supported_features)
+}
+
+fn validate_expectation(expectation: &RepositoryTransferExpectation) -> Result<()> {
+    expectation.roots.validate().map_err(model)?;
+    if expectation.destination_head.is_some() != expectation.destination_target.is_some() {
+        return Err(invalid(
+            "destination target and resolved head must both be present or absent",
+        ));
+    }
+    require_negotiated_features(&expectation.supported_features)
+}
+
+fn required_features() -> Vec<String> {
+    REQUIRED_FEATURES
+        .iter()
+        .map(|value| (*value).to_string())
+        .collect()
+}
+
+fn require_negotiated_features(supported: &[String]) -> Result<()> {
+    let supported = supported
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    for required in REQUIRED_FEATURES {
+        if !supported.contains(required) {
+            return Err(invalid(format!(
+                "destination does not advertise required feature {required}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_required_features(required: &[String]) -> Result<()> {
+    let expected = required_features();
+    if required != expected {
+        let known = REQUIRED_FEATURES.into_iter().collect::<BTreeSet<_>>();
+        if let Some(unknown) = required
+            .iter()
+            .map(String::as_str)
+            .find(|feature| !known.contains(feature))
+        {
+            return Err(invalid(format!(
+                "unknown required repository transfer feature {unknown}"
+            )));
+        }
+        return Err(invalid(
+            "required repository transfer features are missing, duplicated, or out of canonical order",
+        ));
+    }
+    Ok(())
+}
+
+fn collect_fast_forward_closure(
+    changes: &std::collections::HashMap<SemanticChangeId, SemanticChange>,
+    source_head: SemanticChangeId,
+    boundary: Option<SemanticChangeId>,
+) -> Result<Vec<SemanticChangeId>> {
+    if boundary == Some(source_head) {
+        return Ok(Vec::new());
+    }
+    let mut ordered = Vec::new();
+    let mut visiting = BTreeSet::new();
+    let mut visited = BTreeSet::new();
+    let mut reached_boundary = boundary.is_none();
+
+    fn visit(
+        id: SemanticChangeId,
+        boundary: Option<SemanticChangeId>,
+        changes: &std::collections::HashMap<SemanticChangeId, SemanticChange>,
+        visiting: &mut BTreeSet<SemanticChangeId>,
+        visited: &mut BTreeSet<SemanticChangeId>,
+        ordered: &mut Vec<SemanticChangeId>,
+        reached_boundary: &mut bool,
+    ) -> Result<()> {
+        if Some(id) == boundary {
+            *reached_boundary = true;
+            return Ok(());
+        }
+        if visited.contains(&id) {
+            return Ok(());
+        }
+        if !visiting.insert(id) {
+            return Err(invalid(format!(
+                "semantic history contains a cycle at {id}"
+            )));
+        }
+        let change = changes
+            .get(&id)
+            .ok_or_else(|| invalid(format!("semantic history is missing change {id}")))?;
+        for parent in &change.parents {
+            visit(
+                *parent,
+                boundary,
+                changes,
+                visiting,
+                visited,
+                ordered,
+                reached_boundary,
+            )?;
+        }
+        visiting.remove(&id);
+        visited.insert(id);
+        ordered.push(id);
+        Ok(())
+    }
+
+    visit(
+        source_head,
+        boundary,
+        changes,
+        &mut visiting,
+        &mut visited,
+        &mut ordered,
+        &mut reached_boundary,
+    )?;
+    if !reached_boundary {
+        return Err(RepositoryTransferError::Conflict(format!(
+            "destination head {} is not an ancestor of source head {}",
+            boundary.expect("boundary is present when not reached"),
+            source_head
+        )));
+    }
+    Ok(ordered)
+}
+
+fn validate_change_and_tree_closure<'a>(
+    current: impl Iterator<Item = &'a SemanticChange>,
+    pack: &RepositoryTransferPack,
+) -> Result<BTreeSet<Hash256>> {
+    let mut combined = current
+        .cloned()
+        .map(|change| (change.id, change))
+        .collect::<BTreeMap<_, _>>();
+    for change in &pack.changes {
+        match combined.get(&change.id) {
+            Some(existing) if existing != change => {
+                return Err(RepositoryTransferError::Conflict(format!(
+                    "destination already has different bytes for semantic change {}",
+                    change.id
+                )));
+            }
+            Some(_) => {}
+            None => {
+                combined.insert(change.id, change.clone());
+            }
+        }
+    }
+    let store = TransferChangeStore { changes: combined };
+    for identity in &pack.trees {
+        let tree = store.resolve_tree_at(&identity.change_id).map_err(model)?;
+        let actual = compute_resolved_tree_hash(&tree).map_err(model)?;
+        if actual != identity.tree_hash {
+            return Err(invalid(format!(
+                "change {} tree identity {} recomputes to {}",
+                identity.change_id, identity.tree_hash, actual
+            )));
+        }
+    }
+    let source_tree = store.resolve_tree_at(&pack.source_head).map_err(model)?;
+    let actual_source = compute_resolved_tree_hash(&source_tree).map_err(model)?;
+    if actual_source != pack.source_tree_hash {
+        return Err(invalid(format!(
+            "source head {} tree identity {} recomputes to {}",
+            pack.source_head, pack.source_tree_hash, actual_source
+        )));
+    }
+    let mut required_source_bodies = BTreeSet::new();
+    for artifact in source_tree.artifacts() {
+        if let Some(hash) = artifact.entry.blob_identity() {
+            required_source_bodies.insert(hash);
+        } else if !matches!(artifact.entry, TreeEntry::Gitlink { .. }) {
+            return Err(invalid(format!(
+                "source tree entry at {} has neither CAS body nor Gitlink identity",
+                artifact.path
+            )));
+        }
+    }
+    Ok(required_source_bodies)
+}
+
+fn decode_and_validate_bodies(pack: &RepositoryTransferPack) -> Result<BTreeMap<Hash256, Vec<u8>>> {
+    let mut decoded = BTreeMap::new();
+    for body in &pack.bodies {
+        decoded.insert(body.hash, body.decode()?);
+    }
+    for record in &pack.external_objects {
+        let bytes = decoded.get(&record.body_hash).ok_or_else(|| {
+            invalid(format!(
+                "external object {} body {} is absent",
+                record.object.oid, record.body_hash
+            ))
+        })?;
+        record.validate_raw(bytes).map_err(model)?;
+    }
+    Ok(decoded)
+}
+
+fn validate_body_coverage<B: StorageBackend + ?Sized + 'static>(
+    authority: &RepositoryAuthorityManager<B>,
+    required: &BTreeSet<Hash256>,
+    decoded: &BTreeMap<Hash256, Vec<u8>>,
+) -> Result<()> {
+    for hash in required {
+        if decoded.contains_key(hash) {
+            continue;
+        }
+        if authority
+            .load_source_blob(*hash)
+            .map_err(storage)?
+            .is_none()
+        {
+            return Err(invalid(format!(
+                "required immutable source body {hash} is absent from pack and destination CAS"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn transfer_transaction(
+    pack: &RepositoryTransferPack,
+    actor: AuthorId,
+) -> Result<RepositoryTransaction> {
+    let expected = pack
+        .expected_destination_target
+        .clone()
+        .map_or(RefExpectation::MustNotExist, |target| {
+            RefExpectation::MustEqual { target }
+        });
+    let default_ref_mutation = if pack.expected_destination_default_ref.is_none() {
+        Some(DefaultRefMutation {
+            expected: DefaultRefExpectation::MustBeUnset,
+            new_default: Some(pack.destination_ref.clone()),
+        })
+    } else {
+        None
+    };
+    let transaction = RepositoryTransaction {
+        schema_version: REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+        operation_id: pack.operation_id,
+        repository_id: pack.repository_id.clone(),
+        expected_generation: pack.expected_destination_roots.generation,
+        expected_roots: pack.expected_destination_roots.clone(),
+        actor,
+        reason: format!(
+            "receive exact repository-v6 fast-forward {} into {}",
+            pack.transfer_id, pack.destination_ref
+        ),
+        external_objects: pack.external_objects.clone(),
+        git_authority_delta: None,
+        changes: pack.changes.clone(),
+        aliases: pack.aliases.clone(),
+        ref_mutations: vec![RefMutation {
+            name: pack.destination_ref.clone(),
+            expected,
+            new_target: Some(RefTarget::change(pack.source_head)),
+            policy: RefUpdatePolicy::FastForwardOnly,
+        }],
+        default_ref_mutation,
+        workspace_mutation: None,
+        local_overlay_delta: None,
+    };
+    transaction.validate().map_err(model)?;
+    Ok(transaction)
+}
+
+fn transfer_receipt(
+    pack: &RepositoryTransferPack,
+    authority_receipt: RepositoryCommitReceipt,
+    outcome: RepositoryTransferApplyOutcome,
+) -> RepositoryTransferReceipt {
+    RepositoryTransferReceipt {
+        schema_version: REPOSITORY_TRANSFER_SCHEMA_VERSION,
+        protocol: REPOSITORY_TRANSFER_PROTOCOL.to_string(),
+        transfer_id: pack.transfer_id,
+        repository_id: pack.repository_id.clone(),
+        destination_ref: pack.destination_ref.clone(),
+        destination_head: pack.source_head,
+        outcome,
+        authority_receipt,
+    }
+}
+
+fn compute_transfer_id(pack: &RepositoryTransferPack) -> Result<Hash256> {
+    let mut canonical = pack.clone();
+    canonical.transfer_id = Hash256::from_bytes([0; 32]);
+    let payload = serde_json::to_vec(&canonical)
+        .map_err(|error| invalid(format!("serialize transfer identity: {error}")))?;
+    Ok(domain_hash(b"kin-repository-transfer-v1\0", &payload))
+}
+
+fn hash_git_authority(authority: Option<&GitExternalAuthority>) -> Result<Option<Hash256>> {
+    authority
+        .map(|authority| {
+            let payload = serde_json::to_vec(authority)
+                .map_err(|error| invalid(format!("serialize Git authority identity: {error}")))?;
+            Ok(domain_hash(b"kin-transfer-git-authority-v1\0", &payload))
+        })
+        .transpose()
+}
+
+fn domain_hash(domain: &[u8], payload: &[u8]) -> Hash256 {
+    let mut hasher = Sha256::new();
+    hasher.update(domain);
+    hasher.update((payload.len() as u64).to_le_bytes());
+    hasher.update(payload);
+    Hash256::from_bytes(hasher.finalize().into())
+}
+
+fn verify_body(expected: Hash256, bytes: &[u8]) -> Result<()> {
+    let actual = Hash256::from_bytes(Sha256::digest(bytes).into());
+    if actual != expected {
+        return Err(invalid(format!(
+            "source body identity {expected} recomputes to {actual}"
+        )));
+    }
+    Ok(())
+}
+
+fn enforce_count(label: &str, actual: usize, limit: u32) -> Result<()> {
+    if actual > limit as usize {
+        return Err(invalid(format!(
+            "{label} count {actual} exceeds limit {limit}"
+        )));
+    }
+    Ok(())
+}
+
+fn invalid(message: impl Into<String>) -> RepositoryTransferError {
+    RepositoryTransferError::Invalid(message.into())
+}
+
+fn storage(error: impl std::fmt::Display) -> RepositoryTransferError {
+    RepositoryTransferError::Storage(error.to_string())
+}
+
+fn model(error: impl std::fmt::Display) -> RepositoryTransferError {
+    invalid(error.to_string())
+}
+
+fn repository_commit(error: KinDbError) -> RepositoryTransferError {
+    match error {
+        KinDbError::Model(ModelError::Conflict(message))
+        | KinDbError::ConcurrentAccessError(message) => RepositoryTransferError::Conflict(message),
+        KinDbError::Model(error) => RepositoryTransferError::Invalid(error.to_string()),
+        error => RepositoryTransferError::Storage(error.to_string()),
+    }
+}
+
+struct TransferChangeStore {
+    changes: BTreeMap<SemanticChangeId, SemanticChange>,
+}
+
+impl TransferChangeStore {
+    fn new(changes: impl IntoIterator<Item = SemanticChange>) -> Self {
+        Self {
+            changes: changes
+                .into_iter()
+                .map(|change| (change.id, change))
+                .collect(),
+        }
+    }
+}
+
+impl ChangeStore for TransferChangeStore {
+    type Error = ModelError;
+
+    fn get_entity_history(
+        &self,
+        _id: &kin_model::EntityId,
+    ) -> std::result::Result<Vec<SemanticChange>, Self::Error> {
+        Err(ModelError::InvalidOperation(
+            "entity history is unavailable in repository transfer replay".to_string(),
+        ))
+    }
+
+    fn find_merge_bases(
+        &self,
+        _a: &SemanticChangeId,
+        _b: &SemanticChangeId,
+    ) -> std::result::Result<Vec<SemanticChangeId>, Self::Error> {
+        Err(ModelError::InvalidOperation(
+            "merge-base search is unavailable in repository transfer replay".to_string(),
+        ))
+    }
+
+    fn create_change(&self, _change: &SemanticChange) -> std::result::Result<(), Self::Error> {
+        Err(ModelError::InvalidOperation(
+            "repository transfer replay is immutable".to_string(),
+        ))
+    }
+
+    fn get_change(
+        &self,
+        id: &SemanticChangeId,
+    ) -> std::result::Result<Option<SemanticChange>, Self::Error> {
+        Ok(self.changes.get(id).cloned())
+    }
+
+    fn get_changes_since(
+        &self,
+        _base: &SemanticChangeId,
+        _head: &SemanticChangeId,
+    ) -> std::result::Result<Vec<SemanticChange>, Self::Error> {
+        Err(ModelError::InvalidOperation(
+            "range queries are unavailable in repository transfer replay".to_string(),
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use kin_db::LocalFileBackend;
+    use kin_model::{
+        compute_semantic_change_id, ArtifactId, ExternalObjectKind, GitExternalAuthorityDelta,
+        GitObjectBodyLoader, GitObjectFormat, GitObjectId, GitRawRef, GitRawTarget, LocatedEntry,
+        RepoPath, Timestamp, TreeDelta,
+    };
+    use sha1::{Digest as _, Sha1};
+    use tempfile::TempDir;
+    use uuid::Uuid;
+
+    use super::*;
+
+    type TestManager = RepositoryAuthorityManager<LocalFileBackend>;
+
+    struct TransferFixture {
+        _source_dir: TempDir,
+        _destination_dir: TempDir,
+        source: TestManager,
+        destination: TestManager,
+        repository_id: RepositoryId,
+        main: RefName,
+        pack: RepositoryTransferPack,
+        body_hashes: Vec<Hash256>,
+        gitlink_target: GitObjectId,
+    }
+
+    fn digest(bytes: &[u8]) -> Hash256 {
+        Hash256::from_bytes(Sha256::digest(bytes).into())
+    }
+
+    fn manager(
+        directory: &TempDir,
+        repository_id: &RepositoryId,
+    ) -> RepositoryAuthorityManager<LocalFileBackend> {
+        let storage_root = directory.path().join("kindb");
+        std::fs::create_dir_all(&storage_root).unwrap();
+        RepositoryAuthorityManager::open(
+            repository_id.clone(),
+            Arc::new(LocalFileBackend::new(storage_root)),
+        )
+        .unwrap()
+    }
+
+    fn native_change(
+        parents: Vec<SemanticChangeId>,
+        message: &str,
+        tree_deltas: Vec<TreeDelta>,
+    ) -> SemanticChange {
+        let mut change = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+            origin: ChangeOrigin::Native,
+            parents,
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("transfer-source"),
+            message: message.to_string(),
+            entity_deltas: Vec::new(),
+            relation_deltas: Vec::new(),
+            tree_deltas,
+            admission_policy_delta: None,
+            projected_files: Vec::new(),
+            spec_link: None,
+            evidence: Vec::new(),
+            risk_summary: None,
+        };
+        change.id = compute_semantic_change_id(&change).unwrap();
+        change
+    }
+
+    #[derive(Clone, Default)]
+    struct GitBodies(BTreeMap<Hash256, Vec<u8>>);
+
+    impl GitObjectBodyLoader for GitBodies {
+        type Error = std::convert::Infallible;
+
+        fn load_body(
+            &mut self,
+            body_hash: &Hash256,
+        ) -> std::result::Result<Option<Vec<u8>>, Self::Error> {
+            Ok(self.0.get(body_hash).cloned())
+        }
+    }
+
+    fn git_object_id(kind: ExternalObjectKind, body: &[u8]) -> GitObjectId {
+        let mut hasher = Sha1::new();
+        hasher.update(kind.git_header());
+        hasher.update(b" ");
+        hasher.update(body.len().to_string().as_bytes());
+        hasher.update([0]);
+        hasher.update(body);
+        GitObjectId::sha1(hasher.finalize().into())
+    }
+
+    fn git_record(
+        kind: ExternalObjectKind,
+        body: Vec<u8>,
+        bodies: &mut GitBodies,
+    ) -> ExternalObjectRecord {
+        let object_id = git_object_id(kind, &body);
+        let record = ExternalObjectRecord::from_raw(kind, object_id, &body).unwrap();
+        bodies.0.insert(record.body_hash, body);
+        record
+    }
+
+    fn git_tree_body(entries: &[(&[u8], &[u8], GitObjectId)]) -> Vec<u8> {
+        let mut body = Vec::new();
+        for (name, mode, object_id) in entries {
+            body.extend_from_slice(mode);
+            body.push(b' ');
+            body.extend_from_slice(name);
+            body.push(0);
+            body.extend_from_slice(object_id.as_bytes());
+        }
+        body
+    }
+
+    fn git_commit_body(tree: GitObjectId, parents: &[GitObjectId], message: &[u8]) -> Vec<u8> {
+        let mut body = format!("tree {tree}\n").into_bytes();
+        for parent in parents {
+            body.extend_from_slice(format!("parent {parent}\n").as_bytes());
+        }
+        body.extend_from_slice(
+            b"author Kin <kin@example.com> 1700000000 +0000\n\
+              committer Kin <kin@example.com> 1700000000 +0000\n\n",
+        );
+        body.extend_from_slice(message);
+        body
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn install_imported_baseline(
+        manager: &TestManager,
+        repository_id: &RepositoryId,
+        main: &RefName,
+        bodies: &GitBodies,
+        external_objects: Vec<ExternalObjectRecord>,
+        authority: GitExternalAuthority,
+        changes: Vec<SemanticChange>,
+        aliases: Vec<ExternalChangeAlias>,
+        head_object: ExternalObjectId,
+        operation: u128,
+    ) {
+        for record in &external_objects {
+            manager
+                .save_source_blob(
+                    record.body_hash,
+                    bodies
+                        .0
+                        .get(&record.body_hash)
+                        .expect("fixture retains every exact Git object body"),
+                )
+                .unwrap();
+        }
+        let lease = manager.read_authority();
+        let transaction = RepositoryTransaction {
+            schema_version: REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+            operation_id: OperationId::from_uuid(Uuid::from_u128(operation)),
+            repository_id: repository_id.clone(),
+            expected_generation: lease.roots().generation,
+            expected_roots: lease.roots().clone(),
+            actor: AuthorId::new("transfer-fixture"),
+            reason: "install identical exact imported-Git baseline".to_string(),
+            external_objects,
+            git_authority_delta: Some(GitExternalAuthorityDelta::initialize(authority)),
+            changes,
+            aliases,
+            ref_mutations: vec![RefMutation {
+                name: main.clone(),
+                expected: RefExpectation::MustNotExist,
+                new_target: Some(RefTarget::external_object(head_object)),
+                policy: RefUpdatePolicy::FastForwardOnly,
+            }],
+            default_ref_mutation: Some(DefaultRefMutation {
+                expected: DefaultRefExpectation::MustBeUnset,
+                new_default: Some(main.clone()),
+            }),
+            workspace_mutation: None,
+            local_overlay_delta: None,
+        };
+        drop(lease);
+        manager.commit_repository_transaction(transaction).unwrap();
+    }
+
+    fn fixture() -> TransferFixture {
+        let repository_id = RepositoryId::new("repository-transfer-test").unwrap();
+        let main = RefName::branch(b"main").unwrap();
+        let source_dir = tempfile::tempdir().unwrap();
+        let destination_dir = tempfile::tempdir().unwrap();
+        let source = manager(&source_dir, &repository_id);
+        let destination = manager(&destination_dir, &repository_id);
+
+        let compose_v1 = b"services:\n  api:\n    build: .\n".to_vec();
+        let compose_v2 =
+            b"services:\n  api:\n    build: .\n    environment:\n      KIN: native\n".to_vec();
+        let dockerfile = b"FROM scratch\nCOPY payload.bin /payload.bin\n".to_vec();
+        let executable = b"#!/bin/sh\nexec kin doctor\n".to_vec();
+        let unsupported = b"pub fn main() void {}\n".to_vec();
+        let binary = vec![0, 1, 2, 0xff, 0, 0x80];
+        let symlink = b"compose.yaml".to_vec();
+        let mut git_bodies = GitBodies::default();
+        let compose = git_record(
+            ExternalObjectKind::Blob,
+            compose_v1.clone(),
+            &mut git_bodies,
+        );
+        let docker = git_record(
+            ExternalObjectKind::Blob,
+            dockerfile.clone(),
+            &mut git_bodies,
+        );
+        let check = git_record(
+            ExternalObjectKind::Blob,
+            executable.clone(),
+            &mut git_bodies,
+        );
+        let zig = git_record(
+            ExternalObjectKind::Blob,
+            unsupported.clone(),
+            &mut git_bodies,
+        );
+        let payload = git_record(ExternalObjectKind::Blob, binary.clone(), &mut git_bodies);
+        let link = git_record(ExternalObjectKind::Blob, symlink.clone(), &mut git_bodies);
+        let gitlink_target = GitObjectId::sha1([0x5a; 20]);
+        let compose_artifact = ArtifactId(Uuid::from_u128(1));
+        let compose_v1_entry = LocatedEntry::new(
+            RepoPath::from_utf8("compose.yaml").unwrap(),
+            TreeEntry::blob(compose.body_hash, false),
+        );
+        let tree_deltas = vec![
+            TreeDelta::Added {
+                artifact_id: ArtifactId(Uuid::from_u128(2)),
+                new: LocatedEntry::new(
+                    RepoPath::from_utf8("Dockerfile").unwrap(),
+                    TreeEntry::blob(docker.body_hash, false),
+                ),
+            },
+            TreeDelta::Added {
+                artifact_id: ArtifactId(Uuid::from_u128(3)),
+                new: LocatedEntry::new(
+                    RepoPath::from_utf8("check").unwrap(),
+                    TreeEntry::blob(check.body_hash, true),
+                ),
+            },
+            TreeDelta::Added {
+                artifact_id: ArtifactId(Uuid::from_u128(6)),
+                new: LocatedEntry::new(
+                    RepoPath::from_utf8("compose-current").unwrap(),
+                    TreeEntry::symlink(link.body_hash),
+                ),
+            },
+            TreeDelta::Added {
+                artifact_id: compose_artifact,
+                new: compose_v1_entry.clone(),
+            },
+            TreeDelta::Added {
+                artifact_id: ArtifactId(Uuid::from_u128(5)),
+                new: LocatedEntry::new(
+                    RepoPath::from_bytes(b"data-\xff.bin".to_vec()).unwrap(),
+                    TreeEntry::blob(payload.body_hash, false),
+                ),
+            },
+            TreeDelta::Added {
+                artifact_id: ArtifactId(Uuid::from_u128(7)),
+                new: LocatedEntry::new(
+                    RepoPath::from_utf8("dependency").unwrap(),
+                    TreeEntry::gitlink(gitlink_target),
+                ),
+            },
+            TreeDelta::Added {
+                artifact_id: ArtifactId(Uuid::from_u128(4)),
+                new: LocatedEntry::new(
+                    RepoPath::from_utf8("plugin.zig").unwrap(),
+                    TreeEntry::blob(zig.body_hash, false),
+                ),
+            },
+        ];
+        let empty_tree = git_record(ExternalObjectKind::Tree, Vec::new(), &mut git_bodies);
+        let root_tree = git_record(
+            ExternalObjectKind::Tree,
+            git_tree_body(&[
+                (b"Dockerfile", b"100644", docker.object.oid),
+                (b"check", b"100755", check.object.oid),
+                (b"compose-current", b"120000", link.object.oid),
+                (b"compose.yaml", b"100644", compose.object.oid),
+                (b"data-\xff.bin", b"100644", payload.object.oid),
+                (b"dependency", b"160000", gitlink_target),
+                (b"plugin.zig", b"100644", zig.object.oid),
+            ]),
+            &mut git_bodies,
+        );
+        let parent_commit = git_record(
+            ExternalObjectKind::Commit,
+            git_commit_body(empty_tree.object.oid, &[], b"empty parent"),
+            &mut git_bodies,
+        );
+        let head_commit = git_record(
+            ExternalObjectKind::Commit,
+            git_commit_body(
+                root_tree.object.oid,
+                &[parent_commit.object.oid],
+                b"exact mixed repository baseline",
+            ),
+            &mut git_bodies,
+        );
+        let external_objects = vec![
+            compose.clone(),
+            docker,
+            check,
+            zig,
+            payload,
+            link,
+            empty_tree,
+            root_tree,
+            parent_commit.clone(),
+            head_commit.clone(),
+        ];
+        let raw_refs = vec![GitRawRef {
+            name: main.clone(),
+            target: GitRawTarget::Direct {
+                object: head_commit.object,
+            },
+        }];
+        let mut loader = git_bodies.clone();
+        let authority = GitExternalAuthority::from_raw_parts(
+            repository_id.clone(),
+            GitObjectFormat::Sha1,
+            raw_refs,
+            GitRawTarget::Symbolic {
+                target: main.clone(),
+            },
+            external_objects.clone(),
+            &mut loader,
+        )
+        .unwrap();
+        let timestamp = Timestamp(
+            chrono::DateTime::parse_from_rfc3339("2026-07-26T14:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        );
+        let mut parent = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+            origin: ChangeOrigin::GitCommit {
+                oid: parent_commit.object.oid,
+            },
+            parents: Vec::new(),
+            timestamp: timestamp.clone(),
+            author: AuthorId::new("transfer-import"),
+            message: "import exact empty parent".to_string(),
+            entity_deltas: Vec::new(),
+            relation_deltas: Vec::new(),
+            tree_deltas: Vec::new(),
+            admission_policy_delta: None,
+            projected_files: Vec::new(),
+            spec_link: None,
+            evidence: Vec::new(),
+            risk_summary: None,
+        };
+        parent.id = compute_semantic_change_id(&parent).unwrap();
+        let mut imported_head = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+            origin: ChangeOrigin::GitCommit {
+                oid: head_commit.object.oid,
+            },
+            parents: vec![parent.id],
+            timestamp,
+            author: AuthorId::new("transfer-import"),
+            message: "import exact mixed repository baseline".to_string(),
+            entity_deltas: Vec::new(),
+            relation_deltas: Vec::new(),
+            tree_deltas,
+            admission_policy_delta: None,
+            projected_files: Vec::new(),
+            spec_link: None,
+            evidence: Vec::new(),
+            risk_summary: None,
+        };
+        imported_head.id = compute_semantic_change_id(&imported_head).unwrap();
+        let aliases = vec![
+            ExternalChangeAlias::new(repository_id.clone(), parent_commit.object.oid, parent.id),
+            ExternalChangeAlias::new(
+                repository_id.clone(),
+                head_commit.object.oid,
+                imported_head.id,
+            ),
+        ];
+        for (manager, operation) in [(&source, 1_u128), (&destination, 2_u128)] {
+            install_imported_baseline(
+                manager,
+                &repository_id,
+                &main,
+                &git_bodies,
+                external_objects.clone(),
+                authority.clone(),
+                vec![parent.clone(), imported_head.clone()],
+                aliases.clone(),
+                head_commit.object,
+                operation,
+            );
+        }
+
+        let compose_v2_hash = digest(&compose_v2);
+        source
+            .save_source_blob(compose_v2_hash, &compose_v2)
+            .unwrap();
+        let child = native_change(
+            vec![imported_head.id],
+            "update non-language Compose configuration",
+            vec![TreeDelta::Updated {
+                artifact_id: compose_artifact,
+                old: compose_v1_entry,
+                new: LocatedEntry::new(
+                    RepoPath::from_utf8("compose.yaml").unwrap(),
+                    TreeEntry::blob(compose_v2_hash, false),
+                ),
+            }],
+        );
+        let source_lease = source.read_authority();
+        let source_advance = RepositoryTransaction {
+            schema_version: REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+            operation_id: OperationId::from_uuid(Uuid::from_u128(3)),
+            repository_id: repository_id.clone(),
+            expected_generation: source_lease.roots().generation,
+            expected_roots: source_lease.roots().clone(),
+            actor: AuthorId::new("transfer-source"),
+            reason: "advance source with exact Compose edit".to_string(),
+            external_objects: Vec::new(),
+            git_authority_delta: None,
+            changes: vec![child.clone()],
+            aliases: Vec::new(),
+            ref_mutations: vec![RefMutation {
+                name: main.clone(),
+                expected: RefExpectation::MustEqual {
+                    target: RefTarget::external_object(head_commit.object),
+                },
+                new_target: Some(RefTarget::change(child.id)),
+                policy: RefUpdatePolicy::FastForwardOnly,
+            }],
+            default_ref_mutation: None,
+            workspace_mutation: None,
+            local_overlay_delta: None,
+        };
+        drop(source_lease);
+        source
+            .commit_repository_transaction(source_advance)
+            .unwrap();
+
+        let body_hashes = external_objects
+            .iter()
+            .map(|record| record.body_hash)
+            .chain(std::iter::once(compose_v2_hash))
+            .collect::<Vec<_>>();
+
+        let status = repository_transfer_status(&destination, &repository_id, &main).unwrap();
+        let expectation = RepositoryTransferExpectation::try_from(status).unwrap();
+        let pack = build_repository_transfer_pack(&source, &main, &expectation).unwrap();
+        TransferFixture {
+            _source_dir: source_dir,
+            _destination_dir: destination_dir,
+            source,
+            destination,
+            repository_id,
+            main,
+            pack,
+            body_hashes,
+            gitlink_target,
+        }
+    }
+
+    #[test]
+    fn exact_fast_forward_transfers_every_repository_member_and_retries_idempotently() {
+        let fixture = fixture();
+        let advertised =
+            repository_transfer_status(&fixture.destination, &fixture.repository_id, &fixture.main)
+                .unwrap();
+        assert!(!advertised.push_apply_ready);
+        assert!(advertised.bounded_envelope_export_ready);
+        assert!(!advertised.pull_apply_ready);
+        assert_eq!(fixture.pack.changes.len(), 1);
+        assert_eq!(fixture.pack.trees.len(), 1);
+        assert_eq!(
+            fixture.pack.bodies.len(),
+            1,
+            "the identical imported baseline stays destination-owned while the native Compose edit transfers"
+        );
+        assert!(!fixture.pack.bodies.iter().any(|body| {
+            body.hash
+                == Hash256::from_bytes(Sha256::digest(fixture.gitlink_target.as_bytes()).into())
+        }));
+
+        let actor = AuthorId::new("authenticated-user");
+        let receipt = apply_repository_transfer_pack(
+            &fixture.destination,
+            &fixture.repository_id,
+            &fixture.main,
+            actor.clone(),
+            &fixture.pack,
+        )
+        .unwrap();
+        assert_eq!(receipt.outcome, RepositoryTransferApplyOutcome::Committed);
+        assert_eq!(receipt.destination_head, fixture.pack.source_head);
+
+        let status =
+            repository_transfer_status(&fixture.destination, &fixture.repository_id, &fixture.main)
+                .unwrap();
+        assert_eq!(status.destination_head, Some(fixture.pack.source_head));
+        assert_eq!(
+            status.destination_tree_hash,
+            Some(fixture.pack.source_tree_hash)
+        );
+        let lease = fixture.destination.read_authority();
+        let store = TransferChangeStore::new(lease.snapshot().changes.values().cloned());
+        let tree = store.resolve_tree_at(&fixture.pack.source_head).unwrap();
+        assert!(tree.artifacts().any(|artifact| {
+            matches!(
+                artifact.entry,
+                TreeEntry::Gitlink { target } if target == fixture.gitlink_target
+            )
+        }));
+        drop(lease);
+        for hash in &fixture.body_hashes {
+            assert_eq!(
+                fixture.destination.load_source_blob(*hash).unwrap(),
+                fixture.source.load_source_blob(*hash).unwrap()
+            );
+        }
+
+        let replay = apply_repository_transfer_pack(
+            &fixture.destination,
+            &fixture.repository_id,
+            &fixture.main,
+            actor,
+            &fixture.pack,
+        )
+        .unwrap();
+        assert_eq!(
+            replay.outcome,
+            RepositoryTransferApplyOutcome::IdempotentReplay
+        );
+        assert_eq!(
+            replay.authority_receipt.transaction_hash,
+            receipt.authority_receipt.transaction_hash
+        );
+
+        let error = apply_repository_transfer_pack(
+            &fixture.destination,
+            &fixture.repository_id,
+            &fixture.main,
+            AuthorId::new("different-authenticated-user"),
+            &fixture.pack,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("different exact transaction"));
+    }
+
+    #[test]
+    fn receiver_rejects_missing_unchanged_source_tree_body() {
+        let fixture = fixture();
+        let missing = fixture.body_hashes[1];
+        assert!(
+            !fixture.pack.bodies.iter().any(|body| body.hash == missing),
+            "the regression requires an unchanged baseline body"
+        );
+        let digest = missing.to_string();
+        std::fs::remove_file(
+            fixture
+                ._destination_dir
+                .path()
+                .join("kindb")
+                .join(fixture.repository_id.to_string())
+                .join("source-blobs")
+                .join("sha256")
+                .join(&digest[..2])
+                .join(&digest),
+        )
+        .unwrap();
+
+        let error = apply_repository_transfer_pack(
+            &fixture.destination,
+            &fixture.repository_id,
+            &fixture.main,
+            AuthorId::new("receiver"),
+            &fixture.pack,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("required immutable source body"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn strict_pack_rejects_tampering_unknowns_missing_parents_and_duplicates() {
+        let fixture = fixture();
+
+        let mut body_tamper = fixture.pack.clone();
+        body_tamper.bodies[0].bytes_base64 = BASE64.encode(b"tampered");
+        body_tamper.bodies[0].byte_len = 8;
+        body_tamper.transfer_id = compute_transfer_id(&body_tamper).unwrap();
+        let error = validate_pack(&body_tamper).unwrap_err();
+        assert!(error.to_string().contains("source body identity"));
+
+        let mut tree_tamper = fixture.pack.clone();
+        tree_tamper.trees[0].tree_hash = Hash256::from_bytes([0x44; 32]);
+        tree_tamper.transfer_id = compute_transfer_id(&tree_tamper).unwrap();
+        let error = apply_repository_transfer_pack(
+            &fixture.destination,
+            &fixture.repository_id,
+            &fixture.main,
+            AuthorId::new("authenticated-user"),
+            &tree_tamper,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("tree identity"));
+
+        let status =
+            repository_transfer_status(&fixture.destination, &fixture.repository_id, &fixture.main)
+                .unwrap();
+        let mut full_expectation = RepositoryTransferExpectation::try_from(status).unwrap();
+        full_expectation.destination_target = None;
+        full_expectation.destination_head = None;
+        let mut missing_parent =
+            build_repository_transfer_pack(&fixture.source, &fixture.main, &full_expectation)
+                .unwrap();
+        assert!(missing_parent.changes.len() >= 3);
+        missing_parent.changes.remove(0);
+        missing_parent.trees.remove(0);
+        missing_parent.transfer_id = compute_transfer_id(&missing_parent).unwrap();
+        let error = validate_pack(&missing_parent).unwrap_err();
+        assert!(error.to_string().contains("before or without parent"));
+
+        let mut duplicate = fixture.pack.clone();
+        duplicate.changes.push(duplicate.changes[0].clone());
+        duplicate.transfer_id = compute_transfer_id(&duplicate).unwrap();
+        let error = validate_pack(&duplicate).unwrap_err();
+        assert!(error.to_string().contains("duplicate semantic change"));
+
+        let mut unknown_feature = fixture.pack.clone();
+        unknown_feature
+            .required_features
+            .push("filesystem-fallback-v1".to_string());
+        unknown_feature.transfer_id = compute_transfer_id(&unknown_feature).unwrap();
+        let error = validate_pack(&unknown_feature).unwrap_err();
+        assert!(error.to_string().contains("unknown required"));
+
+        let mut unknown_field = serde_json::to_value(&fixture.pack).unwrap();
+        unknown_field
+            .as_object_mut()
+            .unwrap()
+            .insert("semanticChanges".to_string(), serde_json::json!([]));
+        assert!(serde_json::from_value::<RepositoryTransferPack>(unknown_field).is_err());
+
+        let mut unsupported_version = fixture.pack.clone();
+        unsupported_version.schema_version += 1;
+        let error = validate_pack(&unsupported_version).unwrap_err();
+        assert!(error.to_string().contains("unsupported schema version"));
+
+        let mut oversized = fixture.pack.clone();
+        oversized.changes = (0..=MAX_TRANSFER_CHANGES)
+            .map(|_| fixture.pack.changes[0].clone())
+            .collect();
+        let error = validate_pack(&oversized).unwrap_err();
+        assert!(error.to_string().contains("exceeds limit"));
+    }
+
+    #[test]
+    fn receiver_binds_repository_ref_actor_and_lease() {
+        let fixture = fixture();
+        let wrong_repository = RepositoryId::new("wrong-repository").unwrap();
+        let error = apply_repository_transfer_pack(
+            &fixture.destination,
+            &wrong_repository,
+            &fixture.main,
+            AuthorId::new("authenticated-user"),
+            &fixture.pack,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("does not match receiver"));
+
+        let wrong_ref = RefName::branch(b"other").unwrap();
+        let error = apply_repository_transfer_pack(
+            &fixture.destination,
+            &fixture.repository_id,
+            &wrong_ref,
+            AuthorId::new("authenticated-user"),
+            &fixture.pack,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("does not match route ref"));
+
+        let lease = fixture.destination.read_authority();
+        let current_target = lease
+            .authority_metadata()
+            .ref_state
+            .refs
+            .iter()
+            .find(|entry| entry.name == fixture.main)
+            .unwrap()
+            .target
+            .clone();
+        let current_head = lease.resolve_target_change_id(&current_target).unwrap();
+        let concurrent_body = b"services:\n  api:\n    image: remote-only\n";
+        let concurrent_hash = digest(concurrent_body);
+        fixture
+            .destination
+            .save_source_blob(concurrent_hash, concurrent_body)
+            .unwrap();
+        let concurrent_change = native_change(
+            vec![current_head],
+            "advance destination after sender lease",
+            vec![TreeDelta::Updated {
+                artifact_id: ArtifactId(Uuid::from_u128(1)),
+                old: LocatedEntry::new(
+                    RepoPath::from_utf8("compose.yaml").unwrap(),
+                    TreeEntry::blob(fixture.body_hashes[0], false),
+                ),
+                new: LocatedEntry::new(
+                    RepoPath::from_utf8("compose.yaml").unwrap(),
+                    TreeEntry::blob(concurrent_hash, false),
+                ),
+            }],
+        );
+        let concurrent_transaction = RepositoryTransaction {
+            schema_version: REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+            operation_id: OperationId::from_uuid(Uuid::from_u128(0xbeef)),
+            repository_id: fixture.repository_id.clone(),
+            expected_generation: lease.roots().generation,
+            expected_roots: lease.roots().clone(),
+            actor: AuthorId::new("concurrent-writer"),
+            reason: "advance durable authority receipt generation".to_string(),
+            external_objects: Vec::new(),
+            git_authority_delta: None,
+            changes: vec![concurrent_change.clone()],
+            aliases: Vec::new(),
+            ref_mutations: vec![RefMutation {
+                name: fixture.main.clone(),
+                expected: RefExpectation::MustEqual {
+                    target: current_target.clone(),
+                },
+                new_target: Some(RefTarget::change(concurrent_change.id)),
+                policy: RefUpdatePolicy::FastForwardOnly,
+            }],
+            default_ref_mutation: None,
+            workspace_mutation: None,
+            local_overlay_delta: None,
+        };
+        drop(lease);
+        fixture
+            .destination
+            .commit_repository_transaction(concurrent_transaction)
+            .unwrap();
+        let error = apply_repository_transfer_pack(
+            &fixture.destination,
+            &fixture.repository_id,
+            &fixture.main,
+            AuthorId::new("authenticated-user"),
+            &fixture.pack,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("roots/generation moved"));
+    }
+
+    #[test]
+    fn sender_rejects_non_fast_forward_and_missing_negotiated_features() {
+        let fixture = fixture();
+        let status =
+            repository_transfer_status(&fixture.destination, &fixture.repository_id, &fixture.main)
+                .unwrap();
+        let mut non_fast_forward = RepositoryTransferExpectation::try_from(status).unwrap();
+        let unrelated = SemanticChangeId::from_hash(Hash256::from_bytes([0xaa; 32]));
+        non_fast_forward.destination_target = Some(RefTarget::change(unrelated));
+        non_fast_forward.destination_head = Some(unrelated);
+        let error =
+            build_repository_transfer_pack(&fixture.source, &fixture.main, &non_fast_forward)
+                .unwrap_err();
+        assert!(error.to_string().contains("is not an ancestor"));
+
+        non_fast_forward.destination_target = None;
+        non_fast_forward.destination_head = None;
+        non_fast_forward
+            .supported_features
+            .retain(|feature| feature != FEATURE_RAW_REPOSITORY_PATHS);
+        let error =
+            build_repository_transfer_pack(&fixture.source, &fixture.main, &non_fast_forward)
+                .unwrap_err();
+        assert!(error.to_string().contains(FEATURE_RAW_REPOSITORY_PATHS));
+    }
+}

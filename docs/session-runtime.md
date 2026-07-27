@@ -1,4 +1,24 @@
-# Session Runtime: Running Ordinary Tools and Agents in a Kin Repository
+# Session Runtime Acceptance Contract
+
+> **Current development status:** repository-v6 exact session materialization is
+> implemented at the daemon boundary, including non-code/binary artifacts,
+> executable bits, symlinks, exact source-CAS reads, scoped artifact selection,
+> and a durable three-way-reconcile base record. The base is not yet sealed
+> against session-local edits, so reconcile consumption remains fail-closed
+> until it revalidates the record against repository authority. The public `kin exec`, `kin shell`,
+> `kin with --session`, `kin open`, and `kin reconcile` commands remain
+> fail-closed open gates. Docker and Compose are therefore represented and
+> materializable, but are **not yet claimed as end-to-end dogfood-ready through
+> these launchers**. Check `kin capabilities --json` for live availability.
+>
+> The remainder of this document is the contract those commands must satisfy
+> before their gates are opened, not a claim that every step is released today.
+
+Two exact-tree cases still fail closed at the physical session boundary:
+byte-exact non-UTF-8 repository paths (retained in repository authority and Git
+export, but not yet projected by the UTF-8 workspace boundary) and gitlinks
+(retained exactly as imported targets, but awaiting the graph-native
+cross-repository model and recursive materialization).
 
 Kin's session runtime is the venv-like execution contract for a Kin repository:
 you (or an agent) run normal project commands — `npm test`, `make`,
@@ -12,10 +32,10 @@ Three surfaces share this contract:
 
 | Surface | What it is | When to use it |
 | --- | --- | --- |
-| `kin exec -- <cmd>` (alias `kin run`) | One-shot command in a fresh session workspace | `kin exec -- npm test`, `kin run -- make build` |
+| `kin exec -- <cmd>` | One-shot command in a fresh session workspace | `kin exec -- npm test`, `kin exec -- make build` |
 | `kin shell` | Interactive shell inside a session workspace | exploratory work, multiple commands in one session |
 | `kin with --session <assistant> -- <task>` | AI assistant launched inside a session workspace | agent work that should start Kin-native |
-| `kin open <editor>` | Editor launched into a session workspace | human editing sessions |
+| `kin open <code\|cursor>` | Supported editor launched with a blocking wait lifecycle | human editing sessions |
 
 `kin setup` is **not** part of this contract: it is one-time configuration that
 installs Kin's MCP server entry into your AI clients (Claude Code, Cursor,
@@ -35,9 +55,11 @@ Codex, Gemini, Windsurf) and your shell hook. In short:
    resolved against the graph and fail loudly if the entity does not exist.
 2. **Run.** The command executes locally in that workspace (never through the
    daemon), with `KIN_SESSION`, `KIN_SESSION_ID`, and `KIN_SESSION_DIR` set.
-   Interactive shells and agent sessions also pin `KIN_DAEMON_URL` and
-   `KIN_REPO_ID` when available so nested Kin/MCP calls bind to the same repo
-   and session.
+   Every session launcher pins the verified `KIN_DAEMON_URL`,
+   `KIN_DAEMON_AUTH_TOKEN` (when configured), and `KIN_REPO_ID` so nested
+   Kin/MCP calls bind to the same repo and session. Inherited Git, Compose,
+   projection, and repository-path authority is removed before the child
+   starts.
 3. **Reconcile.** On success, Kin reconciles the workspace's own changes into
    the graph — a change-set replay against the base state it was materialized
    from, not a whole-tree overwrite — then removes the workspace.
@@ -160,9 +182,19 @@ The workspace is an execution surface, not a search authority.
 MCP client you launch manually from that shell inherits the session-coherent
 environment.
 
-Agent-session launches do **not** require the daemon's remote command
-execution endpoint, which stays disabled unless an operator explicitly opts in
-with `KIN_DAEMON_ALLOW_EXEC=1`.
+Each launcher registers that session ID with the daemon before starting the
+child, heartbeats it for the child lifetime, and ends it after closeout. This
+keeps the daemon alive without tying it to the short-lived launcher PID.
+
+`kin open` accepts VS Code (`code`) and Cursor (`cursor`) only. Both are invoked
+with their blocking `--wait` lifecycle so Kin never reconciles or deletes the
+workspace while the editor can still be writing to it.
+
+The daemon has no command-execution endpoint. `kin exec` always launches the
+requested argv locally inside the materialized workspace; shell evaluation is
+available only through the explicit `kin exec --shell` mode. Shell mode accepts
+one script argument, so quote the complete script:
+`kin exec --shell -- 'printf "%s\n" "$KIN_REPO_ID"'`.
 
 ## Daemon environment boundary
 

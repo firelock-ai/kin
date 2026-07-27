@@ -1,0 +1,471 @@
+{
+  "schema": "kin.git-replacement-capabilities.v1",
+  "substrate": "repository-v6",
+  "commands": [
+    {
+      "command": "init",
+      "status": "ready",
+      "exposure": "enabled",
+      "authority": "repository-v6 atomic exact Git admission or native unborn authority",
+      "required_for_bounded_dogfood": true,
+      "acceptance_spec": [
+        "fresh Git repositories import the complete exact reachable object, ref, change, tree, mode, symlink, gitlink, and non-code-artifact closure atomically",
+        "fresh non-Git repositories create only an unborn repository-v6 authority",
+        "existing .kin and non-empty non-Git directories fail without mutation",
+        "safe exact Git remote mappings are sealed into graph-adjacent local transport config while unsafe mappings fail closed before .kin publication"
+      ],
+      "evidence_tests": [
+        "crates/kin-cli/tests/init_json.rs"
+      ],
+      "note": "The clean-slate admission dispatcher is implemented and covered by exact Git and native-unborn acceptance tests."
+    },
+    {
+      "command": "status",
+      "status": "ready",
+      "exposure": "enabled",
+      "authority": "repository-v6 workspace/ref/root bundle",
+      "required_for_bounded_dogfood": true,
+      "acceptance_spec": [
+        "report one coherent durable authority generation, exact workspace head/tree, dirty state, refs, and semantic-enrichment state",
+        "do not infer repository membership or readiness from the filesystem or legacy branch sidecars"
+      ],
+      "evidence_tests": [
+        "crates/kin-cli/tests/repository_status.rs"
+      ],
+      "note": "Status reads workspace, refs, roots, exact tree identity, and semantic counts from one repository authority lease; checkout and Git state are not consulted."
+    },
+    {
+      "command": "commit",
+      "status": "open_gate",
+      "exposure": "fail_closed",
+      "authority": "sealed exact-workspace observation consumed by repository-v6 transaction and compare-and-swap ref publication",
+      "required_for_bounded_dogfood": true,
+      "acceptance_spec": [
+        "retain a non-fabricable complete workspace observation and its directory capabilities through final authority publication",
+        "bind the observed path manifest, exact admission policy, source CAS closure, prior tree, roots, and generation into one commit transaction without replanning against newer authority",
+        "reject an unconfirmed mass deletion as a whole observation without publishing simultaneous additions, modifications, policy changes, or graph state",
+        "commit exact workspace tree deltas and semantic deltas in one repository transaction",
+        "preserve all unsupported-language and non-code artifacts, modes, symlinks, gitlinks, and byte-exact paths",
+        "publish the target ref with generation and root-bundle compare-and-swap and no raw-filesystem rebuild"
+      ],
+      "evidence_tests": [
+        "kin_daemon::repository_commit::tests::native_commit_atomically_projects_exact_non_code_tree_and_ref",
+        "kin_daemon::repository_commit::tests::native_commit_preserves_host_unrepresentable_byte_exact_path",
+        "kin_daemon::api::tests::command_commit_preserves_complete_arbitrary_repository_tree",
+        "kin_core::tree::tests::repository_projection_covers_materializable_entries_and_preserves_gitlinks",
+        "kin_core::tree::tests::repository_projection_rejects_gitlink_transition_before_namespace_mutation"
+      ],
+      "note": "Exact artifact representation and repository transaction publication are implemented, but the ambient scanner currently drops its completion proof before publication, can replan a stale desired tree against newer authority, and can partially publish around the mass-deletion guard."
+    },
+    {
+      "command": "log",
+      "status": "ready",
+      "exposure": "enabled",
+      "authority": "repository-v6 workspace/ref plus immutable change DAG",
+      "required_for_bounded_dogfood": true,
+      "acceptance_spec": [
+        "resolve the active workspace head through exact repository refs and external aliases",
+        "walk immutable semantic parents without legacy branch state or Git/filesystem fallback"
+      ],
+      "evidence_tests": [
+        "crates/kin-cli/tests/repository_log.rs"
+      ],
+      "note": "Log resolves one exact workspace base and walks the immutable change DAG from one repository-v6 lease; Git, checkout files, and legacy branch state are not consulted."
+    },
+    {
+      "command": "diff",
+      "status": "ready",
+      "exposure": "enabled",
+      "authority": "immutable repository-v6 trees and semantic changes",
+      "required_for_bounded_dogfood": true,
+      "acceptance_spec": [
+        "diff exact tree membership, byte paths, content identities, executable bits, symlinks, and gitlinks as well as semantic entity and relation changes",
+        "resolve omitted endpoints from repository-v6 workspace/ref authority"
+      ],
+      "evidence_tests": [
+        "crates/kin-cli/src/commands/diff.rs",
+        "crates/kin-cli/tests/repository_diff.rs"
+      ],
+      "note": "Diff resolves refs, changes, Git aliases, HEAD, and the graph-owned workspace from one authority lease; exact byte-path artifact transitions remain complete when semantic enrichment is absent."
+    },
+    {
+      "command": "branch list",
+      "status": "ready",
+      "exposure": "enabled",
+      "authority": "repository-v6 byte-exact refs",
+      "required_for_bounded_dogfood": true,
+      "acceptance_spec": [
+        "list full byte-exact refs and identify the workspace symbolic or detached head from one authority generation"
+      ],
+      "evidence_tests": [
+        "crates/kin-cli/tests/repository_branches.rs"
+      ],
+      "note": "Branch list reads canonical fully-qualified byte refs, targets, default ref, and active workspace head from one repository-v6 authority lease."
+    },
+    {
+      "command": "branch create",
+      "status": "ready",
+      "exposure": "enabled",
+      "authority": "repository-v6 ref transaction",
+      "required_for_bounded_dogfood": true,
+      "acceptance_spec": [
+        "create a fully qualified ref with MustNotExist compare-and-swap against the active workspace base target"
+      ],
+      "evidence_tests": [
+        "crates/kin-cli/tests/repository_branches.rs"
+      ],
+      "note": "Branch creation commits MustNotExist against the exact active workspace base target and repository root bundle."
+    },
+    {
+      "command": "branch delete",
+      "status": "ready",
+      "exposure": "enabled",
+      "authority": "repository-v6 ref transaction",
+      "required_for_bounded_dogfood": true,
+      "acceptance_spec": [
+        "delete an exact ref only with force-with-lease and reject deletion of the active symbolic head"
+      ],
+      "evidence_tests": [
+        "crates/kin-cli/tests/repository_branches.rs"
+      ],
+      "note": "Branch deletion commits force-with-lease against the exact target and rejects default or checked-out refs."
+    },
+    {
+      "command": "branch switch",
+      "status": "ready",
+      "exposure": "enabled",
+      "authority": "repository-v6 workspace transaction and graph-derived projection",
+      "required_for_bounded_dogfood": true,
+      "acceptance_spec": [
+        "transition exact workspace head and tree atomically against expected generation and roots",
+        "verify every blob and symlink body from repository CAS while materializing only entries this host can represent",
+        "retain complete graph authority across Gitlink add, remove, and retarget operations and host-unrepresentable byte paths without inventing source blobs",
+        "preserve independently owned Gitlink directories without traversing their contents and fail closed on namespace races or projection tampering"
+      ],
+      "evidence_tests": [
+        "crates/kin-core/src/tree.rs",
+        "crates/kin-cli/tests/repository_branches.rs"
+      ],
+      "note": "Branch switch resolves byte-exact repository refs from one authority lease, verifies the complete blob and symlink closure from repository CAS, and commits the exact workspace mutation through a crash-recoverable projection WAL. Gitlinks and host-unrepresentable paths remain exact graph members; only host-materializable source bodies are projected."
+    },
+    {
+      "command": "git export",
+      "status": "ready",
+      "exposure": "enabled",
+      "authority": "repository-v6 exact external objects, refs, aliases, and source CAS",
+      "required_for_bounded_dogfood": true,
+      "acceptance_spec": [
+        "rehydrate an exact Git repository from repository authority without synthesizing or rewriting imported objects",
+        "export native Kin changes deterministically with refs updated only after object closure verification"
+      ],
+      "evidence_tests": [
+        "crates/kin-git/src/repository_export.rs",
+        "crates/kin-cli/tests/git_export_roundtrip.rs",
+        "crates/kin-cli/tests/eject_round_trip.rs"
+      ],
+      "note": "On Unix, Git export captures one repository-v6 authority lease, loads exact source and imported object bodies only from repository CAS, self-verifies staged refs and HEAD, and publishes only to a new external destination through a retained parent capability. Other hosts fail before creating the export."
+    },
+    {
+      "command": "eject",
+      "status": "ready",
+      "exposure": "enabled",
+      "authority": "repository-v6 workspace tree and source CAS",
+      "required_for_bounded_dogfood": true,
+      "acceptance_spec": [
+        "verify every projected path, kind, mode, symlink target, and blob against one durable workspace generation",
+        "stop graph projection, freeze the same authority roots, and atomically detach the locked .kin namespace only after exact replacement Git is durable",
+        "restore only the credential-free Git remote, tracking, refspec, and push configuration sealed during exact admission",
+        "retain detached Kin authority and any previous Git directory in a recoverable sibling archive; recursive purge is not an eject product surface"
+      ],
+      "evidence_tests": [
+        "crates/kin-cli/tests/eject_round_trip.rs"
+      ],
+      "note": "On Unix, eject proves the complete graph-owned workspace against repository source CAS, durably builds and fsck-verifies a replacement ordinary Git repository, restores sealed safe Git interoperability config, then holds projection and authority freezes through one capability-anchored Git replacement and .kin detach transaction. Windows currently fails before namespace mutation."
+    },
+    {
+      "command": "clone",
+      "status": "ready",
+      "exposure": "enabled",
+      "authority": "exact Git transport followed by atomic repository-v6 admission",
+      "required_for_bounded_dogfood": false,
+      "acceptance_spec": [
+        "clone with Git transport into an empty destination and call the same exact kin init admission boundary",
+        "remove the destination created by this invocation if and only if admission fails"
+      ],
+      "evidence_tests": [
+        "crates/kin-cli/tests/init_json.rs"
+      ],
+      "note": "Git clone uses Git only as transport; Kin authority is admitted atomically from the completed clone."
+    },
+    {
+      "command": "migrate",
+      "status": "ready",
+      "exposure": "enabled",
+      "authority": "atomic repository-v6 exact Git admission",
+      "required_for_bounded_dogfood": false,
+      "acceptance_spec": [
+        "in-place migration calls the same exact Git admission boundary as init",
+        "snapshot or partial-history modes are rejected"
+      ],
+      "evidence_tests": [
+        "crates/kin-cli/tests/init_json.rs"
+      ],
+      "note": "The migration executor is a thin exact-admission wrapper."
+    },
+    {
+      "command": "checkout",
+      "status": "open_gate",
+      "exposure": "fail_closed",
+      "authority": "daemon-private repository-v6 exact tree, semantic graph, source CAS, and crash-recoverable projection transaction",
+      "required_for_bounded_dogfood": true,
+      "acceptance_spec": [
+        "resolve a selected immutable change through startup-pinned repository and workspace identity without Git or legacy object fallback",
+        "verify complete selected tree, semantic graph, and source CAS closure before one projection and authority transaction",
+        "preserve every unsupported-language and non-code artifact, executable bit, symlink, gitlink, opaque binary, and host-unrepresentable byte path in graph authority while materializing only host-representable entries",
+        "reject every session-scoped request before mutation and preserve independently dirty unselected paths",
+        "replay the exact caller-stable operation across same-daemon and restart crash gaps without advancing authority twice"
+      ],
+      "evidence_tests": [
+        "kin_daemon::api::tests::command_checkout_projects_universal_selected_tree_and_replays_exactly",
+        "kin_daemon::api::tests::command_checkout_persists_same_tree_semantics_and_replays_after_restart",
+        "kin_daemon::api::tests::command_checkout_rejects_unknown_unscoped_and_expired_sessions_without_mutation",
+        "kin_daemon::api::tests::command_checkout_returns_typed_bad_request_and_conflict_statuses",
+        "kin_daemon::api::tests::command_checkout_projection_only_repairs_universal_bytes_and_replays_after_restart"
+      ],
+      "note": "The daemon-private checkout boundary and its exact replay tests are complete, but exposure remains fail-closed until kin-db retains and revalidates the selected repository authority subtree—not only the top-level storage root—across the daemon process lifetime."
+    },
+    {
+      "command": "push",
+      "status": "open_gate",
+      "exposure": "fail_closed",
+      "authority": "repository-v6 remote capability and exact transport",
+      "required_for_bounded_dogfood": false,
+      "acceptance_spec": [
+        "negotiate remote capabilities and transfer missing exact object/change/tree/ref closure with lease-protected publication"
+      ],
+      "evidence_tests": [],
+      "note": "The previous path depended on the removed legacy Git exporter."
+    },
+    {
+      "command": "pull",
+      "status": "open_gate",
+      "exposure": "fail_closed",
+      "authority": "repository-v6 remote capability and exact transport",
+      "required_for_bounded_dogfood": false,
+      "acceptance_spec": [
+        "fetch and validate exact remote closure before one local authority transaction and graph-derived workspace transition"
+      ],
+      "evidence_tests": [],
+      "note": "The previous native sync path materialized file snapshots outside repository-v6 authority."
+    },
+    {
+      "command": "merge",
+      "status": "open_gate",
+      "exposure": "fail_closed",
+      "authority": "repository-v6 immutable DAG and exact tree merge",
+      "required_for_bounded_dogfood": false,
+      "acceptance_spec": [
+        "merge semantic and exact tree deltas across all artifact kinds and publish with ref compare-and-swap"
+      ],
+      "evidence_tests": [],
+      "note": "The old merge executor depends on removed legacy branch state and delta shapes."
+    },
+    {
+      "command": "stash",
+      "status": "open_gate",
+      "exposure": "fail_closed",
+      "authority": "repository-v6 workspace transaction",
+      "required_for_bounded_dogfood": false,
+      "acceptance_spec": [
+        "persist and restore exact graph-owned workspace state without branch sidecars or raw-file inference"
+      ],
+      "evidence_tests": [],
+      "note": "The old stash path updates the removed .kin/HEAD branch marker."
+    },
+    {
+      "command": "reconcile",
+      "status": "open_gate",
+      "exposure": "fail_closed",
+      "authority": "sealed exact-session observation consumed by repository-v6 explicit ingestion boundary",
+      "required_for_bounded_dogfood": false,
+      "acceptance_spec": [
+        "retain the session root capability and a non-fabricable observation seal through final namespace revalidation and authority commit",
+        "bind exact policy, exclusions, complete source CAS closure, prior roots, and generation into the consumed observation",
+        "reject an unconfirmed mass deletion atomically without admitting simultaneous additions or modifications",
+        "admit an explicitly observed projection delta into exact workspace authority with complete artifact identities and source CAS",
+        "never answer semantic queries or silently repair authority from raw files"
+      ],
+      "evidence_tests": [
+        "api::tests::reconcile_endpoint_admits_complete_exact_session_tree_and_replays",
+        "api::tests::reconcile_rejects_control_aliases_special_members_and_stale_bases"
+      ],
+      "note": "The session scanner already performs retained-root double observation and authority-root CAS, but its public observation DTO drops the retained capability before planning and remains fabricable outside the scanner."
+    },
+    {
+      "command": "conflicts",
+      "status": "open_gate",
+      "exposure": "fail_closed",
+      "authority": "repository-v6 merge transaction state",
+      "required_for_bounded_dogfood": false,
+      "acceptance_spec": [
+        "read conflict state committed with the exact merge transaction rather than a .kin sidecar",
+        "represent semantic and exact-tree conflicts across every artifact kind"
+      ],
+      "evidence_tests": [],
+      "note": "The retired command read legacy .kin/merge_state.json state."
+    },
+    {
+      "command": "resolve",
+      "status": "open_gate",
+      "exposure": "fail_closed",
+      "authority": "repository-v6 merge resolution transaction",
+      "required_for_bounded_dogfood": false,
+      "acceptance_spec": [
+        "resolve semantic and exact-tree conflicts against one durable merge transaction",
+        "publish the resolved workspace and target ref atomically with compare-and-swap"
+      ],
+      "evidence_tests": [],
+      "note": "The retired resolver mutated legacy branches and sidecar merge state."
+    },
+    {
+      "command": "rename",
+      "status": "open_gate",
+      "exposure": "fail_closed",
+      "authority": "graph entity identity plus repository-v6 source CAS",
+      "required_for_bounded_dogfood": false,
+      "acceptance_spec": [
+        "plan edits from graph relations and immutable repository source bodies only",
+        "apply exact workspace tree and semantic deltas through one repository transaction"
+      ],
+      "evidence_tests": [],
+      "note": "The old planner read .kin/objects and working-tree files."
+    },
+    {
+      "command": "remote plan-push",
+      "status": "open_gate",
+      "exposure": "fail_closed",
+      "authority": "repository-v6 workspace/ref state and negotiated remote capability",
+      "required_for_bounded_dogfood": false,
+      "acceptance_spec": [
+        "derive the local publication head from one repository authority generation",
+        "plan exact closure transfer and lease-protected ref publication without legacy branch state"
+      ],
+      "evidence_tests": [],
+      "note": "The legacy planner is not an executable repository-v6 transfer proof."
+    },
+    {
+      "command": "exec",
+      "status": "open_gate",
+      "exposure": "fail_closed",
+      "authority": "repository-v6 workspace snapshot and graph-derived session projection",
+      "required_for_bounded_dogfood": false,
+      "acceptance_spec": [
+        "materialize a bounded exact workspace snapshot from repository CAS",
+        "capture session deltas back through explicit repository transactions or discard them"
+      ],
+      "evidence_tests": [],
+      "note": "The legacy session materializer has been removed pending exact workspace projection."
+    },
+    {
+      "command": "open",
+      "status": "open_gate",
+      "exposure": "fail_closed",
+      "authority": "repository-v6 workspace snapshot and graph-derived session projection",
+      "required_for_bounded_dogfood": false,
+      "acceptance_spec": [
+        "open an editor over an exact graph-derived workspace with stable artifact identity",
+        "retain non-code files, unsupported languages, modes, symlinks, and gitlinks"
+      ],
+      "evidence_tests": [],
+      "note": "The legacy session materializer has been removed pending exact workspace projection."
+    },
+    {
+      "command": "with",
+      "status": "open_gate",
+      "exposure": "fail_closed",
+      "authority": "repository-v6 workspace snapshot and graph-derived agent session",
+      "required_for_bounded_dogfood": false,
+      "acceptance_spec": [
+        "bind the assistant to an exact repository generation and capability-scoped session",
+        "capture or discard complete exact deltas without hidden working-tree authority"
+      ],
+      "evidence_tests": [],
+      "note": "The legacy assistant session path depended on removed projection shims."
+    },
+    {
+      "command": "shell",
+      "status": "open_gate",
+      "exposure": "fail_closed",
+      "authority": "repository-v6 workspace snapshot and graph-derived session projection",
+      "required_for_bounded_dogfood": false,
+      "acceptance_spec": [
+        "start a shell in an exact graph-derived workspace",
+        "capture or discard complete exact deltas through repository authority"
+      ],
+      "evidence_tests": [],
+      "note": "The legacy session materializer has been removed pending exact workspace projection."
+    },
+    {
+      "command": "doctor --drift",
+      "status": "open_gate",
+      "exposure": "fail_closed",
+      "authority": "repository-v6 workspace tree and projection receipt",
+      "required_for_bounded_dogfood": false,
+      "acceptance_spec": [
+        "compare a bounded projection observation against one exact workspace generation",
+        "heal only through an explicit repository transaction or graph-derived rematerialization"
+      ],
+      "evidence_tests": [],
+      "note": "The retired drift doctor scanned raw files and read legacy object layout."
+    },
+    {
+      "command": "semver",
+      "status": "open_gate",
+      "exposure": "fail_closed",
+      "authority": "repository-v6 immutable change DAG",
+      "required_for_bounded_dogfood": false,
+      "acceptance_spec": [
+        "derive API impact from repository-v6 changes at explicit refs without legacy branches"
+      ],
+      "evidence_tests": [],
+      "note": "The retired semantic-release analyzer depended on legacy branch and delta shapes."
+    },
+    {
+      "command": "release snapshot",
+      "status": "open_gate",
+      "exposure": "fail_closed",
+      "authority": "repository-v6 refs, proof state, and immutable tree",
+      "required_for_bounded_dogfood": false,
+      "acceptance_spec": [
+        "bind the release snapshot to exact repository roots, proof decisions, and immutable artifacts"
+      ],
+      "evidence_tests": [],
+      "note": "The retired snapshot path constructed changes through legacy branch authority."
+    },
+    {
+      "command": "tag",
+      "status": "open_gate",
+      "exposure": "fail_closed",
+      "authority": "repository-v6 tag ref transaction",
+      "required_for_bounded_dogfood": false,
+      "acceptance_spec": [
+        "create an exact refs/tags target with compare-and-swap and proof-policy checks"
+      ],
+      "evidence_tests": [],
+      "note": "The retired tag path wrote semantic tags through legacy branch state."
+    },
+    {
+      "command": "rollback",
+      "status": "open_gate",
+      "exposure": "fail_closed",
+      "authority": "repository-v6 inverse semantic and exact-tree transaction",
+      "required_for_bounded_dogfood": false,
+      "acceptance_spec": [
+        "construct and commit an exact inverse change that preserves artifact identity and source CAS",
+        "publish the workspace and ref transition atomically"
+      ],
+      "evidence_tests": [],
+      "note": "The retired rollback path inverted legacy tuple deltas and branch state."
+    }
+  ]
+}

@@ -6,10 +6,11 @@ name = "kin-runtime"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Workspace runs, validation, and evidence capture for Kin"
+description = "Graph-backed session execution, validation, and evidence capture for Kin"
 repository.workspace = true
 
 [dependencies]
+kin-core = { workspace = true }
 kin-model = { workspace = true }
 kin-blobs = { workspace = true }
 thiserror = { workspace = true }
@@ -18,8 +19,6 @@ chrono = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
-sha2 = { workspace = true }
-hex = { workspace = true }
 tempfile = { workspace = true }
 
 [dev-dependencies]

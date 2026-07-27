@@ -1,0 +1,3041 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Firelock, LLC
+
+//! Read-only authority preflight for one exact Git workspace migration.
+//!
+//! A lossless object/ref snapshot proves committed repository history, not the
+//! mutable Git index or materialized checkout. This boundary independently
+//! proves that the source index and every tracked worktree leaf equal the
+//! committed workspace seed before a later admission lane may construct a
+//! workspace mutation. It never executes hooks or filters, never recurses into
+//! gitlinks, and never manufactures an admission token.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use gix::bstr::ByteSlice;
+use kin_blobs::{digest, BlobStore};
+use kin_model::{
+    compute_resolved_tree_hash, ExternalObjectKind, GitObjectId, Hash256, RefTarget, RepoPath,
+    RepositoryId, RepositoryRefState, TreeEntry, WorkspaceHead,
+};
+
+use crate::error::{
+    GitCheckoutFilterFact, GitError, LocalGitHookFact, LocalGitHookKind, RegisteredGitWorktreeFact,
+    RegisteredGitWorktreeKind, Result,
+};
+use crate::lossless::{
+    capture_lossless_git_repository, open_repo, reject_shallow_repository, GitObjectFormat,
+    LosslessGitRepository,
+};
+use crate::semantic_import::SemanticGitImportPlan;
+
+/// Successful, point-in-time proof that one Git workspace can be admitted
+/// without flattening index or worktree state into repository authority.
+///
+/// This proves only the Git/source boundary. It does not establish that every
+/// imported historical tree has a branch-versioned shared admission policy,
+/// and therefore is not by itself authorization to admit the current
+/// policy-free semantic import plan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitMigrationPreflightProof {
+    pub repository_id: RepositoryId,
+    pub source_worktree: PathBuf,
+    pub source_git_dir: PathBuf,
+    pub object_format: GitObjectFormat,
+    /// Material workspace HEAD from the semantic seed. The lossless snapshot
+    /// fingerprint separately binds exact raw Git HEAD identity.
+    pub head: WorkspaceHead,
+    pub refs: RepositoryRefState,
+    pub base_target: Option<RefTarget>,
+    pub base_commit_oid: Option<GitObjectId>,
+    pub base_tree_hash: Option<Hash256>,
+    pub snapshot_fingerprint: Hash256,
+    pub semantic_plan_fingerprint: Hash256,
+    pub index: GitIndexPreflightProof,
+    pub tracked_worktree: GitTrackedWorktreeProof,
+    pub ignored_local: IgnoredLocalWorktreeFact,
+    pub compatibility: GitMigrationCompatibilityFacts,
+    pub remote_mapping: GitRemoteMappingFacts,
+    pub observation_fingerprint: Hash256,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitIndexPreflightProof {
+    /// Whether a physical index file existed. Absence is admissible only for a
+    /// truly unborn HEAD whose expected materialized tree is empty.
+    pub present: bool,
+    pub at_rest_checksum: Option<GitObjectId>,
+    pub raw_file_hash: Hash256,
+    pub logical_fingerprint: Hash256,
+    pub entry_count: usize,
+    pub sparse: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitTrackedWorktreeProof {
+    pub entry_count: usize,
+    pub gitlink_count: usize,
+    /// Exact Git paths that this host cannot name losslessly and therefore
+    /// proves only as graph-owned, physically absent entries.
+    pub host_unrepresentable_count: usize,
+    pub fingerprint: Hash256,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IgnoredLocalWorktreeFact {
+    /// Ordered, path-sanitized local ignore inputs that justified exclusions.
+    /// Tracked `.gitignore` files are intentionally absent: they remain part
+    /// of shared repository history.
+    pub inputs: Vec<GitLocalIgnoreInputFact>,
+    /// Case behavior used while matching the frozen inputs.
+    pub ignore_case: bool,
+    pub entries: Vec<IgnoredLocalEntry>,
+    pub fingerprint: Hash256,
+}
+
+impl IgnoredLocalWorktreeFact {
+    pub fn entry_count(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitLocalIgnoreInputFact {
+    pub source_kind: GitLocalIgnoreSourceKind,
+    pub order: usize,
+    pub body: Vec<u8>,
+    pub body_hash: Hash256,
+    pub body_len: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitLocalIgnoreSourceKind {
+    ResolvedGlobalExcludes,
+    RepositoryInfoExclude,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IgnoredLocalEntry {
+    pub path: RepoPath,
+    pub kind: IgnoredLocalEntryKind,
+    pub byte_len: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IgnoredLocalEntryKind {
+    File,
+    Symlink,
+    Directory,
+    Other,
+}
+
+/// Compatibility surfaces intentionally excluded from graph authority.
+///
+/// Successful preflight requires the three blocker collections to be empty;
+/// the explicit shape keeps that fact available to later admission code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitMigrationCompatibilityFacts {
+    pub other_registered_worktrees: Vec<RegisteredGitWorktreeFact>,
+    pub local_hooks: Vec<LocalGitHookFact>,
+    pub configured_custom_hooks_path: bool,
+    pub checkout_filters: Vec<GitCheckoutFilterFact>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct GitRemoteMappingFacts {
+    pub remotes: Vec<GitRemoteConfigFact>,
+    pub branch_tracking: Vec<GitBranchTrackingFact>,
+    /// Effective repository-local `remote.pushDefault`, if explicitly set.
+    pub remote_push_default: Option<Vec<u8>>,
+    /// Effective repository-local `push.default`, if explicitly set.
+    pub push_default: Option<Vec<u8>>,
+}
+
+impl GitRemoteMappingFacts {
+    pub fn is_empty(&self) -> bool {
+        self.remotes.is_empty()
+            && self.branch_tracking.is_empty()
+            && self.remote_push_default.is_none()
+            && self.push_default.is_none()
+    }
+}
+
+impl fmt::Debug for GitRemoteMappingFacts {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GitRemoteMappingFacts")
+            .field("remote_count", &self.remotes.len())
+            .field("branch_tracking_count", &self.branch_tracking.len())
+            .field(
+                "remote_push_default_present",
+                &self.remote_push_default.is_some(),
+            )
+            .field("push_default_present", &self.push_default.is_some())
+            .field("values", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct GitRemoteConfigFact {
+    pub name: Vec<u8>,
+    /// Ordered repository-local `remote.<name>.url` values.
+    pub fetch_urls: Vec<Vec<u8>>,
+    /// Ordered repository-local `remote.<name>.pushurl` values. An empty list
+    /// preserves the explicit absence that makes Git fall back to fetch URLs.
+    pub push_urls: Vec<Vec<u8>>,
+    /// Ordered repository-local `remote.<name>.fetch` refspecs.
+    pub fetch_refspecs: Vec<Vec<u8>>,
+    /// Ordered repository-local `remote.<name>.push` refspecs.
+    pub push_refspecs: Vec<Vec<u8>>,
+}
+
+impl fmt::Debug for GitRemoteConfigFact {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GitRemoteConfigFact")
+            .field("name", &String::from_utf8_lossy(&self.name))
+            .field("fetch_url_count", &self.fetch_urls.len())
+            .field("push_url_count", &self.push_urls.len())
+            .field("fetch_refspec_count", &self.fetch_refspecs.len())
+            .field("push_refspec_count", &self.push_refspecs.len())
+            .field("values", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct GitBranchTrackingFact {
+    pub branch: Vec<u8>,
+    pub remote: Option<Vec<u8>>,
+    pub merge_refs: Vec<Vec<u8>>,
+    pub push_remote: Option<Vec<u8>>,
+}
+
+impl fmt::Debug for GitBranchTrackingFact {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GitBranchTrackingFact")
+            .field("branch", &String::from_utf8_lossy(&self.branch))
+            .field("remote_present", &self.remote.is_some())
+            .field("merge_ref_count", &self.merge_refs.len())
+            .field("push_remote_present", &self.push_remote.is_some())
+            .field("values", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreflightObservation {
+    snapshot: LosslessGitRepository,
+    proof: GitMigrationPreflightProof,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExpectedIndexEntry {
+    mode: gix::index::entry::Mode,
+    oid: GitObjectId,
+    tree_entry: TreeEntry,
+}
+
+/// Prove the exact mutable Git boundary for a previously captured and planned
+/// source repository.
+///
+/// The source repository is never mutated. The supplied blob store is used to
+/// revalidate already-captured object bodies and workspace bytes. The entire
+/// observation is repeated before returning to close the practical TOCTOU
+/// window; any change fails closed.
+///
+/// A later history-enrichment/admission step must still attach and validate
+/// shared admission policy deltas before repository authority can be published.
+pub fn preflight_git_migration(
+    repo_path: &Path,
+    snapshot: &LosslessGitRepository,
+    plan: &SemanticGitImportPlan,
+    blob_store: &BlobStore,
+) -> Result<GitMigrationPreflightProof> {
+    preflight_git_migration_with_hook(repo_path, snapshot, plan, blob_store, None, || {})
+}
+
+/// Repeat an exact Git source proof after Kin has atomically installed `.kin`.
+///
+/// Only the supplied real `.kin` directory at the canonical worktree root is
+/// excluded from the worktree walk. Every Git object, ref, index byte, tracked
+/// leaf, ignored-local fact, and any other untracked path remains subject to
+/// the same two-observation proof as pre-publication migration.
+pub fn preflight_git_migration_after_publication(
+    repo_path: &Path,
+    published_kin_dir: &Path,
+    snapshot: &LosslessGitRepository,
+    plan: &SemanticGitImportPlan,
+    blob_store: &BlobStore,
+) -> Result<GitMigrationPreflightProof> {
+    let source_worktree =
+        fs::canonicalize(repo_path).map_err(|error| GitError::io(repo_path, error))?;
+    let expected_kin_dir = source_worktree.join(".kin");
+    let metadata = fs::symlink_metadata(published_kin_dir)
+        .map_err(|error| GitError::io(published_kin_dir, error))?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(preflight_error(format!(
+            "published Kin repository is not a real directory: {}",
+            published_kin_dir.display()
+        )));
+    }
+    let published_kin_dir = fs::canonicalize(published_kin_dir)
+        .map_err(|error| GitError::io(published_kin_dir, error))?;
+    if published_kin_dir != expected_kin_dir {
+        return Err(preflight_error(format!(
+            "post-publication proof may exclude only {}",
+            expected_kin_dir.display()
+        )));
+    }
+    preflight_git_migration_with_hook(
+        &source_worktree,
+        snapshot,
+        plan,
+        blob_store,
+        Some(&published_kin_dir),
+        || {},
+    )
+}
+
+fn preflight_git_migration_with_hook(
+    repo_path: &Path,
+    snapshot: &LosslessGitRepository,
+    plan: &SemanticGitImportPlan,
+    blob_store: &BlobStore,
+    published_kin_dir: Option<&Path>,
+    after_first_observation: impl FnOnce(),
+) -> Result<GitMigrationPreflightProof> {
+    validate_plan_binding(snapshot, plan, blob_store)?;
+    let expected = expected_index_entries(snapshot, plan)?;
+    let first = observe(
+        repo_path,
+        snapshot,
+        plan,
+        blob_store,
+        &expected,
+        published_kin_dir,
+    )?;
+    after_first_observation();
+    let second = observe(
+        repo_path,
+        snapshot,
+        plan,
+        blob_store,
+        &expected,
+        published_kin_dir,
+    )?;
+    if first != second {
+        return Err(preflight_error(
+            "Git source changed during migration preflight; retry from a fresh snapshot",
+        ));
+    }
+    Ok(second.proof)
+}
+
+fn validate_plan_binding(
+    snapshot: &LosslessGitRepository,
+    plan: &SemanticGitImportPlan,
+    blob_store: &BlobStore,
+) -> Result<()> {
+    plan.validate(blob_store)?;
+    if plan.repository_id != snapshot.repository_id
+        || plan.object_format != snapshot.object_format
+        || plan.external_objects != snapshot.objects
+        || plan.refs != snapshot.refs
+        || plan.head != snapshot.head
+    {
+        return Err(preflight_error(
+            "semantic import plan is not bound to the supplied lossless snapshot",
+        ));
+    }
+    Ok(())
+}
+
+fn observe(
+    repo_path: &Path,
+    expected_snapshot: &LosslessGitRepository,
+    plan: &SemanticGitImportPlan,
+    blob_store: &BlobStore,
+    expected_entries: &BTreeMap<RepoPath, ExpectedIndexEntry>,
+    published_kin_dir: Option<&Path>,
+) -> Result<PreflightObservation> {
+    let source_worktree =
+        fs::canonicalize(repo_path).map_err(|error| GitError::io(repo_path, error))?;
+    let snapshot = capture_lossless_git_repository(
+        &source_worktree,
+        expected_snapshot.repository_id.clone(),
+        blob_store,
+    )?;
+    if snapshot != *expected_snapshot {
+        return Err(preflight_error(
+            "source HEAD, refs, or reachable object closure no longer matches the supplied snapshot",
+        ));
+    }
+
+    let repo = open_repo(&source_worktree)?;
+    reject_shallow_repository(&repo)?;
+    reject_in_progress_operations(&repo)?;
+    let source_git_dir = stable_path(repo.git_dir());
+    let workdir = repo.workdir().ok_or_else(|| {
+        preflight_error("migration preflight requires a materialized Git worktree")
+    })?;
+    if stable_path(workdir) != source_worktree {
+        return Err(preflight_error(format!(
+            "opened Git worktree {} does not match requested source {}",
+            workdir.display(),
+            source_worktree.display()
+        )));
+    }
+
+    let other_worktrees = other_registered_worktrees(&repo, &source_worktree)?;
+    if !other_worktrees.is_empty() {
+        return Err(GitError::AdditionalWorktrees {
+            count: other_worktrees.len(),
+            worktrees: other_worktrees,
+        });
+    }
+
+    let (configured_custom_hooks_path, hooks) = local_hook_facts(&repo)?;
+    let filters = checkout_filter_facts(&repo);
+    if configured_custom_hooks_path || !hooks.is_empty() || !filters.is_empty() {
+        return Err(GitError::LocalCompatibilityBlockers {
+            hook_count: hooks.len(),
+            custom_hooks_path: configured_custom_hooks_path,
+            filter_count: filters.len(),
+            hooks,
+            filters,
+        });
+    }
+
+    let remote_mapping = remote_mapping_facts(&repo)?;
+    let absent_index_allowed = matches!(snapshot.head, WorkspaceHead::Symbolic { .. })
+        && plan.workspace_seed.base_target.is_none()
+        && plan.workspace_seed.base_commit_oid.is_none()
+        && plan.workspace_seed.base_tree_hash.is_none()
+        && expected_entries.is_empty();
+    let (index_file, raw_index) = read_strict_index(&repo, absent_index_allowed)?;
+    let ambient_repo = open_repo_with_user_ignore_config(&source_worktree)?;
+    if stable_path(ambient_repo.git_dir()) != stable_path(repo.git_dir())
+        || stable_path(ambient_repo.common_dir()) != stable_path(repo.common_dir())
+    {
+        return Err(preflight_error(
+            "resolved user ignore configuration opened a different Git repository",
+        ));
+    }
+    let index = prove_index(&index_file, raw_index.as_deref(), expected_entries)?;
+    index_file
+        .verify_extensions(true, &repo.objects)
+        .map_err(|error| preflight_error(format!("verify Git index extensions: {error}")))?;
+    let (tracked_worktree, ignored_local) = prove_worktree(
+        &ambient_repo,
+        &index_file,
+        workdir,
+        expected_entries,
+        blob_store,
+        published_kin_dir,
+    )?;
+    let snapshot_fingerprint = fingerprint_snapshot(&snapshot);
+    let semantic_plan_fingerprint = fingerprint_plan(plan)?;
+    let compatibility = GitMigrationCompatibilityFacts {
+        other_registered_worktrees: Vec::new(),
+        local_hooks: Vec::new(),
+        configured_custom_hooks_path: false,
+        checkout_filters: Vec::new(),
+    };
+    let mut proof = GitMigrationPreflightProof {
+        repository_id: snapshot.repository_id.clone(),
+        source_worktree,
+        source_git_dir,
+        object_format: snapshot.object_format,
+        head: plan.workspace_seed.head.clone(),
+        refs: snapshot.refs.clone(),
+        base_target: plan.workspace_seed.base_target.clone(),
+        base_commit_oid: plan.workspace_seed.base_commit_oid,
+        base_tree_hash: plan.workspace_seed.base_tree_hash,
+        snapshot_fingerprint,
+        semantic_plan_fingerprint,
+        index,
+        tracked_worktree,
+        ignored_local,
+        compatibility,
+        remote_mapping,
+        observation_fingerprint: digest(b"kin.git.preflight.unset"),
+    };
+    proof.observation_fingerprint = fingerprint_proof(&proof);
+    Ok(PreflightObservation { snapshot, proof })
+}
+
+fn expected_index_entries(
+    snapshot: &LosslessGitRepository,
+    plan: &SemanticGitImportPlan,
+) -> Result<BTreeMap<RepoPath, ExpectedIndexEntry>> {
+    let mut blob_oids = BTreeMap::<Hash256, GitObjectId>::new();
+    for record in snapshot
+        .objects
+        .iter()
+        .filter(|record| record.object.kind == ExternalObjectKind::Blob)
+    {
+        if let Some(previous) = blob_oids.insert(record.body_hash, record.object.oid) {
+            if previous != record.object.oid {
+                return Err(preflight_error(format!(
+                    "blob body {} maps to multiple Git object IDs",
+                    record.body_hash
+                )));
+            }
+        }
+    }
+
+    let mut expected = BTreeMap::new();
+    for artifact in plan.workspace_seed.base_tree.artifacts_by_path() {
+        let entry = match artifact.entry {
+            TreeEntry::Blob { hash, executable } => ExpectedIndexEntry {
+                mode: if executable {
+                    gix::index::entry::Mode::FILE_EXECUTABLE
+                } else {
+                    gix::index::entry::Mode::FILE
+                },
+                oid: *blob_oids.get(&hash).ok_or_else(|| {
+                    preflight_error(format!(
+                        "workspace blob {} at {} has no exact Git object identity",
+                        hash, artifact.path
+                    ))
+                })?,
+                tree_entry: artifact.entry,
+            },
+            TreeEntry::Symlink { target_blob } => ExpectedIndexEntry {
+                mode: gix::index::entry::Mode::SYMLINK,
+                oid: *blob_oids.get(&target_blob).ok_or_else(|| {
+                    preflight_error(format!(
+                        "workspace symlink target {} at {} has no exact Git object identity",
+                        target_blob, artifact.path
+                    ))
+                })?,
+                tree_entry: artifact.entry,
+            },
+            TreeEntry::Gitlink { target } => ExpectedIndexEntry {
+                mode: gix::index::entry::Mode::COMMIT,
+                oid: target,
+                tree_entry: artifact.entry,
+            },
+        };
+        if expected.insert(artifact.path.clone(), entry).is_some() {
+            return Err(preflight_error(format!(
+                "workspace seed repeats path {}",
+                artifact.path
+            )));
+        }
+    }
+    Ok(expected)
+}
+
+fn read_strict_index(
+    repo: &gix::Repository,
+    absent_allowed: bool,
+) -> Result<(gix::index::File, Option<Vec<u8>>)> {
+    if repo.config_snapshot().boolean("core.sparseCheckout") == Some(true)
+        || repo.git_dir().join("info/sparse-checkout").exists()
+    {
+        return Err(preflight_error(
+            "sparse checkout configuration is ambiguous for exact migration",
+        ));
+    }
+    let index_path = repo.index_path();
+    let before = match fs::symlink_metadata(&index_path) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_file() {
+                return Err(preflight_error("Git index path is not a regular file"));
+            }
+            Some(fs::read(&index_path).map_err(|error| GitError::io(&index_path, error))?)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && absent_allowed => None,
+        Err(error) => return Err(GitError::io(&index_path, error)),
+    };
+    let index = gix::index::File::at_or_default(
+        &index_path,
+        repo.object_hash(),
+        false,
+        gix::index::decode::Options::default(),
+    )
+    .map_err(|error| preflight_error(format!("open strict Git index: {error}")))?;
+    index
+        .verify_entries()
+        .map_err(|error| preflight_error(format!("verify Git index entries: {error}")))?;
+    match &before {
+        Some(before) => {
+            let after = fs::read(&index_path).map_err(|error| GitError::io(&index_path, error))?;
+            if before != &after {
+                return Err(preflight_error(
+                    "Git index changed while it was being verified",
+                ));
+            }
+        }
+        None => match fs::symlink_metadata(&index_path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => {
+                return Err(preflight_error(
+                    "previously absent Git index appeared while it was being verified",
+                ));
+            }
+            Err(error) => return Err(GitError::io(&index_path, error)),
+        },
+    }
+    Ok((index, before))
+}
+
+fn prove_index(
+    index: &gix::index::File,
+    raw_file: Option<&[u8]>,
+    expected: &BTreeMap<RepoPath, ExpectedIndexEntry>,
+) -> Result<GitIndexPreflightProof> {
+    if index.is_sparse() {
+        return Err(preflight_error(
+            "sparse Git indexes cannot establish an exact materialized workspace",
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    let mut logical = FramedHash::new(b"kin.git.preflight.index.v1");
+    logical.u64(index.entries().len() as u64);
+    for entry in index.entries() {
+        let path = RepoPath::from_bytes(entry.path(index).to_vec())
+            .map_err(|error| preflight_error(format!("invalid index path: {error}")))?;
+        if entry.stage() != gix::index::entry::Stage::Unconflicted {
+            return Err(preflight_error(format!(
+                "index path {path} has conflict stage {:?}",
+                entry.stage()
+            )));
+        }
+        let ambiguous = gix::index::entry::Flags::ASSUME_VALID
+            | gix::index::entry::Flags::SKIP_WORKTREE
+            | gix::index::entry::Flags::INTENT_TO_ADD
+            | gix::index::entry::Flags::CONFLICTED;
+        if entry.flags.intersects(ambiguous) {
+            return Err(preflight_error(format!(
+                "index path {path} has ambiguous flags {:?}",
+                entry.flags & ambiguous
+            )));
+        }
+        if entry.mode == gix::index::entry::Mode::DIR || entry.mode.is_sparse() {
+            return Err(preflight_error(format!(
+                "index path {path} is a sparse directory entry"
+            )));
+        }
+        let expected_entry = expected.get(&path).ok_or_else(|| {
+            preflight_error(format!(
+                "index contains staged or otherwise uncommitted path {path}"
+            ))
+        })?;
+        let actual_oid = git_object_id(entry.id)?;
+        if entry.mode != expected_entry.mode || actual_oid != expected_entry.oid {
+            return Err(preflight_error(format!(
+                "index entry {path} does not match committed workspace seed"
+            )));
+        }
+        if !seen.insert(path.clone()) {
+            return Err(preflight_error(format!("index repeats path {path}")));
+        }
+        logical.bytes(path.as_bytes());
+        logical.u64(u64::from(entry.mode.bits()));
+        logical.bytes(actual_oid.as_bytes());
+        logical.u64(u64::from(entry.flags.bits()));
+    }
+    if seen.len() != expected.len() {
+        let missing = expected
+            .keys()
+            .find(|path| !seen.contains(*path))
+            .expect("different lengths imply a missing expected path");
+        return Err(preflight_error(format!(
+            "index is missing committed path {missing}"
+        )));
+    }
+    Ok(GitIndexPreflightProof {
+        present: raw_file.is_some(),
+        at_rest_checksum: index.checksum().map(git_object_id).transpose()?,
+        raw_file_hash: raw_file
+            .map(digest)
+            .unwrap_or_else(|| digest(b"kin.git.preflight.index.absent.v1")),
+        logical_fingerprint: logical.finish(),
+        entry_count: index.entries().len(),
+        sparse: false,
+    })
+}
+
+fn prove_worktree(
+    ignore_repo: &gix::Repository,
+    index: &gix::index::File,
+    workdir: &Path,
+    expected: &BTreeMap<RepoPath, ExpectedIndexEntry>,
+    blob_store: &BlobStore,
+    published_kin_dir: Option<&Path>,
+) -> Result<(GitTrackedWorktreeProof, IgnoredLocalWorktreeFact)> {
+    let ignore_inputs = local_ignore_inputs(ignore_repo)?;
+    let (mut excludes, ignore_case) = frozen_ignore_stack(ignore_repo, index, &ignore_inputs)?;
+    let mut tracked_hash = FramedHash::new(b"kin.git.preflight.worktree.v2");
+    tracked_hash.u64(expected.len() as u64);
+    let mut state = WorktreeWalk {
+        expected,
+        blob_store,
+        seen: BTreeSet::new(),
+        tracked_hash,
+        gitlink_count: 0,
+        host_unrepresentable_count: 0,
+        ignored: Vec::new(),
+    };
+    let graph_only_paths = expected
+        .iter()
+        .filter(|(path, _)| !host_can_materialize_repo_path(path))
+        .map(|(path, entry)| (path.clone(), *entry))
+        .collect::<Vec<_>>();
+    for (path, entry) in &graph_only_paths {
+        if !state.seen.insert(path.clone()) {
+            return Err(preflight_error(format!(
+                "worktree graph-only proof repeats path {path}"
+            )));
+        }
+        state.host_unrepresentable_count += 1;
+        if matches!(entry.tree_entry, TreeEntry::Gitlink { .. }) {
+            state.gitlink_count += 1;
+        }
+    }
+    walk_directory(
+        workdir,
+        &[],
+        true,
+        published_kin_dir,
+        &mut excludes,
+        &mut state,
+    )?;
+    let confirmed_local_ignore_inputs = local_ignore_inputs(ignore_repo)?;
+    if confirmed_local_ignore_inputs != ignore_inputs {
+        return Err(preflight_error(
+            "local Git ignore inputs changed while the worktree was being verified",
+        ));
+    }
+    if state.seen.len() != expected.len() {
+        let missing = expected
+            .keys()
+            .find(|path| !state.seen.contains(*path))
+            .expect("different lengths imply a missing expected path");
+        return Err(preflight_error(format!(
+            "worktree is missing committed path {missing}"
+        )));
+    }
+    for (path, entry) in &graph_only_paths {
+        hash_host_unrepresentable_entry(&mut state.tracked_hash, path, entry.tree_entry);
+    }
+    state
+        .ignored
+        .sort_by(|left, right| left.path.cmp(&right.path));
+    let mut ignored_hash = FramedHash::new(b"kin.git.preflight.ignored.v1");
+    ignored_hash.u64(u64::from(ignore_case));
+    ignored_hash.u64(ignore_inputs.len() as u64);
+    for input in &ignore_inputs {
+        ignored_hash.u64(local_ignore_source_code(input.source_kind));
+        ignored_hash.u64(input.order as u64);
+        ignored_hash.bytes(input.body_hash.as_bytes());
+        ignored_hash.u64(input.body_len);
+        ignored_hash.bytes(&input.body);
+    }
+    ignored_hash.u64(state.ignored.len() as u64);
+    for entry in &state.ignored {
+        ignored_hash.bytes(entry.path.as_bytes());
+        ignored_hash.u64(ignored_kind_code(entry.kind));
+        ignored_hash.u64(entry.byte_len);
+    }
+    Ok((
+        GitTrackedWorktreeProof {
+            entry_count: state.seen.len(),
+            gitlink_count: state.gitlink_count,
+            host_unrepresentable_count: state.host_unrepresentable_count,
+            fingerprint: state.tracked_hash.finish(),
+        },
+        IgnoredLocalWorktreeFact {
+            inputs: ignore_inputs,
+            ignore_case,
+            entries: state.ignored,
+            fingerprint: ignored_hash.finish(),
+        },
+    ))
+}
+
+struct WorktreeWalk<'a> {
+    expected: &'a BTreeMap<RepoPath, ExpectedIndexEntry>,
+    blob_store: &'a BlobStore,
+    seen: BTreeSet<RepoPath>,
+    tracked_hash: FramedHash,
+    gitlink_count: usize,
+    host_unrepresentable_count: usize,
+    ignored: Vec<IgnoredLocalEntry>,
+}
+
+fn host_can_materialize_repo_path(path: &RepoPath) -> bool {
+    if path.as_utf8().is_none() {
+        #[cfg(any(windows, target_os = "macos"))]
+        return false;
+    }
+    true
+}
+
+fn hash_host_unrepresentable_entry(hash: &mut FramedHash, path: &RepoPath, entry: TreeEntry) {
+    hash.bytes(path.as_bytes());
+    // Representation code 4 is deliberately distinct from materialized blob,
+    // symlink, and Gitlink codes 1-3 below.
+    hash.u64(4);
+    match entry {
+        TreeEntry::Blob {
+            hash: blob,
+            executable,
+        } => {
+            hash.u64(1);
+            hash.bytes(blob.as_bytes());
+            hash.u64(u64::from(executable));
+        }
+        TreeEntry::Symlink { target_blob } => {
+            hash.u64(2);
+            hash.bytes(target_blob.as_bytes());
+        }
+        TreeEntry::Gitlink { target } => {
+            hash.u64(3);
+            hash.bytes(target.as_bytes());
+        }
+    }
+}
+
+fn walk_directory(
+    absolute: &Path,
+    relative: &[u8],
+    root: bool,
+    published_kin_dir: Option<&Path>,
+    excludes: &mut gix::AttributeStack<'_>,
+    state: &mut WorktreeWalk<'_>,
+) -> Result<()> {
+    let mut entries = fs::read_dir(absolute)
+        .map_err(|error| GitError::io(absolute, error))?
+        .collect::<std::io::Result<Vec<_>>>()
+        .map_err(|error| GitError::io(absolute, error))?;
+    entries.sort_by_key(|entry| os_bytes(&entry.file_name()));
+
+    for directory_entry in entries {
+        let name = os_bytes(&directory_entry.file_name());
+        if root && name == b".git" {
+            continue;
+        }
+        let absolute_path = directory_entry.path();
+        if root && published_kin_dir.is_some_and(|published| absolute_path == published) {
+            continue;
+        }
+        let path_bytes = if relative.is_empty() {
+            name
+        } else {
+            let mut joined = Vec::with_capacity(relative.len() + 1 + name.len());
+            joined.extend_from_slice(relative);
+            joined.push(b'/');
+            joined.extend_from_slice(&name);
+            joined
+        };
+        let path = RepoPath::from_bytes(path_bytes.clone())
+            .map_err(|error| preflight_error(format!("invalid worktree path: {error}")))?;
+        let metadata = fs::symlink_metadata(&absolute_path)
+            .map_err(|error| GitError::io(&absolute_path, error))?;
+
+        if let Some(expected) = state.expected.get(&path).copied() {
+            prove_tracked_entry(&absolute_path, &path, &metadata, expected, state)?;
+            continue;
+        }
+
+        let mode = if metadata.is_dir() {
+            Some(gix::index::entry::Mode::DIR)
+        } else if metadata.file_type().is_symlink() {
+            Some(gix::index::entry::Mode::SYMLINK)
+        } else {
+            Some(gix::index::entry::Mode::FILE)
+        };
+        let ignored = excludes
+            .at_entry(path_bytes.as_bstr(), mode)
+            .map_err(|error| preflight_error(format!("evaluate ignore rules for {path}: {error}")))?
+            .is_excluded();
+        if metadata.is_dir() {
+            if ignored {
+                state.ignored.push(IgnoredLocalEntry {
+                    path: path.clone(),
+                    kind: IgnoredLocalEntryKind::Directory,
+                    byte_len: 0,
+                });
+            }
+            walk_directory(
+                &absolute_path,
+                &path_bytes,
+                false,
+                published_kin_dir,
+                excludes,
+                state,
+            )?;
+        } else if ignored {
+            state.ignored.push(IgnoredLocalEntry {
+                path,
+                kind: ignored_entry_kind(&metadata),
+                byte_len: metadata.len(),
+            });
+        } else {
+            return Err(preflight_error(format!(
+                "worktree contains untracked non-ignored path {path}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn prove_tracked_entry(
+    absolute_path: &Path,
+    path: &RepoPath,
+    metadata: &fs::Metadata,
+    expected: ExpectedIndexEntry,
+    state: &mut WorktreeWalk<'_>,
+) -> Result<()> {
+    if !state.seen.insert(path.clone()) {
+        return Err(preflight_error(format!(
+            "worktree materializes tracked path {path} more than once"
+        )));
+    }
+    state.tracked_hash.bytes(path.as_bytes());
+    match expected.tree_entry {
+        TreeEntry::Blob { hash, executable } => {
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                return Err(preflight_error(format!(
+                    "tracked blob {path} is not a regular file"
+                )));
+            }
+            if filesystem_executable(metadata)? != executable {
+                return Err(preflight_error(format!(
+                    "tracked blob {path} has a different executable mode than the committed tree"
+                )));
+            }
+            let actual =
+                fs::read(absolute_path).map_err(|error| GitError::io(absolute_path, error))?;
+            let committed = state.blob_store.read(&hash)?;
+            if actual != committed {
+                return Err(preflight_error(format!(
+                    "tracked blob {path} bytes differ from the committed tree; checkout filters, LFS, CRLF, or unstaged edits are not admissible"
+                )));
+            }
+            state.tracked_hash.u64(1);
+            state.tracked_hash.bytes(hash.as_bytes());
+            state.tracked_hash.u64(u64::from(executable));
+        }
+        TreeEntry::Symlink { target_blob } => {
+            if !metadata.file_type().is_symlink() {
+                return Err(preflight_error(format!(
+                    "tracked symlink {path} is not a symbolic link"
+                )));
+            }
+            let target =
+                fs::read_link(absolute_path).map_err(|error| GitError::io(absolute_path, error))?;
+            let target = path_bytes(&target)?;
+            let committed = state.blob_store.read(&target_blob)?;
+            if target != committed {
+                return Err(preflight_error(format!(
+                    "tracked symlink {path} target differs from the committed tree"
+                )));
+            }
+            state.tracked_hash.u64(2);
+            state.tracked_hash.bytes(target_blob.as_bytes());
+        }
+        TreeEntry::Gitlink { target } => {
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                return Err(preflight_error(format!(
+                    "gitlink {path} is not materialized as a directory"
+                )));
+            }
+            let mut entries =
+                fs::read_dir(absolute_path).map_err(|error| GitError::io(absolute_path, error))?;
+            if entries
+                .next()
+                .transpose()
+                .map_err(|error| GitError::io(absolute_path, error))?
+                .is_some()
+            {
+                return Err(preflight_error(format!(
+                    "gitlink {path} has materialized nested-repository state; exact graph-native nested repository mapping is required before migration"
+                )));
+            }
+            state.gitlink_count += 1;
+            state.tracked_hash.u64(3);
+            state.tracked_hash.bytes(target.as_bytes());
+            // An empty placeholder is only the worktree representation of the
+            // graph-owned pointer. Any nested state above fails closed.
+        }
+    }
+    Ok(())
+}
+
+fn reject_in_progress_operations(repo: &gix::Repository) -> Result<()> {
+    if let Some(operation) = repo.state() {
+        return Err(preflight_error(format!(
+            "Git operation {operation:?} is in progress"
+        )));
+    }
+    let mut roots = vec![repo.git_dir().to_path_buf()];
+    if stable_path(repo.common_dir()) != stable_path(repo.git_dir()) {
+        roots.push(repo.common_dir().to_path_buf());
+    }
+    let markers = [
+        "rebase-apply",
+        "rebase-merge",
+        "sequencer",
+        "MERGE_HEAD",
+        "CHERRY_PICK_HEAD",
+        "REVERT_HEAD",
+        "REBASE_HEAD",
+        "BISECT_LOG",
+        "BISECT_START",
+        "index.lock",
+        "HEAD.lock",
+        "packed-refs.lock",
+        "shallow.lock",
+        "config.lock",
+        "gc.pid",
+    ];
+    for root in &roots {
+        for marker in markers {
+            let path = root.join(marker);
+            if fs::symlink_metadata(&path).is_ok() {
+                return Err(preflight_error(format!(
+                    "Git administrative state {} indicates an in-progress or incomplete operation",
+                    path.display()
+                )));
+            }
+        }
+        for relative in ["refs", "logs", "reftable", "objects/pack", "objects/info"] {
+            if let Some(lock) = find_lock_file(&root.join(relative))? {
+                return Err(preflight_error(format!(
+                    "Git lock {} indicates concurrent repository mutation",
+                    lock.display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn find_lock_file(root: &Path) -> Result<Option<PathBuf>> {
+    let metadata = match fs::symlink_metadata(root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(GitError::io(root, error)),
+    };
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Ok(None);
+    }
+    let mut entries = fs::read_dir(root)
+        .map_err(|error| GitError::io(root, error))?
+        .collect::<std::io::Result<Vec<_>>>()
+        .map_err(|error| GitError::io(root, error))?;
+    entries.sort_by_key(|entry| os_bytes(&entry.file_name()));
+    for entry in entries {
+        let name = os_bytes(&entry.file_name());
+        let metadata = fs::symlink_metadata(entry.path())
+            .map_err(|error| GitError::io(entry.path(), error))?;
+        if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            if let Some(lock) = find_lock_file(&entry.path())? {
+                return Ok(Some(lock));
+            }
+        } else if name.ends_with(b".lock") {
+            return Ok(Some(entry.path()));
+        }
+    }
+    Ok(None)
+}
+
+fn other_registered_worktrees(
+    repo: &gix::Repository,
+    source_worktree: &Path,
+) -> Result<Vec<RegisteredGitWorktreeFact>> {
+    let current_git_dir = stable_path(repo.git_dir());
+    let mut facts = Vec::new();
+    let main = repo
+        .main_repo()
+        .map_err(|error| preflight_error(format!("open main Git repository: {error}")))?;
+    if !main.is_bare() {
+        if let Some(workdir) = main.workdir() {
+            if stable_path(workdir) != stable_path(source_worktree)
+                && stable_path(main.git_dir()) != current_git_dir
+            {
+                facts.push(RegisteredGitWorktreeFact {
+                    kind: RegisteredGitWorktreeKind::Main,
+                    id: None,
+                    path: workdir.to_path_buf(),
+                    locked: false,
+                });
+            }
+        }
+    }
+    for proxy in repo
+        .worktrees()
+        .map_err(|error| preflight_error(format!("enumerate linked Git worktrees: {error}")))?
+    {
+        if stable_path(proxy.git_dir()) == current_git_dir {
+            continue;
+        }
+        let path = proxy.base().map_err(|error| {
+            preflight_error(format!(
+                "read linked worktree {} location: {error}",
+                proxy.id()
+            ))
+        })?;
+        facts.push(RegisteredGitWorktreeFact {
+            kind: RegisteredGitWorktreeKind::Linked,
+            id: Some(proxy.id().to_vec()),
+            path,
+            locked: proxy.is_locked(),
+        });
+    }
+    facts.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    Ok(facts)
+}
+
+fn local_hook_facts(repo: &gix::Repository) -> Result<(bool, Vec<LocalGitHookFact>)> {
+    let custom_hooks_path = repo
+        .config_snapshot()
+        .plumbing()
+        .sections_by_name("core")
+        .is_some_and(|mut sections| {
+            sections.any(|section| section.contains_value_name("hooksPath"))
+        });
+    if custom_hooks_path {
+        return Ok((true, Vec::new()));
+    }
+    let hooks_dir = repo.common_dir().join("hooks");
+    let entries = match fs::read_dir(&hooks_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((false, Vec::new()));
+        }
+        Err(error) => return Err(GitError::io(&hooks_dir, error)),
+    };
+    let mut hooks = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| GitError::io(&hooks_dir, error))?;
+        let name = os_bytes(&entry.file_name());
+        if name.ends_with(b".sample") {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(entry.path())
+            .map_err(|error| GitError::io(entry.path(), error))?;
+        hooks.push(LocalGitHookFact {
+            name,
+            kind: hook_kind(&metadata),
+            executable: filesystem_executable(&metadata)?,
+            byte_len: metadata.len(),
+        });
+    }
+    hooks.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok((false, hooks))
+}
+
+fn checkout_filter_facts(repo: &gix::Repository) -> Vec<GitCheckoutFilterFact> {
+    let config = repo.config_snapshot();
+    let mut facts = BTreeMap::<Vec<u8>, GitCheckoutFilterFact>::new();
+    if let Some(sections) = config.plumbing().sections_by_name("filter") {
+        for section in sections {
+            let Some(name) = section.header().subsection_name() else {
+                continue;
+            };
+            let clean_present = section.contains_value_name("clean");
+            let smudge_present = section.contains_value_name("smudge");
+            let process_present = section.contains_value_name("process");
+            if !clean_present && !smudge_present && !process_present {
+                continue;
+            }
+            let fact = facts
+                .entry(name.to_vec())
+                .or_insert_with(|| GitCheckoutFilterFact {
+                    name: name.to_vec(),
+                    clean_present: false,
+                    smudge_present: false,
+                    process_present: false,
+                    required_present: false,
+                });
+            fact.clean_present |= clean_present;
+            fact.smudge_present |= smudge_present;
+            fact.process_present |= process_present;
+            fact.required_present |= section.contains_value_name("required");
+        }
+    }
+    facts.into_values().collect()
+}
+
+fn remote_mapping_facts(repo: &gix::Repository) -> Result<GitRemoteMappingFacts> {
+    let config = repo.config_snapshot();
+    let mut remotes = Vec::<GitRemoteConfigFact>::new();
+    let mut branch_tracking = Vec::<GitBranchTrackingFact>::new();
+    let mut remote_push_default = None;
+    let mut push_default = None;
+
+    for section in config.plumbing().sections().filter(|section| {
+        matches!(
+            section.meta().source,
+            gix::config::Source::Local | gix::config::Source::Worktree
+        )
+    }) {
+        let section_name = section
+            .header()
+            .name()
+            .to_str()
+            .map_err(|_| unsafe_git_config("non-UTF-8 section name"))?
+            .to_ascii_lowercase();
+        if section.meta().level != 0 || matches!(section_name.as_str(), "include" | "includeif") {
+            return Err(unsafe_git_config("repository-local include"));
+        }
+
+        match section_name.as_str() {
+            "remote" => {
+                if let Some(name) = section.header().subsection_name() {
+                    validate_safe_identifier(name, "remote name")?;
+                    reject_unknown_config_keys(section, &["url", "pushurl", "fetch", "push"])?;
+                    let fact = remote_fact_mut(&mut remotes, name);
+                    append_explicit_values(
+                        section,
+                        "url",
+                        &mut fact.fetch_urls,
+                        validate_safe_remote_url,
+                    )?;
+                    append_explicit_values(
+                        section,
+                        "pushurl",
+                        &mut fact.push_urls,
+                        validate_safe_remote_url,
+                    )?;
+                    append_explicit_values(section, "fetch", &mut fact.fetch_refspecs, |value| {
+                        validate_safe_refspec(value, gix::refspec::parse::Operation::Fetch)
+                    })?;
+                    append_explicit_values(section, "push", &mut fact.push_refspecs, |value| {
+                        validate_safe_refspec(value, gix::refspec::parse::Operation::Push)
+                    })?;
+                } else {
+                    reject_unknown_config_keys(section, &["pushdefault"])?;
+                    set_unique_explicit_value(
+                        section,
+                        "pushdefault",
+                        &mut remote_push_default,
+                        |value| validate_safe_identifier(value, "remote.pushDefault"),
+                    )?;
+                }
+            }
+            "branch" => {
+                let name = section
+                    .header()
+                    .subsection_name()
+                    .ok_or_else(|| unsafe_git_config("branch section without a name"))?;
+                validate_safe_branch_name(name)?;
+                reject_unknown_config_keys(section, &["remote", "merge", "pushremote"])?;
+                let fact = branch_fact_mut(&mut branch_tracking, name);
+                set_unique_explicit_value(section, "remote", &mut fact.remote, |value| {
+                    validate_safe_identifier(value, "branch remote")
+                })?;
+                append_explicit_values(section, "merge", &mut fact.merge_refs, |value| {
+                    validate_safe_merge_ref(value)
+                })?;
+                set_unique_explicit_value(section, "pushremote", &mut fact.push_remote, |value| {
+                    validate_safe_identifier(value, "branch pushRemote")
+                })?;
+            }
+            "push" => {
+                if section.header().subsection_name().is_some() {
+                    return Err(unsafe_git_config("named push section"));
+                }
+                reject_unknown_config_keys(section, &["default"])?;
+                set_unique_explicit_value(section, "default", &mut push_default, |value| {
+                    validate_push_default(value)
+                })?;
+            }
+            "core" => reject_transfer_core_keys(section)?,
+            "credential" | "http" | "https" | "url" | "protocol" | "transport" | "transfer"
+            | "fetch" | "receive" | "uploadpack" | "ssh" | "submodule" | "lfs" => {
+                return Err(unsafe_git_config("unsupported transfer-affecting section"));
+            }
+            _ => {}
+        }
+    }
+
+    validate_remote_relationships(&remotes, &branch_tracking, remote_push_default.as_deref())?;
+    Ok(GitRemoteMappingFacts {
+        remotes,
+        branch_tracking,
+        remote_push_default,
+        push_default,
+    })
+}
+
+fn remote_fact_mut<'a>(
+    remotes: &'a mut Vec<GitRemoteConfigFact>,
+    name: &[u8],
+) -> &'a mut GitRemoteConfigFact {
+    if let Some(position) = remotes.iter().position(|remote| remote.name == name) {
+        return &mut remotes[position];
+    }
+    remotes.push(GitRemoteConfigFact {
+        name: name.to_vec(),
+        fetch_urls: Vec::new(),
+        push_urls: Vec::new(),
+        fetch_refspecs: Vec::new(),
+        push_refspecs: Vec::new(),
+    });
+    remotes.last_mut().expect("remote was just inserted")
+}
+
+fn branch_fact_mut<'a>(
+    branches: &'a mut Vec<GitBranchTrackingFact>,
+    name: &[u8],
+) -> &'a mut GitBranchTrackingFact {
+    if let Some(position) = branches.iter().position(|branch| branch.branch == name) {
+        return &mut branches[position];
+    }
+    branches.push(GitBranchTrackingFact {
+        branch: name.to_vec(),
+        remote: None,
+        merge_refs: Vec::new(),
+        push_remote: None,
+    });
+    branches.last_mut().expect("branch was just inserted")
+}
+
+fn reject_unknown_config_keys(
+    section: &gix::config::file::Section<'_>,
+    allowed: &[&str],
+) -> Result<()> {
+    for name in section.value_names() {
+        let name = name.to_string();
+        if !allowed
+            .iter()
+            .any(|allowed| name.eq_ignore_ascii_case(allowed))
+        {
+            return Err(unsafe_git_config(
+                "unsupported transfer-affecting repository-local key",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn reject_transfer_core_keys(section: &gix::config::file::Section<'_>) -> Result<()> {
+    const TRANSFER_KEYS: &[&str] = &[
+        "askpass",
+        "gitproxy",
+        "sshcommand",
+        "httpproxy",
+        "httpcookiefile",
+    ];
+    for name in section.value_names() {
+        let name = name.to_string();
+        if TRANSFER_KEYS
+            .iter()
+            .any(|blocked| name.eq_ignore_ascii_case(blocked))
+        {
+            return Err(unsafe_git_config("unsupported transfer-affecting core key"));
+        }
+    }
+    Ok(())
+}
+
+fn explicit_values(section: &gix::config::file::Section<'_>, key: &str) -> Result<Vec<Vec<u8>>> {
+    let occurrence_count = section
+        .value_names()
+        .filter(|name| name.to_string().eq_ignore_ascii_case(key))
+        .count();
+    let values = section
+        .values(key)
+        .into_iter()
+        .map(|value| value.to_vec())
+        .collect::<Vec<_>>();
+    if occurrence_count != values.len() {
+        return Err(unsafe_git_config(
+            "implicit repository-local transfer value",
+        ));
+    }
+    Ok(values)
+}
+
+fn append_explicit_values(
+    section: &gix::config::file::Section<'_>,
+    key: &str,
+    destination: &mut Vec<Vec<u8>>,
+    validate: impl Fn(&[u8]) -> Result<()>,
+) -> Result<()> {
+    for value in explicit_values(section, key)? {
+        validate(&value)?;
+        destination.push(value);
+    }
+    Ok(())
+}
+
+fn set_unique_explicit_value(
+    section: &gix::config::file::Section<'_>,
+    key: &str,
+    destination: &mut Option<Vec<u8>>,
+    validate: impl Fn(&[u8]) -> Result<()>,
+) -> Result<()> {
+    for value in explicit_values(section, key)? {
+        if destination.is_some() {
+            return Err(unsafe_git_config(
+                "duplicate scalar repository-local transfer value",
+            ));
+        }
+        validate(&value)?;
+        *destination = Some(value);
+    }
+    Ok(())
+}
+
+fn validate_safe_identifier(value: &[u8], label: &str) -> Result<()> {
+    let utf8 = std::str::from_utf8(value)
+        .map_err(|_| unsafe_git_config("non-UTF-8 repository-local transfer value"))?;
+    if utf8.is_empty()
+        || utf8.starts_with('-')
+        || utf8
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+    {
+        return Err(unsafe_git_config(format!("unsafe {label}")));
+    }
+    Ok(())
+}
+
+fn validate_safe_branch_name(value: &[u8]) -> Result<()> {
+    validate_safe_identifier(value, "branch name")?;
+    let mut full = b"refs/heads/".to_vec();
+    full.extend_from_slice(value);
+    gix::validate::reference::name(full.as_bstr())
+        .map_err(|_| unsafe_git_config("invalid branch name"))?;
+    Ok(())
+}
+
+fn validate_safe_remote_url(value: &[u8]) -> Result<()> {
+    std::str::from_utf8(value).map_err(|_| unsafe_git_config("non-UTF-8 Git remote URL"))?;
+    if value.is_empty()
+        || value.starts_with(b"-")
+        || value
+            .iter()
+            .any(|byte| byte.is_ascii_control() || matches!(byte, b'?' | b'#'))
+    {
+        return Err(unsafe_git_config("unsafe Git remote URL"));
+    }
+    let parsed = gix::Url::try_from(value.as_bstr())
+        .map_err(|_| unsafe_git_config("unparseable Git remote URL"))?;
+    if parsed.user.is_some() || parsed.password.is_some() {
+        return Err(unsafe_git_config(
+            "credential or userinfo in Git remote URL",
+        ));
+    }
+    match parsed.scheme {
+        gix::url::Scheme::File => {}
+        gix::url::Scheme::Git
+        | gix::url::Scheme::Ssh
+        | gix::url::Scheme::Http
+        | gix::url::Scheme::Https => {
+            if parsed.host.as_deref().is_none_or(str::is_empty) {
+                return Err(unsafe_git_config("network Git remote URL without a host"));
+            }
+        }
+        gix::url::Scheme::Ext(_) => {
+            return Err(unsafe_git_config("unsupported custom Git remote scheme"));
+        }
+    }
+    if parsed.path_argument_safe().is_none() {
+        return Err(unsafe_git_config("unsafe Git remote path"));
+    }
+    Ok(())
+}
+
+fn validate_safe_refspec(value: &[u8], operation: gix::refspec::parse::Operation) -> Result<()> {
+    std::str::from_utf8(value).map_err(|_| unsafe_git_config("non-UTF-8 Git refspec"))?;
+    if value
+        .iter()
+        .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+    {
+        return Err(unsafe_git_config("unsafe Git refspec"));
+    }
+    gix::refspec::parse(value.as_bstr(), operation)
+        .map_err(|_| unsafe_git_config("invalid Git refspec"))?;
+    Ok(())
+}
+
+fn validate_safe_merge_ref(value: &[u8]) -> Result<()> {
+    std::str::from_utf8(value).map_err(|_| unsafe_git_config("non-UTF-8 branch merge ref"))?;
+    gix::validate::reference::name(value.as_bstr())
+        .map_err(|_| unsafe_git_config("invalid branch merge ref"))?;
+    Ok(())
+}
+
+fn validate_push_default(value: &[u8]) -> Result<()> {
+    std::str::from_utf8(value).map_err(|_| unsafe_git_config("non-UTF-8 push.default"))?;
+    if !matches!(
+        value,
+        b"nothing" | b"current" | b"upstream" | b"simple" | b"matching"
+    ) {
+        return Err(unsafe_git_config("unsupported push.default"));
+    }
+    Ok(())
+}
+
+fn validate_remote_relationships(
+    remotes: &[GitRemoteConfigFact],
+    branches: &[GitBranchTrackingFact],
+    remote_push_default: Option<&[u8]>,
+) -> Result<()> {
+    let remote_names = remotes
+        .iter()
+        .map(|remote| remote.name.as_slice())
+        .collect::<BTreeSet<_>>();
+    let known_remote = |candidate: &[u8]| candidate == b"." || remote_names.contains(candidate);
+    if remote_push_default.is_some_and(|name| !known_remote(name)) {
+        return Err(unsafe_git_config(
+            "remote.pushDefault names an unknown remote",
+        ));
+    }
+    for branch in branches {
+        if branch
+            .remote
+            .as_deref()
+            .is_some_and(|name| !known_remote(name))
+            || branch
+                .push_remote
+                .as_deref()
+                .is_some_and(|name| !known_remote(name))
+        {
+            return Err(unsafe_git_config("branch tracking names an unknown remote"));
+        }
+        if !branch.merge_refs.is_empty() && branch.remote.is_none() {
+            return Err(unsafe_git_config(
+                "branch merge refs require an explicit remote",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn unsafe_git_config(reason: impl Into<String>) -> GitError {
+    preflight_error(format!(
+        "repository-local Git transport configuration is outside Kin's safe exact subset ({})",
+        reason.into()
+    ))
+}
+
+fn fingerprint_snapshot(snapshot: &LosslessGitRepository) -> Hash256 {
+    let mut hash = FramedHash::new(b"kin.git.lossless.snapshot.v1");
+    hash.bytes(snapshot.repository_id.as_str().as_bytes());
+    hash.u64(object_format_code(snapshot.object_format));
+    hash.u64(snapshot.objects.len() as u64);
+    for object in &snapshot.objects {
+        hash.u64(external_kind_code(object.object.kind));
+        hash.bytes(object.object.oid.as_bytes());
+        hash.bytes(object.body_hash.as_bytes());
+        hash.u64(object.body_len);
+    }
+    encode_refs(&mut hash, &snapshot.refs);
+    encode_head(&mut hash, &snapshot.head);
+    hash.finish()
+}
+
+fn fingerprint_plan(plan: &SemanticGitImportPlan) -> Result<Hash256> {
+    let mut hash = FramedHash::new(b"kin.git.semantic.import-plan.v1");
+    hash.bytes(
+        fingerprint_snapshot(&LosslessGitRepository {
+            repository_id: plan.repository_id.clone(),
+            object_format: plan.object_format,
+            objects: plan.external_objects.clone(),
+            refs: plan.refs.clone(),
+            head: plan.head.clone(),
+        })
+        .as_bytes(),
+    );
+    hash.u64(plan.changes.len() as u64);
+    for change in &plan.changes {
+        hash.bytes(change.id.0.as_bytes());
+    }
+    hash.u64(plan.aliases.len() as u64);
+    for alias in &plan.aliases {
+        hash.bytes(alias.oid.as_bytes());
+        hash.bytes(alias.change_id.0.as_bytes());
+    }
+    hash.u64(plan.commit_trees.len() as u64);
+    for (oid, tree) in &plan.commit_trees {
+        hash.bytes(oid.as_bytes());
+        hash.bytes(compute_resolved_tree_hash(tree)?.as_bytes());
+    }
+    encode_head(&mut hash, &plan.workspace_seed.head);
+    encode_optional_ref_target(&mut hash, plan.workspace_seed.base_target.as_ref());
+    encode_optional_oid(&mut hash, plan.workspace_seed.base_commit_oid.as_ref());
+    match plan.workspace_seed.base_tree_hash {
+        Some(tree_hash) => {
+            hash.u64(1);
+            hash.bytes(tree_hash.as_bytes());
+        }
+        None => hash.u64(0),
+    }
+    Ok(hash.finish())
+}
+
+fn fingerprint_proof(proof: &GitMigrationPreflightProof) -> Hash256 {
+    let mut hash = FramedHash::new(b"kin.git.migration-preflight-proof.v2");
+    hash.bytes(proof.repository_id.as_str().as_bytes());
+    hash.bytes(proof.snapshot_fingerprint.as_bytes());
+    hash.bytes(proof.semantic_plan_fingerprint.as_bytes());
+    hash.u64(u64::from(proof.index.present));
+    hash.bytes(proof.index.raw_file_hash.as_bytes());
+    hash.bytes(proof.index.logical_fingerprint.as_bytes());
+    hash.bytes(proof.tracked_worktree.fingerprint.as_bytes());
+    hash.bytes(proof.ignored_local.fingerprint.as_bytes());
+    hash.u64(proof.remote_mapping.remotes.len() as u64);
+    for remote in &proof.remote_mapping.remotes {
+        hash.bytes(&remote.name);
+        encode_byte_values(&mut hash, &remote.fetch_urls);
+        encode_byte_values(&mut hash, &remote.push_urls);
+        encode_byte_values(&mut hash, &remote.fetch_refspecs);
+        encode_byte_values(&mut hash, &remote.push_refspecs);
+    }
+    hash.u64(proof.remote_mapping.branch_tracking.len() as u64);
+    for branch in &proof.remote_mapping.branch_tracking {
+        hash.bytes(&branch.branch);
+        encode_optional_bytes(&mut hash, branch.remote.as_deref());
+        hash.u64(branch.merge_refs.len() as u64);
+        for merge_ref in &branch.merge_refs {
+            hash.bytes(merge_ref);
+        }
+        encode_optional_bytes(&mut hash, branch.push_remote.as_deref());
+    }
+    encode_optional_bytes(
+        &mut hash,
+        proof.remote_mapping.remote_push_default.as_deref(),
+    );
+    encode_optional_bytes(&mut hash, proof.remote_mapping.push_default.as_deref());
+    hash.finish()
+}
+
+fn encode_byte_values(hash: &mut FramedHash, values: &[Vec<u8>]) {
+    hash.u64(values.len() as u64);
+    for value in values {
+        hash.bytes(value);
+    }
+}
+
+fn open_repo_with_user_ignore_config(path: &Path) -> Result<gix::Repository> {
+    let dot_git = path.join(".git");
+    let open_path = if dot_git.is_dir() { &dot_git } else { path };
+    let options = gix::open::Options::default()
+        .strict_config(true)
+        .config_overrides(["core.useReplaceRefs=true"]);
+    gix::open_opts(open_path, options).map_err(|error| {
+        preflight_error(format!(
+            "open Git repository with resolved user ignore configuration: {error}"
+        ))
+    })
+}
+
+fn local_ignore_inputs(repo: &gix::Repository) -> Result<Vec<GitLocalIgnoreInputFact>> {
+    let mut inputs = Vec::new();
+    if let Some(path) = resolved_global_excludes_path(repo)? {
+        if let Some(body) = read_optional_regular_file(&path)? {
+            inputs.push(local_ignore_input(
+                GitLocalIgnoreSourceKind::ResolvedGlobalExcludes,
+                inputs.len(),
+                body,
+            )?);
+        }
+    }
+    let info_exclude = repo.common_dir().join("info/exclude");
+    if let Some(body) = read_optional_regular_file(&info_exclude)? {
+        inputs.push(local_ignore_input(
+            GitLocalIgnoreSourceKind::RepositoryInfoExclude,
+            inputs.len(),
+            body,
+        )?);
+    }
+    Ok(inputs)
+}
+
+fn frozen_ignore_stack<'repo>(
+    repo: &'repo gix::Repository,
+    index: &gix::index::File,
+    inputs: &[GitLocalIgnoreInputFact],
+) -> Result<(gix::AttributeStack<'repo>, bool)> {
+    let ignore_case = repo
+        .filesystem_options()
+        .map_err(|error| preflight_error(format!("resolve Git filesystem options: {error}")))?
+        .ignore_case;
+    let case = if ignore_case {
+        gix::glob::pattern::Case::Fold
+    } else {
+        gix::glob::pattern::Case::Sensitive
+    };
+    let parse = gix::worktree::stack::state::ignore::ParseIgnore {
+        support_precious: false,
+    };
+    let mut globals = gix::ignore::Search::default();
+    for input in inputs {
+        let source = match input.source_kind {
+            GitLocalIgnoreSourceKind::ResolvedGlobalExcludes => {
+                PathBuf::from(".kin/frozen-global-excludes")
+            }
+            GitLocalIgnoreSourceKind::RepositoryInfoExclude => {
+                PathBuf::from(".kin/frozen-info-exclude")
+            }
+        };
+        globals.add_patterns_buffer(&input.body, source, None, parse);
+    }
+    let ignore = gix::worktree::stack::state::Ignore::new(
+        gix::ignore::Search::default(),
+        globals,
+        None,
+        // Shared `.gitignore` policy comes from the exact committed index/ODB,
+        // never an ambient filesystem fallback.
+        gix::worktree::stack::state::ignore::Source::IdMapping,
+        parse,
+    );
+    let state = gix::worktree::stack::State::IgnoreStack(ignore);
+    let mut id_mappings = state.id_mappings_from_index(index, index.path_backing(), case);
+    for entry in index
+        .entries()
+        .iter()
+        .filter(|entry| entry.mode == gix::index::entry::Mode::FILE_EXECUTABLE)
+    {
+        let path = entry.path(index);
+        let basename = path
+            .rfind_byte(b'/')
+            .map_or(path, |position| path[position + 1..].as_bstr());
+        let is_ignore = match case {
+            gix::glob::pattern::Case::Sensitive => basename == b".gitignore",
+            gix::glob::pattern::Case::Fold => basename.eq_ignore_ascii_case(b".gitignore"),
+        };
+        if is_ignore {
+            id_mappings.push((path.to_owned(), entry.id));
+        }
+    }
+    id_mappings.sort_by(|left, right| left.0.cmp(&right.0));
+    let stack = gix::worktree::Stack::new(
+        repo.workdir()
+            .ok_or_else(|| preflight_error("ignore matcher requires a Git worktree"))?,
+        state,
+        case,
+        Vec::with_capacity(512),
+        id_mappings,
+    );
+    Ok((gix::AttributeStack::new(stack, repo), ignore_case))
+}
+
+fn resolved_global_excludes_path(repo: &gix::Repository) -> Result<Option<PathBuf>> {
+    if let Some(configured) = repo.config_snapshot().trusted_path("core.excludesFile") {
+        let configured = configured.map_err(|error| {
+            preflight_error(format!(
+                "resolve configured global Git excludes file: {error}"
+            ))
+        })?;
+        if !configured.as_os_str().is_empty() {
+            return Ok(Some(configured.into_owned()));
+        }
+    }
+    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+        return Ok(Some(PathBuf::from(xdg).join("git/ignore")));
+    }
+    Ok(std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join(".config/git/ignore")))
+}
+
+fn read_optional_regular_file(path: &Path) -> Result<Option<Vec<u8>>> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(GitError::io(path, error)),
+    };
+    if !metadata.is_file() {
+        return Err(preflight_error(
+            "resolved Git ignore input is not a regular file",
+        ));
+    }
+    fs::read(path)
+        .map(Some)
+        .map_err(|error| GitError::io(path, error))
+}
+
+fn local_ignore_input(
+    source_kind: GitLocalIgnoreSourceKind,
+    order: usize,
+    body: Vec<u8>,
+) -> Result<GitLocalIgnoreInputFact> {
+    let body_len = u64::try_from(body.len())
+        .map_err(|_| preflight_error("local Git ignore input exceeds u64 length"))?;
+    Ok(GitLocalIgnoreInputFact {
+        source_kind,
+        order,
+        body_hash: digest(&body),
+        body_len,
+        body,
+    })
+}
+
+fn encode_refs(hash: &mut FramedHash, refs: &RepositoryRefState) {
+    hash.u64(refs.refs.len() as u64);
+    for repository_ref in &refs.refs {
+        hash.bytes(repository_ref.name.as_bytes());
+        encode_ref_target(hash, &repository_ref.target);
+    }
+    encode_optional_bytes(hash, refs.default_ref.as_ref().map(|name| name.as_bytes()));
+}
+
+fn encode_head(hash: &mut FramedHash, head: &WorkspaceHead) {
+    match head {
+        WorkspaceHead::Symbolic { target } => {
+            hash.u64(1);
+            hash.bytes(target.as_bytes());
+        }
+        WorkspaceHead::Detached { target } => {
+            hash.u64(2);
+            encode_ref_target(hash, target);
+        }
+    }
+}
+
+fn encode_optional_ref_target(hash: &mut FramedHash, target: Option<&RefTarget>) {
+    match target {
+        Some(target) => {
+            hash.u64(1);
+            encode_ref_target(hash, target);
+        }
+        None => hash.u64(0),
+    }
+}
+
+fn encode_ref_target(hash: &mut FramedHash, target: &RefTarget) {
+    match target {
+        RefTarget::Change { change_id } => {
+            hash.u64(1);
+            hash.bytes(change_id.0.as_bytes());
+        }
+        RefTarget::ExternalObject { object } => {
+            hash.u64(2);
+            hash.u64(external_kind_code(object.kind));
+            hash.bytes(object.oid.as_bytes());
+        }
+        RefTarget::Symbolic { target } => {
+            hash.u64(3);
+            hash.bytes(target.as_bytes());
+        }
+    }
+}
+
+fn encode_optional_oid(hash: &mut FramedHash, oid: Option<&GitObjectId>) {
+    match oid {
+        Some(oid) => {
+            hash.u64(1);
+            hash.bytes(oid.as_bytes());
+        }
+        None => hash.u64(0),
+    }
+}
+
+fn encode_optional_bytes(hash: &mut FramedHash, bytes: Option<&[u8]>) {
+    match bytes {
+        Some(bytes) => {
+            hash.u64(1);
+            hash.bytes(bytes);
+        }
+        None => hash.u64(0),
+    }
+}
+
+struct FramedHash {
+    bytes: Vec<u8>,
+}
+
+impl FramedHash {
+    fn new(domain: &[u8]) -> Self {
+        let mut hash = Self { bytes: Vec::new() };
+        hash.bytes(domain);
+        hash
+    }
+
+    fn bytes(&mut self, value: &[u8]) {
+        self.u64(value.len() as u64);
+        self.bytes.extend_from_slice(value);
+    }
+
+    fn u64(&mut self, value: u64) {
+        self.bytes.extend_from_slice(&value.to_be_bytes());
+    }
+
+    fn finish(self) -> Hash256 {
+        digest(&self.bytes)
+    }
+}
+
+fn git_object_id(oid: gix::ObjectId) -> Result<GitObjectId> {
+    match oid.as_bytes() {
+        bytes if bytes.len() == 20 => {
+            let mut value = [0_u8; 20];
+            value.copy_from_slice(bytes);
+            Ok(GitObjectId::sha1(value))
+        }
+        bytes if bytes.len() == 32 => {
+            let mut value = [0_u8; 32];
+            value.copy_from_slice(bytes);
+            Ok(GitObjectId::sha256(value))
+        }
+        bytes => Err(preflight_error(format!(
+            "unsupported Git object ID width {}",
+            bytes.len()
+        ))),
+    }
+}
+
+fn object_format_code(format: GitObjectFormat) -> u64 {
+    match format {
+        GitObjectFormat::Sha1 => 1,
+        GitObjectFormat::Sha256 => 2,
+    }
+}
+
+fn external_kind_code(kind: ExternalObjectKind) -> u64 {
+    match kind {
+        ExternalObjectKind::Commit => 1,
+        ExternalObjectKind::Tree => 2,
+        ExternalObjectKind::Blob => 3,
+        ExternalObjectKind::Tag => 4,
+    }
+}
+
+fn ignored_kind_code(kind: IgnoredLocalEntryKind) -> u64 {
+    match kind {
+        IgnoredLocalEntryKind::File => 1,
+        IgnoredLocalEntryKind::Symlink => 2,
+        IgnoredLocalEntryKind::Directory => 3,
+        IgnoredLocalEntryKind::Other => 4,
+    }
+}
+
+fn local_ignore_source_code(kind: GitLocalIgnoreSourceKind) -> u64 {
+    match kind {
+        GitLocalIgnoreSourceKind::ResolvedGlobalExcludes => 1,
+        GitLocalIgnoreSourceKind::RepositoryInfoExclude => 2,
+    }
+}
+
+fn ignored_entry_kind(metadata: &fs::Metadata) -> IgnoredLocalEntryKind {
+    if metadata.file_type().is_symlink() {
+        IgnoredLocalEntryKind::Symlink
+    } else if metadata.is_file() {
+        IgnoredLocalEntryKind::File
+    } else if metadata.is_dir() {
+        IgnoredLocalEntryKind::Directory
+    } else {
+        IgnoredLocalEntryKind::Other
+    }
+}
+
+fn hook_kind(metadata: &fs::Metadata) -> LocalGitHookKind {
+    if metadata.file_type().is_symlink() {
+        LocalGitHookKind::Symlink
+    } else if metadata.is_file() {
+        LocalGitHookKind::File
+    } else if metadata.is_dir() {
+        LocalGitHookKind::Directory
+    } else {
+        LocalGitHookKind::Other
+    }
+}
+
+fn stable_path(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn preflight_error(reason: impl Into<String>) -> GitError {
+    GitError::MigrationPreflight(reason.into())
+}
+
+#[cfg(unix)]
+fn os_bytes(value: &std::ffi::OsStr) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    value.as_bytes().to_vec()
+}
+
+#[cfg(not(unix))]
+fn os_bytes(value: &std::ffi::OsStr) -> Vec<u8> {
+    value.to_string_lossy().into_owned().into_bytes()
+}
+
+#[cfg(unix)]
+fn path_bytes(value: &Path) -> Result<Vec<u8>> {
+    use std::os::unix::ffi::OsStrExt;
+    Ok(value.as_os_str().as_bytes().to_vec())
+}
+
+#[cfg(not(unix))]
+fn path_bytes(_value: &Path) -> Result<Vec<u8>> {
+    Err(preflight_error(
+        "byte-exact symlink target proof is unsupported on this platform",
+    ))
+}
+
+#[cfg(unix)]
+fn filesystem_executable(metadata: &fs::Metadata) -> Result<bool> {
+    use std::os::unix::fs::PermissionsExt;
+    Ok(metadata.permissions().mode() & 0o100 != 0)
+}
+
+#[cfg(not(unix))]
+fn filesystem_executable(_metadata: &fs::Metadata) -> Result<bool> {
+    Err(preflight_error(
+        "byte-exact executable-mode proof is unsupported on this platform",
+    ))
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::ffi::OsString;
+    use std::io::Write as _;
+    use std::os::unix::ffi::OsStringExt;
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    use std::process::{Command, Output, Stdio};
+
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::{plan_semantic_git_import, GitError};
+
+    struct Fixture {
+        temp: TempDir,
+        repo: PathBuf,
+        store: BlobStore,
+        snapshot: LosslessGitRepository,
+        plan: SemanticGitImportPlan,
+    }
+
+    impl Fixture {
+        fn clean() -> Self {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let repo = temp.path().join("source");
+            fs::create_dir(&repo).expect("source directory");
+            git(&repo, &["init", "--initial-branch=main"]);
+            configure_identity(&repo);
+            git(&repo, &["config", "core.filemode", "true"]);
+
+            fs::create_dir_all(repo.join("src")).expect("src");
+            fs::write(repo.join("src/main.rs"), b"fn main() {}\n").expect("main.rs");
+            fs::write(
+                repo.join("compose.yaml"),
+                b"services:\n  app:\n    image: example/app:latest\n",
+            )
+            .expect("compose");
+            fs::write(repo.join("payload.bin"), [0, 0xff, 0x80, 1]).expect("binary");
+            fs::write(repo.join("script.sh"), b"#!/bin/sh\nexit 0\n").expect("script");
+            let mut permissions = fs::metadata(repo.join("script.sh"))
+                .expect("script metadata")
+                .permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(repo.join("script.sh"), permissions).expect("chmod script");
+            symlink(Path::new("src/main.rs"), repo.join("source-link")).expect("symlink");
+            // Darwin rejects ill-formed UTF-8 at the filesystem syscall
+            // boundary. Other Unix targets exercise a truly non-UTF-8 name;
+            // Darwin still exercises decomposed raw-byte identity.
+            #[cfg(target_vendor = "apple")]
+            let raw_name = OsString::from_vec(b"raw-\xf0\x9f\xa7\xac-name.dat".to_vec());
+            #[cfg(not(target_vendor = "apple"))]
+            let raw_name = OsString::from_vec(b"raw-\xff-name.dat".to_vec());
+            fs::write(repo.join(raw_name), b"raw path\n").expect("raw path");
+            fs::write(repo.join(".gitignore"), b"ignored/\n").expect("gitignore");
+            let mut ignore_permissions = fs::metadata(repo.join(".gitignore"))
+                .expect("gitignore metadata")
+                .permissions();
+            ignore_permissions.set_mode(0o755);
+            fs::set_permissions(repo.join(".gitignore"), ignore_permissions)
+                .expect("chmod gitignore");
+            git(&repo, &["add", "--all", "--force"]);
+            commit(&repo, "initial exact tree");
+
+            let gitlink_target = git_stdout(&repo, &["rev-parse", "HEAD"]);
+            fs::create_dir_all(repo.join("vendor/dependency")).expect("gitlink directory");
+            git(
+                &repo,
+                &[
+                    "update-index",
+                    "--add",
+                    "--cacheinfo",
+                    &format!("160000,{gitlink_target},vendor/dependency"),
+                ],
+            );
+            commit(&repo, "add gitlink leaf");
+
+            fs::create_dir_all(repo.join("ignored")).expect("ignored directory");
+            fs::write(repo.join("ignored/cache.bin"), b"cache\n").expect("ignored cache");
+            let info_exclude = repo.join(".git/info/exclude");
+            let mut info_body = fs::read(&info_exclude).unwrap_or_default();
+            info_body.extend_from_slice(b"\nlocal.tmp\n");
+            fs::write(&info_exclude, info_body).expect("info exclude");
+            fs::write(repo.join("local.tmp"), b"local\n").expect("local ignored");
+            let global_excludes = temp.path().join("global-ignore");
+            fs::write(&global_excludes, b"global.tmp\n").expect("global ignore");
+            git(
+                &repo,
+                &[
+                    "config",
+                    "core.excludesFile",
+                    global_excludes.to_str().expect("utf8 test path"),
+                ],
+            );
+            fs::write(repo.join("global.tmp"), b"global\n").expect("global ignored");
+
+            git(
+                &repo,
+                &[
+                    "remote",
+                    "add",
+                    "origin",
+                    "https://example.invalid/private/repo.git",
+                ],
+            );
+            git(
+                &repo,
+                &[
+                    "remote",
+                    "set-url",
+                    "--add",
+                    "origin",
+                    "https://mirror.example.invalid/private/repo.git",
+                ],
+            );
+            git(
+                &repo,
+                &[
+                    "remote",
+                    "set-url",
+                    "--push",
+                    "origin",
+                    "ssh://example.invalid/private/repo.git",
+                ],
+            );
+            git(
+                &repo,
+                &[
+                    "remote",
+                    "set-url",
+                    "--add",
+                    "--push",
+                    "origin",
+                    "ssh://mirror.example.invalid/private/repo.git",
+                ],
+            );
+            git(
+                &repo,
+                &[
+                    "config",
+                    "--add",
+                    "remote.origin.fetch",
+                    "+refs/tags/*:refs/tags/*",
+                ],
+            );
+            git(
+                &repo,
+                &[
+                    "config",
+                    "--add",
+                    "remote.origin.push",
+                    "refs/heads/main:refs/heads/main",
+                ],
+            );
+            git(&repo, &["config", "branch.main.remote", "origin"]);
+            git(&repo, &["config", "branch.main.merge", "refs/heads/main"]);
+            git(&repo, &["config", "branch.main.pushRemote", "origin"]);
+            git(&repo, &["config", "remote.pushDefault", "origin"]);
+            git(&repo, &["config", "push.default", "simple"]);
+
+            let store = BlobStore::new(temp.path().join("cas")).expect("blob store");
+            let (snapshot, plan) = snapshot_plan(&repo, &store);
+            Self {
+                temp,
+                repo,
+                store,
+                snapshot,
+                plan,
+            }
+        }
+
+        fn preflight(&self) -> Result<GitMigrationPreflightProof> {
+            preflight_git_migration(&self.repo, &self.snapshot, &self.plan, &self.store)
+        }
+    }
+
+    #[test]
+    fn proves_clean_polyglot_non_code_raw_path_and_unmaterialized_gitlink_workspace() {
+        let fixture = Fixture::clean();
+        let proof = fixture.preflight().expect("clean preflight");
+
+        assert_eq!(proof.head, fixture.snapshot.head);
+        assert_eq!(proof.refs, fixture.snapshot.refs);
+        assert_eq!(proof.index.entry_count, 8);
+        assert!(!proof.index.sparse);
+        assert_eq!(proof.tracked_worktree.entry_count, 8);
+        assert_eq!(proof.tracked_worktree.gitlink_count, 1);
+        assert_eq!(proof.tracked_worktree.host_unrepresentable_count, 0);
+        assert!(proof
+            .ignored_local
+            .entries
+            .iter()
+            .any(|entry| entry.path.as_bytes() == b"ignored/cache.bin"));
+        assert!(proof
+            .ignored_local
+            .entries
+            .iter()
+            .any(|entry| entry.path.as_bytes() == b"local.tmp"));
+        assert!(proof
+            .ignored_local
+            .entries
+            .iter()
+            .any(|entry| entry.path.as_bytes() == b"global.tmp"));
+        assert_eq!(proof.ignored_local.inputs.len(), 2);
+        assert_eq!(
+            proof.ignored_local.inputs[0].source_kind,
+            GitLocalIgnoreSourceKind::ResolvedGlobalExcludes
+        );
+        assert_eq!(proof.ignored_local.inputs[0].body, b"global.tmp\n");
+        assert_eq!(
+            proof.ignored_local.inputs[1].source_kind,
+            GitLocalIgnoreSourceKind::RepositoryInfoExclude
+        );
+        for input in &proof.ignored_local.inputs {
+            assert_eq!(input.body_hash, digest(&input.body));
+            assert_eq!(input.body_len, input.body.len() as u64);
+        }
+        assert!(proof.compatibility.other_registered_worktrees.is_empty());
+        assert!(proof.compatibility.local_hooks.is_empty());
+        assert!(proof.compatibility.checkout_filters.is_empty());
+        assert_eq!(proof.remote_mapping.remotes.len(), 1);
+        assert_eq!(proof.remote_mapping.remotes[0].name, b"origin");
+        assert_eq!(
+            proof.remote_mapping.remotes[0].fetch_urls,
+            vec![
+                b"https://example.invalid/private/repo.git".to_vec(),
+                b"https://mirror.example.invalid/private/repo.git".to_vec(),
+            ]
+        );
+        assert_eq!(
+            proof.remote_mapping.remotes[0].push_urls,
+            vec![
+                b"ssh://example.invalid/private/repo.git".to_vec(),
+                b"ssh://mirror.example.invalid/private/repo.git".to_vec(),
+            ]
+        );
+        assert_eq!(
+            proof.remote_mapping.remotes[0].fetch_refspecs,
+            vec![
+                b"+refs/heads/*:refs/remotes/origin/*".to_vec(),
+                b"+refs/tags/*:refs/tags/*".to_vec(),
+            ]
+        );
+        assert_eq!(
+            proof.remote_mapping.remotes[0].push_refspecs,
+            vec![b"refs/heads/main:refs/heads/main".to_vec()]
+        );
+        assert_eq!(proof.remote_mapping.branch_tracking.len(), 1);
+        assert_eq!(
+            proof.remote_mapping.branch_tracking[0].remote,
+            Some(b"origin".to_vec())
+        );
+        assert_eq!(
+            proof.remote_mapping.branch_tracking[0].merge_refs,
+            vec![b"refs/heads/main".to_vec()]
+        );
+        assert_eq!(
+            proof.remote_mapping.branch_tracking[0].push_remote,
+            Some(b"origin".to_vec())
+        );
+        assert_eq!(
+            proof.remote_mapping.remote_push_default,
+            Some(b"origin".to_vec())
+        );
+        assert_eq!(proof.remote_mapping.push_default, Some(b"simple".to_vec()));
+        let debug = format!("{proof:?}");
+        assert!(!debug.contains("example.invalid"));
+        assert!(!debug.contains("refs/heads/main"));
+        assert!(debug.contains("<redacted>"));
+        assert_ne!(
+            proof.observation_fingerprint,
+            digest(b"kin.git.preflight.unset")
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn proves_host_unrepresentable_index_path_as_graph_only_absent() {
+        let (temp, repo) = config_only_repository();
+        fs::write(repo.join("README.md"), b"materialized\n").expect("README");
+        git(&repo, &["add", "README.md"]);
+
+        let blob_oid = String::from_utf8(
+            git_stdin(
+                &repo,
+                &["hash-object", "-w", "--stdin"],
+                "graph-only bytes\n",
+            )
+            .stdout,
+        )
+        .expect("blob oid")
+        .trim()
+        .to_string();
+        let raw_path = b"opaque-\xff.bin";
+        let mut cache_info = format!("100644,{blob_oid},").into_bytes();
+        cache_info.extend_from_slice(raw_path);
+        let arguments = [
+            OsString::from("update-index"),
+            OsString::from("--add"),
+            OsString::from("--cacheinfo"),
+            OsString::from_vec(cache_info),
+        ];
+        let output = git_command(&repo)
+            .args(&arguments)
+            .output()
+            .expect("add raw index path");
+        assert!(
+            output.status.success(),
+            "raw update-index failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        commit(&repo, "host-unrepresentable exact path");
+
+        let store = BlobStore::new(temp.path().join("cas")).expect("blob store");
+        let (snapshot, plan) = snapshot_plan(&repo, &store);
+        assert!(plan
+            .workspace_seed
+            .base_tree
+            .artifact_at_path(&RepoPath::from_bytes(raw_path.to_vec()).unwrap())
+            .is_some());
+
+        let proof =
+            preflight_git_migration(&repo, &snapshot, &plan, &store).expect("exact preflight");
+        assert_eq!(proof.index.entry_count, 2);
+        assert_eq!(proof.tracked_worktree.entry_count, 2);
+        assert_eq!(proof.tracked_worktree.host_unrepresentable_count, 1);
+        assert_eq!(proof.tracked_worktree.gitlink_count, 0);
+    }
+
+    #[test]
+    fn post_publication_proof_excludes_only_the_exact_published_kin_directory() {
+        let fixture = Fixture::clean();
+        let before = fixture.preflight().expect("pre-publication proof");
+        let published_kin = fixture.repo.join(".kin");
+        fs::create_dir(&published_kin).expect("published Kin directory");
+        fs::write(published_kin.join("version"), b"6\n").expect("published Kin metadata");
+
+        let normal = fixture
+            .preflight()
+            .expect_err("ordinary preflight must not hide an ambient .kin");
+        assert!(normal.to_string().contains("untracked non-ignored"));
+        let after = preflight_git_migration_after_publication(
+            &fixture.repo,
+            &published_kin,
+            &fixture.snapshot,
+            &fixture.plan,
+            &fixture.store,
+        )
+        .expect("post-publication proof");
+        assert_eq!(after, before);
+
+        fs::write(fixture.repo.join("outside-kin.txt"), b"untracked\n").expect("untracked sibling");
+        let error = preflight_git_migration_after_publication(
+            &fixture.repo,
+            &published_kin,
+            &fixture.snapshot,
+            &fixture.plan,
+            &fixture.store,
+        )
+        .expect_err("post-publication proof must retain all other worktree authority");
+        assert!(error.to_string().contains("outside-kin.txt"));
+    }
+
+    #[test]
+    fn post_publication_proof_still_rejects_tracked_source_drift() {
+        let fixture = Fixture::clean();
+        let published_kin = fixture.repo.join(".kin");
+        fs::create_dir(&published_kin).expect("published Kin directory");
+        fs::write(published_kin.join("version"), b"6\n").expect("published Kin metadata");
+        fs::write(fixture.repo.join("compose.yaml"), b"services: {}\n")
+            .expect("tracked source drift");
+
+        let error = preflight_git_migration_after_publication(
+            &fixture.repo,
+            &published_kin,
+            &fixture.snapshot,
+            &fixture.plan,
+            &fixture.store,
+        )
+        .expect_err("tracked source drift must fail after publication");
+        assert!(error.to_string().contains("bytes differ"));
+    }
+
+    #[test]
+    fn rejects_materialized_gitlink_state_instead_of_silently_skipping_it() {
+        let nested_marker = Fixture::clean();
+        fs::write(
+            nested_marker.repo.join("vendor/dependency/.git"),
+            b"gitdir: nested-admin\n",
+        )
+        .expect("nested marker");
+        assert_preflight_contains(&nested_marker, "materialized nested-repository state");
+
+        let nested_worktree = Fixture::clean();
+        fs::write(
+            nested_worktree.repo.join("vendor/dependency/dirty.txt"),
+            b"unmapped nested worktree\n",
+        )
+        .expect("nested file");
+        assert_preflight_contains(&nested_worktree, "materialized nested-repository state");
+    }
+
+    #[test]
+    fn rejects_staged_conflicted_intent_and_ambiguous_index_state() {
+        let staged = Fixture::clean();
+        fs::write(staged.repo.join("compose.yaml"), b"services: {}\n").expect("edit");
+        git(&staged.repo, &["add", "compose.yaml"]);
+        assert_preflight_contains(&staged, "index entry compose.yaml");
+
+        let intent = Fixture::clean();
+        fs::write(intent.repo.join("intent.txt"), b"intent\n").expect("intent");
+        git(&intent.repo, &["add", "--intent-to-add", "intent.txt"]);
+        assert_preflight_contains(&intent, "ambiguous flags");
+
+        let assume = Fixture::clean();
+        git(
+            &assume.repo,
+            &["update-index", "--assume-unchanged", "compose.yaml"],
+        );
+        assert_preflight_contains(&assume, "ambiguous flags");
+
+        let skipped = Fixture::clean();
+        git(
+            &skipped.repo,
+            &["update-index", "--skip-worktree", "compose.yaml"],
+        );
+        assert_preflight_contains(&skipped, "ambiguous flags");
+
+        let conflicted = Fixture::clean();
+        let stage_zero = git_stdout(&conflicted.repo, &["ls-files", "-s", "src/main.rs"]);
+        let oid = stage_zero
+            .split_whitespace()
+            .nth(1)
+            .expect("index object id");
+        git(
+            &conflicted.repo,
+            &["update-index", "--force-remove", "src/main.rs"],
+        );
+        let input = format!(
+            "100644 {oid} 1\tsrc/main.rs\n100644 {oid} 2\tsrc/main.rs\n100644 {oid} 3\tsrc/main.rs\n"
+        );
+        git_stdin(&conflicted.repo, &["update-index", "--index-info"], &input);
+        assert_preflight_contains(&conflicted, "conflict stage");
+
+        let sparse = Fixture::clean();
+        fs::write(sparse.repo.join(".git/info/sparse-checkout"), b"/src/\n")
+            .expect("sparse marker");
+        assert_preflight_contains(&sparse, "sparse checkout");
+    }
+
+    #[test]
+    fn rejects_unstaged_untracked_mode_symlink_and_byte_mismatches() {
+        let unstaged = Fixture::clean();
+        fs::write(unstaged.repo.join("src/main.rs"), b"fn changed() {}\n").expect("edit");
+        assert_preflight_contains(&unstaged, "bytes differ");
+
+        let untracked = Fixture::clean();
+        fs::write(untracked.repo.join("surprise.txt"), b"surprise\n").expect("untracked");
+        assert_preflight_contains(&untracked, "untracked non-ignored");
+
+        let executable = Fixture::clean();
+        let mut permissions = fs::metadata(executable.repo.join("script.sh"))
+            .expect("script metadata")
+            .permissions();
+        permissions.set_mode(0o644);
+        fs::set_permissions(executable.repo.join("script.sh"), permissions).expect("chmod");
+        assert_preflight_contains(&executable, "executable mode");
+
+        let symlink_target = Fixture::clean();
+        fs::remove_file(symlink_target.repo.join("source-link")).expect("remove symlink");
+        symlink(
+            Path::new("compose.yaml"),
+            symlink_target.repo.join("source-link"),
+        )
+        .expect("new symlink");
+        assert_preflight_contains(&symlink_target, "target differs");
+
+        let symlink_kind = Fixture::clean();
+        fs::remove_file(symlink_kind.repo.join("source-link")).expect("remove symlink");
+        fs::write(symlink_kind.repo.join("source-link"), b"src/main.rs").expect("regular file");
+        assert_preflight_contains(&symlink_kind, "not a symbolic link");
+    }
+
+    #[test]
+    fn rejects_clean_status_checkout_transformations() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("source");
+        fs::create_dir(&repo).expect("source");
+        git(&repo, &["init", "--initial-branch=main"]);
+        configure_identity(&repo);
+        git(&repo, &["config", "core.autocrlf", "true"]);
+        fs::write(repo.join(".gitattributes"), b"text.txt text eol=crlf\n").expect("attributes");
+        fs::write(repo.join("text.txt"), b"line one\nline two\n").expect("text");
+        git(&repo, &["add", "--all"]);
+        commit(&repo, "crlf checkout");
+        fs::remove_file(repo.join("text.txt")).expect("remove text");
+        git(&repo, &["checkout", "--", "text.txt"]);
+        assert!(fs::read(repo.join("text.txt"))
+            .expect("text bytes")
+            .windows(2)
+            .any(|pair| pair == b"\r\n"));
+        assert_eq!(git_stdout(&repo, &["status", "--porcelain"]), "");
+
+        let store = BlobStore::new(temp.path().join("cas")).expect("blob store");
+        let (snapshot, plan) = snapshot_plan(&repo, &store);
+        let error =
+            preflight_git_migration(&repo, &snapshot, &plan, &store).expect_err("CRLF rejection");
+        assert!(error.to_string().contains("checkout filters, LFS, CRLF"));
+    }
+
+    #[test]
+    fn rejects_operations_missing_index_missing_objects_and_shallow_state() {
+        let operation = Fixture::clean();
+        fs::write(
+            operation.repo.join(".git/MERGE_HEAD"),
+            b"0000000000000000000000000000000000000000\n",
+        )
+        .expect("merge marker");
+        assert_preflight_contains(&operation, "operation Merge");
+
+        let missing_index = Fixture::clean();
+        fs::remove_file(missing_index.repo.join(".git/index")).expect("remove index");
+        let error = missing_index
+            .preflight()
+            .expect_err("missing index must reject");
+        assert!(error.to_string().contains("index"));
+
+        let missing_object = Fixture::clean();
+        let object = missing_object
+            .snapshot
+            .objects
+            .iter()
+            .find(|record| record.object.kind == ExternalObjectKind::Blob)
+            .expect("blob object")
+            .object
+            .oid;
+        let hex = object.to_string();
+        fs::remove_file(
+            missing_object
+                .repo
+                .join(".git/objects")
+                .join(&hex[..2])
+                .join(&hex[2..]),
+        )
+        .expect("remove loose object");
+        let error = missing_object
+            .preflight()
+            .expect_err("missing object must reject");
+        assert!(matches!(
+            error,
+            GitError::MissingObject { .. } | GitError::Git(_) | GitError::CorruptObject { .. }
+        ));
+
+        let shallow = Fixture::clean();
+        let head = git_stdout(&shallow.repo, &["rev-parse", "HEAD"]);
+        fs::write(shallow.repo.join(".git/shallow"), format!("{head}\n")).expect("shallow");
+        assert!(matches!(
+            shallow.preflight().expect_err("shallow rejection"),
+            GitError::ShallowRepository
+        ));
+    }
+
+    #[test]
+    fn returns_structured_hook_filter_and_worktree_blockers() {
+        let hook = Fixture::clean();
+        let hook_path = hook.repo.join(".git/hooks/pre-commit");
+        fs::write(&hook_path, b"#!/bin/sh\nexit 0\n").expect("hook");
+        let mut permissions = fs::metadata(&hook_path)
+            .expect("hook metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&hook_path, permissions).expect("hook chmod");
+        match hook.preflight().expect_err("hook blocker") {
+            GitError::LocalCompatibilityBlockers {
+                hook_count,
+                hooks,
+                filter_count,
+                ..
+            } => {
+                assert_eq!(hook_count, 1);
+                assert_eq!(filter_count, 0);
+                assert_eq!(hooks[0].name, b"pre-commit");
+                assert!(hooks[0].executable);
+            }
+            error => panic!("unexpected error: {error:?}"),
+        }
+
+        let filter = Fixture::clean();
+        git(
+            &filter.repo,
+            &["config", "filter.demo.clean", "external-clean"],
+        );
+        git(
+            &filter.repo,
+            &["config", "filter.demo.smudge", "external-smudge"],
+        );
+        match filter.preflight().expect_err("filter blocker") {
+            GitError::LocalCompatibilityBlockers {
+                hook_count,
+                filters,
+                filter_count,
+                ..
+            } => {
+                assert_eq!(hook_count, 0);
+                assert_eq!(filter_count, 1);
+                assert_eq!(filters[0].name, b"demo");
+                assert!(filters[0].clean_present);
+                assert!(filters[0].smudge_present);
+            }
+            error => panic!("unexpected error: {error:?}"),
+        }
+
+        let custom_hooks = Fixture::clean();
+        git(
+            &custom_hooks.repo,
+            &["config", "core.hooksPath", "../custom-hooks"],
+        );
+        match custom_hooks.preflight().expect_err("custom hooks blocker") {
+            GitError::LocalCompatibilityBlockers {
+                custom_hooks_path, ..
+            } => assert!(custom_hooks_path),
+            error => panic!("unexpected error: {error:?}"),
+        }
+
+        let worktrees = Fixture::clean();
+        let other = worktrees.temp.path().join("other-worktree");
+        git(
+            &worktrees.repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "other",
+                other.to_str().expect("utf8 test path"),
+            ],
+        );
+        let (snapshot, plan) = snapshot_plan(&worktrees.repo, &worktrees.store);
+        match preflight_git_migration(&worktrees.repo, &snapshot, &plan, &worktrees.store)
+            .expect_err("additional worktree blocker")
+        {
+            GitError::AdditionalWorktrees { count, worktrees } => {
+                assert_eq!(count, 1);
+                assert_eq!(worktrees.len(), 1);
+                assert_eq!(stable_path(&worktrees[0].path), stable_path(&other));
+            }
+            error => panic!("unexpected error: {error:?}"),
+        }
+    }
+
+    #[test]
+    fn admits_the_only_linked_worktree_of_a_bare_repository() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let seed = temp.path().join("seed");
+        fs::create_dir(&seed).expect("seed");
+        git(&seed, &["init", "--initial-branch=main"]);
+        configure_identity(&seed);
+        fs::write(seed.join("README.md"), b"seed\n").expect("seed file");
+        git(&seed, &["add", "README.md"]);
+        commit(&seed, "seed");
+
+        let bare = temp.path().join("common.git");
+        git_at(
+            temp.path(),
+            &["init", "--bare", bare.to_str().expect("bare path")],
+        );
+        git_dir(
+            &bare,
+            &[
+                "fetch",
+                seed.to_str().expect("seed path"),
+                "main:refs/heads/main",
+            ],
+        );
+        git_dir(&bare, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        let linked = temp.path().join("linked");
+        git_dir(
+            &bare,
+            &[
+                "worktree",
+                "add",
+                linked.to_str().expect("linked path"),
+                "main",
+            ],
+        );
+        assert!(linked.join(".git").is_file());
+
+        let store = BlobStore::new(temp.path().join("cas")).expect("blob store");
+        let (snapshot, plan) = snapshot_plan(&linked, &store);
+        let proof =
+            preflight_git_migration(&linked, &snapshot, &plan, &store).expect("linked preflight");
+        assert!(proof.compatibility.other_registered_worktrees.is_empty());
+        assert_eq!(proof.tracked_worktree.entry_count, 1);
+    }
+
+    #[test]
+    fn remote_value_drift_with_unchanged_counts_invalidates_preflight() {
+        let fixture = Fixture::clean();
+        let repo = fixture.repo.clone();
+        let error = preflight_git_migration_with_hook(
+            &fixture.repo,
+            &fixture.snapshot,
+            &fixture.plan,
+            &fixture.store,
+            None,
+            move || {
+                git(&repo, &["config", "--unset-all", "remote.origin.url"]);
+                git(
+                    &repo,
+                    &[
+                        "config",
+                        "--add",
+                        "remote.origin.url",
+                        "https://changed.example.invalid/private/repo.git",
+                    ],
+                );
+                git(
+                    &repo,
+                    &[
+                        "config",
+                        "--add",
+                        "remote.origin.url",
+                        "https://mirror.example.invalid/private/repo.git",
+                    ],
+                );
+            },
+        )
+        .expect_err("same-count URL drift must invalidate the proof");
+        let message = error.to_string();
+        assert!(message.contains("changed during migration preflight"));
+        assert!(!message.contains("changed.example.invalid"));
+    }
+
+    #[test]
+    fn rejects_credentials_custom_schemes_and_transfer_overrides_without_disclosure() {
+        let cases = [
+            (
+                "remote.origin.url",
+                "https://super-secret@example.invalid/private/repo.git",
+                "super-secret",
+            ),
+            (
+                "remote.origin.url",
+                "https://example.invalid/repo.git?token=super-secret",
+                "super-secret",
+            ),
+            (
+                "remote.origin.url",
+                "https://example.invalid/repo.git#super-secret",
+                "super-secret",
+            ),
+            (
+                "remote.origin.url",
+                "credential-helper://example.invalid/super-secret",
+                "super-secret",
+            ),
+            ("credential.helper", "!super-secret", "super-secret"),
+            (
+                "http.extraHeader",
+                "Authorization: super-secret",
+                "super-secret",
+            ),
+            ("remote.origin.uploadpack", "super-secret", "super-secret"),
+        ];
+
+        for (case_index, (key, value, secret)) in cases.into_iter().enumerate() {
+            let (temp, repo) = config_only_repository();
+            git(
+                &repo,
+                &[
+                    "remote",
+                    "add",
+                    "origin",
+                    "https://example.invalid/repo.git",
+                ],
+            );
+            git(&repo, &["config", "--replace-all", key, value]);
+            let error = match remote_mapping_facts(&open_repo(&repo).expect("open config fixture"))
+            {
+                Ok(_) => panic!("unsafe transport config case {case_index} must reject"),
+                Err(error) => error,
+            };
+            let message = error.to_string();
+            assert!(message.contains("safe exact subset"), "{message}");
+            assert!(!message.contains(secret), "secret leaked in {message}");
+            drop(temp);
+        }
+
+        let (temp, repo) = config_only_repository();
+        git(
+            &repo,
+            &[
+                "config",
+                "url.https://rewritten.example.invalid/.insteadOf",
+                "https://example.invalid/",
+            ],
+        );
+        let error = remote_mapping_facts(&open_repo(&repo).expect("open rewrite fixture"))
+            .expect_err("URL rewrite must reject");
+        assert!(error.to_string().contains("safe exact subset"));
+        drop(temp);
+
+        let (temp, repo) = config_only_repository();
+        let included = temp.path().join("included-config");
+        fs::write(
+            &included,
+            b"[remote \"hidden\"]\nurl = https://example.invalid/\n",
+        )
+        .expect("included config");
+        git(
+            &repo,
+            &[
+                "config",
+                "include.path",
+                included.to_str().expect("UTF-8 test path"),
+            ],
+        );
+        let error = remote_mapping_facts(&open_repo(&repo).expect("open include fixture"))
+            .expect_err("local include must reject");
+        assert!(error.to_string().contains("safe exact subset"));
+    }
+
+    #[test]
+    fn rejects_non_utf8_remote_names_and_values() {
+        let (_temp, repo) = config_only_repository();
+        let config_path = repo.join(".git/config");
+        let mut config = fs::OpenOptions::new()
+            .append(true)
+            .open(&config_path)
+            .expect("open local config");
+        config
+            .write_all(b"\n[remote \"raw-\xff\"]\n\turl = https://example.invalid/repo.git\n")
+            .expect("append raw config");
+        drop(config);
+
+        let outcome = open_repo(&repo).and_then(|repo| remote_mapping_facts(&repo));
+        assert!(outcome.is_err(), "non-UTF-8 remote name must fail closed");
+    }
+
+    #[test]
+    fn absent_index_is_admitted_only_for_a_truly_unborn_empty_workspace() {
+        let (temp, repo) = config_only_repository();
+        assert!(!repo.join(".git/index").exists());
+        let store = BlobStore::new(temp.path().join("cas")).expect("blob store");
+        let (snapshot, plan) = snapshot_plan(&repo, &store);
+
+        let proof =
+            preflight_git_migration(&repo, &snapshot, &plan, &store).expect("unborn preflight");
+        assert!(!proof.index.present);
+        assert_eq!(proof.index.entry_count, 0);
+        assert!(proof.base_target.is_none());
+        assert!(proof.base_commit_oid.is_none());
+        assert!(proof.base_tree_hash.is_none());
+
+        let (born_temp, born_repo) = config_only_repository();
+        git(
+            &born_repo,
+            &[
+                "commit",
+                "--allow-empty",
+                "--no-gpg-sign",
+                "-m",
+                "born empty",
+            ],
+        );
+        assert!(born_repo.join(".git/index").is_file());
+        let born_store = BlobStore::new(born_temp.path().join("cas")).expect("born blob store");
+        let (born_snapshot, born_plan) = snapshot_plan(&born_repo, &born_store);
+        assert!(born_plan.workspace_seed.base_target.is_some());
+        assert!(born_plan.workspace_seed.base_tree_hash.is_some());
+        assert!(born_plan.workspace_seed.base_tree.is_empty());
+        fs::remove_file(born_repo.join(".git/index")).expect("remove born empty index");
+        let error = preflight_git_migration(&born_repo, &born_snapshot, &born_plan, &born_store)
+            .expect_err("born empty repository without an index must reject");
+        assert!(error.to_string().contains("index"));
+    }
+
+    #[test]
+    fn fails_when_source_or_local_ignore_inputs_change_during_preflight() {
+        let source_change = Fixture::clean();
+        let repo = source_change.repo.clone();
+        let error = preflight_git_migration_with_hook(
+            &source_change.repo,
+            &source_change.snapshot,
+            &source_change.plan,
+            &source_change.store,
+            None,
+            move || {
+                fs::write(repo.join("ignored/new-cache"), b"new\n").expect("TOCTOU file");
+            },
+        )
+        .expect_err("source TOCTOU");
+        assert!(error
+            .to_string()
+            .contains("changed during migration preflight"));
+
+        let ignore_change = Fixture::clean();
+        let info_exclude = ignore_change.repo.join(".git/info/exclude");
+        let error = preflight_git_migration_with_hook(
+            &ignore_change.repo,
+            &ignore_change.snapshot,
+            &ignore_change.plan,
+            &ignore_change.store,
+            None,
+            move || {
+                let mut file = fs::OpenOptions::new()
+                    .append(true)
+                    .open(info_exclude)
+                    .expect("open info exclude");
+                file.write_all(b"later.tmp\n").expect("append ignore");
+            },
+        )
+        .expect_err("ignore-input TOCTOU");
+        assert!(error
+            .to_string()
+            .contains("changed during migration preflight"));
+    }
+
+    fn snapshot_plan(
+        repo: &Path,
+        store: &BlobStore,
+    ) -> (LosslessGitRepository, SemanticGitImportPlan) {
+        let repository_id = RepositoryId::new("preflight-test").expect("repository id");
+        let snapshot =
+            capture_lossless_git_repository(repo, repository_id, store).expect("capture");
+        let plan = plan_semantic_git_import(&snapshot, store).expect("plan");
+        (snapshot, plan)
+    }
+
+    fn config_only_repository() -> (TempDir, PathBuf) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("source");
+        fs::create_dir(&repo).expect("source directory");
+        git(&repo, &["init", "--initial-branch=main"]);
+        configure_identity(&repo);
+        (temp, repo)
+    }
+
+    fn assert_preflight_contains(fixture: &Fixture, expected: &str) {
+        let error = fixture.preflight().expect_err("preflight must reject");
+        assert!(
+            error.to_string().contains(expected),
+            "expected {expected:?} in {error:?}"
+        );
+    }
+
+    fn configure_identity(repo: &Path) {
+        git(repo, &["config", "user.name", "Kin Test"]);
+        git(repo, &["config", "user.email", "kin@example.invalid"]);
+        git(repo, &["config", "commit.gpgSign", "false"]);
+    }
+
+    fn commit(repo: &Path, message: &str) {
+        git(
+            repo,
+            &[
+                "-c",
+                "core.hooksPath=/dev/null",
+                "commit",
+                "-m",
+                message,
+                "--no-gpg-sign",
+            ],
+        );
+    }
+
+    fn git(repo: &Path, args: &[&str]) -> Output {
+        let output = git_command(repo).args(args).output().expect("run git");
+        assert_git_success(args, &output);
+        output
+    }
+
+    fn git_at(directory: &Path, args: &[&str]) -> Output {
+        let output = git_command(directory).args(args).output().expect("run git");
+        assert_git_success(args, &output);
+        output
+    }
+
+    fn git_dir(git_dir: &Path, args: &[&str]) -> Output {
+        let output = clean_git_command()
+            .arg("--git-dir")
+            .arg(git_dir)
+            .args(args)
+            .output()
+            .expect("run git-dir command");
+        assert_git_success(args, &output);
+        output
+    }
+
+    fn git_stdout(repo: &Path, args: &[&str]) -> String {
+        String::from_utf8(git(repo, args).stdout)
+            .expect("utf8 git stdout")
+            .trim()
+            .to_string()
+    }
+
+    fn git_stdin(repo: &Path, args: &[&str], input: &str) -> Output {
+        let mut child = git_command(repo)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn git");
+        child
+            .stdin
+            .as_mut()
+            .expect("git stdin")
+            .write_all(input.as_bytes())
+            .expect("write git stdin");
+        let output = child.wait_with_output().expect("wait for git");
+        assert_git_success(args, &output);
+        output
+    }
+
+    fn git_command(repo: &Path) -> Command {
+        let mut command = clean_git_command();
+        command.current_dir(repo);
+        command
+    }
+
+    fn clean_git_command() -> Command {
+        let mut command = Command::new("git");
+        for variable in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_COMMON_DIR",
+        ] {
+            command.env_remove(variable);
+        }
+        command
+    }
+
+    fn assert_git_success(args: &[&str], output: &Output) {
+        assert!(
+            output.status.success(),
+            "git {args:?} failed\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}

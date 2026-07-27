@@ -7,12 +7,17 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize,
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use kin_blobs::BlobStore;
+use kin_blobs::{BlobError, BlobStore};
 use kin_core::KinLayout;
-use kin_db::StorageBackend;
+use kin_db::{
+    LocalFileBackend, LocalRepositoryAuthorityFreeze, RepositoryAuthorityManager, StorageBackend,
+};
+#[cfg(test)]
+use kin_model::ChangeStore;
 use kin_model::{
-    ChangeStore, EntityId, EntityStore, FilePathId, GraphOverlay, Hash256, SemanticChange,
-    SemanticChangeId, SourceEntryKind, SourceTreeResolution, WorkingCopy,
+    EntityId, EntityStore, FilePathId, Hash256, OperationId, RepoPath, RepositoryCommitReceipt,
+    RepositoryId, ResolvedTree, SemanticChange, SemanticChangeId, TransactionDelta, TreeEntry,
+    WorkspaceId,
 };
 use kin_projection::ProjectionState;
 use kin_reconcile::Reconciler;
@@ -26,11 +31,13 @@ use crate::session_registry::SessionCoordinator;
 /// change would create without first inserting that change into graph
 /// authority. The default `ChangeStore` replay then applies the same
 /// topological and merge-parent semantics as a committed change.
+#[cfg(test)]
 struct ProspectiveChangeStore<'a> {
     graph: &'a kin_db::InMemoryGraph,
     incoming: &'a SemanticChange,
 }
 
+#[cfg(test)]
 impl ChangeStore for ProspectiveChangeStore<'_> {
     type Error = kin_db::KinDbError;
 
@@ -72,39 +79,6 @@ impl ChangeStore for ProspectiveChangeStore<'_> {
         head: &SemanticChangeId,
     ) -> std::result::Result<Vec<SemanticChange>, Self::Error> {
         self.graph.get_changes_since(base, head)
-    }
-
-    fn get_branch(
-        &self,
-        name: &kin_model::BranchName,
-    ) -> std::result::Result<Option<kin_model::Branch>, Self::Error> {
-        self.graph.get_branch(name)
-    }
-
-    fn create_branch(&self, _branch: &kin_model::Branch) -> std::result::Result<(), Self::Error> {
-        Err(kin_db::KinDbError::StorageError(
-            "prospective exact-source replay is read-only".to_string(),
-        ))
-    }
-
-    fn update_branch_head(
-        &self,
-        _name: &kin_model::BranchName,
-        _new_head: &SemanticChangeId,
-    ) -> std::result::Result<(), Self::Error> {
-        Err(kin_db::KinDbError::StorageError(
-            "prospective exact-source replay is read-only".to_string(),
-        ))
-    }
-
-    fn delete_branch(&self, _name: &kin_model::BranchName) -> std::result::Result<(), Self::Error> {
-        Err(kin_db::KinDbError::StorageError(
-            "prospective exact-source replay is read-only".to_string(),
-        ))
-    }
-
-    fn list_branches(&self) -> std::result::Result<Vec<kin_model::Branch>, Self::Error> {
-        self.graph.list_branches()
     }
 }
 
@@ -181,23 +155,49 @@ pub(crate) fn write_persisted_mcp_transactions(
     layout: &KinLayout,
     store: &HashMap<String, kin_mcp::McpTransaction>,
 ) {
+    if let Err(error) = write_persisted_mcp_transactions_checked(layout, store) {
+        warn!(
+            path = %mcp_transactions_disk_path(layout).display(),
+            error = %error,
+            "failed to durably persist MCP transactions"
+        );
+    }
+}
+
+/// Durably mirror MCP transaction state or fail before repository authority is
+/// allowed to move.
+///
+/// The ordinary non-publication lifecycle wrapper above remains best-effort,
+/// but exact repository commits use this checked boundary for their non-terminal
+/// `committing` fence. The file and containing directory are flushed so a
+/// successful return survives process and power loss on hosts that expose
+/// directory fsync.
+pub(crate) fn write_persisted_mcp_transactions_checked(
+    layout: &KinLayout,
+    store: &HashMap<String, kin_mcp::McpTransaction>,
+) -> Result<()> {
     let path = mcp_transactions_disk_path(layout);
-    let bytes = match serde_json::to_vec(store) {
-        Ok(bytes) => bytes,
-        Err(err) => {
-            warn!(error = %err, "failed to serialize MCP transactions for durable persistence");
-            return;
-        }
-    };
+    let bytes = serde_json::to_vec(store).map_err(|error| {
+        DaemonError::Io(std::io::Error::other(format!(
+            "serialize MCP transactions: {error}"
+        )))
+    })?;
     let tmp = path.with_extension("json.tmp");
-    if let Err(err) = std::fs::write(&tmp, &bytes) {
-        warn!(path = %tmp.display(), error = %err, "failed to write MCP transactions temp file");
-        return;
-    }
-    if let Err(err) = std::fs::rename(&tmp, &path) {
-        warn!(path = %path.display(), error = %err, "failed to commit MCP transactions file");
+    let write_result = (|| -> std::io::Result<()> {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, &path)?;
+        if let Some(parent) = path.parent() {
+            sync_directory_metadata(parent)?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = write_result {
         let _ = std::fs::remove_file(&tmp);
+        return Err(DaemonError::Io(error));
     }
+    Ok(())
 }
 
 /// One append-only, release-attributed coordination event. This is the durable
@@ -469,8 +469,7 @@ pub enum DaemonEvent {
         file_path: Option<String>,
         /// Originating session, when the change came from a request that carried
         /// one (the VFS `/vfs/file-changed` and `/vfs/write-notify` handlers).
-        /// `None` for anonymous FS-reconcile-loop changes — never inferred by
-        /// time-correlating `OverlayUpdated` with later events. Additive: `serde`
+        /// `None` for anonymous FS-reconcile-loop changes. Additive: `serde`
         /// default keeps existing payloads and consumers working unchanged.
         #[serde(default)]
         session_id: Option<String>,
@@ -480,12 +479,18 @@ pub enum DaemonEvent {
         paths_added: Vec<String>,
         paths_removed: Vec<String>,
     },
-    /// A session's overlay was updated.
-    OverlayUpdated { session_id: String },
     /// The graph root hash changed (commit happened).
     GraphRootChanged {
         old_root_hash: Option<String>,
         new_root_hash: String,
+    },
+    /// Repository-v6 authority advanced, even when the derived graph root did
+    /// not (for example, a ref-only create/delete).
+    RepositoryAuthorityChanged {
+        repository_id: String,
+        operation_id: OperationId,
+        previous_generation: u64,
+        new_generation: u64,
     },
     /// Durable coordination lifecycle event, appended before broadcast.
     Coordination { event: CoordinationEventEnvelope },
@@ -614,6 +619,17 @@ struct SpineGraphCapture {
     relations: Vec<kin_model::Relation>,
 }
 
+/// One local sibling repository capability frozen while the daemon starts.
+///
+/// Lazy spine initialization may load graph bytes later, but it must never
+/// rediscover a mutable registry path, manifest, or storage root from a request
+/// handler. The binding retains the exact backend root identity observed here.
+#[derive(Clone)]
+struct RegisteredLocalRepositoryAuthority {
+    repo_id: String,
+    binding: kin_core::LocalRepositoryAuthorityBinding,
+}
+
 /// Outcome of ingesting one repo's graph into the spine from durable storage.
 ///
 /// Returned by [`DaemonState::ingest_repo_into_spine`] and surfaced by the
@@ -648,21 +664,6 @@ pub struct SpineRefreshOutcome {
     pub repos_refreshed: usize,
     /// Total cross-repo edges in the spine after the refresh pass.
     pub cross_repo_edges: usize,
-}
-
-/// Exact graph identity for a materialized committed VFS tree.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct VfsTreeCacheKey {
-    pub head: Option<SemanticChangeId>,
-    pub version: u64,
-}
-
-/// Graph-derived file tree and timestamps shared by the VFS endpoints.
-#[derive(Debug)]
-pub(crate) struct VfsTreeSnapshot {
-    pub key: VfsTreeCacheKey,
-    pub files: Arc<HashMap<FilePathId, Hash256>>,
-    pub timestamps: Arc<HashMap<FilePathId, u64>>,
 }
 
 /// One detached graph mutation batch that has not yet been acknowledged by
@@ -703,10 +704,6 @@ impl Drop for GraphPersistenceAttempt<'_> {
 enum SnapshotSaveMode {
     Incremental,
     Full,
-    /// Recover an earlier request whose graph mutation is already visible in
-    /// memory. Persist a full snapshot only when authority is still pending;
-    /// otherwise finish an already-committed generation without advancing it.
-    Retry,
 }
 
 fn exact_source_storage_error(message: impl Into<String>) -> DaemonError {
@@ -715,40 +712,32 @@ fn exact_source_storage_error(message: impl Into<String>) -> DaemonError {
 
 fn exact_source_objects<'a>(
     changes: impl IntoIterator<Item = &'a SemanticChange>,
-) -> Result<Vec<(Hash256, FilePathId, SemanticChangeId, SourceEntryKind)>> {
+) -> Result<Vec<(Hash256, RepoPath, SemanticChangeId, TreeEntry)>> {
     let mut objects = Vec::new();
     for change in changes {
-        for delta in &change.artifact_deltas {
-            if delta.kind.is_removed() {
-                continue;
-            }
-            let Some(kind) = delta.kind.source_entry_kind() else {
-                // Legacy mode-unknown history stays an explicit exact-tree gap;
-                // this object preflight must not normalize it into a mode.
+        for delta in &change.tree_deltas {
+            let Some(located) = delta.new_state() else {
                 continue;
             };
-            let hash = delta.new_hash.ok_or_else(|| {
-                exact_source_storage_error(format!(
-                    "exact source delta for {} in change {} has no content identity",
-                    delta.file_id, change.id
-                ))
-            })?;
-            objects.push((hash, delta.file_id.clone(), change.id, kind));
+            let Some(hash) = located.entry.blob_identity() else {
+                continue;
+            };
+            objects.push((hash, located.path.clone(), change.id, located.entry));
         }
     }
     objects.sort_by(|left, right| {
         left.0
             .as_bytes()
             .cmp(right.0.as_bytes())
-            .then_with(|| left.1 .0.cmp(&right.1 .0))
+            .then_with(|| left.1.cmp(&right.1))
             .then_with(|| left.2 .0.as_bytes().cmp(right.2 .0.as_bytes()))
     });
     Ok(objects)
 }
 
 fn validate_exact_source_bytes(
-    file_id: &FilePathId,
-    kind: SourceEntryKind,
+    path: &RepoPath,
+    entry: TreeEntry,
     expected: Hash256,
     data: &[u8],
     authority: &str,
@@ -756,22 +745,15 @@ fn validate_exact_source_bytes(
     let actual = kin_blobs::digest_bytes(data);
     if actual != *expected.as_bytes() {
         return Err(exact_source_storage_error(format!(
-            "{authority} exact source bytes for {file_id} do not match {expected}: found {}",
+            "{authority} exact source bytes for {path} do not match {expected}: found {}",
             hex::encode(actual)
         )));
     }
-    kin_core::validate_source_entry(file_id, kind, data).map_err(|error| {
+    kin_core::validate_source_entry(path, entry, data).map_err(|error| {
         exact_source_storage_error(format!(
-            "{authority} exact source entry {file_id} at {expected} is not materializable: {error}"
+            "{authority} exact source entry {path} at {expected} is not materializable: {error}"
         ))
     })
-}
-
-#[cfg(test)]
-#[derive(Debug, Clone)]
-pub(crate) struct VfsTreeBuildTestHook {
-    pub materialized: Arc<std::sync::Barrier>,
-    pub resume: Arc<std::sync::Barrier>,
 }
 
 #[derive(Default)]
@@ -795,6 +777,12 @@ pub(crate) struct GraphAuthorityMutationGuard {
     clock: Arc<GraphAuthorityClock>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LocalRepositoryFinalization {
+    pub graph_changed: bool,
+    pub generation_advanced: bool,
+}
+
 impl Drop for GraphAuthorityMutationGuard {
     fn drop(&mut self) {
         self.clock.epoch.fetch_add(1, Ordering::SeqCst);
@@ -813,7 +801,6 @@ pub struct DaemonState {
     pub layout: KinLayout,
     pub graph: Arc<kin_db::InMemoryGraph>,
     pub blobs: Arc<BlobStore>,
-    pub working_copy: RwLock<WorkingCopy>,
     pub reconciler: RwLock<Reconciler>,
     /// Cached FileLayouts for all tracked files.
     /// Populated on init, updated on commits.
@@ -843,9 +830,20 @@ pub struct DaemonState {
     /// Current reconciliation status (RECON_IDLE or RECON_PROCESSING).
     pub reconciliation_status: AtomicU8,
     /// Pluggable storage backend for snapshot persistence.
-    /// `None` = legacy file-based path (via SnapshotManager).
-    /// `Some` = StorageBackend (LocalFile for CLI, GCS for cloud).
-    pub storage_backend: Option<Box<dyn StorageBackend>>,
+    /// `None` = local repository-v6 authority.
+    /// `Some` = hosted StorageBackend (GCS or an isolated backend fixture).
+    pub storage_backend: Option<Arc<dyn StorageBackend>>,
+    /// Startup-opened local storage capability. Reusing this exact backend
+    /// preserves KinDB's device/inode root pin across every local authority
+    /// request; constructing a new backend from the mutable path would bless a
+    /// swapped `.kin/kindb` namespace.
+    local_repository_backend: Option<Arc<LocalFileBackend>>,
+    /// Local sibling capabilities captured from registry configuration at
+    /// startup. The lazy spine loader may open only these retained bindings.
+    registered_local_repository_authorities: Vec<RegisteredLocalRepositoryAuthority>,
+    /// Startup registry/binding gaps prevent a complete local spine claim even
+    /// when every retained sibling that remains can be loaded.
+    registered_local_repository_authority_incomplete: bool,
     /// Frozen startup policy for deployments whose graph backend is the only
     /// write authority. When true, no filesystem/session/VFS compatibility
     /// surface may reconcile bytes back into graph truth.
@@ -856,37 +854,23 @@ pub struct DaemonState {
     /// read index have not both been durably finalized yet. A save with no new
     /// graph mutations still retries this work.
     post_commit_finalization_pending: AtomicBool,
-    /// Subscriber invalidation that must wait for durable authority and its
-    /// local generation/index artifacts to finalize. Multiple mutations before
-    /// recovery coalesce because one root invalidation refreshes subscribers to
-    /// the latest durable graph.
-    pending_persistence_event: Mutex<Option<DaemonEvent>>,
     #[cfg(test)]
     finalization_fail_once: AtomicBool,
+    /// Deterministic crash seam after exact MCP repository authority commits
+    /// but before the derived graph and terminal transaction state install.
     #[cfg(test)]
-    snapshot_save_fail_once: AtomicBool,
+    pub(crate) mcp_fail_after_authority_once: AtomicBool,
+    /// Deterministic crash seam after a branch repository CAS but before the
+    /// daemon installs its derived graph/generation cursor.
+    #[cfg(test)]
+    pub(crate) repository_command_fail_after_authority_once: AtomicBool,
     /// Monotonically increasing version counter for VFS cache invalidation.
     /// Incremented on every graph mutation (reconcile, commit, overlay update).
     /// Unlike entity_count, this never decreases on deletions.
     pub vfs_version: AtomicU64,
-    /// Materialized committed VFS view keyed by exact graph head + monotonic version.
-    /// Endpoint handlers never return this entry unless its key still matches live graph truth.
-    pub(crate) vfs_tree_cache: std::sync::RwLock<Option<Arc<VfsTreeSnapshot>>>,
-    /// Single-flight coordinator for cold VFS materialization. Waiters recheck the cache after
-    /// acquiring this lock, so one exact head/version is replayed at most once.
-    pub(crate) vfs_tree_build_lock: tokio::sync::Mutex<()>,
-    #[cfg(test)]
-    pub(crate) vfs_tree_build_count: AtomicU64,
-    #[cfg(test)]
-    pub(crate) vfs_tree_build_test_hook: std::sync::Mutex<Option<VfsTreeBuildTestHook>>,
     /// Broadcast channel for SSE invalidation events.
     /// Subscribers (VFS daemon, spine, KinLab) receive real-time notifications.
     pub event_tx: tokio::sync::broadcast::Sender<DaemonEvent>,
-    /// Per-session overlay mutations. Each agent session gets its own overlay
-    /// so uncommitted work is isolated. Read merge order:
-    /// committed graph → global overlay (working_copy) → session overlay.
-    pub session_overlays:
-        RwLock<std::collections::HashMap<kin_model::SessionId, kin_model::GraphOverlay>>,
     /// Per-session temporal scopes. When a session has an active scope,
     /// all queries see the cached historical graph instead of the live graph.
     /// Max MAX_CONCURRENT_SCOPES sessions can have active scopes simultaneously.
@@ -920,12 +904,11 @@ pub struct DaemonState {
     /// worker so they cannot drain queues and mutate the vector index
     /// concurrently.
     pub embedding_work: Mutex<()>,
-    /// Serializes the entire snapshot/index/vector save sequence so the
+    /// Serializes derived-index and hosted snapshot persistence so the
     /// persistence loop, idle-shutdown flush, and embedding worker can never
-    /// interleave saves. Holding this across the kndb + kidx writes (and the
-    /// embed worker's kvec write) keeps the on-disk trio from tearing when two
-    /// writers fire at once. Held only for the synchronous save critical
-    /// section — never across an `.await` or another lock.
+    /// interleave writes. Local repository-v6 authority is committed before
+    /// entering this derived finalization path. Held only for the synchronous
+    /// critical section — never across an `.await` or another lock.
     pub persist_lock: Mutex<()>,
     /// When the last successful background save completed.
     pub last_save: std::sync::Mutex<Instant>,
@@ -952,14 +935,15 @@ pub struct DaemonState {
     /// Channel for LSP enrichment messages (incremental or sweep).
     /// None if LSP enrichment is disabled (no servers found).
     pub lsp_enrichment_tx: Option<tokio::sync::mpsc::Sender<LspEnrichmentMessage>>,
-    /// Cached SemanticChangeId → Git OID mapping for fast scope switching.
-    /// Built lazily on first `set_scope` call, reused for subsequent calls.
-    pub change_oid_cache: std::sync::RwLock<Option<kin_core::ChangeOidCache>>,
     /// Repo ID resolved once at construction. Cached to avoid re-reading
     /// `.kin/manifest.json` on every snapshot save — under high host
     /// concurrency those reads contend and surface as opaque "Core error"
     /// shutdown-save failures (SP-20).
     pub cached_repo_id: String,
+    /// Exact local workspace bound by the manifest at startup. Hosted
+    /// storage-backend daemons currently expose repository snapshots rather
+    /// than repository-v6 workspace authority and therefore carry `None`.
+    cached_workspace_id: Option<WorkspaceId>,
     /// True when the daemon is shutting down.
     pub is_shutdown: AtomicBool,
     /// Entity count of the last graph snapshot successfully written to disk,
@@ -996,17 +980,6 @@ pub struct DaemonState {
     pub locate_rankings: Mutex<HashMap<String, CachedLocateRanking>>,
     /// Cached `semantic_locate` result pages keyed by paging-cursor key.
     pub semantic_locate_pages: Mutex<HashMap<String, CachedSemanticPage>>,
-    /// Serializes lazy git-ancestry hydration — the full-history import behind a
-    /// `review`/`history`/`blame`/`locate --ref`/`scope` ref that names an
-    /// unimported Git commit. At most one such import runs at a time: two
-    /// concurrent deep imports roughly double peak memory and can OOM-kill the
-    /// daemon. Concurrent requests for the SAME unimported commit coalesce —
-    /// whoever wins the gate imports it, and later waiters observe it already
-    /// present (the get-or-build guard in `hydrate_imported_git_ref`) and skip
-    /// the re-import. Held across the request `.await` (and moved into the
-    /// `set_scope` blocking task), so it is a tokio mutex behind an `Arc` — not
-    /// the std locks used for the synchronous critical sections above.
-    pub hydration_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// Cached full locate entity-ranking for cursor paging. The daemon caches the
@@ -1053,6 +1026,46 @@ pub(crate) fn graph_collapse_is_wipe(current: u64, baseline: u64) -> bool {
 }
 
 impl DaemonState {
+    /// Workspace identity pinned when this local daemon opened repository
+    /// authority. Mutation routes must use this instead of reparsing a mutable
+    /// working-copy manifest.
+    pub(crate) fn local_repository_workspace_id(&self) -> Option<WorkspaceId> {
+        self.cached_workspace_id
+    }
+
+    /// Clone the startup-pinned local storage capability.
+    pub(crate) fn local_repository_backend(&self) -> Option<Arc<LocalFileBackend>> {
+        self.local_repository_backend.as_ref().map(Arc::clone)
+    }
+
+    /// Clone the complete repository identity/storage capability pinned when
+    /// this local daemon started. Daemon-owned CLI and MCP helpers must receive
+    /// this binding explicitly instead of rediscovering mutable control files.
+    pub(crate) fn local_repository_authority_binding(
+        &self,
+    ) -> std::result::Result<kin_core::LocalRepositoryAuthorityBinding, DaemonError> {
+        let repository_id = RepositoryId::new(self.cached_repo_id.clone()).map_err(|error| {
+            DaemonError::Graph(kin_db::KinDbError::StorageError(format!(
+                "daemon startup repository identity is invalid: {error}"
+            )))
+        })?;
+        let workspace_id = self.local_repository_workspace_id().ok_or_else(|| {
+            DaemonError::Graph(kin_db::KinDbError::StorageError(
+                "local daemon is missing its startup workspace binding".to_string(),
+            ))
+        })?;
+        let backend = self.local_repository_backend().ok_or_else(|| {
+            DaemonError::Graph(kin_db::KinDbError::StorageError(
+                "local daemon is missing its startup storage capability".to_string(),
+            ))
+        })?;
+        Ok(kin_core::LocalRepositoryAuthorityBinding::from_parts(
+            repository_id,
+            workspace_id,
+            backend,
+        ))
+    }
+
     /// Begin one entity/relation authority mutation batch.
     ///
     /// The first epoch edge is published before callers touch the graph; the
@@ -1219,18 +1232,6 @@ impl DaemonState {
             .unwrap_or(0)
     }
 
-    /// Look for the `.kin/kindb/graph.kndb` snapshot file in the workspace.
-    fn find_kndb_path(layout: &KinLayout) -> Option<std::path::PathBuf> {
-        let kndb_path = layout.kindb_snapshot_path();
-        if kndb_path.exists()
-            || kin_db::SnapshotManager::local_authority_exists(kndb_path.as_path())
-        {
-            Some(kndb_path)
-        } else {
-            None
-        }
-    }
-
     /// Open an existing .kin/ directory and create daemon state.
     pub fn open(layout: KinLayout) -> Result<Self> {
         let explicit_repo_id = std::env::var("KIN_REPO_ID")
@@ -1239,14 +1240,146 @@ impl DaemonState {
         Self::open_with_repo_id(layout, explicit_repo_id.as_deref())
     }
 
-    #[cfg(test)]
-    pub(crate) fn open_for_test(layout: KinLayout, repo_id: &str) -> Result<Self> {
-        Self::open_with_repo_id(layout, Some(repo_id))
+    /// Hydrate the daemon's non-authoritative ingestion/projection CAS from one
+    /// exact graph-owned workspace tree.
+    ///
+    /// Repository CAS remains the only source authority. This cache is rebuilt
+    /// exclusively from verified repository bytes; it never repairs from Git,
+    /// a checkout, or the working filesystem.
+    fn hydrate_ingest_cas<B: StorageBackend + ?Sized + 'static>(
+        authority: &RepositoryAuthorityManager<B>,
+        tree: &ResolvedTree,
+        blobs: &BlobStore,
+    ) -> Result<usize> {
+        let mut hydrated = HashSet::new();
+        for artifact in tree.artifacts() {
+            let Some(hash) = artifact.entry.blob_identity() else {
+                // Gitlinks identify another repository commit and deliberately
+                // carry no local source body.
+                continue;
+            };
+            if !hydrated.insert(hash) {
+                continue;
+            }
+            let authoritative = authority.load_source_blob(hash)?.ok_or_else(|| {
+                DaemonError::Graph(kin_db::KinDbError::StorageError(format!(
+                    "workspace artifact {} references source body {} absent from repository authority",
+                    artifact.path, hash
+                )))
+            })?;
+
+            match blobs.read(&hash) {
+                Ok(cached) if cached == authoritative => continue,
+                Ok(_) => {
+                    return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
+                        format!(
+                            "derived ingestion CAS body {} differs from repository authority despite matching its content address",
+                            hash
+                        ),
+                    )))
+                }
+                Err(BlobError::NotFound { .. } | BlobError::HashMismatch { .. }) => {
+                    // HashMismatch quarantines the corrupt derived object, so
+                    // this write can atomically heal it from authority.
+                }
+                Err(error) => return Err(DaemonError::Blob(error)),
+            }
+
+            let installed_hash = blobs.write(&authoritative)?;
+            if installed_hash != hash {
+                return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
+                    format!(
+                        "repository authority body {} hydrated under unexpected derived CAS identity {}",
+                        hash, installed_hash
+                    ),
+                )));
+            }
+            let installed = blobs.read(&hash)?;
+            if installed != authoritative {
+                return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
+                    format!(
+                        "derived ingestion CAS did not retain exact repository authority body {}",
+                        hash
+                    ),
+                )));
+            }
+        }
+        Ok(hydrated.len())
+    }
+
+    /// Freeze local sibling authority capabilities before the daemon becomes
+    /// externally visible.
+    ///
+    /// Registry and manifest reads are startup configuration IO. Request-time
+    /// spine initialization receives only retained identity/storage bindings,
+    /// so a registry edit or storage-root replacement cannot silently change
+    /// the daemon's authority set.
+    fn pin_registered_local_repository_authorities(
+        layout: &KinLayout,
+    ) -> (Vec<RegisteredLocalRepositoryAuthority>, bool) {
+        let registry = match kin_core::registry::KinRegistry::load() {
+            Ok(registry) => registry,
+            Err(error) => {
+                error!(
+                    error = %error,
+                    "registry authority refused at daemon startup; local spine authority will remain incomplete"
+                );
+                return (Vec::new(), true);
+            }
+        };
+        let current_kin_root = layout
+            .root()
+            .canonicalize()
+            .unwrap_or_else(|_| layout.root().to_path_buf());
+        let mut pinned = Vec::new();
+        let mut incomplete = false;
+
+        for repo in registry.repos {
+            let repo_root = repo
+                .path
+                .canonicalize()
+                .unwrap_or_else(|_| repo.path.clone());
+            if repo_root == current_kin_root || current_kin_root.starts_with(&repo_root) {
+                continue;
+            }
+
+            let sibling_layout = KinLayout::new(repo.path.join(".kin"));
+            let binding =
+                match kin_core::LocalRepositoryAuthorityBinding::from_layout(&sibling_layout) {
+                    Ok(binding) => binding,
+                    Err(error) => {
+                        incomplete = true;
+                        warn!(
+                            repo_id = %repo.id,
+                            path = %repo.path.display(),
+                            error = %error,
+                            "sibling repository authority could not be pinned at daemon startup"
+                        );
+                        continue;
+                    }
+                };
+            if binding.repository_id().as_str() != repo.id {
+                incomplete = true;
+                warn!(
+                    repo_id = %repo.id,
+                    path = %repo.path.display(),
+                    manifest_repo_id = %binding.repository_id(),
+                    "registry repository identity does not match startup-pinned manifest authority"
+                );
+                continue;
+            }
+            pinned.push(RegisteredLocalRepositoryAuthority {
+                repo_id: repo.id,
+                binding,
+            });
+        }
+
+        (pinned, incomplete)
     }
 
     /// Open local daemon state with a repository identity already resolved by
-    /// the process entrypoint. This keeps CLI flags and manifest-derived
-    /// authority from being discarded in favor of an unrelated ambient value.
+    /// the process entrypoint. Local overrides must name the manifest's exact
+    /// authority; they cannot rebind one workspace to another repository.
     pub fn open_with_repo_id(layout: KinLayout, explicit_repo_id: Option<&str>) -> Result<Self> {
         // Up-front compatibility gate. A repo created by a pre-0.2 kin carries
         // an on-disk graph/index that this build's post-load embed/readiness
@@ -1266,63 +1399,95 @@ impl DaemonState {
             }
         }
 
-        // Reclaim stale repo locks (daemon.lock + kin-db's graph.lock) left by a
-        // dead daemon whose forked child leaked the flock fd — otherwise the
-        // SnapshotManager::open below fails with a spurious lock error (os error
-        // 35) even though no live daemon owns the repo. A no-op unless the
-        // recorded owner PID is present and dead, so a live daemon's locks are
-        // never touched.
+        // Reclaim stale daemon/runtime locks left by a dead process. A no-op
+        // unless the recorded owner PID is present and dead, so a live
+        // daemon's locks are never touched.
         let _ = crate::lifecycle::reclaim_stale_locks(layout.root());
 
+        // Resolve repository identity before opening any graph state. The
+        // repository-v6 envelope is the only local startup authority; the old
+        // standalone graph.kndb snapshot is not a fallback.
+        let cached_repo_id = kin_core::manifest::resolve_repo_id(&layout, explicit_repo_id)
+            .map_err(DaemonError::from)?;
+        let manifest = kin_core::manifest::KinManifest::load(&layout.manifest_path())
+            .map_err(DaemonError::from)?;
+        if manifest.repo_id != cached_repo_id {
+            return Err(DaemonError::Core(kin_core::KinError::Config(format!(
+                "local repository override {} does not match manifest authority {}; open the matching repository instead",
+                cached_repo_id, manifest.repo_id
+            ))));
+        }
+        let workspace_uuid = uuid::Uuid::parse_str(&manifest.workspace_id).map_err(|error| {
+            DaemonError::Core(kin_core::KinError::Config(format!(
+                "invalid workspace identity in manifest: {error}"
+            )))
+        })?;
+        let workspace_id = WorkspaceId::from_uuid(workspace_uuid);
+        let repository_id = RepositoryId::new(cached_repo_id.clone()).map_err(|error| {
+            DaemonError::Core(kin_core::KinError::Config(format!(
+                "invalid repository identity in manifest: {error}"
+            )))
+        })?;
+        let local_repository_backend = Arc::new(LocalFileBackend::new(layout.kindb_dir()));
+        let (
+            registered_local_repository_authorities,
+            registered_local_repository_authority_incomplete,
+        ) = Self::pin_registered_local_repository_authorities(&layout);
+        let authority = RepositoryAuthorityManager::open(
+            repository_id.clone(),
+            Arc::clone(&local_repository_backend),
+        )
+        .map_err(DaemonError::Graph)?;
+        let lease = authority.read_authority();
+        let workspace_snapshot = lease
+            .workspace_graph_snapshot(&workspace_id)
+            .map_err(DaemonError::Graph)?
+            .ok_or_else(|| {
+                DaemonError::Graph(kin_db::KinDbError::StorageError(format!(
+                    "repository {} authority has no manifest workspace {}",
+                    repository_id, workspace_id
+                )))
+            })?;
         let text_index_path = layout.text_index_dir();
         let locate_only = Self::locate_only_snapshot_mode();
-        let (graph, generation, loaded_snapshot) =
-            if let Some(kndb_path) = Self::find_kndb_path(&layout) {
-                let snapshot_mgr = if locate_only {
-                    kin_db::SnapshotManager::open_read_only_for_locate(&kndb_path)
-                } else {
-                    kin_db::SnapshotManager::open(&kndb_path)
-                };
-                match snapshot_mgr {
-                    Ok(snapshot_mgr) => {
-                        let g = snapshot_mgr.graph();
-                        info!(
-                            locate_only = locate_only,
-                            "Loaded graph from {}",
-                            kndb_path.display()
-                        );
-                        (g, snapshot_mgr.generation(), true)
-                    }
-                    Err(e) => {
-                        return Err(DaemonError::Io(std::io::Error::other(format!(
-                            "failed to load persisted graph snapshot from {}: {}",
-                            kndb_path.display(),
-                            e
-                        ))));
-                    }
-                }
-            } else {
-                (
-                    Arc::new(kin_db::InMemoryGraph::with_text_index(
-                        text_index_path.clone(),
-                    )),
-                    kin_db::GENERATION_INIT,
-                    false,
-                )
-            };
+        let generation = lease.roots().generation;
+        let loaded_snapshot = generation > 0;
+        let workspace_artifact_count = workspace_snapshot.resolved_tree.len();
+        let blobs = BlobStore::new(layout.ingest_cas_dir()).map_err(DaemonError::from)?;
+        let hydrated_source_bodies =
+            Self::hydrate_ingest_cas(&authority, &workspace_snapshot.resolved_tree, &blobs)?;
+        let graph = if locate_only {
+            kin_db::InMemoryGraph::from_snapshot_with_text_index_read_only(
+                workspace_snapshot,
+                text_index_path.clone(),
+            )
+        } else {
+            kin_db::InMemoryGraph::from_snapshot_with_text_index(
+                workspace_snapshot,
+                text_index_path.clone(),
+            )
+        }
+        .map(Arc::new)
+        .map_err(DaemonError::Graph)?;
+        info!(
+            repository = %cached_repo_id,
+            workspace = %workspace_id,
+            generation,
+            locate_only,
+            workspace_artifacts = workspace_artifact_count,
+            hydrated_source_bodies,
+            "loaded daemon query graph from workspace-scoped repository-v6 authority"
+        );
+        drop(lease);
+        drop(authority);
 
-        let blobs = BlobStore::new(layout.objects_dir()).map_err(DaemonError::from)?;
-        // No post-open vector-index load here: `SnapshotManager::open` /
-        // `open_read_only_for_locate` already performed the validated load during
-        // graph construction. A raw force-load on top would re-install a stale
-        // sidecar and trigger the embed-worker reset loop.
-
-        // Compute the deterministic genesis change ID.
-        let genesis = kin_core::build_genesis_change();
-        let working_copy = WorkingCopy {
-            base_change: genesis.id,
-            uncommitted_mutations: GraphOverlay::default(),
-        };
+        // The repository snapshot above is authoritative. Vector/text
+        // structures built from it are derived query surfaces only.
+        //
+        // `from_snapshot_with_text_index` restores the text index but not the
+        // vector sidecar, so without this the reopened repository reports every
+        // entity as unembedded and re-derives an index it already has on disk.
+        Self::load_validated_vector_index(&layout, graph.as_ref());
 
         let mut reconciler = Reconciler::new(layout.working_dir().to_path_buf());
         // Seed LKG from persisted graph so the first reconcile after daemon
@@ -1342,12 +1507,6 @@ impl DaemonState {
         // don't see a reset after daemon restart.
         let persisted_vfs_version = Self::load_persisted_vfs_version(&layout);
 
-        // Resolve the daemon's repository identity once. KIN_PRIMARY_REPO_ID is
-        // retained as the multi-repo compatibility alias, but it feeds the same
-        // cached authority used by graph, MCP, and spine paths.
-        let cached_repo_id = kin_core::manifest::resolve_repo_id(&layout, explicit_repo_id)
-            .map_err(DaemonError::from)?;
-
         // Baseline for the shutdown anti-wipe guard: the entity count loaded
         // from the on-disk snapshot. Read before `graph` is moved into the state.
         let loaded_entity_count = graph.entity_count();
@@ -1358,7 +1517,6 @@ impl DaemonState {
             layout,
             graph,
             blobs: Arc::new(blobs),
-            working_copy: RwLock::new(working_copy),
             reconciler: RwLock::new(reconciler),
             projection: RwLock::new(ProjectionState::new()),
             coordinator,
@@ -1375,25 +1533,22 @@ impl DaemonState {
             is_initialized: AtomicBool::new(loaded_snapshot),
             reconciliation_status: AtomicU8::new(RECON_IDLE),
             storage_backend: None,
+            local_repository_backend: Some(local_repository_backend),
+            registered_local_repository_authorities,
+            registered_local_repository_authority_incomplete,
             filesystem_reconcile_disabled: AtomicBool::new(
                 crate::loop_runner::filesystem_reconcile_disabled_at_startup(false),
             ),
             snapshot_generation: AtomicU64::new(generation),
             post_commit_finalization_pending: AtomicBool::new(false),
-            pending_persistence_event: Mutex::new(None),
             #[cfg(test)]
             finalization_fail_once: AtomicBool::new(false),
             #[cfg(test)]
-            snapshot_save_fail_once: AtomicBool::new(false),
+            mcp_fail_after_authority_once: AtomicBool::new(false),
+            #[cfg(test)]
+            repository_command_fail_after_authority_once: AtomicBool::new(false),
             vfs_version: AtomicU64::new(persisted_vfs_version),
-            vfs_tree_cache: std::sync::RwLock::new(None),
-            vfs_tree_build_lock: tokio::sync::Mutex::new(()),
-            #[cfg(test)]
-            vfs_tree_build_count: AtomicU64::new(0),
-            #[cfg(test)]
-            vfs_tree_build_test_hook: std::sync::Mutex::new(None),
             event_tx: tokio::sync::broadcast::channel(256).0,
-            session_overlays: RwLock::new(std::collections::HashMap::new()),
             session_scopes: RwLock::new(HashMap::new()),
             spine: std::sync::OnceLock::new(),
             spine_refresh_gate: tokio::sync::Mutex::new(()),
@@ -1410,8 +1565,8 @@ impl DaemonState {
             last_activity_ms: AtomicU64::new(0),
             active_requests: AtomicU64::new(0),
             lsp_enrichment_tx: None,
-            change_oid_cache: std::sync::RwLock::new(None),
             cached_repo_id,
+            cached_workspace_id: Some(workspace_id),
             is_shutdown: AtomicBool::new(false),
             persisted_entity_count: AtomicU64::new(loaded_entity_count as u64),
             mass_deletion_blocked: AtomicBool::new(false),
@@ -1419,7 +1574,6 @@ impl DaemonState {
             mcp_transactions: Mutex::new(HashMap::new()),
             locate_rankings: Mutex::new(HashMap::new()),
             semantic_locate_pages: Mutex::new(HashMap::new()),
-            hydration_gate: Arc::new(tokio::sync::Mutex::new(())),
         };
         // Restore in-flight MCP transactions persisted before a restart
         // so staged-but-uncommitted work is not silently dropped across a daemon
@@ -1456,9 +1610,9 @@ impl DaemonState {
 
     /// Open with a pluggable storage backend (GCS, local files, etc.).
     ///
-    /// Loads the graph from `backend.load_snapshot(repo_id)` instead of
-    /// the local `.kin/kindb/graph.kndb` file. Used in cloud deployments
-    /// where graph snapshots live in GCS.
+    /// Loads hosted graph authority from `backend.load_snapshot(repo_id)`.
+    /// Local repositories use repository-v6 through [`Self::open`]; this path
+    /// is reserved for cloud deployments whose snapshots live in GCS.
     pub fn open_with_backend(
         layout: KinLayout,
         backend: Box<dyn StorageBackend>,
@@ -1474,7 +1628,8 @@ impl DaemonState {
                     let g = kin_db::InMemoryGraph::from_snapshot_with_text_index(
                         recovered.snapshot,
                         text_index_path.clone(),
-                    );
+                    )
+                    .map_err(DaemonError::from)?;
                     info!(
                         repo_id,
                         generation = recovered.generation,
@@ -1497,16 +1652,11 @@ impl DaemonState {
                 }
             };
 
-        let blobs = BlobStore::new(layout.objects_dir()).map_err(DaemonError::from)?;
+        let blobs = BlobStore::new(layout.ingest_cas_dir()).map_err(DaemonError::from)?;
         // The backend path builds the graph via `from_snapshot_with_text_index`,
         // which does NOT load the vector-index sidecar — do the validated load
         // here (no-ops if no/stale sidecar).
         Self::load_validated_vector_index(&layout, graph.as_ref());
-        let genesis = kin_core::build_genesis_change();
-        let working_copy = WorkingCopy {
-            base_change: genesis.id,
-            uncommitted_mutations: GraphOverlay::default(),
-        };
         let mut reconciler = Reconciler::new(layout.working_dir().to_path_buf());
         reconciler.seed_lkg_entities_from_graph(graph.as_ref());
 
@@ -1528,7 +1678,6 @@ impl DaemonState {
             layout,
             graph: Arc::clone(&graph),
             blobs: Arc::new(blobs),
-            working_copy: RwLock::new(working_copy),
             reconciler: RwLock::new(reconciler),
             projection: RwLock::new(ProjectionState::new()),
             coordinator,
@@ -1544,26 +1693,23 @@ impl DaemonState {
             started_at: Instant::now(),
             is_initialized: AtomicBool::new(loaded_snapshot),
             reconciliation_status: AtomicU8::new(RECON_IDLE),
-            storage_backend: Some(backend),
+            storage_backend: Some(Arc::from(backend)),
+            local_repository_backend: None,
+            registered_local_repository_authorities: Vec::new(),
+            registered_local_repository_authority_incomplete: false,
             filesystem_reconcile_disabled: AtomicBool::new(
                 crate::loop_runner::filesystem_reconcile_disabled_at_startup(true),
             ),
             snapshot_generation: AtomicU64::new(generation),
             post_commit_finalization_pending: AtomicBool::new(false),
-            pending_persistence_event: Mutex::new(None),
             #[cfg(test)]
             finalization_fail_once: AtomicBool::new(false),
             #[cfg(test)]
-            snapshot_save_fail_once: AtomicBool::new(false),
+            mcp_fail_after_authority_once: AtomicBool::new(false),
+            #[cfg(test)]
+            repository_command_fail_after_authority_once: AtomicBool::new(false),
             vfs_version: AtomicU64::new(persisted_vfs_version),
-            vfs_tree_cache: std::sync::RwLock::new(None),
-            vfs_tree_build_lock: tokio::sync::Mutex::new(()),
-            #[cfg(test)]
-            vfs_tree_build_count: AtomicU64::new(0),
-            #[cfg(test)]
-            vfs_tree_build_test_hook: std::sync::Mutex::new(None),
             event_tx: tokio::sync::broadcast::channel(256).0,
-            session_overlays: RwLock::new(std::collections::HashMap::new()),
             session_scopes: RwLock::new(HashMap::new()),
             spine: std::sync::OnceLock::new(),
             spine_refresh_gate: tokio::sync::Mutex::new(()),
@@ -1580,8 +1726,8 @@ impl DaemonState {
             last_activity_ms: AtomicU64::new(0),
             active_requests: AtomicU64::new(0),
             lsp_enrichment_tx: None,
-            change_oid_cache: std::sync::RwLock::new(None),
             cached_repo_id: repo_id.to_string(),
+            cached_workspace_id: None,
             is_shutdown: AtomicBool::new(false),
             persisted_entity_count: AtomicU64::new(loaded_entity_count as u64),
             mass_deletion_blocked: AtomicBool::new(false),
@@ -1589,7 +1735,6 @@ impl DaemonState {
             mcp_transactions: Mutex::new(HashMap::new()),
             locate_rankings: Mutex::new(HashMap::new()),
             semantic_locate_pages: Mutex::new(HashMap::new()),
-            hydration_gate: Arc::new(tokio::sync::Mutex::new(())),
         };
 
         // Restore in-flight MCP transactions persisted before a restart.
@@ -1746,7 +1891,8 @@ impl DaemonState {
         ))
     }
 
-    /// Lazily initialize the spine from the loaded graph and global registry.
+    /// Lazily initialize the spine from the loaded graph and startup-pinned
+    /// sibling authority capabilities.
     /// Called by `ensure_spine()` on first access. Thread-safe via `OnceLock`.
     ///
     /// Backend selection:
@@ -1756,6 +1902,28 @@ impl DaemonState {
     /// - Otherwise: uses `InMemorySpineBackend` (current behavior, no external deps).
     fn initialize_spine_lazy(&self) {
         self.initialize_spine_lazy_with_publication_hook(|| {});
+    }
+
+    fn load_registered_workspace_graph(
+        binding: &kin_core::LocalRepositoryAuthorityBinding,
+    ) -> std::result::Result<Arc<kin_db::InMemoryGraph>, String> {
+        let authority = binding.open_manager().map_err(|error| {
+            format!("open startup-pinned sibling repository authority: {error}")
+        })?;
+        let lease = authority.read_authority();
+        let snapshot = lease
+            .workspace_graph_snapshot(&binding.workspace_id())
+            .map_err(|error| format!("materialize sibling workspace authority: {error}"))?
+            .ok_or_else(|| {
+                format!(
+                    "sibling repository {} authority has no startup-pinned workspace {}",
+                    binding.repository_id(),
+                    binding.workspace_id()
+                )
+            })?;
+        kin_db::InMemoryGraph::from_snapshot(snapshot)
+            .map(Arc::new)
+            .map_err(|error| format!("open sibling workspace graph: {error}"))
     }
 
     /// Prepare and publish the lazy spine behind the graph-authority visibility
@@ -1786,76 +1954,47 @@ impl DaemonState {
             }
         };
         let mut captures = vec![primary];
-        let mut authority_incomplete = false;
+        let mut authority_incomplete = self.registered_local_repository_authority_incomplete;
 
-        // Capture sibling repos from the global registry. Persisted sibling
-        // graphs are immutable cache inputs, but they still go through one
-        // detached snapshot and exact live-root validation. A bad sibling is
-        // omitted as advisory data and prevents this initialization from ever
-        // claiming complete authority.
-        match kin_core::registry::KinRegistry::load() {
-            Ok(registry) => {
-                let cwd_canonical = self
-                    .layout
-                    .root()
-                    .canonicalize()
-                    .unwrap_or_else(|_| self.layout.root().to_path_buf());
+        // Capture only sibling capabilities frozen during startup. Lazy
+        // initialization may load graph bytes, but cannot rediscover registry
+        // paths, manifests, or storage roots from a request.
+        for registered in &self.registered_local_repository_authorities {
+            let sibling_id = registered.repo_id.clone();
+            let binding = registered.binding.clone();
+            let loaded = std::thread::Builder::new()
+                .name(format!("spine-load-{sibling_id}"))
+                .spawn(move || Self::load_registered_workspace_graph(&binding))
+                .map_err(|error| format!("spawn sibling authority load: {error}"))
+                .and_then(|handle| {
+                    handle
+                        .join()
+                        .map_err(|_| "sibling authority loader panicked".to_string())
+                })
+                .and_then(|result| result);
 
-                for repo in &registry.repos {
-                    let repo_canonical = repo
-                        .path
-                        .canonicalize()
-                        .unwrap_or_else(|_| repo.path.clone());
-                    if repo_canonical == cwd_canonical || cwd_canonical.starts_with(&repo_canonical)
-                    {
-                        continue;
-                    }
-
-                    let kndb_path = repo.path.join(".kin").join("kindb").join("graph.kndb");
-                    if !kndb_path.exists() {
-                        continue;
-                    }
-
-                    let kndb_clone = kndb_path.clone();
-                    let sibling_id = repo.id.clone();
-                    let loaded = std::thread::Builder::new()
-                        .name(format!("spine-load-{}", repo.id))
-                        .spawn(move || -> Option<Arc<kin_db::InMemoryGraph>> {
-                            let snapshot = kin_db::SnapshotManager::open(&kndb_clone).ok()?;
-                            Some(snapshot.graph())
-                        })
-                        .ok()
-                        .and_then(|handle| handle.join().ok())
-                        .flatten();
-
-                    let Some(sibling_graph) = loaded else {
-                        authority_incomplete = true;
-                        warn!(
-                            repo_id = %sibling_id,
-                            path = %kndb_path.display(),
-                            "sibling graph could not be loaded; spine authority will remain incomplete"
-                        );
-                        continue;
-                    };
-                    match self.capture_spine_repo(&sibling_id, sibling_graph) {
-                        Ok(capture) => captures.push(capture),
-                        Err(capture_error) => {
-                            authority_incomplete = true;
-                            warn!(
-                                repo_id = %sibling_id,
-                                error = %capture_error,
-                                "sibling graph capture failed; spine authority will remain incomplete"
-                            );
-                        }
-                    }
+            let sibling_graph = match loaded {
+                Ok(graph) => graph,
+                Err(load_error) => {
+                    authority_incomplete = true;
+                    warn!(
+                        repo_id = %registered.repo_id,
+                        error = %load_error,
+                        "startup-pinned sibling workspace authority could not be loaded; spine authority will remain incomplete"
+                    );
+                    continue;
                 }
-            }
-            Err(load_error) => {
-                authority_incomplete = true;
-                error!(
-                    error = %load_error,
-                    "registry authority refused; spine authority will remain incomplete"
-                );
+            };
+            match self.capture_spine_repo(&registered.repo_id, sibling_graph) {
+                Ok(capture) => captures.push(capture),
+                Err(capture_error) => {
+                    authority_incomplete = true;
+                    warn!(
+                        repo_id = %registered.repo_id,
+                        error = %capture_error,
+                        "sibling graph capture failed; spine authority will remain incomplete"
+                    );
+                }
             }
         }
 
@@ -2424,10 +2563,13 @@ impl DaemonState {
         {
             Some(recovered) => {
                 let text_index_path = self.layout.text_index_dir();
-                let graph = Arc::new(kin_db::InMemoryGraph::from_snapshot_with_text_index(
-                    recovered.snapshot,
-                    text_index_path,
-                ));
+                let graph = Arc::new(
+                    kin_db::InMemoryGraph::from_snapshot_with_text_index(
+                        recovered.snapshot,
+                        text_index_path,
+                    )
+                    .map_err(DaemonError::from)?,
+                );
                 info!(
                     repo_id,
                     generation = recovered.generation,
@@ -2540,8 +2682,27 @@ impl DaemonState {
                 self.graph
                     .upsert_file_layout(&layout)
                     .map_err(DaemonError::from)?;
-                self.graph
-                    .set_file_hash(&file_id.0, kin_blobs::digest_bytes(content));
+                let entry = self
+                    .graph
+                    .get_tree_entry(file_id)
+                    .map_err(DaemonError::from)?
+                    .ok_or_else(|| {
+                        exact_source_storage_error(format!(
+                            "semantic enrichment for {file_id} preceded exact working-tree admission"
+                        ))
+                    })?;
+                let expected = entry.blob_identity().ok_or_else(|| {
+                    exact_source_storage_error(format!(
+                        "semantic enrichment for {file_id} cannot target a gitlink"
+                    ))
+                })?;
+                let actual = kin_blobs::digest_bytes(content);
+                if actual != *expected.as_bytes() {
+                    return Err(exact_source_storage_error(format!(
+                        "semantic enrichment bytes for {file_id} do not match graph-owned tree entry {}",
+                        expected
+                    )));
+                }
             }
             kin_reconcile::ReconcileOutcome::FileRemoved { file_id, .. } => {
                 self.graph
@@ -2559,57 +2720,27 @@ impl DaemonState {
     /// daemon restarts and kin-vfs clients don't see a reset to 0.
     /// Also marks the graph as dirty for background persistence.
     pub fn bump_version(&self) {
+        self.advance_vfs_version(true);
+    }
+
+    /// Invalidate projection/VFS readers without claiming graph mutation.
+    ///
+    /// Projection-only checkout repair changes the physical compatibility view
+    /// while repository authority and the derived graph remain byte-for-byte
+    /// identical. It still retires cached VFS materialization, but must not arm
+    /// graph persistence or emit a synthetic graph-root change.
+    pub(crate) fn invalidate_projection(&self) {
+        self.advance_vfs_version(false);
+    }
+
+    fn advance_vfs_version(&self, graph_mutated: bool) {
         let v = self.vfs_version.fetch_add(1, Ordering::SeqCst) + 1;
-        // Retire the old materialization at the same publication boundary. Requests that
-        // already cloned it may finish against the pre-mutation head; every request that
-        // observes the new version must rebuild or reuse a snapshot with the new key.
-        let mut cache = self
-            .vfs_tree_cache
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *cache = None;
-        drop(cache);
-        self.mark_dirty();
+        if graph_mutated {
+            self.mark_dirty();
+        }
         // Persist asynchronously — don't block the mutation path.
         let path = self.layout.root().join("vfs_version");
         let _ = std::fs::write(&path, v.to_string());
-    }
-
-    /// Get or create a session-scoped overlay for the given session.
-    pub async fn get_or_create_session_overlay(
-        &self,
-        session_id: &kin_model::SessionId,
-    ) -> kin_model::GraphOverlay {
-        let overlays = self.session_overlays.read().await;
-        if let Some(overlay) = overlays.get(session_id) {
-            return overlay.clone();
-        }
-        drop(overlays);
-        let mut overlays = self.session_overlays.write().await;
-        overlays
-            .entry(session_id.clone())
-            .or_insert_with(kin_model::GraphOverlay::default)
-            .clone()
-    }
-
-    /// Update a session's overlay with new mutations.
-    pub async fn update_session_overlay(
-        &self,
-        session_id: &kin_model::SessionId,
-        overlay: kin_model::GraphOverlay,
-    ) {
-        let mut overlays = self.session_overlays.write().await;
-        overlays.insert(session_id.clone(), overlay);
-        self.bump_version();
-        self.emit_event(DaemonEvent::OverlayUpdated {
-            session_id: session_id.to_string(),
-        });
-    }
-
-    /// Drop a session's overlay (on session end or commit).
-    pub async fn remove_session_overlay(&self, session_id: &kin_model::SessionId) {
-        let mut overlays = self.session_overlays.write().await;
-        overlays.remove(session_id);
     }
 
     /// Set a temporal scope for a session. If max concurrent scopes reached,
@@ -2738,41 +2869,10 @@ impl DaemonState {
         (Arc::clone(&self.graph), RequestGraphAuthority::Head)
     }
 
-    /// Resolve the graph authority for a request that may hydrate a Git ref.
-    ///
-    /// Ref hydration mutates the selected graph even though blame/history are
-    /// query surfaces. Treat an active temporal scope like a write lease:
-    /// prune expired entries and refresh the selected scope under the same
-    /// write lock used to clone its graph. This gives hydration a fresh scope
-    /// lease instead of starting from a nearly-expired one. Callers must still
-    /// re-resolve through this method after waiting on the global hydration
-    /// gate because the session scope may have changed while the request was
-    /// queued.
-    pub(crate) async fn graph_for_ref_hydration_with_authority(
-        &self,
-        session_id: Option<&kin_model::SessionId>,
-    ) -> (Arc<kin_db::InMemoryGraph>, RequestGraphAuthority) {
-        if let Some(session_id) = session_id {
-            let mut scopes = self.session_scopes.write().await;
-            scopes.retain(|_, scope| !scope.is_expired());
-            if let Some(scope) = scopes.get_mut(session_id) {
-                scope.created_at = Instant::now();
-                return (
-                    Arc::clone(&scope.cached_graph),
-                    RequestGraphAuthority::SessionScope,
-                );
-            }
-        }
-
-        (Arc::clone(&self.graph), RequestGraphAuthority::Head)
-    }
-
-    /// Revalidate that the authority selected before ref hydration still owns
-    /// the exact graph that was mutated. Session scopes may expire or be
-    /// replaced while synchronous history import is running; in that case the
-    /// old graph is an orphan and must not be acknowledged as current session
-    /// state. HEAD ownership is stable for the daemon lifetime.
-    pub(crate) async fn ref_hydration_authority_is_current(
+    /// Revalidate that a selected request graph is still owned by the same
+    /// authority. Session scopes may expire or be replaced during a long read;
+    /// HEAD ownership is stable for the daemon lifetime.
+    pub(crate) async fn graph_authority_is_current(
         &self,
         session_id: Option<&kin_model::SessionId>,
         graph: &Arc<kin_db::InMemoryGraph>,
@@ -2802,54 +2902,6 @@ impl DaemonState {
         }
     }
 
-    /// Delay an invalidation until the graph authority commit and its local
-    /// derived artifacts have finalized. One pending event is sufficient to
-    /// make subscribers refresh to the latest graph, so concurrent mutations
-    /// coalesce instead of producing stale intermediate notifications.
-    fn queue_persistence_event(&self, event: DaemonEvent) {
-        let mut pending = self
-            .pending_persistence_event
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if pending.is_none() {
-            *pending = Some(event);
-        }
-    }
-
-    fn emit_pending_persistence_event(&self) {
-        let event = self
-            .pending_persistence_event
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        if let Some(event) = event {
-            self.emit_event(event);
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn fail_next_finalization_for_test(&self) {
-        self.finalization_fail_once.store(true, Ordering::SeqCst);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn fail_next_snapshot_save_for_test(&self) {
-        self.snapshot_save_fail_once.store(true, Ordering::SeqCst);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn persistence_event_is_queued_for_test(&self) -> bool {
-        self.pending_persistence_event
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_some()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn emit_pending_persistence_event_for_test(&self) {
-        self.emit_pending_persistence_event();
-    }
-
     /// Save the current graph via the storage backend (CAS write).
     ///
     /// Returns the new generation on success. Fails if another writer
@@ -2859,41 +2911,20 @@ impl DaemonState {
     /// `.kin/kindb/head-generation` so CLI and MCP processes can detect
     /// when their loaded snapshot is stale (P2-2.7).
     pub fn save_snapshot(&self) -> Result<()> {
-        self.save_snapshot_impl(SnapshotSaveMode::Incremental, None)
-    }
-
-    /// Save graph authority and publish `event` only after the generation that
-    /// contains the caller's mutation has finalized. Queueing happens while
-    /// holding `persist_lock`, so an older in-flight generation cannot consume
-    /// this event before the caller's batch is detached and committed.
-    pub(crate) fn save_snapshot_with_event(&self, event: DaemonEvent) -> Result<()> {
-        self.save_snapshot_impl(SnapshotSaveMode::Incremental, Some(event))
+        self.save_snapshot_impl(SnapshotSaveMode::Incremental)
     }
 
     pub fn save_snapshot_full(&self) -> Result<()> {
-        self.save_snapshot_impl(SnapshotSaveMode::Full, None)
+        self.save_snapshot_impl(SnapshotSaveMode::Full)
     }
 
-    pub(crate) fn save_snapshot_full_with_event(&self, event: DaemonEvent) -> Result<()> {
-        self.save_snapshot_impl(SnapshotSaveMode::Full, Some(event))
-    }
-
-    /// Complete persistence for a request whose identical graph change and
-    /// branch head are already visible in memory. A failure before the prior
-    /// authority commit leaves graph deltas pending and therefore requires a
-    /// full snapshot. A failure after the authority commit leaves only local
-    /// finalization pending and must not create a second generation.
-    pub(crate) fn retry_snapshot_authority_with_event(&self, event: DaemonEvent) -> Result<()> {
-        self.save_snapshot_impl(SnapshotSaveMode::Retry, Some(event))
-    }
-
-    /// Whether derived embedding progress can be committed through the local
-    /// `SnapshotManager` authority path.
+    /// Whether derived embedding progress may be checkpointed in a local
+    /// vector sidecar.
     ///
     /// A configured `StorageBackend` owns a distinct generation cursor (GCS in
     /// hosted deployments). Until that backend has an explicit vector-sidecar
-    /// persistence contract, writing local embed progress with its generation is
-    /// unsafe and must fail loud rather than fabricate a durable checkpoint.
+    /// persistence contract, writing a local sidecar against its remote graph
+    /// generation is unsafe and must fail loud.
     pub(crate) fn can_persist_embed_progress_locally(&self) -> bool {
         self.storage_backend.is_none()
     }
@@ -2901,8 +2932,7 @@ impl DaemonState {
     /// Persist every exact-mode source object referenced by `changes` before
     /// the graph authority that names those objects is committed.
     ///
-    /// Legacy mode-unknown deltas remain explicit graph gaps and are skipped;
-    /// exact deltas fail closed when neither the local content-addressed store
+    /// Exact deltas fail closed when neither the local content-addressed store
     /// nor the backend already has the named bytes. Durable source objects may
     /// safely precede a failed graph CAS because they are immutable and
     /// content-addressed, while committing the graph first would create an
@@ -2920,14 +2950,14 @@ impl DaemonState {
         {
             let mut paths = objects
                 .iter()
-                .map(|(_, file_id, change_id, _)| (*change_id, file_id))
+                .map(|(_, path, change_id, _)| (*change_id, path))
                 .collect::<Vec<_>>();
             paths.sort_by(|left, right| {
                 left.0
                      .0
                     .as_bytes()
                     .cmp(right.0 .0.as_bytes())
-                    .then_with(|| left.1 .0.cmp(&right.1 .0))
+                    .then_with(|| left.1.cmp(right.1))
             });
             let mut start = 0;
             while start < paths.len() {
@@ -2936,14 +2966,12 @@ impl DaemonState {
                 while end < paths.len() && paths[end].0 == change_id {
                     end += 1;
                 }
-                kin_core::validate_source_paths(
-                    paths[start..end].iter().map(|(_, file_id)| *file_id),
-                )
-                .map_err(|error| {
-                    exact_source_storage_error(format!(
-                        "exact source change {change_id} is not materializable: {error}"
-                    ))
-                })?;
+                kin_core::validate_source_paths(paths[start..end].iter().map(|(_, path)| *path))
+                    .map_err(|error| {
+                        exact_source_storage_error(format!(
+                            "exact source change {change_id} is not materializable: {error}"
+                        ))
+                    })?;
                 start = end;
             }
         }
@@ -2958,8 +2986,8 @@ impl DaemonState {
             let digest = *hash.as_bytes();
             match self.blobs.read(&kin_blobs::Hash256(digest)) {
                 Ok(data) => {
-                    for (_, file_id, _, kind) in &objects[start..end] {
-                        validate_exact_source_bytes(file_id, *kind, hash, &data, "local")?;
+                    for (_, path, _, entry) in &objects[start..end] {
+                        validate_exact_source_bytes(path, *entry, hash, &data, "local")?;
                     }
                     backend
                         .save_source_blob(repo_id, digest, &data)
@@ -2970,13 +2998,13 @@ impl DaemonState {
                     .map_err(DaemonError::from)?
                 {
                     Some(data) => {
-                        for (_, file_id, _, kind) in &objects[start..end] {
-                            validate_exact_source_bytes(file_id, *kind, hash, &data, "backend")?;
+                        for (_, path, _, entry) in &objects[start..end] {
+                            validate_exact_source_bytes(path, *entry, hash, &data, "backend")?;
                         }
-                        let (_, first_file_id, first_change_id, _) = &objects[start];
+                        let (_, first_path, first_change_id, _) = &objects[start];
                         warn!(
                             repo_id,
-                            file = %first_file_id,
+                            file = %first_path,
                             change = %first_change_id,
                             hash = %hash,
                             references = end - start,
@@ -2985,11 +3013,11 @@ impl DaemonState {
                         );
                     }
                     None => {
-                        let (_, file_id, change_id, _) = &objects[start];
+                        let (_, path, change_id, _) = &objects[start];
                         return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
                             format!(
                                 "exact source bytes for {} in change {} at {} are absent from both local and backend authority: {local_error}",
-                                file_id, change_id, hash
+                                path, change_id, hash
                             ),
                         )));
                     }
@@ -3004,6 +3032,7 @@ impl DaemonState {
     /// Hosted graph commits do not share the caller's local object directory;
     /// an exact change whose bytes are unavailable must therefore fail before
     /// its entities, relations, change record, or branch head become visible.
+    #[cfg(test)]
     pub(crate) fn preflight_exact_source_change(
         &self,
         graph: &kin_db::InMemoryGraph,
@@ -3021,34 +3050,21 @@ impl DaemonState {
             graph,
             incoming: change,
         };
-        let entries = match prospective
-            .resolve_source_tree_at(&change.id)
-            .map_err(DaemonError::from)?
-        {
-            SourceTreeResolution::Exact { entries } => entries,
-            SourceTreeResolution::Incomplete { gaps } => {
-                let gaps = gaps
-                    .iter()
-                    .map(|gap| format!("{}@{}:{:?}", gap.file_id, gap.change_id, gap.reason))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                return Err(exact_source_storage_error(format!(
-                    "incoming source history at {} is not exact: {gaps}",
-                    change.id
-                )));
-            }
-        };
+        let entries = prospective
+            .resolve_tree_at(&change.id)
+            .map_err(DaemonError::from)?;
         self.preflight_materializable_source_entries(entries, "incoming exact")
     }
 
+    #[cfg(test)]
     fn preflight_materializable_source_entries(
         &self,
-        entries: HashMap<FilePathId, kin_model::ResolvedSourceEntry>,
+        entries: ResolvedTree,
         purpose: &str,
     ) -> Result<()> {
-        let mut entries: Vec<_> = entries.into_iter().collect();
-        entries.sort_by(|left, right| left.0 .0.cmp(&right.0 .0));
-        kin_core::validate_source_paths(entries.iter().map(|(file_id, _)| file_id)).map_err(
+        let mut entries = entries.into_artifacts().collect::<Vec<_>>();
+        entries.sort_by(|left, right| left.path.cmp(&right.path));
+        kin_core::validate_source_paths(entries.iter().map(|artifact| &artifact.path)).map_err(
             |error| {
                 exact_source_storage_error(format!(
                     "{purpose} source tree is not materializable: {error}"
@@ -3056,17 +3072,20 @@ impl DaemonState {
             },
         )?;
         entries.sort_by(|left, right| {
-            left.1
-                .hash
-                .as_bytes()
-                .cmp(right.1.hash.as_bytes())
-                .then_with(|| left.0 .0.cmp(&right.0 .0))
+            left.entry
+                .blob_identity()
+                .cmp(&right.entry.blob_identity())
+                .then_with(|| left.path.cmp(&right.path))
         });
         let mut start = 0;
         while start < entries.len() {
-            let source_hash = entries[start].1.hash;
+            let Some(source_hash) = entries[start].entry.blob_identity() else {
+                // Gitlinks have no repository-owned source body.
+                start += 1;
+                continue;
+            };
             let mut end = start + 1;
-            while end < entries.len() && entries[end].1.hash == source_hash {
+            while end < entries.len() && entries[end].entry.blob_identity() == Some(source_hash) {
                 end += 1;
             }
             let digest = *source_hash.as_bytes();
@@ -3077,7 +3096,7 @@ impl DaemonState {
                     .ok_or_else(|| {
                         exact_source_storage_error(format!(
                             "{purpose} source bytes for {} at {} are absent from backend authority",
-                            entries[start].0, source_hash
+                            entries[start].path, source_hash
                         ))
                     })?;
                 (data, "backend")
@@ -3088,48 +3107,23 @@ impl DaemonState {
                     .map_err(|error| {
                         exact_source_storage_error(format!(
                             "{purpose} source bytes for {} at {} are absent or corrupt in local authority: {error}",
-                            entries[start].0, source_hash
+                            entries[start].path, source_hash
                         ))
                     })?;
                 (data, "local")
             };
-            for (file_id, source) in &entries[start..end] {
-                validate_exact_source_bytes(file_id, source.kind, source.hash, &data, authority)?;
+            for artifact in &entries[start..end] {
+                validate_exact_source_bytes(
+                    &artifact.path,
+                    artifact.entry,
+                    source_hash,
+                    &data,
+                    authority,
+                )?;
             }
             start = end;
         }
         Ok(())
-    }
-
-    /// Prove that the exact source tree at `head` is both complete and fully
-    /// materializable from the daemon's immutable source authority.
-    ///
-    /// Release admission calls this while holding the same coordination gate
-    /// as marker/head mutation. Backend-backed daemons use backend objects only
-    /// (the hosted immutable authority); local daemons use their verified CAS.
-    pub(crate) fn preflight_exact_source_tree(
-        &self,
-        graph: &kin_db::InMemoryGraph,
-        head: &SemanticChangeId,
-    ) -> Result<()> {
-        let entries = match graph
-            .resolve_source_tree_at(head)
-            .map_err(DaemonError::from)?
-        {
-            SourceTreeResolution::Exact { entries } => entries,
-            SourceTreeResolution::Incomplete { gaps } => {
-                let gaps = gaps
-                    .iter()
-                    .map(|gap| format!("{}@{}:{:?}", gap.file_id, gap.change_id, gap.reason))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                return Err(exact_source_storage_error(format!(
-                    "release source history at {head} is not exact: {gaps}"
-                )));
-            }
-        };
-
-        self.preflight_materializable_source_entries(entries, &format!("release source at {head}"))
     }
 
     /// Whether filesystem-to-graph compatibility ingestion is disabled for
@@ -3137,6 +3131,163 @@ impl DaemonState {
     /// cannot drift if the process environment later changes.
     pub(crate) fn filesystem_reconcile_disabled(&self) -> bool {
         self.filesystem_reconcile_disabled.load(Ordering::Relaxed)
+    }
+
+    /// Advance this process's repository-authority cursor after a successful
+    /// local repository-v6 compare-and-swap.
+    ///
+    /// The repository transaction is already durable at this point. Derived
+    /// query indexes and the cross-process generation marker are finalized by
+    /// the normal serialized persistence pass; a crash before then is healed
+    /// from repository authority during the next open.
+    pub(crate) fn record_repository_authority_commit(&self, generation: u64) -> Result<()> {
+        if self.storage_backend.is_some() {
+            return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
+                "local repository-v6 generation cannot be installed on a storage-backend daemon"
+                    .to_string(),
+            )));
+        }
+        let previous = self.snapshot_generation.load(Ordering::SeqCst);
+        if generation <= previous {
+            return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
+                format!(
+                    "repository authority generation must advance beyond {previous}, got {generation}"
+                ),
+            )));
+        }
+        self.snapshot_generation.store(generation, Ordering::SeqCst);
+        self.post_commit_finalization_pending
+            .store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Install one already-durable local repository receipt into the daemon's
+    /// derived graph and generation cursor.
+    ///
+    /// Callers must hold `coordination_gate`, `persist_lock`, and one
+    /// `GraphAuthorityMutationGuard` across both the repository CAS and this
+    /// method. The complete delta must have been constructed and preflighted
+    /// before that irreversible CAS. This method revalidates it against the
+    /// still-live graph so a replay heals the authority/daemon crash gap without
+    /// absorbing an unrelated later generation.
+    pub(crate) fn finalize_local_repository_commit(
+        &self,
+        receipt: &RepositoryCommitReceipt,
+        authority_freeze: &LocalRepositoryAuthorityFreeze,
+        delta: &TransactionDelta,
+        expected_previous_tree: &ResolvedTree,
+        desired_tree: &ResolvedTree,
+    ) -> Result<LocalRepositoryFinalization> {
+        receipt.validate().map_err(DaemonError::from)?;
+        if self.storage_backend.is_some() {
+            return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
+                "local repository receipt cannot finalize on hosted graph authority".to_string(),
+            )));
+        }
+        if receipt.repository_id.as_str() != self.cached_repo_id {
+            return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
+                format!(
+                    "repository receipt belongs to {}, not daemon repository {}",
+                    receipt.repository_id, self.cached_repo_id
+                ),
+            )));
+        }
+
+        if authority_freeze.roots() != &receipt.roots_after {
+            return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
+                "repository finalization freeze is not bound to the committed receipt roots"
+                    .to_string(),
+            )));
+        }
+        let workspace_id = self.cached_workspace_id.ok_or_else(|| {
+            DaemonError::Graph(kin_db::KinDbError::StorageError(
+                "local daemon is missing its startup workspace binding".to_string(),
+            ))
+        })?;
+        let authority_snapshot = authority_freeze
+            .authority()
+            .workspace_graph_snapshot(&workspace_id)
+            .map_err(DaemonError::from)?
+            .ok_or_else(|| {
+                DaemonError::Graph(kin_db::KinDbError::StorageError(format!(
+                    "frozen repository authority has no workspace {workspace_id}"
+                )))
+            })?;
+        let authority_graph =
+            kin_db::InMemoryGraph::from_snapshot(authority_snapshot).map_err(DaemonError::from)?;
+        if authority_graph.resolved_tree() != *desired_tree {
+            return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
+                format!(
+                    "repository receipt generation {} does not resolve to the desired tree",
+                    receipt.generation
+                ),
+            )));
+        }
+
+        let live_generation = self.snapshot_generation.load(Ordering::SeqCst);
+        if live_generation != receipt.roots_before.generation
+            && live_generation != receipt.roots_after.generation
+        {
+            return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
+                format!(
+                    "daemon generation {live_generation} matches neither repository receipt base {} nor result {}; reopen from repository authority",
+                    receipt.roots_before.generation, receipt.roots_after.generation
+                ),
+            )));
+        }
+        let live_tree = self.graph.resolved_tree();
+        if live_tree != *expected_previous_tree && live_tree != *desired_tree {
+            return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
+                "daemon query tree matches neither repository receipt base nor result; reopen from repository authority"
+                    .to_string(),
+            )));
+        }
+
+        let authority_snapshot = authority_graph.to_snapshot();
+        let live_snapshot = self.graph.to_snapshot();
+        let already_installed = live_snapshot.resolved_tree == *desired_tree
+            && live_snapshot.entities == authority_snapshot.entities
+            && live_snapshot.relations == authority_snapshot.relations;
+        let graph_changed = !already_installed && delta != &TransactionDelta::default();
+        if graph_changed {
+            let preflight =
+                kin_db::InMemoryGraph::from_snapshot(live_snapshot).map_err(DaemonError::from)?;
+            preflight
+                .apply_transaction_delta(delta)
+                .map_err(DaemonError::from)?;
+            let preflight_snapshot = preflight.to_snapshot();
+            if preflight_snapshot.resolved_tree != *desired_tree
+                || preflight_snapshot.entities != authority_snapshot.entities
+                || preflight_snapshot.relations != authority_snapshot.relations
+            {
+                return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
+                    "preflighted repository delta does not produce the durable workspace graph"
+                        .to_string(),
+                )));
+            }
+            self.graph
+                .apply_transaction_delta(delta)
+                .map_err(DaemonError::from)?;
+        }
+        let live_snapshot = self.graph.to_snapshot();
+        if live_snapshot.resolved_tree != *desired_tree
+            || live_snapshot.entities != authority_snapshot.entities
+            || live_snapshot.relations != authority_snapshot.relations
+        {
+            return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
+                "repository graph finalization did not install the durable workspace graph"
+                    .to_string(),
+            )));
+        }
+
+        let generation_advanced = live_generation == receipt.roots_before.generation;
+        if generation_advanced {
+            self.record_repository_authority_commit(receipt.generation)?;
+        }
+        Ok(LocalRepositoryFinalization {
+            graph_changed,
+            generation_advanced,
+        })
     }
 
     #[cfg(any(feature = "embeddings", feature = "vector"))]
@@ -3147,12 +3298,12 @@ impl DaemonState {
         let generation = self.snapshot_generation.load(Ordering::SeqCst);
         Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
             format!(
-                "{operation} skipped: storage-backend graph authority is at generation {generation}, and no backend vector-sidecar persistence contract exists; refusing to write a local SnapshotManager checkpoint against remote authority"
+                "{operation} skipped: storage-backend graph authority is at generation {generation}, and no backend vector-sidecar persistence contract exists; refusing a local derived checkpoint against remote authority"
             ),
         )))
     }
 
-    fn save_snapshot_impl(&self, mode: SnapshotSaveMode, event: Option<DaemonEvent>) -> Result<()> {
+    fn save_snapshot_impl(&self, mode: SnapshotSaveMode) -> Result<()> {
         // Serialize the whole kndb + generation-marker + kidx write sequence
         // against any other save (persist loop, idle flush, embed worker).
         // Without this, two concurrent saves race on the shared tmp paths and
@@ -3163,25 +3314,7 @@ impl DaemonState {
             .lock()
             .map_err(|_| DaemonError::Io(std::io::Error::other("persist lock poisoned")))?;
 
-        let has_unpersisted_changes = self.graph.has_unpersisted_changes();
-        let finalization_pending = self.post_commit_finalization_pending.load(Ordering::SeqCst);
-        if mode == SnapshotSaveMode::Retry && !has_unpersisted_changes && !finalization_pending {
-            return Ok(());
-        }
-
-        if let Some(event) = event {
-            self.queue_persistence_event(event);
-        }
-
-        #[cfg(test)]
-        if self.snapshot_save_fail_once.swap(false, Ordering::SeqCst) {
-            return Err(DaemonError::Io(std::io::Error::other(
-                "injected pre-authority snapshot save failure",
-            )));
-        }
-
-        let force_full = mode == SnapshotSaveMode::Full
-            || (mode == SnapshotSaveMode::Retry && has_unpersisted_changes);
+        let force_full = mode == SnapshotSaveMode::Full;
 
         let repo_id = self.cached_repo_id.as_str();
         let expected_gen = self.snapshot_generation.load(Ordering::SeqCst);
@@ -3193,9 +3326,9 @@ impl DaemonState {
                 || self.graph.full_snapshot_required()
                 || !backend.supports_incremental_deltas()
             {
-                let (bytes, graph_root_hash, persistence_epoch) = self
+                let (bytes, graph_root_hash, retrieval_authority_hash, persistence_epoch) = self
                     .graph
-                    .begin_snapshot_persistence(None)
+                    .begin_snapshot_persistence_with_retrieval_hash(None)
                     .map_err(DaemonError::from)?;
                 let persistence_attempt =
                     GraphPersistenceAttempt::new(self.graph.as_ref(), persistence_epoch);
@@ -3213,6 +3346,7 @@ impl DaemonState {
                     self.layout.kindb_snapshot_path().as_path(),
                     self.graph.as_ref(),
                     graph_root_hash,
+                    retrieval_authority_hash,
                     persistence_epoch,
                 )
                 .map_err(DaemonError::from)?;
@@ -3273,27 +3407,42 @@ impl DaemonState {
                 self.graph.flush_text_index().map_err(DaemonError::from)?;
                 expected_gen
             }
-        } else if force_full {
-            let (_, generation) = kin_db::SnapshotManager::save_graph_with_expected_generation(
-                self.layout.kindb_snapshot_path(),
-                self.graph.as_ref(),
-                expected_gen,
-            )
-            .map_err(DaemonError::from)?;
-            committed = true;
-            generation
         } else {
-            let generation = kin_db::SnapshotManager::save_graph_delta(
-                self.layout.kindb_snapshot_path(),
-                self.graph.as_ref(),
-                expected_gen,
-            )
-            .map_err(DaemonError::from)?;
-            committed = generation.is_some();
-            generation.unwrap_or(expected_gen)
+            // Local repository-v6 transactions are the only authority commit.
+            // Exact tree admission and explicit commit publication move that
+            // authority before mutating this derived runtime graph. Detach the
+            // current derived batch, prove its exact tree matches the persisted
+            // workspace at this generation, then acknowledge it after flushing
+            // query text. Never recreate graph.kndb as a second local truth.
+            let persistence_attempt = self
+                .graph
+                .begin_delta_persistence(expected_gen)
+                .map(|(_, epoch)| GraphPersistenceAttempt::new(self.graph.as_ref(), epoch));
+            let authority_graph = self.load_committed_authority_graph(expected_gen)?;
+            let authority_tree = authority_graph.resolved_tree();
+            let live_tree = self.graph.resolved_tree();
+            if live_tree != authority_tree {
+                return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
+                    format!(
+                        "refusing to acknowledge derived graph state at repository generation {expected_gen}: live exact tree does not match workspace authority"
+                    ),
+                )));
+            }
+            self.graph.flush_text_index().map_err(DaemonError::from)?;
+            if let Some(attempt) = persistence_attempt {
+                attempt.complete();
+            }
+            self.graph.clear_full_snapshot_required();
+            expected_gen
         };
 
-        self.snapshot_generation.store(new_gen, Ordering::SeqCst);
+        // Backend saves advance their own authority here. Local authority was
+        // already advanced by the repository-v6 transaction and recorded by
+        // `record_repository_authority_commit`; never overwrite a newer local
+        // receipt that may arrive while derived-index I/O is finishing.
+        if self.storage_backend.is_some() {
+            self.snapshot_generation.store(new_gen, Ordering::SeqCst);
+        }
 
         if committed {
             self.post_commit_finalization_pending
@@ -3302,13 +3451,6 @@ impl DaemonState {
         if self.post_commit_finalization_pending.load(Ordering::SeqCst) {
             self.finalize_committed_generation(new_gen)?;
         }
-        // The caller's mutation may have been persisted by a concurrent save
-        // that acquired `persist_lock` after the mutation but before an
-        // event-bearing save reached this critical section. In that case this
-        // save is a no-op (`committed == false`) but the graph is already
-        // durable, so release the queued invalidation now. Committed paths have
-        // already drained it during finalization; this second take is a no-op.
-        self.emit_pending_persistence_event();
 
         info!(
             repo_id,
@@ -3322,19 +3464,10 @@ impl DaemonState {
     /// Incremental per-batch embed-progress flush for the background
     /// embed worker.
     ///
-    /// Persists this batch's vectors — plus any concurrent graph delta from LSP
-    /// enrichment that kept the graph dirty during embed — via
-    /// `SnapshotManager::flush_embed_progress`, which appends only the delta and
-    /// the vector sidecar and NEVER re-serializes the whole (~1 GB) graph. The
-    /// old worker leaned on the periodic full `save_snapshot` to land the graph
-    /// side, which is O(graph) per tick and is what wedged the daemon at scale.
-    ///
-    /// Mirrors `save_snapshot_impl`'s persist-lock + generation-cursor + marker
-    /// discipline so the two persistence paths compose safely (the shared
-    /// `persist_lock` serializes them and keeps `snapshot_generation` consistent).
-    /// Returns the persisted resume `pending` count — derived from graph-vs-index
-    /// truth, so it survives a crash/reopen and reaches zero only at full
-    /// coverage.
+    /// Persists only the derived vector sidecar. Repository-v6 remains the sole
+    /// graph/workspace authority; concurrent semantic or tree changes stay
+    /// pending for the normal authority-aware persistence path rather than
+    /// recreating a local graph.kndb checkpoint.
     #[cfg(feature = "embeddings")]
     pub fn flush_embed_progress(&self) -> Result<usize> {
         self.reject_remote_backend_embed_persistence("embed progress persistence")?;
@@ -3342,29 +3475,26 @@ impl DaemonState {
             .persist_lock
             .lock()
             .map_err(|_| DaemonError::Io(std::io::Error::other("persist lock poisoned")))?;
-        let base_gen = self.snapshot_generation.load(Ordering::SeqCst);
+        let generation = self.snapshot_generation.load(Ordering::SeqCst);
+        let authority_graph = self.load_committed_authority_graph(generation)?;
+        if self.graph.resolved_tree() != authority_graph.resolved_tree() {
+            return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
+                format!(
+                    "refusing vector checkpoint at repository generation {generation}: live exact tree does not match workspace authority"
+                ),
+            )));
+        }
         let embedder_identity = kin_buildinfo::sha_with_dirty(kin_buildinfo::get());
-        let outcome = kin_db::SnapshotManager::flush_embed_progress(
+        kin_db::SnapshotManager::checkpoint_vector_index_for_graph(
             self.layout.kindb_snapshot_path(),
             self.graph.as_ref(),
-            base_gen,
             Some(embedder_identity.as_str()),
         )
         .map_err(DaemonError::from)?;
-        // The graph moved (a delta was appended) only when `generation` is Some;
-        // advance the cursor + publish the marker so CLI/MCP reload, exactly as
-        // save_snapshot_impl does. A vectors-only batch leaves the graph at
-        // `base_gen`, so the cursor stays put.
-        if let Some(generation) = outcome.generation {
-            self.snapshot_generation.store(generation, Ordering::SeqCst);
-            self.post_commit_finalization_pending
-                .store(true, Ordering::SeqCst);
-        }
         if self.post_commit_finalization_pending.load(Ordering::SeqCst) {
-            let generation = self.snapshot_generation.load(Ordering::SeqCst);
             self.finalize_committed_generation(generation)?;
         }
-        Ok(outcome.status.pending)
+        Ok(self.graph.embedding_status().pending)
     }
 
     #[cfg(not(feature = "embeddings"))]
@@ -3428,7 +3558,6 @@ impl DaemonState {
 
         let authority_graph = self.load_committed_authority_graph(generation)?;
         self.finalize_generation_from_graph(generation, authority_graph.as_ref())?;
-        self.emit_pending_persistence_event();
         Ok(())
     }
 
@@ -3502,7 +3631,10 @@ impl DaemonState {
                             ),
                         )));
                     }
-                    Arc::new(kin_db::InMemoryGraph::from_snapshot(recovered.snapshot))
+                    Arc::new(
+                        kin_db::InMemoryGraph::from_snapshot(recovered.snapshot)
+                            .map_err(DaemonError::from)?,
+                    )
                 }
                 None if generation == kin_db::GENERATION_INIT => Arc::clone(&self.graph),
                 None => {
@@ -3515,10 +3647,10 @@ impl DaemonState {
                 }
             }
         } else {
-            let snapshot =
-                kin_db::SnapshotManager::open_read_only(self.layout.kindb_snapshot_path())
-                    .map_err(DaemonError::from)?;
-            let observed_generation = snapshot.generation();
+            let binding = self.local_repository_authority_binding()?;
+            let authority = binding.open_manager().map_err(DaemonError::from)?;
+            let lease = authority.read_authority();
+            let observed_generation = lease.roots().generation;
             if observed_generation != generation {
                 return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
                     format!(
@@ -3527,7 +3659,17 @@ impl DaemonState {
                     ),
                 )));
             }
-            snapshot.graph()
+            let snapshot = lease
+                .workspace_graph_snapshot(&binding.workspace_id())
+                .map_err(DaemonError::from)?
+                .ok_or_else(|| {
+                    DaemonError::Graph(kin_db::KinDbError::StorageError(format!(
+                        "repository {} authority has no manifest workspace {} during read-index finalization",
+                        self.cached_repo_id,
+                        binding.workspace_id()
+                    )))
+                })?;
+            Arc::new(kin_db::InMemoryGraph::from_snapshot(snapshot).map_err(DaemonError::from)?)
         };
         Ok(authority_graph)
     }
@@ -3551,15 +3693,9 @@ impl DaemonState {
 
     /// Write the durable authority head to `.kin/kindb/head-generation`.
     ///
-    /// KinDB owns `.kin/kindb/generation` as the generation of its legacy
-    /// `graph.kndb` compatibility projection. A delta commit advances graph
-    /// authority without advancing that projection, so using the legacy path
-    /// as the daemon freshness marker makes the next authority read look like
-    /// a mixed-version legacy writer and correctly fail closed.
-    ///
-    /// CLI and MCP processes read this file before queries and compare it
-    /// to their loaded generation. If different, they know the daemon has
-    /// committed a newer snapshot and should reload.
+    /// CLI and MCP processes compare this derived notification marker to their
+    /// loaded repository-v6 generation. A mismatch means repository authority
+    /// moved and the reader must acquire a new exact lease before answering.
     fn write_generation_marker(&self, generation: u64) -> Result<()> {
         use std::io::Write;
 
@@ -3601,94 +3737,24 @@ impl DaemonState {
 
     /// Rebuild projection state from the current graph.
     ///
-    /// Primary path: loads each persisted [`FileLayout`] and its blob-backed
-    /// base content from graph truth via [`ProjectionState::from_graph`].
-    ///
-    /// Fallback path: if a file layout exists in the graph but its file hash
-    /// has not yet been persisted (older snapshots from before file hashes were
-    /// always written), `from_graph` returns
-    /// [`ProjectionError::BaseContentUnavailable`].  Rather than hard-failing
-    /// and leaving the daemon unable to serve VFS reads or accept projected
-    /// writes, the fallback iterates layouts individually: files whose hash IS
-    /// present are loaded from blobs (graph-backed); files whose hash is absent
-    /// are loaded from the working-directory copy on disk (migration-debt path).
-    /// Files that are neither in blobs nor on disk are skipped with a warning.
+    /// Loads every persisted [`FileLayout`] and its blob-backed base content
+    /// from the graph's exact resolved tree. Missing entries or blobs are
+    /// authority gaps and fail loudly; runtime projection never repairs graph
+    /// truth from raw filesystem contents.
     ///
     /// Called after graph init, snapshot load, or a write-notify reconcile.
     pub async fn rebuild_projection(&self) -> Result<()> {
         let mut projection = self.projection.write().await;
 
-        // Fast path: all file hashes persisted — build directly from graph truth.
-        match ProjectionState::from_graph(self.graph.as_ref(), self.blobs.as_ref()) {
-            Ok(state) => {
-                let registered = state.file_ids().len();
-                *projection = state;
-                info!(
-                    files = registered,
-                    "rebuilt projection state from persisted graph truth"
-                );
-                return Ok(());
-            }
-            Err(kin_projection::ProjectionError::BaseContentUnavailable { .. }) => {
-                // Fall through to the per-file fallback below.
-            }
-            Err(e) => return Err(DaemonError::from(e)),
-        }
-
-        // Fallback path: some file hashes are absent (older snapshot).
-        // Build the projection file-by-file, reading from disk when blobs lack
-        // the content.  This is migration debt — once all snapshots are on the
-        // current schema (hashes always persisted) this path becomes unreachable.
-        let layouts = self.graph.list_file_layouts().map_err(DaemonError::from)?;
-        let mut new_projection = ProjectionState::new();
-        let mut loaded = 0usize;
-        let mut disk_fallback = 0usize;
-        let mut skipped = 0usize;
-
-        for layout in layouts {
-            let file_id = layout.file_id.clone();
-
-            // Try to load content from blobs (graph-backed, preferred).
-            // InMemoryGraph::get_file_hash takes &str and returns Option<[u8; 32]>.
-            let blob_content = self
-                .graph
-                .get_file_hash(&file_id.0)
-                .and_then(|raw| self.blobs.read(&kin_blobs::Hash256::from_bytes(raw)).ok());
-
-            if let Some(content) = blob_content {
-                new_projection.register_file(layout, content);
-                loaded += 1;
-                continue;
-            }
-
-            // Blob not available: fall back to the on-disk working copy.
-            let file_path = self.layout.working_dir().join(file_id.0.as_str());
-            match std::fs::read(&file_path) {
-                Ok(content) => {
-                    new_projection.register_file(layout, content);
-                    disk_fallback += 1;
-                }
-                Err(e) => {
-                    // File is neither in blobs nor on disk (deleted, not yet
-                    // checked out, etc.) — skip it rather than hard-failing.
-                    warn!(
-                        file = %file_id,
-                        error = %e,
-                        "skipping projection rebuild for file not in blobs or disk \
-                         (migration-debt fallback)"
-                    );
-                    skipped += 1;
-                }
-            }
-        }
-
-        *projection = new_projection;
+        let tree = self.graph.resolved_tree();
+        let state =
+            ProjectionState::from_resolved_tree(self.graph.as_ref(), self.blobs.as_ref(), &tree)
+                .map_err(DaemonError::from)?;
+        let registered = state.file_ids().len();
+        *projection = state;
         info!(
-            files = loaded + disk_fallback,
-            graph_backed = loaded,
-            disk_fallback = disk_fallback,
-            skipped = skipped,
-            "rebuilt projection state via per-file fallback (older snapshot without file hashes)"
+            files = registered,
+            "rebuilt projection state from persisted graph truth"
         );
         Ok(())
     }
@@ -3697,8 +3763,8 @@ impl DaemonState {
     ///
     /// This is the warm path after reconcile/VFS writes: removed files are
     /// evicted from the projection cache, and added/modified files are loaded
-    /// from graph-owned layout + blob content. Missing hashes retain the same
-    /// per-file working-tree fallback used by `rebuild_projection`.
+    /// from graph-owned layout + blob content. Missing entries or blobs fail
+    /// loudly instead of being repaired from the filesystem.
     pub async fn refresh_projection(&self, changed: &ProjectionChangedSet) -> Result<()> {
         if changed.is_empty() {
             return Ok(());
@@ -3706,7 +3772,6 @@ impl DaemonState {
 
         let mut projection = self.projection.write().await;
         let mut loaded = 0usize;
-        let mut disk_fallback = 0usize;
         let mut removed = 0usize;
         let mut skipped = 0usize;
 
@@ -3726,39 +3791,36 @@ impl DaemonState {
                 continue;
             };
 
-            let blob_content = self
+            let entry = self
                 .graph
-                .get_file_hash(&file_id.0)
-                .and_then(|raw| self.blobs.read(&kin_blobs::Hash256::from_bytes(raw)).ok());
-
-            if let Some(content) = blob_content {
-                projection.register_file(layout, content);
-                loaded += 1;
-                continue;
-            }
-
-            let file_path = self.layout.working_dir().join(file_id.0.as_str());
-            match std::fs::read(&file_path) {
-                Ok(content) => {
-                    projection.register_file(layout, content);
-                    disk_fallback += 1;
-                }
-                Err(e) => {
-                    projection.remove_file(file_id);
-                    warn!(
-                        file = %file_id,
-                        error = %e,
-                        "skipping projection refresh for file not in blobs or disk"
-                    );
-                    skipped += 1;
-                }
-            }
+                .get_tree_entry(file_id)
+                .map_err(DaemonError::from)?
+                .ok_or_else(|| {
+                    exact_source_storage_error(format!(
+                        "projection refresh for {file_id} has no graph-owned tree entry"
+                    ))
+                })?;
+            let TreeEntry::Blob { hash, .. } = entry else {
+                return Err(exact_source_storage_error(format!(
+                    "projection refresh for {file_id} has a layout attached to a non-blob tree entry"
+                )));
+            };
+            let content = self
+                .blobs
+                .read(&kin_blobs::Hash256(*hash.as_bytes()))
+                .map_err(|error| {
+                    exact_source_storage_error(format!(
+                        "projection refresh for {file_id} cannot load graph-owned blob {}: {error}",
+                        hash
+                    ))
+                })?;
+            projection.register_file(layout, content);
+            loaded += 1;
         }
 
         info!(
-            upserted = loaded + disk_fallback,
+            upserted = loaded,
             graph_backed = loaded,
-            disk_fallback,
             removed,
             skipped,
             "refreshed projection state for changed files"
@@ -3992,12 +4054,10 @@ impl Drop for EmbedPassGuard<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(feature = "vector")]
-    use kin_db::VectorIndex;
     use kin_model::{
-        Entity, EntityKind, EntityMetadata, FileLayout, FilePathId, FingerprintAlgorithm,
-        GraphOverlay, Hash256, ImportSection, LanguageId, ParseCompleteness, SemanticFingerprint,
-        Visibility, WorkingCopy,
+        ArtifactId, ChangeOrigin, Entity, EntityKind, EntityMetadata, FileLayout, FilePathId,
+        FingerprintAlgorithm, Hash256, ImportSection, LanguageId, LocatedEntry, ParseCompleteness,
+        RepoPath, ResolvedArtifact, ResolvedTree, SemanticFingerprint, TreeDelta, Visibility,
     };
     use kin_reconcile::ReconcileOutcome;
     use serde_json::json;
@@ -4036,9 +4096,6 @@ mod tests {
         fail_cleanup: AtomicBool,
         delta_block: Option<DeltaSaveBlock>,
         recovery_loads: Option<Arc<AtomicU64>>,
-        source_loads: Option<Arc<AtomicU64>>,
-        source_saves: Option<Arc<AtomicU64>>,
-        source_override: Option<Vec<u8>>,
     }
 
     struct DeltaSaveBlock {
@@ -4054,9 +4111,6 @@ mod tests {
                 fail_cleanup: AtomicBool::new(fail_cleanup),
                 delta_block: None,
                 recovery_loads: None,
-                source_loads: None,
-                source_saves: None,
-                source_override: None,
             }
         }
 
@@ -4074,9 +4128,6 @@ mod tests {
                     block_once: AtomicBool::new(true),
                 }),
                 recovery_loads: None,
-                source_loads: None,
-                source_saves: None,
-                source_override: None,
             }
         }
 
@@ -4086,37 +4137,6 @@ mod tests {
                 fail_cleanup: AtomicBool::new(false),
                 delta_block: None,
                 recovery_loads: Some(recovery_loads),
-                source_loads: None,
-                source_saves: None,
-                source_override: None,
-            }
-        }
-
-        fn counting_source(
-            path: &std::path::Path,
-            source_loads: Arc<AtomicU64>,
-            source_saves: Arc<AtomicU64>,
-        ) -> Self {
-            Self {
-                inner: kin_db::LocalFileBackend::new(path),
-                fail_cleanup: AtomicBool::new(false),
-                delta_block: None,
-                recovery_loads: None,
-                source_loads: Some(source_loads),
-                source_saves: Some(source_saves),
-                source_override: None,
-            }
-        }
-
-        fn corrupt_source(path: &std::path::Path, bytes: Vec<u8>) -> Self {
-            Self {
-                inner: kin_db::LocalFileBackend::new(path),
-                fail_cleanup: AtomicBool::new(false),
-                delta_block: None,
-                recovery_loads: None,
-                source_loads: None,
-                source_saves: None,
-                source_override: Some(bytes),
             }
         }
     }
@@ -4132,32 +4152,6 @@ mod tests {
         ) -> std::result::Result<Option<(Vec<u8>, kin_db::Generation)>, kin_db::KinDbError>
         {
             self.inner.load_snapshot(repo_id)
-        }
-
-        fn save_source_blob(
-            &self,
-            repo_id: &str,
-            digest: [u8; 32],
-            data: &[u8],
-        ) -> std::result::Result<(), kin_db::KinDbError> {
-            if let Some(saves) = &self.source_saves {
-                saves.fetch_add(1, Ordering::SeqCst);
-            }
-            self.inner.save_source_blob(repo_id, digest, data)
-        }
-
-        fn load_source_blob(
-            &self,
-            repo_id: &str,
-            digest: [u8; 32],
-        ) -> std::result::Result<Option<Vec<u8>>, kin_db::KinDbError> {
-            if let Some(loads) = &self.source_loads {
-                loads.fetch_add(1, Ordering::SeqCst);
-            }
-            if let Some(bytes) = &self.source_override {
-                return Ok(Some(bytes.clone()));
-            }
-            self.inner.load_source_blob(repo_id, digest)
         }
 
         fn load_snapshot_authority(
@@ -4260,125 +4254,45 @@ mod tests {
         }
     }
 
-    fn exact_source_change(
-        id_byte: u8,
-        file_id: &str,
-        kind: kin_model::ArtifactDeltaKind,
-        hash: Hash256,
-    ) -> kin_model::SemanticChange {
-        kin_model::SemanticChange {
-            id: kin_model::SemanticChangeId::from_hash(Hash256::from_bytes([id_byte; 32])),
+    fn exact_source_change(path: &str, entry: TreeEntry) -> kin_model::SemanticChange {
+        let mut change = kin_model::SemanticChange {
+            id: kin_model::SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+            origin: ChangeOrigin::Native,
             parents: vec![],
             author: kin_model::AuthorId::new("exact-source-preflight-test"),
             message: "exact source preflight fixture".to_string(),
             timestamp: kin_model::Timestamp::now(),
             entity_deltas: vec![],
             relation_deltas: vec![],
-            artifact_deltas: vec![kin_model::ArtifactDelta {
-                file_id: FilePathId::new(file_id),
-                kind,
-                old_hash: None,
-                new_hash: Some(hash),
+            tree_deltas: vec![TreeDelta::Added {
+                artifact_id: ArtifactId::new(),
+                new: LocatedEntry::new(RepoPath::from_utf8(path).unwrap(), entry),
             }],
+            admission_policy_delta: None,
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],
             risk_summary: None,
-            authored_on: None,
-        }
+        };
+        change.id = kin_core::compute_semantic_change_id(&change).unwrap();
+        change
     }
 
     fn local_object_path(layout: &KinLayout, hash: Hash256) -> std::path::PathBuf {
         let encoded = hash.to_string();
-        layout.objects_dir().join(&encoded[..2]).join(&encoded[2..])
+        layout
+            .ingest_cas_dir()
+            .join(&encoded[..2])
+            .join(&encoded[2..])
     }
 
     fn test_state(layout: KinLayout, working_dir: &std::path::Path) -> DaemonState {
-        let snapshot_generation =
-            if kin_db::SnapshotManager::local_authority_exists(layout.kindb_snapshot_path()) {
-                kin_db::SnapshotManager::open_read_only(layout.kindb_snapshot_path())
-                    .unwrap()
-                    .generation()
-            } else {
-                kin_db::GENERATION_INIT
-            };
-        let graph = Arc::new(kin_db::InMemoryGraph::with_text_index(
-            layout.text_index_dir(),
-        ));
-        let blobs = BlobStore::new(layout.objects_dir()).unwrap();
-        let genesis = kin_core::build_genesis_change();
-        let working_copy = WorkingCopy {
-            base_change: genesis.id,
-            uncommitted_mutations: GraphOverlay::default(),
-        };
-        let coordinator = SessionCoordinator::new(Arc::clone(&graph));
-        let loaded_entity_count = graph.entity_count();
-        let coordination_events =
-            CoordinationEventLog::open(&layout, "test-repo").expect("open coordination log");
-
-        DaemonState {
-            layout,
-            graph,
-            blobs: Arc::new(blobs),
-            working_copy: RwLock::new(working_copy),
-            reconciler: RwLock::new(Reconciler::new(working_dir.to_path_buf())),
-            projection: RwLock::new(ProjectionState::new()),
-            coordinator,
-            coordination_gate: tokio::sync::Mutex::new(()),
-            graph_authority_clock: Arc::new(GraphAuthorityClock::default()),
-            coordination_mode: std::sync::RwLock::new(
-                kin_mcp::CoordinationEnforcementMode::from_env(),
-            ),
-            coordination_events,
-            coordination_event_persist_failures: AtomicU64::new(0),
-            started_at: Instant::now(),
-            is_initialized: AtomicBool::new(false),
-            reconciliation_status: AtomicU8::new(RECON_IDLE),
-            storage_backend: None,
-            filesystem_reconcile_disabled: AtomicBool::new(false),
-            snapshot_generation: AtomicU64::new(snapshot_generation),
-            post_commit_finalization_pending: AtomicBool::new(false),
-            pending_persistence_event: Mutex::new(None),
-            #[cfg(test)]
-            finalization_fail_once: AtomicBool::new(false),
-            #[cfg(test)]
-            snapshot_save_fail_once: AtomicBool::new(false),
-            vfs_version: AtomicU64::new(0),
-            vfs_tree_cache: std::sync::RwLock::new(None),
-            vfs_tree_build_lock: tokio::sync::Mutex::new(()),
-            #[cfg(test)]
-            vfs_tree_build_count: AtomicU64::new(0),
-            #[cfg(test)]
-            vfs_tree_build_test_hook: std::sync::Mutex::new(None),
-            event_tx: tokio::sync::broadcast::channel(256).0,
-            session_overlays: RwLock::new(std::collections::HashMap::new()),
-            session_scopes: RwLock::new(HashMap::new()),
-            spine: std::sync::OnceLock::new(),
-            spine_refresh_gate: tokio::sync::Mutex::new(()),
-            repo_graphs: RwLock::new(HashMap::new()),
-            allowed_repo_ids: None,
-            dirty: AtomicBool::new(false),
-            mutation_epoch: AtomicU64::new(0),
-            embedding_work: Mutex::new(()),
-            persist_lock: Mutex::new(()),
-            last_save: std::sync::Mutex::new(Instant::now()),
-            last_mutation: std::sync::Mutex::new(Instant::now()),
-            active_embed_passes: AtomicU32::new(0),
-            background_embed_paused: AtomicBool::new(false),
-            last_activity_ms: AtomicU64::new(0),
-            active_requests: AtomicU64::new(0),
-            lsp_enrichment_tx: None,
-            change_oid_cache: std::sync::RwLock::new(None),
-            cached_repo_id: "test-repo".to_string(),
-            is_shutdown: AtomicBool::new(false),
-            persisted_entity_count: AtomicU64::new(loaded_entity_count as u64),
-            mass_deletion_blocked: AtomicBool::new(false),
-            embed_worker_failed: AtomicBool::new(false),
-            mcp_transactions: Mutex::new(HashMap::new()),
-            locate_rankings: Mutex::new(HashMap::new()),
-            semantic_locate_pages: Mutex::new(HashMap::new()),
-            hydration_gate: Arc::new(tokio::sync::Mutex::new(())),
-        }
+        let canonical_working_dir = working_dir
+            .canonicalize()
+            .expect("daemon fixture working directory must canonicalize");
+        assert_eq!(layout.working_dir(), canonical_working_dir.as_path());
+        DaemonState::open(layout)
+            .expect("daemon test fixtures must open through repository-v6 workspace authority")
     }
 
     fn test_entity(name: &str, file_path: &str) -> Entity {
@@ -4687,6 +4601,21 @@ mod tests {
         let mut reconciler = Reconciler::new(repo_dir.path().to_path_buf());
         let file_id = FilePathId::new("src/lib.rs");
         let content = b"fn persisted() {}\n".to_vec();
+        let content_hash = Hash256::from_bytes(kin_blobs::digest_bytes(&content));
+        state.blobs.write(&content).unwrap();
+        state
+            .graph
+            .apply_transaction_delta(&kin_model::TransactionDelta {
+                tree_deltas: vec![TreeDelta::Added {
+                    artifact_id: ArtifactId::new(),
+                    new: LocatedEntry::new(
+                        RepoPath::from_utf8(&file_id.0).unwrap(),
+                        TreeEntry::blob(content_hash, false),
+                    ),
+                }],
+                ..Default::default()
+            })
+            .unwrap();
 
         reconciler
             .projection_mut()
@@ -4708,8 +4637,8 @@ mod tests {
         let persisted_layout = state.graph.get_file_layout(&file_id).unwrap().unwrap();
         assert_eq!(persisted_layout.file_id, file_id);
         assert_eq!(
-            state.graph.get_file_hash(&file_id.0),
-            Some(kin_blobs::digest_bytes(&content))
+            state.graph.get_tree_entry(&file_id).unwrap(),
+            Some(TreeEntry::blob(content_hash, false))
         );
     }
 
@@ -4779,12 +4708,6 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn spine_initialization_retries_after_busy_primary_authority() {
-        let repo_dir = tempfile::tempdir().unwrap();
-        let init = kin_core::init(repo_dir.path()).unwrap();
-        let state = test_state(init.layout, repo_dir.path());
-        let entity = test_entity("stable_after_writer", "src/lib.rs");
-        state.graph.upsert_entity(&entity).unwrap();
-
         let registry_dir = tempfile::tempdir().unwrap();
         let registry_path = registry_dir.path().join("registry.toml");
         kin_core::registry::KinRegistry { repos: Vec::new() }
@@ -4795,6 +4718,13 @@ mod tests {
         std::env::set_var("KIN_REGISTRY_PATH", &registry_path);
         std::env::remove_var("KIN_DISABLE_SPINE");
 
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let state = test_state(init.layout, repo_dir.path());
+        let primary_repo_id = state.cached_repo_id.clone();
+        let entity = test_entity("stable_after_writer", "src/lib.rs");
+        state.graph.upsert_entity(&entity).unwrap();
+
         let writer = state.begin_graph_authority_mutation();
         let deferred = state.ensure_spine().is_none();
         let once_lock_unpublished = state.spine.get().is_none();
@@ -4803,8 +4733,8 @@ mod tests {
         let (retried, registered_root, registered_entity) = match state.ensure_spine() {
             Some(spine) => (
                 true,
-                spine.root_hash("test-repo"),
-                spine.lookup_by_id("test-repo", &entity.id).is_some(),
+                spine.root_hash(&primary_repo_id),
+                spine.lookup_by_id(&primary_repo_id, &entity.id).is_some(),
             ),
             None => (false, None, false),
         };
@@ -4831,12 +4761,6 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn spine_initialization_revalidates_at_the_publication_edge() {
-        let repo_dir = tempfile::tempdir().unwrap();
-        let init = kin_core::init(repo_dir.path()).unwrap();
-        let state = Arc::new(test_state(init.layout, repo_dir.path()));
-        let original = test_entity("before_publication", "src/original.rs");
-        state.graph.upsert_entity(&original).unwrap();
-
         let registry_dir = tempfile::tempdir().unwrap();
         let registry_path = registry_dir.path().join("registry.toml");
         kin_core::registry::KinRegistry { repos: Vec::new() }
@@ -4846,6 +4770,13 @@ mod tests {
         let prev_disable = std::env::var_os("KIN_DISABLE_SPINE");
         std::env::set_var("KIN_REGISTRY_PATH", &registry_path);
         std::env::remove_var("KIN_DISABLE_SPINE");
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let state = Arc::new(test_state(init.layout, repo_dir.path()));
+        let primary_repo_id = state.cached_repo_id.clone();
+        let original = test_entity("before_publication", "src/original.rs");
+        state.graph.upsert_entity(&original).unwrap();
 
         let prepared = Arc::new(std::sync::Barrier::new(2));
         let resume = Arc::new(std::sync::Barrier::new(2));
@@ -4874,8 +4805,8 @@ mod tests {
         let (retried, registered_root, raced_entity) = match state.ensure_spine() {
             Some(spine) => (
                 true,
-                spine.root_hash("test-repo"),
-                spine.lookup_by_id("test-repo", &raced.id).is_some(),
+                spine.root_hash(&primary_repo_id),
+                spine.lookup_by_id(&primary_repo_id, &raced.id).is_some(),
             ),
             None => (false, None, false),
         };
@@ -4907,7 +4838,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn spine_init_materializes_cross_repo_edges() {
-        use kin_db::{InMemoryGraph, SnapshotManager};
+        use kin_db::InMemoryGraph;
         use kin_model::{
             GraphNodeId, Relation, RelationEvidence, RelationId, RelationKind, RelationOrigin,
         };
@@ -4917,19 +4848,83 @@ mod tests {
         // cross-repo reference by matching the imported-symbol evidence on the
         // primary's relation against an indexed entity name, so the sibling
         // entity is named with the real symbol the reference imports.
-        let sibling_id = "sibling-lib";
         let external_id = kin_model::EntityId::new();
         let imported_symbol = "remote_call";
 
         let sibling_dir = tempfile::tempdir().unwrap();
         let sibling_init = kin_core::init(sibling_dir.path()).unwrap();
+        let sibling_id = sibling_init.repository_id.as_str().to_string();
         let sibling_graph = InMemoryGraph::new();
+        let sibling_blobs =
+            kin_blobs::BlobStore::new(sibling_init.layout.ingest_cas_dir()).unwrap();
+        let sibling_source = b"pub fn remote_call() {}\n";
+        let sibling_digest = sibling_blobs.write(sibling_source).unwrap();
+        sibling_graph
+            .apply_transaction_delta(&kin_model::TransactionDelta {
+                entity_deltas: Vec::new(),
+                relation_deltas: Vec::new(),
+                tree_deltas: vec![TreeDelta::Added {
+                    artifact_id: ArtifactId::new(),
+                    new: LocatedEntry::new(
+                        RepoPath::from_bytes(b"src/lib.rs".to_vec()).unwrap(),
+                        kin_model::TreeEntry::blob(Hash256::from_bytes(sibling_digest.0), false),
+                    ),
+                }],
+                admission_policy_delta: None,
+            })
+            .unwrap();
         sibling_graph
             .batch_upsert_entities(&[test_entity(imported_symbol, "src/lib.rs")])
             .unwrap();
-        let expected_sibling_root = hex::encode(sibling_graph.compute_root_hash());
-        SnapshotManager::save_graph(sibling_init.layout.kindb_snapshot_path(), &sibling_graph)
-            .unwrap();
+        let plan = crate::repository_commit::plan_native_commit(
+            &sibling_graph,
+            &sibling_blobs,
+            &crate::local_repository_authority::LocalRepositoryAuthorityContext::from_layout_for_test(
+                &sibling_init.layout,
+            )
+            .unwrap(),
+            kin_model::OperationId::new(),
+            kin_model::Timestamp::now(),
+            kin_model::AuthorId::new("spine-fixture"),
+            "publish sibling semantic authority".to_string(),
+        )
+        .unwrap();
+        crate::repository_commit::commit_native_plan(
+            &sibling_blobs,
+            &crate::local_repository_authority::LocalRepositoryAuthorityContext::from_layout_for_test(
+                &sibling_init.layout,
+            )
+            .unwrap(),
+            plan,
+        )
+        .unwrap();
+        let sibling_binding =
+            kin_core::LocalRepositoryAuthorityBinding::from_layout(&sibling_init.layout).unwrap();
+        let expected_sibling_root = hex::encode(
+            DaemonState::load_registered_workspace_graph(&sibling_binding)
+                .unwrap()
+                .compute_root_hash(),
+        );
+
+        // Pin the sibling through startup registry configuration before the
+        // primary daemon state becomes externally visible.
+        let registry_dir = tempfile::tempdir().unwrap();
+        let registry_path = registry_dir.path().join("registry.toml");
+        kin_core::registry::KinRegistry {
+            repos: vec![kin_core::registry::RegisteredRepo {
+                id: sibling_id.clone(),
+                path: sibling_dir.path().to_path_buf(),
+                entities: 1,
+                last_commit: String::new(),
+                dependencies: vec![],
+            }],
+        }
+        .save_to(&registry_path)
+        .unwrap();
+        let prev_registry = std::env::var_os("KIN_REGISTRY_PATH");
+        let prev_disable = std::env::var_os("KIN_DISABLE_SPINE");
+        std::env::set_var("KIN_REGISTRY_PATH", &registry_path);
+        std::env::remove_var("KIN_DISABLE_SPINE");
 
         // The primary repo: a caller entity plus an unresolved cross-repo call
         // tagged with the sibling repo as its import source.
@@ -4951,7 +4946,7 @@ mod tests {
                 confidence: 1.0,
                 origin: RelationOrigin::Parsed,
                 created_in: None,
-                import_source: Some(sibling_id.to_string()),
+                import_source: Some(sibling_id.clone()),
                 evidence: vec![RelationEvidence {
                     token: Some(imported_symbol.to_string()),
                     ..RelationEvidence::default()
@@ -4959,33 +4954,12 @@ mod tests {
             })
             .unwrap();
 
-        // Point the global registry at a temp file naming only the sibling so
-        // init discovers and indexes it alongside the primary.
-        let registry_dir = tempfile::tempdir().unwrap();
-        let registry_path = registry_dir.path().join("registry.toml");
-        kin_core::registry::KinRegistry {
-            repos: vec![kin_core::registry::RegisteredRepo {
-                id: sibling_id.to_string(),
-                path: sibling_dir.path().to_path_buf(),
-                entities: 1,
-                last_commit: String::new(),
-                dependencies: vec![],
-            }],
-        }
-        .save_to(&registry_path)
-        .unwrap();
-
-        let prev_registry = std::env::var_os("KIN_REGISTRY_PATH");
-        let prev_disable = std::env::var_os("KIN_DISABLE_SPINE");
-        std::env::set_var("KIN_REGISTRY_PATH", &registry_path);
-        std::env::remove_var("KIN_DISABLE_SPINE");
-
         let (repo_count, edge_count, sibling_root) = {
             let spine = state.ensure_spine().expect("spine must be enabled");
             (
                 spine.repo_count(),
                 spine.edge_count(),
-                spine.root_hash(sibling_id),
+                spine.root_hash(&sibling_id),
             )
         };
 
@@ -5021,9 +4995,9 @@ mod tests {
         // write path. A hosted pod runs one repo and owns no local sibling
         // checkouts and no `registry.toml`: the cross-repo index must be built
         // by loading sibling graphs from the durable StorageBackend (GCS in
-        // cloud, a `LocalFileBackend` rooted at `v2/` here — the same
-        // `v2/<repo>/graph.kndb` layout) via `ingest_repo_into_spine`, NOT from
-        // on-disk `.kndb` siblings the way `initialize_spine_lazy` does.
+        // cloud, a `LocalFileBackend` rooted at `v2/` here) via
+        // `ingest_repo_into_spine`, not from local registry workspace
+        // authorities.
         //
         // Two repos land in storage the way cloud ingestion sees them: the
         // sibling `kin-db` (which exports `InMemoryGraph`) and the primary
@@ -5044,6 +5018,8 @@ mod tests {
         // siblings, no registry).
         let storage = tempfile::tempdir().unwrap();
         let v2_root = storage.path().join("v2");
+        std::fs::create_dir(&v2_root)
+            .expect("storage fixture must create its existing-only backend root");
 
         // ── Ingestion source: seed the sibling graph into storage ─────────
         // Only the sibling's serialized graph reaches storage — never a local
@@ -5245,15 +5221,13 @@ mod tests {
         let repo_dir = tempfile::tempdir().unwrap();
         let init = kin_core::init(repo_dir.path()).unwrap();
         let layout = init.layout;
-        let snapshot_path = layout.kindb_snapshot_path();
-        let mut authority_name = std::ffi::OsString::from(snapshot_path.as_os_str());
-        authority_name.push(".authority.json");
+        let manifest = kin_core::manifest::KinManifest::load(&layout.manifest_path()).unwrap();
+        let repository_dir = layout.kindb_dir().join(&manifest.repo_id);
         let authority: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(authority_name).unwrap()).unwrap();
+            serde_json::from_slice(&std::fs::read(repository_dir.join("authority.json")).unwrap())
+                .unwrap();
         let snapshot_file = authority["snapshot_file"].as_str().unwrap();
-        let mut versions_name = std::ffi::OsString::from(snapshot_path.as_os_str());
-        versions_name.push(".snapshots");
-        let authoritative_snapshot = std::path::PathBuf::from(versions_name).join(snapshot_file);
+        let authoritative_snapshot = repository_dir.join("snapshots").join(snapshot_file);
         std::fs::write(authoritative_snapshot, b"not-a-valid-kndb").unwrap();
 
         let err = match DaemonState::open(layout) {
@@ -5261,8 +5235,14 @@ mod tests {
             Err(err) => err,
         };
         let message = err.to_string();
-        assert!(message.contains("failed to load persisted graph snapshot"));
-        assert!(message.contains("graph.kndb"));
+        assert!(
+            message.contains("snapshot digest mismatch"),
+            "unexpected repository authority corruption error: {message}"
+        );
+        assert!(
+            message.contains(&manifest.repo_id),
+            "corruption error must identify the repository namespace: {message}"
+        );
     }
 
     #[test]
@@ -5311,545 +5291,100 @@ mod tests {
     }
 
     #[test]
-    fn open_with_repo_id_preserves_entrypoint_authority() {
+    fn open_materializes_exact_workspace_tree_and_bodies_from_repository_authority() {
         let repo_dir = tempfile::tempdir().unwrap();
+        let compose = b"services:\n  api:\n    image: kin:dev\n";
+        let binary = [0_u8, 0xff, 0x80, b'\n'];
         let init = kin_core::init(repo_dir.path()).unwrap();
-        let state = DaemonState::open_with_repo_id(init.layout, Some("entrypoint-repo"))
-            .expect("an entrypoint-resolved repository id must open");
-        assert_eq!(state.cached_repo_id, "entrypoint-repo");
-    }
-
-    #[cfg(feature = "vector")]
-    #[test]
-    fn open_rejects_stale_vector_index_sidecar() {
-        // A persisted vector sidecar whose metadata root hash does NOT match the
-        // graph must be REJECTED on open, not installed. Installing a stale-
-        // dimension index is exactly what triggered the embed-worker reset loop;
-        // `DaemonState::open` now relies solely on the validated load that
-        // `SnapshotManager::open` performs during construction (no raw force-load
-        // override). The embed worker rebuilds the index from the live embedder.
-        let repo_dir = tempfile::tempdir().unwrap();
-        let init = kin_core::init(repo_dir.path()).unwrap();
-        let layout = init.layout;
-        let snapshot_path = layout.kindb_snapshot_path();
-        let vector_path = layout.kindb_vector_index_path();
-        let metadata_path = vector_path.with_extension("kvec.meta.json");
-
-        let mgr = kin_db::SnapshotManager::open(&snapshot_path).unwrap();
-        let graph = mgr.graph();
-        let entity = test_entity("vector_reader", "src/lib.rs");
-        graph.upsert_entity(&entity).unwrap();
-        mgr.save().unwrap();
-
-        // Write a sidecar with a deliberately mismatched (stale) root hash.
-        let vectors = VectorIndex::new(4).unwrap();
-        vectors.upsert(entity.id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
-        vectors.save(&vector_path).unwrap();
-        std::fs::write(
-            &metadata_path,
-            serde_json::to_vec(&json!({
-                "version": 1,
-                "graph_root_hash": hex::encode([42u8; 32]),
-                "dimensions": 4,
-                "indexed": 1
-            }))
+        let blobs = BlobStore::new(init.layout.ingest_cas_dir()).unwrap();
+        let compose_hash = Hash256::from_bytes(blobs.write(compose).unwrap().0);
+        let binary_hash = Hash256::from_bytes(blobs.write(&binary).unwrap().0);
+        let blob_artifacts = vec![
+            ResolvedArtifact::new(
+                ArtifactId::new(),
+                RepoPath::from_utf8("compose.yaml").unwrap(),
+                TreeEntry::blob(compose_hash, false),
+            ),
+            ResolvedArtifact::new(
+                ArtifactId::new(),
+                RepoPath::from_utf8("assets/data.bin").unwrap(),
+                TreeEntry::blob(binary_hash, false),
+            ),
+        ];
+        // Only Unix materializes symlinks, so only Unix admits one here.
+        #[cfg(unix)]
+        let artifacts = {
+            let mut artifacts = blob_artifacts;
+            let symlink_hash = Hash256::from_bytes(blobs.write(b"compose.yaml").unwrap().0);
+            artifacts.push(ResolvedArtifact::new(
+                ArtifactId::new(),
+                RepoPath::from_utf8("compose-current").unwrap(),
+                TreeEntry::symlink(symlink_hash),
+            ));
+            artifacts
+        };
+        #[cfg(not(unix))]
+        let artifacts = blob_artifacts;
+        let desired = ResolvedTree::from_artifacts(artifacts).unwrap();
+        crate::repository_commit::publish_workspace_tree(
+            &blobs,
+            &crate::local_repository_authority::LocalRepositoryAuthorityContext::from_layout_for_test(
+                &init.layout,
+            )
             .unwrap(),
+            &desired,
+            kin_model::OperationId::new(),
+            kin_model::AuthorId::new("authority-open-test"),
         )
-        .unwrap();
-        drop(mgr);
+        .unwrap()
+        .expect("exact workspace admission must advance authority");
 
-        let state = DaemonState::open(layout).unwrap();
-        assert_eq!(
-            state.graph.embedding_status().indexed,
-            0,
-            "stale-root-hash vector sidecar must be rejected, not installed"
-        );
+        let state = DaemonState::open(init.layout)
+            .expect("repository-v6 workspace authority must materialize directly");
+        let tree = state.graph.resolved_tree();
+        let compose_artifact = tree
+            .artifact_at_path(&RepoPath::from_utf8("compose.yaml").unwrap())
+            .expect("Compose is exact repository-tree authority");
+        let compose_hash = compose_artifact
+            .entry
+            .blob_identity()
+            .expect("Compose is a blob");
+        assert_eq!(state.blobs.read(&compose_hash).unwrap(), compose);
+
+        let binary_artifact = tree
+            .artifact_at_path(&RepoPath::from_utf8("assets/data.bin").unwrap())
+            .expect("binary assets are exact repository-tree authority");
+        let binary_hash = binary_artifact
+            .entry
+            .blob_identity()
+            .expect("binary asset is a blob");
+        assert_eq!(state.blobs.read(&binary_hash).unwrap(), binary);
+
+        #[cfg(unix)]
+        {
+            let symlink_artifact = tree
+                .artifact_at_path(&RepoPath::from_utf8("compose-current").unwrap())
+                .expect("symlinks are exact repository-tree authority");
+            assert!(matches!(symlink_artifact.entry, TreeEntry::Symlink { .. }));
+            let target_hash = symlink_artifact.entry.blob_identity().unwrap();
+            assert_eq!(state.blobs.read(&target_hash).unwrap(), b"compose.yaml");
+        }
     }
 
     #[test]
-    fn first_publish_commit_persists_under_v2_repo_prefix_and_reloads_with_refs() {
-        // Hosted publish->serve: a full-content commit into the served
-        // graph must persist through the StorageBackend at `<prefix>/<repo>/graph.kndb`
-        // (the GCS `v2/<repo>/` layout, reproduced here with a LocalFileBackend rooted
-        // at `v2/`) and survive a pod restart with its branch refs intact. A fresh
-        // served graph has no branch, so the branch is created before the head update
-        // (update_branch_head errors NotFound otherwise).
-        use kin_db::LocalFileBackend;
-        use kin_model::{
-            AuthorId, Branch, BranchName, ChangeStore, EntityDelta, SemanticChange,
-            SemanticChangeId, Timestamp,
-        };
-
+    fn open_with_repo_id_rejects_identity_other_than_manifest_authority() {
         let repo_dir = tempfile::tempdir().unwrap();
         let init = kin_core::init(repo_dir.path()).unwrap();
-        let layout = init.layout;
-
-        let storage = tempfile::tempdir().unwrap();
-        let v2_root = storage.path().join("v2");
-        let repo_id = "kin";
-        let branch_name = BranchName::new("main");
-
-        let state = DaemonState::open_with_backend(
-            layout.clone(),
-            Box::new(LocalFileBackend::new(&v2_root)),
-            repo_id,
-            None,
-        )
-        .unwrap();
-        assert_eq!(
-            state.graph.entity_count(),
-            0,
-            "a fresh hosted repo starts with an empty served graph"
-        );
-
-        let entity = test_entity("served_fn", "src/lib.rs");
-        state.graph.upsert_entity(&entity).unwrap();
-
-        let change = SemanticChange {
-            id: SemanticChangeId::from_hash(Hash256::from_bytes([7; 32])),
-            parents: vec![],
-            author: AuthorId::new("tester"),
-            message: "first publish".to_string(),
-            timestamp: Timestamp::now(),
-            entity_deltas: vec![EntityDelta::Added(entity.clone())],
-            relation_deltas: vec![],
-            artifact_deltas: vec![],
-            projected_files: vec![],
-            spec_link: None,
-            evidence: vec![],
-            risk_summary: None,
-            authored_on: None,
+        let error = match DaemonState::open_with_repo_id(init.layout, Some("entrypoint-repo")) {
+            Ok(_) => panic!("local workspace authority cannot be rebound to another repository"),
+            Err(error) => error,
         };
-        let change_id = change.id;
-        state
-            .graph
-            .create_branch(&Branch {
-                name: branch_name.clone(),
-                head: change_id,
-            })
-            .unwrap();
-        state.graph.create_change(&change).unwrap();
-        state
-            .graph
-            .update_branch_head(&branch_name, &change_id)
-            .unwrap();
-        state.save_snapshot_full().unwrap();
-
-        let persisted = v2_root.join(repo_id).join("graph.kndb");
         assert!(
-            persisted.exists(),
-            "served commit must persist under v2/<repo>/graph.kndb at {}",
-            persisted.display()
+            error
+                .to_string()
+                .contains("does not match manifest authority"),
+            "unexpected identity mismatch error: {error}"
         );
-
-        drop(state);
-
-        let reopened = DaemonState::open_with_backend(
-            layout,
-            Box::new(LocalFileBackend::new(&v2_root)),
-            repo_id,
-            None,
-        )
-        .unwrap();
-        assert_eq!(
-            reopened.graph.entity_count(),
-            1,
-            "published content must survive reload from the v2 backend"
-        );
-        let branches = reopened.graph.list_branches().unwrap();
-        assert!(
-            branches
-                .iter()
-                .any(|b| b.name == branch_name && b.head == change_id),
-            "published branch head must be visible after reload (refs non-empty)"
-        );
-    }
-
-    #[test]
-    fn storage_backend_replays_sequential_deltas_after_restart() {
-        use kin_db::LocalFileBackend;
-
-        let repo_dir = tempfile::tempdir().unwrap();
-        let init = kin_core::init(repo_dir.path()).unwrap();
-        let layout = init.layout;
-        let storage = tempfile::tempdir().unwrap();
-        let repo_id = "restart-repo";
-
-        let state = DaemonState::open_with_backend(
-            layout.clone(),
-            Box::new(LocalFileBackend::new(storage.path())),
-            repo_id,
-            None,
-        )
-        .unwrap();
-
-        let base = test_entity("base_entity", "src/base.rs");
-        state.graph.upsert_entity(&base).unwrap();
-        state
-            .save_snapshot()
-            .expect("generation zero must promote a full base snapshot");
-        assert_eq!(state.snapshot_generation.load(Ordering::SeqCst), 1);
-
-        let first_delta_entity = test_entity("first_delta_entity", "src/first.rs");
-        state.graph.upsert_entity(&first_delta_entity).unwrap();
-        state.save_snapshot().expect("persist first delta");
-        assert_eq!(state.snapshot_generation.load(Ordering::SeqCst), 2);
-
-        let second_delta_entity = test_entity("second_delta_entity", "src/second.rs");
-        state.graph.upsert_entity(&second_delta_entity).unwrap();
-        state.save_snapshot().expect("persist second delta");
-        assert_eq!(state.snapshot_generation.load(Ordering::SeqCst), 3);
-        drop(state);
-
-        let reopened = DaemonState::open_with_backend(
-            layout,
-            Box::new(LocalFileBackend::new(storage.path())),
-            repo_id,
-            None,
-        )
-        .expect("base snapshot plus deltas must reopen");
-        assert_eq!(reopened.snapshot_generation.load(Ordering::SeqCst), 3);
-        let entities = reopened.graph.list_all_entities().unwrap();
-        let names: HashSet<_> = entities.iter().map(|entity| entity.name.as_str()).collect();
-        assert_eq!(entities.len(), 3);
-        assert!(names.contains("base_entity"));
-        assert!(names.contains("first_delta_entity"));
-        assert!(names.contains("second_delta_entity"));
-    }
-
-    #[test]
-    fn storage_backend_persists_exact_source_objects_before_full_and_delta_authority() {
-        use kin_db::{LocalFileBackend, StorageBackend};
-        use kin_model::{
-            ArtifactDelta, ArtifactDeltaKind, AuthorId, Branch, BranchName, ChangeStore,
-            SemanticChange, SemanticChangeId, Timestamp,
-        };
-
-        let repo_dir = tempfile::tempdir().unwrap();
-        let init = kin_core::init(repo_dir.path()).unwrap();
-        let layout = init.layout;
-        let storage = tempfile::tempdir().unwrap();
-        let repo_id = "exact-source-restart";
-        let branch_name = BranchName::new("main");
-
-        let state = DaemonState::open_with_backend(
-            layout.clone(),
-            Box::new(LocalFileBackend::new(storage.path())),
-            repo_id,
-            None,
-        )
-        .unwrap();
-        let executable = b"#!/bin/sh\necho kin\n";
-        let executable_hash = state.blobs.write(executable).unwrap();
-        let executable_hash = Hash256::from_bytes(executable_hash.0);
-        let first = SemanticChange {
-            id: SemanticChangeId::from_hash(Hash256::from_bytes([31; 32])),
-            parents: vec![],
-            author: AuthorId::new("tester"),
-            message: "add executable".to_string(),
-            timestamp: Timestamp::now(),
-            entity_deltas: vec![],
-            relation_deltas: vec![],
-            artifact_deltas: vec![ArtifactDelta {
-                file_id: FilePathId("bin/kin".to_string()),
-                kind: ArtifactDeltaKind::AddedExecutableFile,
-                old_hash: None,
-                new_hash: Some(executable_hash),
-            }],
-            projected_files: vec![],
-            spec_link: None,
-            evidence: vec![],
-            risk_summary: None,
-            authored_on: None,
-        };
-        state.graph.create_change(&first).unwrap();
-        state
-            .graph
-            .create_branch(&Branch {
-                name: branch_name.clone(),
-                head: first.id,
-            })
-            .unwrap();
-        state.save_snapshot_full().unwrap();
-        assert_eq!(state.snapshot_generation.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            LocalFileBackend::new(storage.path())
-                .load_source_blob(repo_id, *executable_hash.as_bytes())
-                .unwrap()
-                .as_deref(),
-            Some(executable.as_slice())
-        );
-        drop(state);
-
-        let reopened = DaemonState::open_with_backend(
-            layout.clone(),
-            Box::new(LocalFileBackend::new(storage.path())),
-            repo_id,
-            None,
-        )
-        .unwrap();
-        let target = b"bin/kin";
-        let target_hash = reopened.blobs.write(target).unwrap();
-        let target_hash = Hash256::from_bytes(target_hash.0);
-        let second = SemanticChange {
-            id: SemanticChangeId::from_hash(Hash256::from_bytes([32; 32])),
-            parents: vec![first.id],
-            author: AuthorId::new("tester"),
-            message: "add symlink".to_string(),
-            timestamp: Timestamp::now(),
-            entity_deltas: vec![],
-            relation_deltas: vec![],
-            artifact_deltas: vec![ArtifactDelta {
-                file_id: FilePathId("current".to_string()),
-                kind: ArtifactDeltaKind::AddedSymlink,
-                old_hash: None,
-                new_hash: Some(target_hash),
-            }],
-            projected_files: vec![],
-            spec_link: None,
-            evidence: vec![],
-            risk_summary: None,
-            authored_on: None,
-        };
-        reopened.graph.create_change(&second).unwrap();
-        reopened
-            .graph
-            .update_branch_head(&branch_name, &second.id)
-            .unwrap();
-        reopened.save_snapshot().unwrap();
-        assert_eq!(reopened.snapshot_generation.load(Ordering::SeqCst), 2);
-        assert_eq!(
-            LocalFileBackend::new(storage.path())
-                .load_source_blob(repo_id, *target_hash.as_bytes())
-                .unwrap()
-                .as_deref(),
-            Some(target.as_slice())
-        );
-        drop(reopened);
-
-        let reopened = DaemonState::open_with_backend(
-            layout,
-            Box::new(LocalFileBackend::new(storage.path())),
-            repo_id,
-            None,
-        )
-        .unwrap();
-        let exact = reopened.graph.resolve_source_tree_at(&second.id).unwrap();
-        let kin_model::SourceTreeResolution::Exact { entries } = exact else {
-            panic!("persisted exact source history reopened as incomplete")
-        };
-        assert_eq!(
-            entries[&FilePathId("bin/kin".to_string())].kind,
-            kin_model::SourceEntryKind::File { executable: true }
-        );
-        assert_eq!(
-            entries[&FilePathId("current".to_string())].kind,
-            kin_model::SourceEntryKind::Symlink
-        );
-    }
-
-    #[test]
-    fn exact_source_persistence_and_preflight_load_each_content_hash_once() {
-        use kin_db::StorageBackend;
-        use kin_model::{
-            ArtifactDelta, ArtifactDeltaKind, AuthorId, ChangeStore, SemanticChange,
-            SemanticChangeId, Timestamp,
-        };
-
-        let repo_dir = tempfile::tempdir().unwrap();
-        let init = kin_core::init(repo_dir.path()).unwrap();
-        let storage = tempfile::tempdir().unwrap();
-        let repo_id = "deduplicated-exact-source";
-        let source_loads = Arc::new(AtomicU64::new(0));
-        let source_saves = Arc::new(AtomicU64::new(0));
-        let backend = CleanupFailOnceBackend::counting_source(
-            storage.path(),
-            Arc::clone(&source_loads),
-            Arc::clone(&source_saves),
-        );
-        let bytes = b"shared exact source bytes\n";
-        let digest = kin_blobs::digest_bytes(bytes);
-        backend
-            .inner
-            .save_source_blob(repo_id, digest, bytes)
-            .unwrap();
-        let hash = Hash256::from_bytes(digest);
-        let change = SemanticChange {
-            id: SemanticChangeId::from_hash(Hash256::from_bytes([0x93; 32])),
-            parents: vec![],
-            author: AuthorId::new("tester"),
-            message: "reuse one immutable source object".to_string(),
-            timestamp: Timestamp::now(),
-            entity_deltas: vec![],
-            relation_deltas: vec![],
-            artifact_deltas: vec![
-                ArtifactDelta {
-                    file_id: FilePathId("src/first.rs".to_string()),
-                    kind: ArtifactDeltaKind::AddedRegularFile,
-                    old_hash: None,
-                    new_hash: Some(hash),
-                },
-                ArtifactDelta {
-                    file_id: FilePathId("src/second.rs".to_string()),
-                    kind: ArtifactDeltaKind::AddedRegularFile,
-                    old_hash: None,
-                    new_hash: Some(hash),
-                },
-            ],
-            projected_files: vec![],
-            spec_link: None,
-            evidence: vec![],
-            risk_summary: None,
-            authored_on: None,
-        };
-        let state =
-            DaemonState::open_with_backend(init.layout, Box::new(backend), repo_id, None).unwrap();
-        state.graph.create_change(&change).unwrap();
-
-        source_loads.store(0, Ordering::SeqCst);
-        source_saves.store(0, Ordering::SeqCst);
-        state
-            .persist_exact_source_objects(
-                state.storage_backend.as_deref().unwrap(),
-                repo_id,
-                std::iter::once(&change),
-            )
-            .unwrap();
-        assert_eq!(source_loads.load(Ordering::SeqCst), 1);
-        assert_eq!(source_saves.load(Ordering::SeqCst), 0);
-
-        source_loads.store(0, Ordering::SeqCst);
-        state
-            .preflight_exact_source_tree(&state.graph, &change.id)
-            .unwrap();
-        assert_eq!(source_loads.load(Ordering::SeqCst), 1);
-
-        state.blobs.write(bytes).unwrap();
-        source_loads.store(0, Ordering::SeqCst);
-        source_saves.store(0, Ordering::SeqCst);
-        state
-            .persist_exact_source_objects(
-                state.storage_backend.as_deref().unwrap(),
-                repo_id,
-                std::iter::once(&change),
-            )
-            .unwrap();
-        assert_eq!(source_loads.load(Ordering::SeqCst), 0);
-        assert_eq!(source_saves.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn storage_backend_rejects_exact_graph_authority_when_source_bytes_are_missing() {
-        use kin_db::{LocalFileBackend, StorageBackend};
-        use kin_model::{
-            ArtifactDelta, ArtifactDeltaKind, AuthorId, ChangeStore, SemanticChange,
-            SemanticChangeId, Timestamp,
-        };
-
-        let repo_dir = tempfile::tempdir().unwrap();
-        let init = kin_core::init(repo_dir.path()).unwrap();
-        let storage = tempfile::tempdir().unwrap();
-        let repo_id = "missing-exact-source";
-        let state = DaemonState::open_with_backend(
-            init.layout,
-            Box::new(LocalFileBackend::new(storage.path())),
-            repo_id,
-            None,
-        )
-        .unwrap();
-        let missing_hash = Hash256::from_bytes([99; 32]);
-        state
-            .graph
-            .create_change(&SemanticChange {
-                id: SemanticChangeId::from_hash(Hash256::from_bytes([33; 32])),
-                parents: vec![],
-                author: AuthorId::new("tester"),
-                message: "missing source".to_string(),
-                timestamp: Timestamp::now(),
-                entity_deltas: vec![],
-                relation_deltas: vec![],
-                artifact_deltas: vec![ArtifactDelta {
-                    file_id: FilePathId("src/lib.rs".to_string()),
-                    kind: ArtifactDeltaKind::AddedRegularFile,
-                    old_hash: None,
-                    new_hash: Some(missing_hash),
-                }],
-                projected_files: vec![],
-                spec_link: None,
-                evidence: vec![],
-                risk_summary: None,
-                authored_on: None,
-            })
-            .unwrap();
-
-        let error = state
-            .save_snapshot_full()
-            .expect_err("graph authority must not name unavailable exact source bytes");
-        assert!(error
-            .to_string()
-            .contains("absent from both local and backend authority"));
-        assert_eq!(state.snapshot_generation.load(Ordering::SeqCst), 0);
-        assert!(LocalFileBackend::new(storage.path())
-            .load_snapshot(repo_id)
-            .unwrap()
-            .is_none());
-    }
-
-    #[test]
-    fn corrupt_backend_exact_source_preflight_preserves_graph_and_generation() {
-        use kin_db::{LocalFileBackend, StorageBackend};
-        use kin_model::{
-            ArtifactDelta, ArtifactDeltaKind, AuthorId, ChangeStore, SemanticChange,
-            SemanticChangeId, Timestamp,
-        };
-
-        let repo_dir = tempfile::tempdir().unwrap();
-        let init = kin_core::init(repo_dir.path()).unwrap();
-        let storage = tempfile::tempdir().unwrap();
-        let repo_id = "corrupt-exact-source";
-        let state = DaemonState::open_with_backend(
-            init.layout,
-            Box::new(CleanupFailOnceBackend::corrupt_source(
-                storage.path(),
-                b"wrong backend bytes".to_vec(),
-            )),
-            repo_id,
-            None,
-        )
-        .unwrap();
-        let expected_hash =
-            Hash256::from_bytes(kin_blobs::digest_bytes(b"expected exact source bytes"));
-        let change = SemanticChange {
-            id: SemanticChangeId::from_hash(Hash256::from_bytes([34; 32])),
-            parents: vec![],
-            author: AuthorId::new("tester"),
-            message: "corrupt backend source".to_string(),
-            timestamp: Timestamp::now(),
-            entity_deltas: vec![],
-            relation_deltas: vec![],
-            artifact_deltas: vec![ArtifactDelta {
-                file_id: FilePathId("src/lib.rs".to_string()),
-                kind: ArtifactDeltaKind::AddedRegularFile,
-                old_hash: None,
-                new_hash: Some(expected_hash),
-            }],
-            projected_files: vec![],
-            spec_link: None,
-            evidence: vec![],
-            risk_summary: None,
-            authored_on: None,
-        };
-
-        let error = state
-            .preflight_exact_source_change(&state.graph, &change)
-            .expect_err("backend bytes with the wrong digest must fail before graph mutation");
-        assert!(error.to_string().contains("do not match"));
-        assert!(state.graph.get_change(&change.id).unwrap().is_none());
-        assert_eq!(state.snapshot_generation.load(Ordering::SeqCst), 0);
-        assert!(LocalFileBackend::new(storage.path())
-            .load_snapshot(repo_id)
-            .unwrap()
-            .is_none());
     }
 
     #[test]
@@ -5860,12 +5395,7 @@ mod tests {
         let bytes = b"verified local source\n";
         let blob_hash = state.blobs.write(bytes).unwrap();
         let hash = Hash256::from_bytes(blob_hash.0);
-        let change = exact_source_change(
-            35,
-            "src/lib.rs",
-            kin_model::ArtifactDeltaKind::AddedRegularFile,
-            hash,
-        );
+        let change = exact_source_change("src/lib.rs", TreeEntry::blob(hash, false));
 
         state
             .preflight_exact_source_change(&state.graph, &change)
@@ -5887,12 +5417,7 @@ mod tests {
             } else {
                 Hash256::from_bytes(kin_blobs::digest_bytes(expected))
             };
-            let change = exact_source_change(
-                if corrupt { 36 } else { 37 },
-                "src/lib.rs",
-                kin_model::ArtifactDeltaKind::AddedRegularFile,
-                hash,
-            );
+            let change = exact_source_change("src/lib.rs", TreeEntry::blob(hash, false));
             let root_before = state.graph.compute_root_hash();
             let generation_before = state.snapshot_generation.load(Ordering::SeqCst);
 
@@ -5915,26 +5440,24 @@ mod tests {
         let cases = [
             (
                 ".kin/authority",
-                kin_model::ArtifactDeltaKind::AddedRegularFile,
+                false,
                 b"must not enter control state".as_slice(),
             ),
-            (
-                "src/escape",
-                kin_model::ArtifactDeltaKind::AddedSymlink,
-                b"../../outside".as_slice(),
-            ),
+            ("src/escape", true, b"../../outside".as_slice()),
         ];
 
-        for (index, (file_id, kind, bytes)) in cases.into_iter().enumerate() {
+        for (file_id, symlink, bytes) in cases {
             let repo_dir = tempfile::tempdir().unwrap();
             let init = kin_core::init(repo_dir.path()).unwrap();
             let state = test_state(init.layout, repo_dir.path());
             let blob_hash = state.blobs.write(bytes).unwrap();
             let change = exact_source_change(
-                38 + index as u8,
                 file_id,
-                kind,
-                Hash256::from_bytes(blob_hash.0),
+                if symlink {
+                    TreeEntry::symlink(Hash256::from_bytes(blob_hash.0))
+                } else {
+                    TreeEntry::blob(Hash256::from_bytes(blob_hash.0), false)
+                },
             );
             let root_before = state.graph.compute_root_hash();
             let generation_before = state.snapshot_generation.load(Ordering::SeqCst);
@@ -5960,18 +5483,15 @@ mod tests {
         let state = test_state(init.layout, repo_dir.path());
         let file_hash = Hash256::from_bytes(state.blobs.write(b"file bytes").unwrap().0);
         let child_hash = Hash256::from_bytes(state.blobs.write(b"child bytes").unwrap().0);
-        let mut change = exact_source_change(
-            40,
-            "pkg",
-            kin_model::ArtifactDeltaKind::AddedRegularFile,
-            file_hash,
-        );
-        change.artifact_deltas.push(kin_model::ArtifactDelta {
-            file_id: FilePathId::new("pkg/lib.rs"),
-            kind: kin_model::ArtifactDeltaKind::AddedRegularFile,
-            old_hash: None,
-            new_hash: Some(child_hash),
+        let mut change = exact_source_change("pkg", TreeEntry::blob(file_hash, false));
+        change.tree_deltas.push(TreeDelta::Added {
+            artifact_id: ArtifactId::new(),
+            new: LocatedEntry::new(
+                RepoPath::from_utf8("pkg/lib.rs").unwrap(),
+                TreeEntry::blob(child_hash, false),
+            ),
         });
+        change.id = kin_core::compute_semantic_change_id(&change).unwrap();
         let root_before = state.graph.compute_root_hash();
         let generation_before = state.snapshot_generation.load(Ordering::SeqCst);
 
@@ -5994,22 +5514,13 @@ mod tests {
         let init = kin_core::init(repo_dir.path()).unwrap();
         let state = test_state(init.layout, repo_dir.path());
         let child_hash = Hash256::from_bytes(state.blobs.write(b"parent child bytes").unwrap().0);
-        let parent = exact_source_change(
-            41,
-            "pkg/lib.rs",
-            kin_model::ArtifactDeltaKind::AddedRegularFile,
-            child_hash,
-        );
+        let parent = exact_source_change("pkg/lib.rs", TreeEntry::blob(child_hash, false));
         state.graph.create_change(&parent).unwrap();
 
         let file_hash = Hash256::from_bytes(state.blobs.write(b"incoming file bytes").unwrap().0);
-        let mut incoming = exact_source_change(
-            42,
-            "pkg",
-            kin_model::ArtifactDeltaKind::AddedRegularFile,
-            file_hash,
-        );
+        let mut incoming = exact_source_change("pkg", TreeEntry::blob(file_hash, false));
         incoming.parents = vec![parent.id];
+        incoming.id = kin_core::compute_semantic_change_id(&incoming).unwrap();
         let root_before = state.graph.compute_root_hash();
 
         let error = state
@@ -6022,41 +5533,32 @@ mod tests {
     }
 
     #[test]
-    fn local_exact_source_preflight_rejects_merge_parent_tree_collision() {
+    fn local_exact_source_preflight_uses_explicit_first_parent_merge_tree() {
         let repo_dir = tempfile::tempdir().unwrap();
         let init = kin_core::init(repo_dir.path()).unwrap();
         let state = test_state(init.layout, repo_dir.path());
         let child_hash = Hash256::from_bytes(state.blobs.write(b"left child bytes").unwrap().0);
-        let left = exact_source_change(
-            43,
-            "pkg/lib.rs",
-            kin_model::ArtifactDeltaKind::AddedRegularFile,
-            child_hash,
-        );
+        let left = exact_source_change("pkg/lib.rs", TreeEntry::blob(child_hash, false));
         let file_hash = Hash256::from_bytes(state.blobs.write(b"right file bytes").unwrap().0);
-        let right = exact_source_change(
-            44,
-            "pkg",
-            kin_model::ArtifactDeltaKind::AddedRegularFile,
-            file_hash,
-        );
+        let right = exact_source_change("pkg", TreeEntry::blob(file_hash, false));
         state.graph.create_change(&left).unwrap();
         state.graph.create_change(&right).unwrap();
 
         let mut merge = exact_source_change(
-            45,
             "merge-marker.txt",
-            kin_model::ArtifactDeltaKind::AddedRegularFile,
-            Hash256::from_bytes(state.blobs.write(b"merge marker").unwrap().0),
+            TreeEntry::blob(
+                Hash256::from_bytes(state.blobs.write(b"merge marker").unwrap().0),
+                false,
+            ),
         );
         merge.parents = vec![left.id, right.id];
+        merge.id = kin_core::compute_semantic_change_id(&merge).unwrap();
         let root_before = state.graph.compute_root_hash();
 
-        let error = state
+        state
             .preflight_exact_source_change(&state.graph, &merge)
-            .expect_err("all merge parents must participate in prospective tree validation");
+            .expect("the explicit first-parent merge result is the exact repository tree");
 
-        assert!(error.to_string().contains("not materializable"));
         assert!(state.graph.get_change(&merge.id).unwrap().is_none());
         assert_eq!(state.graph.compute_root_hash(), root_before);
     }
@@ -6276,223 +5778,127 @@ mod tests {
     }
 
     #[test]
-    fn default_local_save_restart_save_recovers_authority_generation() {
+    fn local_derived_save_never_creates_a_second_graph_authority() {
         let repo_dir = tempfile::tempdir().unwrap();
         let init = kin_core::init(repo_dir.path()).unwrap();
         let layout = init.layout;
+        let state = DaemonState::open(layout.clone()).unwrap();
+        let repository_generation = state.snapshot_generation.load(Ordering::SeqCst);
 
-        let first = DaemonState::open(layout.clone()).unwrap();
-        let initial_generation = first.snapshot_generation.load(Ordering::SeqCst);
-        first
+        state
             .graph
-            .upsert_entity(&test_entity("first_local", "src/first.rs"))
+            .upsert_entity(&test_entity("derived_only", "src/derived.rs"))
             .unwrap();
-        first.save_snapshot().unwrap();
-        assert_eq!(
-            first.snapshot_generation.load(Ordering::SeqCst),
-            initial_generation + 1
-        );
-        drop(first);
+        state.save_snapshot().unwrap();
 
-        let second = DaemonState::open(layout.clone()).unwrap();
         assert_eq!(
-            second.snapshot_generation.load(Ordering::SeqCst),
-            initial_generation + 1
+            state.snapshot_generation.load(Ordering::SeqCst),
+            repository_generation
         );
-        second
-            .graph
-            .upsert_entity(&test_entity("second_local", "src/second.rs"))
-            .unwrap();
-        second.save_snapshot().unwrap();
-        assert_eq!(
-            second.snapshot_generation.load(Ordering::SeqCst),
-            initial_generation + 2
-        );
-        drop(second);
-
-        let reopened = DaemonState::open(layout.clone()).unwrap();
-        assert_eq!(
-            reopened.snapshot_generation.load(Ordering::SeqCst),
-            initial_generation + 2
+        assert!(!state.graph.has_unpersisted_changes());
+        assert!(
+            !layout.kindb_snapshot_path().exists(),
+            "local derived persistence must never recreate graph.kndb authority"
         );
         assert_eq!(
-            DaemonState::read_generation_marker(&layout),
-            initial_generation + 2
-        );
-        let names: HashSet<_> = reopened
-            .graph
-            .list_all_entities()
+            RepositoryAuthorityManager::open(
+                init.repository_id,
+                Arc::new(LocalFileBackend::new(layout.kindb_dir())),
+            )
             .unwrap()
-            .into_iter()
-            .map(|entity| entity.name)
-            .collect();
-        assert_eq!(names.len(), 2);
-        assert!(names.contains("first_local"));
-        assert!(names.contains("second_local"));
+            .read_authority()
+            .roots()
+            .generation,
+            repository_generation
+        );
     }
 
     #[test]
-    fn default_local_force_full_rejects_stale_daemon_generation() {
+    fn local_derived_save_rejects_an_unadmitted_exact_tree() {
         let repo_dir = tempfile::tempdir().unwrap();
         let init = kin_core::init(repo_dir.path()).unwrap();
         let layout = init.layout;
-        let snapshot_path = layout.kindb_snapshot_path();
         let state = DaemonState::open(layout.clone()).unwrap();
-        let stale_generation = state.snapshot_generation.load(Ordering::SeqCst);
-
-        let external = kin_db::InMemoryGraph::new();
-        let external_entity = test_entity("external_writer", "src/external.rs");
-        external.upsert_entity(&external_entity).unwrap();
-        let (_, external_generation) =
-            kin_db::SnapshotManager::save_graph_with_expected_generation(
-                &snapshot_path,
-                &external,
-                stale_generation,
-            )
+        let body_hash = Hash256::from_bytes(state.blobs.write(b"services: {}\n").unwrap().0);
+        state
+            .graph
+            .apply_transaction_delta(&kin_model::TransactionDelta {
+                tree_deltas: vec![TreeDelta::Added {
+                    artifact_id: ArtifactId::new(),
+                    new: LocatedEntry::new(
+                        RepoPath::from_utf8("compose.yaml").unwrap(),
+                        TreeEntry::blob(body_hash, false),
+                    ),
+                }],
+                ..kin_model::TransactionDelta::default()
+            })
             .unwrap();
-        assert_eq!(external_generation, stale_generation + 1);
 
-        let stale_entity = test_entity("stale_daemon", "src/stale.rs");
-        state.graph.upsert_entity(&stale_entity).unwrap();
         let error = state
-            .save_snapshot_full()
-            .expect_err("stale full daemon writer must lose the generation CAS");
-        assert!(error.to_string().contains(&format!(
-            "expected {stale_generation}, found {external_generation}"
-        )));
+            .save_snapshot()
+            .expect_err("derived persistence cannot admit file truth implicitly");
+        assert!(error
+            .to_string()
+            .contains("live exact tree does not match workspace authority"));
+        assert!(state.graph.has_unpersisted_changes());
+        assert!(!layout.kindb_snapshot_path().exists());
+    }
+
+    #[test]
+    fn local_repository_receipt_finalizes_without_graph_kndb() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let layout = init.layout;
+        let state = DaemonState::open(layout.clone()).unwrap();
+        let body_hash = Hash256::from_bytes(state.blobs.write(b"services: {}\n").unwrap().0);
+        let artifact = ResolvedArtifact::new(
+            ArtifactId::new(),
+            RepoPath::from_utf8("compose.yaml").unwrap(),
+            TreeEntry::blob(body_hash, false),
+        );
+        let desired = ResolvedTree::from_artifacts([artifact.clone()]).unwrap();
+        let admission = crate::repository_commit::publish_workspace_tree(
+            state.blobs.as_ref(),
+            &crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(&state)
+                .unwrap(),
+            &desired,
+            kin_model::OperationId::new(),
+            kin_model::AuthorId::new("dogfood"),
+        )
+        .unwrap()
+        .unwrap();
+        state
+            .record_repository_authority_commit(admission.receipt.generation)
+            .unwrap();
+        state
+            .graph
+            .apply_transaction_delta(&kin_model::TransactionDelta {
+                tree_deltas: vec![TreeDelta::Added {
+                    artifact_id: artifact.artifact_id,
+                    new: artifact.located_entry(),
+                }],
+                ..kin_model::TransactionDelta::default()
+            })
+            .unwrap();
+        state.save_snapshot().unwrap();
+
         assert_eq!(
             state.snapshot_generation.load(Ordering::SeqCst),
-            stale_generation,
-            "failed stale save must not advance its in-memory cursor"
+            admission.receipt.generation
         );
+        assert_eq!(
+            DaemonState::read_generation_marker(&layout),
+            admission.receipt.generation
+        );
+        assert!(!layout.kindb_snapshot_path().exists());
         drop(state);
 
         let reopened = DaemonState::open(layout).unwrap();
+        assert_eq!(reopened.graph.resolved_tree(), desired);
         assert_eq!(
             reopened.snapshot_generation.load(Ordering::SeqCst),
-            external_generation
+            admission.receipt.generation
         );
-        assert!(reopened
-            .graph
-            .get_entity(&external_entity.id)
-            .unwrap()
-            .is_some());
-        assert!(reopened
-            .graph
-            .get_entity(&stale_entity.id)
-            .unwrap()
-            .is_none());
-    }
-
-    #[test]
-    fn default_local_reopen_heals_crash_between_authority_commit_and_finalization() {
-        let repo_dir = tempfile::tempdir().unwrap();
-        let init = kin_core::init(repo_dir.path()).unwrap();
-        let layout = init.layout;
-        let snapshot_path = layout.kindb_snapshot_path();
-        let index_path = snapshot_path.with_extension("kidx");
-
-        let state = DaemonState::open(layout.clone()).unwrap();
-        let base_generation = state.snapshot_generation.load(Ordering::SeqCst);
-        let entity = test_entity("authority_only", "src/authority.rs");
-        state.graph.upsert_entity(&entity).unwrap();
-
-        // Commit graph authority directly, then simulate process death before
-        // DaemonState can publish either its marker or read index. Removing the
-        // canonical compatibility projection additionally proves discovery and
-        // reopen follow the atomic authority sidecar.
-        let (_, generation) = kin_db::SnapshotManager::save_graph_with_generation(
-            &snapshot_path,
-            state.graph.as_ref(),
-        )
-        .unwrap();
-        assert_eq!(generation, base_generation + 1);
-        assert_eq!(
-            DaemonState::read_generation_marker(&layout),
-            base_generation
-        );
-        assert_eq!(
-            kin_db::ReadIndex::load(&index_path).unwrap().entity_count,
-            0
-        );
-        drop(state);
-        std::fs::remove_file(&snapshot_path).unwrap();
-
-        let reopened = DaemonState::open(layout.clone())
-            .expect("validated local authority must heal derived artifacts before serving");
-        assert_eq!(
-            reopened.snapshot_generation.load(Ordering::SeqCst),
-            base_generation + 1
-        );
-        assert_eq!(
-            DaemonState::read_generation_marker(&layout),
-            base_generation + 1
-        );
-        assert_eq!(
-            kin_db::ReadIndex::load(&index_path).unwrap().entity_count,
-            1
-        );
-        assert_eq!(
-            reopened.graph.get_entity(&entity.id).unwrap().unwrap().name,
-            "authority_only"
-        );
-    }
-
-    #[test]
-    fn default_local_finalization_rejects_newer_external_authority() {
-        let repo_dir = tempfile::tempdir().unwrap();
-        let init = kin_core::init(repo_dir.path()).unwrap();
-        let layout = init.layout;
-        let snapshot_path = layout.kindb_snapshot_path();
-        let index_path = snapshot_path.with_extension("kidx");
-
-        let state = DaemonState::open(layout.clone()).unwrap();
-        state
-            .graph
-            .upsert_entity(&test_entity("daemon_generation", "src/daemon.rs"))
-            .unwrap();
-        state.save_snapshot().unwrap();
-        let daemon_generation = state.snapshot_generation.load(Ordering::SeqCst);
-        let daemon_index_count = kin_db::ReadIndex::load(&index_path).unwrap().entity_count;
-
-        let external_graph = {
-            let snapshot = kin_db::SnapshotManager::open_read_only(&snapshot_path).unwrap();
-            snapshot.graph()
-        };
-        external_graph
-            .upsert_entity(&test_entity("external_generation", "src/external.rs"))
-            .unwrap();
-        let (_, external_generation) =
-            kin_db::SnapshotManager::save_graph_with_expected_generation(
-                &snapshot_path,
-                external_graph.as_ref(),
-                daemon_generation,
-            )
-            .unwrap();
-        assert_eq!(external_generation, daemon_generation + 1);
-
-        state
-            .post_commit_finalization_pending
-            .store(true, Ordering::SeqCst);
-        let error = state
-            .finalize_committed_generation(daemon_generation)
-            .expect_err("derived artifacts must not mix two authority generations");
-        assert!(error.to_string().contains(&format!(
-            "expected generation {daemon_generation}, recovered {external_generation}"
-        )));
-        assert_eq!(
-            DaemonState::read_generation_marker(&layout),
-            daemon_generation,
-            "a failed stale finalization must not publish the newer authority under the old cursor"
-        );
-        assert_eq!(
-            kin_db::ReadIndex::load(&index_path).unwrap().entity_count,
-            daemon_index_count,
-            "a failed stale finalization must preserve the last coherent canonical index"
-        );
-        assert!(state
-            .post_commit_finalization_pending
-            .load(Ordering::SeqCst));
     }
 
     #[test]
@@ -6835,8 +6241,6 @@ mod tests {
         let layout = init.layout;
         let index_path = layout.kindb_snapshot_path().with_extension("kidx");
         std::fs::write(&index_path, b"stale canonical index").unwrap();
-        let legacy_generation = layout.kindb_dir().join("generation");
-        std::fs::write(&legacy_generation, "0").unwrap();
         let state = test_state(layout.clone(), repo_dir.path());
 
         state.finalize_loaded_locate_generation(7).unwrap();
@@ -6846,64 +6250,6 @@ mod tests {
             "a partial locate graph must never replace or retain a canonical full read index"
         );
         assert_eq!(DaemonState::read_generation_marker(&layout), 7);
-        assert_eq!(
-            std::fs::read_to_string(legacy_generation).unwrap(),
-            "0",
-            "locate-only freshness must not mutate KinDB's legacy projection marker"
-        );
-    }
-
-    #[test]
-    fn sequential_saves_leave_consistent_kndb_kidx_pair() {
-        let repo_dir = tempfile::tempdir().unwrap();
-        let init = kin_core::init(repo_dir.path()).unwrap();
-        let layout = init.layout;
-        let kndb_path = layout.kindb_snapshot_path();
-        let kidx_path = kndb_path.with_extension("kidx");
-        let legacy_projection_generation = layout.kindb_dir().join("generation");
-        std::fs::write(&legacy_projection_generation, "0").unwrap();
-        let state = test_state(layout.clone(), repo_dir.path());
-        state
-            .graph
-            .upsert_entity(&test_entity("paired_fn", "src/lib.rs"))
-            .unwrap();
-
-        // Two back-to-back saves (as the persist loop + flush would issue) must
-        // each leave both halves of the on-disk pair present and reloadable —
-        // no torn kndb without its kidx, and no kidx without its kndb.
-        state.save_snapshot().unwrap();
-        assert_eq!(
-            std::fs::read_to_string(&legacy_projection_generation)
-                .unwrap()
-                .trim(),
-            "0"
-        );
-        state.save_snapshot().unwrap();
-
-        assert_eq!(
-            DaemonState::read_generation_marker(&layout),
-            2,
-            "the daemon freshness marker must follow the durable authority head"
-        );
-        assert_eq!(
-            std::fs::read_to_string(&legacy_projection_generation)
-                .unwrap()
-                .trim(),
-            "0",
-            "a delta must not mislabel the legacy full-snapshot projection as current"
-        );
-
-        assert!(kndb_path.exists(), "graph.kndb must exist after save");
-        assert!(kidx_path.exists(), "graph.kidx must exist after save");
-
-        // The kndb must reload as a valid snapshot exposing the saved entity.
-        let mgr = kin_db::SnapshotManager::open(&kndb_path).unwrap();
-        let reloaded = mgr.graph();
-        let entities = reloaded.list_all_entities().unwrap();
-        assert!(
-            entities.iter().any(|e| e.name == "paired_fn"),
-            "reloaded snapshot must contain the saved entity"
-        );
     }
 
     #[test]
@@ -6957,12 +6303,7 @@ mod tests {
 
     #[cfg(feature = "embeddings")]
     #[test]
-    fn flush_embed_progress_persists_snapshot_and_reports_pending() {
-        // The incremental flush persists the snapshot (full bundle on
-        // the first write) and returns the persisted resume count. With no
-        // embedder run the lone entity stays unembedded, so `pending` reflects it
-        // — proving the flush composes the graph-delta + sidecar write and reads
-        // coverage from persisted graph-vs-index truth.
+    fn flush_embed_progress_persists_only_vector_sidecar_and_reports_pending() {
         let repo_dir = tempfile::tempdir().unwrap();
         let init = kin_core::init(repo_dir.path()).unwrap();
         let state = Arc::new(test_state(init.layout, repo_dir.path()));
@@ -6970,12 +6311,31 @@ mod tests {
             .graph
             .upsert_entity(&test_entity("embed_me", "src/lib.rs"))
             .unwrap();
+        let vector_path = state.layout.kindb_vector_index_path();
+        let descriptor = kin_db::vector::IndexDescriptor {
+            model_id: Some("fixture-embedder-v1".to_string()),
+            graph_root: Some("fixture-root".to_string()),
+        };
+        let vectors = kin_db::VectorIndex::new(4).unwrap();
+        vectors.set_descriptor(descriptor.clone());
+        vectors.save(&vector_path).unwrap();
+        assert!(matches!(
+            state
+                .graph
+                .load_vector_index_compatible(&vector_path, &descriptor),
+            kin_db::vector::VectorIndexLoad::Loaded(0)
+        ));
+        std::fs::remove_file(&vector_path).unwrap();
         state.graph.queue_missing_for_embedding();
 
         let pending = state.flush_embed_progress().expect("flush must succeed");
         assert!(
-            state.layout.kindb_snapshot_path().exists(),
-            "flush must persist the snapshot bundle"
+            !state.layout.kindb_snapshot_path().exists(),
+            "vector progress must not recreate graph.kndb authority"
+        );
+        assert!(
+            state.layout.kindb_vector_index_path().exists(),
+            "flush must persist the derived vector sidecar"
         );
         assert!(
             pending >= 1,
@@ -7009,16 +6369,9 @@ mod tests {
             .expect("seed remote authority at the local authority generation");
         state.graph.queue_missing_for_embedding();
 
-        let local_before = kin_db::SnapshotManager::open_read_only(snapshot_path.as_path())
-            .expect("kin init creates a local authority fixture");
-        let local_generation_before = local_before.generation();
-        let local_entities_before = local_before.graph().entity_count();
-        drop(local_before);
-        assert_eq!(
-            state.snapshot_generation.load(Ordering::SeqCst),
-            local_generation_before,
-            "the fixture must align generations so an unguarded local flush would mutate"
-        );
+        let vector_path = snapshot_path.with_extension("kvec");
+        let vector_before = std::fs::read(&vector_path).ok();
+        let generation_before = state.snapshot_generation.load(Ordering::SeqCst);
         let error = state
             .flush_embed_progress()
             .expect_err("remote authority must reject local embed checkpoints");
@@ -7028,17 +6381,15 @@ mod tests {
             "{message}"
         );
         assert!(
-            message.contains("refusing to write a local SnapshotManager checkpoint"),
+            message.contains("refusing a local derived checkpoint"),
             "{message}"
         );
         assert_eq!(
             state.snapshot_generation.load(Ordering::SeqCst),
-            local_generation_before
+            generation_before
         );
-        let local_after = kin_db::SnapshotManager::open_read_only(snapshot_path.as_path())
-            .expect("guard must preserve local authority");
-        assert_eq!(local_after.generation(), local_generation_before);
-        assert_eq!(local_after.graph().entity_count(), local_entities_before);
+        assert!(!snapshot_path.exists());
+        assert_eq!(std::fs::read(vector_path).ok(), vector_before);
     }
 
     #[test]
@@ -7065,6 +6416,7 @@ mod tests {
                 scope: "file:src/lib.rs".to_string(),
                 state: "active".to_string(),
                 staged_operations: Vec::new(),
+                commit_payload_hash: None,
             },
         );
         write_persisted_mcp_transactions(&layout, &store);

@@ -13,8 +13,11 @@
 //! to its class; a call through a derived receiver reaches the base-declared
 //! method and nothing else; and an unresolvable receiver still fans out weakly.
 
-use kin_index::{link_cross_file, link_cross_file_incremental, FileParseData, IncrementalLinker};
-use kin_model::{Entity, EntityId, FilePathId, Relation, RelationKind};
+use kin_index::{
+    link_cross_file as link_cross_file_with_identities, link_cross_file_incremental, FileParseData,
+    IncrementalLinker,
+};
+use kin_model::{ArtifactId, Entity, EntityId, FilePathId, Relation, RelationKind};
 use kin_parser::{CppAdapter, LanguageAdapter};
 
 fn parse_cpp(file_path: &str, source: &str) -> FileParseData {
@@ -64,6 +67,15 @@ fn call_confidence(relations: &[Relation], src: EntityId, dst: EntityId) -> Opti
         .map(|r| r.confidence)
 }
 
+fn link_cross_file(files: &[FileParseData]) -> Vec<Relation> {
+    let artifact_ids = files
+        .iter()
+        .map(|file| (file.file_path.clone(), ArtifactId::new()))
+        .collect();
+    link_cross_file_with_identities(files, &artifact_ids)
+        .expect("every fixture file has an explicitly assigned artifact identity")
+}
+
 /// Link `files` through both the batch and incremental linkers, assert the two
 /// agree on every `Calls` edge, and return the batch edges. Receiver-scoped
 /// resolution has a batch tier and an incremental twin, so every scenario is
@@ -73,9 +85,10 @@ fn link_both(files: &[FileParseData]) -> Vec<Relation> {
 
     let mut linker = IncrementalLinker::new();
     for f in files {
-        linker.add_file(&f.file_path, &f.entities);
+        linker.add_file(&f.file_path, ArtifactId::new(), &f.entities);
     }
-    let incremental = link_cross_file_incremental(files, &linker);
+    let incremental = link_cross_file_incremental(files, &linker)
+        .expect("every fixture file has an explicitly assigned artifact identity");
 
     let call_set = |rels: &[Relation]| -> std::collections::HashSet<(EntityId, EntityId)> {
         rels.iter()

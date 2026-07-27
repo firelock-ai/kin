@@ -90,6 +90,8 @@ tree-sitter-hcl = "1.1"
 
 # Git interop
 gix = { version = "0.84", default-features = false, features = ["max-performance-safe", "sha1"] }
+gix-ignore = "0.21"
+bstr = "1"
 
 # HTTP / MCP
 axum = "0.8"
@@ -120,7 +122,7 @@ pretty_assertions = "1"
 serial_test = "3"
 
 # Internal crates
-kin-model = { version = "=0.4.0", registry = "kin" }
+kin-model = { version = "=0.6.0", registry = "kin" }
 kin-blobs = { version = "0.1.1", registry = "kin" }
 kin-core = { path = "crates/kin-core" }
 kin-parser = { path = "crates/kin-parser" }
@@ -142,13 +144,13 @@ kin-daemon = { path = "crates/kin-daemon" }
 kin-mcp = { path = "crates/kin-mcp" }
 kin-spine = { path = "crates/kin-spine" }
 kin-registry = { path = "crates/kin-registry" }
-kin-lsp = { version = "0.4.0", registry = "kin" }
+kin-lsp = { version = "0.6.0", registry = "kin" }
 # Cross-platform base: NO "metal" here. `[workspace.dependencies]` entries cannot be
 # `[target.'cfg(...)']`-gated, so listing "metal" here forces the macOS-only kin-infer/metal
 # backend on every target (incl. Linux, where it cannot compile). Metal is re-enabled
 # additively on macOS via a `[target.'cfg(target_os = "macos")'.dependencies]` block in the
 # binary/runtime crates (kin-cli, kin-daemon). Feature unification makes that additive.
-kin-db = { version = "0.4.0", registry = "kin", default-features = false }
+kin-db = { version = "0.6.1", registry = "kin", default-features = false }
 kin-vfs-core = { version = "0.1.5", registry = "kin" }
 
 [profile.release]

@@ -165,10 +165,9 @@ async fn wait_for_path_removed(path: &Path, what: &str, timeout: Duration) {
     }
 }
 
-async fn create_branch(repo_root: &Path, port: u16, name: &str) {
+async fn record_graph_mutation(repo_root: &Path, port: u16, action: &str) {
     let client = reqwest::Client::new();
-    let url = format!("http://127.0.0.1:{port}/graph/branches");
-    let genesis = kin_core::build_genesis_change().id.to_string();
+    let url = format!("http://127.0.0.1:{port}/graph/mutations");
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut backoff = Duration::from_millis(50);
 
@@ -183,8 +182,11 @@ async fn create_branch(repo_root: &Path, port: u16, name: &str) {
             .map(|contents| contents.trim().to_string())
             .filter(|token| !token.is_empty());
         let mut request = client.post(&url).json(&serde_json::json!({
-            "name": name,
-            "head": genesis
+            "audit_events": [{
+                "action": action,
+                "target_scope": null,
+                "details": "chaos recovery dirty-state fixture"
+            }]
         }));
         if let Some(token) = token {
             request = request.bearer_auth(token);
@@ -338,7 +340,7 @@ async fn daemon_exits_after_dirty_repo_control_dir_is_removed() {
     let port = read_published_port(&mut child, repo.path()).await;
 
     wait_for_serving(&mut child, port).await;
-    create_branch(repo.path(), port, "dirty-before-delete").await;
+    record_graph_mutation(repo.path(), port, "dirty-before-delete").await;
 
     std::fs::remove_dir_all(repo.path().join(".kin")).unwrap();
 

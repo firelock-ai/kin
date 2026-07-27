@@ -76,7 +76,7 @@ pub struct SpineXrefAuthorityAnchor {
     pub entity_id: EntityId,
 }
 
-/// Versioned wire response for `GET /v1/spine/xref`.
+/// Versioned wire response for `GET /spine/xref`.
 ///
 /// `edges` remains the canonical topology payload. `entities` is an additive,
 /// metadata-only sidecar that lets clients render useful cross-repo references

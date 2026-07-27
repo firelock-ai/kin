@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 
+use kin_core::LocalRepositoryAuthorityBinding;
 use kin_model::graph::GraphStore;
 use kin_model::ids::SemanticChangeId;
 use kin_review::{format_review, SemanticReview};
@@ -214,9 +215,13 @@ something — unparsed files, missing spans, an empty impact signal — the repo
 `evidence_gaps` instead of passing silently. Reach for it to evaluate an AI-authored \
 change before merge, or to feed a merge-gate dashboard.";
 
-fn resolve_shadow_ref<G: GraphStore>(store: &G, reference: &str) -> Result<SemanticChangeId> {
+fn resolve_shadow_ref<G: GraphStore>(
+    store: &G,
+    reference: &str,
+    repository_authority: Option<&LocalRepositoryAuthorityBinding>,
+) -> Result<SemanticChangeId> {
     if let Some(branch_name) = reference.strip_prefix("branch:") {
-        return resolve_shadow_branch(store, branch_name);
+        return resolve_shadow_branch(store, branch_name, repository_authority);
     }
 
     if let Some(change_ref) = reference
@@ -227,65 +232,86 @@ fn resolve_shadow_ref<G: GraphStore>(store: &G, reference: &str) -> Result<Seman
     }
 
     if let Some(git_oid) = reference.strip_prefix("git:") {
-        return resolve_shadow_git(store, git_oid);
-    }
-
-    if let Ok(Some(branch)) = store.get_branch(&kin_model::BranchName::new(reference)) {
-        return Ok(branch.head);
+        return resolve_shadow_git(store, git_oid, repository_authority);
     }
 
     if reference.len() == 40 {
-        return resolve_shadow_git(store, reference);
+        return resolve_shadow_git(store, reference, repository_authority);
     }
 
-    resolve_shadow_change(store, reference)
+    if reference.len() == 64 {
+        return resolve_shadow_change(store, reference);
+    }
+
+    resolve_shadow_branch(store, reference, repository_authority)
 }
 
-fn resolve_shadow_branch<G: GraphStore>(store: &G, branch_name: &str) -> Result<SemanticChangeId> {
-    match store
-        .get_branch(&kin_model::BranchName::new(branch_name))
-        .map_err(McpError::graph)?
-    {
-        Some(branch) => Ok(branch.head),
-        None => Err(McpError::InvalidParams(format!(
-            "branch '{}' not found in the graph",
-            branch_name
-        ))),
-    }
+fn resolve_shadow_branch<G: GraphStore>(
+    store: &G,
+    branch_name: &str,
+    repository_authority: Option<&LocalRepositoryAuthorityBinding>,
+) -> Result<SemanticChangeId> {
+    let authority = super::repository_authority::ActiveRepositoryAuthority::open(
+        repository_authority.ok_or_else(|| {
+            McpError::Context(
+                "graph authority gap: shadow ref resolution requires a startup-pinned local \
+                 repository authority binding"
+                    .to_string(),
+            )
+        })?,
+    )?;
+    let ref_name = super::repository_authority::parse_branch_ref(branch_name)?;
+    let change_id = authority.resolve_named_ref(&ref_name)?;
+    ensure_shadow_change(store, change_id, branch_name)
 }
 
 fn resolve_shadow_change<G: GraphStore>(store: &G, change_ref: &str) -> Result<SemanticChangeId> {
     let change_id = parse_change_id(change_ref)?;
+    ensure_shadow_change(store, change_id, change_ref)
+}
+
+fn ensure_shadow_change<G: GraphStore>(
+    store: &G,
+    change_id: SemanticChangeId,
+    reference: &str,
+) -> Result<SemanticChangeId> {
     match store.get_change(&change_id).map_err(McpError::graph)? {
         Some(_) => Ok(change_id),
         None => Err(McpError::InvalidParams(format!(
-            "change '{}' not found in the graph",
-            change_ref
+            "change '{}' resolved to {}, which is not materialized in graph authority",
+            reference, change_id
         ))),
     }
 }
 
-fn resolve_shadow_git<G: GraphStore>(store: &G, git_oid: &str) -> Result<SemanticChangeId> {
-    let change_id = kin_git::semantic_change_id_from_git_oid_hex(git_oid)
-        .map_err(|e| McpError::InvalidParams(format!("invalid git commit '{}': {}", git_oid, e)))?;
-    match store.get_change(&change_id).map_err(McpError::graph)? {
-        Some(_) => Ok(change_id),
-        None => Err(McpError::InvalidParams(format!(
-            "imported Git commit '{}' is not in the graph; import its history first (e.g. run \
-             `kin review shadow` in the repo, which hydrates imported Git refs)",
-            git_oid
-        ))),
-    }
+fn resolve_shadow_git<G: GraphStore>(
+    store: &G,
+    git_oid: &str,
+    repository_authority: Option<&LocalRepositoryAuthorityBinding>,
+) -> Result<SemanticChangeId> {
+    let oid = super::repository_authority::parse_git_object_id(git_oid)?;
+    let authority = super::repository_authority::ActiveRepositoryAuthority::open(
+        repository_authority.ok_or_else(|| {
+            McpError::Context(
+                "graph authority gap: Git alias resolution requires a startup-pinned local \
+                 repository authority binding"
+                    .to_string(),
+            )
+        })?,
+    )?;
+    let change_id = authority.resolve_git_oid(oid)?;
+    ensure_shadow_change(store, change_id, git_oid)
 }
 
 pub fn handle_shadow_gate_report<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
+    repository_authority: Option<&LocalRepositoryAuthorityBinding>,
 ) -> Result<ToolCallResult> {
     let base_ref = get_string_param(args, "base")?;
     let head_ref = get_string_param(args, "head")?;
-    let resolved_base = resolve_shadow_ref(store, &base_ref)?;
-    let resolved_head = resolve_shadow_ref(store, &head_ref)?;
+    let resolved_base = resolve_shadow_ref(store, &base_ref, repository_authority)?;
+    let resolved_head = resolve_shadow_ref(store, &head_ref, repository_authority)?;
 
     let request = kin_review::ShadowRequest {
         base_ref,
@@ -940,6 +966,7 @@ fn parse_identity_arg(
 
 #[cfg(test)]
 mod tests {
+    use super::super::tests::with_empty_test_repository;
     use super::*;
 
     #[test]
@@ -997,7 +1024,10 @@ mod tests {
         args.insert("base".into(), serde_json::json!("branch:missing"));
         args.insert("head".into(), serde_json::json!("branch:missing"));
 
-        let err = handle_shadow_gate_report(&args, &store).unwrap_err();
+        let err = with_empty_test_repository(|authority| {
+            handle_shadow_gate_report(&args, &store, Some(authority))
+        })
+        .unwrap_err();
         assert!(
             err.to_string().contains("not found"),
             "unknown branch must error, got: {err}"
@@ -1017,9 +1047,12 @@ mod tests {
             serde_json::json!("2222222222222222222222222222222222222222"),
         );
 
-        let err = handle_shadow_gate_report(&args, &store).unwrap_err();
+        let err = with_empty_test_repository(|authority| {
+            handle_shadow_gate_report(&args, &store, Some(authority))
+        })
+        .unwrap_err();
         assert!(
-            err.to_string().contains("not in the graph"),
+            err.to_string().contains("no imported repository alias"),
             "unimported git sha must error, got: {err}"
         );
     }

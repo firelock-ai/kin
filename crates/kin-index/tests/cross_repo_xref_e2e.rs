@@ -11,10 +11,10 @@
 
 use std::collections::HashSet;
 
-use kin_index::{link_cross_file, FileParseData};
+use kin_index::{link_cross_file as link_cross_file_with_identities, FileParseData};
 use kin_model::{
-    Entity, EntityId, EntityKind, EntityRole, FilePathId, FingerprintAlgorithm, Hash256,
-    SemanticFingerprint,
+    ArtifactId, Entity, EntityId, EntityKind, EntityRole, FilePathId, FingerprintAlgorithm,
+    Hash256, SemanticFingerprint,
 };
 use kin_parser::AdapterRegistry;
 use kin_spine::{
@@ -60,6 +60,15 @@ fn fingerprint() -> SemanticFingerprint {
         equivalence_hash: kin_model::Hash256::from_bytes([0; 32]),
         stability_score: 1.0,
     }
+}
+
+fn link_cross_file(files: &[FileParseData]) -> Vec<kin_model::Relation> {
+    let artifact_ids = files
+        .iter()
+        .map(|file| (file.file_path.clone(), ArtifactId::new()))
+        .collect();
+    link_cross_file_with_identities(files, &artifact_ids)
+        .expect("every fixture file has an explicitly assigned artifact identity")
 }
 
 #[test]

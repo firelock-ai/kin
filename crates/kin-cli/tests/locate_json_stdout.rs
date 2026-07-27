@@ -4,9 +4,8 @@
 use serial_test::serial;
 use std::env;
 use std::fs;
-use std::time::Duration;
 #[cfg(unix)]
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tempfile::tempdir;
 
 mod common;
@@ -24,6 +23,42 @@ fn wait_for_pid_exit(pid: u32) {
         std::thread::sleep(Duration::from_millis(100));
     }
     panic!("process {pid} did not exit");
+}
+
+/// Commit everything in the worktree so `kin init` sees a clean Git migration
+/// source. Kin refuses to admit a repository whose worktree still holds
+/// untracked, non-ignored paths, because those bytes have no committed history
+/// to become graph-owned truth from.
+fn commit_worktree(repo: &std::path::Path, message: &str) {
+    let add = Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(repo)
+        .output()
+        .expect("git add");
+    assert!(
+        add.status.success(),
+        "git add failed: {}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+    let commit = Command::new("git")
+        .args([
+            "-c",
+            "user.name=kin-ci",
+            "-c",
+            "user.email=ci@kin.dev",
+            "commit",
+            "-q",
+            "-m",
+            message,
+        ])
+        .current_dir(repo)
+        .output()
+        .expect("git commit");
+    assert!(
+        commit.status.success(),
+        "git commit failed: {}",
+        String::from_utf8_lossy(&commit.stderr)
+    );
 }
 
 fn kin_command() -> Command {
@@ -58,6 +93,7 @@ fn locate_json_keeps_tracing_warnings_off_stdout() {
         "git init failed: {}",
         String::from_utf8_lossy(&git_init.stderr)
     );
+    commit_worktree(repo.path(), "seed");
 
     let init = kin_command()
         .arg("init")
@@ -136,11 +172,11 @@ fn locate_autostarts_daemon_when_available() {
         "git init failed: {}",
         String::from_utf8_lossy(&git_init.stderr)
     );
+    commit_worktree(repo.path(), "seed");
 
     let init = kin_command()
         .arg("init")
         .arg(".")
-        .arg("--no-lsp")
         .current_dir(repo.path())
         .output()
         .expect("run kin init");
@@ -217,6 +253,7 @@ fn locate_requires_daemon_by_default() {
         "git init failed: {}",
         String::from_utf8_lossy(&git_init.stderr)
     );
+    commit_worktree(repo.path(), "seed");
 
     let init = kin_command()
         .arg("init")
@@ -254,6 +291,17 @@ fn locate_requires_daemon_by_default() {
     );
 }
 
+/// Every `change <id>` line `kin log` prints, newest first. The oldest entry is
+/// the reachable root of the admitted history.
+fn logged_change_ids(stdout: &[u8]) -> Vec<String> {
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("change "))
+        .map(|id| id.trim().to_string())
+        .filter(|id| id.len() == 64 && id.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .collect()
+}
+
 #[test]
 #[serial]
 fn locate_ref_can_resolve_historical_files_from_the_public_cli() {
@@ -276,11 +324,22 @@ fn locate_ref_can_resolve_historical_files_from_the_public_cli() {
         "git init failed: {}",
         String::from_utf8_lossy(&git_init.stderr)
     );
+    commit_worktree(repo.path(), "seed");
+
+    // Both states are authored in the migration source, so `kin init` admits the
+    // whole closure at once and the historical change is repository authority
+    // from the first command that runs against it.
+    fs::remove_file(repo.path().join("src/lib.py")).expect("remove old source");
+    fs::write(
+        repo.path().join("src/current.py"),
+        "def current_handler(payload):\n    return payload * 2\n",
+    )
+    .expect("write renamed source");
+    commit_worktree(repo.path(), "rename handler");
 
     let init = kin_command()
         .arg("init")
         .arg(".")
-        .arg("--no-lsp")
         .current_dir(repo.path())
         .output()
         .expect("run kin init");
@@ -293,8 +352,6 @@ fn locate_ref_can_resolve_historical_files_from_the_public_cli() {
 
     let log = kin_command()
         .arg("log")
-        .arg("-n")
-        .arg("1")
         .current_dir(repo.path())
         .output()
         .expect("run kin log");
@@ -304,36 +361,16 @@ fn locate_ref_can_resolve_historical_files_from_the_public_cli() {
         String::from_utf8_lossy(&log.stdout),
         String::from_utf8_lossy(&log.stderr)
     );
-    let init_head = String::from_utf8_lossy(&log.stdout)
-        .lines()
-        .find_map(|line| line.trim().strip_prefix("Head: "))
-        .expect("log should print branch head")
-        .to_string();
-
-    fs::remove_file(repo.path().join("src/lib.py")).expect("remove old source");
-    fs::write(
-        repo.path().join("src/current.py"),
-        "def current_handler(payload):\n    return payload * 2\n",
-    )
-    .expect("write renamed source");
-
-    // Sleep briefly to ensure notify events propagate to the daemon before we run commit
-    std::thread::sleep(Duration::from_millis(250));
-
-    let commit = kin_command()
-        .arg("commit")
-        .arg("-m")
-        .arg("rename handler")
-        .arg("--quiet")
-        .current_dir(repo.path())
-        .output()
-        .expect("run kin commit");
-    assert!(
-        commit.status.success(),
-        "kin commit failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&commit.stdout),
-        String::from_utf8_lossy(&commit.stderr)
+    let logged = logged_change_ids(&log.stdout);
+    assert_eq!(
+        logged.len(),
+        2,
+        "kin log should print both admitted changes, got {logged:?}"
     );
+    let init_head = logged
+        .last()
+        .expect("admitted history has a reachable root")
+        .clone();
 
     let query = "Investigate legacy_handler in src/lib.py";
 
@@ -395,9 +432,15 @@ fn locate_ref_can_resolve_historical_files_from_the_public_cli() {
     );
 }
 
+/// Exact `kin init` admits the complete reachable Git closure atomically, so
+/// nothing is left for a ref-scoped query to hydrate later. This replaces the
+/// retired on-demand hydration contract with its inverse: the migration source
+/// is detached after init and historical refs must still resolve from graph
+/// truth alone, while a ref that was never admitted must fail as an explicit
+/// graph gap rather than triggering a filesystem repair.
 #[test]
 #[serial]
-fn locate_ref_hydrates_missing_imported_git_history_on_demand() {
+fn locate_ref_resolves_admitted_history_without_hydrating_from_git() {
     let repo = tempdir().expect("temp repo");
     fs::create_dir_all(repo.path().join("src")).expect("create src dir");
 
@@ -479,9 +522,6 @@ fn locate_ref_hydrates_missing_imported_git_history_on_demand() {
     let init = kin_command()
         .arg("init")
         .arg(".")
-        .arg("--no-lsp")
-        .arg("--git-history")
-        .arg("off")
         .current_dir(repo.path())
         .output()
         .expect("run kin init");
@@ -492,15 +532,18 @@ fn locate_ref_hydrates_missing_imported_git_history_on_demand() {
         String::from_utf8_lossy(&init.stderr)
     );
 
+    // Detach the migration source. Any answer produced from here on is graph
+    // truth admitted at init; an on-demand Git hydration path has nothing left
+    // to read.
+    fs::rename(repo.path().join(".git"), repo.path().join(".git-detached"))
+        .expect("detach migration source");
+
     let historical = kin_command()
         .arg("locate")
         .arg("--json")
         .arg("--ref")
         .arg(format!("git:{old_sha}"))
         .arg("Investigate legacy_handler in src/lib.py")
-        .env("KIN_DAEMON_DISABLE_LSP", "1")
-        .env("KIN_DAEMON_IDLE_TIMEOUT_SECS", "1")
-        .env("KIN_DAEMON_READY_TIMEOUT_SECS", "30")
         .current_dir(repo.path())
         .output()
         .expect("run historical kin locate");
@@ -521,21 +564,39 @@ fn locate_ref_hydrates_missing_imported_git_history_on_demand() {
         .collect::<Vec<_>>();
     assert!(
         files.contains(&"src/lib.py"),
-        "historical locate should surface hydrated imported Git file, got {:?}",
+        "historical locate should resolve the admitted change from graph truth, got {:?}",
         files
+    );
+
+    // A ref that init never admitted is a graph gap, reported as one. It is
+    // never repaired by reaching back into a filesystem checkout.
+    let absent = kin_command()
+        .arg("locate")
+        .arg("--json")
+        .arg("--ref")
+        .arg("git:0123456789abcdef0123456789abcdef01234567")
+        .arg("Investigate legacy_handler in src/lib.py")
+        .current_dir(repo.path())
+        .output()
+        .expect("run absent-ref kin locate");
+    assert!(
+        !absent.status.success(),
+        "an unadmitted ref must not resolve: stdout={}",
+        String::from_utf8_lossy(&absent.stdout)
+    );
+    let absent_stderr = String::from_utf8_lossy(&absent.stderr);
+    assert!(
+        absent_stderr.contains("has no imported repository-v6 alias"),
+        "absent ref must fail as an explicit graph gap: {absent_stderr}"
     );
 }
 
-/// `kin init` imports a bounded history window (default `recent` = 50 commits).
-/// On a repo with more than 50 commits the oldest imported change used to
-/// reference an un-imported Git parent, so the ref-scoped history walk for
-/// `locate --ref git:<oid>` hit that dangling edge and 500'd "change <id> not
-/// found" — even for HEAD, whose own ancestry crosses the truncation boundary.
-/// Import now closes that boundary onto genesis (and the walk stops at the import
-/// horizon), so both HEAD and an out-of-window commit resolve without a 500.
+/// Full-history import admits every reachable Git change into graph authority.
+/// Ref-scoped locate must resolve both the tip and the root without consulting
+/// Git or fabricating missing ancestry.
 #[test]
 #[serial]
-fn locate_ref_resolves_head_and_out_of_window_commits_after_truncated_init() {
+fn locate_ref_resolves_tip_and_root_after_full_history_init() {
     let repo = tempdir().expect("temp repo");
 
     let git_init = Command::new("git")
@@ -549,13 +610,6 @@ fn locate_ref_resolves_head_and_out_of_window_commits_after_truncated_init() {
         "git init failed: {}",
         String::from_utf8_lossy(&git_init.stderr)
     );
-
-    // Neutralize any globally-configured commit-date-rewriting hook so the pinned
-    // dates below survive — the deterministic newest-50 window depends on them.
-    let _ = Command::new("git")
-        .args(["config", "core.hooksPath", "/dev/null"])
-        .current_dir(repo.path())
-        .output();
 
     let commit = |message: &str, seq: u32| {
         // Distinct, strictly increasing dates so the truncation window is
@@ -598,8 +652,7 @@ fn locate_ref_resolves_head_and_out_of_window_commits_after_truncated_init() {
         .to_string()
     };
 
-    // Commit 1 carries real content (so an out-of-window hydration has a file to
-    // surface) and is the oldest commit — it falls outside the newest-50 window.
+    // Commit 1 carries real content and is the reachable root.
     fs::create_dir_all(repo.path().join("src")).expect("create src dir");
     fs::write(
         repo.path().join("src/lib.py"),
@@ -613,11 +666,9 @@ fn locate_ref_resolves_head_and_out_of_window_commits_after_truncated_init() {
         .expect("git add");
     assert!(add.status.success());
     commit("c1 initial", 1);
-    let out_of_window_sha = rev_parse("HEAD");
+    let root_sha = rev_parse("HEAD");
 
-    // 51 more commits (52 total) so the newest-50 window excludes commit 1 and
-    // its boundary parent — the dangling edge the fix closes.
-    for seq in 2..=52u32 {
+    for seq in 2..=4u32 {
         commit(&format!("c{seq}"), seq);
     }
     let head_sha = rev_parse("HEAD");
@@ -625,7 +676,6 @@ fn locate_ref_resolves_head_and_out_of_window_commits_after_truncated_init() {
     let init = kin_command()
         .arg("init")
         .arg(".")
-        .arg("--no-lsp")
         .current_dir(repo.path())
         .output()
         .expect("run kin init");
@@ -636,8 +686,7 @@ fn locate_ref_resolves_head_and_out_of_window_commits_after_truncated_init() {
         String::from_utf8_lossy(&init.stderr)
     );
 
-    // HEAD resolves: the history walk reaches the genesis-closed horizon instead
-    // of a dangling parent, so the daemon does not 500.
+    // The tip resolves strictly from imported graph history.
     let head_locate = kin_command()
         .arg("locate")
         .arg("--json")
@@ -649,30 +698,29 @@ fn locate_ref_resolves_head_and_out_of_window_commits_after_truncated_init() {
         .expect("run head-ref locate");
     assert!(
         head_locate.status.success(),
-        "locate --ref git:<HEAD> failed (truncated-history regression): stdout={} stderr={}",
+        "locate --ref git:<HEAD> failed after full import: stdout={} stderr={}",
         String::from_utf8_lossy(&head_locate.stdout),
         String::from_utf8_lossy(&head_locate.stderr)
     );
     serde_json::from_slice::<serde_json::Value>(&head_locate.stdout)
         .expect("HEAD-ref locate stdout should be valid JSON");
 
-    // An out-of-window commit resolves via on-demand hydration, which imports its
-    // full ancestry down to a genesis-rooted boundary.
-    let old_locate = kin_command()
+    // The root resolves from the same complete imported DAG.
+    let root_locate = kin_command()
         .arg("locate")
         .arg("--json")
         .arg("--ref")
-        .arg(format!("git:{out_of_window_sha}"))
+        .arg(format!("git:{root_sha}"))
         .arg("Investigate legacy_handler in src/lib.py")
         .current_dir(repo.path())
         .output()
-        .expect("run out-of-window-ref locate");
+        .expect("run root-ref locate");
     assert!(
-        old_locate.status.success(),
-        "locate --ref git:<out-of-window> failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&old_locate.stdout),
-        String::from_utf8_lossy(&old_locate.stderr)
+        root_locate.status.success(),
+        "locate --ref git:<root> failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&root_locate.stdout),
+        String::from_utf8_lossy(&root_locate.stderr)
     );
-    serde_json::from_slice::<serde_json::Value>(&old_locate.stdout)
-        .expect("out-of-window-ref locate stdout should be valid JSON");
+    serde_json::from_slice::<serde_json::Value>(&root_locate.stdout)
+        .expect("root-ref locate stdout should be valid JSON");
 }
