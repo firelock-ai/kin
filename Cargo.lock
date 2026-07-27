@@ -3178,6 +3178,7 @@ dependencies = [
  "tracing",
  "unicode-normalization",
  "uuid",
+ "winapi-util",
  "windows-sys 0.61.2",
 ]
 

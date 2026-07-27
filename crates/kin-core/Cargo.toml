@@ -46,6 +46,9 @@ windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Storage_FileSystem",
 ] }
+# Stable access to the `BY_HANDLE_FILE_INFORMATION` identity pair; the `std`
+# accessors for it remain unstable (`windows_by_handle`).
+winapi-util = "0.1"
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }

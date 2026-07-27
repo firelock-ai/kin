@@ -585,7 +585,7 @@ fn create_repository_init_stage_lease(
         destination_path: exact_path_identity(final_kin_dir)?,
         repository_id: repository_id.as_str().to_string(),
         workspace_id: workspace_id.to_string(),
-        stage_identity: recoverable_file_identity(&stage_metadata),
+        stage_identity: recoverable_path_identity(stage_root, &stage_metadata),
     };
     let mut bytes = serde_json::to_vec(&record)
         .map_err(|error| KinError::Other(format!("serialize repository stage owner: {error}")))?;
@@ -675,8 +675,30 @@ fn exact_path_identity(_path: &Path) -> Result<ExactPathIdentity> {
     ))
 }
 
+/// Recoverable identity of the entry `metadata` described.
+///
+/// `metadata` must come from `symlink_metadata` on `path`: Unix identity is
+/// read straight out of it, while Windows identity exists only on an open
+/// handle and is read by reopening the same unfollowed entry.
 #[cfg(unix)]
-fn recoverable_file_identity(metadata: &std::fs::Metadata) -> RecoverableFileIdentity {
+fn recoverable_path_identity(
+    _path: &Path,
+    metadata: &std::fs::Metadata,
+) -> RecoverableFileIdentity {
+    recoverable_unix_identity(metadata)
+}
+
+/// Recoverable identity of a handle Kin already holds open.
+#[cfg(unix)]
+fn recoverable_open_file_identity(
+    _file: &File,
+    metadata: &std::fs::Metadata,
+) -> RecoverableFileIdentity {
+    recoverable_unix_identity(metadata)
+}
+
+#[cfg(unix)]
+fn recoverable_unix_identity(metadata: &std::fs::Metadata) -> RecoverableFileIdentity {
     use std::os::unix::fs::MetadataExt;
 
     RecoverableFileIdentity::Unix {
@@ -685,21 +707,76 @@ fn recoverable_file_identity(metadata: &std::fs::Metadata) -> RecoverableFileIde
     }
 }
 
+/// Recoverable identity of the entry `metadata` described.
+///
+/// Windows binds file identity to an open handle rather than to `Metadata`, so
+/// the entry is reopened with exactly the access `symlink_metadata` used: a
+/// zero access mask asks for identity without demanding read rights,
+/// `FILE_FLAG_BACKUP_SEMANTICS` admits directory handles, and
+/// `FILE_FLAG_OPEN_REPARSE_POINT` leaves a final symlink unfollowed.
 #[cfg(windows)]
-fn recoverable_file_identity(metadata: &std::fs::Metadata) -> RecoverableFileIdentity {
-    use std::os::windows::fs::MetadataExt;
+fn recoverable_path_identity(
+    path: &Path,
+    _metadata: &std::fs::Metadata,
+) -> RecoverableFileIdentity {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    };
 
-    match (metadata.volume_serial_number(), metadata.file_index()) {
-        (Some(volume_serial_number), Some(file_index)) => RecoverableFileIdentity::Windows {
-            volume_serial_number,
-            file_index,
-        },
-        _ => RecoverableFileIdentity::Unavailable,
+    match OpenOptions::new()
+        .access_mode(0)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+    {
+        Ok(file) => recoverable_windows_identity(&file),
+        Err(_) => RecoverableFileIdentity::Unavailable,
+    }
+}
+
+/// Recoverable identity of a handle Kin already holds open.
+#[cfg(windows)]
+fn recoverable_open_file_identity(
+    file: &File,
+    _metadata: &std::fs::Metadata,
+) -> RecoverableFileIdentity {
+    recoverable_windows_identity(file)
+}
+
+/// Read the `BY_HANDLE_FILE_INFORMATION` identity pair for an open handle.
+///
+/// The `std` accessors for these fields are still unstable, so the same
+/// handle information is read through a stable wrapper. A handle whose
+/// identity cannot be read, or whose volume serial does not fit the `DWORD`
+/// it is documented to be, stays `Unavailable` rather than failing the caller
+/// or panicking.
+#[cfg(windows)]
+fn recoverable_windows_identity(file: &File) -> RecoverableFileIdentity {
+    let Ok(information) = winapi_util::file::information(file) else {
+        return RecoverableFileIdentity::Unavailable;
+    };
+    let Ok(volume_serial_number) = u32::try_from(information.volume_serial_number()) else {
+        return RecoverableFileIdentity::Unavailable;
+    };
+    RecoverableFileIdentity::Windows {
+        volume_serial_number,
+        file_index: information.file_index(),
     }
 }
 
 #[cfg(not(any(unix, windows)))]
-fn recoverable_file_identity(_metadata: &std::fs::Metadata) -> RecoverableFileIdentity {
+fn recoverable_path_identity(
+    _path: &Path,
+    _metadata: &std::fs::Metadata,
+) -> RecoverableFileIdentity {
+    RecoverableFileIdentity::Unavailable
+}
+
+#[cfg(not(any(unix, windows)))]
+fn recoverable_open_file_identity(
+    _file: &File,
+    _metadata: &std::fs::Metadata,
+) -> RecoverableFileIdentity {
     RecoverableFileIdentity::Unavailable
 }
 
@@ -1560,7 +1637,8 @@ fn remove_stage_owner(lease: RepositoryInitStageLease) -> Result<()> {
         .map_err(|error| KinError::io(&lease.owner_path, error))?;
     if !path_metadata.file_type().is_file()
         || path_metadata.file_type().is_symlink()
-        || recoverable_file_identity(&open_metadata) != recoverable_file_identity(&path_metadata)
+        || recoverable_open_file_identity(&lease.owner_file, &open_metadata)
+            != recoverable_path_identity(&lease.owner_path, &path_metadata)
     {
         return Err(KinError::Other(format!(
             "repository stage owner path changed while held: {}",
@@ -1582,7 +1660,8 @@ fn validate_live_stage_lease(lease: &RepositoryInitStageLease, stage_root: &Path
     if observed != lease.record
         || observed.stage_path != exact_path_identity(stage_root)?
         || observed.stage_identity
-            != recoverable_file_identity(
+            != recoverable_path_identity(
+                stage_root,
                 &std::fs::symlink_metadata(stage_root)
                     .map_err(|error| KinError::io(stage_root, error))?,
             )
@@ -1840,7 +1919,8 @@ fn recover_orphaned_repository_stages(
                 continue;
             };
             if validate_private_stage_directory(owned_root).is_err()
-                || recoverable_file_identity(
+                || recoverable_path_identity(
+                    owned_root,
                     &std::fs::symlink_metadata(owned_root)
                         .map_err(|error| KinError::io(owned_root, error))?,
                 ) != record.stage_identity
@@ -1860,7 +1940,8 @@ fn recover_orphaned_repository_stages(
                     );
                     continue;
                 }
-                let reaped_identity = recoverable_file_identity(
+                let reaped_identity = recoverable_path_identity(
+                    &reap_root,
                     &std::fs::symlink_metadata(&reap_root)
                         .map_err(|error| KinError::io(&reap_root, error))?,
                 );
