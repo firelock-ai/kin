@@ -242,8 +242,14 @@ fn diff_is_exact_for_polyglot_non_code_binary_modes_symlinks_gitlinks_and_raw_pa
     assert_eq!(report["summary"]["artifacts_added"], 2);
     assert_eq!(report["summary"]["artifacts_updated"], 8);
     assert_eq!(report["summary"]["artifacts_removed"], 2);
+    // Admission binds the semantics of every imported change, so a diff across
+    // imported history carries entity deltas as well as the exact tree. Both
+    // edited supported-language files keep their declaration set and change one
+    // body each: the Rust `answer`, the Python `answer`, and the Python module
+    // that contains it. The unsupported-language, binary, symlink, gitlink, and
+    // raw-path artifacts contribute none.
     assert_eq!(report["summary"]["entities_added"], 0);
-    assert_eq!(report["summary"]["entities_modified"], 0);
+    assert_eq!(report["summary"]["entities_modified"], 3);
     assert_eq!(report["summary"]["entities_removed"], 0);
     assert_eq!(report["summary"]["relations_added"], 0);
     assert_eq!(report["summary"]["relations_modified"], 0);
