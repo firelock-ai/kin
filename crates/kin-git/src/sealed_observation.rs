@@ -23,18 +23,29 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use kin_blobs::{digest, BlobStore};
+use kin_blobs::digest;
+#[cfg(test)]
+use kin_blobs::BlobStore;
 use kin_model::{GitObjectId, Hash256, RepoPath, RepositoryId, ResolvedTree, TreeEntry};
 
 use crate::admission_history::AdmittedSemanticGitImportPlan;
 use crate::error::{GitError, Result, UnsealedContentGap};
 use crate::semantic_import::SemanticGitImportPlan;
 
-/// Upper bound on gaps carried in a failure. The reported total is always
-/// exact; only the per-entry detail list is bounded, so a repository with a
-/// systematically empty store produces a readable error rather than one entry
-/// per artifact in its entire history.
+/// Upper bound on gaps carried in a failure. A gap is one distinct unsealed
+/// body, counted once no matter how many admitted entries reference it, so the
+/// reported total and the detail list count the same thing. Only the detail
+/// list is bounded, so a repository with a systematically empty store produces
+/// a readable error rather than one entry per artifact in its entire history.
 const MAX_REPORTED_GAPS: usize = 32;
+
+/// Shape tags bound into the per-tree content digest. An entry's shape is part
+/// of what the repository owns, so a body that moves between a regular file, an
+/// executable, and a symlink is a different observation even at the same path.
+const SHAPE_REGULAR_FILE: u8 = 1;
+const SHAPE_EXECUTABLE_FILE: u8 = 2;
+const SHAPE_SYMLINK: u8 = 3;
+const SHAPE_FOREIGN_GITLINK: u8 = 4;
 
 /// Graph-owned content the observation is permitted to read.
 ///
@@ -50,6 +61,11 @@ pub trait SealedContentSource {
     fn load_sealed_content(&self, digest: Hash256) -> std::result::Result<Vec<u8>, String>;
 }
 
+// Sealing against a bare content store proves byte-exactness but says nothing
+// about graph ownership, so this impl exists only for fixtures that need a real
+// store behind the observation. Product paths must seal against repository
+// authority; gating the impl keeps the weaker source from compiling into one.
+#[cfg(test)]
 impl SealedContentSource for BlobStore {
     fn load_sealed_content(&self, digest: Hash256) -> std::result::Result<Vec<u8>, String> {
         self.read(&digest).map_err(|error| error.to_string())
@@ -169,34 +185,48 @@ pub fn seal_all_content_observation(
     let mut observed_trees = 0usize;
     let mut sealed = BTreeSet::<Hash256>::new();
     let mut failed = BTreeSet::<Hash256>::new();
-    let mut total_gaps = 0usize;
     let mut reported_gaps = Vec::<UnsealedContentGap>::new();
     let mut exclusions = BTreeMap::<(RepoPath, GitObjectId), DeclaredContentExclusion>::new();
     let mut non_utf8_paths = BTreeSet::<RepoPath>::new();
+    let mut tree_digests = Vec::<Hash256>::new();
 
     for tree in closure.admitted_trees() {
         observed_trees += 1;
+        // One digest per admitted tree over its exact (path, shape, body)
+        // sequence. Counts alone cannot distinguish two closures that agree on
+        // totals but describe different content, so the observed content itself
+        // is what the fingerprint ends up binding.
+        let mut tree_content = Vec::new();
+        tree_content.extend_from_slice(b"kin.git.sealed-content-observation.tree.v1\0");
         for artifact in tree.artifacts_by_path() {
             observed_entries += 1;
             let path = &artifact.path;
             if path.as_utf8().is_none() {
                 non_utf8_paths.insert(path.clone());
             }
+            append_bytes(&mut tree_content, path.as_bytes());
             let identity = match artifact.entry {
                 TreeEntry::Blob { hash, executable } => {
                     if executable {
                         coverage.executable_file_entries += 1;
+                        tree_content.push(SHAPE_EXECUTABLE_FILE);
                     } else {
                         coverage.regular_file_entries += 1;
+                        tree_content.push(SHAPE_REGULAR_FILE);
                     }
+                    append_bytes(&mut tree_content, hash.as_bytes());
                     hash
                 }
                 TreeEntry::Symlink { target_blob } => {
                     coverage.symlink_entries += 1;
+                    tree_content.push(SHAPE_SYMLINK);
+                    append_bytes(&mut tree_content, target_blob.as_bytes());
                     target_blob
                 }
                 TreeEntry::Gitlink { target } => {
                     coverage.gitlink_entries += 1;
+                    tree_content.push(SHAPE_FOREIGN_GITLINK);
+                    append_bytes(&mut tree_content, target.to_string().as_bytes());
                     exclusions.entry((path.clone(), target)).or_insert_with(|| {
                         DeclaredContentExclusion {
                             path: path.clone(),
@@ -206,11 +236,7 @@ pub fn seal_all_content_observation(
                     continue;
                 }
             };
-            if sealed.contains(&identity) {
-                continue;
-            }
-            if failed.contains(&identity) {
-                total_gaps += 1;
+            if sealed.contains(&identity) || failed.contains(&identity) {
                 continue;
             }
             match seal_body(content, identity) {
@@ -227,7 +253,6 @@ pub fn seal_all_content_observation(
                 }
                 Err(detail) => {
                     failed.insert(identity);
-                    total_gaps += 1;
                     if reported_gaps.len() < MAX_REPORTED_GAPS {
                         reported_gaps.push(UnsealedContentGap {
                             path: path.as_bytes().to_vec(),
@@ -238,11 +263,14 @@ pub fn seal_all_content_observation(
                 }
             }
         }
+        tree_digests.push(digest(&tree_content));
     }
 
-    if total_gaps > 0 {
+    // One gap per distinct unsealed body, so a report that lists every gap it
+    // found is never described as truncated.
+    if !failed.is_empty() {
         return Err(GitError::UnsealedContent {
-            total_gaps,
+            total_gaps: failed.len(),
             reported: reported_gaps,
         });
     }
@@ -256,6 +284,7 @@ pub fn seal_all_content_observation(
         observed_entries,
         &coverage,
         &exclusions,
+        &tree_digests,
     );
     Ok(SealedContentObservation {
         repository_id,
@@ -282,15 +311,23 @@ fn seal_body(
     Ok(body)
 }
 
+/// Bind one observation to a single identity.
+///
+/// The digest covers the observed content itself, not only how much of it there
+/// was: `tree_content_digests` carries the exact (path, shape, body) sequence of
+/// every admitted tree, in admission order. Two observations therefore
+/// fingerprint identically only when they describe the same content, which is
+/// what lets one derivation be cross-checked against another.
 fn fingerprint_observation(
     repository_id: &RepositoryId,
     observed_trees: usize,
     observed_entries: usize,
     coverage: &SealedContentCoverage,
     exclusions: &[DeclaredContentExclusion],
+    tree_content_digests: &[Hash256],
 ) -> Hash256 {
     let mut buffer = Vec::new();
-    buffer.extend_from_slice(b"kin.git.sealed-content-observation.v1\0");
+    buffer.extend_from_slice(b"kin.git.sealed-content-observation.v2\0");
     append_bytes(&mut buffer, repository_id.as_str().as_bytes());
     for count in [
         observed_trees,
@@ -307,6 +344,10 @@ fn fingerprint_observation(
         buffer.extend_from_slice(&(count as u64).to_le_bytes());
     }
     buffer.extend_from_slice(&coverage.sealed_body_bytes.to_le_bytes());
+    buffer.extend_from_slice(&(tree_content_digests.len() as u64).to_le_bytes());
+    for tree_digest in tree_content_digests {
+        buffer.extend_from_slice(tree_digest.as_bytes());
+    }
     buffer.extend_from_slice(&(exclusions.len() as u64).to_le_bytes());
     for exclusion in exclusions {
         append_bytes(&mut buffer, exclusion.path.as_bytes());
@@ -361,6 +402,71 @@ mod tests {
                 return Ok(b"content that is not what the tree recorded".to_vec());
             }
             self.inner.load_sealed_content(digest)
+        }
+    }
+
+    /// An explicit list of admitted trees, so a test can seal a deliberately
+    /// altered closure through the production observation rather than asserting
+    /// against a hand-computed fingerprint.
+    struct ObservedTrees {
+        repository_id: RepositoryId,
+        trees: Vec<ResolvedTree>,
+    }
+
+    impl ObservedTrees {
+        fn from_closure(closure: &impl AdmittedContentClosure) -> Self {
+            Self {
+                repository_id: closure.closure_repository_id().clone(),
+                trees: closure.admitted_trees().into_iter().cloned().collect(),
+            }
+        }
+
+        /// Exchange the bodies of two same-shape entries in the last admitted
+        /// tree, leaving every count and the byte total untouched.
+        fn with_exchanged_head_bodies(&self, left: &[u8], right: &[u8]) -> Self {
+            let left = RepoPath::from_bytes(left.to_vec()).unwrap();
+            let right = RepoPath::from_bytes(right.to_vec()).unwrap();
+            let mut trees = self.trees.clone();
+            let head = trees.last_mut().expect("the closure observes a tree");
+            let left_entry = head
+                .artifact_at_path(&left)
+                .expect("left path exists")
+                .entry;
+            let right_entry = head
+                .artifact_at_path(&right)
+                .expect("right path exists")
+                .entry;
+            assert_ne!(
+                left_entry, right_entry,
+                "exchanging equal entries is not a divergence"
+            );
+            let exchanged = head
+                .clone()
+                .into_artifacts()
+                .map(|mut artifact| {
+                    if artifact.path == left {
+                        artifact.entry = right_entry;
+                    } else if artifact.path == right {
+                        artifact.entry = left_entry;
+                    }
+                    artifact
+                })
+                .collect::<Vec<_>>();
+            *head = ResolvedTree::from_artifacts(exchanged).unwrap();
+            Self {
+                repository_id: self.repository_id.clone(),
+                trees,
+            }
+        }
+    }
+
+    impl AdmittedContentClosure for ObservedTrees {
+        fn closure_repository_id(&self) -> &RepositoryId {
+            &self.repository_id
+        }
+
+        fn admitted_trees(&self) -> Vec<&ResolvedTree> {
+            self.trees.iter().collect()
         }
     }
 
@@ -527,14 +633,23 @@ mod tests {
         };
 
         let error = seal_all_content_observation(&fixture.plan, &source).unwrap_err();
+        let described = error.to_string();
         let GitError::UnsealedContent {
             total_gaps,
             reported,
         } = error
         else {
-            panic!("absent content must fail as an unsealed-content gap, got {error:?}");
+            panic!("absent content must fail as an unsealed-content gap, got {described}");
         };
-        assert!(total_gaps >= 1);
+        // One body is withheld, and the three admitted trees that reference it
+        // are one gap, not three. A count that grew per occurrence would make a
+        // complete report read as a truncated one.
+        assert_eq!(total_gaps, 1);
+        assert_eq!(reported.len(), 1);
+        assert!(
+            !described.contains("further gap"),
+            "a report that lists every gap must not read as truncated: {described}"
+        );
         let gap = reported
             .iter()
             .find(|gap| gap.path == b"assets/raw.bin")
@@ -575,16 +690,58 @@ mod tests {
         let second = seal_all_content_observation(&fixture.plan, &fixture.blob_store).unwrap();
         assert_eq!(second.fingerprint, first.fingerprint);
 
-        let mut drifted = first.clone();
-        drifted.coverage.symlink_entries += 1;
-        let refingerprinted = fingerprint_observation(
-            &drifted.repository_id,
-            drifted.observed_trees,
-            drifted.observed_entries,
-            &drifted.coverage,
-            &drifted.exclusions,
+        // Coverage drift changes the identity with the observed content held
+        // fixed, so the counts are bound as well as the content.
+        let observed_content = [digest(b"one admitted tree")];
+        let baseline = fingerprint_observation(
+            &first.repository_id,
+            first.observed_trees,
+            first.observed_entries,
+            &first.coverage,
+            &first.exclusions,
+            &observed_content,
         );
-        assert_ne!(refingerprinted, first.fingerprint);
+        let mut drifted = first.coverage;
+        drifted.symlink_entries += 1;
+        let refingerprinted = fingerprint_observation(
+            &first.repository_id,
+            first.observed_trees,
+            first.observed_entries,
+            &drifted,
+            &first.exclusions,
+            &observed_content,
+        );
+        assert_ne!(refingerprinted, baseline);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn seal_separates_identical_counts_that_describe_different_content() {
+        let fixture = ExactFixture::all_shapes();
+        let observed = ObservedTrees::from_closure(&fixture.plan);
+        let diverged = observed.with_exchanged_head_bodies(b"src/lib.rs", b"assets/raw.bin");
+
+        let from_observed = seal_all_content_observation(&observed, &fixture.blob_store).unwrap();
+        let from_diverged = seal_all_content_observation(&diverged, &fixture.blob_store).unwrap();
+
+        // Exchanging two bodies between two paths of the same shape seals the
+        // same distinct bodies, the same byte total, and every same count. Only
+        // a fingerprint that binds which body sits at which path can tell the
+        // two observations apart, so the seal is a content statement rather
+        // than a tally.
+        assert_eq!(from_diverged.observed_trees, from_observed.observed_trees);
+        assert_eq!(
+            from_diverged.observed_entries,
+            from_observed.observed_entries
+        );
+        assert_eq!(from_diverged.coverage, from_observed.coverage);
+        assert_eq!(from_diverged.exclusions, from_observed.exclusions);
+        assert_ne!(from_diverged.fingerprint, from_observed.fingerprint);
+
+        // The unaltered explicit closure still fingerprints exactly like the
+        // plan it was derived from.
+        let from_plan = seal_all_content_observation(&fixture.plan, &fixture.blob_store).unwrap();
+        assert_eq!(from_observed.fingerprint, from_plan.fingerprint);
     }
 
     fn write(repo: &Path, relative: &str, body: &[u8]) {

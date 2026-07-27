@@ -64,8 +64,9 @@ pub struct UnsealedContentGap {
 
 /// Render a gap report so the failure names the paths an operator must fix.
 ///
-/// The count is always exact; when the sample is narrower than the count, the
-/// message says so rather than reading as if every gap were listed.
+/// The count and the sample both count distinct unsealed bodies, so the exact
+/// count is reported, a truncated sample says so, and a sample that lists every
+/// gap it found never reads as truncated.
 fn describe_unsealed_gaps(total_gaps: usize, reported: &[UnsealedContentGap]) -> String {
     let mut described = reported
         .iter()
@@ -144,12 +145,15 @@ pub enum GitError {
     },
 
     #[error(
-        "sealed all-content observation failed: {total_gaps} admitted entr(ies) have no byte-exact graph-owned body, so this repository cannot answer for its own content without reading the filesystem: {}",
+        "sealed all-content observation failed: {total_gaps} admitted bod(ies) are not byte-exact in graph-owned storage, so this repository cannot answer for its own content without reading the filesystem: {}",
         describe_unsealed_gaps(*total_gaps, reported)
     )]
     UnsealedContent {
+        /// Distinct unsealed bodies, counted once each however many admitted
+        /// entries reference them.
         total_gaps: usize,
-        /// A bounded sample of the gaps. `total_gaps` is always the exact count.
+        /// A bounded sample of the gaps, one entry per distinct unsealed body.
+        /// `total_gaps` is always the exact count.
         reported: Vec<UnsealedContentGap>,
     },
 

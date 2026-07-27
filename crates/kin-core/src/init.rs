@@ -324,8 +324,13 @@ impl SealedContentSource for GraphOwnedContent<'_> {
 
 impl SealedContentSource for PreparedRepositoryInit {
     fn load_sealed_content(&self, digest: Hash256) -> std::result::Result<Vec<u8>, String> {
-        let authority = self.authority().map_err(|error| error.to_string())?;
-        GraphOwnedContent::new(authority).load_sealed_content(digest)
+        match self.load_source_blob(digest) {
+            Ok(Some(body)) => Ok(body),
+            Ok(None) => {
+                Err("the staged repository owns no body for this content identity".to_string())
+            }
+            Err(error) => Err(error.to_string()),
+        }
     }
 }
 
