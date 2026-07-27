@@ -2068,6 +2068,29 @@ mod tests {
         );
     }
 
+    #[cfg(not(unix))]
+    #[test]
+    fn lossless_publication_fails_closed_off_unix() {
+        let root = tempdir().unwrap();
+        let source = root.path().join("unborn");
+        fs::create_dir(&source).unwrap();
+        git_ok(&source, ["init", "--initial-branch=future"]);
+        let blob_store = BlobStore::new(root.path().join("cas")).unwrap();
+        let repository_id = RepositoryId::new("unborn").unwrap();
+        let snapshot =
+            capture_lossless_git_repository(&source, repository_id, &blob_store).unwrap();
+
+        let output = root.path().join("rehydrated.git");
+        let error = rehydrate_lossless_git_repository(&snapshot, &blob_store, &output)
+            .expect_err("retained-capability publication must fail closed off unix");
+        assert!(
+            error.to_string().contains("unsupported on this platform"),
+            "unexpected error: {error}"
+        );
+        assert!(!output.exists());
+    }
+
+    #[cfg(unix)]
     #[test]
     fn unborn_head_roundtrips_without_inventing_objects_or_refs() {
         let root = tempdir().unwrap();
