@@ -2,7 +2,9 @@
 // Copyright 2026 Firelock, LLC
 
 use anyhow::{anyhow, bail, Result};
-use kin_model::{Entity, EntityFilter, GraphStore, Hash256, SemanticChangeId};
+use kin_model::{
+    Entity, EntityFilter, EntityId, EntityRevision, GraphStore, Hash256, SemanticChangeId,
+};
 
 use super::repository_authority::{parse_git_object_id, parse_ref_name, ActiveRepositoryAuthority};
 
@@ -102,24 +104,61 @@ where
     })
 }
 
-pub(crate) fn resolve_entity_query_at_ref<G>(
+/// The entity a query names at `head`, together with its revision timeline.
+///
+/// Both come out of one replay of committed state, which is also why the two
+/// are resolved together: the entity lookup already needs the state at `head`,
+/// and resolving revisions separately would replay the same history twice.
+pub(crate) fn resolve_entity_with_revisions_at<G>(
     graph: &G,
     entity_query: &str,
     head: &SemanticChangeId,
-) -> Result<Entity>
+) -> Result<(Entity, Vec<EntityRevision>)>
 where
     G: GraphStore,
     <G as GraphStore>::Error: std::fmt::Display + Send + Sync + 'static,
 {
-    let state = graph
+    let mut state = graph
         .resolve_graph_at(head)
         .map_err(|error| anyhow!(error.to_string()))?;
     let entities = state
         .entities
-        .into_values()
+        .values()
         .filter(|entity| entity_matches_query(entity, entity_query))
+        .cloned()
         .collect();
-    choose_entity_match(entities, entity_query)
+    let target = choose_entity_match(entities, entity_query)?;
+    let revisions = state
+        .entity_revisions
+        .remove(&target.id)
+        .unwrap_or_default();
+    Ok((target, revisions))
+}
+
+/// Every revision of `entity_id` visible at `head`, oldest first.
+///
+/// `ChangeStore::get_entity_revisions_at` is not usable here. It replays only
+/// the changes that mention this entity, yet validates every delta those
+/// changes carry. A change that touches this entity while also modifying or
+/// removing a second one is then checked against a state the second entity's
+/// own history was filtered out of, so a sound repository answers with a
+/// "stale old payload" conflict for an entity nobody asked about, and the
+/// command fails before printing a single revision. Replaying the complete
+/// first-parent state keeps every delta's precondition checkable, which is the
+/// same reason the MCP entity handlers resolve through `resolve_graph_at`.
+pub(crate) fn resolve_entity_revisions_at<G>(
+    graph: &G,
+    entity_id: &EntityId,
+    head: &SemanticChangeId,
+) -> Result<Vec<EntityRevision>>
+where
+    G: GraphStore,
+    <G as GraphStore>::Error: std::fmt::Display + Send + Sync + 'static,
+{
+    let mut state = graph
+        .resolve_graph_at(head)
+        .map_err(|error| anyhow!(error.to_string()))?;
+    Ok(state.entity_revisions.remove(entity_id).unwrap_or_default())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -479,6 +518,93 @@ mod tests {
 
     fn change_id(byte: u8) -> SemanticChangeId {
         SemanticChangeId::from_hash(Hash256::from_bytes([byte; 32]))
+    }
+
+    /// One version of an entity. `marker` varies the fingerprint so two
+    /// versions of the same entity are distinguishable revisions.
+    fn entity_version(id: EntityId, name: &str, marker: u8) -> Entity {
+        let mut entity = named_entity(name);
+        entity.id = id;
+        entity.fingerprint.ast_hash = Hash256::from_bytes([marker; 32]);
+        entity.signature = format!("fn {name}(v{marker})");
+        entity
+    }
+
+    fn change_with_deltas(
+        parents: Vec<SemanticChangeId>,
+        deltas: Vec<kin_model::EntityDelta>,
+    ) -> SemanticChange {
+        let mut change = change_with_id(change_id(0), parents);
+        change.entity_deltas = deltas;
+        change.id = kin_core::compute_semantic_change_id(&change).unwrap();
+        change
+    }
+
+    /// `kin history <entity>` and `kin blame <entity>` with no `--ref` resolve
+    /// the entity from the live graph and its revisions from committed state at
+    /// head, so this helper is the whole revision path for the default
+    /// invocation. It must survive a change that touches the queried entity
+    /// alongside a second one whose own introducing change does not mention the
+    /// queried entity: deriving revisions from the entity-filtered change list
+    /// validated that second entity against a state it was never added to, and
+    /// answered a query about `alpha` with a stale-payload conflict naming
+    /// `beta`.
+    #[test]
+    fn revisions_survive_a_change_that_also_removes_another_entity() {
+        let graph = kin_db::InMemoryGraph::new();
+        let alpha = kin_model::EntityId::new();
+        let beta = kin_model::EntityId::new();
+        let gamma = kin_model::EntityId::new();
+
+        let add_alpha = change_with_deltas(
+            Vec::new(),
+            vec![kin_model::EntityDelta::Added {
+                new: entity_version(alpha, "alpha", 1),
+            }],
+        );
+        let add_beta = change_with_deltas(
+            vec![add_alpha.id],
+            vec![kin_model::EntityDelta::Added {
+                new: entity_version(beta, "beta", 1),
+            }],
+        );
+        let revise_alpha = change_with_deltas(
+            vec![add_beta.id],
+            vec![
+                kin_model::EntityDelta::Modified {
+                    old: entity_version(alpha, "alpha", 1),
+                    new: entity_version(alpha, "alpha", 2),
+                },
+                kin_model::EntityDelta::Removed {
+                    old: entity_version(beta, "beta", 1),
+                },
+                kin_model::EntityDelta::Added {
+                    new: entity_version(gamma, "gamma", 1),
+                },
+            ],
+        );
+        for entry in [&add_alpha, &add_beta, &revise_alpha] {
+            graph.create_change(entry).unwrap();
+        }
+
+        let revisions = resolve_entity_revisions_at(&graph, &alpha, &revise_alpha.id)
+            .expect("a sound history must not report a conflict for an unqueried entity");
+
+        assert_eq!(revisions.len(), 2);
+        assert_eq!(revisions[0].introduced_by, add_alpha.id);
+        assert_eq!(revisions[0].ended_by, Some(revise_alpha.id));
+        assert_eq!(revisions[1].introduced_by, revise_alpha.id);
+        assert_eq!(revisions[1].ended_by, None);
+        assert_eq!(
+            revisions[1].previous_revision,
+            Some(revisions[0].revision_id)
+        );
+        assert!(
+            !revisions
+                .iter()
+                .any(|revision| revision.introduced_by == add_beta.id),
+            "a change that never touches alpha is not a revision of alpha"
+        );
     }
 
     fn absent_binding(layout: &kin_core::KinLayout) -> kin_core::LocalRepositoryAuthorityBinding {
