@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use fs2::FileExt as _;
 use kin_db::{LocalFileBackend, RepositoryAuthorityManager, StorageBackend};
+use kin_git::SealedContentSource;
 use kin_model::{
     compute_resolved_tree_hash, AdmissionCase, AdmissionPolicyDelta, AuthorId,
     DefaultRefExpectation, DefaultRefMutation, EffectiveAdmissionPolicyStamp, ExternalObjectId,
@@ -220,6 +221,17 @@ impl PreparedRepositoryInit {
             .map_err(graph_error)
     }
 
+    /// Read immutable source bytes back out of the unpublished staging store.
+    ///
+    /// This is the read side of [`Self::save_source_blob`], and it exists so
+    /// admission can prove the staged repository owns every body its admitted
+    /// trees reference before that repository is published.
+    pub fn load_source_blob(&self, digest: Hash256) -> Result<Option<Vec<u8>>> {
+        self.authority()?
+            .load_source_blob(digest)
+            .map_err(graph_error)
+    }
+
     /// Commit exactly one complete generation-zero to generation-one
     /// repository transition.
     ///
@@ -283,6 +295,37 @@ impl PreparedRepositoryInit {
         self.authority.as_ref().ok_or_else(|| {
             KinError::Other("staged repository authority is no longer open".to_string())
         })
+    }
+}
+
+/// Graph-owned repository content, exposed to sealed observation.
+///
+/// The wrapper deliberately narrows a full authority manager down to the single
+/// capability an observation needs: resolve a content identity to the bytes the
+/// repository already owns. An observation therefore cannot reach the working
+/// tree, the ambient object store, or any other authority surface.
+pub struct GraphOwnedContent<'a>(&'a RepositoryAuthorityManager<LocalFileBackend>);
+
+impl<'a> GraphOwnedContent<'a> {
+    pub const fn new(authority: &'a RepositoryAuthorityManager<LocalFileBackend>) -> Self {
+        Self(authority)
+    }
+}
+
+impl SealedContentSource for GraphOwnedContent<'_> {
+    fn load_sealed_content(&self, digest: Hash256) -> std::result::Result<Vec<u8>, String> {
+        match self.0.load_source_blob(digest) {
+            Ok(Some(body)) => Ok(body),
+            Ok(None) => Err("the repository owns no body for this content identity".to_string()),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+}
+
+impl SealedContentSource for PreparedRepositoryInit {
+    fn load_sealed_content(&self, digest: Hash256) -> std::result::Result<Vec<u8>, String> {
+        let authority = self.authority().map_err(|error| error.to_string())?;
+        GraphOwnedContent::new(authority).load_sealed_content(digest)
     }
 }
 

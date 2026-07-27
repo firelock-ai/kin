@@ -459,16 +459,23 @@ mod tests {
         let observation =
             seal_all_content_observation(&fixture.plan, &fixture.blob_store).unwrap();
 
-        // Two commits plus the workspace seed tree.
+        // Two commits plus the workspace seed tree, each carrying the same
+        // seven paths: four plain files, one executable, one symlink, one
+        // gitlink.
         assert_eq!(observation.observed_trees, 3);
-        assert!(observation.coverage.executable_file_entries > 0);
-        assert!(observation.coverage.symlink_entries > 0);
-        assert!(observation.coverage.gitlink_entries > 0);
+        assert_eq!(observation.observed_entries, 21);
+        assert_eq!(observation.coverage.regular_file_entries, 12);
+        assert_eq!(observation.coverage.executable_file_entries, 3);
+        assert_eq!(observation.coverage.symlink_entries, 3);
+        assert_eq!(observation.coverage.gitlink_entries, 3);
         assert_eq!(observation.coverage.non_utf8_paths, 1);
 
-        // The opaque binary, the symlink target, the executable body, and the
-        // empty file are all proven present and byte-exact.
-        assert!(observation.coverage.opaque_bodies >= 1);
+        // Seven distinct bodies: two revisions of the source file, the opaque
+        // binary, the empty file, the executable, the symlink target, and the
+        // body behind the non-UTF-8 path. All are sealed, none is skipped.
+        assert_eq!(observation.coverage.sealed_bodies, 7);
+        assert_eq!(observation.coverage.sealed_body_bytes, 98);
+        assert_eq!(observation.coverage.opaque_bodies, 1);
         assert_eq!(observation.coverage.empty_bodies, 1);
         for body in [
             fixture.binary_body,

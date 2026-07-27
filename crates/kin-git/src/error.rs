@@ -62,6 +62,32 @@ pub struct UnsealedContentGap {
     pub detail: String,
 }
 
+/// Render a gap report so the failure names the paths an operator must fix.
+///
+/// The count is always exact; when the sample is narrower than the count, the
+/// message says so rather than reading as if every gap were listed.
+fn describe_unsealed_gaps(total_gaps: usize, reported: &[UnsealedContentGap]) -> String {
+    let mut described = reported
+        .iter()
+        .map(|gap| {
+            format!(
+                "{} (expects {}: {})",
+                String::from_utf8_lossy(&gap.path),
+                gap.expected,
+                gap.detail
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    if total_gaps > reported.len() {
+        described.push_str(&format!(
+            "; and {} further gap(s) not listed",
+            total_gaps - reported.len()
+        ));
+    }
+    described
+}
+
 /// Errors from the kin-git adapter.
 #[derive(Debug, Error)]
 pub enum GitError {
@@ -118,7 +144,8 @@ pub enum GitError {
     },
 
     #[error(
-        "sealed all-content observation failed: {total_gaps} admitted entr(ies) have no byte-exact graph-owned body, so this repository cannot answer for its own content without reading the filesystem"
+        "sealed all-content observation failed: {total_gaps} admitted entr(ies) have no byte-exact graph-owned body, so this repository cannot answer for its own content without reading the filesystem: {}",
+        describe_unsealed_gaps(*total_gaps, reported)
     )]
     UnsealedContent {
         total_gaps: usize,
