@@ -1507,7 +1507,6 @@ mod tests {
             .collect()
     }
 
-    #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
     fn sealed_remote(name: &str, url: &str) -> GitRemoteTransportConfig {
         GitRemoteTransportConfig {
             name: name.to_string(),
@@ -1627,6 +1626,7 @@ mod tests {
         assert_eq!(sealed_without_urls.publish_url(), None);
     }
 
+    #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
     fn named_config(name: &str) -> KinConfig {
         KinConfig {
             name: Some(name.to_string()),
