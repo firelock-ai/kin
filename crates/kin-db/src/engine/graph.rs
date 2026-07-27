@@ -412,6 +412,164 @@ where
     ordered
 }
 
+/// The entity state one lineage carries into a change.
+///
+/// `live` names the entity each revision currently publishes; `ended` keeps the
+/// revision a removal closed so a later re-add in the same lineage names its
+/// real predecessor instead of starting a detached chain.
+#[derive(Clone, Default)]
+struct LineageEntities {
+    live: HashMap<EntityId, (std::sync::Arc<Entity>, EntityRevisionId)>,
+    ended: HashMap<EntityId, EntityRevisionId>,
+}
+
+fn push_entity_revision(
+    revisions: &mut HashMap<EntityId, Vec<EntityRevision>>,
+    entity: Entity,
+    change_id: SemanticChangeId,
+    supersedes: Option<EntityRevisionId>,
+) -> EntityRevisionId {
+    let entries = revisions.entry(entity.id).or_default();
+    if let Some(superseded) = supersedes.and_then(|previous| {
+        entries
+            .iter_mut()
+            .find(|revision| revision.revision_id == previous)
+    }) {
+        superseded.mark_ended(change_id);
+    }
+    let revision = EntityRevision::new(entity, change_id, supersedes);
+    let revision_id = revision.revision_id;
+    entries.push(revision);
+    revision_id
+}
+
+/// Derive every entity revision the change DAG publishes.
+///
+/// Each change is read against its first declared parent, the same material
+/// lineage `resolve_graph_at` replays. Replaying the whole DAG as one flat
+/// topological sequence instead folds divergent siblings into a single state,
+/// so a merge that restates its second parent's transition looks like a stale
+/// payload even though every lineage reaching it is consistent. Preconditions
+/// are still enforced against the state each change was authored on, so an old
+/// payload no parent published still fails closed.
+///
+/// `ordered` must list parents before children.
+fn derive_entity_revisions_across_history(
+    ordered: Vec<SemanticChange>,
+) -> Result<HashMap<EntityId, Vec<EntityRevision>>, KinDbError> {
+    let mut pending_children: HashMap<SemanticChangeId, usize> = HashMap::new();
+    for change in &ordered {
+        if let Some(parent) = change.parents.first() {
+            *pending_children.entry(*parent).or_insert(0) += 1;
+        }
+    }
+
+    let mut states: HashMap<SemanticChangeId, LineageEntities> = HashMap::new();
+    let mut revisions: HashMap<EntityId, Vec<EntityRevision>> = HashMap::new();
+
+    for change in ordered {
+        let change_id = change.id;
+        // The last child to read a parent takes ownership of its state, so a
+        // linear history moves one map forward rather than copying the whole
+        // live entity set per change.
+        let mut state = match change.parents.first() {
+            Some(parent) => match pending_children.get_mut(parent) {
+                Some(remaining) if *remaining <= 1 => {
+                    *remaining = 0;
+                    states.remove(parent).unwrap_or_default()
+                }
+                Some(remaining) => {
+                    *remaining -= 1;
+                    states.get(parent).cloned().unwrap_or_default()
+                }
+                None => LineageEntities::default(),
+            },
+            None => LineageEntities::default(),
+        };
+
+        for delta in &change.entity_deltas {
+            match delta {
+                EntityDelta::Added { new: entity } => {
+                    if state.live.contains_key(&entity.id) {
+                        return Err(kin_model::ModelError::Conflict(format!(
+                            "change {change_id} adds existing entity {}",
+                            entity.id
+                        ))
+                        .into());
+                    }
+                    let supersedes = state.ended.remove(&entity.id);
+                    let revision_id =
+                        push_entity_revision(&mut revisions, entity.clone(), change_id, supersedes);
+                    state.live.insert(
+                        entity.id,
+                        (std::sync::Arc::new(entity.clone()), revision_id),
+                    );
+                }
+                EntityDelta::Modified { old, new } => {
+                    if old.id != new.id {
+                        return Err(kin_model::ModelError::Conflict(format!(
+                            "change {change_id} modifies entity {} into different identity {}",
+                            old.id, new.id
+                        ))
+                        .into());
+                    }
+                    let supersedes = match state.live.get(&old.id) {
+                        Some((live, revision_id)) if live.as_ref() == old => *revision_id,
+                        _ => {
+                            return Err(kin_model::ModelError::Conflict(format!(
+                                "change {change_id} has stale old payload for entity {}",
+                                old.id
+                            ))
+                            .into())
+                        }
+                    };
+                    let revision_id = push_entity_revision(
+                        &mut revisions,
+                        new.clone(),
+                        change_id,
+                        Some(supersedes),
+                    );
+                    state
+                        .live
+                        .insert(new.id, (std::sync::Arc::new(new.clone()), revision_id));
+                }
+                EntityDelta::Removed { old } => {
+                    let ended = match state.live.get(&old.id) {
+                        Some((live, revision_id)) if live.as_ref() == old => *revision_id,
+                        _ => {
+                            return Err(kin_model::ModelError::Conflict(format!(
+                                "change {change_id} has stale old payload for removed entity {}",
+                                old.id
+                            ))
+                            .into())
+                        }
+                    };
+                    if let Some(revision) = revisions.get_mut(&old.id).and_then(|entries| {
+                        entries
+                            .iter_mut()
+                            .find(|revision| revision.revision_id == ended)
+                    }) {
+                        revision.mark_ended(change_id);
+                    }
+                    state.live.remove(&old.id);
+                    state.ended.insert(old.id, ended);
+                }
+            }
+        }
+
+        // A change no other change builds on has no reader left, so its state
+        // is dropped here instead of being retained for the whole derivation.
+        if pending_children
+            .get(&change_id)
+            .is_some_and(|remaining| *remaining > 0)
+        {
+            states.insert(change_id, state);
+        }
+    }
+
+    Ok(revisions)
+}
+
 fn find_artifact_revision(
     changes: impl IntoIterator<Item = (SemanticChangeId, SemanticChange)>,
     target: ArtifactRevisionId,
@@ -1996,18 +2154,14 @@ impl InMemoryGraph {
             // manager, never by this in-place mutable graph.
             repository_authority: _,
         } = snapshot;
-        let entity_revisions: HashMap<EntityId, Vec<EntityRevision>> = if entity_revisions
-            .is_empty()
-            && !changes.is_empty()
-        {
-            kin_model::graph::derive_entity_revisions_from_changes(topologically_order_changes(
-                changes.iter().map(|(id, change)| (*id, change.clone())),
-            ))?
-            .into_iter()
-            .collect()
-        } else {
-            entity_revisions.into_iter().collect()
-        };
+        let entity_revisions: HashMap<EntityId, Vec<EntityRevision>> =
+            if entity_revisions.is_empty() && !changes.is_empty() {
+                derive_entity_revisions_across_history(topologically_order_changes(
+                    changes.iter().map(|(id, change)| (*id, change.clone())),
+                ))?
+            } else {
+                entity_revisions.into_iter().collect()
+            };
         let _span = tracing::info_span!(
             "kindb.graph.from_snapshot",
             entities = entities.len(),
@@ -2361,13 +2515,9 @@ impl InMemoryGraph {
         let entity_data = EntityData {
             entities,
             entity_revisions: if entity_revisions.is_empty() && !changes.is_empty() {
-                kin_model::graph::derive_entity_revisions_from_changes(
-                    topologically_order_changes(
-                        changes.iter().map(|(id, change)| (*id, change.clone())),
-                    ),
-                )?
-                .into_iter()
-                .collect()
+                derive_entity_revisions_across_history(topologically_order_changes(
+                    changes.iter().map(|(id, change)| (*id, change.clone())),
+                ))?
             } else {
                 entity_revisions
             },
@@ -12458,6 +12608,180 @@ mod tests {
         assert_eq!(
             revisions[1].previous_revision,
             Some(revisions[0].revision_id)
+        );
+    }
+
+    #[test]
+    fn from_snapshot_backfills_entity_revisions_across_merge_history() {
+        let graph = InMemoryGraph::new();
+
+        let entity_v1 = test_entity("foo", "src/lib.rs");
+        let genesis_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x81; 32])),
+                parents: vec![],
+                timestamp: Timestamp::now(),
+                author: AuthorId::new("test"),
+                message: "add foo".to_string(),
+                entity_deltas: vec![EntityDelta::Added {
+                    new: entity_v1.clone(),
+                }],
+                relation_deltas: vec![],
+                tree_deltas: vec![],
+                projected_files: vec![],
+                spec_link: None,
+                evidence: vec![],
+                risk_summary: None,
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
+            },
+        );
+
+        let mut entity_v2 = entity_v1.clone();
+        entity_v2.signature = "fn foo(value: i32)".to_string();
+        entity_v2.fingerprint.signature_hash = Hash256::from_bytes([0x82; 32]);
+        let branch_delta = vec![EntityDelta::Modified {
+            old: entity_v1.clone(),
+            new: entity_v2.clone(),
+        }];
+        let branch_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x83; 32])),
+                parents: vec![genesis_id],
+                timestamp: Timestamp::now(),
+                author: AuthorId::new("test"),
+                message: "revise foo on a side branch".to_string(),
+                entity_deltas: branch_delta.clone(),
+                relation_deltas: vec![],
+                tree_deltas: vec![],
+                projected_files: vec![],
+                spec_link: None,
+                evidence: vec![],
+                risk_summary: None,
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
+            },
+        );
+
+        // The merge takes the side branch's content, so its own delta restates
+        // that transition against its first parent.
+        let merge_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x84; 32])),
+                parents: vec![genesis_id, branch_id],
+                timestamp: Timestamp::now(),
+                author: AuthorId::new("test"),
+                message: "merge the side branch".to_string(),
+                entity_deltas: branch_delta,
+                relation_deltas: vec![],
+                tree_deltas: vec![],
+                projected_files: vec![],
+                spec_link: None,
+                evidence: vec![],
+                risk_summary: None,
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
+            },
+        );
+
+        let mut snapshot = graph.to_snapshot();
+        snapshot.entity_revisions.clear();
+
+        let reloaded = InMemoryGraph::from_snapshot(snapshot)
+            .expect("merge history must reload without a stale-payload refusal");
+        let repaired = reloaded.to_snapshot();
+        let revisions = repaired
+            .entity_revisions
+            .get(&entity_v1.id)
+            .expect("reload should rebuild entity revision chain");
+        assert_eq!(
+            revisions
+                .iter()
+                .map(|revision| revision.introduced_by)
+                .collect::<Vec<_>>(),
+            vec![genesis_id, branch_id, merge_id]
+        );
+        assert_eq!(revisions[0].previous_revision, None);
+        // Both the side branch and the merge supersede the genesis revision:
+        // each reads its own first parent, not a folded sibling state.
+        assert_eq!(
+            revisions[1].previous_revision,
+            Some(revisions[0].revision_id)
+        );
+        assert_eq!(
+            revisions[2].previous_revision,
+            Some(revisions[0].revision_id)
+        );
+    }
+
+    #[test]
+    fn from_snapshot_refuses_an_old_payload_the_first_parent_never_published() {
+        let graph = InMemoryGraph::new();
+
+        let entity_v1 = test_entity("foo", "src/lib.rs");
+        let genesis_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x85; 32])),
+                parents: vec![],
+                timestamp: Timestamp::now(),
+                author: AuthorId::new("test"),
+                message: "add foo".to_string(),
+                entity_deltas: vec![EntityDelta::Added {
+                    new: entity_v1.clone(),
+                }],
+                relation_deltas: vec![],
+                tree_deltas: vec![],
+                projected_files: vec![],
+                spec_link: None,
+                evidence: vec![],
+                risk_summary: None,
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
+            },
+        );
+
+        let mut unpublished = entity_v1.clone();
+        unpublished.signature = "fn foo(value: u64)".to_string();
+        unpublished.fingerprint.signature_hash = Hash256::from_bytes([0x86; 32]);
+        let mut replacement = unpublished.clone();
+        replacement.signature = "fn foo(value: u128)".to_string();
+        replacement.fingerprint.signature_hash = Hash256::from_bytes([0x87; 32]);
+        admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x88; 32])),
+                parents: vec![genesis_id],
+                timestamp: Timestamp::now(),
+                author: AuthorId::new("test"),
+                message: "revise a payload nobody published".to_string(),
+                entity_deltas: vec![EntityDelta::Modified {
+                    old: unpublished,
+                    new: replacement,
+                }],
+                relation_deltas: vec![],
+                tree_deltas: vec![],
+                projected_files: vec![],
+                spec_link: None,
+                evidence: vec![],
+                risk_summary: None,
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
+            },
+        );
+
+        let mut snapshot = graph.to_snapshot();
+        snapshot.entity_revisions.clear();
+
+        let Err(error) = InMemoryGraph::from_snapshot(snapshot) else {
+            panic!("a payload no parent published must not rebuild into a revision chain");
+        };
+        assert!(
+            error.to_string().contains("stale old payload for entity"),
+            "unexpected revision derivation error: {error}"
         );
     }
 

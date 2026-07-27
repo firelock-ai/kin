@@ -5711,6 +5711,130 @@ mod tests {
         );
     }
 
+    fn merge_history_fixture(
+        merge_old: Entity,
+        merge_new: Entity,
+    ) -> (GraphSnapshot, Vec<kin_model::SemanticChange>) {
+        let original = semantic_test_entity("src/lib.rs", "kin", LanguageId::Rust, 0x61);
+        let mut revised = original.clone();
+        revised.signature = "fn kin(value: i32)".to_string();
+        revised.fingerprint.signature_hash = Hash256::from_bytes([0x62; 32]);
+
+        let mut genesis = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+            origin: ChangeOrigin::Native,
+            parents: Vec::new(),
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("authority-test"),
+            message: "introduce kin".to_string(),
+            entity_deltas: vec![EntityDelta::Added {
+                new: original.clone(),
+            }],
+            relation_deltas: Vec::new(),
+            tree_deltas: Vec::new(),
+            admission_policy_delta: None,
+            projected_files: Vec::new(),
+            spec_link: None,
+            evidence: Vec::new(),
+            risk_summary: None,
+        };
+        genesis.id = compute_semantic_change_id(&genesis).unwrap();
+
+        let mut branch = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+            origin: ChangeOrigin::Native,
+            parents: vec![genesis.id],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("authority-test"),
+            message: "revise kin on a side branch".to_string(),
+            entity_deltas: vec![EntityDelta::Modified {
+                old: original.clone(),
+                new: revised.clone(),
+            }],
+            relation_deltas: Vec::new(),
+            tree_deltas: Vec::new(),
+            admission_policy_delta: None,
+            projected_files: Vec::new(),
+            spec_link: None,
+            evidence: Vec::new(),
+            risk_summary: None,
+        };
+        branch.id = compute_semantic_change_id(&branch).unwrap();
+
+        let mut merge = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+            origin: ChangeOrigin::Native,
+            parents: vec![genesis.id, branch.id],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("authority-test"),
+            message: "merge the side branch".to_string(),
+            entity_deltas: vec![EntityDelta::Modified {
+                old: merge_old,
+                new: merge_new,
+            }],
+            relation_deltas: Vec::new(),
+            tree_deltas: Vec::new(),
+            admission_policy_delta: None,
+            projected_files: Vec::new(),
+            spec_link: None,
+            evidence: Vec::new(),
+            risk_summary: None,
+        };
+        merge.id = compute_semantic_change_id(&merge).unwrap();
+
+        let mut snapshot = GraphSnapshot::empty();
+        snapshot.changes.insert(genesis.id, genesis.clone());
+        snapshot.changes.insert(branch.id, branch.clone());
+        snapshot.changes.insert(merge.id, merge.clone());
+        let mut genesis_children = vec![branch.id, merge.id];
+        genesis_children.sort_unstable();
+        snapshot
+            .change_children
+            .insert(genesis.id, genesis_children);
+        snapshot.change_children.insert(branch.id, vec![merge.id]);
+
+        (snapshot, vec![genesis, branch, merge])
+    }
+
+    #[test]
+    fn history_replay_admits_a_merge_that_carries_its_second_parent_edits() {
+        let original = semantic_test_entity("src/lib.rs", "kin", LanguageId::Rust, 0x61);
+        let mut revised = original.clone();
+        revised.signature = "fn kin(value: i32)".to_string();
+        revised.fingerprint.signature_hash = Hash256::from_bytes([0x62; 32]);
+
+        // A Git merge whose result is its second parent's content is authored
+        // against the merge's first parent, so it restates the transition the
+        // side branch already published. Both readings are the same history.
+        let (snapshot, changes) = merge_history_fixture(original, revised);
+
+        validate_history_replay(&snapshot, &changes)
+            .expect("a merge restating its second parent's edit is not a stale payload");
+        validate_history_replay(&snapshot, &[])
+            .expect("reopen must replay the same merge history it admitted");
+    }
+
+    #[test]
+    fn history_replay_refuses_a_merge_whose_old_payload_no_parent_published() {
+        let mut unpublished = semantic_test_entity("src/lib.rs", "kin", LanguageId::Rust, 0x61);
+        unpublished.signature = "fn kin(value: u64)".to_string();
+        unpublished.fingerprint.signature_hash = Hash256::from_bytes([0x63; 32]);
+        let mut replacement = unpublished.clone();
+        replacement.signature = "fn kin(value: u128)".to_string();
+        replacement.fingerprint.signature_hash = Hash256::from_bytes([0x64; 32]);
+
+        let (snapshot, changes) = merge_history_fixture(unpublished, replacement);
+
+        for (label, new_changes) in [("admission", changes.as_slice()), ("reopen", &[][..])] {
+            let error = validate_history_replay(&snapshot, new_changes)
+                .expect_err("an old payload no parent ever published must be refused");
+            assert!(
+                error.to_string().contains("stale old payload for entity"),
+                "unexpected {label} replay error: {error}"
+            );
+        }
+    }
+
     #[test]
     fn removal_rejects_a_missing_old_body_before_publication() {
         let backend = Arc::new(MemoryBackend::default());
