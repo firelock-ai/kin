@@ -1063,6 +1063,13 @@ mod tests {
         source.upsert_entity(&entity).unwrap();
         let snapshot = source.to_snapshot();
         let expected_root = kin_db::compute_graph_root_hash(&snapshot);
+        // The sidecar records the retrieval-authority digest, not the legacy
+        // graph root. The legacy root covers entity and relation topology only,
+        // so it cannot detect an exact repository-tree or artifact-enrichment
+        // change that moves retrieval results. Bind the identity the sidecar
+        // actually carries.
+        let expected_sidecar_identity =
+            kin_db::storage::compute_retrieval_authority_hash(&snapshot);
 
         let graph = kin_db::InMemoryGraph::from_snapshot_with_text_index_and_root_hash(
             snapshot,
@@ -1073,7 +1080,7 @@ mod tests {
         kin_db::SnapshotManager::save_graph(layout.kindb_snapshot_path(), &graph).unwrap();
 
         let persisted = kin_db::TextIndex::open_read_only(Some(&layout.text_index_dir())).unwrap();
-        assert_eq!(persisted.graph_root_hash(), Some(expected_root));
+        assert_eq!(persisted.graph_root_hash(), Some(expected_sidecar_identity));
         let reopened_hits = persisted.fuzzy_search("bootstrap_entity", 10).unwrap();
         assert!(
             reopened_hits

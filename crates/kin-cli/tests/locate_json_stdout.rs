@@ -26,6 +26,42 @@ fn wait_for_pid_exit(pid: u32) {
     panic!("process {pid} did not exit");
 }
 
+/// Commit everything in the worktree so `kin init` sees a clean Git migration
+/// source. Kin refuses to admit a repository whose worktree still holds
+/// untracked, non-ignored paths, because those bytes have no committed history
+/// to become graph-owned truth from.
+fn commit_worktree(repo: &std::path::Path, message: &str) {
+    let add = Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(repo)
+        .output()
+        .expect("git add");
+    assert!(
+        add.status.success(),
+        "git add failed: {}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+    let commit = Command::new("git")
+        .args([
+            "-c",
+            "user.name=kin-ci",
+            "-c",
+            "user.email=ci@kin.dev",
+            "commit",
+            "-q",
+            "-m",
+            message,
+        ])
+        .current_dir(repo)
+        .output()
+        .expect("git commit");
+    assert!(
+        commit.status.success(),
+        "git commit failed: {}",
+        String::from_utf8_lossy(&commit.stderr)
+    );
+}
+
 fn kin_command() -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_kin"));
     cmd.env("KIN_DAEMON_DISABLE_LSP", "1")
@@ -58,6 +94,7 @@ fn locate_json_keeps_tracing_warnings_off_stdout() {
         "git init failed: {}",
         String::from_utf8_lossy(&git_init.stderr)
     );
+    commit_worktree(repo.path(), "seed");
 
     let init = kin_command()
         .arg("init")
@@ -136,6 +173,7 @@ fn locate_autostarts_daemon_when_available() {
         "git init failed: {}",
         String::from_utf8_lossy(&git_init.stderr)
     );
+    commit_worktree(repo.path(), "seed");
 
     let init = kin_command()
         .arg("init")
@@ -216,6 +254,7 @@ fn locate_requires_daemon_by_default() {
         "git init failed: {}",
         String::from_utf8_lossy(&git_init.stderr)
     );
+    commit_worktree(repo.path(), "seed");
 
     let init = kin_command()
         .arg("init")
@@ -275,6 +314,7 @@ fn locate_ref_can_resolve_historical_files_from_the_public_cli() {
         "git init failed: {}",
         String::from_utf8_lossy(&git_init.stderr)
     );
+    commit_worktree(repo.path(), "seed");
 
     let init = kin_command()
         .arg("init")
@@ -540,13 +580,6 @@ fn locate_ref_resolves_tip_and_root_after_full_history_init() {
         "git init failed: {}",
         String::from_utf8_lossy(&git_init.stderr)
     );
-
-    // Neutralize any globally-configured hooks so this acceptance fixture stays
-    // self-contained.
-    let _ = Command::new("git")
-        .args(["config", "core.hooksPath", "/dev/null"])
-        .current_dir(repo.path())
-        .output();
 
     let commit = |message: &str, seq: u32| {
         // Distinct, strictly increasing dates so the truncation window is

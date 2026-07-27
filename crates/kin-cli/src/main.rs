@@ -2890,9 +2890,9 @@ mod tests {
             let mut command = Cli::command();
             let help = command.render_long_help().to_string();
             for supported in [
-                "Run a command in a graph-backed session workspace",
-                "Launch an editor in a materialized session workspace",
-                "Open an interactive shell in a materialized session workspace",
+                "Run a command in an exact graph-backed session workspace",
+                "Launch an editor in an exact graph-derived session workspace",
+                "Open a shell in an exact graph-derived session workspace",
             ] {
                 assert!(
                     help.contains(supported),
