@@ -292,6 +292,17 @@ fn locate_requires_daemon_by_default() {
     );
 }
 
+/// Every `change <id>` line `kin log` prints, newest first. The oldest entry is
+/// the reachable root of the admitted history.
+fn logged_change_ids(stdout: &[u8]) -> Vec<String> {
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("change "))
+        .map(|id| id.trim().to_string())
+        .filter(|id| id.len() == 64 && id.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .collect()
+}
+
 #[test]
 #[serial]
 fn locate_ref_can_resolve_historical_files_from_the_public_cli() {
@@ -316,6 +327,17 @@ fn locate_ref_can_resolve_historical_files_from_the_public_cli() {
     );
     commit_worktree(repo.path(), "seed");
 
+    // Both states are authored in the migration source, so `kin init` admits the
+    // whole closure at once and the historical change is repository authority
+    // from the first command that runs against it.
+    fs::remove_file(repo.path().join("src/lib.py")).expect("remove old source");
+    fs::write(
+        repo.path().join("src/current.py"),
+        "def current_handler(payload):\n    return payload * 2\n",
+    )
+    .expect("write renamed source");
+    commit_worktree(repo.path(), "rename handler");
+
     let init = kin_command()
         .arg("init")
         .arg(".")
@@ -331,8 +353,6 @@ fn locate_ref_can_resolve_historical_files_from_the_public_cli() {
 
     let log = kin_command()
         .arg("log")
-        .arg("-n")
-        .arg("1")
         .current_dir(repo.path())
         .output()
         .expect("run kin log");
@@ -342,36 +362,16 @@ fn locate_ref_can_resolve_historical_files_from_the_public_cli() {
         String::from_utf8_lossy(&log.stdout),
         String::from_utf8_lossy(&log.stderr)
     );
-    let init_head = String::from_utf8_lossy(&log.stdout)
-        .lines()
-        .find_map(|line| line.trim().strip_prefix("Head: "))
-        .expect("log should print branch head")
-        .to_string();
-
-    fs::remove_file(repo.path().join("src/lib.py")).expect("remove old source");
-    fs::write(
-        repo.path().join("src/current.py"),
-        "def current_handler(payload):\n    return payload * 2\n",
-    )
-    .expect("write renamed source");
-
-    // Sleep briefly to ensure notify events propagate to the daemon before we run commit
-    std::thread::sleep(Duration::from_millis(250));
-
-    let commit = kin_command()
-        .arg("commit")
-        .arg("-m")
-        .arg("rename handler")
-        .arg("--quiet")
-        .current_dir(repo.path())
-        .output()
-        .expect("run kin commit");
-    assert!(
-        commit.status.success(),
-        "kin commit failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&commit.stdout),
-        String::from_utf8_lossy(&commit.stderr)
+    let logged = logged_change_ids(&log.stdout);
+    assert_eq!(
+        logged.len(),
+        2,
+        "kin log should print both admitted changes, got {logged:?}"
     );
+    let init_head = logged
+        .last()
+        .expect("admitted history has a reachable root")
+        .clone();
 
     let query = "Investigate legacy_handler in src/lib.py";
 
@@ -433,9 +433,15 @@ fn locate_ref_can_resolve_historical_files_from_the_public_cli() {
     );
 }
 
+/// Exact `kin init` admits the complete reachable Git closure atomically, so
+/// nothing is left for a ref-scoped query to hydrate later. This replaces the
+/// retired on-demand hydration contract with its inverse: the migration source
+/// is detached after init and historical refs must still resolve from graph
+/// truth alone, while a ref that was never admitted must fail as an explicit
+/// graph gap rather than triggering a filesystem repair.
 #[test]
 #[serial]
-fn locate_ref_hydrates_missing_imported_git_history_on_demand() {
+fn locate_ref_resolves_admitted_history_without_hydrating_from_git() {
     let repo = tempdir().expect("temp repo");
     fs::create_dir_all(repo.path().join("src")).expect("create src dir");
 
@@ -527,15 +533,18 @@ fn locate_ref_hydrates_missing_imported_git_history_on_demand() {
         String::from_utf8_lossy(&init.stderr)
     );
 
+    // Detach the migration source. Any answer produced from here on is graph
+    // truth admitted at init; an on-demand Git hydration path has nothing left
+    // to read.
+    fs::rename(repo.path().join(".git"), repo.path().join(".git-detached"))
+        .expect("detach migration source");
+
     let historical = kin_command()
         .arg("locate")
         .arg("--json")
         .arg("--ref")
         .arg(format!("git:{old_sha}"))
         .arg("Investigate legacy_handler in src/lib.py")
-        .env("KIN_DAEMON_DISABLE_LSP", "1")
-        .env("KIN_DAEMON_IDLE_TIMEOUT_SECS", "1")
-        .env("KIN_DAEMON_READY_TIMEOUT_SECS", "30")
         .current_dir(repo.path())
         .output()
         .expect("run historical kin locate");
@@ -556,8 +565,30 @@ fn locate_ref_hydrates_missing_imported_git_history_on_demand() {
         .collect::<Vec<_>>();
     assert!(
         files.contains(&"src/lib.py"),
-        "historical locate should surface hydrated imported Git file, got {:?}",
+        "historical locate should resolve the admitted change from graph truth, got {:?}",
         files
+    );
+
+    // A ref that init never admitted is a graph gap, reported as one. It is
+    // never repaired by reaching back into a filesystem checkout.
+    let absent = kin_command()
+        .arg("locate")
+        .arg("--json")
+        .arg("--ref")
+        .arg("git:0123456789abcdef0123456789abcdef01234567")
+        .arg("Investigate legacy_handler in src/lib.py")
+        .current_dir(repo.path())
+        .output()
+        .expect("run absent-ref kin locate");
+    assert!(
+        !absent.status.success(),
+        "an unadmitted ref must not resolve: stdout={}",
+        String::from_utf8_lossy(&absent.stdout)
+    );
+    let absent_stderr = String::from_utf8_lossy(&absent.stderr);
+    assert!(
+        absent_stderr.contains("has no imported repository-v6 alias"),
+        "absent ref must fail as an explicit graph gap: {absent_stderr}"
     );
 }
 
