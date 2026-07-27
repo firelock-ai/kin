@@ -9,12 +9,15 @@
 //! the staged `.kin` repository is atomically published.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use kin_blobs::BlobStore;
+use kin_db::{LocalFileBackend, RepositoryAuthorityManager};
 use kin_git::{
     admit_semantic_git_import, build_git_external_authority, capture_lossless_git_repository,
     plan_semantic_git_import, preflight_git_migration, preflight_git_migration_after_publication,
-    GitLocalIgnoreSourceKind, GitMigrationPreflightProof, LosslessGitRepository,
+    seal_all_content_observation, AdmittedContentClosure, GitLocalIgnoreSourceKind,
+    GitMigrationPreflightProof, LosslessGitRepository, SealedContentObservation,
 };
 use kin_model::{
     compute_resolved_tree_hash, AdmissionCase, AuthorId, ChangeStore,
@@ -31,14 +34,144 @@ use crate::config::{
     KinConfig,
 };
 use crate::error::{KinError, Result};
-use crate::init::{prepare_repository_layout_at, publish_repository_layout_linearized, InitResult};
+use crate::init::{
+    prepare_repository_layout_at, publish_repository_layout_linearized, GraphOwnedContent,
+    InitResult,
+};
+use crate::layout::KinLayout;
 use crate::manifest::KinManifest;
+
+// Gated on unix as well as test because exact Git admission is unix-only, so
+// the tests that drive this injection are too. Leaving it on every test build
+// would make it dead code on Windows, which CI rejects under `-D warnings`.
+#[cfg(all(unix, test))]
+std::thread_local! {
+    static WITHHELD_STAGED_BODY: std::cell::Cell<Option<Hash256>> =
+        const { std::cell::Cell::new(None) };
+    static DIVERGED_PUBLISHED_CLOSURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Drop one captured body on its way into the staged repository, so a test can
+/// prove admission refuses a graph that cannot answer for its own content.
+#[cfg(all(unix, test))]
+fn withhold_staged_body(digest: Hash256) {
+    WITHHELD_STAGED_BODY.set(Some(digest));
+}
+
+#[cfg(all(unix, test))]
+fn clear_withheld_staged_body() {
+    WITHHELD_STAGED_BODY.set(None);
+}
+
+#[cfg(all(unix, test))]
+fn staged_body_is_withheld(digest: Hash256) -> bool {
+    WITHHELD_STAGED_BODY.with(|withheld| withheld.get() == Some(digest))
+}
+
+#[cfg(not(all(unix, test)))]
+const fn staged_body_is_withheld(_digest: Hash256) -> bool {
+    false
+}
+
+/// Derive the published observation from a deliberately diverged closure, so a
+/// test can prove the cross-check refuses a divergence rather than assuming it.
+#[cfg(all(unix, test))]
+fn diverge_published_closure(diverged: bool) {
+    DIVERGED_PUBLISHED_CLOSURE.set(diverged);
+}
+
+#[cfg(all(unix, test))]
+fn published_closure_is_diverged() -> bool {
+    DIVERGED_PUBLISHED_CLOSURE.get()
+}
+
+/// A closure whose last admitted tree carries the bodies of two plain files
+/// exchanged.
+///
+/// Every shape count, distinct body, and byte total is unchanged by the
+/// exchange, so this is exactly the divergence a fingerprint over counts alone
+/// cannot see and a fingerprint bound to observed content must reject.
+#[cfg(all(unix, test))]
+struct DivergedClosure {
+    repository_id: RepositoryId,
+    trees: Vec<kin_model::ResolvedTree>,
+}
+
+#[cfg(all(unix, test))]
+impl DivergedClosure {
+    fn from_closure(closure: &impl AdmittedContentClosure) -> Self {
+        use kin_model::{ResolvedTree, TreeEntry};
+
+        let mut trees = closure
+            .admitted_trees()
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let head = trees
+            .last_mut()
+            .expect("an admitted closure observes a tree");
+        let plain_files = head
+            .artifacts_by_path()
+            .filter(|artifact| {
+                matches!(
+                    artifact.entry,
+                    TreeEntry::Blob {
+                        executable: false,
+                        ..
+                    }
+                )
+            })
+            .map(|artifact| (artifact.path.clone(), artifact.entry))
+            .take(2)
+            .collect::<Vec<_>>();
+        let [(left_path, left_entry), (right_path, right_entry)] = plain_files.as_slice() else {
+            panic!("the admitted head tree carries two plain files to exchange");
+        };
+        assert_ne!(
+            left_entry, right_entry,
+            "exchanging equal entries is not a divergence"
+        );
+        let exchanged = head
+            .clone()
+            .into_artifacts()
+            .map(|mut artifact| {
+                if artifact.path == *left_path {
+                    artifact.entry = *right_entry;
+                } else if artifact.path == *right_path {
+                    artifact.entry = *left_entry;
+                }
+                artifact
+            })
+            .collect::<Vec<_>>();
+        *head = ResolvedTree::from_artifacts(exchanged)
+            .expect("exchanging two entries preserves tree validity");
+        Self {
+            repository_id: closure.closure_repository_id().clone(),
+            trees,
+        }
+    }
+}
+
+#[cfg(all(unix, test))]
+impl AdmittedContentClosure for DivergedClosure {
+    fn closure_repository_id(&self) -> &RepositoryId {
+        &self.repository_id
+    }
+
+    fn admitted_trees(&self) -> Vec<&kin_model::ResolvedTree> {
+        self.trees.iter().collect()
+    }
+}
 
 /// Admit one clean materialized Git worktree as a complete Kin repository.
 ///
-/// The source Git repository is never mutated. Publication is all-or-nothing:
-/// source drift, unsupported compatibility state, an existing destination, or
-/// any graph/CAS validation error leaves `.kin` absent.
+/// The source Git repository is never mutated. Every refusal before the
+/// publication rename leaves `.kin` absent: source drift, unsupported
+/// compatibility state, an existing destination, a graph or CAS validation
+/// error, or an admitted closure the staged graph cannot answer for. Divergence
+/// found after the rename cannot unpublish, so it fails loud as
+/// [`KinError::RepositoryPublishedButUncertain`] with the published repository
+/// left in place for recovery.
 pub fn init_from_git(working_dir: &Path) -> Result<InitResult> {
     init_from_git_with_hook(working_dir, || {})
 }
@@ -93,6 +226,8 @@ fn init_from_git_with_hooks(
     let mut prepared =
         prepare_repository_layout_at(&staging_dir, &final_kin_dir, config, manifest)?;
     copy_captured_authority(&prepared, &snapshot, &capture_store, &source_proof)?;
+    let sealed_observation = seal_all_content_observation(&admitted, &prepared)
+        .map_err(|error| git_boundary_error("seal all-content observation", error))?;
 
     let workspace_seed = admitted.workspace_seed.clone();
     let workspace_policy = admitted.workspace_policy().clone();
@@ -147,6 +282,27 @@ fn init_from_git_with_hooks(
                     .to_string(),
             ));
         }
+        // Re-seal the published repository, deriving the closure from the exact
+        // import plan rather than its admitted form. Requiring both derivations
+        // to fingerprint identically proves publication preserved graph-owned
+        // content and that the two closures agree, instead of assuming it.
+        //
+        // This observation is after the linearization point, so it detects
+        // divergence rather than preventing publication: a refusal here leaves
+        // the published `.kin` on disk and reports
+        // `RepositoryPublishedButUncertain`, exactly like the post-publication
+        // source proof above. The staged observation before publication is what
+        // keeps a repository that cannot answer for its content from being
+        // published at all. Neither site degrades into a filesystem read.
+        let published_observation =
+            seal_published_content_observation(published.path(), &semantic_plan)?;
+        if published_observation.fingerprint != sealed_observation.fingerprint {
+            return Err(KinError::Other(
+                "sealed all-content observation changed across repository publication; published \
+                 authority is not safe to use without recovery"
+                    .to_string(),
+            ));
+        }
         Ok(())
     })?;
     // Exact Git refs intentionally retain external-object targets, so the
@@ -161,9 +317,42 @@ fn init_from_git_with_hooks(
         repository = %result.repository_id,
         workspace = %result.workspace_id,
         generation = result.authority.receipt.generation,
+        observed_trees = sealed_observation.observed_trees,
+        observed_entries = sealed_observation.observed_entries,
+        sealed_bodies = sealed_observation.coverage.sealed_bodies,
+        sealed_body_bytes = sealed_observation.coverage.sealed_body_bytes,
+        opaque_bodies = sealed_observation.coverage.opaque_bodies,
+        declared_exclusions = sealed_observation.exclusions.len(),
+        seal = %sealed_observation.fingerprint,
         "admitted exact Git repository as graph-owned Kin authority"
     );
     Ok(result)
+}
+
+/// Re-derive the sealed all-content observation against a published repository.
+///
+/// Reads only graph-owned content through the published repository's own
+/// authority, so a repository that seals here answers for its admitted content
+/// without consulting the working tree or the source object store.
+fn seal_published_content_observation(
+    published_kin_dir: &Path,
+    closure: &impl AdmittedContentClosure,
+) -> Result<SealedContentObservation> {
+    let layout = KinLayout::new(published_kin_dir.to_path_buf());
+    let authority = RepositoryAuthorityManager::open(
+        closure.closure_repository_id().clone(),
+        Arc::new(LocalFileBackend::new(layout.kindb_dir())),
+    )
+    .map_err(|error| KinError::Graph(error.to_string()))?;
+    let content = GraphOwnedContent::new(&authority);
+    #[cfg(all(unix, test))]
+    if published_closure_is_diverged() {
+        let diverged = DivergedClosure::from_closure(closure);
+        return seal_all_content_observation(&diverged, &content)
+            .map_err(|error| git_boundary_error("seal published all-content observation", error));
+    }
+    seal_all_content_observation(closure, &content)
+        .map_err(|error| git_boundary_error("seal published all-content observation", error))
 }
 
 fn verify_material_workspace_seed(
@@ -345,6 +534,9 @@ fn copy_captured_authority(
                 error,
             )
         })?;
+        if staged_body_is_withheld(record.body_hash) {
+            continue;
+        }
         prepared.save_source_blob(record.body_hash, &body)?;
     }
     for input in &proof.ignored_local.inputs {
@@ -1122,6 +1314,257 @@ mod tests {
             .tree
             .artifact_at_path(&RepoPath::from_utf8("containers/Dockerfile").unwrap())
             .is_some());
+    }
+
+    /// A source repository carrying an opaque binary, an executable bit, a
+    /// symlink, an empty file, and two revisions of a source file, so the
+    /// admitted closure spans more content than the workspace head alone.
+    #[cfg(unix)]
+    fn initialize_all_shapes_source(source: &Path) {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        initialize_git(source);
+        std::fs::create_dir_all(source.join("src")).unwrap();
+        std::fs::write(source.join("src/lib.rs"), b"pub fn answer() -> u8 { 42 }\n").unwrap();
+        std::fs::write(source.join("payload.bin"), [0_u8, 255, 17, 0, 128, 42]).unwrap();
+        std::fs::write(source.join("empty.txt"), b"").unwrap();
+        let executable = source.join("tool");
+        std::fs::write(&executable, b"#!/bin/sh\nexit 0\n").unwrap();
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+        symlink("src/lib.rs", source.join("source-link")).unwrap();
+        git(source, ["add", "--all"]);
+        git(source, ["commit", "-m", "exact tree with every shape"]);
+
+        // A second revision so a body that no longer appears at the workspace
+        // head still belongs to the admitted closure.
+        std::fs::write(source.join("src/lib.rs"), b"pub fn answer() -> u8 { 43 }\n").unwrap();
+        git(source, ["add", "--all"]);
+        git(source, ["commit", "-m", "second revision"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn admitted_repository_owns_every_historical_body_without_the_source_git_repository() {
+        use std::sync::Arc;
+
+        use kin_db::{LocalFileBackend, RepositoryAuthorityManager};
+        use kin_model::TreeEntry;
+
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        initialize_all_shapes_source(&source);
+
+        let result = init_from_git(&source).unwrap();
+
+        // Remove the Git object store the content came from. Anything the
+        // repository can still answer is genuinely graph-owned.
+        std::fs::remove_dir_all(source.join(".git")).unwrap();
+
+        let backend = Arc::new(LocalFileBackend::new(result.layout.kindb_dir()));
+        let authority =
+            RepositoryAuthorityManager::open(result.repository_id.clone(), backend).unwrap();
+        let lease = authority.read_authority();
+        let metadata = lease.metadata();
+        assert_eq!(metadata.aliases.len(), 2);
+
+        let workspace = &metadata.workspaces[0];
+        let mut proven = 0_usize;
+        for artifact in workspace.tree.artifacts() {
+            let Some(identity) = artifact.entry.blob_identity() else {
+                continue;
+            };
+            let body = authority
+                .load_source_blob(identity)
+                .unwrap()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "admitted repository cannot answer for {}",
+                        String::from_utf8_lossy(artifact.path.as_bytes())
+                    )
+                });
+            assert_eq!(kin_blobs::digest(&body), identity);
+            proven += 1;
+        }
+        // Five content-bearing paths: the source file, the opaque binary, the
+        // empty file, the executable, and the symlink target.
+        assert_eq!(proven, 5);
+
+        // The superseded first revision is still owned, so history reads never
+        // need the source Git repository either. Its body appears at no path in
+        // the head tree, so only the admitted closure can account for it.
+        let superseded_body = kin_blobs::digest(b"pub fn answer() -> u8 { 42 }\n");
+        assert!(
+            workspace
+                .tree
+                .artifacts()
+                .all(|artifact| artifact.entry.blob_identity() != Some(superseded_body)),
+            "the superseded body must not be reachable from the head tree"
+        );
+        let body = authority
+            .load_source_blob(superseded_body)
+            .unwrap()
+            .expect("admitted repository cannot answer for the superseded revision");
+        assert_eq!(kin_blobs::digest(&body), superseded_body);
+
+        let superseded = lease
+            .metadata()
+            .aliases
+            .iter()
+            .map(|alias| alias.change_id)
+            .collect::<Vec<_>>();
+        assert_eq!(superseded.len(), 2);
+        assert!(matches!(
+            workspace
+                .tree
+                .artifact_at_path(&kin_model::RepoPath::from_utf8("source-link").unwrap())
+                .unwrap()
+                .entry,
+            TreeEntry::Symlink { .. }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn admission_fails_closed_when_a_body_never_reaches_graph_storage() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        initialize_all_shapes_source(&source);
+
+        // A Git blob's CAS identity is the digest of its raw body, which for a
+        // regular file is the file's exact bytes.
+        let opaque = kin_blobs::digest(&std::fs::read(source.join("payload.bin")).unwrap());
+
+        withhold_staged_body(opaque);
+        let error = init_from_git(&source).unwrap_err();
+        clear_withheld_staged_body();
+
+        let message = error.to_string();
+        assert!(
+            message.contains("seal all-content observation"),
+            "admission must fail on the seal, got: {message}"
+        );
+        assert!(
+            message.contains("payload.bin"),
+            "the failure must name the unsealed path, got: {message}"
+        );
+        // Fail closed means nothing was published.
+        assert!(!source.join(".kin").exists());
+        assert_no_staging_directories(root.path());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_body_lost_across_publication_is_refused_before_the_published_seal_reads_it() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        initialize_all_shapes_source(&source);
+
+        // Remove one body from the published store between the two
+        // observations, which the staged observation already proved present.
+        let opaque = kin_blobs::digest(&std::fs::read(source.join("payload.bin")).unwrap());
+        let published_kin_dir = source.join(".kin");
+        let error = init_from_git_with_hooks(
+            &source,
+            || {},
+            move || remove_published_body(&published_kin_dir, opaque),
+        )
+        .unwrap_err();
+
+        // A physically defective published body never reaches the published
+        // seal: opening the published repository's authority loads and
+        // re-digests every body the admitted trees reference, so it refuses
+        // first. That is the layering this pins, and it is why the published
+        // seal's own detection power is closure divergence rather than store
+        // corruption. Do not rewrite this to expect the seal; a store defect
+        // cannot get past graph-authority verification to reach it.
+        let message = error.to_string();
+        assert!(
+            message.contains("is absent from immutable source CAS"),
+            "graph authority must refuse the absent body, got: {message}"
+        );
+        assert!(
+            message.contains(&opaque.to_string()),
+            "the refusal must name the lost body, got: {message}"
+        );
+        // The rename already happened, so the contract here is uncertain rather
+        // than absent: the operator is told to recover, not to reinitialize.
+        assert!(matches!(
+            error,
+            KinError::RepositoryPublishedButUncertain { .. }
+        ));
+        assert!(source.join(".kin").is_dir());
+        assert_no_staging_directories(root.path());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn published_closure_divergence_fails_loud_as_published_but_uncertain() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        initialize_all_shapes_source(&source);
+
+        // The published derivation observes two plain files with their bodies
+        // exchanged. Both bodies are present and byte-exact, so the seal itself
+        // succeeds and only the cross-check against the staged observation can
+        // refuse. Counts and byte totals are identical, so the fingerprint has
+        // to bind content for this to be detectable at all.
+        diverge_published_closure(true);
+        let error = init_from_git(&source).unwrap_err();
+        diverge_published_closure(false);
+
+        let message = error.to_string();
+        assert!(
+            message
+                .contains("sealed all-content observation changed across repository publication"),
+            "the cross-check must name the divergence, got: {message}"
+        );
+        assert!(matches!(
+            error,
+            KinError::RepositoryPublishedButUncertain { .. }
+        ));
+        assert!(source.join(".kin").is_dir());
+        assert_no_staging_directories(root.path());
+    }
+
+    /// Delete one graph-owned body from a published repository.
+    ///
+    /// The body is located by the content identity the store names its file
+    /// after, rather than by a hardcoded store layout, so the injection keeps
+    /// working if the directory shape changes and fails loudly if the naming
+    /// convention does.
+    #[cfg(unix)]
+    fn remove_published_body(published_kin_dir: &Path, identity: Hash256) {
+        let name = identity
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        assert!(
+            remove_first_named_file(published_kin_dir, &name),
+            "published repository stores no body named {name}"
+        );
+    }
+
+    #[cfg(unix)]
+    fn remove_first_named_file(directory: &Path, name: &str) -> bool {
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_dir() {
+                if remove_first_named_file(&entry.path(), name) {
+                    return true;
+                }
+            } else if entry.file_name() == std::ffi::OsStr::new(name) {
+                std::fs::remove_file(entry.path()).unwrap();
+                return true;
+            }
+        }
+        false
     }
 
     fn initialize_git(source: &Path) {
