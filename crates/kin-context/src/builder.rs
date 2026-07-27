@@ -840,11 +840,16 @@ where
     let mut entries = Vec::new();
 
     for file_id in file_ids {
+        // Resolve exact tree identity before reading any path-keyed facet. A
+        // planned artifact read keys on the admitted ArtifactId, so a path the
+        // repository tree does not admit is reported as a graph gap instead of
+        // being answered from whatever enrichment still carries that path.
+        let artifact_id = require_admitted_artifact_id(graph, file_id)?;
+
         if let Some(file) = graph
             .get_shallow_file(file_id)
             .map_err(|e| ContextError::Graph(e.to_string()))?
         {
-            let artifact_id = require_admitted_artifact_id(graph, &file.file_id)?;
             entries.push(ArtifactContextEntry {
                 retrieval_key: RetrievalKey::Artifact(artifact_id),
                 file_path: file.file_id.clone(),
@@ -857,7 +862,6 @@ where
             .get_structured_artifact(file_id)
             .map_err(|e| ContextError::Graph(e.to_string()))?
         {
-            let artifact_id = require_admitted_artifact_id(graph, &artifact.file_id)?;
             entries.push(ArtifactContextEntry {
                 retrieval_key: RetrievalKey::Artifact(artifact_id),
                 file_path: artifact.file_id.clone(),
@@ -870,7 +874,6 @@ where
             .get_opaque_artifact(file_id)
             .map_err(|e| ContextError::Graph(e.to_string()))?
         {
-            let artifact_id = require_admitted_artifact_id(graph, &artifact.file_id)?;
             entries.push(ArtifactContextEntry {
                 retrieval_key: RetrievalKey::Artifact(artifact_id),
                 file_path: artifact.file_id.clone(),
