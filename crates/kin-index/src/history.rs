@@ -21,7 +21,8 @@ use sha2::{Digest, Sha256};
 use crate::classifier::{FileClassification, FileClassifier};
 use crate::error::{IndexError, Result};
 use crate::linker::{
-    link_cross_file_with_completeness, ArtifactIdentityMap, FileParseCompletenessMap, FileParseData,
+    is_external_import_placeholder, link_cross_file_with_completeness, ArtifactIdentityMap,
+    FileParseCompletenessMap, FileParseData,
 };
 use crate::pipeline::IndexPipeline;
 
@@ -35,7 +36,7 @@ use crate::pipeline::IndexPipeline;
 /// establish whether replay semantics actually changed, and if they did, bump
 /// this constant and the manifest's recorded version together. Never
 /// regenerate a digest silently.
-pub const HYDRATION_SEMANTICS_VERSION: u32 = 4;
+pub const HYDRATION_SEMANTICS_VERSION: u32 = 5;
 
 /// Semantic graph delta derived for one pre-enrichment change identity.
 ///
@@ -284,10 +285,16 @@ fn semantic_state_for_tree(
         }
         completeness.insert(file.path.clone(), file.completeness.clone());
         for entity in &file.entities {
-            if entities.insert(entity.id, entity.clone()).is_some() {
+            if let Some(previous) = entities.insert(entity.id, entity.clone()) {
                 return Err(invalid(format!(
-                    "semantic entity identity {:?} is duplicated in one tree",
-                    entity.id
+                    "semantic entity identity {} is duplicated in one tree: {} {:?} from {:?} and {} {:?} from {}",
+                    entity.id,
+                    previous.name,
+                    previous.kind,
+                    previous.file_origin,
+                    entity.name,
+                    entity.kind,
+                    file.path
                 )));
             }
         }
@@ -303,6 +310,27 @@ fn semantic_state_for_tree(
     let linked = link_cross_file_with_completeness(&parse_data, &artifact_ids, &completeness)?;
     let mut relations = BTreeMap::new();
     for relation in linked {
+        if let Some(absent) = absent_local_endpoint(&relation, &entities) {
+            // A change carries the entity set of its own tree, so replaying it
+            // can only bind an edge whose endpoints that tree defines. The
+            // linker's cross-repo placeholder destination is absent by
+            // contract and stays a view-time inference rather than change-owned
+            // history; every other absent endpoint is inconsistent state and
+            // fails closed here instead of being admitted.
+            if absent.is_destination && is_external_import_placeholder(&relation) {
+                continue;
+            }
+            return Err(invalid(format!(
+                "linked relation {} names {} entity {} that the tree does not define",
+                relation.id,
+                if absent.is_destination {
+                    "destination"
+                } else {
+                    "source"
+                },
+                absent.entity_id
+            )));
+        }
         if relations.insert(relation.id, relation).is_some() {
             return Err(invalid(
                 "cross-file linker returned a duplicate relation identity",
@@ -315,6 +343,31 @@ fn semantic_state_for_tree(
         entities,
         relations,
     })
+}
+
+/// An entity endpoint of a linked relation that the tree does not define.
+struct AbsentEndpoint {
+    entity_id: EntityId,
+    is_destination: bool,
+}
+
+/// Report the first entity endpoint of `relation` that `entities` does not
+/// define, source before destination. Non-entity endpoints are not part of the
+/// entity state a change replays, so they are never reported.
+fn absent_local_endpoint(
+    relation: &Relation,
+    entities: &BTreeMap<EntityId, Entity>,
+) -> Option<AbsentEndpoint> {
+    [(relation.src, false), (relation.dst, true)]
+        .into_iter()
+        .find_map(|(node, is_destination)| {
+            node.as_entity()
+                .filter(|entity_id| !entities.contains_key(entity_id))
+                .map(|entity_id| AbsentEndpoint {
+                    entity_id,
+                    is_destination,
+                })
+        })
 }
 
 fn stabilize_historical_entities(
@@ -438,7 +491,7 @@ mod tests {
     use kin_git::{
         admit_semantic_git_import, capture_lossless_git_repository, plan_semantic_git_import,
     };
-    use kin_model::{EntityKind, RepositoryId};
+    use kin_model::{ChangeStore, EntityKind, RepositoryId};
     use tempfile::tempdir;
 
     use super::*;
@@ -658,6 +711,117 @@ mod tests {
             .unwrap()
             .validate(&blob_store)
             .unwrap();
+    }
+
+    /// The shape that blocked every real repository: a commit that starts
+    /// calling a symbol imported from another crate. The linker answers with a
+    /// cross-repo placeholder destination that is absent from this repository's
+    /// entity set by contract, so a change carrying that edge cannot be
+    /// replayed. Admission must still bind the commit and the local call graph
+    /// around it.
+    #[test]
+    fn calling_an_imported_external_symbol_stays_replayable() {
+        let root = tempdir().unwrap();
+        let repository = root.path().join("source");
+        fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "--initial-branch=main"]);
+        git(
+            &repository,
+            &["config", "user.email", "kin@example.invalid"],
+        );
+        git(&repository, &["config", "user.name", "Kin Test"]);
+        write(
+            &repository,
+            "src/main.rs",
+            b"fn colored() -> bool {\n    true\n}\n\nfn main() {\n    let _ = colored();\n}\n",
+        );
+        git(&repository, &["add", "--all"]);
+        git(&repository, &["commit", "-m", "local call graph only"]);
+
+        write(
+            &repository,
+            "src/main.rs",
+            b"extern crate isatty;\n\nuse isatty::stdout_isatty;\n\nfn colored() -> bool {\n    true\n}\n\nfn main() {\n    let _ = colored() && stdout_isatty();\n}\n",
+        );
+        git(&repository, &["add", "--all"]);
+        git(&repository, &["commit", "-m", "detect interactive terminal"]);
+
+        let blob_store = BlobStore::new(root.path().join("cas")).unwrap();
+        let snapshot = capture_lossless_git_repository(
+            &repository,
+            RepositoryId::new("history-external-import").unwrap(),
+            &blob_store,
+        )
+        .unwrap();
+        let plan = plan_semantic_git_import(&snapshot, &blob_store).unwrap();
+        let trees = trees_by_change(&plan);
+        let deltas = derive_historical_semantic_deltas(&plan.changes, &trees, &blob_store).unwrap();
+
+        let bindings = deltas
+            .iter()
+            .map(|delta| {
+                (
+                    delta.change_id,
+                    delta.entity_deltas.clone(),
+                    delta.relation_deltas.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let enriched = plan
+            .with_historical_semantics(&blob_store, &bindings)
+            .unwrap();
+        enriched.validate(&blob_store).unwrap();
+        let admitted = admit_semantic_git_import(&enriched, &blob_store).unwrap();
+
+        let entity_ids = admitted
+            .changes
+            .iter()
+            .flat_map(|change| &change.entity_deltas)
+            .filter_map(EntityDelta::new_state)
+            .map(|entity| entity.id)
+            .collect::<HashSet<_>>();
+        let bound_relations = admitted
+            .changes
+            .iter()
+            .flat_map(|change| &change.relation_deltas)
+            .filter_map(RelationDelta::new_state)
+            .collect::<Vec<_>>();
+        assert!(
+            bound_relations
+                .iter()
+                .any(|relation| relation.kind == kin_model::RelationKind::Calls),
+            "the local call graph must survive"
+        );
+        for relation in &bound_relations {
+            for node in [relation.src, relation.dst] {
+                if let kin_model::GraphNodeId::Entity(entity_id) = node {
+                    assert!(
+                        entity_ids.contains(&entity_id),
+                        "relation {} names entity {entity_id}, which history never defines",
+                        relation.id
+                    );
+                }
+            }
+        }
+
+        let graph = kin_db::InMemoryGraph::new();
+        for change in &admitted.changes {
+            graph.create_change(change).unwrap();
+        }
+        let head = admitted
+            .changes
+            .iter()
+            .map(|change| change.id)
+            .find(|candidate| {
+                !admitted
+                    .changes
+                    .iter()
+                    .any(|change| change.parents.contains(candidate))
+            })
+            .unwrap();
+        graph
+            .resolve_graph_at(&head)
+            .expect("admitted history must replay without a dangling relation");
     }
 
     #[test]
