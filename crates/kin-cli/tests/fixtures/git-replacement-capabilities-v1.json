@@ -214,12 +214,13 @@
     },
     {
       "command": "checkout",
-      "status": "open_gate",
-      "exposure": "fail_closed",
+      "status": "ready",
+      "exposure": "enabled",
       "authority": "daemon-private repository-v6 exact tree, semantic graph, source CAS, and crash-recoverable projection transaction",
       "required_for_bounded_dogfood": true,
       "acceptance_spec": [
         "resolve a selected immutable change through startup-pinned repository and workspace identity without Git or legacy object fallback",
+        "refuse a repository storage namespace replaced at the same ambient path, detached, or absent from the pinned store instead of answering from replacement authority",
         "verify complete selected tree, semantic graph, and source CAS closure before one projection and authority transaction",
         "preserve every unsupported-language and non-code artifact, executable bit, symlink, gitlink, opaque binary, and host-unrepresentable byte path in graph authority while materializing only host-representable entries",
         "reject every session-scoped request before mutation and preserve independently dirty unselected paths",
@@ -230,9 +231,13 @@
         "kin_daemon::api::tests::command_checkout_persists_same_tree_semantics_and_replays_after_restart",
         "kin_daemon::api::tests::command_checkout_rejects_unknown_unscoped_and_expired_sessions_without_mutation",
         "kin_daemon::api::tests::command_checkout_returns_typed_bad_request_and_conflict_statuses",
-        "kin_daemon::api::tests::command_checkout_projection_only_repairs_universal_bytes_and_replays_after_restart"
+        "kin_daemon::api::tests::command_checkout_projection_only_repairs_universal_bytes_and_replays_after_restart",
+        "kin_daemon::api::tests::command_checkout_refuses_replaced_repository_namespace_without_mutation",
+        "kin_daemon::api::tests::command_checkout_refuses_detached_repository_namespace_without_mutation",
+        "kin_core::repository_authority::tests::retained_binding_rejects_identical_repository_namespace_replacement",
+        "kin_core::repository_authority::tests::retained_binding_rejects_detached_repository_namespace"
       ],
-      "note": "The daemon-private checkout boundary and its exact replay tests are complete, but exposure remains fail-closed until kin-db retains and revalidates the selected repository authority subtree—not only the top-level storage root—across the daemon process lifetime."
+      "note": "Checkout binds only the repository and workspace identity this daemon pinned at startup, revalidates the retained per-repository storage namespace before planning, and answers a namespace replaced at the same ambient path, detached, or absent from the pinned store with a typed conflict instead of mismatched truth. Exact projection, universal artifact preservation, and caller-stable replay are proven across same-daemon and restart gaps. The retained-identity refusals are proven on Unix; the Windows file-identity path is implemented but not covered by CI."
     },
     {
       "command": "push",

@@ -1509,6 +1509,13 @@ impl DaemonState {
             Arc::clone(&local_repository_backend),
         )
         .map_err(DaemonError::Graph)?;
+        // Opening authority above is what retains the per-repository storage
+        // capability on this backend. Prove the pin took before serving any
+        // request from it: a daemon that cannot revalidate its own namespace
+        // must refuse to start rather than run unpinned, because every later
+        // authority bind treats whatever is retained as the baseline.
+        kin_core::revalidate_pinned_local_namespace(&local_repository_backend, &repository_id)
+            .map_err(DaemonError::Graph)?;
         let lease = authority.read_authority();
         let workspace_snapshot = lease
             .workspace_graph_snapshot(&workspace_id)
