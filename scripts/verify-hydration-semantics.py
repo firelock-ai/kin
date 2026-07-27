@@ -48,7 +48,7 @@ MANIFEST_PATH = os.path.join(SCRIPT_DIR, "hydration-semantics-manifest.json")
 REQUIRED_FIELDS = ("file", "function", "digest", "reason", "owner")
 
 # The file and constant that declare the dial this manifest is pinned to.
-VERSION_FILE = "crates/kin-cli/src/commands/init/history_checkpoint.rs"
+VERSION_FILE = "crates/kin-index/src/history.rs"
 VERSION_CONST = "HYDRATION_SEMANTICS_VERSION"
 
 # Applied with `.match(code, line_start)`, which anchors at the offset; a

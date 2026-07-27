@@ -25,6 +25,18 @@ use crate::linker::{
 };
 use crate::pipeline::IndexPipeline;
 
+/// Declared version of the replay semantics that author historical deltas.
+///
+/// Kin's deep history is not a stored fact. It is re-authored here from
+/// graph-owned trees and CAS bodies, so editing any of the replay functions
+/// pinned by `scripts/hydration-semantics-manifest.json` changes what Kin
+/// reports about the past on repositories that were already ingested. A digest
+/// mismatch in that guard is a decision to make, not a file to regenerate:
+/// establish whether replay semantics actually changed, and if they did, bump
+/// this constant and the manifest's recorded version together. Never
+/// regenerate a digest silently.
+pub const HYDRATION_SEMANTICS_VERSION: u32 = 4;
+
 /// Semantic graph delta derived for one pre-enrichment change identity.
 ///
 /// Callers apply these deltas to the matching change and then recompute change
