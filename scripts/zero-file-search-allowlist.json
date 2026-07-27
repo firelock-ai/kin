@@ -25,32 +25,8 @@
       "expiration": "2026-12-31"
     },
     {
-      "file": "crates/kin-cli/src/commands/stash.rs",
-      "reason": "IO Boundary: stashes and restores uncommitted file changes",
-      "owner": "kin-cli",
-      "expiration": "2026-12-31"
-    },
-    {
       "file": "crates/kin-cli/src/commands/session_workspace.rs",
       "reason": "IO Boundary: syncs workspace by reading and writing files",
-      "owner": "kin-cli",
-      "expiration": "2026-12-31"
-    },
-    {
-      "file": "crates/kin-cli/src/commands/native_sync.rs",
-      "reason": "IO Boundary: reads/writes sync files between local and remote state",
-      "owner": "kin-cli",
-      "expiration": "2026-12-31"
-    },
-    {
-      "file": "crates/kin-cli/src/commands/open.rs",
-      "reason": "IO Boundary: materializes session folder and reads/writes files",
-      "owner": "kin-cli",
-      "expiration": "2026-12-31"
-    },
-    {
-      "file": "crates/kin-cli/src/commands/shell.rs",
-      "reason": "IO Boundary: bootstraps session shell workspace files",
       "owner": "kin-cli",
       "expiration": "2026-12-31"
     },
@@ -144,25 +120,6 @@
         ".and_then(|dir| std::fs::read_dir(dir).ok())",
         "let pgrep = std::process::Command::new(\"/usr/bin/pgrep\")",
         "let ps = std::process::Command::new(\"/bin/ps\")"
-      ]
-    },
-    {
-      "file": "crates/kin-mcp/src/handlers/common.rs",
-      "reason": "Layout discovery boundary: candidate_source_roots only probes KIN_SOURCE_ROOT and the cwd for a .kin layout so the BlobStore can be located. Entity bodies are still fetched by graph-recorded hash and re-digested before use, and a miss reports graph-miss rather than falling back to the working tree",
-      "owner": "kin-mcp",
-      "expiration": "2026-12-31",
-      "allow_match": [
-        "if root.is_dir()",
-        "cwd.is_dir()"
-      ]
-    },
-    {
-      "file": "crates/kin-git/src/import.rs",
-      "reason": "Git ingestion boundary: open_repo probes for a .git directory to distinguish a worktree from a bare repo before handing the path to gix. Explicit input boundary for building graph truth, not a semantic answer",
-      "owner": "kin-git",
-      "expiration": "2026-12-31",
-      "allow_match": [
-        "dot_git.is_dir()"
       ]
     },
     {

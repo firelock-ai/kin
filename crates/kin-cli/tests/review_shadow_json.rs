@@ -447,6 +447,9 @@ fn shadow_report_stale_base_surfaces_ancestry_gap_end_to_end() {
     );
 }
 
+/// An abbreviated hash matching nothing must fail with the friendly
+/// ref-resolution error, exactly like any other unresolvable ref.
+#[test]
 fn shadow_report_unknown_abbreviated_sha_fails_friendly() {
     let dir = tempdir().expect("tempdir");
     let repo = dir.path();
