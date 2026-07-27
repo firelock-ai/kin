@@ -1,6 +1,6 @@
 {
   "comment": "Replay-semantics surface pinned by scripts/verify-hydration-semantics.py. These functions re-author the entity/relation deltas persisted for historical changes during Git admission, so editing one changes what Kin reports about the past on already-ingested repositories. A digest mismatch is not a failure to fix by regenerating: decide first whether replay semantics changed, and if so bump HYDRATION_SEMANTICS_VERSION and hydration_semantics_version together.",
-  "hydration_semantics_version": 4,
+  "hydration_semantics_version": 5,
   "guarded": [
     {
       "file": "crates/kin-index/src/history.rs",
@@ -12,14 +12,14 @@
     {
       "file": "crates/kin-index/src/history.rs",
       "function": "semantic_state_for_tree",
-      "digest": "sha256:f91a92ef3090a8c8622badfb59bd59f4032729c5caf35e331f7014c72dc06e80",
+      "digest": "sha256:883a0ba2ac406e67a7efb59d59cae37c0d33aa6829938d20f986d19833d75cab",
       "reason": "Turns one exact resolved tree plus CAS bodies into the entity/relation state a change is diffed from and to. Its classification, parse, and cross-file linking order decide what the past is said to contain.",
       "owner": "kin-index"
     },
     {
       "file": "crates/kin-index/src/history.rs",
       "function": "stabilize_historical_entities",
-      "digest": "sha256:257511e43f2742ae16e93bc62f4aa760211c98c8359e566200820c568035fd9a",
+      "digest": "sha256:ee7c9abc6215b230dc26f31f98f961e1d89f88e0bdb10e0004990d239d4375ff",
       "reason": "Carries entity identity across changes. Whether an entity is recognized as the same one decides whether history records a modification or an unrelated add and remove pair.",
       "owner": "kin-index"
     },

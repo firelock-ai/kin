@@ -21,7 +21,8 @@ use sha2::{Digest, Sha256};
 use crate::classifier::{FileClassification, FileClassifier};
 use crate::error::{IndexError, Result};
 use crate::linker::{
-    link_cross_file_with_completeness, ArtifactIdentityMap, FileParseCompletenessMap, FileParseData,
+    is_external_import_placeholder, link_cross_file_with_completeness, ArtifactIdentityMap,
+    FileParseCompletenessMap, FileParseData,
 };
 use crate::pipeline::IndexPipeline;
 
@@ -35,7 +36,7 @@ use crate::pipeline::IndexPipeline;
 /// establish whether replay semantics actually changed, and if they did, bump
 /// this constant and the manifest's recorded version together. Never
 /// regenerate a digest silently.
-pub const HYDRATION_SEMANTICS_VERSION: u32 = 4;
+pub const HYDRATION_SEMANTICS_VERSION: u32 = 5;
 
 /// Semantic graph delta derived for one pre-enrichment change identity.
 ///
@@ -284,10 +285,16 @@ fn semantic_state_for_tree(
         }
         completeness.insert(file.path.clone(), file.completeness.clone());
         for entity in &file.entities {
-            if entities.insert(entity.id, entity.clone()).is_some() {
+            if let Some(previous) = entities.insert(entity.id, entity.clone()) {
                 return Err(invalid(format!(
-                    "semantic entity identity {:?} is duplicated in one tree",
-                    entity.id
+                    "semantic entity identity {} is duplicated in one tree: {} {:?} from {:?} and {} {:?} from {}",
+                    entity.id,
+                    previous.name,
+                    previous.kind,
+                    previous.file_origin,
+                    entity.name,
+                    entity.kind,
+                    file.path
                 )));
             }
         }
@@ -303,6 +310,27 @@ fn semantic_state_for_tree(
     let linked = link_cross_file_with_completeness(&parse_data, &artifact_ids, &completeness)?;
     let mut relations = BTreeMap::new();
     for relation in linked {
+        if let Some(absent) = absent_local_endpoint(&relation, &entities) {
+            // A change carries the entity set of its own tree, so replaying it
+            // can only bind an edge whose endpoints that tree defines. The
+            // linker's cross-repo placeholder destination is absent by
+            // contract and stays a view-time inference rather than change-owned
+            // history; every other absent endpoint is inconsistent state and
+            // fails closed here instead of being admitted.
+            if absent.is_destination && is_external_import_placeholder(&relation) {
+                continue;
+            }
+            return Err(invalid(format!(
+                "linked relation {} names {} entity {} that the tree does not define",
+                relation.id,
+                if absent.is_destination {
+                    "destination"
+                } else {
+                    "source"
+                },
+                absent.entity_id
+            )));
+        }
         if relations.insert(relation.id, relation).is_some() {
             return Err(invalid(
                 "cross-file linker returned a duplicate relation identity",
@@ -317,12 +345,39 @@ fn semantic_state_for_tree(
     })
 }
 
+/// An entity endpoint of a linked relation that the tree does not define.
+struct AbsentEndpoint {
+    entity_id: EntityId,
+    is_destination: bool,
+}
+
+/// Report the first entity endpoint of `relation` that `entities` does not
+/// define, source before destination. Non-entity endpoints are not part of the
+/// entity state a change replays, so they are never reported.
+fn absent_local_endpoint(
+    relation: &Relation,
+    entities: &BTreeMap<EntityId, Entity>,
+) -> Option<AbsentEndpoint> {
+    [(relation.src, false), (relation.dst, true)]
+        .into_iter()
+        .find_map(|(node, is_destination)| {
+            node.as_entity()
+                .filter(|entity_id| !entities.contains_key(entity_id))
+                .map(|entity_id| AbsentEndpoint {
+                    entity_id,
+                    is_destination,
+                })
+        })
+}
+
 fn stabilize_historical_entities(
     artifact_id: ArtifactId,
     old_entities: Vec<&Entity>,
     parsed_entities: &[Entity],
 ) -> Vec<Entity> {
     let mut matched = HashSet::<EntityId>::new();
+    let mut in_use = HashSet::<EntityId>::new();
+    let mut unmatched = Vec::new();
     let mut current = Vec::with_capacity(parsed_entities.len());
 
     for parsed in parsed_entities {
@@ -347,11 +402,31 @@ fn stabilize_historical_entities(
             stabilized.created_in = old.created_in;
             stabilized.superseded_by = old.superseded_by;
             matched.insert(old.id);
+            in_use.insert(old.id);
         } else {
-            stabilized.id = historical_entity_id(artifact_id, parsed.id);
+            unmatched.push(current.len());
         }
         current.push(stabilized);
     }
+
+    // Deriving an identity from the parser identity alone can land on one this
+    // same file already carries. Inheritance deliberately detaches an entity
+    // from the position it was first parsed at, so a later definition that
+    // takes over that position derives exactly the identity the moved entity
+    // still holds: two conditionally compiled definitions of one name are
+    // enough. Mint against the identities already in use so distinct
+    // definitions can never collapse into one entity.
+    for index in unmatched {
+        let parser_id = parsed_entities[index].id;
+        let mut identity = historical_entity_id(artifact_id, parser_id);
+        let mut displacement = 0_u32;
+        while !in_use.insert(identity) {
+            displacement += 1;
+            identity = displaced_historical_entity_id(artifact_id, parser_id, displacement);
+        }
+        current[index].id = identity;
+    }
+
     current.sort_by_key(|entity| entity.id);
     current
 }
@@ -361,6 +436,30 @@ fn historical_entity_id(artifact_id: ArtifactId, parser_id: EntityId) -> EntityI
     hasher.update(b"kin.historical-entity.v1\0");
     hasher.update(artifact_id.0.as_bytes());
     hasher.update(parser_id.0.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    EntityId(uuid::Uuid::from_bytes(bytes))
+}
+
+/// Derive the identity of a parsed entity whose primary derived identity is
+/// already carried by another entity in the same file.
+///
+/// Kept separate from [`historical_entity_id`] so an identity only ever moves
+/// when a collision actually forces it: every entity that can keep its primary
+/// derivation keeps exactly the identity it had.
+fn displaced_historical_entity_id(
+    artifact_id: ArtifactId,
+    parser_id: EntityId,
+    displacement: u32,
+) -> EntityId {
+    let mut hasher = Sha256::new();
+    hasher.update(b"kin.historical-entity.displaced.v1\0");
+    hasher.update(artifact_id.0.as_bytes());
+    hasher.update(parser_id.0.as_bytes());
+    hasher.update(displacement.to_be_bytes());
     let digest = hasher.finalize();
     let mut bytes = [0_u8; 16];
     bytes.copy_from_slice(&digest[..16]);
@@ -438,7 +537,7 @@ mod tests {
     use kin_git::{
         admit_semantic_git_import, capture_lossless_git_repository, plan_semantic_git_import,
     };
-    use kin_model::{EntityKind, RepositoryId};
+    use kin_model::{ChangeStore, EntityKind, RepositoryId};
     use tempfile::tempdir;
 
     use super::*;
@@ -658,6 +757,223 @@ mod tests {
             .unwrap()
             .validate(&blob_store)
             .unwrap();
+    }
+
+    /// The shape that blocked every real repository: a commit that starts
+    /// calling a symbol imported from another crate. The linker answers with a
+    /// cross-repo placeholder destination that is absent from this repository's
+    /// entity set by contract, so a change carrying that edge cannot be
+    /// replayed. Admission must still bind the commit and the local call graph
+    /// around it.
+    #[test]
+    fn calling_an_imported_external_symbol_stays_replayable() {
+        let root = tempdir().unwrap();
+        let repository = root.path().join("source");
+        fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "--initial-branch=main"]);
+        git(
+            &repository,
+            &["config", "user.email", "kin@example.invalid"],
+        );
+        git(&repository, &["config", "user.name", "Kin Test"]);
+        write(
+            &repository,
+            "src/main.rs",
+            b"fn colored() -> bool {\n    true\n}\n\nfn main() {\n    let _ = colored();\n}\n",
+        );
+        git(&repository, &["add", "--all"]);
+        git(&repository, &["commit", "-m", "local call graph only"]);
+
+        write(
+            &repository,
+            "src/main.rs",
+            b"extern crate isatty;\n\nuse isatty::stdout_isatty;\n\nfn colored() -> bool {\n    true\n}\n\nfn main() {\n    let _ = colored() && stdout_isatty();\n}\n",
+        );
+        git(&repository, &["add", "--all"]);
+        git(
+            &repository,
+            &["commit", "-m", "detect interactive terminal"],
+        );
+
+        let blob_store = BlobStore::new(root.path().join("cas")).unwrap();
+        let snapshot = capture_lossless_git_repository(
+            &repository,
+            RepositoryId::new("history-external-import").unwrap(),
+            &blob_store,
+        )
+        .unwrap();
+        let plan = plan_semantic_git_import(&snapshot, &blob_store).unwrap();
+        let trees = trees_by_change(&plan);
+        let deltas = derive_historical_semantic_deltas(&plan.changes, &trees, &blob_store).unwrap();
+
+        let bindings = deltas
+            .iter()
+            .map(|delta| {
+                (
+                    delta.change_id,
+                    delta.entity_deltas.clone(),
+                    delta.relation_deltas.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let enriched = plan
+            .with_historical_semantics(&blob_store, &bindings)
+            .unwrap();
+        enriched.validate(&blob_store).unwrap();
+        let admitted = admit_semantic_git_import(&enriched, &blob_store).unwrap();
+
+        let entity_ids = admitted
+            .changes
+            .iter()
+            .flat_map(|change| &change.entity_deltas)
+            .filter_map(EntityDelta::new_state)
+            .map(|entity| entity.id)
+            .collect::<HashSet<_>>();
+        let bound_relations = admitted
+            .changes
+            .iter()
+            .flat_map(|change| &change.relation_deltas)
+            .filter_map(RelationDelta::new_state)
+            .collect::<Vec<_>>();
+        assert!(
+            bound_relations
+                .iter()
+                .any(|relation| relation.kind == kin_model::RelationKind::Calls),
+            "the local call graph must survive"
+        );
+        for relation in &bound_relations {
+            for node in [relation.src, relation.dst] {
+                if let kin_model::GraphNodeId::Entity(entity_id) = node {
+                    assert!(
+                        entity_ids.contains(&entity_id),
+                        "relation {} names entity {entity_id}, which history never defines",
+                        relation.id
+                    );
+                }
+            }
+        }
+
+        let graph = kin_db::InMemoryGraph::new();
+        for change in &admitted.changes {
+            graph.create_change(change).unwrap();
+        }
+        let head = admitted
+            .changes
+            .iter()
+            .map(|change| change.id)
+            .find(|candidate| {
+                !admitted
+                    .changes
+                    .iter()
+                    .any(|change| change.parents.contains(candidate))
+            })
+            .unwrap();
+        graph
+            .resolve_graph_at(&head)
+            .expect("admitted history must replay without a dangling relation");
+    }
+
+    /// Identity derivation is positional, inheritance is not. A definition that
+    /// takes over the position an inherited entity was first parsed at derives
+    /// that entity's identity, and two definitions of one name in one file must
+    /// never collapse into a single entity because of it.
+    #[test]
+    fn a_definition_taking_an_inherited_position_keeps_its_own_identity() {
+        let artifact_id = ArtifactId::new();
+        let path = "src/output.rs";
+        let moved = parsed_function(path, "print_entry_uncolorized", 2);
+        let arrived = parsed_function(path, "print_entry_uncolorized", 6);
+        let inherited = Entity {
+            id: historical_entity_id(artifact_id, arrived.id),
+            ..parsed_function(path, "print_entry_uncolorized", 6)
+        };
+
+        let stabilized =
+            stabilize_historical_entities(artifact_id, vec![&inherited], &[moved, arrived]);
+
+        assert_eq!(stabilized.len(), 2);
+        assert_ne!(
+            stabilized[0].id, stabilized[1].id,
+            "two definitions must not share one identity"
+        );
+        assert!(
+            stabilized.iter().any(|entity| entity.id == inherited.id),
+            "the entity that matched must keep the identity it carried"
+        );
+    }
+
+    /// The whole-history form of the same defect: one conditionally compiled
+    /// pair is enough to make a tree claim one entity twice.
+    #[test]
+    fn conditionally_compiled_duplicates_of_one_name_enrich() {
+        let root = tempdir().unwrap();
+        let repository = root.path().join("source");
+        fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "--initial-branch=main"]);
+        git(
+            &repository,
+            &["config", "user.email", "kin@example.invalid"],
+        );
+        git(&repository, &["config", "user.name", "Kin Test"]);
+        write(
+            &repository,
+            "src/output.rs",
+            b"fn head() {}\n\nfn tail() {}\n\nfn print_entry_uncolorized() {}\n",
+        );
+        git(&repository, &["add", "--all"]);
+        git(&repository, &["commit", "-m", "one definition"]);
+
+        write(
+            &repository,
+            "src/output.rs",
+            b"fn print_entry_uncolorized_base() {}\n#[cfg(not(unix))]\nfn print_entry_uncolorized() {}\n#[cfg(unix)]\nfn print_entry_uncolorized() {}\n",
+        );
+        git(&repository, &["add", "--all"]);
+        git(&repository, &["commit", "-m", "split by target"]);
+
+        let blob_store = BlobStore::new(root.path().join("cas")).unwrap();
+        let snapshot = capture_lossless_git_repository(
+            &repository,
+            RepositoryId::new("history-conditional-duplicates").unwrap(),
+            &blob_store,
+        )
+        .unwrap();
+        let plan = plan_semantic_git_import(&snapshot, &blob_store).unwrap();
+        let trees = trees_by_change(&plan);
+        let deltas = derive_historical_semantic_deltas(&plan.changes, &trees, &blob_store).unwrap();
+
+        let tip = deltas
+            .last()
+            .unwrap()
+            .entity_deltas
+            .iter()
+            .filter_map(EntityDelta::new_state)
+            .filter(|entity| entity.name == "print_entry_uncolorized")
+            .map(|entity| entity.id)
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            tip.len(),
+            2,
+            "both definitions must reach history as distinct entities"
+        );
+    }
+
+    fn parsed_function(path: &str, name: &str, start_line: u32) -> Entity {
+        let pipeline = IndexPipeline::new();
+        let body = format!("{}fn {name}() {{}}\n", "\n".repeat(start_line as usize - 1));
+        let indexed = pipeline
+            .index_file_content_with_tests(
+                &FilePathId::new(path),
+                body.as_bytes(),
+                kin_blobs::Hash256::from_bytes(kin_blobs::digest_bytes(body.as_bytes())),
+            )
+            .unwrap()
+            .indexed_file;
+        indexed
+            .entities
+            .into_iter()
+            .find(|entity| entity.name == name)
+            .unwrap()
     }
 
     #[test]
