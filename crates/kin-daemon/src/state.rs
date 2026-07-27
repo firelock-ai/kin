@@ -5486,13 +5486,21 @@ mod tests {
             TreeEntry::blob(hash, false),
         )])
         .unwrap();
-        crate::repository_commit::publish_workspace_tree(
-            &blobs,
-            &crate::local_repository_authority::LocalRepositoryAuthorityContext::from_layout_for_test(
+        let context =
+            crate::local_repository_authority::LocalRepositoryAuthorityContext::from_layout_for_test(
                 &init.layout,
             )
-            .unwrap(),
-            &desired,
+            .unwrap();
+        let admitted = crate::repository_commit::admitted_workspace_tree_for_test(
+            init.layout.working_dir(),
+            context.open().unwrap().read_authority().roots().clone(),
+            ResolvedTree::default(),
+            desired.clone(),
+        );
+        crate::repository_commit::publish_workspace_tree(
+            &blobs,
+            &context,
+            &admitted,
             kin_model::OperationId::new(),
             kin_model::AuthorId::new("lsp-authority-test"),
         )
