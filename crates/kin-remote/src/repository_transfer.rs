@@ -336,6 +336,87 @@ pub fn repository_transfer_status<B: StorageBackend + ?Sized + 'static>(
     })
 }
 
+/// One advertised ref and the change it resolves to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepositoryRefAdvertisementEntry {
+    pub name: RefName,
+    pub target: RefTarget,
+    pub head: SemanticChangeId,
+}
+
+/// What a repository publishes before any history moves.
+///
+/// A clone starts here: it has no ref of its own to ask about yet, so it
+/// cannot use the per-ref transfer status, and it needs the default ref
+/// before it can initialize a replica that adopts the remote layout.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepositoryRefAdvertisement {
+    pub schema_version: u32,
+    pub protocol: String,
+    pub repository_id: RepositoryId,
+    /// Published refs ordered by name, so the advertisement is one spelling
+    /// per repository state rather than a function of storage order.
+    pub refs: Vec<RepositoryRefAdvertisementEntry>,
+    /// The ref a fresh clone adopts.
+    ///
+    /// An unborn repository publishes a default ref that is absent from
+    /// `refs`: it has declared where history will land without having any.
+    /// A clone must reproduce that state rather than treat it as an error.
+    pub default_ref: Option<RefName>,
+    pub roots: RootBundle,
+    pub supported_features: Vec<String>,
+    pub limits: RepositoryTransferLimits,
+}
+
+/// Advertise every published ref for `repository_id`.
+pub fn repository_ref_advertisement<B: StorageBackend + ?Sized + 'static>(
+    authority: &RepositoryAuthorityManager<B>,
+    repository_id: &RepositoryId,
+) -> Result<RepositoryRefAdvertisement> {
+    let lease = authority.read_authority();
+    if &lease.authority_metadata().repository_id != repository_id {
+        return Err(invalid(format!(
+            "authority belongs to {}, not requested repository {}",
+            lease.authority_metadata().repository_id,
+            repository_id
+        )));
+    }
+
+    let mut refs = Vec::with_capacity(lease.authority_metadata().ref_state.refs.len());
+    for entry in &lease.authority_metadata().ref_state.refs {
+        refs.push(RepositoryRefAdvertisementEntry {
+            name: entry.name.clone(),
+            target: entry.target.clone(),
+            head: lease
+                .resolve_target_change_id(&entry.target)
+                .map_err(storage)?,
+        });
+    }
+    refs.sort_by(|left, right| left.name.cmp(&right.name));
+    if let Some(duplicate) = refs
+        .windows(2)
+        .find(|pair| pair[0].name == pair[1].name)
+        .map(|pair| pair[0].name.clone())
+    {
+        return Err(invalid(format!(
+            "repository publishes ref {duplicate} more than once"
+        )));
+    }
+
+    Ok(RepositoryRefAdvertisement {
+        schema_version: REPOSITORY_TRANSFER_SCHEMA_VERSION,
+        protocol: REPOSITORY_TRANSFER_PROTOCOL.to_string(),
+        repository_id: repository_id.clone(),
+        refs,
+        default_ref: lease.authority_metadata().ref_state.default_ref.clone(),
+        roots: lease.roots().clone(),
+        supported_features: required_features(),
+        limits: RepositoryTransferLimits::default(),
+    })
+}
+
 pub fn build_repository_transfer_pack<B: StorageBackend + ?Sized + 'static>(
     authority: &RepositoryAuthorityManager<B>,
     source_ref: &RefName,
@@ -1792,6 +1873,141 @@ mod tests {
             error.to_string().contains("required immutable source body"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn advertisement_publishes_ordered_refs_with_resolved_heads() {
+        let fixture = fixture();
+        let advertised =
+            repository_ref_advertisement(&fixture.source, &fixture.repository_id).unwrap();
+
+        assert_eq!(advertised.protocol, REPOSITORY_TRANSFER_PROTOCOL);
+        assert_eq!(
+            advertised.schema_version,
+            REPOSITORY_TRANSFER_SCHEMA_VERSION
+        );
+        assert_eq!(advertised.repository_id, fixture.repository_id);
+
+        let main = advertised
+            .refs
+            .iter()
+            .find(|entry| entry.name == fixture.main)
+            .expect("source publishes the transferred ref");
+        let status =
+            repository_transfer_status(&fixture.source, &fixture.repository_id, &fixture.main)
+                .unwrap();
+        assert_eq!(Some(main.head), status.destination_head);
+        assert_eq!(Some(main.target.clone()), status.destination_target);
+        assert_eq!(advertised.default_ref, status.default_ref);
+
+        // Publish two more refs in an order the advertisement must not keep,
+        // so the ordering assertion below has something to sort.
+        let head = status.destination_head.unwrap();
+        let zulu = RefName::branch(b"zulu").unwrap();
+        let alpha = RefName::branch(b"alpha").unwrap();
+        let lease = fixture.source.read_authority();
+        let transaction = RepositoryTransaction {
+            schema_version: REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+            operation_id: OperationId::new(),
+            repository_id: fixture.repository_id.clone(),
+            expected_generation: lease.roots().generation,
+            expected_roots: lease.roots().clone(),
+            actor: AuthorId::new("transfer-fixture"),
+            reason: "publish additional refs out of advertised order".to_string(),
+            external_objects: Vec::new(),
+            git_authority_delta: None,
+            changes: Vec::new(),
+            aliases: Vec::new(),
+            ref_mutations: vec![
+                RefMutation {
+                    name: zulu.clone(),
+                    expected: RefExpectation::MustNotExist,
+                    new_target: Some(RefTarget::change(head)),
+                    policy: RefUpdatePolicy::FastForwardOnly,
+                },
+                RefMutation {
+                    name: alpha.clone(),
+                    expected: RefExpectation::MustNotExist,
+                    new_target: Some(RefTarget::change(head)),
+                    policy: RefUpdatePolicy::FastForwardOnly,
+                },
+            ],
+            default_ref_mutation: None,
+            workspace_mutation: None,
+            local_overlay_delta: None,
+        };
+        drop(lease);
+        fixture
+            .source
+            .commit_repository_transaction(transaction)
+            .unwrap();
+
+        let advertised =
+            repository_ref_advertisement(&fixture.source, &fixture.repository_id).unwrap();
+        assert_eq!(advertised.refs.len(), 3);
+        assert!(advertised
+            .refs
+            .windows(2)
+            .all(|pair| pair[0].name < pair[1].name));
+        assert_eq!(advertised.refs.first().unwrap().name, alpha);
+        assert_eq!(advertised.refs.last().unwrap().name, zulu);
+        assert!(advertised
+            .refs
+            .iter()
+            .all(|entry| entry.head == head || entry.name == fixture.main));
+    }
+
+    #[test]
+    fn advertisement_rejects_a_repository_it_was_not_asked_for() {
+        let fixture = fixture();
+        let other = RepositoryId::new(uuid::Uuid::new_v4().to_string()).unwrap();
+        let error = repository_ref_advertisement(&fixture.source, &other).unwrap_err();
+        assert!(error.to_string().contains("not requested repository"));
+    }
+
+    #[test]
+    fn unborn_repository_advertises_a_default_ref_it_has_no_history_for() {
+        let directory = TempDir::new().unwrap();
+        let repository_id = RepositoryId::new(uuid::Uuid::new_v4().to_string()).unwrap();
+        let authority = manager(&directory, &repository_id);
+        let trunk = RefName::branch(b"trunk").unwrap();
+
+        // Declare where history will land without landing any, which is the
+        // state an empty repository is published in.
+        let lease = authority.read_authority();
+        let transaction = RepositoryTransaction {
+            schema_version: REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+            operation_id: OperationId::new(),
+            repository_id: repository_id.clone(),
+            expected_generation: lease.roots().generation,
+            expected_roots: lease.roots().clone(),
+            actor: AuthorId::new("transfer-fixture"),
+            reason: "declare an unborn default ref".to_string(),
+            external_objects: Vec::new(),
+            git_authority_delta: None,
+            changes: Vec::new(),
+            aliases: Vec::new(),
+            ref_mutations: Vec::new(),
+            default_ref_mutation: Some(DefaultRefMutation {
+                expected: DefaultRefExpectation::MustBeUnset,
+                new_default: Some(trunk.clone()),
+            }),
+            workspace_mutation: None,
+            local_overlay_delta: None,
+        };
+        drop(lease);
+        authority
+            .commit_repository_transaction(transaction)
+            .unwrap();
+
+        let advertised = repository_ref_advertisement(&authority, &repository_id).unwrap();
+
+        // A clone of an empty repository has to reproduce exactly this: a
+        // declared landing place with nothing in it. Treating the advertised
+        // default as a ref that must resolve would make empty repositories
+        // uncloneable.
+        assert!(advertised.refs.is_empty());
+        assert_eq!(advertised.default_ref, Some(trunk));
     }
 
     #[test]
