@@ -1063,21 +1063,29 @@ fn display_path(path: &[u8]) -> String {
 mod tests {
     use std::ffi::OsStr;
     use std::fs;
+    #[cfg(unix)]
     use std::io::Write as _;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Output};
 
+    #[cfg(unix)]
     use kin_model::{
-        AdmissionRuleSourceKind, AuthorityRoot, OperationId, RepoPath, RootBundle,
-        SharedAdmissionPolicy, REPOSITORY_ROOT_SCHEMA_VERSION,
+        AdmissionRuleSourceKind, AuthorityRoot, OperationId, RootBundle,
+        REPOSITORY_ROOT_SCHEMA_VERSION,
     };
+    use kin_model::{RepoPath, SharedAdmissionPolicy};
     use pretty_assertions::assert_eq;
-    use tempfile::{tempdir, TempDir};
+    use tempfile::tempdir;
+    #[cfg(unix)]
+    use tempfile::TempDir;
 
     use super::*;
-    use crate::admission_history::{admit_semantic_git_import, AdmittedSemanticGitImportPlan};
+    use crate::admission_history::admit_semantic_git_import;
+    #[cfg(unix)]
+    use crate::admission_history::AdmittedSemanticGitImportPlan;
     use crate::lossless::capture_lossless_git_repository;
 
+    #[cfg(unix)]
     struct SemanticFixture {
         root: TempDir,
         repo: PathBuf,
@@ -1097,8 +1105,8 @@ mod tests {
         gitlink: GitObjectId,
     }
 
+    #[cfg(unix)]
     impl SemanticFixture {
-        #[cfg(unix)]
         fn octopus_polyglot() -> Self {
             use std::os::unix::fs::{symlink, PermissionsExt};
 
@@ -1815,6 +1823,7 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     fn change_for_oid(plan: &SemanticGitImportPlan, oid: GitObjectId) -> &SemanticChange {
         plan.changes
             .iter()
@@ -1822,10 +1831,12 @@ mod tests {
             .unwrap()
     }
 
+    #[cfg(unix)]
     fn alias_for_oid(plan: &SemanticGitImportPlan, oid: GitObjectId) -> &ExternalChangeAlias {
         plan.aliases.iter().find(|alias| alias.oid == oid).unwrap()
     }
 
+    #[cfg(unix)]
     fn admitted_change_for_oid(
         plan: &AdmittedSemanticGitImportPlan,
         oid: GitObjectId,
@@ -1836,6 +1847,7 @@ mod tests {
             .unwrap()
     }
 
+    #[cfg(unix)]
     fn admitted_alias_for_oid(
         plan: &AdmittedSemanticGitImportPlan,
         oid: GitObjectId,
@@ -1843,10 +1855,12 @@ mod tests {
         plan.aliases.iter().find(|alias| alias.oid == oid).unwrap()
     }
 
+    #[cfg(unix)]
     fn artifact_id(tree: &ResolvedTree, path: &[u8]) -> ArtifactId {
         tree.artifact_at_path(&repo_path(path)).unwrap().artifact_id
     }
 
+    #[cfg(unix)]
     fn assert_entry(tree: &ResolvedTree, path: &[u8], expected: TreeEntry) {
         let artifact = tree.artifact_at_path(&repo_path(path)).unwrap_or_else(|| {
             panic!(
@@ -1865,6 +1879,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     fn body_hash_for_blob(plan: &SemanticGitImportPlan, oid: GitObjectId) -> Hash256 {
         plan.external_objects
             .iter()
@@ -1877,6 +1892,7 @@ mod tests {
         RepoPath::from_bytes(path).unwrap()
     }
 
+    #[cfg(unix)]
     fn model_oid(hex_oid: &str) -> GitObjectId {
         let bytes = hex::decode(hex_oid).unwrap();
         match bytes.len() {
@@ -1886,6 +1902,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn root_bundle() -> RootBundle {
         fn root(byte: u8) -> AuthorityRoot {
             AuthorityRoot::new(
@@ -1938,6 +1955,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     fn git_text<I, S>(repo: &Path, args: I) -> String
     where
         I: IntoIterator<Item = S>,
@@ -1953,6 +1971,7 @@ mod tests {
         String::from_utf8(output.stdout).unwrap().trim().to_string()
     }
 
+    #[cfg(unix)]
     fn git_stdin_ok<I, S>(repo: &Path, args: I, stdin: &[u8])
     where
         I: IntoIterator<Item = S>,
@@ -1968,6 +1987,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     fn git_stdin_text<I, S>(repo: &Path, args: I, stdin: &[u8]) -> String
     where
         I: IntoIterator<Item = S>,
@@ -1997,6 +2017,7 @@ mod tests {
             .unwrap()
     }
 
+    #[cfg(unix)]
     fn git_stdin_output<I, S>(repo: &Path, args: I, stdin: &[u8]) -> Output
     where
         I: IntoIterator<Item = S>,

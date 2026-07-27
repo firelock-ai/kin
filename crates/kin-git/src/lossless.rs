@@ -10,9 +10,11 @@
 //! repository and publishes the destination only after an exact recapture.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+#[cfg(unix)]
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use gix::bstr::ByteSlice;
@@ -26,20 +28,21 @@ use kin_model::{
 
 use crate::error::{GitError, Result};
 
+#[cfg(unix)]
 static STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-#[cfg(test)]
+#[cfg(all(unix, test))]
 std::thread_local! {
     static FAIL_NEXT_PUBLICATION_PARENT_SYNC: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
 }
 
-#[cfg(test)]
+#[cfg(all(unix, test))]
 fn inject_next_publication_parent_sync_failure() {
     FAIL_NEXT_PUBLICATION_PARENT_SYNC.set(true);
 }
 
-#[cfg(test)]
+#[cfg(all(unix, test))]
 fn fail_publication_parent_sync_if_injected(output_path: &Path) -> Result<()> {
     FAIL_NEXT_PUBLICATION_PARENT_SYNC.with(|fail| {
         if fail.replace(false) {
@@ -53,7 +56,7 @@ fn fail_publication_parent_sync_if_injected(output_path: &Path) -> Result<()> {
     })
 }
 
-#[cfg(not(test))]
+#[cfg(all(unix, not(test)))]
 fn fail_publication_parent_sync_if_injected(_output_path: &Path) -> Result<()> {
     Ok(())
 }
@@ -890,7 +893,9 @@ struct PublicationIdentity {
 /// so a replacement of the ambient parent cannot redirect a mutation.
 pub(crate) struct ClaimedStaging {
     path: PathBuf,
+    #[cfg(unix)]
     parent_display: PathBuf,
+    #[cfg(unix)]
     name: OsString,
     published: bool,
     #[cfg(unix)]
@@ -1063,6 +1068,7 @@ pub(crate) fn require_anchored_publication_platform(path: &Path) -> Result<()> {
     }
 }
 
+#[cfg(unix)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PublicationHookPoint {
     AfterNamespaceMutation,
@@ -1634,6 +1640,7 @@ fn display_bytes(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use std::ffi::OsStr;
+    #[cfg(unix)]
     use std::io::Write as _;
     use std::process::{Command, Output};
 
@@ -1642,13 +1649,17 @@ mod tests {
 
     use super::*;
 
+    /// Gitlink target recorded by the polyglot fixture, which is never a
+    /// capturable object in the source repository.
+    #[cfg(unix)]
+    const POLYGLOT_GITLINK_OID: &str = "4242424242424242424242424242424242424242";
+
     struct Fixture {
         _root: TempDir,
         repo: PathBuf,
         cas_root: PathBuf,
         blob_store: BlobStore,
         first_commit: String,
-        gitlink_oid: String,
     }
 
     #[cfg(unix)]
@@ -1846,14 +1857,13 @@ mod tests {
             let mut index_entry = format!("100644 {non_utf8_oid}\t").into_bytes();
             index_entry.extend_from_slice(b"odd-\xff.bin\0");
             git_stdin_ok(&repo, ["update-index", "-z", "--index-info"], &index_entry);
-            let gitlink_oid = "4242424242424242424242424242424242424242".to_string();
             git_ok(
                 &repo,
                 [
                     "update-index",
                     "--add",
                     "--cacheinfo",
-                    &format!("160000,{gitlink_oid},vendor/sub"),
+                    &format!("160000,{POLYGLOT_GITLINK_OID},vendor/sub"),
                 ],
             );
             git_ok(&repo, ["commit", "-m", "initial exact tree"]);
@@ -1893,7 +1903,6 @@ mod tests {
                 cas_root,
                 blob_store,
                 first_commit,
-                gitlink_oid,
             }
         }
 
@@ -1915,7 +1924,6 @@ mod tests {
                 cas_root,
                 blob_store,
                 first_commit,
-                gitlink_oid: String::new(),
             }
         }
     }
@@ -1951,7 +1959,7 @@ mod tests {
         assert!(!snapshot
             .objects
             .iter()
-            .any(|record| record.object.oid.to_string() == fixture.gitlink_oid));
+            .any(|record| record.object.oid.to_string() == POLYGLOT_GITLINK_OID));
         assert_eq!(
             snapshot.refs.default_ref.as_ref().unwrap().as_bytes(),
             b"refs/heads/main"
@@ -2296,6 +2304,7 @@ mod tests {
             .unwrap()
     }
 
+    #[cfg(unix)]
     fn git_stdin_ok<I, S>(repo: &Path, args: I, stdin: &[u8])
     where
         I: IntoIterator<Item = S>,
@@ -2311,6 +2320,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     fn git_stdin_text<I, S>(repo: &Path, args: I, stdin: &[u8]) -> String
     where
         I: IntoIterator<Item = S>,
@@ -2326,6 +2336,7 @@ mod tests {
         String::from_utf8(output.stdout).unwrap().trim().to_string()
     }
 
+    #[cfg(unix)]
     fn git_stdin_output<I, S>(repo: &Path, args: I, stdin: &[u8]) -> Output
     where
         I: IntoIterator<Item = S>,
@@ -2345,6 +2356,7 @@ mod tests {
         child.wait_with_output().unwrap()
     }
 
+    #[cfg(unix)]
     fn assert_raw_objects_match(
         repo_path: &Path,
         snapshot: &LosslessGitRepository,

@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
+// Every case here drives the retained no-follow projection, which only Unix
+// implements, so the whole binary is scoped to that platform.
+#![cfg(unix)]
+
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::ffi::OsString;

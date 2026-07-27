@@ -728,6 +728,7 @@ impl Default for KinConfig {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ConfigAuthorityKind {
+    #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
     PublishedRepository,
     InitializationStage,
 }

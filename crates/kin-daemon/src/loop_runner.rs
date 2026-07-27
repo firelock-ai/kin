@@ -1558,6 +1558,7 @@ mod tests {
         state.blobs.read(&kin_blobs::Hash256(hash.0)).unwrap()
     }
 
+    #[cfg(unix)]
     fn authority_tree(state: &DaemonState) -> kin_model::ResolvedTree {
         let manifest =
             kin_core::manifest::KinManifest::load(&state.layout.manifest_path()).unwrap();

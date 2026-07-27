@@ -21,7 +21,9 @@ use kin_model::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tracing::{info, warn};
+use tracing::info;
+#[cfg(unix)]
+use tracing::warn;
 
 use crate::config::KinConfig;
 use crate::error::{KinError, Result};
@@ -484,13 +486,16 @@ pub fn prepare_repository_layout_at(
 }
 
 fn create_private_staging_root(staging_root: &Path) -> Result<()> {
-    let mut builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
-    {
+    let builder = {
         use std::os::unix::fs::DirBuilderExt;
 
+        let mut builder = std::fs::DirBuilder::new();
         builder.mode(0o700);
-    }
+        builder
+    };
+    #[cfg(not(unix))]
+    let builder = std::fs::DirBuilder::new();
     builder
         .create(staging_root)
         .map_err(|error| KinError::io(staging_root, error))?;
@@ -537,6 +542,7 @@ fn stage_id_from_directory_name(name: &str) -> Option<uuid::Uuid> {
     (id.get_version_num() == 4 && id.to_string() == raw).then_some(id)
 }
 
+#[cfg(unix)]
 fn stage_id_from_owner_name(name: &str) -> Option<uuid::Uuid> {
     let raw = name
         .strip_prefix(INIT_STAGE_PREFIX)?
@@ -1781,15 +1787,7 @@ fn open_stage_owner_for_recovery(path: &Path) -> Result<File> {
         .map_err(|error| KinError::io(path, error))
 }
 
-#[cfg(not(unix))]
-fn open_stage_owner_for_recovery(path: &Path) -> Result<File> {
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-        .map_err(|error| KinError::io(path, error))
-}
-
+#[cfg(unix)]
 fn filesystem_entry_exists(path: &Path) -> Result<bool> {
     match std::fs::symlink_metadata(path) {
         Ok(_) => Ok(true),

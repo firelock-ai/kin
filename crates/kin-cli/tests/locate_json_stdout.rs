@@ -4,9 +4,8 @@
 use serial_test::serial;
 use std::env;
 use std::fs;
-use std::time::Duration;
 #[cfg(unix)]
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tempfile::tempdir;
 
 mod common;

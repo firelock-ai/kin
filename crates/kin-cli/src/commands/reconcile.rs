@@ -9,27 +9,39 @@
 //! [`kin_model::ResolvedTree`]; the daemon then admits that tree through a
 //! repository-v6 compare-and-swap and the exact primary-projection WAL.
 
+#[cfg(unix)]
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(unix)]
 use std::io::Read as _;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
-use kin_model::{
-    ArtifactId, Hash256, RepoPath, ResolvedArtifact, ResolvedTree, TreeDelta, TreeEntry,
-};
+use kin_model::{ArtifactId, Hash256, RepoPath, ResolvedTree, TreeDelta};
+#[cfg(any(unix, test))]
+use kin_model::{ResolvedArtifact, TreeEntry};
 use serde::{Deserialize, Serialize};
 
+#[cfg(unix)]
 use super::repository_authority::ActiveRepositoryAuthority;
 use super::session_workspace::SessionWorkspaceBase;
 
 pub const RECONCILE_SUMMARY_SCHEMA: &str = "kin.session-reconcile.v1";
 
+// Bounds for the retained no-follow session observation, which only the Unix
+// traversal below performs.
+#[cfg(unix)]
 const MAX_SESSION_BASE_BYTES: u64 = 4 * 1024 * 1024;
+#[cfg(unix)]
 const MAX_SESSION_ENTRIES: usize = 100_000;
+#[cfg(unix)]
 const MAX_SESSION_DIRECTORIES: usize = 100_000;
+#[cfg(unix)]
 const MAX_SESSION_DEPTH: usize = 256;
+#[cfg(unix)]
 const MAX_SESSION_PATH_BYTES: usize = 4096;
+#[cfg(unix)]
 const MAX_SESSION_BODY_BYTES: u64 = 256 * 1024 * 1024;
+#[cfg(unix)]
 const MAX_SESSION_TOTAL_BYTES: u64 = 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -201,7 +213,7 @@ pub fn observe_session_workspace(
     }
     #[cfg(not(unix))]
     {
-        let _ = (layout, session_dir, blobs, confirm_mass_deletion);
+        let _ = (layout, binding, session_dir, blobs, confirm_mass_deletion);
         bail!(
             "exact session reconciliation is fail-closed on this platform until retained \
              no-follow directory traversal is available"
@@ -264,6 +276,7 @@ fn validate_session_leaf(name: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn validate_base_authority_preflight(
     binding: &kin_core::LocalRepositoryAuthorityBinding,
     base: &SessionWorkspaceBase,
@@ -315,6 +328,7 @@ fn validate_base_authority_preflight(
     Ok(())
 }
 
+#[cfg(unix)]
 fn validate_base_is_current(
     binding: &kin_core::LocalRepositoryAuthorityBinding,
     base: &SessionWorkspaceBase,
@@ -333,6 +347,7 @@ fn validate_base_is_current(
     Ok(())
 }
 
+#[cfg(unix)]
 fn build_desired_tree(base: &SessionWorkspaceBase, scan: &SessionScan) -> Result<ResolvedTree> {
     let materialized = base
         .materialized_artifact_ids
@@ -374,6 +389,7 @@ fn build_desired_tree(base: &SessionWorkspaceBase, scan: &SessionScan) -> Result
         .map_err(|error| anyhow!("build complete desired session tree: {error}"))
 }
 
+#[cfg(unix)]
 fn deterministic_added_artifact_id(
     operation_id: kin_model::OperationId,
     path: &RepoPath,
@@ -381,6 +397,7 @@ fn deterministic_added_artifact_id(
     ArtifactId(uuid::Uuid::new_v5(&operation_id.as_uuid(), path.as_bytes()))
 }
 
+#[cfg(any(unix, test))]
 fn enforce_mass_deletion(source_count: usize, deltas: &[TreeDelta], confirmed: bool) -> Result<()> {
     let removed = deltas
         .iter()

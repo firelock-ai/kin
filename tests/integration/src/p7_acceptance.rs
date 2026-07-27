@@ -351,9 +351,9 @@ fn brownfield_full_migration_preserves_mixed_repo_shape_and_bytes() {
         std::fs::write(full_path, bytes).unwrap();
     }
 
-    let mut expected_artifacts = files.len();
+    // The executable mode bit and the symlink are Unix-only artifacts.
     #[cfg(unix)]
-    {
+    let expected_artifacts = {
         use std::os::unix::fs::PermissionsExt;
         std::fs::write(dir.path().join("run-tool"), b"#!/bin/sh\nexit 0\n").unwrap();
         let mut permissions = std::fs::metadata(dir.path().join("run-tool"))
@@ -362,8 +362,10 @@ fn brownfield_full_migration_preserves_mixed_repo_shape_and_bytes() {
         permissions.set_mode(0o755);
         std::fs::set_permissions(dir.path().join("run-tool"), permissions).unwrap();
         std::os::unix::fs::symlink("compose.yaml", dir.path().join("compose-link")).unwrap();
-        expected_artifacts += 2;
-    }
+        files.len() + 2
+    };
+    #[cfg(not(unix))]
+    let expected_artifacts = files.len();
 
     run_git(dir.path(), &["add", "--all"]);
     run_git(dir.path(), &["commit", "-m", "initial mixed commit"]);

@@ -1556,6 +1556,7 @@ pub struct ExactProjectionGitStage {
     proof: Option<kin_git::RepositoryGitExportProof>,
     #[cfg(unix)]
     expected_tree: Option<ResolvedTree>,
+    #[cfg(unix)]
     parent_display_path: std::path::PathBuf,
     display_path: std::path::PathBuf,
 }
@@ -1896,7 +1897,6 @@ impl ExactProjectionGitStage {
     #[cfg(all(test, not(unix)))]
     fn open_existing_unverified_for_test(path: &Path) -> Result<Self> {
         Ok(Self {
-            parent_display_path: path.parent().unwrap_or(path).to_path_buf(),
             display_path: path.to_path_buf(),
         })
     }
@@ -5143,6 +5143,31 @@ fn tracked_open_directory_identity(
     tracked_windows_handle_identity(directory.as_raw_handle().cast())
 }
 
+/// Report whether the directory opened for a component is the entry the
+/// preceding no-follow `metadata` described.
+///
+/// Unix binds the observation to the opened handle through the device and inode
+/// pair, which closes the window between the `symlink_metadata` call and the
+/// open. Windows binds identity to an open handle rather than to `Metadata`, so
+/// there is no pre-open identity to carry across; `open_directory_nofollow`
+/// instead reads the reparse and directory attributes off the handle it returns
+/// and refuses anything else, which binds the same guarantee at the open itself.
+#[cfg(unix)]
+fn opened_directory_matches_entry(
+    directory: &cap_std::fs::Dir,
+    metadata: &cap_std::fs::Metadata,
+) -> std::io::Result<bool> {
+    Ok(tracked_open_directory_identity(directory)? == tracked_entry_identity(metadata))
+}
+
+#[cfg(windows)]
+fn opened_directory_matches_entry(
+    _directory: &cap_std::fs::Dir,
+    _metadata: &cap_std::fs::Metadata,
+) -> std::io::Result<bool> {
+    Ok(true)
+}
+
 #[cfg(windows)]
 fn tracked_windows_handle_identity(
     handle: windows_sys::Win32::Foundation::HANDLE,
@@ -5200,7 +5225,7 @@ fn reconciliation_hmac(key: &[u8; 32], message: &[u8]) -> [u8; 32] {
     outer.finalize().into()
 }
 
-#[cfg(any(unix, windows))]
+#[cfg(unix)]
 fn constant_time_bytes_equal(left: &[u8], right: &[u8]) -> bool {
     left.len() == right.len()
         && left
@@ -10718,12 +10743,10 @@ impl ProjectionRoot {
                     self.display_root.join(&relative).display()
                 )));
             }
-            let expected_identity = tracked_entry_identity(&metadata);
             let child = open_directory_nofollow(&parent, component)
                 .map_err(|error| KinError::io(self.display_root.join(&relative), error))?;
-            if tracked_open_directory_identity(&child)
+            if !opened_directory_matches_entry(&child, &metadata)
                 .map_err(|error| KinError::io(self.display_root.join(&relative), error))?
-                != expected_identity
             {
                 return Err(KinError::Other(format!(
                     "host-unrepresentable graph-only path {file_id} changed ancestor identity during verification"
@@ -10767,12 +10790,10 @@ impl ProjectionRoot {
             if !metadata.is_dir() || metadata_is_reparse(&metadata) {
                 return Err(conflict("an ancestor is not a no-follow real directory"));
             }
-            let expected_identity = tracked_entry_identity(&metadata);
             let child = open_directory_nofollow(&parent, component)
                 .map_err(|error| KinError::io(self.display_root.join(&relative), error))?;
-            if tracked_open_directory_identity(&child)
+            if !opened_directory_matches_entry(&child, &metadata)
                 .map_err(|error| KinError::io(self.display_root.join(&relative), error))?
-                != expected_identity
             {
                 return Err(conflict(
                     "an ancestor changed identity while being retained",
@@ -10794,12 +10815,12 @@ impl ProjectionRoot {
                 "the named entry is a file, symbolic link, reparse point, or special object",
             ));
         }
-        let identity = tracked_entry_identity(&metadata);
         let directory = open_directory_nofollow(&parent, name)
             .map_err(|error| KinError::io(&display, error))?;
-        if tracked_open_directory_identity(&directory)
+        let identity = tracked_open_directory_identity(&directory)
+            .map_err(|error| KinError::io(&display, error))?;
+        if !opened_directory_matches_entry(&directory, &metadata)
             .map_err(|error| KinError::io(&display, error))?
-            != identity
         {
             return Err(conflict(
                 "the named directory changed identity while being retained",
@@ -11885,6 +11906,7 @@ mod tests {
         TreeEntry::blob(Hash256::from_bytes([0x11; 32]), false)
     }
 
+    #[cfg(unix)]
     fn executable() -> TreeEntry {
         TreeEntry::blob(Hash256::from_bytes([0x22; 32]), true)
     }

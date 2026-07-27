@@ -5299,7 +5299,7 @@ mod tests {
         let blobs = BlobStore::new(init.layout.ingest_cas_dir()).unwrap();
         let compose_hash = Hash256::from_bytes(blobs.write(compose).unwrap().0);
         let binary_hash = Hash256::from_bytes(blobs.write(&binary).unwrap().0);
-        let mut artifacts = vec![
+        let blob_artifacts = vec![
             ResolvedArtifact::new(
                 ArtifactId::new(),
                 RepoPath::from_utf8("compose.yaml").unwrap(),
@@ -5311,15 +5311,20 @@ mod tests {
                 TreeEntry::blob(binary_hash, false),
             ),
         ];
+        // Only Unix materializes symlinks, so only Unix admits one here.
         #[cfg(unix)]
-        {
+        let artifacts = {
+            let mut artifacts = blob_artifacts;
             let symlink_hash = Hash256::from_bytes(blobs.write(b"compose.yaml").unwrap().0);
             artifacts.push(ResolvedArtifact::new(
                 ArtifactId::new(),
                 RepoPath::from_utf8("compose-current").unwrap(),
                 TreeEntry::symlink(symlink_hash),
             ));
-        }
+            artifacts
+        };
+        #[cfg(not(unix))]
+        let artifacts = blob_artifacts;
         let desired = ResolvedTree::from_artifacts(artifacts).unwrap();
         crate::repository_commit::publish_workspace_tree(
             &blobs,
