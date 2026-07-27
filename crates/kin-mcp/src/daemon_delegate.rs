@@ -1024,17 +1024,35 @@ async fn forward_graph_status(
         with_session_header(with_auth(request), arguments)
     })
     .await?;
-    let summary = value.get("summary").unwrap_or(&value);
+    text_result_from_value(project_graph_status(&value)?).map(Some)
+}
+
+/// Project the daemon's status response into the coverage fields MCP agents
+/// need.
+///
+/// Rejects an empty body loudly. The shared request helper reads one as `Null`
+/// so the mutations that answer `204 No Content` work, but every count here
+/// falls back to 0, so letting `Null` through would render a missing answer as
+/// a real reading of an empty graph. A status surface that reports zeros it did
+/// not measure is worse than one that fails.
+fn project_graph_status(value: &serde_json::Value) -> Result<serde_json::Value, String> {
+    if value.is_null() {
+        return Err(
+            "daemon graph status returned an empty body; refusing to report zero counts as \
+             graph truth"
+                .to_string(),
+        );
+    }
+    let summary = value.get("summary").unwrap_or(value);
     let field_u64 = |key: &str| summary.get(key).and_then(serde_json::Value::as_u64);
-    let result = serde_json::json!({
+    Ok(serde_json::json!({
         "entity_count": field_u64("entities").unwrap_or(0),
         "embeddings_indexed": field_u64("embeddings_indexed").unwrap_or(0),
         "embeddings_total": field_u64("embeddings_total").unwrap_or(0),
         "embeddings_pending": field_u64("embeddings_pending").unwrap_or(0),
         "authority": "repo-daemon",
         "note": "Embedding coverage is computed from the daemon-owned live graph."
-    });
-    text_result_from_value(result).map(Some)
+    }))
 }
 
 pub fn daemon_unavailable_tool_result(name: &str) -> ToolCallResult {
@@ -1450,6 +1468,31 @@ mod tests {
             "expected a parse failure, got: {err:?}"
         );
         handle.abort();
+    }
+
+    /// The empty-body allowance exists for the 204 mutations. It must not reach
+    /// the status projection, where every count defaults to 0 and an absent
+    /// answer would render as a genuine reading of an empty graph.
+    #[test]
+    fn graph_status_refuses_to_report_an_empty_body_as_zero_counts() {
+        let err = project_graph_status(&serde_json::Value::Null)
+            .expect_err("an empty status body must fail loudly");
+        assert!(err.contains("empty body"), "{err}");
+        assert!(err.contains("refusing"), "{err}");
+    }
+
+    #[test]
+    fn graph_status_projects_summary_counts() {
+        let value = serde_json::json!({
+            "summary": { "entities": 42, "embeddings_indexed": 7, "embeddings_total": 10 }
+        });
+        let projected = project_graph_status(&value).expect("a real body must project");
+        assert_eq!(projected["entity_count"], 42);
+        assert_eq!(projected["embeddings_indexed"], 7);
+        assert_eq!(projected["embeddings_total"], 10);
+        // Absent within a present body is still 0: that is a real reading.
+        assert_eq!(projected["embeddings_pending"], 0);
+        assert_eq!(projected["authority"], "repo-daemon");
     }
 
     /// An HTTP error from a live daemon must classify as `DaemonError`, never
