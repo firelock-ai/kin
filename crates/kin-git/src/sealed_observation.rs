@@ -197,12 +197,12 @@ pub fn seal_all_content_observation(
                 }
                 TreeEntry::Gitlink { target } => {
                     coverage.gitlink_entries += 1;
-                    exclusions
-                        .entry((path.clone(), target))
-                        .or_insert_with(|| DeclaredContentExclusion {
+                    exclusions.entry((path.clone(), target)).or_insert_with(|| {
+                        DeclaredContentExclusion {
                             path: path.clone(),
                             reason: ContentExclusionReason::ForeignGitlinkTarget { target },
-                        });
+                        }
+                    });
                     continue;
                 }
             };
@@ -446,7 +446,12 @@ mod tests {
         plan.workspace_seed
             .base_tree
             .artifact_at_path(&path)
-            .unwrap_or_else(|| panic!("fixture is missing {}", String::from_utf8_lossy(path.as_bytes())))
+            .unwrap_or_else(|| {
+                panic!(
+                    "fixture is missing {}",
+                    String::from_utf8_lossy(path.as_bytes())
+                )
+            })
             .entry
             .blob_identity()
             .expect("fixture entry carries content")
@@ -456,8 +461,7 @@ mod tests {
     #[test]
     fn seals_every_content_shape_and_declares_only_foreign_gitlinks() {
         let fixture = ExactFixture::all_shapes();
-        let observation =
-            seal_all_content_observation(&fixture.plan, &fixture.blob_store).unwrap();
+        let observation = seal_all_content_observation(&fixture.plan, &fixture.blob_store).unwrap();
 
         // Two commits plus the workspace seed tree, each carrying the same
         // seven paths: four plain files, one executable, one symlink, one
@@ -501,13 +505,10 @@ mod tests {
     #[test]
     fn admitted_and_unadmitted_closures_seal_to_the_same_fingerprint() {
         let fixture = ExactFixture::all_shapes();
-        let admitted =
-            admit_semantic_git_import(&fixture.plan, &fixture.blob_store).unwrap();
+        let admitted = admit_semantic_git_import(&fixture.plan, &fixture.blob_store).unwrap();
 
-        let from_plan =
-            seal_all_content_observation(&fixture.plan, &fixture.blob_store).unwrap();
-        let from_admitted =
-            seal_all_content_observation(&admitted, &fixture.blob_store).unwrap();
+        let from_plan = seal_all_content_observation(&fixture.plan, &fixture.blob_store).unwrap();
+        let from_admitted = seal_all_content_observation(&admitted, &fixture.blob_store).unwrap();
         assert_eq!(from_admitted, from_plan);
     }
 
