@@ -12,6 +12,7 @@
 # conscious decision to keep a name out of the registry, not a place to silence a
 # real gap.
 #
+KIN_REAL_REPOSITORY
 KIN_UPDATE_TEMP_CLEANUP_CRASH_PARENT
 KIN_UPDATE_TEMP_LEASE_CRASH_MARKER
 KIN_UPDATE_TEMP_LEASE_CRASH_PARENT

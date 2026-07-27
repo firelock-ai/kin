@@ -376,6 +376,8 @@ fn stabilize_historical_entities(
     parsed_entities: &[Entity],
 ) -> Vec<Entity> {
     let mut matched = HashSet::<EntityId>::new();
+    let mut in_use = HashSet::<EntityId>::new();
+    let mut unmatched = Vec::new();
     let mut current = Vec::with_capacity(parsed_entities.len());
 
     for parsed in parsed_entities {
@@ -400,11 +402,31 @@ fn stabilize_historical_entities(
             stabilized.created_in = old.created_in;
             stabilized.superseded_by = old.superseded_by;
             matched.insert(old.id);
+            in_use.insert(old.id);
         } else {
-            stabilized.id = historical_entity_id(artifact_id, parsed.id);
+            unmatched.push(current.len());
         }
         current.push(stabilized);
     }
+
+    // Deriving an identity from the parser identity alone can land on one this
+    // same file already carries. Inheritance deliberately detaches an entity
+    // from the position it was first parsed at, so a later definition that
+    // takes over that position derives exactly the identity the moved entity
+    // still holds: two conditionally compiled definitions of one name are
+    // enough. Mint against the identities already in use so distinct
+    // definitions can never collapse into one entity.
+    for index in unmatched {
+        let parser_id = parsed_entities[index].id;
+        let mut identity = historical_entity_id(artifact_id, parser_id);
+        let mut displacement = 0_u32;
+        while !in_use.insert(identity) {
+            displacement += 1;
+            identity = displaced_historical_entity_id(artifact_id, parser_id, displacement);
+        }
+        current[index].id = identity;
+    }
+
     current.sort_by_key(|entity| entity.id);
     current
 }
@@ -414,6 +436,30 @@ fn historical_entity_id(artifact_id: ArtifactId, parser_id: EntityId) -> EntityI
     hasher.update(b"kin.historical-entity.v1\0");
     hasher.update(artifact_id.0.as_bytes());
     hasher.update(parser_id.0.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    EntityId(uuid::Uuid::from_bytes(bytes))
+}
+
+/// Derive the identity of a parsed entity whose primary derived identity is
+/// already carried by another entity in the same file.
+///
+/// Kept separate from [`historical_entity_id`] so an identity only ever moves
+/// when a collision actually forces it: every entity that can keep its primary
+/// derivation keeps exactly the identity it had.
+fn displaced_historical_entity_id(
+    artifact_id: ArtifactId,
+    parser_id: EntityId,
+    displacement: u32,
+) -> EntityId {
+    let mut hasher = Sha256::new();
+    hasher.update(b"kin.historical-entity.displaced.v1\0");
+    hasher.update(artifact_id.0.as_bytes());
+    hasher.update(parser_id.0.as_bytes());
+    hasher.update(displacement.to_be_bytes());
     let digest = hasher.finalize();
     let mut bytes = [0_u8; 16];
     bytes.copy_from_slice(&digest[..16]);
@@ -744,7 +790,10 @@ mod tests {
             b"extern crate isatty;\n\nuse isatty::stdout_isatty;\n\nfn colored() -> bool {\n    true\n}\n\nfn main() {\n    let _ = colored() && stdout_isatty();\n}\n",
         );
         git(&repository, &["add", "--all"]);
-        git(&repository, &["commit", "-m", "detect interactive terminal"]);
+        git(
+            &repository,
+            &["commit", "-m", "detect interactive terminal"],
+        );
 
         let blob_store = BlobStore::new(root.path().join("cas")).unwrap();
         let snapshot = capture_lossless_git_repository(
@@ -822,6 +871,109 @@ mod tests {
         graph
             .resolve_graph_at(&head)
             .expect("admitted history must replay without a dangling relation");
+    }
+
+    /// Identity derivation is positional, inheritance is not. A definition that
+    /// takes over the position an inherited entity was first parsed at derives
+    /// that entity's identity, and two definitions of one name in one file must
+    /// never collapse into a single entity because of it.
+    #[test]
+    fn a_definition_taking_an_inherited_position_keeps_its_own_identity() {
+        let artifact_id = ArtifactId::new();
+        let path = "src/output.rs";
+        let moved = parsed_function(path, "print_entry_uncolorized", 2);
+        let arrived = parsed_function(path, "print_entry_uncolorized", 6);
+        let inherited = Entity {
+            id: historical_entity_id(artifact_id, arrived.id),
+            ..parsed_function(path, "print_entry_uncolorized", 6)
+        };
+
+        let stabilized =
+            stabilize_historical_entities(artifact_id, vec![&inherited], &[moved, arrived]);
+
+        assert_eq!(stabilized.len(), 2);
+        assert_ne!(
+            stabilized[0].id, stabilized[1].id,
+            "two definitions must not share one identity"
+        );
+        assert!(
+            stabilized.iter().any(|entity| entity.id == inherited.id),
+            "the entity that matched must keep the identity it carried"
+        );
+    }
+
+    /// The whole-history form of the same defect: one conditionally compiled
+    /// pair is enough to make a tree claim one entity twice.
+    #[test]
+    fn conditionally_compiled_duplicates_of_one_name_enrich() {
+        let root = tempdir().unwrap();
+        let repository = root.path().join("source");
+        fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "--initial-branch=main"]);
+        git(
+            &repository,
+            &["config", "user.email", "kin@example.invalid"],
+        );
+        git(&repository, &["config", "user.name", "Kin Test"]);
+        write(
+            &repository,
+            "src/output.rs",
+            b"fn head() {}\n\nfn tail() {}\n\nfn print_entry_uncolorized() {}\n",
+        );
+        git(&repository, &["add", "--all"]);
+        git(&repository, &["commit", "-m", "one definition"]);
+
+        write(
+            &repository,
+            "src/output.rs",
+            b"fn print_entry_uncolorized_base() {}\n#[cfg(not(unix))]\nfn print_entry_uncolorized() {}\n#[cfg(unix)]\nfn print_entry_uncolorized() {}\n",
+        );
+        git(&repository, &["add", "--all"]);
+        git(&repository, &["commit", "-m", "split by target"]);
+
+        let blob_store = BlobStore::new(root.path().join("cas")).unwrap();
+        let snapshot = capture_lossless_git_repository(
+            &repository,
+            RepositoryId::new("history-conditional-duplicates").unwrap(),
+            &blob_store,
+        )
+        .unwrap();
+        let plan = plan_semantic_git_import(&snapshot, &blob_store).unwrap();
+        let trees = trees_by_change(&plan);
+        let deltas = derive_historical_semantic_deltas(&plan.changes, &trees, &blob_store).unwrap();
+
+        let tip = deltas
+            .last()
+            .unwrap()
+            .entity_deltas
+            .iter()
+            .filter_map(EntityDelta::new_state)
+            .filter(|entity| entity.name == "print_entry_uncolorized")
+            .map(|entity| entity.id)
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            tip.len(),
+            2,
+            "both definitions must reach history as distinct entities"
+        );
+    }
+
+    fn parsed_function(path: &str, name: &str, start_line: u32) -> Entity {
+        let pipeline = IndexPipeline::new();
+        let body = format!("{}fn {name}() {{}}\n", "\n".repeat(start_line as usize - 1));
+        let indexed = pipeline
+            .index_file_content_with_tests(
+                &FilePathId::new(path),
+                body.as_bytes(),
+                kin_blobs::Hash256::from_bytes(kin_blobs::digest_bytes(body.as_bytes())),
+            )
+            .unwrap()
+            .indexed_file;
+        indexed
+            .entities
+            .into_iter()
+            .find(|entity| entity.name == name)
+            .unwrap()
     }
 
     #[test]

@@ -19,7 +19,7 @@
     {
       "file": "crates/kin-index/src/history.rs",
       "function": "stabilize_historical_entities",
-      "digest": "sha256:257511e43f2742ae16e93bc62f4aa760211c98c8359e566200820c568035fd9a",
+      "digest": "sha256:ee7c9abc6215b230dc26f31f98f961e1d89f88e0bdb10e0004990d239d4375ff",
       "reason": "Carries entity identity across changes. Whether an entity is recognized as the same one decides whether history records a modification or an unrelated add and remove pair.",
       "owner": "kin-index"
     },
