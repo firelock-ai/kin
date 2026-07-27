@@ -329,7 +329,7 @@ mod tests {
         let kin_dir = root.join(".kin");
         fs::create_dir_all(&kin_dir).unwrap();
         fs::write(
-            kin_dir.join("VERSION"),
+            kin_dir.join("version"),
             kin_core::layout::KIN_LAYOUT_VERSION.to_string(),
         )
         .unwrap();

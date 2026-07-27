@@ -2330,7 +2330,7 @@ mod tests {
         let before = fixture.preflight().expect("pre-publication proof");
         let published_kin = fixture.repo.join(".kin");
         fs::create_dir(&published_kin).expect("published Kin directory");
-        fs::write(published_kin.join("VERSION"), b"6\n").expect("published Kin metadata");
+        fs::write(published_kin.join("version"), b"6\n").expect("published Kin metadata");
 
         let normal = fixture
             .preflight()
@@ -2363,7 +2363,7 @@ mod tests {
         let fixture = Fixture::clean();
         let published_kin = fixture.repo.join(".kin");
         fs::create_dir(&published_kin).expect("published Kin directory");
-        fs::write(published_kin.join("VERSION"), b"6\n").expect("published Kin metadata");
+        fs::write(published_kin.join("version"), b"6\n").expect("published Kin metadata");
         fs::write(fixture.repo.join("compose.yaml"), b"services: {}\n")
             .expect("tracked source drift");
 
