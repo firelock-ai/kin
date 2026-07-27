@@ -520,6 +520,93 @@ mod tests {
         SemanticChangeId::from_hash(Hash256::from_bytes([byte; 32]))
     }
 
+    /// One version of an entity. `marker` varies the fingerprint so two
+    /// versions of the same entity are distinguishable revisions.
+    fn entity_version(id: EntityId, name: &str, marker: u8) -> Entity {
+        let mut entity = named_entity(name);
+        entity.id = id;
+        entity.fingerprint.ast_hash = Hash256::from_bytes([marker; 32]);
+        entity.signature = format!("fn {name}(v{marker})");
+        entity
+    }
+
+    fn change_with_deltas(
+        parents: Vec<SemanticChangeId>,
+        deltas: Vec<kin_model::EntityDelta>,
+    ) -> SemanticChange {
+        let mut change = change_with_id(change_id(0), parents);
+        change.entity_deltas = deltas;
+        change.id = kin_core::compute_semantic_change_id(&change).unwrap();
+        change
+    }
+
+    /// `kin history <entity>` and `kin blame <entity>` with no `--ref` resolve
+    /// the entity from the live graph and its revisions from committed state at
+    /// head, so this helper is the whole revision path for the default
+    /// invocation. It must survive a change that touches the queried entity
+    /// alongside a second one whose own introducing change does not mention the
+    /// queried entity: deriving revisions from the entity-filtered change list
+    /// validated that second entity against a state it was never added to, and
+    /// answered a query about `alpha` with a stale-payload conflict naming
+    /// `beta`.
+    #[test]
+    fn revisions_survive_a_change_that_also_removes_another_entity() {
+        let graph = kin_db::InMemoryGraph::new();
+        let alpha = kin_model::EntityId::new();
+        let beta = kin_model::EntityId::new();
+        let gamma = kin_model::EntityId::new();
+
+        let add_alpha = change_with_deltas(
+            Vec::new(),
+            vec![kin_model::EntityDelta::Added {
+                new: entity_version(alpha, "alpha", 1),
+            }],
+        );
+        let add_beta = change_with_deltas(
+            vec![add_alpha.id],
+            vec![kin_model::EntityDelta::Added {
+                new: entity_version(beta, "beta", 1),
+            }],
+        );
+        let revise_alpha = change_with_deltas(
+            vec![add_beta.id],
+            vec![
+                kin_model::EntityDelta::Modified {
+                    old: entity_version(alpha, "alpha", 1),
+                    new: entity_version(alpha, "alpha", 2),
+                },
+                kin_model::EntityDelta::Removed {
+                    old: entity_version(beta, "beta", 1),
+                },
+                kin_model::EntityDelta::Added {
+                    new: entity_version(gamma, "gamma", 1),
+                },
+            ],
+        );
+        for entry in [&add_alpha, &add_beta, &revise_alpha] {
+            graph.create_change(entry).unwrap();
+        }
+
+        let revisions = resolve_entity_revisions_at(&graph, &alpha, &revise_alpha.id)
+            .expect("a sound history must not report a conflict for an unqueried entity");
+
+        assert_eq!(revisions.len(), 2);
+        assert_eq!(revisions[0].introduced_by, add_alpha.id);
+        assert_eq!(revisions[0].ended_by, Some(revise_alpha.id));
+        assert_eq!(revisions[1].introduced_by, revise_alpha.id);
+        assert_eq!(revisions[1].ended_by, None);
+        assert_eq!(
+            revisions[1].previous_revision,
+            Some(revisions[0].revision_id)
+        );
+        assert!(
+            !revisions
+                .iter()
+                .any(|revision| revision.introduced_by == add_beta.id),
+            "a change that never touches alpha is not a revision of alpha"
+        );
+    }
+
     fn absent_binding(layout: &kin_core::KinLayout) -> kin_core::LocalRepositoryAuthorityBinding {
         kin_core::LocalRepositoryAuthorityBinding::from_parts(
             kin_model::RepositoryId::new("absent-ref-lookup").unwrap(),
