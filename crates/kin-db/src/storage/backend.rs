@@ -1728,6 +1728,69 @@ struct LocalStorageRootIdentity {
     file_index: u64,
 }
 
+/// Read the exact `BY_HANDLE_FILE_INFORMATION` identity of a storage root.
+///
+/// Windows binds file identity to an open handle rather than to `Metadata`, and
+/// the `std` accessors for those fields are still unstable, so the root is
+/// reopened and its handle information is read through a stable wrapper. The
+/// reopen keeps exactly the reach `symlink_metadata` had: a zero access mask
+/// asks for identity without demanding read rights,
+/// `FILE_FLAG_BACKUP_SEMANTICS` admits a directory handle, and
+/// `FILE_FLAG_OPEN_REPARSE_POINT` leaves a final symlink unfollowed, so a root
+/// swapped for a link after the metadata call cannot redirect identity. A root
+/// that disappeared in that window is absent, exactly as a missing root is at
+/// the metadata call. A volume serial that does not fit the `DWORD` it is
+/// documented to be, and a filesystem that reports no file ID at all, both fail
+/// closed rather than pinning an identity that cannot tell two directories
+/// apart.
+#[cfg(windows)]
+fn windows_storage_root_identity(
+    path: &Path,
+) -> Result<Option<LocalStorageRootIdentity>, KinDbError> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    };
+
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .access_mode(0)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+    let root = match options.open(path) {
+        Ok(root) => root,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(KinDbError::StorageError(format!(
+                "failed to inspect local storage root {}: {error}",
+                path.display()
+            )))
+        }
+    };
+    let information = winapi_util::file::information(&root).map_err(|error| {
+        KinDbError::StorageError(format!(
+            "failed to inspect local storage root {}: {error}",
+            path.display()
+        ))
+    })?;
+    let volume_serial = u32::try_from(information.volume_serial_number()).map_err(|_| {
+        KinDbError::StorageError(format!(
+            "local storage root {} has no stable volume identity",
+            path.display()
+        ))
+    })?;
+    let file_index = information.file_index();
+    if file_index == 0 {
+        return Err(KinDbError::StorageError(format!(
+            "local storage root {} has no stable file identity",
+            path.display()
+        )));
+    }
+    Ok(Some(LocalStorageRootIdentity {
+        volume_serial,
+        file_index,
+    }))
+}
+
 /// One existing local repository authority held beneath its exclusive
 /// cross-process lock.
 ///
@@ -1858,22 +1921,7 @@ impl LocalFileBackend {
                     path.display()
                 )));
             }
-            let volume_serial = metadata.volume_serial_number().ok_or_else(|| {
-                KinDbError::StorageError(format!(
-                    "local storage root {} has no stable volume identity",
-                    path.display()
-                ))
-            })?;
-            let file_index = metadata.file_index().ok_or_else(|| {
-                KinDbError::StorageError(format!(
-                    "local storage root {} has no stable file identity",
-                    path.display()
-                ))
-            })?;
-            Ok(Some(LocalStorageRootIdentity {
-                volume_serial,
-                file_index,
-            }))
+            windows_storage_root_identity(path)
         }
     }
 
