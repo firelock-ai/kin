@@ -696,12 +696,27 @@ pub fn validate_pack(pack: &RepositoryTransferPack) -> Result<()> {
         }
     }
 
+    // Bodies are a deduplicated set, and the sender emits them ordered by
+    // identity. Pack identity is computed over the serialized pack, so a
+    // permuted body array describes the same transfer under a different
+    // transfer id. Pinning the order here keeps that identity a function of
+    // content alone.
     let mut body_hashes = BTreeSet::new();
+    let mut previous_body: Option<Hash256> = None;
     let mut total = 0_u64;
     for body in &pack.bodies {
         if !body_hashes.insert(body.hash) {
             return Err(invalid(format!("duplicate source body {}", body.hash)));
         }
+        if let Some(previous) = previous_body {
+            if body.hash < previous {
+                return Err(invalid(format!(
+                    "source body {} breaks ascending pack order after {}",
+                    body.hash, previous
+                )));
+            }
+        }
+        previous_body = Some(body.hash);
         let bytes = body.decode()?;
         total = total
             .checked_add(body.byte_len)
@@ -1777,6 +1792,47 @@ mod tests {
             error.to_string().contains("required immutable source body"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn pack_identity_is_a_function_of_body_content_not_body_order() {
+        let fixture = fixture();
+        let status =
+            repository_transfer_status(&fixture.destination, &fixture.repository_id, &fixture.main)
+                .unwrap();
+        let mut full = RepositoryTransferExpectation::try_from(status).unwrap();
+        full.destination_target = None;
+        full.destination_head = None;
+        let pack = build_repository_transfer_pack(&fixture.source, &fixture.main, &full).unwrap();
+        assert!(pack.bodies.len() >= 2);
+
+        // The sender deduplicates bodies through an ordered set, so a pack it
+        // builds is always ascending by body identity.
+        assert!(pack
+            .bodies
+            .windows(2)
+            .all(|pair| pair[0].hash < pair[1].hash));
+        validate_pack(&pack).unwrap();
+
+        // Reordering bodies preserves every byte of transferred content but
+        // changes the serialized pack, and with it the recomputed transfer
+        // identity. Accepting both spellings would let one transfer carry two
+        // identities, so the receiver pins the canonical order instead.
+        let mut permuted = pack.clone();
+        permuted.bodies.reverse();
+        permuted.transfer_id = compute_transfer_id(&permuted).unwrap();
+        assert_ne!(permuted.transfer_id, pack.transfer_id);
+        let error = validate_pack(&permuted).unwrap_err();
+        assert!(
+            error.to_string().contains("ascending"),
+            "unexpected error: {error}"
+        );
+
+        let mut duplicate = pack.clone();
+        duplicate.bodies.push(pack.bodies[0].clone());
+        duplicate.transfer_id = compute_transfer_id(&duplicate).unwrap();
+        let error = validate_pack(&duplicate).unwrap_err();
+        assert!(error.to_string().contains("duplicate source body"));
     }
 
     #[test]
