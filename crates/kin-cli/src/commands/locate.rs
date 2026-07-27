@@ -1495,9 +1495,11 @@ pub fn run_with_graph_capture_with_priority_files(
         None,
         SnippetOptions::default(),
         None,
+        kin_mcp::handlers::common::EntitySourceScope::WorkspaceHead,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run_with_graph_capture_with_priority_files_and_vector_source(
     graph: &kin_db::InMemoryGraph,
     workspace_root: Option<&std::path::Path>,
@@ -1509,6 +1511,7 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
     vector_source: Option<&kin_db::InMemoryGraph>,
     snippet_opts: SnippetOptions,
     repository_authority: Option<&kin_core::LocalRepositoryAuthorityBinding>,
+    source_scope: kin_mcp::handlers::common::EntitySourceScope,
 ) -> Result<LocateResult> {
     let _span = tracing::info_span!(
         "kin.locate.run_with_graph",
@@ -3555,12 +3558,24 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
     // Project bounded inline snippets from graph-owned content (no extra IO on
     // the working tree). No-op unless requested; the early budget-exhausted
     // return above carries no symbols, so it needs no snippets.
-    attach_snippets(&mut result, graph, &snippet_opts, repository_authority)?;
+    attach_snippets(
+        &mut result,
+        graph,
+        &snippet_opts,
+        repository_authority,
+        source_scope,
+    )?;
     // Re-project the ranked symbols into the graph-native PRIMARY surface: a
     // single globally-ranked entity list (file demoted to provenance). Reuses the
     // snippet projection's bounds; the daemon caches the full ranking and windows
     // one page. No-op unless the agent/JSON surface requested snippets.
-    build_entity_view(&mut result, graph, &snippet_opts, repository_authority)?;
+    build_entity_view(
+        &mut result,
+        graph,
+        &snippet_opts,
+        repository_authority,
+        source_scope,
+    )?;
     Ok(result)
 }
 
@@ -3630,6 +3645,7 @@ where
         Some(vector_source),
         snippet_opts,
         repository_authority,
+        kin_mcp::handlers::common::EntitySourceScope::At(*head),
     )
 }
 
@@ -15176,6 +15192,7 @@ pub fn attach_snippets(
     graph: &kin_db::InMemoryGraph,
     opts: &SnippetOptions,
     repository_authority: Option<&kin_core::LocalRepositoryAuthorityBinding>,
+    source_scope: kin_mcp::handlers::common::EntitySourceScope,
 ) -> Result<()> {
     if !opts.enabled {
         return Ok(());
@@ -15210,6 +15227,7 @@ pub fn attach_snippets(
                 opts.max_lines,
                 opts.max_chars,
                 repository_authority,
+                source_scope,
             )? {
                 sym.snippet = Some(source.body);
                 filled += 1;
@@ -15251,6 +15269,7 @@ fn bounded_entity_body_with_note(
     max_lines: usize,
     max_chars: usize,
     repository_authority: Option<&kin_core::LocalRepositoryAuthorityBinding>,
+    source_scope: kin_mcp::handlers::common::EntitySourceScope,
 ) -> Result<Option<String>> {
     let Some(source) = kin_mcp::handlers::common::read_entity_source_excerpt_detailed(
         graph,
@@ -15258,6 +15277,7 @@ fn bounded_entity_body_with_note(
         max_lines,
         max_chars,
         repository_authority,
+        source_scope,
     )?
     else {
         return Ok(None);
@@ -15298,6 +15318,7 @@ pub fn build_entity_view(
     graph: &kin_db::InMemoryGraph,
     opts: &SnippetOptions,
     repository_authority: Option<&kin_core::LocalRepositoryAuthorityBinding>,
+    source_scope: kin_mcp::handlers::common::EntitySourceScope,
 ) -> Result<()> {
     if !opts.enabled {
         return Ok(());
@@ -15334,6 +15355,7 @@ pub fn build_entity_view(
                     opts.max_lines,
                     opts.max_chars,
                     repository_authority,
+                    source_scope,
                 )?
                 .or_else(|| sym.snippet.clone())
             } else {
@@ -16489,7 +16511,14 @@ mod tests {
             }],
             ..Default::default()
         };
-        build_entity_view(&mut result, &graph, &SnippetOptions::default(), None).unwrap();
+        build_entity_view(
+            &mut result,
+            &graph,
+            &SnippetOptions::default(),
+            None,
+            kin_mcp::handlers::common::EntitySourceScope::WorkspaceHead,
+        )
+        .unwrap();
         assert!(
             result.entities.is_empty(),
             "disabled snippet opts must leave the entity surface untouched"

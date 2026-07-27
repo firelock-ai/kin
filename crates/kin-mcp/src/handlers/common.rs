@@ -428,6 +428,7 @@ pub fn trace_body<G: GraphStore>(
         MCP_SOURCE_MAX_LINES,
         MCP_SOURCE_MAX_CHARS,
         repository_authority,
+        EntitySourceScope::WorkspaceHead,
     )?
     .map(|source| source.body)
     .unwrap_or_else(|| entity.signature.clone()))
@@ -954,7 +955,12 @@ pub fn collect_graph_reference_rows<G: GraphStore>(
 
         let file_path = entity.file_origin.as_ref().map(|path| path.0.clone());
         let key = reference_row_key(file_path.as_deref(), &entity.name);
-        let snippet = read_bounded_entity_snippet(store, &entity, repository_authority)?;
+        let snippet = read_bounded_entity_snippet(
+            store,
+            &entity,
+            repository_authority,
+            EntitySourceScope::WorkspaceHead,
+        )?;
         let entry = grouped.entry(key).or_insert_with(|| ReferenceRow {
             entity_id: Some(source_entity_id.to_string()),
             name: entity.name.clone(),
@@ -1039,10 +1045,48 @@ fn graph_source_gap(message: impl Into<String>) -> McpError {
     )))
 }
 
+/// The committed repository change a source projection resolves against.
+///
+/// `EntitySourceScope::WorkspaceHead` reads the active workspace head and is
+/// what every HEAD-scoped surface wants.
+///
+/// `EntitySourceScope::At(change)` reads a specific committed change and is
+/// mandatory whenever `store` is a ref-scoped historical view: such a view holds
+/// only the changes reachable from its ref, so resolving an entity revision or a
+/// tree against the workspace head is both the wrong history and a hard
+/// graph-store miss for any ref that is not the head itself.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum EntitySourceScope {
+    #[default]
+    WorkspaceHead,
+    At(SemanticChangeId),
+}
+
+impl EntitySourceScope {
+    /// Resolve the change this scope names, consulting repository authority only
+    /// for the workspace-head case.
+    fn resolve(
+        self,
+        authority: &super::repository_authority::ActiveRepositoryAuthority,
+    ) -> Result<SemanticChangeId> {
+        match self {
+            EntitySourceScope::WorkspaceHead => authority.current_source_change_id(),
+            EntitySourceScope::At(change_id) => Ok(change_id),
+        }
+    }
+}
+
+impl From<SemanticChangeId> for EntitySourceScope {
+    fn from(change_id: SemanticChangeId) -> Self {
+        EntitySourceScope::At(change_id)
+    }
+}
+
 fn resolve_entity_source_authority<G: GraphStore>(
     store: &G,
     entity: &Entity,
     repository_authority: Option<&LocalRepositoryAuthorityBinding>,
+    scope: EntitySourceScope,
 ) -> Result<Option<(ExactEntitySource, Vec<u8>, SourceSpan)>> {
     LAST_READ_STALE.with(|f| f.set(false));
     LAST_READ_SOURCE.with(|f| f.set("unknown"));
@@ -1068,10 +1112,31 @@ fn resolve_entity_source_authority<G: GraphStore>(
         })?,
     )
     .map_err(record_graph_source_gap)?;
-    let source_change_id = authority.current_source_change_id()?;
-    let revision = store
-        .resolve_entity_revision_at(&entity.id, &source_change_id)
-        .map_err(McpError::graph)?
+    let source_change_id = scope.resolve(&authority)?;
+    // Replay the COMPLETE first-parent history at the source change, then read
+    // this entity's active revision out of that state. `resolve_entity_revision_at`
+    // is not usable here: it replays only the changes that mention this entity,
+    // yet validates every delta those changes carry. A change that introduces
+    // this entity while removing or modifying another one is then checked
+    // against a state the other entity's own history was filtered out of, and a
+    // sound repository reports a false history conflict. Resolving the whole
+    // state also yields the tree at the same change, so this replaces the
+    // separate tree resolution below rather than adding to it.
+    let committed = store.resolve_graph_at(&source_change_id).map_err(|error| {
+        graph_source_gap(format!(
+            "cannot resolve committed repository state at {source_change_id}: {error}"
+        ))
+    })?;
+    let revision = committed
+        .entity_revisions
+        .get(&entity.id)
+        .and_then(|revisions| {
+            revisions
+                .iter()
+                .rev()
+                .find(|revision| revision.ended_by.is_none())
+        })
+        .cloned()
         .ok_or_else(|| {
             graph_source_gap(format!(
                 "entity {} has no active committed revision at {}",
@@ -1091,11 +1156,7 @@ fn resolve_entity_source_authority<G: GraphStore>(
             entity.id, recorded_origin.0
         ))
     })?;
-    let current_tree = store.resolve_tree_at(&source_change_id).map_err(|error| {
-        graph_source_gap(format!(
-            "cannot resolve repository tree at {source_change_id}: {error}"
-        ))
-    })?;
+    let current_tree = committed.tree;
     let current_artifact = current_tree.artifact_at_path(&path).ok_or_else(|| {
         graph_source_gap(format!(
             "entity {} points at '{}' but that path is absent at {}",
@@ -1177,9 +1238,10 @@ pub fn read_entity_source_excerpt_detailed<G: GraphStore>(
     max_lines: usize,
     max_chars: usize,
     repository_authority: Option<&LocalRepositoryAuthorityBinding>,
+    scope: EntitySourceScope,
 ) -> Result<Option<ExactEntitySource>> {
     let Some((mut source, bytes, span)) =
-        resolve_entity_source_authority(store, entity, repository_authority)?
+        resolve_entity_source_authority(store, entity, repository_authority, scope)?
     else {
         return Ok(None);
     };
@@ -1228,6 +1290,7 @@ pub fn read_bounded_entity_snippet<G: GraphStore>(
     store: &G,
     entity: &Entity,
     repository_authority: Option<&LocalRepositoryAuthorityBinding>,
+    scope: EntitySourceScope,
 ) -> Result<Option<String>> {
     Ok(read_entity_source_excerpt_detailed(
         store,
@@ -1235,6 +1298,7 @@ pub fn read_bounded_entity_snippet<G: GraphStore>(
         RETRIEVAL_SNIPPET_MAX_LINES,
         RETRIEVAL_SNIPPET_MAX_CHARS,
         repository_authority,
+        scope,
     )?
     .map(|source| source.body))
 }
@@ -1520,6 +1584,7 @@ pub fn entity_response_json<G: GraphStore>(
         MCP_SOURCE_MAX_LINES,
         MCP_SOURCE_MAX_CHARS,
         repository_authority,
+        EntitySourceScope::WorkspaceHead,
     )? {
         obj.insert("source_excerpt".into(), serde_json::json!(source.body));
         obj.insert(
@@ -1554,6 +1619,7 @@ pub fn focal_context_json<G: GraphStore>(
         MCP_SOURCE_MAX_LINES,
         MCP_SOURCE_MAX_CHARS,
         repository_authority,
+        EntitySourceScope::WorkspaceHead,
     )?;
     let is_stale = LAST_READ_STALE.with(|f| f.get());
     let source = LAST_READ_SOURCE.with(|f| f.get());

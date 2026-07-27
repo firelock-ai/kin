@@ -202,6 +202,7 @@ pub fn handle_get_entity_source<G: GraphStore>(
                 10_000,
                 1_000_000,
                 repository_authority,
+                EntitySourceScope::WorkspaceHead,
             )?
             .ok_or_else(|| McpError::Context("entity source body unavailable".into()))?;
             let is_stale = LAST_READ_STALE.with(|f| f.get());
@@ -485,6 +486,7 @@ fn resolve_entity_source_generic<G: GraphStore>(
                 DEFAULT_SOURCE_MAX_LINES,
                 DEFAULT_SOURCE_MAX_BYTES,
                 repository_authority,
+                EntitySourceScope::WorkspaceHead,
             ) {
                 Ok(Some(source)) => ResolvedEntitySource::Found(EntitySourceRow {
                     id: entity.id.to_string(),
@@ -632,6 +634,7 @@ pub fn handle_get_context_pack<G: GraphStore>(
                     MCP_SOURCE_MAX_LINES,
                     MCP_SOURCE_MAX_CHARS,
                     repository_authority,
+                    EntitySourceScope::WorkspaceHead,
                 )?;
                 let is_stale = LAST_READ_STALE.with(|f| f.get());
                 let source = LAST_READ_SOURCE.with(|f| f.get());

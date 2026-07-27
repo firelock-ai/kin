@@ -1316,6 +1316,28 @@ async fn resolve_session_graph(
     state.graph_for_request(session_id).await
 }
 
+/// Resolve the committed change that graph-owned source projections must read
+/// at for this request.
+///
+/// A session temporal scope replaces the served graph with a ref-scoped
+/// historical view that holds only the changes reachable from its ref. Source
+/// projection must follow that view: resolving an entity revision or repository
+/// tree against the workspace head would read the wrong history, and for any
+/// scope other than the head itself the head change is not even present in the
+/// view.
+async fn resolve_session_source_scope(
+    state: &DaemonState,
+    session_id: Option<&SessionId>,
+) -> kin_mcp::handlers::common::EntitySourceScope {
+    let Some(session_id) = session_id else {
+        return kin_mcp::handlers::common::EntitySourceScope::WorkspaceHead;
+    };
+    match state.get_session_scope(session_id).await {
+        Some((_, head, _, _)) => kin_mcp::handlers::common::EntitySourceScope::At(head),
+        None => kin_mcp::handlers::common::EntitySourceScope::WorkspaceHead,
+    }
+}
+
 const XREF_STABLE_READ_ATTEMPTS: usize = 3;
 
 /// One optimistic, point-in-time graph authority used by xref-style reads.
@@ -3625,13 +3647,19 @@ async fn run_fused_locate_for_state(
         .map_err(|error| error.to_string())?;
     // When a session scope is active, discover historical test artifact
     // priority files to match the ref-scoped path's behavior.
-    let scope_ref_string = if let Some(sid) = session_id {
-        state
-            .get_session_scope(sid)
-            .await
-            .map(|(ref_str, _, _, _)| ref_str)
+    let session_scope = if let Some(sid) = session_id {
+        state.get_session_scope(sid).await
     } else {
         None
+    };
+    let scope_ref_string = session_scope
+        .as_ref()
+        .map(|(ref_str, _, _, _)| ref_str.clone());
+    // The scoped graph is a historical view; its source projection must resolve
+    // at the scoped head, not at the workspace head.
+    let source_scope = match session_scope.as_ref() {
+        Some((_, head, _, _)) => kin_mcp::handlers::common::EntitySourceScope::At(*head),
+        None => kin_mcp::handlers::common::EntitySourceScope::WorkspaceHead,
     };
     let extra_priority_files = scope_ref_string
         .as_deref()
@@ -3663,6 +3691,7 @@ async fn run_fused_locate_for_state(
         vector_source,
         snippet_opts,
         Some(&repository_authority),
+        source_scope,
     )
     .map_err(|error| error.to_string())
 }
@@ -4977,6 +5006,7 @@ fn build_semantic_locate_result(
     state: &DaemonState,
     graph: &kin_db::InMemoryGraph,
     arguments: &HashMap<String, serde_json::Value>,
+    source_scope: kin_mcp::handlers::common::EntitySourceScope,
 ) -> kin_mcp::ToolCallResult {
     let query = match arguments.get("query").and_then(serde_json::Value::as_str) {
         Some(value) if !value.trim().is_empty() => value.to_string(),
@@ -5188,6 +5218,7 @@ fn build_semantic_locate_result(
                     graph,
                     entity,
                     repository_authority.as_ref(),
+                    source_scope,
                 ) {
                     Ok(snippet) => snippet,
                     Err(error) => {
@@ -5851,6 +5882,7 @@ async fn mcp_tools_call(
             &state,
             graph.as_ref(),
             &request.arguments,
+            resolve_session_source_scope(&state, session_id.as_ref()).await,
         )));
     }
 
