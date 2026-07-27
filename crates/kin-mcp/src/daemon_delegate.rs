@@ -1234,11 +1234,17 @@ pub async fn forward_release_intent(
 pub async fn forward_check_traffic(
     scope_strings: &[String],
 ) -> Result<Option<serde_json::Value>, String> {
-    let Some(base) = daemon_base_url() else {
+    if daemon_base_url().is_none() {
         return Ok(None);
-    };
+    }
     let mut reports = Vec::new();
     for scope in scope_strings {
+        // Re-resolve per scope: if an earlier scope revived the daemon, the
+        // remaining ones must address the new URL directly instead of each
+        // rediscovering the dead one through the whole retry-then-revive path.
+        let Some(base) = daemon_base_url() else {
+            return Ok(None);
+        };
         let encoded = scope.replace(':', "%3A");
         let value = daemon_json_request("check traffic", &base, |client, base| {
             with_auth(client.get(format!("{base}/traffic/{encoded}")))
