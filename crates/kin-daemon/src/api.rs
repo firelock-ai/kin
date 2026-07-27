@@ -4,27 +4,27 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener as StdTcpListener};
-use std::path::{Component, Path as FsPath, PathBuf};
+use std::path::{Path as FsPath, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::state::{
     CachedLocateRanking, CachedSemanticPage, CoordinationEventDraft, DaemonEvent, DaemonState,
-    ProjectionChangedSet, RequestGraphAuthority, VfsTreeCacheKey, VfsTreeSnapshot,
-    LOCATE_RANKING_CACHE_CAP,
+    RequestGraphAuthority, LOCATE_RANKING_CACHE_CAP,
 };
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post, put};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
+use kin_db::{LocalFileBackend, RepositoryAuthorityManager, StorageBackend};
 use kin_model::session::{Intent, IntentScope, IntentSummary, LockType};
 use kin_model::{
-    Branch, BranchName, ChangeStore, ContractId, EntityId, EntityStore, FileLayout, FilePathId,
-    GraphNodeId, IntentId, ProvenanceStore, ResolvedSourceEntry, SessionCapabilities, SessionId,
-    SessionStore, SessionTransport, SourceEntryKind, SourceTreeResolution, WorkStore,
+    ChangeStore, ContractId, EntityId, EntityStore, FilePathId, GraphNodeId, IntentId, RepoPath,
+    RepositoryId, SessionCapabilities, SessionId, SessionStore, SessionTransport, TransactionDelta,
+    TreeEntry, WorkStore, WorkspaceId, WorkspaceTreeSnapshot,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -35,10 +35,90 @@ use uuid::Uuid;
 
 static BOOTSTRAP_EXPORTS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
 static EXACT_SOURCE_ARCHIVE_EXPORTS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+const REPOSITORY_TRANSFER_HTTP_BODY_LIMIT: usize = 24 * 1024 * 1024;
 
 fn exact_source_archive_exports() -> Arc<tokio::sync::Semaphore> {
     Arc::clone(
         EXACT_SOURCE_ARCHIVE_EXPORTS.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1))),
+    )
+}
+
+/// Coherent repository-v6 authority for the daemon's primary workspace.
+///
+/// Every request opens the durable publication and then holds one immutable
+/// lease while resolving refs, workspace tree state, and source identities.
+/// The raw checkout and Git object database are never consulted.
+struct ActiveApiRepositoryAuthority {
+    manager: RepositoryAuthorityManager<LocalFileBackend>,
+    repository_id: RepositoryId,
+    workspace_id: WorkspaceId,
+}
+
+impl ActiveApiRepositoryAuthority {
+    fn open(state: &DaemonState) -> Result<Self, (StatusCode, String)> {
+        let binding = state
+            .local_repository_authority_binding()
+            .map_err(repository_authority_error)?;
+        let manager = binding.open_manager().map_err(repository_authority_error)?;
+        Ok(Self {
+            manager,
+            repository_id: binding.repository_id().clone(),
+            workspace_id: binding.workspace_id(),
+        })
+    }
+
+    #[cfg(test)]
+    fn open_layout_for_test(layout: &kin_core::KinLayout) -> Result<Self, (StatusCode, String)> {
+        let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(layout)
+            .map_err(repository_authority_error)?;
+        let manager = binding.open_manager().map_err(repository_authority_error)?;
+        Ok(Self {
+            manager,
+            repository_id: binding.repository_id().clone(),
+            workspace_id: binding.workspace_id(),
+        })
+    }
+
+    fn workspace_tree_snapshot(&self) -> Result<WorkspaceTreeSnapshot, (StatusCode, String)> {
+        self.manager
+            .workspace_tree_snapshot(&self.repository_id, &self.workspace_id)
+            .map_err(repository_authority_error)?
+            .ok_or_else(|| {
+                (
+                    StatusCode::FAILED_DEPENDENCY,
+                    format!(
+                        "repository-v6 authority has no workspace {}",
+                        self.workspace_id
+                    ),
+                )
+            })
+    }
+}
+
+fn repository_authority_error(error: impl std::fmt::Display) -> (StatusCode, String) {
+    (
+        StatusCode::FAILED_DEPENDENCY,
+        format!("repository-v6 authority unavailable: {error}"),
+    )
+}
+
+/// Fail closed when an explicit filesystem-admission command is unavailable.
+///
+/// Filesystem reads are permitted only at this named ingestion boundary. They
+/// never become query/history/VFS authority and cannot silently repair a
+/// repository-v6 gap.
+fn filesystem_ingest_disabled_response(endpoint: &str, path: &str) -> (StatusCode, String) {
+    (
+        StatusCode::CONFLICT,
+        json!({
+            "error": "filesystem_admission_disabled",
+            "endpoint": endpoint,
+            "path": path,
+            "mutation_applied": false,
+            "authority": "repository_v6",
+            "configuration": crate::loop_runner::DISABLE_FILESYSTEM_RECONCILE_ENV,
+        })
+        .to_string(),
     )
 }
 
@@ -94,20 +174,6 @@ fn exact_source_archive_body(
 fn lock_recover<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-/// Read-acquire a `std::sync::RwLock`, recovering on poison. See
-/// [`lock_recover`] for why recovery (not propagation) is correct here.
-fn read_recover<T>(lock: &std::sync::RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
-    lock.read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-/// Write-acquire a `std::sync::RwLock`, recovering on poison. See
-/// [`lock_recover`] for why recovery (not propagation) is correct here.
-fn write_recover<T>(lock: &std::sync::RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
-    lock.write()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
@@ -200,17 +266,6 @@ pub struct ReadinessResponse {
     pub ready: bool,
 }
 
-/// Working copy status response.
-#[derive(Debug, Serialize, serde::Deserialize)]
-pub struct StatusResponse {
-    pub base_change: String,
-    pub entity_adds: usize,
-    pub entity_mods: usize,
-    pub entity_removes: usize,
-    pub relation_adds: usize,
-    pub relation_removes: usize,
-}
-
 /// JSON-friendly intent payload for CLI and adapter consumers.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct IntentResponse {
@@ -239,6 +294,8 @@ struct RegisterIntentRequest {
 
 #[derive(Debug, Deserialize)]
 struct StartSessionRequest {
+    #[serde(default)]
+    session_id: Option<String>,
     vendor: String,
     client_name: String,
     #[serde(default = "default_session_transport")]
@@ -405,7 +462,9 @@ pub struct RepoFilesResponse {
 /// A single projected file entry returned from a repo file listing.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RepoFileEntry {
-    pub path: String,
+    pub path: RepoPath,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_path: Option<String>,
 }
 
 /// Repo refs response.
@@ -519,209 +578,6 @@ struct RepoEntitiesQuery {
     query: Option<String>,
 }
 
-/// Query parameters for VFS read endpoint.
-#[derive(Debug, Deserialize)]
-struct VfsReadParams {
-    /// Optional session ID for session-scoped overlay (future).
-    #[serde(default)]
-    session_id: Option<String>,
-}
-
-/// Request body for VFS file-changed notification.
-#[derive(Debug, Deserialize)]
-struct FileChangedRequest {
-    path: String,
-    /// Optional byte range of the edit for incremental tree-sitter parse.
-    /// When all three fields are present, the reconciler uses tree-sitter's
-    /// incremental parse (<5ms) instead of a full re-parse (50-100ms).
-    #[serde(default)]
-    edit_start_byte: Option<usize>,
-    #[serde(default)]
-    edit_old_end_byte: Option<usize>,
-    #[serde(default)]
-    edit_new_end_byte: Option<usize>,
-    /// Optional VFS shim caller session. Additive field used for write-veto
-    /// self-exclusion so a session's own hard intents don't block its writes
-    /// (parity with `/vfs/write-notify`). Absent → no own-write exclusion.
-    #[serde(default)]
-    session_id: Option<String>,
-}
-
-/// Request body for VFS write-notify (shim → daemon immediate re-index).
-#[derive(Debug, Deserialize)]
-struct WriteNotifyRequest {
-    file_path: String,
-    /// Content hash from the shim (reserved for future use — the reconciler
-    /// reads the file directly today, but the hash can be used for
-    /// skip-if-unchanged optimization later).
-    #[serde(default)]
-    #[allow(dead_code)]
-    content_hash: Option<String>,
-    /// Session ID of the VFS shim caller, used for self-exclusion during
-    /// lease checks so a session's own hard locks don't block its writes.
-    #[serde(default)]
-    session_id: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct DaemonCommitRequest {
-    pub change: kin_model::SemanticChange,
-    pub branch_name: kin_model::BranchName,
-    #[serde(default)]
-    pub shallow_files: Vec<kin_model::ShallowTrackedFile>,
-    #[serde(default)]
-    pub shallow_clears: Vec<kin_model::FilePathId>,
-    #[serde(default)]
-    pub audit_event: Option<kin_model::provenance::AuditEvent>,
-    #[serde(default)]
-    pub session_id: Option<String>,
-    #[serde(default)]
-    pub release_policy: Option<DaemonReleasePolicy>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct DaemonReleasePolicy {
-    #[serde(default)]
-    pub force: bool,
-    #[serde(default)]
-    pub require_proof: bool,
-    #[serde(default)]
-    pub require_approval: bool,
-}
-
-fn release_policy_failure(gate: &str, fields: serde_json::Value) -> (StatusCode, String) {
-    let mut body = serde_json::json!({
-        "error": "release_policy_failed",
-        "gate": gate,
-        "mutation_applied": false,
-    });
-    if let (Some(body), Some(fields)) = (body.as_object_mut(), fields.as_object()) {
-        body.extend(fields.clone());
-    }
-    (StatusCode::CONFLICT, body.to_string())
-}
-
-fn canonical_release_entity_count(message: &str) -> Option<usize> {
-    let (tag, snapshot) = message
-        .strip_prefix("release: ")
-        .and_then(|message| message.rsplit_once(" ("))?;
-    let entity_count = snapshot.strip_suffix(" entities snapshot)")?;
-    if tag.trim().is_empty() || tag != tag.trim() || tag.chars().any(char::is_control) {
-        return None;
-    }
-    entity_count.parse::<usize>().ok()
-}
-
-fn release_change_reachable_from(
-    graph: &kin_db::InMemoryGraph,
-    target: &kin_model::SemanticChangeId,
-    head: &kin_model::SemanticChangeId,
-) -> Result<bool, (StatusCode, String)> {
-    let mut pending = vec![*head];
-    let mut visited = HashSet::new();
-    while let Some(change_id) = pending.pop() {
-        if change_id == *target {
-            return Ok(true);
-        }
-        if !visited.insert(change_id) {
-            continue;
-        }
-        let change = graph
-            .get_change(&change_id)
-            .map_err(internal_error)?
-            .ok_or_else(|| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("branch history at {head} references missing change {change_id}"),
-                )
-            })?;
-        pending.extend(change.parents);
-    }
-    Ok(false)
-}
-
-/// Enforce daemon release policy against the immutable source authority named
-/// by the release marker's sole parent.
-///
-/// The live graph can contain overlays, later branch heads, and verification
-/// runs created after this source state. Rebuilding a historical evidence graph
-/// keeps entity/coverage/approval decisions anchored to `source_head`. Because
-/// VerificationRun does not yet carry an immutable source-change or manifest
-/// binding, `release_evidence_graph_at` intentionally admits no current run as
-/// proof; strict proof therefore fails closed whenever the historical head has
-/// entities.
-fn enforce_daemon_release_policy(
-    graph: &kin_db::InMemoryGraph,
-    source_head: &kin_model::SemanticChangeId,
-    marker_entity_count: usize,
-    policy: &DaemonReleasePolicy,
-) -> Result<(), (StatusCode, String)> {
-    let frozen_snapshot = graph.to_snapshot();
-    let frozen_root = kin_db::compute_graph_root_hash(&frozen_snapshot);
-    let frozen_graph = kin_db::InMemoryGraph::from_snapshot_without_text_index_with_root_hash(
-        frozen_snapshot.clone(),
-        frozen_root,
-    );
-    let (evidence_graph, _) =
-        release_evidence_graph_at(&frozen_graph, &frozen_snapshot, source_head)?;
-    let source_entity_count = evidence_graph
-        .list_all_entities()
-        .map_err(internal_error)?
-        .len();
-    if marker_entity_count != source_entity_count {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            serde_json::json!({
-                "error": "invalid_release_snapshot_count",
-                "mutation_applied": false,
-                "marker_entity_count": marker_entity_count,
-                "source_entity_count": source_entity_count,
-                "source_head": source_head.to_string(),
-                "message": "release marker entity count does not match its immutable source",
-            })
-            .to_string(),
-        ));
-    }
-    let coverage =
-        kin_review::source_bound_release_proof_coverage(&evidence_graph).map_err(internal_error)?;
-
-    if coverage.coverage_ratio < 0.5 && !policy.force {
-        return Err(release_policy_failure(
-            "coverage",
-            serde_json::json!({
-                "coverage_ratio": coverage.coverage_ratio,
-                "source_head": source_head.to_string(),
-                "message": "immutable source-bound release coverage is below the 50% threshold",
-            }),
-        ));
-    }
-    if policy.require_proof && !coverage.missing_proof.is_empty() {
-        return Err(release_policy_failure(
-            "proof",
-            serde_json::json!({
-                "missing_proof": coverage.missing_proof.iter().map(ToString::to_string).collect::<Vec<_>>(),
-                "source_head": source_head.to_string(),
-                "message": "release contains entities without immutable source-bound passing proof; current verification runs do not carry source authority",
-            }),
-        ));
-    }
-    if policy.require_approval {
-        let unapproved = kin_review::unapproved_changes(&evidence_graph, source_head, usize::MAX)
-            .map_err(internal_error)?;
-        if !unapproved.is_empty() {
-            return Err(release_policy_failure(
-                "approval",
-                serde_json::json!({
-                    "unapproved_changes": unapproved.iter().map(|change| change.change_id.to_string()).collect::<Vec<_>>(),
-                    "source_head": source_head.to_string(),
-                    "message": "release contains non-root changes without human approval reachable from its immutable parent",
-                }),
-            ));
-        }
-    }
-    Ok(())
-}
-
 /// The current API version number, returned in the `X-Kin-API-Version` header.
 pub const API_VERSION: &str = "2";
 
@@ -773,7 +629,7 @@ struct DaemonAuthState {
 }
 
 fn is_public_route(path: &str) -> bool {
-    let path = path.strip_prefix("/v1").unwrap_or(path);
+    let path = path.strip_prefix("/v2").unwrap_or(path);
     matches!(path, "/health" | "/ready" | "/readiness" | "/spine/health")
 }
 
@@ -947,19 +803,16 @@ fn auth_error(status: StatusCode, message: &str) -> Response {
     response
 }
 
-/// Build the core route set (without state or middleware).
-fn api_routes(retire_v1_branch_head_update: bool) -> Router<Arc<DaemonState>> {
-    let branch_head_update: axum::routing::MethodRouter<Arc<DaemonState>> =
-        if retire_v1_branch_head_update {
-            put(graph_update_branch_head_v1_retired)
-        } else {
-            put(graph_update_branch_head)
-        };
+/// Build the repository-v6 daemon route set (without state or middleware).
+///
+/// Legacy graph-branch mutation, filesystem reconcile, raw write-notify, and
+/// ref-agnostic archive routes are intentionally absent. They represented
+/// pre-v6 authority and must not remain as compatibility shims.
+fn api_routes() -> Router<Arc<DaemonState>> {
     Router::new()
         .route("/health", get(health))
         .route("/readiness", get(readiness))
         .route("/ready", get(readiness))
-        .route("/status", get(status))
         .route("/session", post(start_session).get(list_sessions))
         .route(
             "/session/{session_id}",
@@ -991,10 +844,8 @@ fn api_routes(retire_v1_branch_head_update: bool) -> Router<Arc<DaemonState>> {
         .route("/history", post(history))
         .route("/verify/run", post(verify_run))
         .route("/commands/verify", post(command_verify))
-        .route("/reconcile", post(reconcile))
         .route("/support", get(support))
         .route("/graph/bootstrap", get(graph_bootstrap))
-        .route("/graph/commit", post(graph_commit))
         .route("/graph/mutations", post(graph_mutations))
         .route("/commands/status", post(command_status))
         .route("/commands/resources", post(command_resources))
@@ -1018,14 +869,8 @@ fn api_routes(retire_v1_branch_head_update: bool) -> Router<Arc<DaemonState>> {
             "/commands/session-workspace",
             post(command_session_workspace),
         )
-        .route("/commands/exec", post(command_exec))
+        .route("/reconcile", post(reconcile_session_workspace))
         .route("/commands/commit", post(command_commit))
-        .route(
-            "/graph/branches",
-            get(graph_list_branches).post(graph_create_branch),
-        )
-        .route("/graph/branches/{name}", delete(graph_delete_branch))
-        .route("/graph/branches/{name}/head", branch_head_update)
         .route("/mcp/tools/call", post(mcp_tools_call))
         // Multi-repo endpoints — list and query lazily-loaded repo graphs
         .route("/repos", get(list_repos))
@@ -1034,14 +879,23 @@ fn api_routes(retire_v1_branch_head_update: bool) -> Router<Arc<DaemonState>> {
         .route("/repos/{repo_id}/files", get(repo_files))
         .route("/repos/{repo_id}/refs", get(repo_refs))
         .route("/repos/{repo_id}/history", get(repo_history))
-        .route("/repos/{repo_id}/compare", get(repo_compare))
+        .route(
+            "/repos/{repo_id}/transfer/status",
+            post(repo_transfer_status),
+        )
+        .route(
+            "/repos/{repo_id}/transfer/export",
+            post(repo_transfer_export)
+                .layer(DefaultBodyLimit::max(REPOSITORY_TRANSFER_HTTP_BODY_LIMIT)),
+        )
+        .route(
+            "/repos/{repo_id}/transfer/receive",
+            post(repo_transfer_receive)
+                .layer(DefaultBodyLimit::max(REPOSITORY_TRANSFER_HTTP_BODY_LIMIT)),
+        )
         .route(
             "/repos/{repo_id}/archive/tar/{source_change_id}",
             get(repo_exact_source_tar_gz),
-        )
-        .route(
-            "/repos/{repo_id}/release/evidence/{source_change_id}",
-            get(repo_release_evidence),
         )
         // Provenance endpoints — Merkle DAG proof lineage
         .route(
@@ -1058,14 +912,7 @@ fn api_routes(retire_v1_branch_head_update: bool) -> Router<Arc<DaemonState>> {
         .route("/vfs/stat/{*path}", get(vfs_stat))
         .route("/vfs/read/{*path}", get(vfs_read))
         .route("/vfs/readdir/{*path}", get(vfs_readdir))
-        .route("/vfs/file-changed", post(vfs_file_changed))
-        .route("/vfs/write-notify", post(vfs_write_notify))
         .route("/vfs/subscribe", get(vfs_subscribe))
-        // Archive endpoints — downloadable source archives
-        // Axum doesn't allow parameters and literals in the same segment,
-        // so we use /archive/tar/{ref} and /archive/zip/{ref} instead.
-        .route("/archive/tar/{ref}", get(archive_tar_gz))
-        .route("/archive/zip/{ref}", get(archive_zip))
         // Spine endpoints — cross-repo federation queries
         .route("/spine/health", get(spine_health))
         .route("/spine/repos", get(spine_repos))
@@ -1284,17 +1131,16 @@ fn npm_registry_auth_error(status: StatusCode, message: &str) -> Response {
 
 /// Build the axum router with all daemon API routes.
 ///
-/// Routes are served at `/`, `/v2/`, and the legacy `/v1/` read-compatibility
-/// prefix. The unsafe v1 branch-head mutation is explicitly retired instead
-/// of silently accepting the v2 CAS contract. All responses identify the
-/// effective API contract in the `X-Kin-API-Version` header.
+/// Routes are served at `/` and `/v2/`. The pre-release `/v1/` compatibility
+/// prefix is deliberately gone: repository-v6 is the first supported
+/// authority contract. All responses identify the effective API contract in
+/// the `X-Kin-API-Version` header.
 pub fn router(state: Arc<DaemonState>) -> Router {
     router_with_auth(state, None)
 }
 
 fn router_with_auth(state: Arc<DaemonState>, auth_token: Option<String>) -> Router {
-    let routes = api_routes(false);
-    let legacy_v1_routes = api_routes(true);
+    let routes = api_routes();
     let activity_state = Arc::clone(&state);
 
     // Package registry — all ecosystems share the same packages dir and manifest store
@@ -1389,7 +1235,6 @@ fn router_with_auth(state: Arc<DaemonState>, auth_token: Option<String>) -> Rout
     // `validate_host_and_origin`) still apply to EVERYTHING, registry included.
     let daemon_routes = Router::new()
         .merge(routes.clone())
-        .nest("/v1", legacy_v1_routes)
         .nest("/v2", routes)
         .layer(middleware::from_fn_with_state(
             DaemonAuthState { auth_token },
@@ -1471,6 +1316,28 @@ async fn resolve_session_graph(
     state.graph_for_request(session_id).await
 }
 
+/// Resolve the committed change that graph-owned source projections must read
+/// at for this request.
+///
+/// A session temporal scope replaces the served graph with a ref-scoped
+/// historical view that holds only the changes reachable from its ref. Source
+/// projection must follow that view: resolving an entity revision or repository
+/// tree against the workspace head would read the wrong history, and for any
+/// scope other than the head itself the head change is not even present in the
+/// view.
+async fn resolve_session_source_scope(
+    state: &DaemonState,
+    session_id: Option<&SessionId>,
+) -> kin_mcp::handlers::common::EntitySourceScope {
+    let Some(session_id) = session_id else {
+        return kin_mcp::handlers::common::EntitySourceScope::WorkspaceHead;
+    };
+    match state.get_session_scope(session_id).await {
+        Some((_, head, _, _)) => kin_mcp::handlers::common::EntitySourceScope::At(head),
+        None => kin_mcp::handlers::common::EntitySourceScope::WorkspaceHead,
+    }
+}
+
 const XREF_STABLE_READ_ATTEMPTS: usize = 3;
 
 /// One optimistic, point-in-time graph authority used by xref-style reads.
@@ -1508,23 +1375,26 @@ fn prepare_xref_graph_read(
             (version_before == version_after
                 && root == live_root
                 && state.graph_authority_epoch_is_current(mutation_epoch))
-            .then(|| XrefGraphReadAttempt {
-                graph: Arc::new(
-                    kin_db::InMemoryGraph::from_snapshot_without_text_index_with_root_hash(
-                        snapshot, root_hash,
-                    ),
-                ),
-                root,
-                head_version: Some(version_after),
-                mutation_epoch,
+            .then(|| {
+                kin_db::InMemoryGraph::from_snapshot_without_text_index_with_root_hash(
+                    snapshot, root_hash,
+                )
+                .ok()
+                .map(|graph| XrefGraphReadAttempt {
+                    graph: Arc::new(graph),
+                    root,
+                    head_version: Some(version_after),
+                    mutation_epoch,
+                })
             })
+            .flatten()
         }
         RequestGraphAuthority::SessionScope => {
             // `to_snapshot` clones the entity/relation store under one graph
             // read lock. Build the query graph from that detached state so a
-            // private ref-hydration cannot interleave the handler's entity and
-            // relation reads. A live-root check below still rejects a snapshot
-            // that was already superseded before the attempt began.
+            // private session mutation cannot interleave the handler's entity
+            // and relation reads. A live-root check below still rejects a
+            // snapshot that was already superseded before the attempt began.
             let snapshot = selected_graph.to_snapshot();
             let root_hash = kin_db::compute_graph_root_hash(&snapshot);
             let root = hex::encode(root_hash);
@@ -1534,12 +1404,12 @@ fn prepare_xref_graph_read(
             if !state.graph_authority_epoch_is_current(mutation_epoch) {
                 return None;
             }
+            let graph = kin_db::InMemoryGraph::from_snapshot_without_text_index_with_root_hash(
+                snapshot, root_hash,
+            )
+            .ok()?;
             Some(XrefGraphReadAttempt {
-                graph: Arc::new(
-                    kin_db::InMemoryGraph::from_snapshot_without_text_index_with_root_hash(
-                        snapshot, root_hash,
-                    ),
-                ),
+                graph: Arc::new(graph),
                 root,
                 head_version: None,
                 mutation_epoch,
@@ -1576,7 +1446,7 @@ async fn xref_graph_read_is_still_current(
         RequestGraphAuthority::SessionScope => {
             if hex::encode(selected_graph.compute_root_hash()) != attempt.root
                 || !state
-                    .ref_hydration_authority_is_current(session_id, selected_graph, authority)
+                    .graph_authority_is_current(session_id, selected_graph, authority)
                     .await
             {
                 return false;
@@ -1641,6 +1511,7 @@ where
     F: FnMut(usize),
 {
     let spine = state.ensure_spine();
+    let repository_authority = mcp_repository_authority_binding(state)?;
     for attempt_number in 0..XREF_STABLE_READ_ATTEMPTS {
         let Some(attempt) = prepare_xref_graph_read(state, &selected_graph, authority) else {
             continue;
@@ -1654,6 +1525,7 @@ where
                 graph_root: &attempt.root,
                 spine,
             },
+            repository_authority.as_ref(),
         )
         .await;
         if xref_graph_read_is_still_current(state, session_id, &selected_graph, authority, &attempt)
@@ -1669,6 +1541,34 @@ where
     Err(kin_mcp::McpError::Other(
         "graph authority changed repeatedly during find_references; retry".to_string(),
     ))
+}
+
+fn mcp_repository_authority_binding(
+    state: &DaemonState,
+) -> kin_mcp::Result<Option<kin_core::LocalRepositoryAuthorityBinding>> {
+    if state.storage_backend.is_some() {
+        return Ok(None);
+    }
+    state
+        .local_repository_authority_binding()
+        .map(Some)
+        .map_err(|error| {
+            kin_mcp::McpError::Context(format!(
+                "graph authority gap: daemon local repository binding is unavailable: {error}"
+            ))
+        })
+}
+
+fn require_mcp_local_repository_authority(
+    state: &DaemonState,
+) -> kin_mcp::Result<kin_core::LocalRepositoryAuthorityBinding> {
+    mcp_repository_authority_binding(state)?.ok_or_else(|| {
+        kin_mcp::McpError::Context(
+            "graph authority gap: this MCP operation requires startup-pinned local repository \
+             authority, but the daemon is serving hosted snapshot authority"
+                .to_string(),
+        )
+    })
 }
 
 async fn mcp_bulk_check_references_with_stable_authority<F>(
@@ -1712,147 +1612,6 @@ where
     ))
 }
 
-/// Resolve the graph together with the authority that owns ref hydration.
-///
-/// A request may wait a long time for the serialized hydration gate. Resolve
-/// once to decide whether the gate is needed, then resolve again after owning
-/// it so a session-scope change during that wait cannot send mutation to an
-/// orphaned graph. The state helper also refreshes an active scope's write
-/// lease because hydration mutates that graph even though this is a query
-/// endpoint.
-async fn resolve_ref_hydration_graph(
-    state: &DaemonState,
-    session_id: Option<&SessionId>,
-    references: &[&str],
-) -> (
-    Arc<kin_db::InMemoryGraph>,
-    RequestGraphAuthority,
-    Option<tokio::sync::OwnedMutexGuard<()>>,
-) {
-    let mut hydration_gate = None;
-    loop {
-        let (graph, authority) = state
-            .graph_for_ref_hydration_with_authority(session_id)
-            .await;
-        let needs_hydration = references.iter().any(|reference| {
-            kin_cli::commands::ref_lookup::git_ref_requires_hydration(graph.as_ref(), reference)
-        });
-        if needs_hydration && hydration_gate.is_none() {
-            hydration_gate = Some(Arc::clone(&state.hydration_gate).lock_owned().await);
-            // The session scope may have changed while the gate was held by a
-            // different request. Select the current graph/authority again
-            // before performing any mutation.
-            continue;
-        }
-        return (graph, authority, hydration_gate);
-    }
-}
-
-/// Run a synchronous ref-hydration `prepare` step on the blocking pool.
-///
-/// Lazy Git-ref hydration replays history synchronously and runs for minutes on
-/// a deep ref. Called straight from an async handler it parks a tokio worker for
-/// that whole time, which leaves the runtime's ability to observe a shutdown
-/// signal resting on how many cores the host happens to have rather than on the
-/// daemon's design: with every worker parked, the signal future is never polled.
-/// Dispatching here keeps the async workers schedulable no matter how deep the
-/// import is.
-///
-/// The hydration gate is carried through rather than released here. It is moved
-/// into the closure and handed back, so the caller still decides when the gate
-/// drops — `prepare` must not outlive it, and the later explicit `drop` must
-/// still happen where it does today. Returning the guard is deliberate: it makes
-/// "the gate outlives the prepare" a property the compiler enforces instead of
-/// one a reviewer has to notice. Releasing it early would let two deep imports
-/// overlap — roughly 2x peak memory, exactly what the gate exists to prevent —
-/// and would not produce a compile error.
-async fn prepare_on_blocking_pool<T, F>(
-    hydration_gate: Option<tokio::sync::OwnedMutexGuard<()>>,
-    prepare: F,
-) -> Result<(T, Option<tokio::sync::OwnedMutexGuard<()>>), (StatusCode, String)>
-where
-    F: FnOnce() -> T + Send + 'static,
-    T: Send + 'static,
-{
-    tokio::task::spawn_blocking(move || (prepare(), hydration_gate))
-        .await
-        .map_err(internal_error)
-}
-
-async fn ensure_ref_hydration_authority_is_current(
-    state: &DaemonState,
-    graph: &Arc<kin_db::InMemoryGraph>,
-    authority: RequestGraphAuthority,
-    session_id: Option<&SessionId>,
-    hydrated_changes: usize,
-) -> Result<(), (StatusCode, String)> {
-    if hydrated_changes == 0
-        || state
-            .ref_hydration_authority_is_current(session_id, graph, authority)
-            .await
-    {
-        return Ok(());
-    }
-
-    Err((
-        StatusCode::CONFLICT,
-        "session temporal scope changed or expired during ref hydration; retry against the current scope"
-            .to_string(),
-    ))
-}
-
-/// Publish a completed ref hydration at the correct graph-authority boundary.
-///
-/// This is called immediately after ref preparation and before entity
-/// rendering. A later missing/ambiguous entity error therefore cannot leave a
-/// mutated HEAD graph unversioned and unsaved. Session-scope graph growth stays
-/// private and ephemeral by design, so it is logged but never published as a
-/// global root change or persisted through `state.graph`.
-fn acknowledge_ref_hydration(
-    state: &DaemonState,
-    authority: RequestGraphAuthority,
-    session_id: Option<&SessionId>,
-    hydrated_changes: usize,
-    operation: &'static str,
-    event_label: &'static str,
-) -> Result<(), (StatusCode, String)> {
-    if hydrated_changes == 0 {
-        return Ok(());
-    }
-
-    match authority {
-        RequestGraphAuthority::Head => {
-            tracing::info!(
-                hydrated_changes,
-                operation,
-                graph_authority = "head",
-                "historical ref hydration changed the durable graph"
-            );
-            state.bump_version();
-            state
-                .save_snapshot_with_event(DaemonEvent::GraphRootChanged {
-                    old_root_hash: None,
-                    new_root_hash: event_label.to_string(),
-                })
-                .map_err(internal_error)?;
-            state.mark_clean();
-        }
-        RequestGraphAuthority::SessionScope => {
-            tracing::info!(
-                hydrated_changes,
-                operation,
-                ?session_id,
-                graph_authority = "session-scope",
-                "historical ref hydration changed a private session graph"
-            );
-        }
-    }
-
-    Ok(())
-}
-
-/// GET /health — liveness check with extended diagnostics.
-/// Supports `?repo=X` to report health for a specific repo's graph.
 async fn health(
     Query(repo_query): Query<RepoQuery>,
     State(state): State<Arc<DaemonState>>,
@@ -1964,21 +1723,6 @@ async fn readiness(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
     }
 }
 
-/// GET /status — current working copy status.
-async fn status(State(state): State<Arc<DaemonState>>) -> Result<impl IntoResponse, StatusCode> {
-    let wc = state.working_copy.read().await;
-    let overlay = &wc.uncommitted_mutations;
-
-    Ok(Json(StatusResponse {
-        base_change: wc.base_change.to_string(),
-        entity_adds: overlay.entity_adds.len(),
-        entity_mods: overlay.entity_mods.len(),
-        entity_removes: overlay.entity_removes.len(),
-        relation_adds: overlay.relation_adds.len(),
-        relation_removes: overlay.relation_removes.len(),
-    }))
-}
-
 /// GET /session — list all active sessions.
 async fn list_sessions(
     State(state): State<Arc<DaemonState>>,
@@ -1993,9 +1737,28 @@ async fn start_session(
     Json(request): Json<StartSessionRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let transport = parse_session_transport(&request.transport)?;
+    let requested_session_id = request
+        .session_id
+        .as_deref()
+        .map(parse_session_id)
+        .transpose()?;
+    if let Some(session_id) = requested_session_id {
+        if state
+            .coordinator
+            .get_session(&session_id)
+            .map_err(internal_error)?
+            .is_some()
+        {
+            return Err((
+                StatusCode::CONFLICT,
+                format!("session already exists: {session_id}"),
+            ));
+        }
+    }
     let session_id = state
         .coordinator
-        .register_session(
+        .register_session_with_id(
+            requested_session_id.unwrap_or_else(SessionId::new),
             &request.vendor,
             &request.client_name,
             transport,
@@ -2069,15 +1832,6 @@ async fn session_heartbeat(
     }))
 }
 
-fn open_repo(path: &std::path::Path) -> std::result::Result<gix::Repository, gix::open::Error> {
-    let dot_git = path.join(".git");
-    if dot_git.is_dir() {
-        gix::open(dot_git)
-    } else {
-        gix::open(path)
-    }
-}
-
 fn resolve_scope_build_timeout(raw: Option<&str>) -> Duration {
     let seconds = raw
         .and_then(|raw| raw.parse::<u64>().ok())
@@ -2116,91 +1870,25 @@ async fn set_scope(
 
     // Offload the heavy computation to a blocking thread to keep the main event loop responsive
     let state_clone = Arc::clone(&state);
+    let repository_authority = state
+        .local_repository_authority_binding()
+        .map_err(repository_authority_error)?;
     let ref_string = req.ref_string.clone();
     let timeout = scope_build_timeout();
-    // A deep scope base_commit lazily imports its full ancestry; serialize that
-    // against every other daemon hydration so two deep imports never run at once
-    // (roughly 2x peak memory → OOM). Already-imported refs skip the gate and
-    // stay on the fast path. Acquired here (async) and moved into the blocking
-    // task so it is held for the whole import.
-    let hydration_gate = if kin_cli::commands::ref_lookup::git_ref_requires_hydration(
-        state.graph.as_ref(),
-        &ref_string,
-    ) {
-        Some(Arc::clone(&state.hydration_gate).lock_owned().await)
-    } else {
-        None
-    };
-    let graph_mutation = hydration_gate
-        .as_ref()
-        .map(|_| state.begin_graph_authority_mutation());
-    let scope_task = tokio::task::spawn_blocking(
-        move || -> std::result::Result<_, (StatusCode, String)> {
-            let _hydration_gate = hydration_gate;
-            let _graph_mutation = graph_mutation;
-            // Resolve the ref through the locate entry point, which hydrates a
-            // not-yet-imported Git ancestry at artifact-only depth. Scope-for-
-            // retrieval only needs the base_commit's tree state: build_graph_at_ref
-            // below takes the file tree from the imported artifact deltas (or from
-            // the Git tree) and rebuilds the scoped entity set by re-parsing it.
-            // The per-commit semantic replay that depth skips ("Hydrating History:
-            // [n/26747]") re-parses and re-links every ancestor commit — ~10 min on
-            // a deep base_commit — and nothing on this path reads the deltas it
-            // produces; the scoped entity set is ranked with HEAD vectors via
-            // `vector_source`. Callers that do read those deltas — history, blame,
-            // review — resolve through the semantic entry points instead.
-            let resolved =
-            kin_cli::commands::ref_lookup::resolve_ref_importing_git_if_needed_for_locate_with_report(
+    let scope_task =
+        tokio::task::spawn_blocking(move || -> std::result::Result<_, (StatusCode, String)> {
+            // Runtime scope queries are graph/CAS-only. An unimported ref is a
+            // graph gap and must fail instead of silently repairing authority
+            // from a colocated Git checkout.
+            let head = kin_cli::commands::ref_lookup::resolve_ref(
                 state_clone.graph.as_ref(),
-                &state_clone.layout,
+                &repository_authority,
                 Some(&ref_string),
             )
             .map_err(|err| (StatusCode::BAD_REQUEST, format!("{:#}", err)))?;
-            if resolved.hydrated_git_history {
-                state_clone.bump_version();
-                state_clone.save_snapshot().map_err(internal_error)?;
-                state_clone.mark_clean();
-            }
-            let head = resolved.head;
-
-            // Build the historical graph at that ref, using cached OID mapping
-            // for fast scope switching without re-walking the commit DAG.
-            let oid_cache: Option<kin_core::ChangeOidCache> = {
-                let needs_build = read_recover(&state_clone.change_oid_cache).is_none();
-                if needs_build {
-                    if let Ok(repo) = open_repo(state_clone.layout.working_dir()) {
-                        match kin_core::build_change_oid_cache(&repo) {
-                            Ok(cache) => {
-                                info!("built change OID cache for fast scope switching");
-                                *write_recover(&state_clone.change_oid_cache) = Some(cache);
-                            }
-                            Err(err) => {
-                                tracing::warn!(error = %err, "failed to build change OID cache, falling back to per-call lookup");
-                            }
-                        }
-                    }
-                }
-                read_recover(&state_clone.change_oid_cache).clone()
-            };
-            let historical = if let Some(git_oid) = ref_string.strip_prefix("git:") {
-                kin_core::build_graph_at_git_ref_with_repo(
-                    state_clone.graph.as_ref(),
-                    state_clone.blobs.as_ref(),
-                    &head,
-                    state_clone.layout.working_dir(),
-                    git_oid,
-                    oid_cache.as_ref(),
-                )
-            } else {
-                kin_core::build_graph_at_ref_with_repo(
-                    state_clone.graph.as_ref(),
-                    state_clone.blobs.as_ref(),
-                    &head,
-                    Some(state_clone.layout.working_dir()),
-                    oid_cache.as_ref(),
-                )
-            }
-            .map_err(internal_error)?;
+            let authority = ActiveApiRepositoryAuthority::open(&state_clone)?;
+            let historical =
+                kin_core::build_graph_at_ref(&authority.manager, &head).map_err(internal_error)?;
 
             // Refresh cochange relations from the historical change set so the
             // cached graph matches what run_with_graph_capture_at_ref() produces.
@@ -2211,8 +1899,7 @@ async fn set_scope(
             let cached_graph = Arc::new(historical);
 
             Ok((head, cached_graph))
-        },
-    );
+        });
     let (head, cached_graph) = match tokio::time::timeout(timeout, scope_task).await {
         Ok(joined) => joined.map_err(|err| {
             (
@@ -2288,332 +1975,6 @@ async fn get_scope(
     }
 }
 
-/// POST /graph/commit — accepts a full semantic commit from the CLI and applies it to Truth.
-async fn graph_commit(
-    State(state): State<Arc<DaemonState>>,
-    Json(request): Json<DaemonCommitRequest>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
-    use kin_model::{EntityDelta, RelationDelta};
-
-    // Serialize caller-supplied history publication so the same-ID check and
-    // insertion are one authority operation. `create_change` is an overwrite
-    // primitive internally, so the API must enforce immutable IDs itself.
-    let _mutation_guard = state.coordination_gate.lock().await;
-    let graph = &*state.graph;
-    let live_branch = graph
-        .get_branch(&request.branch_name)
-        .map_err(internal_error)?;
-    let change_already_exists = match graph
-        .get_change(&request.change.id)
-        .map_err(internal_error)?
-    {
-        Some(existing) => {
-            let existing = serde_json::to_value(&existing).map_err(internal_error)?;
-            let incoming = serde_json::to_value(&request.change).map_err(internal_error)?;
-            if existing != incoming {
-                return Err((
-                    StatusCode::CONFLICT,
-                    serde_json::json!({
-                        "error": "semantic_change_id_collision",
-                        "change_id": request.change.id.to_string(),
-                        "mutation_applied": false,
-                        "message": "semantic change ID already exists with a different immutable payload",
-                    })
-                    .to_string(),
-                ));
-            }
-            true
-        }
-        None => false,
-    };
-
-    let release_author = request.change.author.to_string() == "kin-release";
-    let release_message_signal = request.change.message.starts_with("release: ");
-    let release_entity_count = canonical_release_entity_count(&request.change.message);
-    let release_marker = release_author && release_entity_count.is_some();
-    if release_author != release_message_signal
-        || (release_message_signal && release_entity_count.is_none())
-    {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            serde_json::json!({
-                "error": "invalid_release_marker",
-                "mutation_applied": false,
-                "message": "release markers must use both the canonical kin-release author and release: message prefix",
-            })
-            .to_string(),
-        ));
-    }
-    let release_shape_is_empty = request.change.parents.len() == 1
-        && request.change.entity_deltas.is_empty()
-        && request.change.relation_deltas.is_empty()
-        && request.change.artifact_deltas.is_empty()
-        && request.change.projected_files.is_empty()
-        && request.shallow_files.is_empty()
-        && request.shallow_clears.is_empty()
-        && request.audit_event.is_none()
-        && request.change.authored_on.as_ref() == Some(&request.branch_name);
-
-    if release_marker && request.release_policy.is_none() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            serde_json::json!({
-                "error": "release_policy_required",
-                "mutation_applied": false,
-                "message": "release changes must carry daemon-enforced release policy",
-            })
-            .to_string(),
-        ));
-    }
-
-    if request.release_policy.is_some() {
-        if live_branch.is_none() {
-            return Err((
-                StatusCode::CONFLICT,
-                serde_json::json!({
-                    "error": "release_branch_missing",
-                    "branch": request.branch_name.to_string(),
-                    "change_id": request.change.id.to_string(),
-                    "change_materialized": change_already_exists,
-                    "mutation_applied": false,
-                    "message": "release requires an existing branch authority",
-                })
-                .to_string(),
-            ));
-        }
-        if !release_marker || !release_shape_is_empty {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                serde_json::json!({
-                    "error": "invalid_release_change_shape",
-                    "mutation_applied": false,
-                    "message": "release commits must be empty-delta marker changes with exactly one live parent",
-                })
-                .to_string(),
-            ));
-        }
-    }
-
-    let exact_release_retry = release_marker
-        && release_shape_is_empty
-        && request.release_policy.is_some()
-        && change_already_exists
-        && match &live_branch {
-            Some(branch) => release_change_reachable_from(graph, &request.change.id, &branch.head)?,
-            None => false,
-        };
-
-    // Compare-and-swap the caller's observed parent against the live branch
-    // while holding the same gate used for the eventual head mutation. Merge
-    // commits may carry additional parents, but their first parent is the
-    // target branch authority they were constructed against. An exact release
-    // recovery is the only exception: its branch already points at the marker
-    // or at a descendant that retained the marker. Policy is still evaluated
-    // against the marker's immutable parent.
-    if !exact_release_retry {
-        if let Some(branch) = &live_branch {
-            let expected_head = request.change.parents.first().copied();
-            if expected_head != Some(branch.head) {
-                return Err((
-                    StatusCode::CONFLICT,
-                    serde_json::json!({
-                        "error": "stale_branch_head",
-                        "branch": request.branch_name.to_string(),
-                        "expected_head": expected_head.map(|head| head.to_string()),
-                        "actual_head": branch.head.to_string(),
-                        "change_id": request.change.id.to_string(),
-                        "change_materialized": change_already_exists,
-                        "mutation_applied": false,
-                        "message": "semantic change parent does not match the current branch head",
-                    })
-                    .to_string(),
-                ));
-            }
-        }
-    }
-
-    if let Some(policy) = &request.release_policy {
-        // Both first publication and an identical recovery retry evaluate the
-        // same immutable parent. Never substitute the live branch head here:
-        // on retry it is the release marker itself, while ambient overlays can
-        // otherwise add or remove entities without changing history.
-        enforce_daemon_release_policy(
-            graph,
-            &request.change.parents[0],
-            release_entity_count.expect("validated release policy has a canonical marker"),
-            policy,
-        )?;
-        state
-            .preflight_exact_source_tree(graph, &request.change.parents[0])
-            .map_err(|error| {
-                (
-                    StatusCode::FAILED_DEPENDENCY,
-                    serde_json::json!({
-                        "error": "release_source_not_exact",
-                        "source_head": request.change.parents[0].to_string(),
-                        "mutation_applied": false,
-                        "message": error.to_string(),
-                    })
-                    .to_string(),
-                )
-            })?;
-    }
-
-    // An identical retry already reachable from the branch must not reapply
-    // graph mutations. This also reconciles a durable journal after later
-    // branch progress: the marker remains release authority even though it is
-    // no longer the tip. General commits still fail closed on stale parents.
-    if exact_release_retry {
-        state
-            .retry_snapshot_authority_with_event(DaemonEvent::GraphRootChanged {
-                old_root_hash: None,
-                new_root_hash: live_branch
-                    .as_ref()
-                    .map(|branch| branch.head.to_string())
-                    .unwrap_or_else(|| request.change.id.to_string()),
-            })
-            .map_err(internal_error)?;
-        return Ok(Json(serde_json::json!({"status": "ok"})));
-    }
-
-    // --- Lease enforcement gate ---
-    // Collect the entity scopes touched by this commit and check for hard
-    // lock conflicts. If another session holds a hard lease on any scope
-    // in the write set, reject with 409 Conflict.
-    {
-        use kin_model::session::IntentScope;
-
-        let mut scopes: Vec<IntentScope> = Vec::new();
-        for delta in &request.change.entity_deltas {
-            match delta {
-                EntityDelta::Added(e) => scopes.push(IntentScope::Entity(e.id)),
-                EntityDelta::Modified { new, .. } => scopes.push(IntentScope::Entity(new.id)),
-                EntityDelta::Removed(id) => scopes.push(IntentScope::Entity(*id)),
-            }
-        }
-
-        if !scopes.is_empty() {
-            let caller_session = request
-                .session_id
-                .as_ref()
-                .and_then(|s| uuid::Uuid::parse_str(s).ok().map(kin_model::SessionId));
-            let traffic = state
-                .coordinator
-                .check_traffic(&scopes)
-                .map_err(internal_error)?;
-            if traffic.has_hard_blocks {
-                // Filter out blocks owned by the caller's own session.
-                let foreign_blocks: Vec<_> = traffic
-                    .reports
-                    .iter()
-                    .flat_map(|r| r.active_intents.iter())
-                    .filter(|s| {
-                        s.lock_type == kin_model::session::LockType::Hard
-                            && caller_session.as_ref().is_none_or(|cs| &s.session_id != cs)
-                    })
-                    .collect();
-                if !foreign_blocks.is_empty() {
-                    let body = serde_json::json!({
-                        "error": "lease_conflict",
-                        "conflict_type": "HardCollision",
-                        "blocking_intents": foreign_blocks.iter().map(|b| {
-                            serde_json::json!({
-                                "intent_id": b.intent_id.to_string(),
-                                "session_id": b.session_id.to_string(),
-                                "lock_type": format!("{:?}", b.lock_type),
-                                "task_description": b.task_description,
-                            })
-                        }).collect::<Vec<_>>(),
-                        "message": format!(
-                            "commit blocked: {} entity scope(s) held by active hard lease(s)",
-                            foreign_blocks.len()
-                        ),
-                    });
-                    return Err((StatusCode::CONFLICT, body.to_string()));
-                }
-            }
-        }
-    }
-
-    // Release admission already validated the marker parent's complete exact
-    // tree above. The marker has no artifact deltas, so resolving it produces
-    // that identical tree; reading every source object again here only doubles
-    // release latency and peak backend traffic without adding authority.
-    if request.release_policy.is_none() {
-        state
-            .preflight_exact_source_change(graph, &request.change)
-            .map_err(internal_error)?;
-    }
-
-    let graph_mutation = state.begin_graph_authority_mutation();
-    for delta in &request.change.entity_deltas {
-        match delta {
-            EntityDelta::Added(e) => {
-                graph.upsert_entity(e).map_err(internal_error)?;
-            }
-            EntityDelta::Modified { new, .. } => {
-                graph.upsert_entity(new).map_err(internal_error)?;
-            }
-            EntityDelta::Removed(id) => {
-                graph.remove_entity(id).map_err(internal_error)?;
-            }
-        }
-    }
-
-    for delta in &request.change.relation_deltas {
-        match delta {
-            RelationDelta::Added(r) => {
-                graph.upsert_relation(r).map_err(internal_error)?;
-            }
-            RelationDelta::Removed(id) => {
-                graph.remove_relation(id).map_err(internal_error)?;
-            }
-        }
-    }
-
-    for clear in &request.shallow_clears {
-        graph.delete_shallow_file(clear).map_err(internal_error)?;
-    }
-
-    for sf in &request.shallow_files {
-        graph.upsert_shallow_file(sf).map_err(internal_error)?;
-    }
-
-    if !change_already_exists {
-        graph
-            .create_change(&request.change)
-            .map_err(internal_error)?;
-    }
-    if live_branch.is_some() {
-        graph
-            .update_branch_head(&request.branch_name, &request.change.id)
-            .map_err(internal_error)?;
-    } else {
-        graph
-            .create_branch(&Branch {
-                name: request.branch_name.clone(),
-                head: request.change.id,
-            })
-            .map_err(internal_error)?;
-    }
-
-    if let Some(audit) = &request.audit_event {
-        graph.record_audit_event(audit).map_err(internal_error)?;
-    }
-
-    // Broadcast root hash change and compact the delta journal at the commit boundary.
-    state.bump_version();
-    drop(graph_mutation);
-    state
-        .save_snapshot_full_with_event(DaemonEvent::GraphRootChanged {
-            old_root_hash: None,
-            new_root_hash: request.change.id.to_string(),
-        })
-        .map_err(internal_error)?;
-
-    Ok(Json(serde_json::json!({"status": "ok"})))
-}
-
 /// POST /graph/mutations — apply daemon-authoritative graph metadata writes
 /// that are not represented as SemanticChange commits.
 async fn graph_mutations(
@@ -2655,6 +2016,7 @@ async fn graph_mutations(
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     }
 
+    state.mark_dirty();
     state.bump_version();
     state.emit_event(DaemonEvent::GraphRootChanged {
         old_root_hash: None,
@@ -2664,9 +2026,8 @@ async fn graph_mutations(
     Ok(Json(serde_json::json!({"status": "ok"})))
 }
 
-/// POST /commands/status — render CLI status from daemon-owned graph state.
+/// POST /commands/status — render one coherent repository-v6 authority lease.
 async fn command_status(
-    headers: axum::http::HeaderMap,
     State(state): State<Arc<DaemonState>>,
     Json(request): Json<kin_cli::commands::status::CommandStatusRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
@@ -2680,9 +2041,10 @@ async fn command_status(
         ));
     }
 
-    let session_id = extract_session_id_from_headers(&headers)?;
-    let graph = resolve_session_graph(&state, session_id.as_ref()).await;
-    let summary = kin_cli::commands::status::build_status_summary(&state.layout, graph.as_ref())
+    let repository_authority = state
+        .local_repository_authority_binding()
+        .map_err(repository_authority_error)?;
+    let report = kin_cli::commands::status::inspect(&state.layout, &repository_authority)
         .map_err(internal_error)?;
     let daemon_build = kin_buildinfo::get();
     let build = kin_cli::commands::status::BuildStatus {
@@ -2698,12 +2060,9 @@ async fn command_status(
         daemon_source_known: daemon_build.source_known,
         daemon_dependency_provenance: daemon_build.dependency_provenance.to_string(),
     };
-    let response = kin_cli::commands::status::build_command_status_response(
-        summary,
-        request.json,
-        Some(build),
-    )
-    .map_err(internal_error)?;
+    let response =
+        kin_cli::commands::status::build_command_status_response(report, request.json, Some(build))
+            .map_err(internal_error)?;
     Ok(Json(response))
 }
 
@@ -2830,9 +2189,15 @@ async fn command_graph(
 
     let session_id = extract_session_id_from_headers(&headers)?;
     let graph = resolve_session_graph(&state, session_id.as_ref()).await;
-    let response =
-        kin_cli::commands::graph::execute_graph_command(&state.layout, graph.as_ref(), &request)
-            .map_err(internal_error)?;
+    let repository_authority = state
+        .local_repository_authority_binding()
+        .map_err(repository_authority_error)?;
+    let response = kin_cli::commands::graph::execute_graph_command(
+        &repository_authority,
+        graph.as_ref(),
+        &request,
+    )
+    .map_err(internal_error)?;
     Ok(Json(response))
 }
 
@@ -2941,8 +2306,11 @@ async fn command_trace_data_flow(
 
     let session_id = extract_session_id_from_headers(&headers)?;
     let graph = resolve_session_graph(&state, session_id.as_ref()).await;
+    let repository_authority = state
+        .local_repository_authority_binding()
+        .map_err(repository_authority_error)?;
     let response = kin_cli::commands::trace_data_flow::build_trace_data_flow_response(
-        &state.layout,
+        &repository_authority,
         graph.as_ref(),
         &request,
     )
@@ -3031,9 +2399,9 @@ async fn command_xref(
     Ok(Json(response))
 }
 
-/// POST /commands/diff — render semantic diffs from daemon-owned graph state.
+/// POST /commands/diff — render exact diffs from repository-v6 authority.
 async fn command_diff(
-    headers: axum::http::HeaderMap,
+    _headers: axum::http::HeaderMap,
     State(state): State<Arc<DaemonState>>,
     Json(request): Json<kin_cli::commands::diff::DiffRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
@@ -3047,9 +2415,10 @@ async fn command_diff(
         ));
     }
 
-    let session_id = extract_session_id_from_headers(&headers)?;
-    let graph = resolve_session_graph(&state, session_id.as_ref()).await;
-    let response = kin_cli::commands::diff::build_diff_response(graph.as_ref(), &request)
+    let repository_authority = state
+        .local_repository_authority_binding()
+        .map_err(repository_authority_error)?;
+    let response = kin_cli::commands::diff::build_diff_response(&repository_authority, &request)
         .map_err(internal_error)?;
     Ok(Json(response))
 }
@@ -3072,8 +2441,11 @@ async fn command_log(
 
     let session_id = extract_session_id_from_headers(&headers)?;
     let graph = resolve_session_graph(&state, session_id.as_ref()).await;
+    let repository_authority = state
+        .local_repository_authority_binding()
+        .map_err(repository_authority_error)?;
     let response =
-        kin_cli::commands::log::build_log_response(&state.layout, graph.as_ref(), &request)
+        kin_cli::commands::log::build_log_response(&repository_authority, graph.as_ref(), &request)
             .map_err(internal_error)?;
     Ok(Json(response))
 }
@@ -3149,6 +2521,7 @@ async fn command_security(
 
 /// POST /commands/branch — run branch lifecycle commands in the repo daemon.
 async fn command_branch(
+    headers: axum::http::HeaderMap,
     State(state): State<Arc<DaemonState>>,
     Json(request): Json<kin_cli::commands::branch::BranchRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
@@ -3161,6 +2534,21 @@ async fn command_branch(
             "daemon not fully initialized".to_string(),
         ));
     }
+    if state.storage_backend.is_some() {
+        return Err((
+            StatusCode::CONFLICT,
+            "local repository branch authority is unavailable for hosted snapshot authority"
+                .to_string(),
+        ));
+    }
+    if extract_session_id_from_headers(&headers)?.is_some() {
+        return Err((
+            StatusCode::CONFLICT,
+            "primary repository branch commands do not accept X-Kin-Session; run against HEAD \
+             authority without ambient session scope"
+                .to_string(),
+        ));
+    }
 
     let requires_authority_gate =
         !matches!(&request, kin_cli::commands::branch::BranchRequest::List);
@@ -3170,23 +2558,11 @@ async fn command_branch(
         None
     };
 
-    let response = kin_cli::commands::branch::execute_branch_request(
-        &state.layout,
-        state.graph.as_ref(),
-        &request,
-    )
-    .map_err(internal_error)?;
-    if response.mutated {
-        state.bump_version();
-        state.emit_event(DaemonEvent::GraphRootChanged {
-            old_root_hash: None,
-            new_root_hash: "branch-state".to_string(),
-        });
-    }
+    let response = crate::repository_branch::execute(&state, &request)?;
     Ok(Json(response))
 }
 
-/// POST /commands/checkout — restore files through daemon-owned graph state.
+/// POST /commands/checkout — restore one exact repository-authority path.
 async fn command_checkout(
     headers: axum::http::HeaderMap,
     State(state): State<Arc<DaemonState>>,
@@ -3201,17 +2577,25 @@ async fn command_checkout(
             "daemon not fully initialized".to_string(),
         ));
     }
+    if state.storage_backend.is_some() {
+        return Err((
+            StatusCode::CONFLICT,
+            "exact local checkout is unavailable for hosted snapshot authority".to_string(),
+        ));
+    }
+
+    let session_id = extract_session_id_from_headers(&headers)?;
+    if session_id.is_some() {
+        return Err((
+            StatusCode::CONFLICT,
+            "checkout does not accept X-Kin-Session because it mutates the primary repository \
+             workspace; materialize and mutate a session workspace instead"
+                .to_string(),
+        ));
+    }
 
     let _coordination = state.coordination_gate.lock().await;
-    let session_id = extract_session_id_from_headers(&headers)?;
-    let graph = resolve_session_graph(&state, session_id.as_ref()).await;
-
-    let response = kin_cli::commands::checkout::execute_checkout_request(
-        &state.layout,
-        graph.as_ref(),
-        &request,
-    )
-    .map_err(internal_error)?;
+    let response = crate::repository_checkout::execute(&state, &request)?;
     Ok(Json(response))
 }
 
@@ -3239,7 +2623,7 @@ async fn command_rename(
     Ok(Json(response))
 }
 
-/// POST /commands/session-workspace — materialize graph-owned files for sessions.
+/// POST /commands/session-workspace — materialize repository-authority files for sessions.
 async fn command_session_workspace(
     State(state): State<Arc<DaemonState>>,
     Json(request): Json<kin_cli::commands::session_workspace::SessionWorkspaceRequest>,
@@ -3254,35 +2638,27 @@ async fn command_session_workspace(
         ));
     }
 
+    let repository_authority = state
+        .local_repository_authority_binding()
+        .map_err(repository_authority_error)?;
     let response = kin_cli::commands::session_workspace::materialize_session_workspace(
         &state.layout,
-        state.graph.as_ref(),
+        &repository_authority,
         &request,
     )
-    .map_err(internal_error)?;
+    .map_err(session_reconcile_error)?;
     Ok(Json(response))
 }
 
-/// POST /commands/exec — execute inside a daemon-materialized graph workspace.
-/// Whether the daemon is permitted to run shell command execution
-/// (`POST /commands/exec`, which spawns `sh -c`). This is a high-risk
-/// capability (local RCE if an unauthorized caller reaches the loopback
-/// daemon), so it stays disabled unless the operator explicitly opts in via
-/// `KIN_DAEMON_ALLOW_EXEC`. Being initialized is necessary but NOT sufficient.
-fn exec_capability_enabled() -> bool {
-    std::env::var("KIN_DAEMON_ALLOW_EXEC")
-        .map(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
-}
-
-async fn command_exec(
+/// POST /reconcile — admit one twice-verified disposable-session observation.
+///
+/// Filesystem reads occur only in `observe_session_workspace`. Repository
+/// authority and the primary graph-derived projection then move together
+/// through the repository-v6 projection WAL. Semantic parsing is derived,
+/// optional follow-up work and never controls exact membership.
+async fn reconcile_session_workspace(
     State(state): State<Arc<DaemonState>>,
-    Json(request): Json<kin_cli::commands::exec::ExecRequest>,
+    Json(request): Json<kin_cli::commands::reconcile::ReconcileRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     if !state
         .is_initialized
@@ -3293,38 +2669,192 @@ async fn command_exec(
             "daemon not fully initialized".to_string(),
         ));
     }
-
-    if !exec_capability_enabled() {
+    if state.storage_backend.is_some() {
         return Err((
-            StatusCode::FORBIDDEN,
-            "command execution is disabled; set KIN_DAEMON_ALLOW_EXEC=1 to opt in to daemon-side `sh -c` execution".to_string(),
+            StatusCode::CONFLICT,
+            "exact local session reconciliation is unavailable for hosted snapshot authority"
+                .to_string(),
         ));
     }
 
-    let response = kin_cli::commands::exec::execute_exec_request(
+    let _coordination = state.coordination_gate.lock().await;
+    let graph_mutation = state.begin_graph_authority_mutation();
+    let repository_authority = state
+        .local_repository_authority_binding()
+        .map_err(repository_authority_error)?;
+    let observation = kin_cli::commands::reconcile::observe_session_workspace(
         &state.layout,
-        state.graph.as_ref(),
-        &request,
+        &repository_authority,
+        &request.session_dir,
+        state.blobs.as_ref(),
+        request.confirm_mass_deletion,
     )
-    .map_err(internal_error)?;
-    Ok(Json(response))
+    .map_err(session_reconcile_error)?;
+
+    let previous_tree_hash = observation.base.source_workspace.tree_hash;
+    let desired_tree_hash = kin_model::compute_resolved_tree_hash(&observation.desired_tree)
+        .map_err(repository_authority_error)?;
+    let changes = observation.changes();
+    let added = changes
+        .iter()
+        .filter(|change| change.kind == kin_cli::commands::reconcile::ReconcileChangeKind::Added)
+        .count();
+    let modified = changes
+        .iter()
+        .filter(|change| change.kind == kin_cli::commands::reconcile::ReconcileChangeKind::Modified)
+        .count();
+    let removed = changes
+        .iter()
+        .filter(|change| change.kind == kin_cli::commands::reconcile::ReconcileChangeKind::Removed)
+        .count();
+
+    if state.graph.resolved_tree() != observation.base.source_workspace.tree
+        && state.graph.resolved_tree() != observation.desired_tree
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            "daemon query tree is not bound to the session base or its exact recovered target; \
+             reopen the daemon from repository authority"
+                .to_string(),
+        ));
+    }
+
+    let (authority_generation, workspace_generation, idempotent_replay) = if observation
+        .deltas
+        .is_empty()
+    {
+        (
+            observation.base.authority_roots.generation,
+            observation.base.source_workspace.generation,
+            false,
+        )
+    } else {
+        let authority_context =
+            crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(&state)
+                .map_err(repository_commit_error)?;
+        let plan = crate::repository_commit::plan_session_workspace_admission(
+            state.blobs.as_ref(),
+            &authority_context,
+            &observation.base,
+            &observation.desired_tree,
+        )
+        .map_err(repository_commit_error)?;
+        let committed = crate::repository_commit::commit_session_workspace_admission(
+            &state.layout,
+            state.blobs.as_ref(),
+            &authority_context,
+            plan,
+        )
+        .map_err(repository_commit_error)?;
+
+        let live_generation = state
+            .snapshot_generation
+            .load(std::sync::atomic::Ordering::SeqCst);
+        if committed.receipt.generation > live_generation {
+            state
+                .record_repository_authority_commit(committed.receipt.generation)
+                .map_err(repository_commit_error)?;
+        } else if committed.receipt.generation < live_generation {
+            return Err((
+                StatusCode::CONFLICT,
+                format!(
+                    "daemon generation {live_generation} is newer than recovered session \
+                         receipt {}",
+                    committed.receipt.generation
+                ),
+            ));
+        }
+
+        let graph_tree = state.graph.resolved_tree();
+        if graph_tree == observation.base.source_workspace.tree {
+            state
+                .graph
+                .apply_transaction_delta(&TransactionDelta {
+                    tree_deltas: observation.deltas.clone(),
+                    ..TransactionDelta::default()
+                })
+                .map_err(internal_error)?;
+        } else if graph_tree != observation.desired_tree {
+            return Err((
+                StatusCode::CONFLICT,
+                "repository receipt is durable but the daemon query tree cannot be advanced \
+                     from the retained session base; restart to reload exact authority"
+                    .to_string(),
+            ));
+        }
+
+        state.mark_dirty();
+        state.bump_version();
+        state.emit_event(DaemonEvent::GraphRootChanged {
+            old_root_hash: Some(previous_tree_hash.to_string()),
+            new_root_hash: desired_tree_hash.to_string(),
+        });
+        (
+            committed.receipt.generation,
+            observation
+                .base
+                .source_workspace
+                .generation
+                .saturating_add(1),
+            committed.idempotent_replay,
+        )
+    };
+
+    drop(graph_mutation);
+    Ok(Json(kin_cli::commands::reconcile::ReconcileSummary {
+        schema: kin_cli::commands::reconcile::RECONCILE_SUMMARY_SCHEMA.to_string(),
+        operation_id: observation.base.reconcile_operation_id,
+        repository_id: observation.base.repository_id,
+        authority_generation,
+        workspace_generation,
+        previous_tree_hash,
+        desired_tree_hash,
+        idempotent_replay,
+        changed: !observation.deltas.is_empty(),
+        added,
+        modified,
+        removed,
+        observed_materialized_artifacts: observation.observed_materialized_artifacts,
+        preserved_graph_only_artifacts: observation.preserved_graph_only_artifacts,
+        observed_body_bytes: observation.observed_body_bytes,
+        semantic_files_enriched: 0,
+        semantic_enrichment_failures: 0,
+        changes,
+    }))
+}
+
+fn session_reconcile_error(error: impl std::fmt::Display) -> (StatusCode, String) {
+    let message = error.to_string();
+    let status = if [
+        "stale",
+        "tampered",
+        "changed",
+        "mass-deletion",
+        "no longer match",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
+    {
+        StatusCode::CONFLICT
+    } else {
+        StatusCode::BAD_REQUEST
+    };
+    (status, message)
 }
 
 // ── Thin-Client Commands ─────────────────────────────────────────────────
 
 /// POST /commands/commit — Thin-client commit endpoint.
 ///
-/// The daemon runs the entire commit pipeline: reconcile pending file changes,
-/// build entity deltas from the working copy overlay, create the semantic change,
-/// and update the branch head. The CLI just sends the message and dry_run flag.
-///
-/// This replaces the old pattern where the CLI did all parsing locally and
-/// POSTed the pre-built SemanticChange to /graph/commit.
+/// The daemon first admits pending filesystem input into graph state, then
+/// publishes one repository-v6 transaction containing the semantic change,
+/// exact tree, workspace base, and named-ref compare-and-swap.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CommandCommitRequest {
+    operation_id: kin_model::OperationId,
+    timestamp: kin_model::Timestamp,
     message: String,
-    #[serde(default)]
-    dry_run: bool,
     #[serde(default)]
     session_id: Option<String>,
 }
@@ -3349,75 +2879,46 @@ async fn command_commit(
         ));
     }
 
-    // Force a filesystem sync to guarantee the daemon has reconciled all offline changes
-    // before building the commit deltas.
-    crate::loop_runner::sync_filesystem_with_graph(&state)
+    // Hold one uninterrupted graph-authority gate across forced filesystem
+    // admission, change construction, and branch publication. The sync helper
+    // deliberately does not re-lock this non-reentrant mutex.
+    let _coordination = state.coordination_gate.lock().await;
+    crate::loop_runner::sync_filesystem_with_graph_under_coordination(&state)
         .await
         .map_err(internal_error)?;
 
-    // Serialize the branch read, change construction, and head publication
-    // with `/graph/commit` release CAS operations.
-    let _coordination = state.coordination_gate.lock().await;
-
     let graph = &*state.graph;
-
-    // Read current branch from the .kin/HEAD file.
-    let branch_name = kin_core::read_current_branch(&state.layout).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to read HEAD: {e}"),
-        )
-    })?;
-
-    // Ensure the branch exists in the graph (bootstrap if needed).
-    let branch = graph
-        .get_branch(&branch_name)
-        .map_err(internal_error)?
-        .ok_or_else(|| {
-            (
-                StatusCode::BAD_REQUEST,
-                format!("branch '{}' not found", branch_name),
-            )
-        })?;
-
-    // Compute deltas reconstructively by diffing current graph state against
-    // the last-committed change-DAG node.  The reconcile loop's
-    // `apply_overlay_to_graph` folds mutations into the primary graph and
-    // then clears the working-copy overlay, so reading the overlay here
-    // would always produce empty deltas.  Instead we walk the change DAG
-    // from genesis to branch.head to reconstruct the committed baseline,
-    // then diff it against the live graph — robust regardless of overlay drain timing.
-    let commit_deltas = crate::commit_deltas::compute_deltas_vs_last_commit(
+    let authority_context =
+        crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(&state)
+            .map_err(repository_commit_error)?;
+    let plan = crate::repository_commit::plan_native_commit(
         graph,
         state.blobs.as_ref(),
-        &state.layout,
-        &branch.head,
+        &authority_context,
+        request.operation_id,
+        request.timestamp,
+        kin_model::AuthorId::new(kin_core::whoami()),
+        request.message,
     )
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to compute commit deltas: {e}"),
-        )
-    })?;
+    .map_err(repository_commit_error)?;
+    let change_id = plan.change.id;
+    let branch_name = plan.branch.clone();
+    let entity_count = plan.entity_count;
+    let relation_count = plan.relation_count;
+    let file_count = plan.file_count;
 
-    let entity_deltas = commit_deltas.entity_deltas;
-    let relation_deltas = commit_deltas.relation_deltas;
-    let artifact_deltas = commit_deltas.artifact_deltas;
-
-    let entity_count = entity_deltas.len();
-    let relation_count = relation_deltas.len();
-    let file_count = artifact_deltas.len();
-
-    // --- Lease enforcement gate (same as /graph/commit) ---
+    // --- Lease enforcement gate for native repository publication ---
     {
         use kin_model::session::IntentScope;
 
-        let scopes: Vec<IntentScope> = entity_deltas
+        let scopes: Vec<IntentScope> = plan
+            .change
+            .entity_deltas
             .iter()
-            .map(|d| match d {
-                kin_model::EntityDelta::Added(e) => IntentScope::Entity(e.id),
+            .map(|delta| match delta {
+                kin_model::EntityDelta::Added { new } => IntentScope::Entity(new.id),
                 kin_model::EntityDelta::Modified { new, .. } => IntentScope::Entity(new.id),
-                kin_model::EntityDelta::Removed(ref id) => IntentScope::Entity(*id),
+                kin_model::EntityDelta::Removed { old } => IntentScope::Entity(old.id),
             })
             .collect();
 
@@ -3463,58 +2964,23 @@ async fn command_commit(
         }
     }
 
-    if request.dry_run {
-        return Ok(Json(CommandCommitResponse {
-            change_id: "dry-run".to_string(),
-            branch: branch_name.to_string(),
-            entity_count,
-            relation_count,
-            file_count,
-        }));
-    }
-
-    // Create the semantic change.
-    let mut change = kin_model::SemanticChange {
-        id: kin_model::SemanticChangeId::from_hash(kin_model::Hash256::from_bytes([0; 32])),
-        parents: vec![branch.head],
-        author: kin_model::AuthorId::new(kin_core::whoami()),
-        message: request.message,
-        timestamp: kin_model::Timestamp::now(),
-        entity_deltas,
-        relation_deltas,
-        artifact_deltas,
-        projected_files: vec![],
-        spec_link: None,
-        evidence: vec![],
-        risk_summary: None,
-        authored_on: None,
-    };
-    change.id = kin_core::compute_semantic_change_id(&change).map_err(internal_error)?;
-
-    let change_id = change.id;
-
-    // `/commands/commit` constructs the change in-process, but it publishes
-    // through the same immutable graph authority as `/graph/commit`. Keep the
-    // exact-source gate identical across both entry points and run it before
-    // any change or branch mutation.
+    let committed = crate::repository_commit::commit_native_plan_with_projection(
+        &state.layout,
+        state.blobs.as_ref(),
+        &authority_context,
+        plan,
+    )
+    .map_err(repository_commit_error)?;
     state
-        .preflight_exact_source_change(graph, &change)
-        .map_err(internal_error)?;
-
-    graph.create_change(&change).map_err(internal_error)?;
+        .record_repository_authority_commit(committed.receipt.generation)
+        .map_err(repository_commit_error)?;
+    // The repository transaction is durable authority. The in-process graph is
+    // a derived query view; install the exact immutable change only after the
+    // authority CAS succeeds.
     graph
-        .update_branch_head(&branch_name, &change_id)
+        .create_change(&committed.change)
         .map_err(internal_error)?;
-
-    // Clear the working copy overlay — mutations are now committed.
-    let mut working_copy = state.working_copy.write().await;
-    working_copy.base_change = change_id;
-    working_copy.uncommitted_mutations = kin_model::GraphOverlay::default();
-    drop(working_copy);
-
-    // Broadcast events and mark dirty for background persistence.
     state.bump_version();
-    state.save_snapshot_full().map_err(internal_error)?;
     state.emit_event(DaemonEvent::GraphRootChanged {
         old_root_hash: None,
         new_root_hash: change_id.to_string(),
@@ -3529,231 +2995,20 @@ async fn command_commit(
     }))
 }
 
-// ── Branch Management ───────────────────────────────────────────────────
-
-#[derive(Debug, Deserialize)]
-struct CreateBranchRequest {
-    name: String,
-    head: String,
-}
-
-#[derive(Debug, Serialize)]
-struct BranchResponse {
-    name: String,
-    head: String,
-}
-
-async fn graph_list_branches(
-    State(state): State<Arc<DaemonState>>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
-    if !state
-        .is_initialized
-        .load(std::sync::atomic::Ordering::Relaxed)
-    {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "daemon not fully initialized".to_string(),
-        ));
-    }
-
-    let branches = state.graph.list_branches().map_err(internal_error)?;
-    let resp: Vec<BranchResponse> = branches
-        .into_iter()
-        .map(|b| BranchResponse {
-            name: b.name.to_string(),
-            head: b.head.to_string(),
-        })
-        .collect();
-
-    Ok((StatusCode::OK, Json(resp)))
-}
-
-async fn graph_create_branch(
-    State(state): State<Arc<DaemonState>>,
-    Json(request): Json<CreateBranchRequest>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
-    if !state
-        .is_initialized
-        .load(std::sync::atomic::Ordering::Relaxed)
-    {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "daemon not fully initialized".to_string(),
-        ));
-    }
-
-    use kin_model::{Branch, BranchName, Hash256, SemanticChangeId};
-
-    let _coordination = state.coordination_gate.lock().await;
-
-    let head_hash = Hash256::from_hex(&request.head).map_err(bad_request)?;
-    let head = SemanticChangeId::from_hash(head_hash);
-    if state
-        .graph
-        .get_change(&head)
-        .map_err(internal_error)?
-        .is_none()
-    {
-        return Err((
-            StatusCode::NOT_FOUND,
-            serde_json::json!({
-                "error": "branch_head_not_found",
-                "branch": request.name,
-                "head": head.to_string(),
-                "mutation_applied": false,
-                "message": "branch head must name an existing semantic change",
-            })
-            .to_string(),
-        ));
-    }
-    let branch = Branch {
-        name: BranchName::new(&request.name),
-        head,
+fn repository_commit_error(error: crate::error::DaemonError) -> (StatusCode, String) {
+    let status = match &error {
+        crate::error::DaemonError::Graph(kin_db::KinDbError::Model(
+            kin_model::ModelError::Conflict(_),
+        )) => StatusCode::CONFLICT,
+        crate::error::DaemonError::Graph(kin_db::KinDbError::Model(
+            kin_model::ModelError::InvalidOperation(_),
+        ))
+        | crate::error::DaemonError::Core(kin_core::KinError::Model(
+            kin_model::ModelError::InvalidOperation(_),
+        )) => StatusCode::BAD_REQUEST,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
-
-    state.graph.create_branch(&branch).map_err(internal_error)?;
-    state.bump_version();
-
-    Ok((
-        StatusCode::CREATED,
-        Json(serde_json::json!({ "status": "ok" })),
-    ))
-}
-
-async fn graph_delete_branch(
-    Path(name): Path<String>,
-    State(state): State<Arc<DaemonState>>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
-    if !state
-        .is_initialized
-        .load(std::sync::atomic::Ordering::Relaxed)
-    {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "daemon not fully initialized".to_string(),
-        ));
-    }
-
-    use kin_model::BranchName;
-    let _coordination = state.coordination_gate.lock().await;
-    state
-        .graph
-        .delete_branch(&BranchName::new(&name))
-        .map_err(internal_error)?;
-    state.bump_version();
-
-    Ok((StatusCode::OK, Json(serde_json::json!({ "status": "ok" }))))
-}
-
-#[derive(Debug, Deserialize)]
-struct UpdateBranchHeadRequest {
-    head: String,
-    expected_head: String,
-}
-
-async fn graph_update_branch_head_v1_retired(Path(name): Path<String>) -> impl IntoResponse {
-    (
-        StatusCode::GONE,
-        Json(serde_json::json!({
-            "error": "v1_branch_head_update_retired",
-            "branch": name,
-            "mutation_applied": false,
-            "message": "PUT branch head moved to /v2 and requires expected_head for atomic fast-forward CAS",
-        })),
-    )
-}
-
-async fn graph_update_branch_head(
-    Path(name): Path<String>,
-    State(state): State<Arc<DaemonState>>,
-    Json(request): Json<UpdateBranchHeadRequest>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
-    if !state
-        .is_initialized
-        .load(std::sync::atomic::Ordering::Relaxed)
-    {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "daemon not fully initialized".to_string(),
-        ));
-    }
-
-    use kin_model::{BranchName, Hash256, SemanticChangeId};
-
-    let head_hash = Hash256::from_hex(&request.head).map_err(bad_request)?;
-    let expected_head_hash = Hash256::from_hex(&request.expected_head).map_err(bad_request)?;
-    let branch_name = BranchName::new(&name);
-    let expected_head = SemanticChangeId::from_hash(expected_head_hash);
-    let _coordination = state.coordination_gate.lock().await;
-    let branch = state
-        .graph
-        .get_branch(&branch_name)
-        .map_err(internal_error)?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("branch '{name}' not found")))?;
-    if branch.head != expected_head {
-        return Err((
-            StatusCode::CONFLICT,
-            serde_json::json!({
-                "error": "stale_branch_head",
-                "branch": name,
-                "expected_head": expected_head.to_string(),
-                "actual_head": branch.head.to_string(),
-                "mutation_applied": false,
-                "message": "branch head changed before update",
-            })
-            .to_string(),
-        ));
-    }
-
-    let new_head = SemanticChangeId::from_hash(head_hash);
-    if state
-        .graph
-        .get_change(&new_head)
-        .map_err(internal_error)?
-        .is_none()
-    {
-        return Err((
-            StatusCode::NOT_FOUND,
-            serde_json::json!({
-                "error": "branch_head_not_found",
-                "branch": name,
-                "head": new_head.to_string(),
-                "mutation_applied": false,
-                "message": "branch head must name an existing semantic change",
-            })
-            .to_string(),
-        ));
-    }
-    let ancestry = kin_review::ref_graph::collect_ancestry(state.graph.as_ref(), &new_head)
-        .map_err(internal_error)?;
-    if !ancestry.contains(&expected_head) {
-        return Err((
-            StatusCode::CONFLICT,
-            serde_json::json!({
-                "error": "non_fast_forward_branch_update",
-                "branch": name,
-                "expected_head": expected_head.to_string(),
-                "new_head": new_head.to_string(),
-                "mutation_applied": false,
-                "message": "branch updates must advance to a descendant of the current head",
-            })
-            .to_string(),
-        ));
-    }
-
-    state
-        .graph
-        .update_branch_head(&branch_name, &new_head)
-        .map_err(internal_error)?;
-
-    // Broadcast root hash change. bump_version() marks dirty for background persistence.
-    state.bump_version();
-    state.emit_event(DaemonEvent::GraphRootChanged {
-        old_root_hash: None,
-        new_root_hash: request.head,
-    });
-
-    Ok((StatusCode::OK, Json(serde_json::json!({ "status": "ok" }))))
+    (status, error.to_string())
 }
 
 /// DELETE /session/{session_id} — end a session and release its intents.
@@ -4278,36 +3533,22 @@ async fn locate(
     let multi_query = variants.len() >= 2;
 
     let mut result = if let Some(reference) = req.reference.as_deref() {
-        // Explicit --ref always takes precedence over session scope.
-        // Locating at an unimported Git ref lazily imports its full ancestry;
-        // serialize that against every other daemon hydration. Already-imported
-        // refs skip the gate and stay on the fast path.
-        let _hydration_gate = if kin_cli::commands::ref_lookup::git_ref_requires_hydration(
+        // Explicit --ref always takes precedence over session scope. Ref
+        // resolution is a graph-only read; import and repair are explicit
+        // repository transactions.
+        let repository_authority = state
+            .local_repository_authority_binding()
+            .map_err(repository_authority_error)?;
+        let head = kin_cli::commands::ref_lookup::resolve_ref(
             state.graph.as_ref(),
-            reference,
-        ) {
-            Some(state.hydration_gate.lock().await)
-        } else {
-            None
-        };
-        let _graph_mutation = _hydration_gate
-            .as_ref()
-            .map(|_| state.begin_graph_authority_mutation());
-        let resolved = kin_cli::commands::ref_lookup::resolve_ref_importing_git_if_needed_for_locate_with_report(
-            state.graph.as_ref(),
-            &state.layout,
+            &repository_authority,
             Some(reference),
         )
         .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
-        if resolved.hydrated_git_history {
-            state.bump_version();
-            state.save_snapshot().map_err(internal_error)?;
-            state.mark_clean();
-        }
-        let head = resolved.head;
         if multi_query {
             run_multiquery_locate_at_ref(
                 &state,
+                &repository_authority,
                 &head,
                 reference,
                 &variants,
@@ -4319,7 +3560,7 @@ async fn locate(
             )
         } else {
             kin_cli::commands::locate::run_with_graph_capture_at_ref(
-                &state.layout,
+                &repository_authority,
                 state.graph.as_ref(),
                 state.blobs.as_ref(),
                 &head,
@@ -4401,15 +3642,24 @@ async fn run_fused_locate_for_state(
     max_files_explicit: bool,
     snippet_opts: kin_cli::commands::locate::SnippetOptions,
 ) -> Result<kin_cli::commands::locate::LocateResult, String> {
+    let repository_authority = state
+        .local_repository_authority_binding()
+        .map_err(|error| error.to_string())?;
     // When a session scope is active, discover historical test artifact
     // priority files to match the ref-scoped path's behavior.
-    let scope_ref_string = if let Some(sid) = session_id {
-        state
-            .get_session_scope(sid)
-            .await
-            .map(|(ref_str, _, _, _)| ref_str)
+    let session_scope = if let Some(sid) = session_id {
+        state.get_session_scope(sid).await
     } else {
         None
+    };
+    let scope_ref_string = session_scope
+        .as_ref()
+        .map(|(ref_str, _, _, _)| ref_str.clone());
+    // The scoped graph is a historical view; its source projection must resolve
+    // at the scoped head, not at the workspace head.
+    let source_scope = match session_scope.as_ref() {
+        Some((_, head, _, _)) => kin_mcp::handlers::common::EntitySourceScope::At(*head),
+        None => kin_mcp::handlers::common::EntitySourceScope::WorkspaceHead,
     };
     let extra_priority_files = scope_ref_string
         .as_deref()
@@ -4430,14 +3680,9 @@ async fn run_fused_locate_for_state(
     // only uses vector_source when the primary graph has no embeddings,
     // so there's no double-query.
     let vector_source = Some(state.graph.as_ref());
-    let workspace_root = if scope_ref_string.is_some() {
-        None
-    } else {
-        Some(kin_core::source_dir(&state.layout))
-    };
     kin_cli::commands::locate::run_with_graph_capture_with_priority_files_and_vector_source(
         graph,
-        workspace_root.as_deref(),
+        None,
         text,
         explain,
         max_files,
@@ -4445,6 +3690,8 @@ async fn run_fused_locate_for_state(
         extra_priority_files,
         vector_source,
         snippet_opts,
+        Some(&repository_authority),
+        source_scope,
     )
     .map_err(|error| error.to_string())
 }
@@ -4591,6 +3838,7 @@ async fn run_multiquery_fused_locate(
 #[allow(clippy::too_many_arguments)]
 fn run_multiquery_locate_at_ref(
     state: &Arc<DaemonState>,
+    repository_authority: &kin_core::LocalRepositoryAuthorityBinding,
     head: &kin_model::SemanticChangeId,
     reference: &str,
     variants: &[String],
@@ -4604,7 +3852,7 @@ fn run_multiquery_locate_at_ref(
     for (index, variant) in variants.iter().enumerate() {
         per_variant.push(
             kin_cli::commands::locate::run_with_graph_capture_at_ref(
-                &state.layout,
+                repository_authority,
                 state.graph.as_ref(),
                 state.blobs.as_ref(),
                 head,
@@ -4700,12 +3948,7 @@ async fn search(
         kin_cli::commands::search::collect_daemon_search_response(graph.as_ref(), &req)
             .map_err(internal_error)?;
     if req.show_body {
-        attach_search_bodies(
-            &state.layout,
-            graph.as_ref(),
-            &mut result,
-            req.body_limit.unwrap_or(10),
-        );
+        attach_search_bodies(&state, &mut result, req.body_limit.unwrap_or(10));
     }
     Ok(Json(result))
 }
@@ -4751,9 +3994,16 @@ async fn trace(
 
     let session_id = extract_session_id_from_headers(&headers)?;
     let graph = resolve_session_graph(&state, session_id.as_ref()).await;
-    let result =
-        kin_cli::commands::trace::build_trace_response(&state.layout, graph.as_ref(), &req)
-            .map_err(internal_error)?;
+    let repository_authority = state
+        .local_repository_authority_binding()
+        .map_err(repository_authority_error)?;
+    let result = kin_cli::commands::trace::build_trace_response(
+        &state.layout,
+        &repository_authority,
+        graph.as_ref(),
+        &req,
+    )
+    .map_err(internal_error)?;
     Ok(Json(result))
 }
 
@@ -4799,84 +4049,6 @@ async fn review(
     }
 
     let session_id = extract_session_id_from_headers(&headers)?;
-    let req = match req {
-        kin_cli::commands::review::ReviewRequest::Shadow {
-            base,
-            head,
-            title,
-            source_url,
-            author,
-            json,
-        } => {
-            // Scoped so the borrows of `base`/`head` end here and both can move
-            // into the blocking closure below.
-            let (graph, authority, hydration_gate) = {
-                let references = [base.as_str(), head.as_str()];
-                resolve_ref_hydration_graph(&state, session_id.as_ref(), &references).await
-            };
-            let graph_mutation = hydration_gate
-                .as_ref()
-                .map(|_| state.begin_graph_authority_mutation());
-            // Shadow review resolves both refs at full semantic depth, so the
-            // same synchronous multi-minute replay applies. Blocking pool, gate
-            // round-trips out for the drop below.
-            let (prepared, hydration_gate) = {
-                let prepare_state = Arc::clone(&state);
-                let prepare_graph = Arc::clone(&graph);
-                prepare_on_blocking_pool(hydration_gate, move || {
-                    kin_cli::commands::review::prepare_shadow_request(
-                        &prepare_state.layout,
-                        prepare_graph.as_ref(),
-                        base,
-                        head,
-                        title,
-                        source_url,
-                        author,
-                        json,
-                    )
-                })
-                .await?
-            };
-            let hydrated_changes = prepared.hydrated_changes();
-            ensure_ref_hydration_authority_is_current(
-                &state,
-                &graph,
-                authority,
-                session_id.as_ref(),
-                hydrated_changes,
-            )
-            .await?;
-            acknowledge_ref_hydration(
-                &state,
-                authority,
-                session_id.as_ref(),
-                hydrated_changes,
-                "review",
-                "review-hydration",
-            )?;
-            drop(graph_mutation);
-            drop(hydration_gate);
-
-            let response = kin_cli::commands::review::render_prepared_shadow_request(
-                graph.as_ref(),
-                prepared,
-            )
-            .map_err(|error| {
-                // The client response carries only the top-level context;
-                // record the full cause chain here so a shadow failure is
-                // diagnosable from the daemon log.
-                tracing::warn!(target: "kin_daemon::api", "shadow review render failed: {error:#}");
-                if kin_cli::commands::ref_lookup::is_ref_resolution_error(&error) {
-                    (StatusCode::BAD_REQUEST, format!("{error:#}"))
-                } else {
-                    internal_error(error)
-                }
-            })?;
-            return Ok(Json(response));
-        }
-        request => request,
-    };
-
     let mutates = matches!(
         req,
         kin_cli::commands::review::ReviewRequest::Create { .. }
@@ -4892,10 +4064,22 @@ async fn review(
     } else {
         resolve_session_graph(&state, session_id.as_ref()).await
     };
-    let execution =
-        kin_cli::commands::review::execute_review_request(&state.layout, graph.as_ref(), req)
-            .await
-            .map_err(internal_error)?;
+    let repository_authority = state
+        .local_repository_authority_binding()
+        .map_err(repository_authority_error)?;
+    let execution = kin_cli::commands::review::execute_review_request(
+        &repository_authority,
+        graph.as_ref(),
+        req,
+    )
+    .await
+    .map_err(|error| {
+        if kin_cli::commands::ref_lookup::is_ref_resolution_error(&error) {
+            (StatusCode::BAD_REQUEST, format!("{error:#}"))
+        } else {
+            internal_error(error)
+        }
+    })?;
     if execution.mutated {
         state.bump_version();
         state.emit_event(DaemonEvent::GraphRootChanged {
@@ -5045,11 +4229,10 @@ async fn embed(
             // this handler does its own pre/per-batch/post persistence, and a
             // full-graph flush per feed gap amplifies FS churn on large repos.
 
-            // Pin graph.kndb on disk at the current root hash H before embedding so
-            // the per-batch kvec flushes (which tag metadata with H) match on reopen.
-            // The vector index is a pure sidecar (not in the merkle root), so
-            // embedding never changes H; this only closes the mutated-but-unsaved
-            // window. Cost: one snapshot write up front.
+            // Finalize repository-v6 generation/read-index state before tagging
+            // vector metadata with the live graph root H. The vector index is a
+            // pure derived sidecar (not in the Merkle root), so embedding never
+            // changes H and can never create an alternate graph authority.
             // save_snapshot() acquires persist_lock internally; the non-reentrant std
             // Mutex self-deadlocks if we hold persist_lock across this call (this was
             // the daemon embed hang — the worker wedged here before embedding started).
@@ -5147,62 +4330,22 @@ async fn blame(
     }
 
     let session_id = extract_session_id_from_headers(&headers)?;
-    // Blaming at an unimported Git ref lazily imports its full ancestry;
-    // serialize that against every other daemon hydration. Already-imported (or
-    // absent) refs skip the gate and stay on the fast path.
-    let reference = req.reference.as_deref();
-    let (graph, authority, hydration_gate) =
-        resolve_ref_hydration_graph(&state, session_id.as_ref(), reference.as_slice()).await;
-    let graph_mutation = hydration_gate
-        .as_ref()
-        .map(|_| state.begin_graph_authority_mutation());
-    // Preparing resolves the ref, which hydrates a not-yet-imported ancestry at
-    // full semantic depth — minutes of synchronous replay. Run it on the
-    // blocking pool so it cannot park an async worker; the gate comes back out
-    // so it still drops below, after the authority check.
-    let (prepared, hydration_gate) = {
-        let prepare_state = Arc::clone(&state);
-        let prepare_graph = Arc::clone(&graph);
-        let prepare_req = req.clone();
-        prepare_on_blocking_pool(hydration_gate, move || {
-            kin_cli::commands::blame::prepare_blame_request(
-                &prepare_state.layout,
-                prepare_graph.as_ref(),
-                &prepare_req,
-            )
-        })
-        .await?
-    };
-    let prepared = prepared.map_err(internal_error)?;
-    let hydrated_changes = prepared.hydrated_changes();
-    ensure_ref_hydration_authority_is_current(
-        &state,
-        &graph,
-        authority,
-        session_id.as_ref(),
-        hydrated_changes,
+    let graph = resolve_session_graph(&state, session_id.as_ref()).await;
+    let repository_authority = state
+        .local_repository_authority_binding()
+        .map_err(repository_authority_error)?;
+    let response = kin_cli::commands::blame::execute_blame_request(
+        &repository_authority,
+        graph.as_ref(),
+        &req,
     )
-    .await?;
-    acknowledge_ref_hydration(
-        &state,
-        authority,
-        session_id.as_ref(),
-        hydrated_changes,
-        "blame",
-        "blame-hydration",
-    )?;
-    drop(graph_mutation);
-    drop(hydration_gate);
-
-    let response =
-        kin_cli::commands::blame::render_prepared_blame_request(graph.as_ref(), &req, prepared)
-            .map_err(|error| {
-                if kin_cli::commands::ref_lookup::is_ref_resolution_error(&error) {
-                    (StatusCode::BAD_REQUEST, format!("{error:#}"))
-                } else {
-                    internal_error(error)
-                }
-            })?;
+    .map_err(|error| {
+        if kin_cli::commands::ref_lookup::is_ref_resolution_error(&error) {
+            (StatusCode::BAD_REQUEST, format!("{error:#}"))
+        } else {
+            internal_error(error)
+        }
+    })?;
     Ok(Json(response))
 }
 
@@ -5223,67 +4366,24 @@ async fn history(
     }
 
     let session_id = extract_session_id_from_headers(&headers)?;
-    // History at an unimported Git ref lazily imports its full ancestry;
-    // serialize that against every other daemon hydration. Already-imported (or
-    // absent) refs skip the gate and stay on the fast path.
-    let reference = req.reference.as_deref();
-    let (graph, authority, hydration_gate) =
-        resolve_ref_hydration_graph(&state, session_id.as_ref(), reference.as_slice()).await;
-    let graph_mutation = hydration_gate
-        .as_ref()
-        .map(|_| state.begin_graph_authority_mutation());
-    // Same reasoning as blame: full-depth semantic hydration is synchronous and
-    // minutes long, so it runs on the blocking pool and the gate round-trips.
-    let (prepared, hydration_gate) = {
-        let prepare_state = Arc::clone(&state);
-        let prepare_graph = Arc::clone(&graph);
-        let prepare_req = req.clone();
-        prepare_on_blocking_pool(hydration_gate, move || {
-            kin_cli::commands::history::prepare_history_request(
-                &prepare_state.layout,
-                prepare_graph.as_ref(),
-                &prepare_req,
-            )
-        })
-        .await?
-    };
-    let prepared = prepared.map_err(internal_error)?;
-    let hydrated_changes = prepared.hydrated_changes();
-    ensure_ref_hydration_authority_is_current(
-        &state,
-        &graph,
-        authority,
-        session_id.as_ref(),
-        hydrated_changes,
+    let graph = resolve_session_graph(&state, session_id.as_ref()).await;
+    let repository_authority = state
+        .local_repository_authority_binding()
+        .map_err(repository_authority_error)?;
+    let response = kin_cli::commands::history::execute_history_request(
+        &repository_authority,
+        graph.as_ref(),
+        &req,
     )
-    .await?;
-    acknowledge_ref_hydration(
-        &state,
-        authority,
-        session_id.as_ref(),
-        hydrated_changes,
-        "history",
-        "history-hydration",
-    )?;
-    drop(graph_mutation);
-    drop(hydration_gate);
-
-    let response =
-        kin_cli::commands::history::render_prepared_history_request(graph.as_ref(), &req, prepared)
-            .map_err(|error| {
-                if kin_cli::commands::ref_lookup::is_ref_resolution_error(&error) {
-                    (StatusCode::BAD_REQUEST, format!("{error:#}"))
-                } else {
-                    internal_error(error)
-                }
-            })?;
+    .map_err(|error| {
+        if kin_cli::commands::ref_lookup::is_ref_resolution_error(&error) {
+            (StatusCode::BAD_REQUEST, format!("{error:#}"))
+        } else {
+            internal_error(error)
+        }
+    })?;
     Ok(Json(response))
 }
-
-/// Hold graph authority unstable for one logical writer transaction.
-///
-/// The guard deliberately spans durable acknowledgement as well as in-memory
-/// mutations so xref readers cannot certify an intermediate batch or a graph
 /// state whose generation has not yet been persisted.
 fn with_graph_authority_mutation<T>(state: &DaemonState, operation: impl FnOnce() -> T) -> T {
     let mutation = state.begin_graph_authority_mutation();
@@ -5313,10 +4413,14 @@ async fn verify_run(
     let _coordination = state.coordination_gate.lock().await;
 
     let state_for_verify = Arc::clone(&state);
+    let repository_authority = state
+        .local_repository_authority_binding()
+        .map_err(repository_authority_error)?;
     let response = tokio::task::spawn_blocking(move || {
         with_graph_authority_mutation(state_for_verify.as_ref(), || {
             let response = kin_cli::commands::verify::execute_verify_run(
                 &state_for_verify.layout,
+                &repository_authority,
                 state_for_verify.graph.as_ref(),
                 &req,
             )
@@ -5350,8 +4454,11 @@ async fn command_verify(
         ));
     }
 
+    let repository_authority = state
+        .local_repository_authority_binding()
+        .map_err(repository_authority_error)?;
     let response = kin_cli::commands::verify::execute_verify_command(
-        &state.layout,
+        &repository_authority,
         state.graph.as_ref(),
         &req,
     )
@@ -5359,107 +4466,29 @@ async fn command_verify(
     Ok(Json(response))
 }
 
-/// POST /reconcile — reconcile a session workspace into daemon-owned graph state.
-async fn reconcile(
-    State(state): State<Arc<DaemonState>>,
-    headers: axum::http::HeaderMap,
-    Json(req): Json<kin_cli::commands::reconcile::ReconcileRequest>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
-    if !state
-        .is_initialized
-        .load(std::sync::atomic::Ordering::Relaxed)
-    {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "daemon not fully initialized".to_string(),
-        ));
-    }
-
-    if state.filesystem_reconcile_disabled() {
-        return Err((
-            StatusCode::CONFLICT,
-            format!(
-                "filesystem reconcile is disabled by {}; remote graph authority cannot ingest a session checkout",
-                crate::loop_runner::DISABLE_FILESYSTEM_RECONCILE_ENV
-            ),
-        ));
-    }
-
-    let session_id = extract_session_id_from_headers(&headers)?;
-    let state_for_reconcile = Arc::clone(&state);
-
-    let summary = if let Some(sid) = session_id {
-        // Resolve the session's PRIVATE scoped graph for this write. A scoped
-        // reconcile mutates this graph in place without persisting (session
-        // edits are ephemeral and isolated from HEAD). It must therefore never
-        // fall back to the shared HEAD graph: doing so would leak the edits
-        // into every other session and diverge in-memory HEAD from the durable
-        // snapshot while the generation marker still reads clean.
-        let scoped_graph = match state_for_reconcile.scoped_graph_for_write(&sid).await {
-            Some(graph) => graph,
-            None => {
-                return Err((
-                    StatusCode::CONFLICT,
-                    format!(
-                        "no active temporal scope for session {sid}; \
-                         POST /session/{{id}}/scope before reconcile"
-                    ),
-                ));
-            }
-        };
-        tokio::task::spawn_blocking(move || {
-            with_graph_authority_mutation(state_for_reconcile.as_ref(), || {
-                kin_cli::commands::reconcile::execute_reconcile_session_dir_scoped(
-                    &state_for_reconcile.layout,
-                    scoped_graph.as_ref(),
-                    &req.session_dir,
-                )
-                .map_err(|error| error.to_string())
-            })
-        })
-        .await
-        .map_err(internal_error)?
-        .map_err(internal_error)?
-    } else {
-        tokio::task::spawn_blocking(move || {
-            with_graph_authority_mutation(state_for_reconcile.as_ref(), || {
-                kin_cli::commands::reconcile::execute_reconcile_session_dir_with_persist(
-                    &state_for_reconcile.layout,
-                    state_for_reconcile.graph.as_ref(),
-                    &req.session_dir,
-                    || {
-                        state_for_reconcile.bump_version();
-                        state_for_reconcile.save_snapshot().map_err(|error| {
-                            std::io::Error::new(std::io::ErrorKind::Other, error.to_string())
-                        })?;
-                        state_for_reconcile.mark_clean();
-                        Ok(())
-                    },
-                )
-                .map_err(|error| error.to_string())
-            })
-        })
-        .await
-        .map_err(internal_error)?
-        .map_err(internal_error)?
-    };
-    Ok(Json(summary))
-}
-
 fn attach_search_bodies(
-    layout: &kin_core::KinLayout,
-    graph: &kin_db::InMemoryGraph,
+    state: &DaemonState,
     response: &mut kin_cli::commands::search::DaemonSearchResponse,
     max_lines: usize,
 ) {
-    let Some((blob_store, tree)) = search_body_source_from_graph(layout, graph) else {
+    let Ok(authority) = ActiveApiRepositoryAuthority::open(state) else {
+        return;
+    };
+    let lease = authority.manager.read_authority();
+    let Some(workspace) = lease
+        .metadata()
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.workspace_id == authority.workspace_id)
+    else {
         return;
     };
     for record in &mut response.records {
         let kin_cli::commands::search::DaemonSearchRecord::Entity(entity) = record else {
             continue;
         };
-        if let Some((body, omitted)) = search_body_from_graph(&blob_store, &tree, entity, max_lines)
+        if let Some((body, omitted)) =
+            search_body_from_authority(&authority.manager, workspace, entity, max_lines)
         {
             entity.body = Some(body);
             entity.body_omitted_line_count = omitted;
@@ -5467,33 +4496,17 @@ fn attach_search_bodies(
     }
 }
 
-fn search_body_source_from_graph(
-    layout: &kin_core::KinLayout,
-    graph: &kin_db::InMemoryGraph,
-) -> Option<(
-    kin_blobs::BlobStore,
-    HashMap<kin_model::FilePathId, kin_model::Hash256>,
-)> {
-    let branch_name = kin_core::read_current_branch(layout).ok()?;
-    let branch = graph.get_branch(&branch_name).ok()??;
-    let genesis = kin_core::build_genesis_change();
-    let tree = kin_core::build_file_tree(graph, &genesis.id, &branch.head).ok()?;
-    let blob_store = kin_blobs::BlobStore::new(layout.objects_dir()).ok()?;
-    Some((blob_store, tree))
-}
-
-fn search_body_from_graph(
-    blob_store: &kin_blobs::BlobStore,
-    tree: &HashMap<kin_model::FilePathId, kin_model::Hash256>,
+fn search_body_from_authority(
+    manager: &RepositoryAuthorityManager<LocalFileBackend>,
+    workspace: &kin_model::WorkspaceState,
     entity: &kin_cli::commands::search::DaemonSearchEntityRecord,
     max_lines: usize,
 ) -> Option<(String, usize)> {
     let rel_path = entity.file.as_deref()?;
-    let file_id = safe_graph_relative_file_id(rel_path)?;
-    let hash = tree.get(&file_id)?;
-    let bytes = blob_store
-        .read(&kin_blobs::Hash256(*hash.as_bytes()))
-        .ok()?;
+    let path = RepoPath::from_utf8(rel_path.to_string()).ok()?;
+    let artifact = workspace.tree.artifact_at_path(&path)?;
+    let digest = artifact.entry.blob_identity()?;
+    let bytes = manager.load_source_blob(digest).ok()??;
     let start = entity.start_byte?.min(bytes.len());
     let end = entity.end_byte?.min(bytes.len());
     if start >= end {
@@ -5507,18 +4520,6 @@ fn search_body_from_graph(
     }
     let shown = lines.len().min(max_lines.max(1));
     Some((lines[..shown].join("\n"), lines.len().saturating_sub(shown)))
-}
-
-fn safe_graph_relative_file_id(rel_path: &str) -> Option<kin_model::FilePathId> {
-    let rel = FsPath::new(rel_path);
-    if rel.is_absolute()
-        || rel
-            .components()
-            .any(|component| matches!(component, Component::ParentDir))
-    {
-        return None;
-    }
-    Some(kin_model::FilePathId::new(rel_path))
 }
 
 /// GET /support — return graph observability from daemon-owned graph state.
@@ -5538,8 +4539,12 @@ async fn support(
 
     let session_id = extract_session_id_from_headers(&headers)?;
     let graph = resolve_session_graph(&state, session_id.as_ref()).await;
-    let result = kin_cli::commands::support::inspect_support_graph(&state.layout, graph.as_ref())
-        .map_err(internal_error)?;
+    let repository_authority = state
+        .local_repository_authority_binding()
+        .map_err(repository_authority_error)?;
+    let result =
+        kin_cli::commands::support::inspect_support_graph(&repository_authority, graph.as_ref())
+            .map_err(internal_error)?;
     Ok(Json(result))
 }
 
@@ -5587,9 +4592,9 @@ fn mcp_tool_mutates_graph(name: &str) -> bool {
             | "kin_review_discuss_resolve"
             | "kin_review_assign"
             | "kin_review_unassign"
-            // Commit applies staged entity/relation deltas via
-            // apply_transaction_delta, so it must run against the canonical
-            // mutable graph — never a session's read-only temporal-scope view.
+            // Commit publishes one repository-v6 semantic/tree/ref transaction,
+            // then installs that receipt into the canonical derived graph. It
+            // must never run against a session's read-only temporal view.
             | "kin_transaction_commit"
     )
 }
@@ -5653,80 +4658,6 @@ fn forget_mcp_transaction(state: &DaemonState, transaction_id: &str) {
     // Keep the durable mirror in step with the in-memory eviction so a
     // committed/aborted transaction does not reappear after a restart.
     crate::state::write_persisted_mcp_transactions(&state.layout, &store);
-}
-
-/// Collect the current graph state of all entities referenced in a commit
-/// transaction's staged operations.  Called immediately before the commit is
-/// applied so the returned entities carry the source-span metadata set by the
-/// last reconcile — the information
-/// [`project_after_mcp_commit`](crate::projection_wiring::project_after_mcp_commit)
-/// needs to splice the mutation back into the working-directory files.
-///
-/// Only entity operations are projected (relations and blobs have no file span).
-/// Entities not yet in the graph (new creates staged for the first time) are
-/// silently omitted — they have no span, so
-/// `project_after_mcp_commit` would skip them anyway.
-fn collect_pre_commit_entities(
-    state: &DaemonState,
-    sessions: &kin_mcp::SessionRegistry,
-    arguments: &HashMap<String, serde_json::Value>,
-) -> (
-    Vec<kin_model::Entity>,
-    HashMap<kin_model::EntityId, Vec<u8>>,
-) {
-    let Some(tx_id) = arguments
-        .get("transaction_id")
-        .and_then(serde_json::Value::as_str)
-    else {
-        return (vec![], HashMap::new());
-    };
-    let Some(transaction) = sessions.get_transaction(tx_id) else {
-        return (vec![], HashMap::new());
-    };
-
-    // Operations may arrive pre-staged on the transaction or inline on the
-    // commit call itself; both are applied by the commit, so both must be
-    // projected. Mirrors the merge in `transaction_coordination_context`.
-    let mut staged = transaction.staged_operations;
-    if let Some(inline) = arguments.get("operations") {
-        if let Ok(mut parsed) =
-            serde_json::from_value::<Vec<kin_mcp::McpMutationOperation>>(inline.clone())
-        {
-            staged.append(&mut parsed);
-        }
-    }
-
-    let mut entities = Vec::new();
-    let mut supplied_bodies: HashMap<kin_model::EntityId, Vec<u8>> = HashMap::new();
-    for op in &staged {
-        if kin_mcp::session::is_target_body_update(op) {
-            if let Ok(existing) =
-                kin_mcp::handlers::sessions::resolve_target_entity(state.graph.as_ref(), &op.target)
-            {
-                if let Some(body) = op.body.as_ref() {
-                    supplied_bodies.insert(existing.id, body.clone().into_bytes());
-                }
-                entities.push(existing);
-            }
-            continue;
-        }
-        let Some(kin_mcp::McpMutationPayload::Entity(payload_entity)) = op.payload.as_ref() else {
-            continue;
-        };
-        // Capture the agent-supplied new source text (if present) keyed
-        // by entity id, so the post-commit projection writes it to the working
-        // file instead of re-splicing the file's own bytes (an identity no-op).
-        if let Some(body) = op.body.as_ref() {
-            supplied_bodies.insert(payload_entity.id, body.clone().into_bytes());
-        }
-        // Look up the pre-commit entity from the graph — it carries the span
-        // set by the last reconcile.  The agent's staged payload may not have
-        // span metadata (agents do not know file placement).
-        if let Ok(Some(graph_entity)) = state.graph.get_entity(&payload_entity.id) {
-            entities.push(graph_entity);
-        }
-    }
-    (entities, supplied_bodies)
 }
 
 fn transaction_coordination_context(
@@ -6021,7 +4952,10 @@ fn fused_match_evidence(
 /// `snippet` is a bounded inline body excerpt (entity granularity only),
 /// projected from graph-owned content via the same body projection
 /// `get_entity_source` uses, so one `semantic_locate` is act-on-able without a
-/// follow-up read; omitted on a graph gap or when `include_snippet` is false.
+/// follow-up read. A graph/tree/blob authority gap fails the tool call instead
+/// of returning an apparently complete hit without its graph-owned body;
+/// snippets are omitted only when `include_snippet` is false or a hit has no
+/// entity body.
 /// Max entity pages retained for a single `semantic_locate` ranking. Bounds the
 /// per-query snippet/projection work while still letting a cursor walk well past
 /// the first page.
@@ -6085,6 +5019,7 @@ fn build_semantic_locate_result(
     state: &DaemonState,
     graph: &kin_db::InMemoryGraph,
     arguments: &HashMap<String, serde_json::Value>,
+    source_scope: kin_mcp::handlers::common::EntitySourceScope,
 ) -> kin_mcp::ToolCallResult {
     let query = match arguments.get("query").and_then(serde_json::Value::as_str) {
         Some(value) if !value.trim().is_empty() => value.to_string(),
@@ -6128,6 +5063,14 @@ fn build_semantic_locate_result(
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(true)
         && !file_granularity;
+    let repository_authority = if include_snippet {
+        match require_mcp_local_repository_authority(state) {
+            Ok(binding) => Some(binding),
+            Err(error) => return kin_mcp::ToolCallResult::error(error.to_string()),
+        }
+    } else {
+        None
+    };
 
     let graph_version = state.vfs_version.load(std::sync::atomic::Ordering::SeqCst);
     let granularity_token = format!("sem:{}", if file_granularity { "file" } else { "entity" });
@@ -6281,10 +5224,24 @@ fn build_semantic_locate_result(
         }
 
         // Project the bounded snippet from graph-owned content — no working-tree
-        // read; a graph gap yields no snippet rather than a fallback.
+        // read and no silent graph-gap downgrade.
         let snippet = if include_snippet {
             if let kin_db::ResolvedRetrievalItem::Entity(entity) = &item {
-                kin_mcp::handlers::common::read_bounded_entity_snippet(graph, entity)
+                match kin_mcp::handlers::common::read_bounded_entity_snippet(
+                    graph,
+                    entity,
+                    repository_authority.as_ref(),
+                    source_scope,
+                ) {
+                    Ok(snippet) => snippet,
+                    Err(error) => {
+                        return kin_mcp::ToolCallResult::error(format!(
+                            "semantic_locate could not read graph-owned source for entity {}: \
+                             {error}",
+                            entity.id
+                        ));
+                    }
+                }
             } else {
                 None
             }
@@ -6726,9 +5683,13 @@ async fn mcp_tools_call(
                 "missing required parameter: entity_id".to_string(),
             )));
         };
+        let repository_authority = match require_mcp_local_repository_authority(&state) {
+            Ok(binding) => binding,
+            Err(error) => return Ok(Json(kin_mcp::ToolCallResult::error(error.to_string()))),
+        };
         let result =
             entity_source_tool_result(kin_cli::commands::graph::build_entity_source_outcome(
-                &state.layout,
+                &repository_authority,
                 graph.as_ref(),
                 entity_id,
             ));
@@ -6745,13 +5706,17 @@ async fn mcp_tools_call(
             Ok(parsed) => parsed,
             Err(error) => return Ok(Json(kin_mcp::ToolCallResult::error(error.to_string()))),
         };
+        let repository_authority = match require_mcp_local_repository_authority(&state) {
+            Ok(binding) => binding,
+            Err(error) => return Ok(Json(kin_mcp::ToolCallResult::error(error.to_string()))),
+        };
         let resolved = entity_ids
             .iter()
             .map(|entity_id| {
                 resolved_entity_source_from_outcome(
                     entity_id,
                     kin_cli::commands::graph::build_entity_source_outcome(
-                        &state.layout,
+                        &repository_authority,
                         graph.as_ref(),
                         entity_id,
                     ),
@@ -6808,8 +5773,12 @@ async fn mcp_tools_call(
             direction: parsed_direction,
             limit_per_step,
         };
+        let repository_authority = match require_mcp_local_repository_authority(&state) {
+            Ok(binding) => binding,
+            Err(error) => return Ok(Json(kin_mcp::ToolCallResult::error(error.to_string()))),
+        };
         let result = match kin_cli::commands::trace_data_flow::build_trace_data_flow_response(
-            &state.layout,
+            &repository_authority,
             graph.as_ref(),
             &req,
         ) {
@@ -6926,6 +5895,7 @@ async fn mcp_tools_call(
             &state,
             graph.as_ref(),
             &request.arguments,
+            resolve_session_source_scope(&state, session_id.as_ref()).await,
         )));
     }
 
@@ -7032,16 +6002,6 @@ async fn mcp_tools_call(
         })
         .unwrap_or_default();
 
-    // Snapshot entity state before the commit so we can project the
-    // mutations into working-directory files after the graph is updated.
-    // Entities without a span (new creates, relation-only ops) are included but
-    // silently skipped by project_after_mcp_commit.
-    let (pre_commit_entities, supplied_bodies) = if request.name == "kin_transaction_commit" {
-        collect_pre_commit_entities(&state, &sessions, &request.arguments)
-    } else {
-        (vec![], HashMap::new())
-    };
-
     if request.name == "kin_transaction_commit" && transaction_id.is_some() {
         persist_coordination_reservation(
             &state,
@@ -7073,7 +6033,7 @@ async fn mcp_tools_call(
     }
 
     let graph_mutation = mutates.then(|| state.begin_graph_authority_mutation());
-    let mut result = if transaction_preflight
+    let result = if transaction_preflight
         .as_ref()
         .is_some_and(|preflight| !preflight.allowed)
     {
@@ -7084,9 +6044,10 @@ async fn mcp_tools_call(
         )
         .map_err(internal_error)?;
         kin_mcp::ToolCallResult::error(format!(
-            "coordination enforcement rejected transaction before graph apply: {evidence}"
+            "coordination enforcement rejected transaction before repository publication: {evidence}"
         ))
     } else {
+        let repository_authority = mcp_repository_authority_binding(&state);
         let handled = if request.name == "find_references" {
             mcp_find_references_with_stable_authority(
                 &state,
@@ -7107,15 +6068,28 @@ async fn mcp_tools_call(
                 |_| {},
             )
             .await
-        } else {
-            kin_mcp::handlers::handle_tool_call(
-                &request.name,
-                &request.arguments,
-                graph.as_ref(),
+        } else if request.name == "kin_transaction_commit" {
+            Ok(crate::mcp_commit::commit_exact_transaction(
+                &state,
                 &sessions,
-                kin_mcp::SessionAuthorityMode::OfflineFallback,
-            )
-            .await
+                &request.arguments,
+                transaction_preflight.as_ref(),
+            ))
+        } else {
+            match repository_authority {
+                Ok(repository_authority) => {
+                    kin_mcp::handlers::handle_tool_call(
+                        &request.name,
+                        &request.arguments,
+                        graph.as_ref(),
+                        &sessions,
+                        kin_mcp::SessionAuthorityMode::OfflineFallback,
+                        repository_authority.as_ref(),
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
+            }
         };
         match handled {
             Ok(result) => result,
@@ -7140,14 +6114,20 @@ async fn mcp_tools_call(
         let coordination_rejected = transaction_preflight
             .as_ref()
             .is_some_and(|preflight| !preflight.allowed);
+        let receipt_recovery_pending = transaction_id
+            .as_deref()
+            .and_then(|transaction_id| sessions.get_transaction(transaction_id))
+            .is_some_and(|transaction| transaction.state == "committing");
         persist_coordination_event(
             &state,
             CoordinationEventDraft {
                 event: "transaction_outcome",
                 outcome: if coordination_rejected {
-                    "coordination_rejected_before_graph_apply"
+                    "coordination_rejected_before_repository_apply"
+                } else if receipt_recovery_pending {
+                    "repository_receipt_recovery_pending"
                 } else {
-                    "commit_failed_before_graph_apply"
+                    "commit_failed_before_repository_apply"
                 }
                 .to_string(),
                 session_id: transaction_session_id.clone(),
@@ -7183,108 +6163,7 @@ async fn mcp_tools_call(
         });
     }
 
-    // Project entity mutations into working-directory files (so the next
-    // reconcile does not silently clobber the graph — file-wins LWW) and enrich
-    // the commit response with what the commit actually did.
-    //
-    // The graph commit has already landed and the version counter already
-    // reflects it above.  A projection failure does NOT roll back the graph —
-    // the agent's intent is preserved and the caller is told loudly so it can
-    // retry or inspect the source file.
-    //
-    // Conflicts (skip-conflicted semantics): entities where a
-    // concurrent human file edit was detected are NOT projected; the commit is
-    // surfaced as an error so the agent can resolve.
     if request.name == "kin_transaction_commit" && result.is_error != Some(true) {
-        // The real graph Merkle root, now that the delta has landed.
-        let new_root_hash = hex::encode(state.graph.compute_root_hash());
-
-        let (modified_files, collision_warnings) = if pre_commit_entities.is_empty() {
-            // Relation-only / new-entity / zero-op commit: nothing to project.
-            (Vec::new(), Vec::new())
-        } else {
-            match crate::projection_wiring::project_after_mcp_commit(
-                &state,
-                &pre_commit_entities,
-                &supplied_bodies,
-            )
-            .await
-            {
-                Err(proj_err) => {
-                    persist_coordination_event(
-                        &state,
-                        CoordinationEventDraft {
-                            event: "transaction_outcome",
-                            outcome: "projection_failed_after_graph_apply".to_string(),
-                            session_id: transaction_session_id.clone(),
-                            intent_id: None,
-                            intent_ids: transaction_intent_ids.clone(),
-                            transaction_id: transaction_id.clone(),
-                            scopes: transaction_scope_labels.clone(),
-                            enforcement_mode: transaction_preflight
-                                .as_ref()
-                                .map(|preflight| preflight.mode.as_str())
-                                .unwrap_or_else(|| state.coordination_mode().as_str())
-                                .to_string(),
-                            blocking_intent_ids: Vec::new(),
-                        },
-                    )?;
-                    return Ok(Json(kin_mcp::ToolCallResult::error(format!(
-                        "graph commit succeeded but file projection failed — agent intent is \
-                         preserved in the graph; retry projection or inspect the source file. \
-                         Detail: {proj_err}"
-                    ))));
-                }
-                Ok((_modified, _warnings, conflicts)) if !conflicts.is_empty() => {
-                    // Some entities were skipped due to concurrent file edits.
-                    // Surface each conflict loudly so the agent can resolve.
-                    let conflict_msgs: Vec<String> = conflicts
-                        .iter()
-                        .map(|c| {
-                            format!(
-                                "conflict on {}: {}",
-                                c.affected_files
-                                    .first()
-                                    .map(|f| f.to_string())
-                                    .unwrap_or_else(|| "<unknown file>".into()),
-                                c.divergence_reason
-                            )
-                        })
-                        .collect();
-                    persist_coordination_event(
-                        &state,
-                        CoordinationEventDraft {
-                            event: "transaction_outcome",
-                            outcome: "projection_conflict_after_graph_apply".to_string(),
-                            session_id: transaction_session_id.clone(),
-                            intent_id: None,
-                            intent_ids: transaction_intent_ids.clone(),
-                            transaction_id: transaction_id.clone(),
-                            scopes: transaction_scope_labels.clone(),
-                            enforcement_mode: transaction_preflight
-                                .as_ref()
-                                .map(|preflight| preflight.mode.as_str())
-                                .unwrap_or_else(|| state.coordination_mode().as_str())
-                                .to_string(),
-                            blocking_intent_ids: Vec::new(),
-                        },
-                    )?;
-                    return Ok(Json(kin_mcp::ToolCallResult::error(format!(
-                        "graph commit succeeded but {n} entity/entities had concurrent file \
-                         edits — those entities were NOT projected (human edits preserved). \
-                         Resolve conflicts and retry. Details: {details}",
-                        n = conflicts.len(),
-                        details = conflict_msgs.join("; "),
-                    ))));
-                }
-                Ok((modified, warnings, _conflicts)) => (modified, warnings),
-            }
-        };
-
-        // Fold the projection outcome and root hash into the success
-        // response so a commit reports what it did instead of an opaque
-        // "committed". `ops_applied`/`empty` already rode in from the handler.
-        result = enrich_commit_result(result, &new_root_hash, &modified_files, &collision_warnings);
         persist_coordination_event(
             &state,
             CoordinationEventDraft {
@@ -7318,57 +6197,321 @@ async fn mcp_tools_call(
     Ok(Json(result))
 }
 
-/// Enrich a successful `kin_transaction_commit` text result with the
-/// post-commit graph root hash and the graph→file projection outcome.
-///
-/// The base handler returns `{transaction_id, state, status, ops_applied,
-/// empty}`; this adds `new_root_hash`, `modified_files`, `collision_warnings`,
-/// and `conflicts: []` (a non-empty conflict set is surfaced as an error by the
-/// caller, so the success path always reports an empty conflicts list). Errors
-/// and non-JSON payloads pass through untouched.
-fn enrich_commit_result(
-    result: kin_mcp::ToolCallResult,
-    new_root_hash: &str,
-    modified_files: &[FilePathId],
-    collision_warnings: &[kin_model::IntentSummary],
-) -> kin_mcp::ToolCallResult {
-    if result.is_error == Some(true) {
-        return result;
-    }
-    let Some(kin_mcp::ContentBlock::Text { text }) = result.content.first() else {
-        return result;
-    };
-    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(text) else {
-        return result;
-    };
-    let Some(map) = value.as_object_mut() else {
-        return result;
-    };
-    map.insert("new_root_hash".into(), serde_json::json!(new_root_hash));
-    map.insert(
-        "modified_files".into(),
-        serde_json::json!(modified_files
-            .iter()
-            .map(|f| f.to_string())
-            .collect::<Vec<_>>()),
-    );
-    map.insert(
-        "collision_warnings".into(),
-        serde_json::to_value(collision_warnings).unwrap_or_else(|_| serde_json::json!([])),
-    );
-    map.insert("conflicts".into(), serde_json::json!([]));
-
-    match serde_json::to_string_pretty(&value) {
-        Ok(json) => kin_mcp::ToolCallResult::text(json),
-        Err(_) => kin_mcp::ToolCallResult::error(
-            "commit succeeded but response serialization failed".to_string(),
-        ),
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Multi-repo endpoints — list and query lazily-loaded repo graphs
 // ---------------------------------------------------------------------------
+
+async fn repository_authority_snapshot(
+    state: &DaemonState,
+    repo_id: &str,
+) -> Result<kin_db::GraphSnapshot, (StatusCode, String)> {
+    if repo_id == state.cached_repo_id {
+        let authority = ActiveApiRepositoryAuthority::open(state)?;
+        return Ok(authority.manager.read_authority().snapshot().clone());
+    }
+
+    let graph = state
+        .get_repo_graph(repo_id)
+        .await
+        .map_err(internal_error)?;
+    let snapshot = graph.to_snapshot();
+    let metadata = snapshot.repository_authority.as_ref().ok_or_else(|| {
+        (
+            StatusCode::FAILED_DEPENDENCY,
+            format!("repository {repo_id} has no repository-v6 authority envelope"),
+        )
+    })?;
+    if metadata.repository_id.as_str() != repo_id {
+        return Err((
+            StatusCode::FAILED_DEPENDENCY,
+            format!(
+                "requested repository {repo_id} but durable authority belongs to {}",
+                metadata.repository_id
+            ),
+        ));
+    }
+    metadata
+        .validate_against_snapshot(&snapshot)
+        .map_err(repository_authority_error)?;
+    Ok(snapshot)
+}
+
+fn repository_metadata(
+    snapshot: &kin_db::GraphSnapshot,
+) -> Result<&kin_db::PersistedRepositoryAuthority, (StatusCode, String)> {
+    snapshot.repository_authority.as_ref().ok_or_else(|| {
+        (
+            StatusCode::FAILED_DEPENDENCY,
+            "snapshot has no repository-v6 authority envelope".to_string(),
+        )
+    })
+}
+
+fn resolve_repository_ref_target(
+    snapshot: &kin_db::GraphSnapshot,
+    target: &kin_model::RefTarget,
+) -> Result<kin_model::SemanticChangeId, (StatusCode, String)> {
+    let metadata = repository_metadata(snapshot)?;
+    let mut target = target.clone();
+    let mut seen = HashSet::new();
+    loop {
+        match target {
+            kin_model::RefTarget::Change { change_id } => return Ok(change_id),
+            kin_model::RefTarget::ExternalObject { object }
+                if object.kind == kin_model::ExternalObjectKind::Commit =>
+            {
+                return metadata
+                    .aliases
+                    .iter()
+                    .find(|alias| alias.oid == object.oid)
+                    .map(|alias| alias.change_id)
+                    .ok_or_else(|| {
+                        (
+                            StatusCode::FAILED_DEPENDENCY,
+                            format!(
+                                "external commit {} has no repository-v6 semantic alias",
+                                object.oid
+                            ),
+                        )
+                    });
+            }
+            kin_model::RefTarget::ExternalObject { object } => {
+                return Err((
+                    StatusCode::FAILED_DEPENDENCY,
+                    format!(
+                        "repository ref targets external {:?} {}; exact history requires a materializable commit target",
+                        object.kind, object.oid
+                    ),
+                ));
+            }
+            kin_model::RefTarget::Symbolic { target: name } => {
+                if !seen.insert(name.clone()) {
+                    return Err((
+                        StatusCode::FAILED_DEPENDENCY,
+                        format!("repository ref cycle reaches {name}"),
+                    ));
+                }
+                target = metadata
+                    .ref_state
+                    .refs
+                    .iter()
+                    .find(|repository_ref| repository_ref.name == name)
+                    .map(|repository_ref| repository_ref.target.clone())
+                    .ok_or_else(|| {
+                        (
+                            StatusCode::FAILED_DEPENDENCY,
+                            format!("symbolic repository ref target {name} is missing"),
+                        )
+                    })?;
+            }
+        }
+    }
+}
+
+fn default_repository_ref(
+    metadata: &kin_db::PersistedRepositoryAuthority,
+) -> Option<&kin_model::RepositoryRef> {
+    metadata
+        .ref_state
+        .default_ref
+        .as_ref()
+        .and_then(|name| {
+            metadata
+                .ref_state
+                .refs
+                .iter()
+                .find(|repository_ref| &repository_ref.name == name)
+        })
+        .or_else(|| {
+            metadata
+                .ref_state
+                .refs
+                .iter()
+                .find(|repository_ref| repository_ref.name.is_branch())
+        })
+        .or_else(|| metadata.ref_state.refs.first())
+}
+
+fn repository_tree_at(
+    snapshot: kin_db::GraphSnapshot,
+    change_id: &kin_model::SemanticChangeId,
+) -> Result<kin_model::ResolvedTree, (StatusCode, String)> {
+    let root_hash = kin_db::compute_graph_root_hash(&snapshot);
+    let graph =
+        kin_db::InMemoryGraph::from_snapshot_without_text_index_with_root_hash(snapshot, root_hash)
+            .map_err(repository_authority_error)?;
+    graph
+        .resolve_tree_at(change_id)
+        .map_err(repository_authority_error)
+}
+
+fn short_ref_name(name: &kin_model::RefName) -> String {
+    let bytes = name.as_bytes();
+    for prefix in [b"refs/heads/".as_slice(), b"refs/tags/".as_slice()] {
+        if let Some(short) = bytes.strip_prefix(prefix) {
+            return String::from_utf8_lossy(short).into_owned();
+        }
+    }
+    name.to_string()
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RepositoryTransferStatusRequest {
+    destination_ref: kin_model::RefName,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RepositoryTransferExportRequest {
+    source_ref: kin_model::RefName,
+    expectation: kin_remote::repository_transfer::RepositoryTransferExpectation,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RepositoryTransferReceiveRequest {
+    destination_ref: kin_model::RefName,
+    pack: kin_remote::repository_transfer::RepositoryTransferPack,
+}
+
+fn repository_transfer_authority(
+    state: &DaemonState,
+    repo_id: &str,
+) -> Result<(RepositoryId, RepositoryAuthorityManager<dyn StorageBackend>), (StatusCode, String)> {
+    if let Some(allowed) = &state.allowed_repo_ids {
+        if !allowed.contains(repo_id) {
+            return Err((
+                StatusCode::NOT_FOUND,
+                format!("repository {repo_id} is not admitted by this daemon"),
+            ));
+        }
+    }
+    let repository_id = RepositoryId::new(repo_id.to_string()).map_err(|error| {
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("invalid repository identity: {error}"),
+        )
+    })?;
+    let backend: Arc<dyn StorageBackend> = if let Some(backend) = &state.storage_backend {
+        Arc::clone(backend)
+    } else if repo_id == state.cached_repo_id {
+        state.local_repository_backend().ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "local daemon is missing its startup storage capability".to_string(),
+            )
+        })?
+    } else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("repository {repo_id} is unavailable in local daemon mode"),
+        ));
+    };
+    let authority = RepositoryAuthorityManager::open(repository_id.clone(), backend)
+        .map_err(repository_authority_error)?;
+    Ok((repository_id, authority))
+}
+
+fn repository_transfer_error(
+    error: kin_remote::repository_transfer::RepositoryTransferError,
+) -> (StatusCode, String) {
+    use kin_remote::repository_transfer::RepositoryTransferError;
+    let status = match error {
+        RepositoryTransferError::Invalid(_) => StatusCode::UNPROCESSABLE_ENTITY,
+        RepositoryTransferError::Conflict(_) => StatusCode::CONFLICT,
+        RepositoryTransferError::Storage(_) => StatusCode::FAILED_DEPENDENCY,
+    };
+    (status, error.to_string())
+}
+
+/// POST /repos/{repo_id}/transfer/status — exact destination lease and
+/// negotiated repository-v6 transfer capability.
+async fn repo_transfer_status(
+    Path(repo_id): Path<String>,
+    State(state): State<Arc<DaemonState>>,
+    Json(request): Json<RepositoryTransferStatusRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let (repository_id, authority) = repository_transfer_authority(&state, &repo_id)?;
+    let status = kin_remote::repository_transfer::repository_transfer_status(
+        &authority,
+        &repository_id,
+        &request.destination_ref,
+    )
+    .map_err(repository_transfer_error)?;
+    Ok(Json(status))
+}
+
+/// POST /repos/{repo_id}/transfer/export — build a pull/push pack from one
+/// coherent source authority lease and immutable CAS.
+async fn repo_transfer_export(
+    Path(repo_id): Path<String>,
+    State(state): State<Arc<DaemonState>>,
+    Json(request): Json<RepositoryTransferExportRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let (repository_id, authority) = repository_transfer_authority(&state, &repo_id)?;
+    if request.expectation.repository_id != repository_id {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!(
+                "transfer expectation belongs to {}, not route repository {}",
+                request.expectation.repository_id, repository_id
+            ),
+        ));
+    }
+    let pack = kin_remote::repository_transfer::build_repository_transfer_pack(
+        &authority,
+        &request.source_ref,
+        &request.expectation,
+    )
+    .map_err(repository_transfer_error)?;
+    Ok(Json(pack))
+}
+
+/// POST /repos/{repo_id}/transfer/receive — validate and publish one exact
+/// fast-forward repository transaction. Actor provenance is the authenticated
+/// daemon/control-plane receiver itself; no caller-provided actor field exists
+/// on this authority payload.
+async fn repo_transfer_receive(
+    Path(repo_id): Path<String>,
+    State(state): State<Arc<DaemonState>>,
+    Json(request): Json<RepositoryTransferReceiveRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let (repository_id, authority) = repository_transfer_authority(&state, &repo_id)?;
+    let receipt = kin_remote::repository_transfer::apply_repository_transfer_pack(
+        &authority,
+        &repository_id,
+        &request.destination_ref,
+        kin_model::AuthorId::new("kin-daemon:repository-transfer-receiver"),
+        &request.pack,
+    )
+    .map_err(repository_transfer_error)?;
+
+    // Repository authority is already durable. Refresh only derived daemon
+    // views after that receipt exists; a failure here cannot revoke or fake
+    // the committed transfer.
+    if state.storage_backend.is_some() {
+        state.repo_graphs.write().await.remove(&repo_id);
+    } else if receipt.outcome
+        == kin_remote::repository_transfer::RepositoryTransferApplyOutcome::Committed
+    {
+        // An idempotent replay already updated these derived local views on
+        // the original request. Reapplying them would make the receipt path
+        // spuriously fail after authority had correctly returned its replay.
+        state
+            .record_repository_authority_commit(receipt.authority_receipt.generation)
+            .map_err(repository_commit_error)?;
+        for change in &request.pack.changes {
+            state.graph.create_change(change).map_err(internal_error)?;
+        }
+        state.bump_version();
+        state.emit_event(DaemonEvent::GraphRootChanged {
+            old_root_hash: None,
+            new_root_hash: request.pack.source_head.to_string(),
+        });
+    }
+    Ok(Json(receipt))
+}
 
 /// GET /repos — list all repos available in storage.
 ///
@@ -7449,112 +6592,137 @@ async fn repo_entities(
     }))
 }
 
-/// GET /repos/{repo_id}/files — list projected file paths for a specific repo.
+/// GET /repos/{repo_id}/files — list the default ref's exact repository tree.
 async fn repo_files(
     Path(repo_id): Path<String>,
     State(state): State<Arc<DaemonState>>,
 ) -> std::result::Result<impl IntoResponse, (StatusCode, String)> {
-    let graph = state
-        .get_repo_graph(&repo_id)
-        .await
-        .map_err(internal_error)?;
-    let mut files = graph.indexed_file_paths();
-    files.sort();
-    Ok(Json(RepoFilesResponse {
-        repo_id,
-        files: files
-            .into_iter()
-            .map(|path| RepoFileEntry { path })
-            .collect(),
-    }))
+    let snapshot = repository_authority_snapshot(&state, &repo_id).await?;
+    let metadata = repository_metadata(&snapshot)?;
+    let files = if let Some(repository_ref) = default_repository_ref(metadata) {
+        let change_id = resolve_repository_ref_target(&snapshot, &repository_ref.target)?;
+        repository_tree_at(snapshot, &change_id)?
+            .into_artifacts()
+            .map(|artifact| RepoFileEntry {
+                display_path: artifact.path.as_utf8().map(ToOwned::to_owned),
+                path: artifact.path,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    Ok(Json(RepoFilesResponse { repo_id, files }))
 }
 
-/// GET /repos/{repo_id}/refs — list semantic branch refs for a specific repo.
+/// GET /repos/{repo_id}/refs — list repository-v6 refs.
 async fn repo_refs(
     Path(repo_id): Path<String>,
     State(state): State<Arc<DaemonState>>,
 ) -> std::result::Result<impl IntoResponse, (StatusCode, String)> {
-    let graph = state
-        .get_repo_graph(&repo_id)
-        .await
-        .map_err(internal_error)?;
-    let branches = sorted_branches(graph.as_ref())?;
-    let default_branch_name = select_default_branch_name(&branches);
-    let selected_branch = select_default_branch(&branches);
-    let selected_head = selected_branch
-        .as_ref()
-        .map(|branch| branch.head.to_string());
-    let refs = branches
-        .into_iter()
-        .map(|branch| {
-            let name = branch.name.to_string();
-            let commit_id = branch.head.to_string();
+    let snapshot = repository_authority_snapshot(&state, &repo_id).await?;
+    let metadata = repository_metadata(&snapshot)?;
+    let default_name = metadata.ref_state.default_ref.clone();
+    let workspace_head = metadata.workspaces.iter().find_map(|workspace| {
+        if let kin_model::WorkspaceHead::Symbolic { target } = &workspace.head {
+            Some(target.clone())
+        } else {
+            None
+        }
+    });
+    let selected = default_repository_ref(metadata);
+    let selected_head = selected.map(|repository_ref| match &repository_ref.target {
+        kin_model::RefTarget::Change { change_id } => change_id.to_string(),
+        kin_model::RefTarget::ExternalObject { object } => object.oid.to_string(),
+        kin_model::RefTarget::Symbolic { target } => target.to_string(),
+    });
+    let refs = metadata
+        .ref_state
+        .refs
+        .iter()
+        .map(|repository_ref| {
+            let name = repository_ref.name.to_string();
+            let commit_id = match &repository_ref.target {
+                kin_model::RefTarget::Change { change_id } => change_id.to_string(),
+                kin_model::RefTarget::ExternalObject { object } => object.oid.to_string(),
+                kin_model::RefTarget::Symbolic { target } => target.to_string(),
+            };
             RepoRefEntry {
-                short_name: name.clone(),
+                short_name: short_ref_name(&repository_ref.name),
                 name,
-                kind: "branch".to_string(),
+                kind: if repository_ref.name.is_branch() {
+                    "branch"
+                } else if repository_ref.name.is_tag() {
+                    "tag"
+                } else {
+                    "ref"
+                }
+                .to_string(),
                 short_commit_id: short_change_id(&commit_id),
                 commit_id,
-                is_head: selected_head
+                is_head: workspace_head
                     .as_ref()
-                    .map(|head| head == &branch.head.to_string())
-                    .unwrap_or(false),
-                is_default_branch: default_branch_name
+                    .is_some_and(|head| head == &repository_ref.name),
+                is_default_branch: default_name
                     .as_ref()
-                    .map(|default_name| default_name == &branch.name.to_string())
-                    .unwrap_or(false),
+                    .is_some_and(|default| default == &repository_ref.name),
             }
         })
         .collect();
+    let default_branch = default_name.as_ref().map(short_ref_name);
     Ok(Json(RepoRefsResponse {
         repo_id,
-        branch_name: default_branch_name.clone(),
-        default_branch: default_branch_name,
+        branch_name: workspace_head
+            .as_ref()
+            .map(short_ref_name)
+            .or_else(|| default_branch.clone()),
+        default_branch,
         head_ref: selected_head,
         refs,
     }))
 }
 
-/// GET /repos/{repo_id}/history — list semantic history for the selected branch.
+/// GET /repos/{repo_id}/history — first-parent history of the default ref.
 async fn repo_history(
     Path(repo_id): Path<String>,
     State(state): State<Arc<DaemonState>>,
 ) -> std::result::Result<impl IntoResponse, (StatusCode, String)> {
-    let graph = state
-        .get_repo_graph(&repo_id)
-        .await
-        .map_err(internal_error)?;
-    let branches = sorted_branches(graph.as_ref())?;
-    let selected_branch = select_default_branch(&branches);
-    let Some(branch) = selected_branch else {
+    let snapshot = repository_authority_snapshot(&state, &repo_id).await?;
+    let metadata = repository_metadata(&snapshot)?;
+    let Some(repository_ref) = default_repository_ref(metadata) else {
         return Ok(Json(RepoHistoryResponse {
             repo_id,
-            branch_name: None,
+            branch_name: metadata.ref_state.default_ref.as_ref().map(short_ref_name),
             baseline_ref: None,
             head_ref: None,
             commits: Vec::new(),
         }));
     };
-
+    let head = resolve_repository_ref_target(&snapshot, &repository_ref.target)?;
     let mut commits = Vec::new();
     let mut seen = HashSet::new();
-    let mut current = Some(branch.head.clone());
+    let mut current = Some(head);
     while let Some(change_id) = current {
-        if !seen.insert(change_id.clone()) {
-            break;
+        if !seen.insert(change_id) {
+            return Err((
+                StatusCode::FAILED_DEPENDENCY,
+                format!("repository-v6 history contains a cycle at {change_id}"),
+            ));
         }
-        let Some(change) = graph.get_change(&change_id).map_err(internal_error)? else {
-            break;
-        };
+        let change = snapshot.changes.get(&change_id).ok_or_else(|| {
+            (
+                StatusCode::FAILED_DEPENDENCY,
+                format!("repository-v6 ref history references missing change {change_id}"),
+            )
+        })?;
         let commit_id = change.id.to_string();
         commits.push(RepoHistoryEntry {
             short_commit_id: short_change_id(&commit_id),
             commit_id,
             author: change.author.to_string(),
             authored_at: change.timestamp.to_string(),
-            subject: change.message,
+            subject: change.message.clone(),
         });
-        current = change.parents.first().cloned();
+        current = change.parents.first().copied();
         if commits.len() >= 50 {
             break;
         }
@@ -7562,31 +6730,11 @@ async fn repo_history(
 
     Ok(Json(RepoHistoryResponse {
         repo_id,
-        branch_name: Some(branch.name.to_string()),
+        branch_name: Some(short_ref_name(&repository_ref.name)),
         baseline_ref: None,
-        head_ref: Some(branch.head.to_string()),
+        head_ref: Some(head.to_string()),
         commits,
     }))
-}
-
-fn sorted_branches(
-    graph: &kin_db::InMemoryGraph,
-) -> std::result::Result<Vec<kin_model::Branch>, (StatusCode, String)> {
-    let mut branches = graph.list_branches().map_err(internal_error)?;
-    branches.sort_by(|left, right| left.name.0.cmp(&right.name.0));
-    Ok(branches)
-}
-
-fn select_default_branch_name(branches: &[kin_model::Branch]) -> Option<String> {
-    select_default_branch(branches).map(|branch| branch.name.to_string())
-}
-
-fn select_default_branch(branches: &[kin_model::Branch]) -> Option<kin_model::Branch> {
-    branches
-        .iter()
-        .find(|branch| branch.name.0 == "main")
-        .cloned()
-        .or_else(|| branches.first().cloned())
 }
 
 fn short_change_id(value: &str) -> String {
@@ -7765,668 +6913,54 @@ async fn repo_provenance_verify(
 }
 
 // ---------------------------------------------------------------------------
-// Compare endpoint — arbitrary ref pairs, entity-level conflicts, merge sim
-// ---------------------------------------------------------------------------
-
-/// Query parameters for the compare endpoint.
-#[derive(Debug, Deserialize)]
-struct RepoCompareQuery {
-    #[serde(default)]
-    left: Option<String>,
-    #[serde(default)]
-    right: Option<String>,
-    #[serde(default)]
-    base: Option<String>,
-    #[serde(default)]
-    head: Option<String>,
-    #[serde(default)]
-    simulate_merge: bool,
-}
-
-/// Compare response payload.
-#[derive(Debug, Serialize)]
-pub struct RepoCompareResponsePayload {
-    pub repo_id: String,
-    pub base_ref: String,
-    pub head_ref: String,
-    pub merge_base_ref: Option<String>,
-    pub ahead: usize,
-    pub behind: usize,
-    pub files: Vec<CompareFileEntry>,
-    pub conflicts: Vec<EntityConflict>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub merge_simulation: Option<MergeSimulation>,
-}
-
-/// A file entry in the compare result.
-#[derive(Debug, Serialize)]
-pub struct CompareFileEntry {
-    pub path: String,
-    pub status: String,
-}
-
-/// Entity-level conflict detail for overlapping changes.
-#[derive(Debug, Serialize)]
-pub struct EntityConflict {
-    pub file: String,
-    pub entity_id: String,
-    pub entity_name: String,
-    pub left_version: EntityVersion,
-    pub right_version: EntityVersion,
-}
-
-/// Snapshot of an entity at a particular side of the comparison.
-#[derive(Debug, Serialize)]
-pub struct EntityVersion {
-    pub change_type: String,
-    pub signature: String,
-    pub fingerprint: String,
-}
-
-/// Result of a simulated 3-way merge.
-#[derive(Debug, Serialize)]
-pub struct MergeSimulation {
-    pub can_auto_merge: bool,
-    pub clean_merges: usize,
-    pub auto_resolvable_conflicts: usize,
-    pub manual_conflicts: usize,
-    pub details: Vec<MergeDetail>,
-}
-
-/// Per-entity merge simulation detail.
-#[derive(Debug, Serialize)]
-pub struct MergeDetail {
-    pub entity_id: String,
-    pub entity_name: String,
-    pub file: String,
-    pub resolution: String,
-}
-
-/// Resolve an arbitrary ref string to a SemanticChangeId.
-///
-/// Accepts: branch name, full commit hash (hex), or special refs like `HEAD~N`.
-fn resolve_ref(
-    graph: &kin_db::InMemoryGraph,
-    ref_str: &str,
-) -> std::result::Result<kin_model::SemanticChangeId, (StatusCode, String)> {
-    if let Some(suffix) = ref_str.strip_prefix("HEAD") {
-        let branches = sorted_branches(graph)?;
-        let branch = select_default_branch(&branches).ok_or_else(|| {
-            (
-                StatusCode::BAD_REQUEST,
-                "No branch found for HEAD".to_string(),
-            )
-        })?;
-        let mut current = branch.head;
-        if let Some(tilde_part) = suffix.strip_prefix('~') {
-            let n: usize = tilde_part.parse().map_err(|_| {
-                (
-                    StatusCode::BAD_REQUEST,
-                    format!("Invalid HEAD~N syntax: {ref_str}"),
-                )
-            })?;
-            for _ in 0..n {
-                let change = graph
-                    .get_change(&current)
-                    .map_err(internal_error)?
-                    .ok_or_else(|| {
-                        (
-                            StatusCode::NOT_FOUND,
-                            format!("Change {current} not found in history"),
-                        )
-                    })?;
-                current = change.parents.first().cloned().ok_or_else(|| {
-                    (
-                        StatusCode::BAD_REQUEST,
-                        format!("HEAD~{n} exceeds history depth"),
-                    )
-                })?;
-            }
-        } else if !suffix.is_empty() {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                format!("Unknown ref syntax: {ref_str}"),
-            ));
-        }
-        return Ok(current);
-    }
-
-    // Try as branch name
-    if let Some(branch) = graph
-        .get_branch(&BranchName::new(ref_str))
-        .map_err(internal_error)?
-    {
-        return Ok(branch.head);
-    }
-
-    // Try as hex commit hash
-    if let Ok(hash) = kin_model::Hash256::from_hex(ref_str) {
-        let change_id = kin_model::SemanticChangeId::from_hash(hash);
-        if graph
-            .get_change(&change_id)
-            .map_err(internal_error)?
-            .is_some()
-        {
-            return Ok(change_id);
-        }
-    }
-
-    Err((
-        StatusCode::BAD_REQUEST,
-        format!("Cannot resolve ref: {ref_str}"),
-    ))
-}
-
-/// Collect which files each side touched.
-fn collect_changed_files(
-    left_changes: &[kin_model::SemanticChange],
-    right_changes: &[kin_model::SemanticChange],
-) -> Vec<CompareFileEntry> {
-    let mut file_statuses: HashMap<String, String> = HashMap::new();
-
-    for change in left_changes.iter().chain(right_changes.iter()) {
-        for file in &change.projected_files {
-            file_statuses
-                .entry(file.0.clone())
-                .or_insert_with(|| "modified".to_string());
-        }
-        for delta in &change.entity_deltas {
-            let path = match delta {
-                kin_model::EntityDelta::Added(e) => e.file_origin.as_ref().map(|f| f.0.clone()),
-                kin_model::EntityDelta::Modified { new, .. } => {
-                    new.file_origin.as_ref().map(|f| f.0.clone())
-                }
-                kin_model::EntityDelta::Removed(_) => None,
-            };
-            if let Some(p) = path {
-                file_statuses
-                    .entry(p)
-                    .or_insert_with(|| "modified".to_string());
-            }
-        }
-        for delta in &change.entity_deltas {
-            if let kin_model::EntityDelta::Added(e) = delta {
-                if let Some(ref f) = e.file_origin {
-                    file_statuses.insert(f.0.clone(), "added".to_string());
-                }
-            }
-        }
-    }
-
-    let mut files: Vec<CompareFileEntry> = file_statuses
-        .into_iter()
-        .map(|(path, status)| CompareFileEntry { path, status })
-        .collect();
-    files.sort_by(|a, b| a.path.cmp(&b.path));
-    files
-}
-
-fn extract_entity_deltas(
-    changes: &[kin_model::SemanticChange],
-    out: &mut HashMap<String, (kin_model::EntityDelta, String)>,
-) {
-    for change in changes {
-        for delta in &change.entity_deltas {
-            let (id, file) = match delta {
-                kin_model::EntityDelta::Added(e) => (
-                    e.id.to_string(),
-                    e.file_origin
-                        .as_ref()
-                        .map(|f| f.0.clone())
-                        .unwrap_or_default(),
-                ),
-                kin_model::EntityDelta::Modified { new, .. } => (
-                    new.id.to_string(),
-                    new.file_origin
-                        .as_ref()
-                        .map(|f| f.0.clone())
-                        .unwrap_or_default(),
-                ),
-                kin_model::EntityDelta::Removed(id) => (id.to_string(), String::new()),
-            };
-            out.insert(id, (delta.clone(), file));
-        }
-    }
-}
-
-/// Detect entity-level conflicts: entities modified on both sides since the merge base.
-fn detect_entity_conflicts(
-    left_changes: &[kin_model::SemanticChange],
-    right_changes: &[kin_model::SemanticChange],
-) -> Vec<EntityConflict> {
-    let mut left_entities: HashMap<String, (kin_model::EntityDelta, String)> = HashMap::new();
-    let mut right_entities: HashMap<String, (kin_model::EntityDelta, String)> = HashMap::new();
-
-    extract_entity_deltas(left_changes, &mut left_entities);
-    extract_entity_deltas(right_changes, &mut right_entities);
-
-    let mut conflicts = Vec::new();
-    for (entity_id, (left_delta, file)) in &left_entities {
-        if let Some((right_delta, _)) = right_entities.get(entity_id) {
-            let left_ver = entity_version_from_delta(left_delta);
-            let right_ver = entity_version_from_delta(right_delta);
-            let name = entity_name_from_delta(left_delta);
-            conflicts.push(EntityConflict {
-                file: file.clone(),
-                entity_id: entity_id.clone(),
-                entity_name: name,
-                left_version: left_ver,
-                right_version: right_ver,
-            });
-        }
-    }
-    conflicts.sort_by(|a, b| a.file.cmp(&b.file).then(a.entity_name.cmp(&b.entity_name)));
-    conflicts
-}
-
-fn entity_version_from_delta(delta: &kin_model::EntityDelta) -> EntityVersion {
-    match delta {
-        kin_model::EntityDelta::Added(e) => EntityVersion {
-            change_type: "added".to_string(),
-            signature: e.signature.clone(),
-            fingerprint: format!("{:?}", e.fingerprint.ast_hash),
-        },
-        kin_model::EntityDelta::Modified { new, .. } => EntityVersion {
-            change_type: "modified".to_string(),
-            signature: new.signature.clone(),
-            fingerprint: format!("{:?}", new.fingerprint.ast_hash),
-        },
-        kin_model::EntityDelta::Removed(id) => EntityVersion {
-            change_type: "removed".to_string(),
-            signature: String::new(),
-            fingerprint: id.to_string(),
-        },
-    }
-}
-
-fn entity_name_from_delta(delta: &kin_model::EntityDelta) -> String {
-    match delta {
-        kin_model::EntityDelta::Added(e) => e.name.clone(),
-        kin_model::EntityDelta::Modified { new, .. } => new.name.clone(),
-        kin_model::EntityDelta::Removed(id) => id.to_string(),
-    }
-}
-
-/// Simulate a 3-way merge: compare entity deltas from both sides against the merge base.
-fn simulate_merge(
-    left_changes: &[kin_model::SemanticChange],
-    right_changes: &[kin_model::SemanticChange],
-) -> MergeSimulation {
-    let mut left_entities: HashMap<String, (kin_model::EntityDelta, String)> = HashMap::new();
-    let mut right_entities: HashMap<String, (kin_model::EntityDelta, String)> = HashMap::new();
-
-    extract_entity_deltas(left_changes, &mut left_entities);
-    extract_entity_deltas(right_changes, &mut right_entities);
-
-    let mut clean_merges: usize = 0;
-    let mut auto_resolvable: usize = 0;
-    let mut manual_conflicts: usize = 0;
-    let mut details = Vec::new();
-
-    let all_ids: HashSet<String> = left_entities
-        .keys()
-        .chain(right_entities.keys())
-        .cloned()
-        .collect();
-    for entity_id in &all_ids {
-        let in_left = left_entities.get(entity_id);
-        let in_right = right_entities.get(entity_id);
-        match (in_left, in_right) {
-            (Some((delta, file)), None) | (None, Some((delta, file))) => {
-                clean_merges += 1;
-                details.push(MergeDetail {
-                    entity_id: entity_id.clone(),
-                    entity_name: entity_name_from_delta(delta),
-                    file: file.clone(),
-                    resolution: "clean".to_string(),
-                });
-            }
-            (Some((left_delta, file)), Some((right_delta, _))) => {
-                let left_fp = entity_version_from_delta(left_delta).fingerprint;
-                let right_fp = entity_version_from_delta(right_delta).fingerprint;
-                if left_fp == right_fp {
-                    auto_resolvable += 1;
-                    details.push(MergeDetail {
-                        entity_id: entity_id.clone(),
-                        entity_name: entity_name_from_delta(left_delta),
-                        file: file.clone(),
-                        resolution: "auto_resolved".to_string(),
-                    });
-                } else {
-                    manual_conflicts += 1;
-                    details.push(MergeDetail {
-                        entity_id: entity_id.clone(),
-                        entity_name: entity_name_from_delta(left_delta),
-                        file: file.clone(),
-                        resolution: "manual_conflict".to_string(),
-                    });
-                }
-            }
-            (None, None) => unreachable!(),
-        }
-    }
-
-    details.sort_by(|a, b| a.file.cmp(&b.file).then(a.entity_name.cmp(&b.entity_name)));
-    MergeSimulation {
-        can_auto_merge: manual_conflicts == 0,
-        clean_merges,
-        auto_resolvable_conflicts: auto_resolvable,
-        manual_conflicts,
-        details,
-    }
-}
-
-/// GET /repos/{repo_id}/compare — compare arbitrary ref pairs with entity-level conflict detail.
-async fn repo_compare(
-    Path(repo_id): Path<String>,
-    Query(params): Query<RepoCompareQuery>,
-    State(state): State<Arc<DaemonState>>,
-) -> std::result::Result<impl IntoResponse, (StatusCode, String)> {
-    let graph = state
-        .get_repo_graph(&repo_id)
-        .await
-        .map_err(internal_error)?;
-
-    let left_ref_str = params.left.or(params.base).ok_or_else(|| {
-        (
-            StatusCode::BAD_REQUEST,
-            "Missing required query param: base (or left)".to_string(),
-        )
-    })?;
-    let right_ref_str = params.right.or(params.head).ok_or_else(|| {
-        (
-            StatusCode::BAD_REQUEST,
-            "Missing required query param: head (or right)".to_string(),
-        )
-    })?;
-
-    let left_id = resolve_ref(&graph, &left_ref_str)?;
-    let right_id = resolve_ref(&graph, &right_ref_str)?;
-
-    let merge_bases = graph
-        .find_merge_bases(&left_id, &right_id)
-        .map_err(internal_error)?;
-    let merge_base = merge_bases.first().cloned();
-    let merge_base_ref = merge_base.as_ref().map(|id| id.to_string());
-
-    let left_changes = if let Some(ref base) = merge_base {
-        graph
-            .get_changes_since(base, &left_id)
-            .map_err(internal_error)?
-    } else {
-        Vec::new()
-    };
-
-    let right_changes = if let Some(ref base) = merge_base {
-        graph
-            .get_changes_since(base, &right_id)
-            .map_err(internal_error)?
-    } else {
-        Vec::new()
-    };
-
-    let ahead = right_changes.len();
-    let behind = left_changes.len();
-
-    let files = collect_changed_files(&left_changes, &right_changes);
-    let conflicts = detect_entity_conflicts(&left_changes, &right_changes);
-
-    let merge_simulation = if params.simulate_merge {
-        Some(simulate_merge(&left_changes, &right_changes))
-    } else {
-        None
-    };
-
-    Ok(Json(RepoCompareResponsePayload {
-        repo_id,
-        base_ref: left_id.to_string(),
-        head_ref: right_id.to_string(),
-        merge_base_ref,
-        ahead,
-        behind,
-        files,
-        conflicts,
-        merge_simulation,
-    }))
-}
-
-// ---------------------------------------------------------------------------
 // VFS endpoints — serve the committed file tree and blob content
 // ---------------------------------------------------------------------------
 
-/// Resolve the genesis ID and current branch head for the active branch.
+/// Load one complete repository-v6 workspace projection.
 ///
-/// Returns `Ok(None)` when no branch exists yet.
-fn resolve_branch_head(
+/// The manager constructs the wire snapshot from one authority lease and
+/// verifies every blob/symlink body against repository-owned immutable CAS.
+fn active_workspace_tree(
     state: &DaemonState,
-) -> Result<Option<(kin_model::SemanticChangeId, kin_model::SemanticChangeId)>, (StatusCode, String)>
-{
-    let genesis = kin_core::build_genesis_change();
-    let genesis_id = genesis.id;
-
-    let current_branch = kin_core::read_current_branch(&state.layout).ok();
-
-    let head = state
-        .graph
-        .get_branch(current_branch.as_ref().unwrap_or(&BranchName::new("main")))
-        .map_err(internal_error)?
-        .map(|b| b.head)
-        .or_else(|| {
-            state
-                .graph
-                .get_branch(&BranchName::new("main"))
-                .ok()
-                .flatten()
-                .map(|b| b.head)
-        })
-        .or_else(|| {
-            state
-                .graph
-                .list_branches()
-                .ok()
-                .and_then(|branches| branches.into_iter().next().map(|b| b.head))
-        });
-
-    match head {
-        Some(head_id) => Ok(Some((genesis_id, head_id))),
-        None => Ok(None),
-    }
+) -> Result<(ActiveApiRepositoryAuthority, WorkspaceTreeSnapshot), (StatusCode, String)> {
+    let authority = ActiveApiRepositoryAuthority::open(state)?;
+    let snapshot = authority.workspace_tree_snapshot()?;
+    Ok((authority, snapshot))
 }
 
-/// Capture an exact VFS cache key without straddling a graph-version change.
-fn current_vfs_cache_key(state: &DaemonState) -> Result<VfsTreeCacheKey, (StatusCode, String)> {
-    for _ in 0..8 {
-        let version_before = state.vfs_version.load(std::sync::atomic::Ordering::SeqCst);
-        let head = resolve_branch_head(state)?.map(|(_, head)| head);
-        let version_after = state.vfs_version.load(std::sync::atomic::Ordering::SeqCst);
-        if version_before == version_after {
-            return Ok(VfsTreeCacheKey {
-                head,
-                version: version_after,
-            });
-        }
-    }
-    Err((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "graph changed repeatedly while resolving the VFS snapshot key; retry".to_string(),
-    ))
-}
-
-/// Materialize one committed VFS snapshot for an already-captured graph key.
-fn build_vfs_tree_snapshot(
-    state: &DaemonState,
-    key: VfsTreeCacheKey,
-) -> Result<VfsTreeSnapshot, (StatusCode, String)> {
-    let Some(head_id) = key.head.clone() else {
-        return Ok(VfsTreeSnapshot {
-            key,
-            files: Arc::new(HashMap::new()),
-            timestamps: Arc::new(HashMap::new()),
-        });
-    };
-    let genesis_id = kin_core::build_genesis_change().id;
-    let changes = state
-        .graph
-        .get_changes_since(&genesis_id, &head_id)
-        .map_err(internal_error)?;
-
-    let mut files: HashMap<FilePathId, kin_model::Hash256> = HashMap::new();
-    let mut timestamps: HashMap<FilePathId, u64> = HashMap::new();
-    for change in &changes {
-        let epoch_secs = change.timestamp.0.timestamp() as u64;
-        for delta in &change.artifact_deltas {
-            if delta.kind.is_removed() {
-                files.remove(&delta.file_id);
-                timestamps.remove(&delta.file_id);
-            } else {
-                if let Some(hash) = delta.new_hash {
-                    files.insert(delta.file_id.clone(), hash);
-                }
-                timestamps.insert(delta.file_id.clone(), epoch_secs);
-            }
-        }
-    }
-
-    #[cfg(test)]
-    {
-        state
-            .vfs_tree_build_count
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let hook = state
-            .vfs_tree_build_test_hook
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        if let Some(hook) = hook {
-            hook.materialized.wait();
-            hook.resume.wait();
-        }
-    }
-
-    Ok(VfsTreeSnapshot {
-        key,
-        files: Arc::new(files),
-        timestamps: Arc::new(timestamps),
-    })
-}
-
-/// Return the graph-derived VFS snapshot for the exact current head/version.
-///
-/// Cache misses build on the blocking pool. The key is checked again after the build and under
-/// the cache write lock, so a concurrent head change can never publish or return a stale view.
-async fn current_vfs_snapshot(
-    state: &Arc<DaemonState>,
-) -> Result<Arc<VfsTreeSnapshot>, (StatusCode, String)> {
-    for _ in 0..8 {
-        let mut key = current_vfs_cache_key(state)?;
-        if let Some(snapshot) = read_recover(&state.vfs_tree_cache).as_ref() {
-            if snapshot.key == key {
-                return Ok(Arc::clone(snapshot));
-            }
-        }
-
-        // Serialize cold fills, then recheck both graph identity and the cache. All waiters for
-        // one head/version reuse the first fill instead of replaying the DAG independently.
-        let _build_guard = state.vfs_tree_build_lock.lock().await;
-        key = current_vfs_cache_key(state)?;
-        if let Some(snapshot) = read_recover(&state.vfs_tree_cache).as_ref() {
-            if snapshot.key == key {
-                return Ok(Arc::clone(snapshot));
-            }
-        }
-
-        let build_state = Arc::clone(state);
-        let build_key = key.clone();
-        let snapshot =
-            tokio::task::spawn_blocking(move || build_vfs_tree_snapshot(&build_state, build_key))
-                .await
-                .map_err(|error| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("VFS snapshot build task failed: {error}"),
-                    )
-                })??;
-
-        // Recheck the complete graph identity after replay. This is deliberately outside the
-        // cache lock to avoid a cache->graph lock-order inversion with mutation paths.
-        if current_vfs_cache_key(state)? != key {
-            continue;
-        }
-
-        let snapshot = Arc::new(snapshot);
-        let mut cache = write_recover(&state.vfs_tree_cache);
-        // A mutation can land between the full-key check above and this lock. Version is the
-        // publication/CAS token: bump_version increments it before taking this same write lock
-        // to clear the cache. Therefore an old builder can publish only before the mutation
-        // boundary completes; after a completed invalidation it is discarded here.
-        let published_version = state.vfs_version.load(std::sync::atomic::Ordering::SeqCst);
-        if published_version != key.version {
-            continue;
-        }
-        if let Some(existing) = cache.as_ref() {
-            if existing.key == key {
-                return Ok(Arc::clone(existing));
-            }
-        }
-        *cache = Some(Arc::clone(&snapshot));
-        return Ok(snapshot);
-    }
-
-    Err((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "graph kept changing while materializing the VFS snapshot; retry".to_string(),
-    ))
-}
-
-/// GET /vfs/version — monotonic counter that increments on graph mutations.
-async fn vfs_version(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
-    Json(json!({ "version": state.vfs_version.load(std::sync::atomic::Ordering::SeqCst) }))
-}
-
-/// GET /vfs/tree — full file tree as `{ files: { path: hex_hash, ... }, timestamps: { path: epoch_secs, ... } }`.
-///
-/// Merges the committed tree with overlay additions and removals from the
-/// working copy so the VFS sees uncommitted new/deleted files.
-async fn vfs_tree(
+/// GET /vfs/version — repository generation bound to the exact workspace tree.
+async fn vfs_version(
     State(state): State<Arc<DaemonState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let snapshot = current_vfs_snapshot(&state).await?;
-    let mut tree = (*snapshot.files).clone();
+    let (_, snapshot) = active_workspace_tree(&state)?;
+    Ok(Json(json!({
+        "version": snapshot.binding.roots.generation,
+        "workspace_generation": snapshot.binding.workspace_generation,
+        "tree_hash": snapshot.binding.workspace_tree_hash,
+    })))
+}
 
-    // Merge overlay: add files for new entities, remove deleted entities' files.
-    let wc = state.working_copy.read().await;
-    let overlay = &wc.uncommitted_mutations;
+fn validate_vfs_tree_path(path: &str) -> Result<(), String> {
+    RepoPath::from_utf8(path.to_string())
+        .map(|_| ())
+        .map_err(|error| format!("non-canonical repository path {path:?}: {error}"))
+}
 
-    // Add files from newly-added entities that have a file_origin.
-    for entity in overlay.entity_adds.values() {
-        if let Some(ref file_id) = entity.file_origin {
-            if !tree.contains_key(file_id) {
-                // Placeholder hash — the VFS read path will project from overlay bodies.
-                tree.insert(file_id.clone(), kin_model::Hash256::from_bytes([0; 32]));
-            }
-        }
-    }
-
-    // Remove files whose sole entities have been removed.
-    // (Only remove if ALL entities for that file are in the remove set.)
-    // For now, just mark removed entity files so the VFS can exclude them.
-    // Full implementation requires cross-referencing layout regions.
-    // Stub: no removals from tree yet — callers check overlay.entity_removes.
-
-    drop(wc);
-
-    let files: HashMap<String, String> = tree
-        .into_iter()
-        .map(|(path, hash)| (path.0, hash.to_string()))
-        .collect();
-
-    let ts: HashMap<String, u64> = snapshot
-        .timestamps
-        .iter()
-        .map(|(path, epoch)| (path.0.clone(), *epoch))
-        .collect();
-
-    Ok(Json(json!({ "files": files, "timestamps": ts })))
+/// GET /vfs/tree — exact repository-v6 workspace tree.
+///
+/// This is the shared `kin-model` v3 wire contract, not the former private
+/// path-to-hash map. Its strong ETag binds repository roots, workspace
+/// generation, exact tree entries (including executable/symlink/gitlink
+/// identity), sizes, and projection mtimes.
+async fn vfs_tree(State(state): State<Arc<DaemonState>>) -> Result<Response, (StatusCode, String)> {
+    let (_, snapshot) = active_workspace_tree(&state)?;
+    let identity = snapshot.identity().map_err(repository_authority_error)?;
+    let mut response = Json(snapshot).into_response();
+    response.headers_mut().insert(
+        header::ETAG,
+        HeaderValue::from_str(&format!("\"{identity}\"")).map_err(repository_authority_error)?,
+    );
+    Ok(response)
 }
 
 /// GET /vfs/stat/*path — return VirtualStat-like JSON for a file path.
@@ -8434,142 +6968,252 @@ async fn vfs_stat(
     Path(path): Path<String>,
     State(state): State<Arc<DaemonState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let snapshot = current_vfs_snapshot(&state).await?;
-    let tree = &snapshot.files;
-    let timestamps = &snapshot.timestamps;
-
-    // Check if the path is a file.
-    let file_id = FilePathId::new(&path);
-    if let Some(hash) = tree.get(&file_id) {
-        // Try to get the size from the blob store.
-        let blob_hash = kin_blobs::Hash256(hash.0);
-        let size = state
-            .blobs
-            .read(&blob_hash)
-            .map(|data| data.len() as u64)
-            .unwrap_or(0);
-
-        let mtime = timestamps.get(&file_id).copied().unwrap_or(0);
-
-        return Ok(Json(json!({
-            "is_file": true,
-            "is_dir": false,
-            "size": size,
-            "content_hash": hash.to_string(),
-            "mode": 0o644,
-            "mtime": mtime,
-        })));
+    let (_, snapshot) = active_workspace_tree(&state)?;
+    if !path.is_empty() && path != "." {
+        validate_vfs_tree_path(&path).map_err(|message| (StatusCode::BAD_REQUEST, message))?;
+        let repo_path = RepoPath::from_utf8(path.clone())
+            .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+        if let Some(artifact) = snapshot
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.path == repo_path)
+        {
+            let (is_file, is_symlink, is_gitlink, mode, content_hash) = match artifact.entry {
+                TreeEntry::Blob { hash, executable } => (
+                    true,
+                    false,
+                    false,
+                    if executable { 0o755 } else { 0o644 },
+                    hash.to_string(),
+                ),
+                TreeEntry::Symlink { target_blob } => {
+                    (false, true, false, 0o777, target_blob.to_string())
+                }
+                TreeEntry::Gitlink { target } => (false, false, true, 0o755, target.to_string()),
+            };
+            return Ok(Json(json!({
+                "is_file": is_file,
+                "is_dir": is_gitlink,
+                "is_symlink": is_symlink,
+                "is_gitlink": is_gitlink,
+                "size": artifact.size,
+                "content_hash": content_hash,
+                "mode": mode,
+                "mtime": artifact.mtime,
+                "artifact_id": artifact.artifact_id,
+            })));
+        }
     }
 
-    // Check if the path is a directory (any file starts with path/).
-    let dir_prefix = if path.ends_with('/') {
-        path.clone()
+    let prefix = if path.is_empty() || path == "." {
+        String::new()
     } else {
-        format!("{}/", path)
+        format!("{path}/")
     };
-
-    let is_dir =
-        path.is_empty() || path == "." || tree.keys().any(|k| k.0.starts_with(&dir_prefix));
-
-    if is_dir {
-        // Directory mtime = max mtime of any file under it.
-        let dir_mtime = timestamps
+    let under_directory = |artifact: &kin_model::WorkspaceTreeArtifact| {
+        artifact
+            .path
+            .as_utf8()
+            .is_some_and(|candidate| prefix.is_empty() || candidate.starts_with(&prefix))
+    };
+    if prefix.is_empty() || snapshot.artifacts.iter().any(under_directory) {
+        let mtime = snapshot
+            .artifacts
             .iter()
-            .filter(|(fid, _)| fid.0.starts_with(&dir_prefix) || path.is_empty() || path == ".")
-            .map(|(_, &t)| t)
+            .filter(|artifact| under_directory(artifact))
+            .map(|artifact| artifact.mtime)
             .max()
             .unwrap_or(0);
-
         return Ok(Json(json!({
             "is_file": false,
             "is_dir": true,
+            "is_symlink": false,
+            "is_gitlink": false,
             "size": 0,
             "content_hash": null,
             "mode": 0o755,
-            "mtime": dir_mtime,
+            "mtime": mtime,
         })));
     }
 
     Err((StatusCode::NOT_FOUND, format!("not found: {path}")))
 }
 
-/// GET /vfs/read/*path — return file content, with overlay projection if needed.
-///
-/// 1. Read blob content from committed tree
-/// 2. Check if working copy overlay has entity mutations for this file
-/// 3. If no overlap → return blob directly (zero overhead fast path)
-/// 4. If overlap → project overlay mutations onto blob content
-async fn vfs_read(
-    Path(path): Path<String>,
-    Query(params): Query<VfsReadParams>,
-    State(state): State<Arc<DaemonState>>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let snapshot = current_vfs_snapshot(&state).await?;
-    let tree = &snapshot.files;
-
-    let file_id = FilePathId::new(&path);
-    let hash = tree
-        .get(&file_id)
-        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("file not found: {path}")))?;
-
-    let blob_hash = kin_blobs::Hash256(hash.0);
-    let blob_data = state.blobs.read(&blob_hash).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("blob read error: {e}"),
-        )
-    })?;
-
-    // Build merged overlay bodies: committed graph → global overlay → session overlay.
-    // Session overlay takes priority over global overlay.
-    let wc = state.working_copy.read().await;
-    let mut merged_bodies = wc.uncommitted_mutations.entity_bodies.clone();
-
-    // Merge session overlay on top of global overlay if session_id is provided.
-    if let Some(ref session_id_str) = params.session_id {
-        if let Ok(session_id) = parse_session_id(session_id_str) {
-            let session_overlay = state.get_or_create_session_overlay(&session_id).await;
-            // Session overlay bodies take priority over global overlay bodies.
-            for (entity_id, body) in session_overlay.entity_bodies {
-                merged_bodies.insert(entity_id, body);
-            }
-        }
-    }
-
-    if merged_bodies.is_empty() {
-        drop(wc);
-        return Ok(blob_data);
-    }
-
-    // Try to get the FileLayout for this file from projection state.
-    let projection = state.projection.read().await;
-    let layout = projection.get_layout(&file_id);
-
-    let projected = project_vfs_overlay_bytes(&file_id, &blob_data, layout, &merged_bodies)?;
-
-    drop(projection);
-    drop(wc);
-    Ok(projected)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VfsRangeError {
+    Malformed,
+    Unsatisfiable,
 }
 
-fn project_vfs_overlay_bytes(
-    file_id: &FilePathId,
-    blob_data: &[u8],
-    layout: Option<&FileLayout>,
-    merged_bodies: &HashMap<EntityId, Vec<u8>>,
-) -> Result<Vec<u8>, (StatusCode, String)> {
-    let Some(layout) = layout else {
-        return Ok(blob_data.to_vec());
+fn parse_vfs_byte_range(
+    headers: &HeaderMap,
+    total_size: u64,
+) -> Result<Option<(usize, usize)>, VfsRangeError> {
+    let mut values = headers.get_all(header::RANGE).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(VfsRangeError::Malformed);
+    }
+
+    let value = value.to_str().map_err(|_| VfsRangeError::Malformed)?;
+    let range = value
+        .strip_prefix("bytes=")
+        .ok_or(VfsRangeError::Malformed)?;
+    if range.contains(',') {
+        return Err(VfsRangeError::Malformed);
+    }
+
+    let (start, end) = range.split_once('-').ok_or(VfsRangeError::Malformed)?;
+    if start.is_empty() || end.is_empty() {
+        return Err(VfsRangeError::Malformed);
+    }
+    let start = start.parse::<u64>().map_err(|_| VfsRangeError::Malformed)?;
+    let requested_end = end.parse::<u64>().map_err(|_| VfsRangeError::Malformed)?;
+
+    if total_size == 0 || start >= total_size || requested_end < start {
+        return Err(VfsRangeError::Unsatisfiable);
+    }
+
+    let end = requested_end.min(total_size - 1);
+    let start = usize::try_from(start).map_err(|_| VfsRangeError::Unsatisfiable)?;
+    let end = usize::try_from(end).map_err(|_| VfsRangeError::Unsatisfiable)?;
+    Ok(Some((start, end)))
+}
+
+fn vfs_read_error(
+    status: StatusCode,
+    message: impl Into<String>,
+) -> (StatusCode, HeaderMap, String) {
+    (status, HeaderMap::new(), message.into())
+}
+
+fn vfs_unsatisfiable_range_error(total_size: u64) -> (StatusCode, HeaderMap, String) {
+    let mut headers = HeaderMap::new();
+    headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    let content_range = HeaderValue::from_str(&format!("bytes */{total_size}"))
+        .expect("numeric unsatisfied Content-Range is always a valid HTTP header");
+    headers.insert(header::CONTENT_RANGE, content_range);
+    (
+        StatusCode::RANGE_NOT_SATISFIABLE,
+        headers,
+        format!("requested byte range is unsatisfiable for {total_size}-byte blob"),
+    )
+}
+
+/// GET /vfs/read/*path — return exact repository-owned CAS bytes.
+async fn vfs_read(
+    Path(path): Path<String>,
+    State(state): State<Arc<DaemonState>>,
+    headers: HeaderMap,
+) -> Result<Response, (StatusCode, HeaderMap, String)> {
+    validate_vfs_tree_path(&path)
+        .map_err(|message| vfs_read_error(StatusCode::BAD_REQUEST, message))?;
+    let (authority, snapshot) = active_workspace_tree(&state)
+        .map_err(|(status, message)| vfs_read_error(status, message))?;
+    let repo_path = RepoPath::from_utf8(path.clone())
+        .map_err(|error| vfs_read_error(StatusCode::BAD_REQUEST, error.to_string()))?;
+    let artifact = snapshot
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.path == repo_path)
+        .ok_or_else(|| {
+            vfs_read_error(
+                StatusCode::NOT_FOUND,
+                format!("file not found in repository-v6 workspace tree: {path}"),
+            )
+        })?;
+    let digest = artifact.entry.blob_identity().ok_or_else(|| {
+        vfs_read_error(
+            StatusCode::FAILED_DEPENDENCY,
+            format!("gitlink {path} has no local source body"),
+        )
+    })?;
+    let blob_data = authority
+        .manager
+        .load_source_blob(digest)
+        .map_err(|error| {
+            vfs_read_error(
+                StatusCode::FAILED_DEPENDENCY,
+                format!("repository CAS read failed for {path} at {digest}: {error}"),
+            )
+        })?
+        .ok_or_else(|| {
+            vfs_read_error(
+                StatusCode::FAILED_DEPENDENCY,
+                format!("repository CAS body missing for {path} at {digest}"),
+            )
+        })?;
+    let total_size = u64::try_from(blob_data.len()).map_err(|_| {
+        vfs_read_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("repository CAS blob size exceeds u64 for {path}"),
+        )
+    })?;
+    if total_size != artifact.size {
+        return Err(vfs_read_error(
+            StatusCode::FAILED_DEPENDENCY,
+            format!(
+                "repository-v6 workspace metadata says {path} has {} bytes but CAS returned {total_size}",
+                artifact.size
+            ),
+        ));
+    }
+
+    let byte_range = match parse_vfs_byte_range(&headers, total_size) {
+        Ok(range) => range,
+        Err(VfsRangeError::Malformed) => {
+            return Err(vfs_read_error(
+                StatusCode::BAD_REQUEST,
+                "Range must contain exactly one closed byte interval: bytes=start-end",
+            ));
+        }
+        Err(VfsRangeError::Unsatisfiable) => {
+            return Err(vfs_unsatisfiable_range_error(total_size));
+        }
     };
 
-    match kin_projection::project_overlay_to_bytes(blob_data, layout, merged_bodies) {
-        Ok(Some(projected)) => Ok(projected),
-        Ok(None) => Ok(blob_data.to_vec()),
-        Err(e) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("projection failed for {}: {}", file_id, e),
-        )),
+    let (status, response_bytes, content_range) = match byte_range {
+        Some((start, end)) => (
+            StatusCode::PARTIAL_CONTENT,
+            blob_data[start..=end].to_vec(),
+            Some(format!("bytes {start}-{end}/{total_size}")),
+        ),
+        None => (StatusCode::OK, blob_data, None),
+    };
+
+    let mut response = response_bytes.into_response();
+    *response.status_mut() = status;
+    response
+        .headers_mut()
+        .insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("x-kin-blob-hash"),
+        HeaderValue::from_str(&digest.to_string()).map_err(|error| {
+            vfs_read_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("invalid graph blob hash header for {path}: {error}"),
+            )
+        })?,
+    );
+    if let Some(content_range) = content_range {
+        response.headers_mut().insert(
+            header::CONTENT_RANGE,
+            HeaderValue::from_str(&content_range).map_err(|error| {
+                vfs_read_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("invalid Content-Range for {path}: {error}"),
+                )
+            })?,
+        );
     }
+
+    Ok(response)
 }
 
 /// GET /vfs/readdir/*path — return directory listing derived from the file tree.
@@ -8577,24 +7221,23 @@ async fn vfs_readdir(
     Path(path): Path<String>,
     State(state): State<Arc<DaemonState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let snapshot = current_vfs_snapshot(&state).await?;
-    let tree = &snapshot.files;
-
+    let (_, snapshot) = active_workspace_tree(&state)?;
     let prefix = if path.is_empty() || path == "." {
         String::new()
-    } else if path.ends_with('/') {
-        path.clone()
     } else {
-        format!("{}/", path)
+        validate_vfs_tree_path(&path).map_err(|message| (StatusCode::BAD_REQUEST, message))?;
+        format!("{path}/")
     };
 
     let mut entries: HashSet<String> = HashSet::new();
     let mut file_entries = Vec::new();
 
-    for file_path in tree.keys() {
-        let fp = &file_path.0;
+    for artifact in &snapshot.artifacts {
+        let Some(fp) = artifact.path.as_utf8() else {
+            continue;
+        };
         let rest = if prefix.is_empty() {
-            fp.as_str()
+            fp
         } else if let Some(r) = fp.strip_prefix(&prefix) {
             r
         } else {
@@ -8613,17 +7256,31 @@ async fn vfs_readdir(
         }
 
         if entries.insert(child_name.to_string()) {
-            let is_dir = rest.contains('/');
+            let nested = rest.contains('/');
+            let file_type = if nested {
+                "directory"
+            } else if matches!(artifact.entry, TreeEntry::Gitlink { .. }) {
+                "gitlink"
+            } else if matches!(artifact.entry, TreeEntry::Symlink { .. }) {
+                "symlink"
+            } else {
+                "file"
+            };
             file_entries.push(json!({
                 "name": child_name,
-                "file_type": if is_dir { "directory" } else { "file" },
+                "file_type": file_type,
+                "artifact_id": (!nested).then_some(artifact.artifact_id),
             }));
         }
     }
 
     if file_entries.is_empty() && !prefix.is_empty() {
-        // Check if the path even exists as a directory.
-        let any = tree.keys().any(|k| k.0.starts_with(&prefix));
+        let any = snapshot.artifacts.iter().any(|artifact| {
+            artifact
+                .path
+                .as_utf8()
+                .is_some_and(|value| value.starts_with(&prefix))
+        });
         if !any {
             return Err((
                 StatusCode::NOT_FOUND,
@@ -8640,663 +7297,6 @@ async fn vfs_readdir(
     });
 
     Ok(Json(json!({ "entries": file_entries })))
-}
-
-/// Rung-3 write-veto precheck shared by the VFS apply paths (`vfs_file_changed`
-/// and `vfs_write_notify`) so the two siblings can never drift — leaving one
-/// ungated would make enforce-mode trivially bypassable via the other endpoint.
-///
-/// Under `KIN_WRITE_VETO=enforce`, returns `Err((409, body))` when the file's
-/// existing entity scopes or its artifact scope are held under another session's
-/// hard intent, rejecting the write *before* it is folded into the graph. Under
-/// the default warn mode the write is NOT rejected: returns
-/// `Ok(Some(annotation))` naming the blocking intent(s) so the caller can attach
-/// a `write_veto_warning` to the response envelope. Returns `Ok(None)` when the
-/// veto is off, no intents are active, or the write is allowed — leaving the
-/// response unchanged. `caller` is the writing session when attributed; a
-/// session is never blocked by its own intent. See [`crate::write_veto`].
-async fn write_veto_precheck(
-    state: &Arc<DaemonState>,
-    file_path: &FsPath,
-    display_path: &str,
-    caller: Option<SessionId>,
-    capability_warnings: &[String],
-) -> std::result::Result<Option<serde_json::Value>, (StatusCode, String)> {
-    let mode = crate::write_veto::WriteVetoMode::from(state.coordination_mode());
-    if mode.is_off() {
-        return Ok(None);
-    }
-    // Cheap short-circuit: with no active intents a write can collide with
-    // nothing, so warn-by-default costs nothing on the common single-agent path
-    // (no per-file entity query, no scope build).
-    let now = kin_model::Timestamp::now();
-    let mut intents: Vec<_> = state
-        .graph
-        .list_all_intents()
-        .map_err(internal_error)?
-        .into_iter()
-        .filter(|intent| {
-            intent
-                .expires_at
-                .as_ref()
-                .is_none_or(|expires_at| expires_at >= &now)
-        })
-        .collect();
-    intents.sort_by_key(|intent| intent.intent_id.to_string());
-    if intents.is_empty() {
-        return Ok(vfs_capability_warning(capability_warnings));
-    }
-    let file_id = kin_index::normalize_file_path_id(file_path, state.layout.working_dir());
-    let filter = kin_model::EntityFilter {
-        file_path: Some(file_id.clone()),
-        ..Default::default()
-    };
-    // Perf: this `query_entities` runs once per write while intents are active;
-    // it is O(entities-in-file) and is the only added cost on the hot path. Cap
-    // the per-file entity-scope comparison set so the veto can never cost more
-    // than the reconcile it guards — a file-level hard intent is still caught via
-    // the always-present Artifact scope, and the reconciler's own (uncapped)
-    // check remains the backstop.
-    const VETO_SCOPE_CAP: usize = 1024;
-    let file_entities = state
-        .graph
-        .query_entities(&filter)
-        .map_err(internal_error)?;
-    if file_entities.len() > VETO_SCOPE_CAP {
-        tracing::warn!(
-            path = %display_path,
-            entities = file_entities.len(),
-            cap = VETO_SCOPE_CAP,
-            "write-veto: capping per-file entity-scope comparison set"
-        );
-    }
-    let mut touched: Vec<IntentScope> = file_entities
-        .iter()
-        .take(VETO_SCOPE_CAP)
-        .map(|e| IntentScope::Entity(e.id))
-        .collect();
-    touched.push(IntentScope::Artifact(file_id));
-
-    if let crate::write_veto::WriteVetoDecision::Deny { blocking } =
-        crate::write_veto::evaluate_write_veto(&intents, &touched, caller)
-    {
-        if mode.is_enforcing() {
-            tracing::info!(
-                path = %display_path,
-                blocking = blocking.len(),
-                "write-veto: rejecting write; scope held by foreign hard intent"
-            );
-            let body = crate::write_veto::veto_conflict_body(display_path, &blocking);
-            return Err((StatusCode::CONFLICT, body.to_string()));
-        }
-        // Warn (default): the write proceeds, but log the would-be veto with
-        // per-intent attribution and annotate the response so the agent sees who
-        // holds the colliding scope.
-        for b in &blocking {
-            tracing::warn!(
-                path = %display_path,
-                blocking_session = %b.session_id,
-                blocking_intent = %b.intent_id,
-                lock = ?b.lock_type,
-                "write-veto[warn]: write would be rejected under KIN_WRITE_VETO=enforce"
-            );
-        }
-        let mut annotation = crate::write_veto::veto_warning_annotation(display_path, &blocking);
-        if !capability_warnings.is_empty() {
-            if let Some(object) = annotation.as_object_mut() {
-                object.insert(
-                    "capability_violations".to_string(),
-                    serde_json::json!(capability_warnings),
-                );
-            }
-        }
-        return Ok(Some(annotation));
-    }
-    Ok(vfs_capability_warning(capability_warnings))
-}
-
-fn vfs_capability_warning(violations: &[String]) -> Option<serde_json::Value> {
-    (!violations.is_empty()).then(|| {
-        serde_json::json!({
-            "would_block": true,
-            "conflict_type": "CapabilityDenied",
-            "capability_violations": violations,
-            "message": "VFS write would be rejected in enforce mode because caller identity or can_write capability is invalid",
-        })
-    })
-}
-
-fn resolve_vfs_write_caller(
-    state: &DaemonState,
-    header_session: Option<SessionId>,
-    body_session: Option<SessionId>,
-) -> std::result::Result<(Option<SessionId>, Vec<String>), (StatusCode, String)> {
-    let mode = state.coordination_mode();
-    if !mode.evaluates() {
-        return Ok((header_session.or(body_session), Vec::new()));
-    }
-
-    let mut violations = Vec::new();
-    if header_session.is_none() && body_session.is_some() {
-        violations.push("body session_id is not bound to X-Kin-Session".to_string());
-    }
-    if let (Some(header), Some(body)) = (header_session, body_session) {
-        if header != body {
-            violations.push("body session_id does not match X-Kin-Session".to_string());
-        }
-    }
-    let caller = header_session.or(body_session);
-    match caller {
-        Some(session_id) => match state
-            .coordinator
-            .get_session(&session_id)
-            .map_err(internal_error)?
-        {
-            Some(session) if session.capabilities.can_write => {}
-            Some(_) => violations.push("can_write=false".to_string()),
-            None => violations.push("VFS caller is not an active rich agent session".to_string()),
-        },
-        None => violations.push("VFS write has no attributed agent session".to_string()),
-    }
-
-    if mode.is_enforcing() && !violations.is_empty() {
-        return Err((
-            StatusCode::FORBIDDEN,
-            serde_json::json!({
-                "error": "coordination_capability_denied",
-                "capability_violations": violations,
-            })
-            .to_string(),
-        ));
-    }
-    Ok((caller, violations))
-}
-
-/// How a reconcile-detected hard collision maps under the active write-veto
-/// mode. Distinguishes enforce (reject) from warn (proceed + annotate) so the
-/// two handlers share one decision path.
-enum CollisionVeto {
-    /// Not a vetoable collision, or veto off — the caller's normal path.
-    Ignore,
-    /// Enforce: reject with this structured `409` body.
-    Block(serde_json::Value),
-    /// Warn: proceed, but annotate the response with this `write_veto_warning`.
-    Warn(serde_json::Value),
-}
-
-/// Map a reconcile `CollisionBlocked` (e.g. a brand-new entity colliding with a
-/// foreign hard intent — a scope the precheck cannot see because the entity does
-/// not yet exist in the graph) to the active mode's response: a pre-write `409`
-/// under enforce, a `write_veto_warning` annotation under warn, or `Ignore`
-/// otherwise (off, or a non-collision error).
-fn write_veto_collision_response(
-    err: &kin_reconcile::ReconcileError,
-    display_path: &str,
-    mode: crate::write_veto::WriteVetoMode,
-) -> CollisionVeto {
-    if mode.is_off() {
-        return CollisionVeto::Ignore;
-    }
-    if let kin_reconcile::ReconcileError::CollisionBlocked {
-        blocking_intents, ..
-    } = err
-    {
-        if mode.is_enforcing() {
-            tracing::info!(
-                path = %display_path,
-                blocking = blocking_intents.len(),
-                "write-veto: hard collision during reconcile"
-            );
-            let body = crate::write_veto::veto_conflict_body(display_path, blocking_intents);
-            return CollisionVeto::Block(body);
-        }
-        for b in blocking_intents {
-            tracing::warn!(
-                path = %display_path,
-                blocking_session = %b.session_id,
-                blocking_intent = %b.intent_id,
-                "write-veto[warn]: hard collision during reconcile (write not folded)"
-            );
-        }
-        return CollisionVeto::Warn(crate::write_veto::veto_warning_annotation(
-            display_path,
-            blocking_intents,
-        ));
-    }
-    CollisionVeto::Ignore
-}
-
-/// Attach a `write_veto_warning` annotation to a JSON response body when the
-/// veto is in warn mode and the write would have been blocked. No-op when there
-/// is no warning or the body is not a JSON object.
-fn attach_veto_warning(
-    mut body: serde_json::Value,
-    warning: Option<serde_json::Value>,
-) -> serde_json::Value {
-    if let (Some(obj), Some(w)) = (body.as_object_mut(), warning) {
-        obj.insert("write_veto_warning".to_string(), w);
-    }
-    body
-}
-
-/// Build the fail-closed response used by filesystem notification endpoints
-/// when this daemon is running with graph-only authority. Keep this check ahead
-/// of write-veto and reconciler acquisition: these routes must not even begin a
-/// filesystem-to-graph attempt in this mode.
-fn filesystem_ingest_disabled_response(endpoint: &str, path: &str) -> (StatusCode, String) {
-    (
-        StatusCode::CONFLICT,
-        json!({
-            "error": "filesystem_reconcile_disabled",
-            "endpoint": endpoint,
-            "path": path,
-            "reindexed": false,
-            "mutation_applied": false,
-            "authority": "graph",
-            "configuration": crate::loop_runner::DISABLE_FILESYSTEM_RECONCILE_ENV,
-        })
-        .to_string(),
-    )
-}
-
-/// POST /vfs/file-changed — notify the daemon that a file was modified on disk.
-///
-/// Triggers reconciliation for the specified path. Used by the VFS write-back
-/// flow to inform the daemon that projected content has been written through.
-async fn vfs_file_changed(
-    headers: axum::http::HeaderMap,
-    State(state): State<Arc<DaemonState>>,
-    Json(request): Json<FileChangedRequest>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
-    if state.filesystem_reconcile_disabled() {
-        return Err(filesystem_ingest_disabled_response(
-            "/vfs/file-changed",
-            &request.path,
-        ));
-    }
-
-    // One ordering with intent registration and transaction commits: no hard
-    // intent can appear after this path's precheck but before graph apply.
-    let _coordination = state.coordination_gate.lock().await;
-    let file_path = std::path::PathBuf::from(&request.path);
-    tracing::info!(path = %request.path, "VFS file-changed notification received");
-
-    // Rung-3 write veto (KIN_WRITE_VETO=enforce): the general-purpose sibling of
-    // /vfs/write-notify must gate too, else enforce is trivially bypassable by
-    // choosing this endpoint. Off by default (byte-identical).
-    let header_session = extract_session_id_from_headers(&headers)?;
-    let body_session = request
-        .session_id
-        .as_ref()
-        .map(|session_id| parse_session_id(session_id))
-        .transpose()?;
-    let (caller, capability_warnings) =
-        resolve_vfs_write_caller(&state, header_session, body_session)?;
-    let veto_warning = write_veto_precheck(
-        &state,
-        &file_path,
-        &request.path,
-        caller,
-        &capability_warnings,
-    )
-    .await?;
-
-    let event = kin_index::FileEvent::Changed(file_path);
-
-    // Construct an EditHint when all three byte-range fields are present.
-    let edit_hint = request
-        .edit_start_byte
-        .zip(request.edit_old_end_byte)
-        .zip(request.edit_new_end_byte)
-        .map(|((start, old_end), new_end)| kin_parser::EditHint {
-            start_byte: start,
-            old_end_byte: old_end,
-            new_end_byte: new_end,
-        });
-
-    let mut reconciler = state.reconciler.write().await;
-    let mut wc = state.working_copy.write().await;
-    let graph_mutation = state.begin_graph_authority_mutation();
-
-    // Temporarily adopt the caller's session so the reconciler's own collision
-    // check excludes the caller's intents (parity with /vfs/write-notify); the
-    // write-veto precheck above applies the same own-write exclusion.
-    let prev_session_id = if let Some(session_id) = caller {
-        let prev = reconciler.session_id().copied();
-        reconciler.set_session_id(session_id);
-        prev
-    } else {
-        None
-    };
-
-    let result = reconciler.reconcile_file_change_with_hint(
-        &event,
-        &state.blobs,
-        state.graph.as_ref(),
-        &mut wc.uncommitted_mutations,
-        edit_hint.as_ref(),
-    );
-
-    if caller.is_some() {
-        match prev_session_id {
-            Some(prev) => reconciler.set_session_id(prev),
-            None => reconciler.clear_session_id(),
-        }
-    }
-
-    match result {
-        Ok(outcome) => {
-            let should_apply = matches!(
-                &outcome,
-                kin_reconcile::ReconcileOutcome::Updated { .. }
-                    | kin_reconcile::ReconcileOutcome::FileRemoved { .. }
-            );
-            if should_apply {
-                kin_reconcile::apply_overlay_to_graph(
-                    state.graph.as_ref(),
-                    &mut wc.uncommitted_mutations,
-                )
-                .map_err(internal_error)?;
-                state
-                    .persist_projection_truth_from_reconcile(&reconciler, &outcome)
-                    .map_err(internal_error)?;
-            }
-            let mut projection_changed = ProjectionChangedSet::default();
-            if should_apply {
-                projection_changed.record_reconcile_outcome(&outcome);
-            }
-            drop(wc);
-            drop(reconciler);
-            tracing::debug!(path = %request.path, ?outcome, "reconciled file change");
-
-            // Emit SSE events for each entity affected by the file change.
-            use crate::state::{ChangeType, DaemonEvent};
-            use kin_reconcile::ReconcileOutcome;
-
-            let (added_count, modified_count, removed_count) = match &outcome {
-                ReconcileOutcome::Updated {
-                    added,
-                    modified,
-                    removed,
-                    ..
-                } => {
-                    for id in added {
-                        state.emit_event(DaemonEvent::EntityChanged {
-                            entity_id: *id,
-                            change_type: ChangeType::Created,
-                            file_path: Some(request.path.clone()),
-                            // Truthful attribution: the originating session the
-                            // VFS write-back request carried (None if anonymous).
-                            session_id: caller.map(|session_id| session_id.to_string()),
-                        });
-                    }
-                    for id in modified {
-                        state.emit_event(DaemonEvent::EntityChanged {
-                            entity_id: *id,
-                            change_type: ChangeType::Modified,
-                            file_path: Some(request.path.clone()),
-                            // Truthful attribution: the originating session the
-                            // VFS write-back request carried (None if anonymous).
-                            session_id: caller.map(|session_id| session_id.to_string()),
-                        });
-                    }
-                    for id in removed {
-                        state.emit_event(DaemonEvent::EntityChanged {
-                            entity_id: *id,
-                            change_type: ChangeType::Deleted,
-                            file_path: Some(request.path.clone()),
-                            // Truthful attribution: the originating session the
-                            // VFS write-back request carried (None if anonymous).
-                            session_id: caller.map(|session_id| session_id.to_string()),
-                        });
-                    }
-                    (added.len(), modified.len(), removed.len())
-                }
-                _ => (0, 0, 0),
-            };
-
-            // Bump version counter and refresh projection so subsequent
-            // VFS reads serve updated FileLayouts.
-            if !projection_changed.is_empty() {
-                state.bump_version(); // marks dirty for background persistence
-            }
-            drop(graph_mutation);
-            if !projection_changed.is_empty() {
-                if let Err(e) = state.refresh_projection(&projection_changed).await {
-                    tracing::warn!(error = %e, "failed to refresh projection after write-back");
-                }
-            }
-
-            Ok(Json(attach_veto_warning(
-                json!({
-                    "status": "reconciled",
-                    "path": request.path,
-                    "added": added_count,
-                    "modified": modified_count,
-                    "removed": removed_count,
-                }),
-                veto_warning,
-            )))
-        }
-        Err(e) => {
-            drop(wc);
-            drop(reconciler);
-            // Under enforce, surface a hard collision detected during reconcile
-            // as a pre-write 409; under warn, annotate the soft notification.
-            let warning = match write_veto_collision_response(
-                &e,
-                &request.path,
-                crate::write_veto::WriteVetoMode::from(state.coordination_mode()),
-            ) {
-                CollisionVeto::Block(body) => {
-                    return Err((StatusCode::CONFLICT, body.to_string()));
-                }
-                CollisionVeto::Warn(w) => veto_warning.or(Some(w)),
-                CollisionVeto::Ignore => veto_warning,
-            };
-            tracing::warn!(path = %request.path, error = %e, "reconciliation failed");
-            Ok(Json(attach_veto_warning(
-                json!({
-                    "status": "error",
-                    "path": request.path,
-                    "error": e.to_string(),
-                }),
-                warning,
-            )))
-        }
-    }
-}
-
-/// POST /vfs/write-notify — immediate re-index triggered by VFS shim after write-through.
-///
-/// The shim sends this notification right after a write completes on disk,
-/// tightening the window where file state leads graph state. Unlike
-/// `/vfs/file-changed` (which is general-purpose), this endpoint is
-/// optimized for the shim hot-path: minimal request body, fast response.
-async fn vfs_write_notify(
-    headers: axum::http::HeaderMap,
-    State(state): State<Arc<DaemonState>>,
-    Json(request): Json<WriteNotifyRequest>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
-    if state.filesystem_reconcile_disabled() {
-        return Err(filesystem_ingest_disabled_response(
-            "/vfs/write-notify",
-            &request.file_path,
-        ));
-    }
-
-    let _coordination = state.coordination_gate.lock().await;
-    let file_path = std::path::PathBuf::from(&request.file_path);
-    tracing::info!(path = %request.file_path, "VFS write-notify received");
-
-    // Rung-3 write veto (KIN_WRITE_VETO=enforce): reject a write whose existing
-    // entity/artifact scopes are held under another session's hard intent
-    // before the reconciler touches the overlay. Off by default (byte-identical).
-    let header_session = extract_session_id_from_headers(&headers)?;
-    let body_session = request
-        .session_id
-        .as_ref()
-        .map(|session_id| parse_session_id(session_id))
-        .transpose()?;
-    let (caller, capability_warnings) =
-        resolve_vfs_write_caller(&state, header_session, body_session)?;
-    let veto_warning = write_veto_precheck(
-        &state,
-        &file_path,
-        &request.file_path,
-        caller,
-        &capability_warnings,
-    )
-    .await?;
-
-    let event = kin_index::FileEvent::Changed(file_path);
-
-    let mut reconciler = state.reconciler.write().await;
-    let mut wc = state.working_copy.write().await;
-    let graph_mutation = state.begin_graph_authority_mutation();
-
-    // If the caller supplies a session_id, temporarily set it on the
-    // reconciler so check_scopes() excludes the caller's own intents.
-    let prev_session_id = if let Some(session_id) = caller {
-        let prev = reconciler.session_id().copied();
-        reconciler.set_session_id(session_id);
-        prev
-    } else {
-        None
-    };
-
-    let result = reconciler.reconcile_file_change_with_hint(
-        &event,
-        &state.blobs,
-        state.graph.as_ref(),
-        &mut wc.uncommitted_mutations,
-        None,
-    );
-
-    // Always restore the previous session_id so caller identity doesn't
-    // leak into future reconciles through the shared reconciler.
-    if caller.is_some() {
-        match prev_session_id {
-            Some(prev) => reconciler.set_session_id(prev),
-            None => reconciler.clear_session_id(),
-        }
-    }
-
-    match result {
-        Ok(outcome) => {
-            let should_apply = matches!(
-                &outcome,
-                kin_reconcile::ReconcileOutcome::Updated { .. }
-                    | kin_reconcile::ReconcileOutcome::FileRemoved { .. }
-            );
-            if should_apply {
-                kin_reconcile::apply_overlay_to_graph(
-                    state.graph.as_ref(),
-                    &mut wc.uncommitted_mutations,
-                )
-                .map_err(internal_error)?;
-                state
-                    .persist_projection_truth_from_reconcile(&reconciler, &outcome)
-                    .map_err(internal_error)?;
-            }
-            let mut projection_changed = ProjectionChangedSet::default();
-            if should_apply {
-                projection_changed.record_reconcile_outcome(&outcome);
-            }
-
-            let entity_count = match &outcome {
-                kin_reconcile::ReconcileOutcome::Updated {
-                    added,
-                    modified,
-                    removed,
-                    ..
-                } => {
-                    let count = added.len() + modified.len() + removed.len();
-
-                    for id in added {
-                        state.emit_event(DaemonEvent::EntityChanged {
-                            entity_id: *id,
-                            change_type: crate::state::ChangeType::Created,
-                            file_path: Some(request.file_path.clone()),
-                            // Truthful attribution: the originating session the
-                            // write-notify request carried (None if anonymous).
-                            session_id: request.session_id.clone(),
-                        });
-                    }
-                    for id in modified {
-                        state.emit_event(DaemonEvent::EntityChanged {
-                            entity_id: *id,
-                            change_type: crate::state::ChangeType::Modified,
-                            file_path: Some(request.file_path.clone()),
-                            // Truthful attribution: the originating session the
-                            // write-notify request carried (None if anonymous).
-                            session_id: request.session_id.clone(),
-                        });
-                    }
-                    for id in removed {
-                        state.emit_event(DaemonEvent::EntityChanged {
-                            entity_id: *id,
-                            change_type: crate::state::ChangeType::Deleted,
-                            file_path: Some(request.file_path.clone()),
-                            // Truthful attribution: the originating session the
-                            // write-notify request carried (None if anonymous).
-                            session_id: request.session_id.clone(),
-                        });
-                    }
-                    count
-                }
-                _ => 0,
-            };
-
-            drop(wc);
-            drop(reconciler);
-
-            if !projection_changed.is_empty() {
-                state.bump_version(); // marks dirty for background persistence
-            }
-            drop(graph_mutation);
-            if !projection_changed.is_empty() {
-                if let Err(e) = state.refresh_projection(&projection_changed).await {
-                    tracing::warn!(error = %e, "failed to refresh projection after write-notify");
-                }
-            }
-
-            Ok(Json(attach_veto_warning(
-                json!({
-                    "reindexed": true,
-                    "entity_count": entity_count,
-                }),
-                veto_warning,
-            )))
-        }
-        Err(e) => {
-            drop(wc);
-            drop(reconciler);
-            // Under enforce, surface a hard collision detected during reconcile
-            // (e.g. a brand-new entity the precheck cannot see) as a pre-write
-            // 409; under warn, annotate the soft notification below.
-            let warning = match write_veto_collision_response(
-                &e,
-                &request.file_path,
-                crate::write_veto::WriteVetoMode::from(state.coordination_mode()),
-            ) {
-                CollisionVeto::Block(body) => {
-                    return Err((StatusCode::CONFLICT, body.to_string()));
-                }
-                CollisionVeto::Warn(w) => veto_warning.or(Some(w)),
-                CollisionVeto::Ignore => veto_warning,
-            };
-            tracing::warn!(path = %request.file_path, error = %e, "write-notify reconciliation failed");
-            Ok(Json(attach_veto_warning(
-                json!({
-                    "reindexed": false,
-                    "entity_count": 0,
-                    "error": e.to_string(),
-                }),
-                warning,
-            )))
-        }
-    }
 }
 
 /// GET /vfs/subscribe — SSE stream for real-time invalidation events.
@@ -9395,7 +7395,7 @@ struct SpineXrefParams {
     entity: String,
 }
 
-/// Stable wire response for the canonical `GET /v1/spine/edges` bulk read.
+/// Stable wire response for the canonical `GET /spine/edges` bulk read.
 /// Field order plus the snapshot's canonical collections make identical graph
 /// authority serialize to identical response bytes.
 #[derive(Debug, Serialize)]
@@ -9508,7 +7508,7 @@ async fn spine_xref(
     ))
 }
 
-/// `GET /v1/spine/edges` — one atomic graph-authoritative cross-repo snapshot.
+/// `GET /spine/edges` — one atomic graph-authoritative cross-repo snapshot.
 ///
 /// This is a read-only protected daemon route. It returns the complete edge
 /// universe held by the spine in deterministic order, rather than sampling
@@ -9800,18 +7800,7 @@ fn persist_coordination_reservation(
 }
 
 fn primary_repo_id(state: &DaemonState) -> String {
-    std::env::var("KIN_REPO_ID")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| {
-            state
-                .layout
-                .working_dir()
-                .file_name()
-                .and_then(|name| name.to_str())
-                .map(|name| name.to_string())
-        })
-        .unwrap_or_else(|| "default".to_string())
+    state.cached_repo_id.clone()
 }
 
 /// Derive a short repo name from the daemon's working directory.
@@ -9952,31 +7941,6 @@ fn parse_exact_source_change_id(
     Ok(kin_model::SemanticChangeId::from_hash(
         kin_model::Hash256::from_bytes(bytes),
     ))
-}
-
-fn resolve_exact_source_tree(
-    graph: &kin_db::InMemoryGraph,
-    requested_change: &kin_model::SemanticChangeId,
-) -> Result<HashMap<FilePathId, ResolvedSourceEntry>, (StatusCode, String)> {
-    match graph
-        .resolve_source_tree_at(requested_change)
-        .map_err(internal_error)?
-    {
-        SourceTreeResolution::Exact { entries } => Ok(entries),
-        SourceTreeResolution::Incomplete { gaps } => {
-            let gap_summary = gaps
-                .iter()
-                .map(|gap| format!("{}@{}:{:?}", gap.file_id, gap.change_id, gap.reason))
-                .collect::<Vec<_>>()
-                .join(", ");
-            Err((
-                StatusCode::FAILED_DEPENDENCY,
-                format!(
-                    "exact source history is incomplete for {requested_change}: {gap_summary}; no fallback was attempted"
-                ),
-            ))
-        }
-    }
 }
 
 fn validate_exact_source_path(path: &str) -> Result<(), (StatusCode, String)> {
@@ -10193,17 +8157,29 @@ fn build_exact_source_tar_gz(
 fn load_exact_source_entries(
     state: &DaemonState,
     repo_id: &str,
-    tree: std::collections::HashMap<FilePathId, ResolvedSourceEntry>,
+    tree: kin_model::ResolvedTree,
 ) -> Result<Vec<ExactSourceEntry>, (StatusCode, String)> {
+    if repo_id == state.cached_repo_id {
+        let authority = ActiveApiRepositoryAuthority::open(state)?;
+        return load_exact_source_entries_with(tree, |path, digest, _remaining_bytes| {
+            authority.manager.load_source_blob(digest).map_err(|error| {
+                (
+                    StatusCode::FAILED_DEPENDENCY,
+                    format!("repository CAS blob load failed for {path} at {digest}: {error}"),
+                )
+            })
+        });
+    }
+
     let backend = state.storage_backend.as_ref().ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
             "exact source export requires immutable backend source storage".to_string(),
         )
     })?;
-    load_exact_source_entries_with(tree, |file_id, digest, remaining_bytes| {
+    load_exact_source_entries_with(tree, |path, digest, remaining_bytes| {
         backend
-            .load_source_blob_bounded(repo_id, digest, remaining_bytes)
+            .load_source_blob_bounded(repo_id, *digest.as_bytes(), remaining_bytes)
             .map_err(|error| {
                 let status = if matches!(
                     &error,
@@ -10217,8 +8193,7 @@ fn load_exact_source_entries(
                     status,
                     format!(
                         "immutable source blob load failed for {} at {}: {error}",
-                        file_id.0,
-                        hex::encode(digest)
+                        path, digest
                     ),
                 )
             })
@@ -10226,16 +8201,16 @@ fn load_exact_source_entries(
 }
 
 fn load_exact_source_entries_with(
-    tree: std::collections::HashMap<FilePathId, ResolvedSourceEntry>,
+    tree: kin_model::ResolvedTree,
     mut load_blob: impl FnMut(
-        &FilePathId,
-        [u8; 32],
+        &RepoPath,
+        kin_model::Hash256,
         u64,
     ) -> Result<Option<Vec<u8>>, (StatusCode, String)>,
 ) -> Result<Vec<ExactSourceEntry>, (StatusCode, String)> {
-    let mut files: Vec<_> = tree.into_iter().collect();
-    files.sort_by(|left, right| left.0 .0.cmp(&right.0 .0));
-    let archive_entry_count = files.len().checked_add(1).ok_or_else(|| {
+    let mut artifacts: Vec<_> = tree.into_artifacts().collect();
+    artifacts.sort_by(|left, right| left.path.cmp(&right.path));
+    let archive_entry_count = artifacts.len().checked_add(1).ok_or_else(|| {
         (
             StatusCode::PAYLOAD_TOO_LARGE,
             "exact source archive entry count overflow".to_string(),
@@ -10247,68 +8222,93 @@ fn load_exact_source_entries_with(
             "exact source tree exceeds the archive entry limit".to_string(),
         ));
     }
-    kin_core::validate_portable_source_paths(files.iter().map(|(file_id, _)| file_id.0.as_str()))
-        .map_err(|error| {
+    let utf8_paths = artifacts
+        .iter()
+        .map(|artifact| {
+            artifact.path.as_utf8().ok_or_else(|| {
+                (
+                    StatusCode::FAILED_DEPENDENCY,
+                    format!(
+                        "portable exact-source archive cannot represent non-UTF-8 path {}",
+                        artifact.path
+                    ),
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    kin_core::validate_portable_source_paths(utf8_paths.iter().copied()).map_err(|error| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("graph contains conflicting or unportable exact-source paths: {error}"),
         )
     })?;
-    files.sort_by(|left, right| {
-        left.1
-            .hash
-            .as_bytes()
-            .cmp(right.1.hash.as_bytes())
-            .then_with(|| left.0 .0.cmp(&right.0 .0))
-    });
-    let mut entries = Vec::with_capacity(files.len());
+
+    let mut entries = Vec::with_capacity(artifacts.len());
+    let mut loaded = HashMap::<kin_model::Hash256, Arc<[u8]>>::new();
     let mut expanded_bytes = 0_u64;
     let mut remaining_load_bytes = EXACT_SOURCE_MAX_EXPANDED_BYTES as u64;
-    let mut start = 0;
-    while start < files.len() {
-        let source_hash = files[start].1.hash;
-        let mut end = start + 1;
-        while end < files.len() && files[end].1.hash == source_hash {
-            end += 1;
-        }
-        let digest = *source_hash.as_bytes();
-        let data: Arc<[u8]> = load_blob(&files[start].0, digest, remaining_load_bytes)?
-            .ok_or_else(|| {
-                (
-                    StatusCode::FAILED_DEPENDENCY,
-                    format!(
-                        "exact source bytes are unavailable for {} at {}; no fallback was attempted",
-                        files[start].0 .0,
-                        hex::encode(digest)
-                    ),
-                )
-            })?
-            .into();
-        let loaded_bytes = u64::try_from(data.len()).map_err(|_| {
+    for artifact in artifacts {
+        let path = artifact
+            .path
+            .as_utf8()
+            .expect("UTF-8 paths were validated above")
+            .to_string();
+        let digest = artifact.entry.blob_identity().ok_or_else(|| {
             (
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "exact source blob length does not fit the allocation limit".to_string(),
+                StatusCode::FAILED_DEPENDENCY,
+                format!(
+                    "portable exact-source archive cannot materialize gitlink {}",
+                    artifact.path
+                ),
             )
         })?;
-        remaining_load_bytes = remaining_load_bytes
-            .checked_sub(loaded_bytes)
-            .ok_or_else(|| {
+        let data = if let Some(data) = loaded.get(&digest) {
+            Arc::clone(data)
+        } else {
+            let data: Arc<[u8]> = load_blob(&artifact.path, digest, remaining_load_bytes)?
+                .ok_or_else(|| {
+                    (
+                        StatusCode::FAILED_DEPENDENCY,
+                        format!(
+                            "exact source bytes are unavailable for {} at {}; no fallback was attempted",
+                            artifact.path, digest
+                        ),
+                    )
+                })?
+                .into();
+            let loaded_bytes = u64::try_from(data.len()).map_err(|_| {
                 (
                     StatusCode::PAYLOAD_TOO_LARGE,
-                    "exact source tree exceeds the source allocation limit".to_string(),
+                    "exact source blob length does not fit the allocation limit".to_string(),
                 )
             })?;
-        let logical_group_bytes = u64::try_from(data.len())
-            .unwrap_or(u64::MAX)
-            .checked_mul(u64::try_from(end - start).unwrap_or(u64::MAX))
-            .ok_or_else(|| {
-                (
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    "exact source tree expanded byte count overflow".to_string(),
-                )
-            })?;
+            remaining_load_bytes =
+                remaining_load_bytes
+                    .checked_sub(loaded_bytes)
+                    .ok_or_else(|| {
+                        (
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                            "exact source tree exceeds the source allocation limit".to_string(),
+                        )
+                    })?;
+            let actual: [u8; 32] = Sha256::digest(data.as_ref()).into();
+            if actual != *digest.as_bytes() {
+                return Err((
+                    StatusCode::FAILED_DEPENDENCY,
+                    format!(
+                        "immutable source blob digest mismatch for {}: requested {}, found {}",
+                        artifact.path,
+                        digest,
+                        hex::encode(actual)
+                    ),
+                ));
+            }
+            loaded.insert(digest, Arc::clone(&data));
+            data
+        };
+
         expanded_bytes = expanded_bytes
-            .checked_add(logical_group_bytes)
+            .checked_add(u64::try_from(data.len()).unwrap_or(u64::MAX))
             .ok_or_else(|| {
                 (
                     StatusCode::PAYLOAD_TOO_LARGE,
@@ -10321,54 +8321,30 @@ fn load_exact_source_entries_with(
                 "exact source tree exceeds the expanded byte limit".to_string(),
             ));
         }
-        let actual: [u8; 32] = Sha256::digest(data.as_ref()).into();
-        if actual != digest {
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!(
-                    "immutable source blob digest mismatch for {}: requested {}, found {}",
-                    files[start].0 .0,
-                    hex::encode(digest),
-                    hex::encode(actual)
-                ),
-            ));
-        }
-        let mut symlink_target: Option<Arc<str>> = None;
-        for (file_id, source) in &files[start..end] {
-            match source.kind {
-                SourceEntryKind::File { executable } => entries.push(ExactSourceEntry::File {
-                    path: file_id.0.clone(),
-                    data: Arc::clone(&data),
-                    executable,
-                }),
-                SourceEntryKind::Symlink => {
-                    let target = if let Some(target) = &symlink_target {
-                        Arc::clone(target)
-                    } else {
-                        let target = std::str::from_utf8(data.as_ref())
-                            .map(Arc::<str>::from)
-                            .map_err(|_| {
-                                (
-                                    StatusCode::INTERNAL_SERVER_ERROR,
-                                    format!(
-                                        "exact-source symlink target bytes are not UTF-8 for {} at {}",
-                                        file_id.0,
-                                        hex::encode(digest)
-                                    ),
-                                )
-                            })?;
-                        symlink_target = Some(Arc::clone(&target));
-                        target
-                    };
-                    validate_exact_source_symlink(&file_id.0, target.as_ref())?;
-                    entries.push(ExactSourceEntry::Symlink {
-                        path: file_id.0.clone(),
-                        target,
-                    });
-                }
+
+        match artifact.entry {
+            TreeEntry::Blob { executable, .. } => entries.push(ExactSourceEntry::File {
+                path,
+                data,
+                executable,
+            }),
+            TreeEntry::Symlink { .. } => {
+                let target = std::str::from_utf8(data.as_ref())
+                    .map(Arc::<str>::from)
+                    .map_err(|_| {
+                        (
+                            StatusCode::FAILED_DEPENDENCY,
+                            format!(
+                                "exact-source symlink target bytes are not UTF-8 for {} at {}",
+                                artifact.path, digest
+                            ),
+                        )
+                    })?;
+                validate_exact_source_symlink(&path, target.as_ref())?;
+                entries.push(ExactSourceEntry::Symlink { path, target });
             }
+            TreeEntry::Gitlink { .. } => unreachable!("gitlinks fail before body load"),
         }
-        start = end;
     }
     Ok(entries)
 }
@@ -10384,22 +8360,15 @@ async fn repo_exact_source_tar_gz(
     // streaming lands so concurrent requests cannot multiply peak RSS.
     let archive_permit = try_acquire_exact_source_archive_slot(exact_source_archive_exports())?;
     let requested_change = parse_exact_source_change_id(&source_change_id)?;
-    let graph = state
-        .get_repo_graph(&repo_id)
-        .await
-        .map_err(internal_error)?;
-    if graph
-        .get_change(&requested_change)
-        .map_err(internal_error)?
-        .is_none()
-    {
+    let snapshot = repository_authority_snapshot(&state, &repo_id).await?;
+    if !snapshot.changes.contains_key(&requested_change) {
         return Err((
             StatusCode::NOT_FOUND,
             format!("semantic change {requested_change} was not found in repo {repo_id}"),
         ));
     }
 
-    let tree = resolve_exact_source_tree(graph.as_ref(), &requested_change)?;
+    let tree = repository_tree_at(snapshot, &requested_change)?;
     let state_for_archive = Arc::clone(&state);
     let repo_for_archive = repo_id.clone();
     let ((archive, manifest_hash), archive_permit) = tokio::task::spawn_blocking(move || {
@@ -10460,466 +8429,8 @@ async fn repo_exact_source_tar_gz(
     Ok((headers, body))
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
-struct RepoReleaseCheckEvidence {
-    pass: bool,
-    blockers: Vec<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
-struct RepoCoverageEvidence {
-    total_entities: usize,
-    covered_entities: usize,
-    coverage_ratio: f64,
-    missing_proof_count: usize,
-}
-
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
-struct RepoSecurityEvidence {
-    finding_count: usize,
-}
-
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
-struct RepoReleaseEvidenceResponse {
-    source_change_id: String,
-    authority_anchor: String,
-    source_manifest_sha256: String,
-    release_check: RepoReleaseCheckEvidence,
-    coverage: RepoCoverageEvidence,
-    security: RepoSecurityEvidence,
-}
-
-fn reachable_change_ids(
-    snapshot: &kin_db::GraphSnapshot,
-    head: &kin_model::SemanticChangeId,
-) -> Result<HashSet<kin_model::SemanticChangeId>, (StatusCode, String)> {
-    let mut reachable = HashSet::new();
-    let mut pending = vec![*head];
-    while let Some(change_id) = pending.pop() {
-        if !reachable.insert(change_id) {
-            continue;
-        }
-        let change = snapshot.changes.get(&change_id).ok_or_else(|| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("graph history for {head} references missing semantic change {change_id}"),
-            )
-        })?;
-        pending.extend(change.parents.iter().copied());
-    }
-    Ok(reachable)
-}
-
-fn release_evidence_graph_at(
-    frozen_graph: &kin_db::InMemoryGraph,
-    frozen_snapshot: &kin_db::GraphSnapshot,
-    head: &kin_model::SemanticChangeId,
-) -> Result<(kin_db::InMemoryGraph, [u8; 32]), (StatusCode, String)> {
-    let reachable = reachable_change_ids(frozen_snapshot, head)?;
-    let resolved = frozen_graph
-        .resolve_graph_at(head)
-        .map_err(internal_error)?;
-    let mut snapshot = kin_db::GraphSnapshot::empty();
-    snapshot.entities = resolved.entities;
-    snapshot.relations = resolved.relations;
-    snapshot.entity_revisions = resolved.entity_revisions;
-    snapshot.entity_tombstones = resolved.entity_tombstones;
-    snapshot.relation_tombstones = resolved.relation_tombstones;
-    snapshot.file_hashes = resolved
-        .file_tree
-        .into_iter()
-        .map(|(file_id, hash)| (file_id.0, *hash.as_bytes()))
-        .collect();
-
-    for change_id in &reachable {
-        let change = frozen_snapshot.changes.get(change_id).ok_or_else(|| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("reachable semantic change {change_id} disappeared from frozen history"),
-            )
-        })?;
-        snapshot.changes.insert(*change_id, change.clone());
-        for parent in &change.parents {
-            if reachable.contains(parent) {
-                snapshot
-                    .change_children
-                    .entry(*parent)
-                    .or_default()
-                    .push(*change_id);
-            }
-        }
-    }
-    for children in snapshot.change_children.values_mut() {
-        children.sort_by_key(ToString::to_string);
-        children.dedup();
-    }
-    let evidence_branch = BranchName::new("release-evidence");
-    snapshot.branches.insert(
-        evidence_branch.clone(),
-        Branch {
-            name: evidence_branch,
-            head: *head,
-        },
-    );
-
-    // Verification runs, test cases, assertions, contracts, mock hints, and
-    // coverage mappings currently have no immutable source-change/manifest
-    // binding. Grafting their current values into a historical graph lets
-    // later tests change an older release's proof, security findings, graph
-    // root, and authority anchor. Fail closed: retain only relations already
-    // reconstructed by `resolve_graph_at(head)` from source-bound history and
-    // admit no current structural verification metadata until the model binds
-    // it to immutable source authority.
-
-    snapshot.actors = frozen_snapshot.actors.clone();
-    snapshot.approvals = frozen_snapshot
-        .approvals
-        .iter()
-        .filter(|approval| reachable.contains(&approval.change_id))
-        .cloned()
-        .collect();
-
-    let graph_root = kin_db::compute_graph_root_hash(&snapshot);
-    Ok((
-        kin_db::InMemoryGraph::from_snapshot_without_text_index_with_root_hash(
-            snapshot, graph_root,
-        ),
-        graph_root,
-    ))
-}
-
-fn append_anchor_field(hasher: &mut Sha256, value: &[u8]) {
-    hasher.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_le_bytes());
-    hasher.update(value);
-}
-
-fn release_evidence_anchor(
-    repo_id: &str,
-    source_change_id: &str,
-    source_manifest_hash: &str,
-    graph_root: [u8; 32],
-    release_check: &RepoReleaseCheckEvidence,
-    coverage: &RepoCoverageEvidence,
-    security: &RepoSecurityEvidence,
-) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(b"kin-release-evidence-v1\0");
-    append_anchor_field(&mut hasher, repo_id.as_bytes());
-    append_anchor_field(&mut hasher, source_change_id.as_bytes());
-    append_anchor_field(&mut hasher, source_manifest_hash.as_bytes());
-    append_anchor_field(&mut hasher, &graph_root);
-    hasher.update([u8::from(release_check.pass)]);
-    for blocker in &release_check.blockers {
-        append_anchor_field(&mut hasher, blocker.as_bytes());
-    }
-    hasher.update(
-        u64::try_from(coverage.total_entities)
-            .unwrap_or(u64::MAX)
-            .to_le_bytes(),
-    );
-    hasher.update(
-        u64::try_from(coverage.covered_entities)
-            .unwrap_or(u64::MAX)
-            .to_le_bytes(),
-    );
-    hasher.update(coverage.coverage_ratio.to_bits().to_le_bytes());
-    hasher.update(
-        u64::try_from(coverage.missing_proof_count)
-            .unwrap_or(u64::MAX)
-            .to_le_bytes(),
-    );
-    hasher.update(
-        u64::try_from(security.finding_count)
-            .unwrap_or(u64::MAX)
-            .to_le_bytes(),
-    );
-    hex::encode(hasher.finalize())
-}
-
-fn build_repo_release_evidence(
-    state: &DaemonState,
-    repo_id: &str,
-    source_change_id: kin_model::SemanticChangeId,
-    frozen_snapshot: kin_db::GraphSnapshot,
-) -> Result<RepoReleaseEvidenceResponse, (StatusCode, String)> {
-    let frozen_root = kin_db::compute_graph_root_hash(&frozen_snapshot);
-    let frozen_graph = kin_db::InMemoryGraph::from_snapshot_without_text_index_with_root_hash(
-        frozen_snapshot.clone(),
-        frozen_root,
-    );
-    if frozen_graph
-        .get_change(&source_change_id)
-        .map_err(internal_error)?
-        .is_none()
-    {
-        return Err((
-            StatusCode::NOT_FOUND,
-            format!("semantic change {source_change_id} was not found in repo {repo_id}"),
-        ));
-    }
-
-    let source_tree = resolve_exact_source_tree(&frozen_graph, &source_change_id)?;
-    let source_entries = load_exact_source_entries(state, repo_id, source_tree)?;
-    let source_manifest = canonical_exact_source_manifest(&source_entries)?;
-    let source_manifest_hash = hex::encode(Sha256::digest(&source_manifest));
-
-    let (evidence_graph, evidence_root) =
-        release_evidence_graph_at(&frozen_graph, &frozen_snapshot, &source_change_id)?;
-    let coverage_summary = kin_review::source_bound_release_proof_coverage(&evidence_graph)
-        .map_err(|error| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("source-bound release proof scan failed: {error}"),
-            )
-        })?;
-    let mut unapproved =
-        kin_review::unapproved_changes(&evidence_graph, &source_change_id, usize::MAX).map_err(
-            |error| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("source-bound release approval scan failed: {error}"),
-                )
-            },
-        )?;
-    unapproved.sort_by_key(|change| change.change_id.to_string());
-
-    let mut blockers = Vec::new();
-    if !coverage_summary.missing_proof.is_empty() {
-        blockers.push(format!(
-            "{} entities missing test proof",
-            coverage_summary.missing_proof.len()
-        ));
-    }
-    if !unapproved.is_empty() {
-        let detail = unapproved
-            .iter()
-            .map(|change| format!("{} ({})", change.change_id, change.author))
-            .collect::<Vec<_>>()
-            .join(", ");
-        blockers.push(format!(
-            "{} non-root change(s) lack human approval: {detail}",
-            unapproved.len()
-        ));
-    }
-    let release_check = RepoReleaseCheckEvidence {
-        pass: blockers.is_empty(),
-        blockers,
-    };
-    let coverage = RepoCoverageEvidence {
-        total_entities: coverage_summary.total_entities,
-        covered_entities: coverage_summary.covered_entities,
-        coverage_ratio: coverage_summary.coverage_ratio,
-        missing_proof_count: coverage_summary.missing_proof.len(),
-    };
-    let security = RepoSecurityEvidence {
-        finding_count: kin_review::security_findings(&evidence_graph, true)
-            .map_err(|error| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("source-bound security scan failed: {error}"),
-                )
-            })?
-            .len(),
-    };
-    let canonical_change = source_change_id.to_string();
-    let authority_anchor = release_evidence_anchor(
-        repo_id,
-        &canonical_change,
-        &source_manifest_hash,
-        evidence_root,
-        &release_check,
-        &coverage,
-        &security,
-    );
-
-    Ok(RepoReleaseEvidenceResponse {
-        source_change_id: canonical_change,
-        authority_anchor,
-        source_manifest_sha256: source_manifest_hash,
-        release_check,
-        coverage,
-        security,
-    })
-}
-
-/// GET /repos/{repo_id}/release/evidence/{source_change_id} — compute Kin's
-/// release, proof-coverage, and security gates against one immutable source
-/// change. The exact source manifest and historical graph root are bound into
-/// the returned authority anchor.
-async fn repo_release_evidence(
-    Path((repo_id, source_change_id)): Path<(String, String)>,
-    State(state): State<Arc<DaemonState>>,
-) -> Result<Json<RepoReleaseEvidenceResponse>, (StatusCode, String)> {
-    // Evidence computes the same exact-source manifest as archive export and
-    // currently reads whole backend blobs. Share the process-wide singleton so
-    // an evidence request cannot multiply archive export's bounded peak RSS.
-    let archive_permit = try_acquire_exact_source_archive_slot(exact_source_archive_exports())?;
-    let requested_change = parse_exact_source_change_id(&source_change_id)?;
-    let graph = state
-        .get_repo_graph(&repo_id)
-        .await
-        .map_err(internal_error)?;
-    let frozen_snapshot = graph.to_snapshot();
-    let state_for_evidence = Arc::clone(&state);
-    let repo_for_evidence = repo_id.clone();
-    let evidence = tokio::task::spawn_blocking(move || {
-        let _archive_permit = archive_permit;
-        build_repo_release_evidence(
-            &state_for_evidence,
-            &repo_for_evidence,
-            requested_change,
-            frozen_snapshot,
-        )
-    })
-    .await
-    .map_err(|error| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("source-bound release evidence worker failed: {error}"),
-        )
-    })??;
-    Ok(Json(evidence))
-}
-
-fn repo_name(state: &DaemonState) -> String {
-    primary_repo_id(state)
-}
-
-/// Collect the current file tree contents as (path, bytes) pairs.
-fn collect_archive_files(
-    state: &DaemonState,
-    snapshot: &VfsTreeSnapshot,
-) -> Result<Vec<(String, Vec<u8>)>, (StatusCode, String)> {
-    let mut files: Vec<(String, Vec<u8>)> = Vec::with_capacity(snapshot.files.len());
-    for (file_id, hash) in snapshot.files.iter() {
-        let blob_hash = kin_blobs::Hash256(hash.0);
-        let data = state.blobs.read(&blob_hash).map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("blob read error for {}: {e}", file_id.0),
-            )
-        })?;
-        files.push((file_id.0.clone(), data));
-    }
-    files.sort_by(|a, b| a.0.cmp(&b.0));
-    Ok(files)
-}
-
-/// GET /archive/{ref}.tar.gz — download a gzipped tarball of the repo file tree.
-async fn archive_tar_gz(
-    Path(git_ref): Path<String>,
-    State(state): State<Arc<DaemonState>>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let snapshot = current_vfs_snapshot(&state).await?;
-    let files = collect_archive_files(&state, &snapshot)?;
-    let name = repo_name(&state);
-    let prefix = format!("{name}-{git_ref}/");
-
-    let mut buf = Vec::new();
-    {
-        let gz = flate2::write::GzEncoder::new(&mut buf, flate2::Compression::fast());
-        let mut archive = tar::Builder::new(gz);
-
-        for (path, data) in &files {
-            let mut hdr = tar::Header::new_gnu();
-            hdr.set_size(data.len() as u64);
-            hdr.set_mode(0o644);
-            hdr.set_cksum();
-            let entry_path = format!("{prefix}{path}");
-            archive
-                .append_data(&mut hdr, &entry_path, data.as_slice())
-                .map_err(|e| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("tar write error: {e}"),
-                    )
-                })?;
-        }
-
-        archive.finish().map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("tar finish error: {e}"),
-            )
-        })?;
-    }
-
-    let filename = format!("{name}-{git_ref}.tar.gz");
-    Ok((
-        [
-            (header::CONTENT_TYPE, "application/gzip".to_string()),
-            (
-                header::CONTENT_DISPOSITION,
-                format!("attachment; filename=\"{filename}\""),
-            ),
-            (header::CACHE_CONTROL, "public, max-age=300".to_string()),
-        ],
-        buf,
-    ))
-}
-
-/// GET /archive/{ref}.zip — download a zip archive of the repo file tree.
-async fn archive_zip(
-    Path(git_ref): Path<String>,
-    State(state): State<Arc<DaemonState>>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let snapshot = current_vfs_snapshot(&state).await?;
-    let files = collect_archive_files(&state, &snapshot)?;
-    let name = repo_name(&state);
-    let prefix = format!("{name}-{git_ref}/");
-
-    let mut buf = Vec::new();
-    {
-        let cursor = std::io::Cursor::new(&mut buf);
-        let mut zip = zip::ZipWriter::new(cursor);
-        let options = zip::write::SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Deflated)
-            .unix_permissions(0o644);
-
-        for (path, data) in &files {
-            let entry_path = format!("{prefix}{path}");
-            zip.start_file(&entry_path, options).map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("zip write error: {e}"),
-                )
-            })?;
-            zip.write_all(data).map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("zip write error: {e}"),
-                )
-            })?;
-        }
-
-        zip.finish().map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("zip finish error: {e}"),
-            )
-        })?;
-    }
-
-    let filename = format!("{name}-{git_ref}.zip");
-    Ok((
-        [
-            (header::CONTENT_TYPE, "application/zip".to_string()),
-            (
-                header::CONTENT_DISPOSITION,
-                format!("attachment; filename=\"{filename}\""),
-            ),
-            (header::CACHE_CONTROL, "public, max-age=300".to_string()),
-        ],
-        buf,
-    ))
-}
-
 fn internal_error<E: std::fmt::Display>(error: E) -> (StatusCode, String) {
     (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
-}
-
-fn bad_request<E: std::fmt::Display>(error: E) -> (StatusCode, String) {
-    (StatusCode::BAD_REQUEST, error.to_string())
 }
 
 impl From<Intent> for IntentResponse {
@@ -11256,26 +8767,23 @@ mod tests {
         let bytes = b"shared archive payload\n";
         let digest: [u8; 32] = Sha256::digest(bytes).into();
         let hash = Hash256::from_bytes(digest);
-        let tree = HashMap::from([
-            (
-                FilePathId::new("src/first.rs"),
-                ResolvedSourceEntry {
-                    hash,
-                    kind: SourceEntryKind::File { executable: false },
-                },
+        let tree = kin_model::ResolvedTree::from_artifacts([
+            kin_model::ResolvedArtifact::new(
+                kin_model::ArtifactId::new(),
+                RepoPath::from_utf8("src/first.rs").unwrap(),
+                TreeEntry::blob(hash, false),
             ),
-            (
-                FilePathId::new("src/second.rs"),
-                ResolvedSourceEntry {
-                    hash,
-                    kind: SourceEntryKind::File { executable: true },
-                },
+            kin_model::ResolvedArtifact::new(
+                kin_model::ArtifactId::new(),
+                RepoPath::from_utf8("src/second.rs").unwrap(),
+                TreeEntry::blob(hash, true),
             ),
-        ]);
+        ])
+        .unwrap();
         let mut loads = 0;
         let entries = load_exact_source_entries_with(tree, |_, requested, max_bytes| {
             loads += 1;
-            assert_eq!(requested, digest);
+            assert_eq!(requested, hash);
             assert_eq!(max_bytes, EXACT_SOURCE_MAX_EXPANDED_BYTES as u64);
             Ok(Some(bytes.to_vec()))
         })
@@ -11297,27 +8805,26 @@ mod tests {
         let second = b"second immutable payload with a different length\n";
         let first_digest: [u8; 32] = Sha256::digest(first).into();
         let second_digest: [u8; 32] = Sha256::digest(second).into();
-        let tree = HashMap::from([
-            (
-                FilePathId::new("src/first.rs"),
-                ResolvedSourceEntry {
-                    hash: Hash256::from_bytes(first_digest),
-                    kind: SourceEntryKind::File { executable: false },
-                },
+        let first_hash = Hash256::from_bytes(first_digest);
+        let second_hash = Hash256::from_bytes(second_digest);
+        let tree = kin_model::ResolvedTree::from_artifacts([
+            kin_model::ResolvedArtifact::new(
+                kin_model::ArtifactId::new(),
+                RepoPath::from_utf8("src/first.rs").unwrap(),
+                TreeEntry::blob(first_hash, false),
             ),
-            (
-                FilePathId::new("src/second.rs"),
-                ResolvedSourceEntry {
-                    hash: Hash256::from_bytes(second_digest),
-                    kind: SourceEntryKind::File { executable: false },
-                },
+            kin_model::ResolvedArtifact::new(
+                kin_model::ArtifactId::new(),
+                RepoPath::from_utf8("src/second.rs").unwrap(),
+                TreeEntry::blob(second_hash, false),
             ),
-        ]);
+        ])
+        .unwrap();
         let mut expected = [
-            (first_digest, first.as_slice()),
-            (second_digest, second.as_slice()),
+            (first_hash, first.as_slice()),
+            (second_hash, second.as_slice()),
         ];
-        expected.sort_by_key(|(digest, _)| *digest);
+        expected.sort_by_key(|(digest, _)| digest.to_string());
         let mut observed = Vec::new();
 
         load_exact_source_entries_with(tree, |_, requested, max_bytes| {
@@ -11338,214 +8845,6 @@ mod tests {
             observed[1].1,
             EXACT_SOURCE_MAX_EXPANDED_BYTES as u64 - expected[0].1.len() as u64
         );
-    }
-
-    #[test]
-    fn historical_release_evidence_omits_unbound_later_verification_runs() {
-        use kin_model::VerificationStore;
-
-        let graph = kin_db::InMemoryGraph::new();
-        let root = kin_core::build_genesis_change();
-        graph.create_change(&root).unwrap();
-        let entity = test_entity("source_bound", "src/lib.rs");
-        let mut source_change = root.clone();
-        source_change.id = SemanticChangeId::from_hash(Hash256::from_bytes([0x85; 32]));
-        source_change.parents = vec![root.id];
-        source_change.message = "historical source".to_string();
-        source_change.entity_deltas = vec![kin_model::EntityDelta::Added(entity.clone())];
-        graph.create_change(&source_change).unwrap();
-        graph.upsert_entity(&entity).unwrap();
-
-        let run = kin_model::VerificationRun {
-            run_id: kin_model::VerificationRunId::new(),
-            test_ids: vec![],
-            status: kin_model::VerificationStatus::Passing,
-            runner: kin_model::TestRunner::Cargo,
-            started_at: Timestamp::now(),
-            finished_at: Some(Timestamp::now()),
-            duration_ms: Some(1),
-            evidence_blob: None,
-            exit_code: Some(0),
-        };
-        graph.create_verification_run(&run).unwrap();
-        graph
-            .link_run_proves_entity(&run.run_id, &entity.id)
-            .unwrap();
-        assert_eq!(
-            kin_review::passing_proof_coverage(&graph)
-                .unwrap()
-                .covered_entities,
-            1,
-            "the current unbound run is a false-green without historical filtering"
-        );
-
-        let snapshot = graph.to_snapshot();
-        let (historical, _) =
-            release_evidence_graph_at(&graph, &snapshot, &source_change.id).unwrap();
-        let coverage = kin_review::passing_proof_coverage(&historical).unwrap();
-        assert_eq!(coverage.total_entities, 1);
-        assert_eq!(coverage.covered_entities, 0);
-        assert_eq!(coverage.missing_proof, vec![entity.id]);
-    }
-
-    #[test]
-    fn later_unbound_tests_cannot_rewrite_historical_security_or_anchor() {
-        use kin_model::{EntityStore, VerificationStore};
-
-        let graph = kin_db::InMemoryGraph::new();
-        let root = kin_core::build_genesis_change();
-        graph.create_change(&root).unwrap();
-        let mut entity = test_entity("historical_endpoint", "src/api.rs");
-        entity.kind = EntityKind::ApiEndpoint;
-        let mut source_change = root.clone();
-        source_change.id = SemanticChangeId::from_hash(Hash256::from_bytes([0x86; 32]));
-        source_change.parents = vec![root.id];
-        source_change.message = "historical endpoint source".to_string();
-        source_change.entity_deltas = vec![kin_model::EntityDelta::Added(entity.clone())];
-        graph.create_change(&source_change).unwrap();
-        graph.upsert_entity(&entity).unwrap();
-
-        let before_snapshot = graph.to_snapshot();
-        let (before_graph, before_root) =
-            release_evidence_graph_at(&graph, &before_snapshot, &source_change.id).unwrap();
-        let before_security_count = kin_review::security_findings(&before_graph, true)
-            .unwrap()
-            .len();
-        assert!(before_security_count > 0);
-
-        let release_check = RepoReleaseCheckEvidence {
-            pass: false,
-            blockers: vec!["fixed historical blocker".to_string()],
-        };
-        let coverage = RepoCoverageEvidence {
-            total_entities: 1,
-            covered_entities: 0,
-            coverage_ratio: 0.0,
-            missing_proof_count: 1,
-        };
-        let before_security = RepoSecurityEvidence {
-            finding_count: before_security_count,
-        };
-        let before_anchor = release_evidence_anchor(
-            "repo",
-            &source_change.id.to_string(),
-            "fixed-manifest",
-            before_root,
-            &release_check,
-            &coverage,
-            &before_security,
-        );
-
-        let test = kin_model::TestCase {
-            test_id: kin_model::TestId::new(),
-            name: "later_endpoint_test".to_string(),
-            language: "rust".to_string(),
-            kind: kin_model::TestKind::Unit,
-            scopes: vec![kin_model::WorkScope::Entity(entity.id)],
-            runner: kin_model::TestRunner::Cargo,
-            file_origin: Some(FilePathId::new("tests/later.rs")),
-        };
-        graph.create_test_case(&test).unwrap();
-        graph
-            .create_assertion(&kin_model::Assertion {
-                assertion_id: kin_model::AssertionId::new(),
-                summary: "later assertion".to_string(),
-                expected_behavior: "later behavior".to_string(),
-                target_scope: kin_model::WorkScope::Entity(entity.id),
-            })
-            .unwrap();
-        graph
-            .create_contract(&kin_model::Contract {
-                id: EntityId::new(),
-                kind: kin_model::ContractKind::OpenApi,
-                name: "later contract".to_string(),
-                schema_hash: Hash256::from_bytes([0x87; 32]),
-                producers: vec![entity.id],
-                consumers: vec![],
-                version: None,
-            })
-            .unwrap();
-        graph
-            .create_mock_hint(&kin_model::MockHint {
-                hint_id: kin_model::MockHintId::new(),
-                test_id: test.test_id,
-                dependency_scope: kin_model::WorkScope::Entity(entity.id),
-                strategy: kin_model::MockStrategy::Stub,
-            })
-            .unwrap();
-        graph
-            .upsert_relation(&kin_model::Relation {
-                id: kin_model::RelationId::new(),
-                kind: RelationKind::Tests,
-                // The release scanner's entity relation API currently admits
-                // only entity-to-entity edges. This uncommitted overlay edge
-                // has the exact shape that the former historical graft copied
-                // and that can false-green `untested-api`.
-                src: GraphNodeId::Entity(entity.id),
-                dst: GraphNodeId::Entity(entity.id),
-                confidence: 1.0,
-                origin: kin_model::RelationOrigin::Inferred,
-                created_in: None,
-                import_source: None,
-                evidence: vec![],
-            })
-            .unwrap();
-        assert!(
-            kin_review::security_findings(&graph, true).unwrap().len() < before_security_count,
-            "the later unbound Tests relation must demonstrate the false-green current graph"
-        );
-
-        let mut after_snapshot = graph.to_snapshot();
-        after_snapshot
-            .test_covers_entity
-            .push((test.test_id, entity.id));
-        assert!(!after_snapshot.test_cases.is_empty());
-        assert!(!after_snapshot.assertions.is_empty());
-        assert!(!after_snapshot.contracts.is_empty());
-        assert!(!after_snapshot.mock_hints.is_empty());
-        assert!(!after_snapshot.test_covers_entity.is_empty());
-        assert!(after_snapshot
-            .relations
-            .values()
-            .any(|relation| matches!(relation.kind, RelationKind::Tests | RelationKind::Covers)));
-
-        let after_snapshot_root = kin_db::compute_graph_root_hash(&after_snapshot);
-        let after_frozen = kin_db::InMemoryGraph::from_snapshot_without_text_index_with_root_hash(
-            after_snapshot.clone(),
-            after_snapshot_root,
-        );
-        let (after_graph, after_root) =
-            release_evidence_graph_at(&after_frozen, &after_snapshot, &source_change.id).unwrap();
-        let historical_snapshot = after_graph.to_snapshot();
-        assert!(historical_snapshot.test_cases.is_empty());
-        assert!(historical_snapshot.assertions.is_empty());
-        assert!(historical_snapshot.contracts.is_empty());
-        assert!(historical_snapshot.mock_hints.is_empty());
-        assert!(historical_snapshot.test_covers_entity.is_empty());
-        assert!(!historical_snapshot
-            .relations
-            .values()
-            .any(|relation| matches!(relation.kind, RelationKind::Tests | RelationKind::Covers)));
-
-        let after_security_count = kin_review::security_findings(&after_graph, true)
-            .unwrap()
-            .len();
-        let after_security = RepoSecurityEvidence {
-            finding_count: after_security_count,
-        };
-        let after_anchor = release_evidence_anchor(
-            "repo",
-            &source_change.id.to_string(),
-            "fixed-manifest",
-            after_root,
-            &release_check,
-            &coverage,
-            &after_security,
-        );
-
-        assert_eq!(after_security_count, before_security_count);
-        assert_eq!(after_root, before_root);
-        assert_eq!(after_anchor, before_anchor);
     }
 
     #[test]
@@ -11726,411 +9025,6 @@ mod tests {
         assert!(validate_exact_source_symlink("dir/link", "../.kin-session/base.json").is_err());
         assert!(validate_exact_source_symlink("dir/link", "../.KiN-SeSsIoN/base.json").is_err());
         assert!(validate_exact_source_symlink("dir/link", "../README.md").is_ok());
-    }
-
-    fn exact_source_backend_state(repo_id: &str) -> Arc<DaemonState> {
-        install_test_registry_override();
-        let directory =
-            std::env::temp_dir().join(format!("kin-daemon-exact-source-{}", uuid::Uuid::new_v4()));
-        let kin_dir = directory.join(".kin");
-        std::fs::create_dir_all(kin_dir.join("objects")).unwrap();
-        std::fs::create_dir_all(kin_dir.join("working")).unwrap();
-        let layout = kin_core::KinLayout::new(kin_dir);
-        kin_core::manifest::KinManifest::new()
-            .save(&layout.manifest_path())
-            .unwrap();
-        let backend = directory.join("backend");
-        std::fs::create_dir_all(&backend).unwrap();
-        Arc::new(
-            DaemonState::open_with_backend(
-                layout,
-                Box::new(kin_db::LocalFileBackend::new(backend)),
-                repo_id,
-                None,
-            )
-            .unwrap(),
-        )
-    }
-
-    fn exact_source_delta(
-        state: &DaemonState,
-        path: &str,
-        kind: ArtifactDeltaKind,
-        old_hash: Option<Hash256>,
-        data: &[u8],
-    ) -> ArtifactDelta {
-        let blob_hash = state.blobs.write(data).unwrap();
-        ArtifactDelta {
-            file_id: FilePathId::new(path),
-            kind,
-            old_hash,
-            new_hash: Some(blob_hash),
-        }
-    }
-
-    fn install_two_change_exact_source_history(
-        state: &DaemonState,
-    ) -> (SemanticChangeId, SemanticChangeId) {
-        let branch_name = BranchName::new("main");
-        let old_readme = state.blobs.write(b"old source\n").unwrap();
-        let first_entity = test_entity("first_source_entity", "src/first.rs");
-        state.graph.upsert_entity(&first_entity).unwrap();
-        let first = SemanticChange {
-            id: SemanticChangeId::from_hash(Hash256::from_bytes([81; 32])),
-            parents: vec![],
-            timestamp: Timestamp::now(),
-            author: AuthorId::new("human-test"),
-            message: "first exact source".to_string(),
-            entity_deltas: vec![EntityDelta::Added(first_entity)],
-            relation_deltas: vec![],
-            artifact_deltas: vec![
-                ArtifactDelta {
-                    file_id: FilePathId::new("README.md"),
-                    kind: ArtifactDeltaKind::AddedRegularFile,
-                    old_hash: None,
-                    new_hash: Some(old_readme),
-                },
-                exact_source_delta(
-                    state,
-                    "bin/run",
-                    ArtifactDeltaKind::AddedExecutableFile,
-                    None,
-                    b"#!/bin/sh\necho old\n",
-                ),
-                exact_source_delta(
-                    state,
-                    "current",
-                    ArtifactDeltaKind::AddedSymlink,
-                    None,
-                    b"bin/run",
-                ),
-            ],
-            projected_files: vec![],
-            spec_link: None,
-            evidence: vec![],
-            risk_summary: None,
-            authored_on: Some(branch_name.clone()),
-        };
-        state.graph.create_change(&first).unwrap();
-        state
-            .graph
-            .create_branch(&Branch {
-                name: branch_name.clone(),
-                head: first.id,
-            })
-            .unwrap();
-
-        let second_entity = test_entity("second_source_entity", "src/second.rs");
-        state.graph.upsert_entity(&second_entity).unwrap();
-        let second = SemanticChange {
-            id: SemanticChangeId::from_hash(Hash256::from_bytes([82; 32])),
-            parents: vec![first.id],
-            timestamp: Timestamp::now(),
-            author: AuthorId::new("human-test"),
-            message: "newer exact source".to_string(),
-            entity_deltas: vec![EntityDelta::Added(second_entity)],
-            relation_deltas: vec![],
-            artifact_deltas: vec![exact_source_delta(
-                state,
-                "README.md",
-                ArtifactDeltaKind::ModifiedRegularFile,
-                Some(old_readme),
-                b"new source\n",
-            )],
-            projected_files: vec![],
-            spec_link: None,
-            evidence: vec![],
-            risk_summary: None,
-            authored_on: Some(branch_name.clone()),
-        };
-        state.graph.create_change(&second).unwrap();
-        state
-            .graph
-            .update_branch_head(&branch_name, &second.id)
-            .unwrap();
-        state.save_snapshot_full().unwrap();
-        (first.id, second.id)
-    }
-
-    async fn exact_source_get(
-        app: Router,
-        path: String,
-        authenticated: bool,
-    ) -> axum::response::Response {
-        let mut request = Request::get(path);
-        if authenticated {
-            request = request.header(header::AUTHORIZATION, "Bearer exact-source-token");
-        }
-        app.oneshot(request.body(Body::empty()).unwrap())
-            .await
-            .unwrap()
-    }
-
-    fn read_exact_source_tar_entry(
-        archive: &[u8],
-        wanted: &str,
-    ) -> (u32, bool, Option<String>, Vec<u8>) {
-        use std::io::Read;
-
-        let decoder = flate2::read::GzDecoder::new(archive);
-        let mut archive = tar::Archive::new(decoder);
-        for entry in archive.entries().unwrap() {
-            let mut entry = entry.unwrap();
-            if entry.path().unwrap().as_ref() != FsPath::new(wanted) {
-                continue;
-            }
-            let mode = entry.header().mode().unwrap();
-            let is_symlink = entry.header().entry_type().is_symlink();
-            let link = entry
-                .link_name()
-                .unwrap()
-                .map(|target| target.to_string_lossy().into_owned());
-            let mut data = Vec::new();
-            entry.read_to_end(&mut data).unwrap();
-            return (mode, is_symlink, link, data);
-        }
-        panic!("archive entry {wanted:?} was not found")
-    }
-
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn exact_source_routes_are_authenticated_historical_and_file_independent() {
-        let repo_id = "exact-route-repo";
-        let state = exact_source_backend_state(repo_id);
-        let (old_change, new_change) = install_two_change_exact_source_history(&state);
-        let app = router_with_auth(Arc::clone(&state), Some("exact-source-token".to_string()));
-        let old_path = format!("/repos/{repo_id}/archive/tar/{old_change}");
-
-        let rejected = exact_source_get(app.clone(), old_path.clone(), false).await;
-        assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
-
-        let old_response = exact_source_get(app.clone(), old_path.clone(), true).await;
-        assert_eq!(old_response.status(), StatusCode::OK);
-        assert_eq!(
-            old_response.headers()["x-kin-source-change-id"],
-            old_change.to_string()
-        );
-        let old_manifest = old_response.headers()["x-kin-source-manifest-sha256"].clone();
-        let old_archive_frame = axum::body::to_bytes(old_response.into_body(), 1024 * 1024)
-            .await
-            .unwrap();
-        // Tower's in-process transport hands the server-owned Bytes directly
-        // to the test client. Copy into client-owned storage and release that
-        // server allocation, matching a real network write completing.
-        let old_archive = old_archive_frame.to_vec();
-        drop(old_archive_frame);
-        assert_eq!(
-            read_exact_source_tar_entry(&old_archive, "kin-source/README.md"),
-            (0o644, false, None, b"old source\n".to_vec())
-        );
-        assert_eq!(
-            read_exact_source_tar_entry(&old_archive, "kin-source/bin/run"),
-            (0o755, false, None, b"#!/bin/sh\necho old\n".to_vec())
-        );
-        assert_eq!(
-            read_exact_source_tar_entry(&old_archive, "kin-source/current"),
-            (0o777, true, Some("bin/run".to_string()), Vec::new())
-        );
-
-        // A newer branch head and a decoy working-tree file cannot change the
-        // bytes returned for the explicitly requested historical source ID.
-        std::fs::write(state.layout.working_dir().join("README.md"), b"raw decoy\n").unwrap();
-        let repeated = exact_source_get(app.clone(), old_path, true).await;
-        assert_eq!(repeated.status(), StatusCode::OK);
-        assert_eq!(
-            repeated.headers()["x-kin-source-manifest-sha256"],
-            old_manifest
-        );
-        let repeated_archive_frame = axum::body::to_bytes(repeated.into_body(), 1024 * 1024)
-            .await
-            .unwrap();
-        let repeated_archive = repeated_archive_frame.to_vec();
-        drop(repeated_archive_frame);
-        assert_eq!(old_archive, repeated_archive);
-
-        let new_response = exact_source_get(
-            app.clone(),
-            format!("/repos/{repo_id}/archive/tar/{new_change}"),
-            true,
-        )
-        .await;
-        assert_eq!(new_response.status(), StatusCode::OK);
-        let new_manifest = new_response.headers()["x-kin-source-manifest-sha256"].clone();
-        assert_ne!(old_manifest, new_manifest);
-        let new_archive_frame = axum::body::to_bytes(new_response.into_body(), 1024 * 1024)
-            .await
-            .unwrap();
-        let new_archive = new_archive_frame.to_vec();
-        drop(new_archive_frame);
-        assert_eq!(
-            read_exact_source_tar_entry(&new_archive, "kin-source/README.md").3,
-            b"new source\n"
-        );
-
-        let old_evidence = exact_source_get(
-            app.clone(),
-            format!("/repos/{repo_id}/release/evidence/{old_change}"),
-            true,
-        )
-        .await;
-        assert_eq!(old_evidence.status(), StatusCode::OK);
-        let old_evidence: RepoReleaseEvidenceResponse = serde_json::from_slice(
-            &axum::body::to_bytes(old_evidence.into_body(), 64 * 1024)
-                .await
-                .unwrap(),
-        )
-        .unwrap();
-        let new_evidence = exact_source_get(
-            app,
-            format!("/repos/{repo_id}/release/evidence/{new_change}"),
-            true,
-        )
-        .await;
-        assert_eq!(new_evidence.status(), StatusCode::OK);
-        let new_evidence: RepoReleaseEvidenceResponse = serde_json::from_slice(
-            &axum::body::to_bytes(new_evidence.into_body(), 64 * 1024)
-                .await
-                .unwrap(),
-        )
-        .unwrap();
-
-        assert_eq!(old_evidence.source_change_id, old_change.to_string());
-        assert_eq!(new_evidence.source_change_id, new_change.to_string());
-        assert_eq!(old_evidence.coverage.total_entities, 1);
-        assert_eq!(new_evidence.coverage.total_entities, 2);
-        assert_eq!(old_evidence.coverage.missing_proof_count, 1);
-        assert_eq!(new_evidence.coverage.missing_proof_count, 2);
-        assert_ne!(old_evidence.authority_anchor, new_evidence.authority_anchor);
-        assert_eq!(
-            old_evidence.source_manifest_sha256,
-            old_manifest.to_str().unwrap()
-        );
-        assert_eq!(
-            new_evidence.source_manifest_sha256,
-            new_manifest.to_str().unwrap()
-        );
-    }
-
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn exact_source_archive_fails_closed_on_legacy_mode_gap() {
-        let repo_id = "legacy-source-gap";
-        let state = exact_source_backend_state(repo_id);
-        let content = state.blobs.write(b"local compatibility bytes\n").unwrap();
-        let change = SemanticChange {
-            id: SemanticChangeId::from_hash(Hash256::from_bytes([83; 32])),
-            parents: vec![],
-            timestamp: Timestamp::now(),
-            author: AuthorId::new("human-test"),
-            message: "legacy source".to_string(),
-            entity_deltas: vec![],
-            relation_deltas: vec![],
-            artifact_deltas: vec![ArtifactDelta {
-                file_id: FilePathId::new("legacy.txt"),
-                kind: ArtifactDeltaKind::Added,
-                old_hash: None,
-                new_hash: Some(content),
-            }],
-            projected_files: vec![],
-            spec_link: None,
-            evidence: vec![],
-            risk_summary: None,
-            authored_on: None,
-        };
-        state.graph.create_change(&change).unwrap();
-        state.save_snapshot_full().unwrap();
-        std::fs::write(
-            state.layout.working_dir().join("legacy.txt"),
-            b"filesystem fallback must not be served\n",
-        )
-        .unwrap();
-
-        let response = exact_source_get(
-            router_with_auth(state, Some("exact-source-token".to_string())),
-            format!("/repos/{repo_id}/archive/tar/{}", change.id),
-            true,
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::FAILED_DEPENDENCY);
-        let body = String::from_utf8(
-            axum::body::to_bytes(response.into_body(), 16 * 1024)
-                .await
-                .unwrap()
-                .to_vec(),
-        )
-        .unwrap();
-        assert!(body.contains("exact source history is incomplete"));
-        assert!(body.contains("no fallback was attempted"));
-    }
-
-    /// Dispatching the prepare must leave the async worker schedulable.
-    ///
-    /// Pinned to a single worker deliberately. This defect is invisible above
-    /// one core: with several workers a parked one is masked by the others, so
-    /// a green multi-core run cannot demonstrate the fix. One worker makes
-    /// "the prepare parked the only worker" observable.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    async fn prepare_on_blocking_pool_leaves_the_async_worker_schedulable() {
-        let ticks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let ticker_ticks = Arc::clone(&ticks);
-        let ticker = tokio::spawn(async move {
-            loop {
-                ticker_ticks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                tokio::time::sleep(Duration::from_millis(2)).await;
-            }
-        });
-
-        // Stands in for the synchronous multi-minute hydration replay.
-        let (value, gate) = prepare_on_blocking_pool(None, || {
-            std::thread::sleep(Duration::from_millis(150));
-            7_u32
-        })
-        .await
-        .expect("blocking prepare joins");
-
-        assert_eq!(value, 7);
-        assert!(gate.is_none());
-        // Run inline on the async worker, that 150ms sleep would have parked the
-        // only worker and this ticker could never have advanced.
-        let observed = ticks.load(std::sync::atomic::Ordering::SeqCst);
-        ticker.abort();
-        assert!(
-            observed > 1,
-            "async worker was starved during the blocking prepare ({observed} ticks)"
-        );
-    }
-
-    /// The hydration gate must stay held for the whole prepare and come back
-    /// still locked, so the caller keeps deciding when it drops.
-    ///
-    /// Releasing it early would let two deep imports overlap — roughly 2x peak
-    /// memory, the thing the gate exists to prevent — and would produce no
-    /// compile error, so the invariant is pinned here rather than left to
-    /// review.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn prepare_on_blocking_pool_holds_the_gate_and_hands_it_back_locked() {
-        let gate = Arc::new(tokio::sync::Mutex::new(()));
-        let guard = Arc::clone(&gate).lock_owned().await;
-        let probe = Arc::clone(&gate);
-
-        let (_, returned) = prepare_on_blocking_pool(Some(guard), move || {
-            assert!(
-                probe.try_lock().is_err(),
-                "gate was released while the prepare was still running"
-            );
-        })
-        .await
-        .expect("blocking prepare joins");
-
-        assert!(
-            gate.try_lock().is_err(),
-            "gate was released before the caller dropped it"
-        );
-        drop(returned);
-        assert!(
-            gate.try_lock().is_ok(),
-            "gate did not release when the caller dropped it"
-        );
     }
 
     #[test]
@@ -12668,13 +9562,11 @@ mod tests {
     }
     use axum::routing::get as axum_get;
     use kin_model::{
-        Actor, ActorId, ActorKind, AgentSession, AnnotationFilter, Approval, ApprovalDecision,
-        ApprovalId, ArtifactDelta, ArtifactDeltaKind, AuditEventId, AuthorId, Branch, BranchName,
-        Entity, EntityDelta, EntityId, EntityKind, EntityRole, FilePathId, FingerprintAlgorithm,
-        Hash256, IdentityRef, ImportSection, IntentScope, LanguageId, Priority, RelationKind,
-        SemanticChange, SemanticChangeId, SemanticFingerprint, SourceRegion, SourceSpan, TestCase,
-        TestKind, TestRunner, Timestamp, Visibility, WorkItem, WorkKind, WorkScope, WorkStatus,
-        WorkStore,
+        AgentSession, AnnotationFilter, AuthorId, Entity, EntityDelta, EntityId, EntityKind,
+        EntityRole, FilePathId, FingerprintAlgorithm, Hash256, IdentityRef, IntentScope,
+        LanguageId, Priority, RelationKind, SemanticChange, SemanticChangeId, SemanticFingerprint,
+        SourceSpan, TestCase, TestKind, TestRunner, Timestamp, Visibility, WorkItem, WorkKind,
+        WorkScope, WorkStatus, WorkStore,
     };
     use kin_model::{ReviewStore, VerificationStore};
     use kin_registry::Ecosystem;
@@ -12706,88 +9598,299 @@ mod tests {
     }
 
     fn test_state() -> Arc<DaemonState> {
-        test_state_with_repo_id(None)
-    }
-
-    fn test_state_with_repo_id(repo_id: Option<&str>) -> Arc<DaemonState> {
         install_test_registry_override();
         let dir = std::env::temp_dir().join(format!("kin-daemon-test-state-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let kin_dir = dir.join(".kin");
-        std::fs::create_dir_all(kin_dir.join("objects")).unwrap();
-        std::fs::create_dir_all(kin_dir.join("working")).unwrap();
-        let layout = kin_core::KinLayout::new(kin_dir);
-        kin_core::manifest::KinManifest::new()
-            .save(&layout.manifest_path())
-            .unwrap();
-        Arc::new(match repo_id {
-            Some(repo_id) => DaemonState::open_for_test(layout, repo_id).unwrap(),
-            None => DaemonState::open(layout).unwrap(),
-        })
+        let layout = kin_core::init(&dir).unwrap().layout;
+        Arc::new(DaemonState::open(layout).unwrap())
     }
 
-    fn run_hydration_fixture_git(repo: &FsPath, args: &[&str]) -> String {
+    fn committed_test_state() -> Arc<DaemonState> {
+        let initial = test_state();
+        let layout = initial.layout.clone();
+        install_repository_file(&initial, "README.md", b"branch authority fixture\n");
+        drop(initial);
+        let state = Arc::new(DaemonState::open(layout).unwrap());
+        std::fs::write(
+            state.layout.working_dir().join("README.md"),
+            b"branch authority fixture\n",
+        )
+        .unwrap();
+        state
+    }
+
+    #[cfg(unix)]
+    fn run_test_git<const N: usize>(repository: &FsPath, args: [&str; N]) {
         let output = std::process::Command::new("git")
             .args(args)
-            .current_dir(repo)
-            .env("GIT_AUTHOR_DATE", "1000000000 +0000")
-            .env("GIT_COMMITTER_DATE", "1000000000 +0000")
+            .current_dir(repository)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
             .output()
-            .expect("run hydration fixture git command");
+            .unwrap();
         assert!(
             output.status.success(),
-            "git {args:?} failed: stdout={} stderr={}",
+            "git {:?} failed\nstdout: {}\nstderr: {}",
+            args,
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        String::from_utf8(output.stdout)
-            .expect("git output is utf8")
-            .trim()
-            .to_string()
     }
 
-    /// Create a real Git commit outside graph truth. A ref query against the
-    /// returned oid must therefore take the daemon's cold hydration path.
-    fn setup_daemon_hydration_fixture(state: &DaemonState) -> String {
-        // `is_initialized = true` means the canonical Kin boundary root is
-        // already durable in production. Keep the synthetic daemon fixture
-        // faithful to that invariant so strict temporal traversal does not
-        // mistake its intentionally bare test graph for a valid repository.
-        let genesis = kin_core::build_genesis_change();
-        if state.graph.get_change(&genesis.id).unwrap().is_none() {
-            state.graph.create_change(&genesis).unwrap();
-        }
-        let repo = state.layout.working_dir();
-        std::fs::create_dir_all(repo.join("src")).unwrap();
-        std::fs::write(
-            repo.join("src/lib.rs"),
-            "pub fn hydrated_target(value: u64) -> u64 {\n    value + 1\n}\n",
-        )
-        .unwrap();
+    #[cfg(unix)]
+    fn universal_branch_test_state(
+        label: &str,
+    ) -> (
+        Arc<DaemonState>,
+        kin_core::KinLayout,
+        PathBuf,
+        SemanticChangeId,
+        SemanticChangeId,
+    ) {
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
 
-        run_hydration_fixture_git(repo, &["init", "--quiet"]);
-        run_hydration_fixture_git(
-            repo,
-            &["config", "user.email", "hydration-test@example.com"],
+        install_test_registry_override();
+        let repository =
+            std::env::temp_dir().join(format!("kin-daemon-{label}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(repository.join("selected")).unwrap();
+        run_test_git(&repository, ["init", "--initial-branch=main"]);
+        run_test_git(&repository, ["config", "user.email", "kin@example.invalid"]);
+        run_test_git(
+            &repository,
+            ["config", "user.name", "Kin Branch Route Test"],
         );
-        run_hydration_fixture_git(repo, &["config", "user.name", "Hydration Test"]);
-        run_hydration_fixture_git(repo, &["add", "src/lib.rs"]);
-        run_hydration_fixture_git(repo, &["commit", "--quiet", "-m", "add hydrated target"]);
-        run_hydration_fixture_git(repo, &["rev-parse", "HEAD"])
-    }
-
-    fn setup_daemon_shadow_hydration_fixture(state: &DaemonState) -> (String, String) {
-        let base = setup_daemon_hydration_fixture(state);
-        let repo = state.layout.working_dir();
         std::fs::write(
-            repo.join("src/lib.rs"),
-            "pub fn hydrated_target(value: u64) -> u64 {\n    value + 2\n}\n",
+            repository.join("selected/compose.yaml"),
+            b"services:\n  api:\n    image: main\n",
         )
         .unwrap();
-        run_hydration_fixture_git(repo, &["add", "src/lib.rs"]);
-        run_hydration_fixture_git(repo, &["commit", "--quiet", "-m", "change hydrated target"]);
-        let head = run_hydration_fixture_git(repo, &["rev-parse", "HEAD"]);
-        (base, head)
+        std::fs::write(
+            repository.join("selected/data.bin"),
+            [0_u8, 0xff, 0x10, 0x00],
+        )
+        .unwrap();
+        std::fs::write(repository.join("selected/run-tool"), b"#!/bin/sh\nexit 0\n").unwrap();
+        let mut permissions = std::fs::metadata(repository.join("selected/run-tool"))
+            .unwrap()
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(repository.join("selected/run-tool"), permissions).unwrap();
+        symlink("compose.yaml", repository.join("selected/current-compose")).unwrap();
+        std::fs::write(repository.join("outside.txt"), b"outside main\n").unwrap();
+        run_test_git(&repository, ["add", "--all"]);
+        run_test_git(&repository, ["commit", "-s", "-m", "main universal tree"]);
+
+        run_test_git(&repository, ["switch", "-c", "feature"]);
+        std::fs::write(
+            repository.join("selected/compose.yaml"),
+            b"services:\n  api:\n    image: feature\n",
+        )
+        .unwrap();
+        std::fs::write(repository.join("selected/Dockerfile"), b"FROM scratch\n").unwrap();
+        std::fs::write(
+            repository.join("selected/notes.mystery"),
+            b"unsupported language bytes\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repository.join("selected/data.bin"),
+            [0xff_u8, 0x00, 0x41, 0x10],
+        )
+        .unwrap();
+        run_test_git(&repository, ["add", "--all"]);
+        run_test_git(
+            &repository,
+            ["commit", "-s", "-m", "feature universal tree"],
+        );
+        run_test_git(&repository, ["switch", "main"]);
+
+        let layout = kin_core::init_from_git(&repository).unwrap().layout;
+        let authority = ActiveApiRepositoryAuthority::open_layout_for_test(&layout).unwrap();
+        let lease = authority.manager.read_authority();
+        let resolve = |name: &[u8]| {
+            let name = kin_model::RefName::branch(name).unwrap();
+            let target = lease.resolve_ref_target(&name).unwrap().unwrap();
+            lease.resolve_target_change_id(&target).unwrap()
+        };
+        let main_change = resolve(b"main");
+        let feature_change = resolve(b"feature");
+        drop(lease);
+        drop(authority);
+        let state = Arc::new(DaemonState::open(layout.clone()).unwrap());
+        (state, layout, repository, main_change, feature_change)
+    }
+
+    #[cfg(unix)]
+    fn repository_source_cas_path(
+        layout: &kin_core::KinLayout,
+        repository_id: &str,
+        digest: Hash256,
+    ) -> PathBuf {
+        let digest = digest.to_string();
+        layout
+            .kindb_dir()
+            .join(repository_id)
+            .join("source-blobs")
+            .join("sha256")
+            .join(&digest[..2])
+            .join(digest)
+    }
+
+    #[cfg(unix)]
+    fn copy_test_directory(source: &FsPath, destination: &FsPath) {
+        std::fs::create_dir(destination).unwrap();
+        for entry in std::fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            let source_path = entry.path();
+            let destination_path = destination.join(entry.file_name());
+            let file_type = entry.file_type().unwrap();
+            if file_type.is_dir() {
+                copy_test_directory(&source_path, &destination_path);
+            } else if file_type.is_file() {
+                std::fs::copy(&source_path, &destination_path).unwrap();
+            } else {
+                panic!(
+                    "authority-copy fixture does not support special member {}",
+                    source_path.display()
+                );
+            }
+        }
+        std::fs::set_permissions(
+            destination,
+            std::fs::metadata(source).unwrap().permissions(),
+        )
+        .unwrap();
+    }
+
+    async fn post_branch_request(
+        state: Arc<DaemonState>,
+        request: &kin_cli::commands::branch::BranchRequest,
+        session_id: Option<kin_model::SessionId>,
+    ) -> (StatusCode, Vec<u8>) {
+        let mut request_builder =
+            Request::post("/commands/branch").header("content-type", "application/json");
+        if let Some(session_id) = session_id {
+            request_builder = request_builder.header("X-Kin-Session", session_id.to_string());
+        }
+        let response = router(state)
+            .oneshot(
+                request_builder
+                    .body(Body::from(serde_json::to_vec(request).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        (status, body.to_vec())
+    }
+
+    #[cfg(unix)]
+    fn test_state_with_verified_gitlink() -> Arc<DaemonState> {
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
+        use std::process::Command;
+
+        fn git<const N: usize>(repository: &FsPath, args: [&str; N]) {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(repository)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {:?} failed\nstdout: {}\nstderr: {}",
+                args,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        install_test_registry_override();
+        let dir = std::env::temp_dir().join(format!("kin-daemon-gitlink-state-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("assets")).unwrap();
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("compose.yaml"),
+            b"services:\n  api:\n    image: kin:base\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("bin/verify"), b"#!/bin/sh\nexit 0\n").unwrap();
+        let mut executable_permissions = std::fs::metadata(dir.join("bin/verify"))
+            .unwrap()
+            .permissions();
+        executable_permissions.set_mode(0o755);
+        std::fs::set_permissions(dir.join("bin/verify"), executable_permissions).unwrap();
+        std::fs::write(
+            dir.join("assets/policy.unknown"),
+            b"\x00\xffopaque base bytes\x00",
+        )
+        .unwrap();
+        std::fs::write(dir.join("delete.me"), b"delete this exact member\n").unwrap();
+        std::fs::write(dir.join("src/lib.py"), b"def retained():\n    return 1\n").unwrap();
+        symlink("compose.yaml", dir.join("current-compose")).unwrap();
+
+        git(&dir, ["init", "--initial-branch=main"]);
+        git(&dir, ["config", "user.email", "kin@example.invalid"]);
+        git(&dir, ["config", "user.name", "Kin Test"]);
+        git(&dir, ["add", "--all"]);
+        git(
+            &dir,
+            [
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                "160000,4444444444444444444444444444444444444444,vendor/subrepo",
+            ],
+        );
+        git(&dir, ["commit", "-s", "-m", "exact session fixture"]);
+        std::fs::create_dir_all(dir.join("vendor/subrepo")).unwrap();
+
+        let layout = kin_core::init_from_git(&dir).unwrap().layout;
+        Arc::new(DaemonState::open(layout).unwrap())
+    }
+
+    #[tokio::test]
+    async fn repository_transfer_status_preserves_non_utf8_ref_bytes_and_gates_push() {
+        let state = test_state();
+        let repository_id = state.cached_repo_id.clone();
+        let destination_ref =
+            kin_model::RefName::from_bytes(b"refs/heads/raw-\xff".to_vec()).unwrap();
+        let request_body = serde_json::to_vec(&serde_json::json!({
+            "destination_ref": destination_ref,
+        }))
+        .unwrap();
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::post(format!("/repos/{repository_id}/transfer/status"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(request_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let status: kin_remote::repository_transfer::RepositoryTransferStatus =
+            serde_json::from_slice(&body).unwrap();
+        assert_eq!(status.destination_ref, destination_ref);
+        assert!(!status.push_apply_ready);
+        assert!(status.bounded_envelope_export_ready);
+        assert!(!status.pull_apply_ready);
+    }
+
+    #[test]
+    fn repository_transfer_receive_has_no_caller_actor_field() {
+        let forged = serde_json::json!({
+            "destination_ref": { "bytes_hex": "726566732f68656164732f6d61696e" },
+            "actor": "forged@example.com",
+            "pack": {},
+        });
+        assert!(serde_json::from_value::<RepositoryTransferReceiveRequest>(forged).is_err());
     }
 
     #[tokio::test]
@@ -12869,280 +9972,1730 @@ mod tests {
         }
     }
 
-    fn install_branch_file(state: &Arc<DaemonState>, rel_path: &str, content: &[u8]) {
-        let branch_name = BranchName::new("main");
-        let genesis = kin_core::build_genesis_change();
-        state.graph.create_change(&genesis).unwrap();
-
-        let blob_store = kin_blobs::BlobStore::new(state.layout.objects_dir()).unwrap();
-        let blob_hash = blob_store.write(content).unwrap();
-        let change = SemanticChange {
-            id: SemanticChangeId::from_hash(Hash256::from_bytes([0x77; 32])),
-            parents: vec![genesis.id],
-            timestamp: Timestamp::now(),
-            author: AuthorId::new("test"),
-            message: "add test file".to_string(),
-            entity_deltas: vec![],
-            relation_deltas: vec![],
-            artifact_deltas: vec![ArtifactDelta {
-                file_id: FilePathId::new(rel_path),
-                kind: ArtifactDeltaKind::Added,
-                old_hash: None,
-                new_hash: Some(blob_hash),
-            }],
-            projected_files: vec![FilePathId::new(rel_path)],
-            spec_link: None,
-            evidence: vec![],
-            risk_summary: None,
-            authored_on: Some(branch_name.clone()),
-        };
-        state.graph.create_change(&change).unwrap();
-        state
-            .graph
-            .create_branch(&Branch {
-                name: branch_name.clone(),
-                head: change.id,
-            })
-            .unwrap();
-        kin_core::write_current_branch(&state.layout, &branch_name).unwrap();
-    }
-
-    fn install_release_test_branch(state: &Arc<DaemonState>) -> SemanticChangeId {
-        let genesis = kin_core::build_genesis_change();
-        state.graph.create_change(&genesis).unwrap();
-        state
-            .graph
-            .create_branch(&Branch {
-                name: BranchName::new("main"),
-                head: genesis.id,
-            })
-            .unwrap();
-        genesis.id
-    }
-
-    fn install_release_entity_head(
-        state: &Arc<DaemonState>,
-        entity: &Entity,
-        id_byte: u8,
-    ) -> SemanticChange {
-        let genesis = kin_core::build_genesis_change();
-        state.graph.create_change(&genesis).unwrap();
-        let change = SemanticChange {
-            id: SemanticChangeId::from_hash(Hash256::from_bytes([id_byte; 32])),
-            parents: vec![genesis.id],
-            timestamp: Timestamp::now(),
-            author: AuthorId::new("agent-test"),
-            message: "add release entity".to_string(),
-            entity_deltas: vec![EntityDelta::Added(entity.clone())],
-            relation_deltas: vec![],
-            artifact_deltas: vec![],
-            projected_files: vec![],
-            spec_link: None,
-            evidence: vec![],
-            risk_summary: None,
-            authored_on: Some(BranchName::new("main")),
-        };
-        state.graph.upsert_entity(entity).unwrap();
-        state.graph.create_change(&change).unwrap();
-        state
-            .graph
-            .create_branch(&Branch {
-                name: BranchName::new("main"),
-                head: change.id,
-            })
-            .unwrap();
-        change
-    }
-
-    fn release_test_change(parent: SemanticChangeId, id_byte: u8) -> SemanticChange {
-        release_test_change_with_count(parent, id_byte, 0)
-    }
-
-    fn release_test_change_with_count(
-        parent: SemanticChangeId,
-        id_byte: u8,
-        entity_count: usize,
-    ) -> SemanticChange {
-        SemanticChange {
-            id: SemanticChangeId::from_hash(Hash256::from_bytes([id_byte; 32])),
-            parents: vec![parent],
-            timestamp: Timestamp::now(),
-            author: AuthorId::new("kin-release"),
-            message: format!("release: test ({entity_count} entities snapshot)"),
-            entity_deltas: vec![],
-            relation_deltas: vec![],
-            artifact_deltas: vec![],
-            projected_files: vec![],
-            spec_link: None,
-            evidence: vec![],
-            risk_summary: None,
-            authored_on: Some(BranchName::new("main")),
-        }
-    }
-
-    fn release_test_payload(change: &SemanticChange) -> serde_json::Value {
-        serde_json::json!({
-            "change": change,
-            "branch_name": "main",
-            "release_policy": {
-                "force": true,
-                "require_proof": false,
-                "require_approval": false,
-            },
-        })
-    }
-
-    fn exact_source_test_change(
-        parent: SemanticChangeId,
-        id_byte: u8,
-        file_id: &str,
-        kind: ArtifactDeltaKind,
-        hash: Hash256,
-    ) -> SemanticChange {
-        SemanticChange {
-            id: SemanticChangeId::from_hash(Hash256::from_bytes([id_byte; 32])),
-            parents: vec![parent],
-            timestamp: Timestamp::now(),
-            author: AuthorId::new("exact-source-api-test"),
-            message: "exact source API fixture".to_string(),
-            entity_deltas: vec![],
-            relation_deltas: vec![],
-            artifact_deltas: vec![ArtifactDelta {
-                file_id: FilePathId::new(file_id),
-                kind,
-                old_hash: None,
-                new_hash: Some(hash),
-            }],
-            projected_files: vec![FilePathId::new(file_id)],
-            spec_link: None,
-            evidence: vec![],
-            risk_summary: None,
-            authored_on: Some(BranchName::new("main")),
-        }
-    }
-
-    fn install_source_test_head(state: &Arc<DaemonState>, change: &SemanticChange) {
-        state.graph.create_change(change).unwrap();
-        state
-            .graph
-            .update_branch_head(&BranchName::new("main"), &change.id)
-            .unwrap();
-    }
-
-    fn api_local_object_path(state: &DaemonState, hash: Hash256) -> PathBuf {
-        let encoded = hash.to_string();
-        state
-            .layout
-            .objects_dir()
-            .join(&encoded[..2])
-            .join(&encoded[2..])
-    }
-
-    fn install_exact_checkout_branches(
-        state: &Arc<DaemonState>,
-    ) -> (SemanticChange, SemanticChange) {
-        let genesis = kin_core::build_genesis_change();
-        state.graph.create_change(&genesis).unwrap();
-        let main_blob = state.blobs.write(b"main checkout bytes\n").unwrap();
-        let main = exact_source_test_change(
-            genesis.id,
-            0xbc,
-            "src/shared.rs",
-            ArtifactDeltaKind::AddedRegularFile,
-            Hash256::from_bytes(main_blob.0),
-        );
-        state.graph.create_change(&main).unwrap();
-        state
-            .graph
-            .create_branch(&Branch {
-                name: BranchName::new("main"),
-                head: main.id,
-            })
-            .unwrap();
-
-        let feature_blob = state.blobs.write(b"feature checkout bytes\n").unwrap();
-        let feature = SemanticChange {
-            id: SemanticChangeId::from_hash(Hash256::from_bytes([0xbd; 32])),
-            parents: vec![main.id],
-            timestamp: Timestamp::now(),
-            author: AuthorId::new("exact-checkout-api-test"),
-            message: "feature checkout fixture".to_string(),
-            entity_deltas: vec![],
-            relation_deltas: vec![],
-            artifact_deltas: vec![ArtifactDelta {
-                file_id: FilePathId::new("src/shared.rs"),
-                kind: ArtifactDeltaKind::ModifiedRegularFile,
-                old_hash: main.artifact_deltas[0].new_hash,
-                new_hash: Some(Hash256::from_bytes(feature_blob.0)),
-            }],
-            projected_files: vec![FilePathId::new("src/shared.rs")],
-            spec_link: None,
-            evidence: vec![],
-            risk_summary: None,
-            authored_on: Some(BranchName::new("feature")),
-        };
-        state.graph.create_change(&feature).unwrap();
-        state
-            .graph
-            .create_branch(&Branch {
-                name: BranchName::new("feature"),
-                head: feature.id,
-            })
-            .unwrap();
-        kin_core::write_current_branch(&state.layout, &BranchName::new("main")).unwrap();
-        std::fs::create_dir_all(state.layout.working_dir().join("src")).unwrap();
-        std::fs::write(
-            state.layout.working_dir().join("src/shared.rs"),
-            b"main checkout bytes\n",
-        )
-        .unwrap();
-        (main, feature)
-    }
-
-    fn advance_branch_with_file(
+    fn install_repository_file(
         state: &Arc<DaemonState>,
         rel_path: &str,
         content: &[u8],
-        id_byte: u8,
-    ) {
-        let branch_name = BranchName::new("main");
-        let parent = state
-            .graph
-            .get_branch(&branch_name)
-            .unwrap()
-            .expect("main branch")
-            .head;
+    ) -> SemanticChangeId {
+        install_repository_entry(state, rel_path, content, |hash| {
+            TreeEntry::blob(hash, false)
+        })
+    }
+
+    fn install_repository_entry(
+        state: &Arc<DaemonState>,
+        rel_path: &str,
+        content: &[u8],
+        entry: impl FnOnce(Hash256) -> TreeEntry,
+    ) -> SemanticChangeId {
         let blob_hash = state.blobs.write(content).unwrap();
-        let change = SemanticChange {
-            id: SemanticChangeId::from_hash(Hash256::from_bytes([id_byte; 32])),
-            parents: vec![parent],
-            timestamp: Timestamp::now(),
-            author: AuthorId::new("test"),
-            message: "advance test branch".to_string(),
-            entity_deltas: vec![],
-            relation_deltas: vec![],
-            artifact_deltas: vec![ArtifactDelta {
-                file_id: FilePathId::new(rel_path),
-                kind: ArtifactDeltaKind::Added,
-                old_hash: None,
-                new_hash: Some(blob_hash),
-            }],
-            projected_files: vec![FilePathId::new(rel_path)],
-            spec_link: None,
-            evidence: vec![],
-            risk_summary: None,
-            authored_on: Some(branch_name.clone()),
-        };
-        state.graph.create_change(&change).unwrap();
+        let entry = entry(Hash256::from_bytes(blob_hash.0));
+        let artifact_id = kin_model::ArtifactId::new();
+        let path = RepoPath::from_utf8(rel_path).unwrap();
         state
             .graph
-            .update_branch_head(&branch_name, &change.id)
+            .apply_transaction_delta(&kin_model::TransactionDelta {
+                entity_deltas: Vec::new(),
+                relation_deltas: Vec::new(),
+                tree_deltas: vec![kin_model::TreeDelta::Added {
+                    artifact_id,
+                    new: kin_model::LocatedEntry::new(path, entry),
+                }],
+                admission_policy_delta: None,
+            })
             .unwrap();
+        let plan = crate::repository_commit::plan_native_commit(
+            &state.graph,
+            &state.blobs,
+            &crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(state)
+                .unwrap(),
+            kin_model::OperationId::new(),
+            Timestamp::now(),
+            AuthorId::new("api-test"),
+            format!("install {rel_path}"),
+        )
+        .unwrap();
+        crate::repository_commit::commit_native_plan(
+            &state.blobs,
+            &crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(state)
+                .unwrap(),
+            plan,
+        )
+        .unwrap()
+        .change
+        .id
+    }
+
+    fn install_repository_entities(
+        state: &Arc<DaemonState>,
+        entities: Vec<Entity>,
+    ) -> SemanticChangeId {
+        state
+            .graph
+            .apply_transaction_delta(&kin_model::TransactionDelta {
+                entity_deltas: entities
+                    .into_iter()
+                    .map(|new| EntityDelta::Added { new })
+                    .collect(),
+                ..kin_model::TransactionDelta::default()
+            })
+            .unwrap();
+        let plan = crate::repository_commit::plan_native_commit(
+            &state.graph,
+            &state.blobs,
+            &crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(state)
+                .unwrap(),
+            kin_model::OperationId::new(),
+            Timestamp::now(),
+            AuthorId::new("api-test"),
+            "install graph-only relation endpoints".to_string(),
+        )
+        .unwrap();
+        let committed = crate::repository_commit::commit_native_plan(
+            &state.blobs,
+            &crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(state)
+                .unwrap(),
+            plan,
+        )
+        .unwrap();
+        state
+            .graph
+            .create_changes(vec![committed.change.clone()])
+            .unwrap();
+        state
+            .record_repository_authority_commit(committed.receipt.generation)
+            .unwrap();
+        committed.change.id
+    }
+
+    fn publish_same_tree_semantic_target(
+        layout: &kin_core::KinLayout,
+        parent: SemanticChangeId,
+        entity: Entity,
+    ) -> SemanticChangeId {
+        let authority = ActiveApiRepositoryAuthority::open_layout_for_test(layout).unwrap();
+        let lease = authority.manager.read_authority();
+        let roots = lease.roots().clone();
+        let mut change = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+            origin: kin_model::ChangeOrigin::Native,
+            parents: vec![parent],
+            author: AuthorId::new("checkout-history-test"),
+            message: "same-tree semantic target".to_string(),
+            timestamp: Timestamp::now(),
+            entity_deltas: vec![EntityDelta::Added { new: entity }],
+            relation_deltas: Vec::new(),
+            tree_deltas: Vec::new(),
+            admission_policy_delta: None,
+            projected_files: Vec::new(),
+            spec_link: None,
+            evidence: Vec::new(),
+            risk_summary: None,
+        };
+        change.id = kin_core::compute_semantic_change_id(&change).unwrap();
+        let target_ref = kin_model::RefName::branch(b"semantic-target").unwrap();
+        let transaction = kin_model::RepositoryTransaction {
+            schema_version: kin_model::REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+            operation_id: kin_model::OperationId::new(),
+            repository_id: authority.repository_id,
+            expected_generation: roots.generation,
+            expected_roots: roots,
+            actor: AuthorId::new("checkout-history-test"),
+            reason: "publish same-tree checkout target".to_string(),
+            external_objects: Vec::new(),
+            git_authority_delta: None,
+            changes: vec![change.clone()],
+            aliases: Vec::new(),
+            ref_mutations: vec![kin_model::RefMutation {
+                name: target_ref,
+                expected: kin_model::RefExpectation::MustNotExist,
+                new_target: Some(kin_model::RefTarget::change(change.id)),
+                policy: kin_model::RefUpdatePolicy::FastForwardOnly,
+            }],
+            default_ref_mutation: None,
+            workspace_mutation: None,
+            local_overlay_delta: None,
+        };
+        drop(lease);
+        authority
+            .manager
+            .commit_repository_transaction(transaction)
+            .unwrap();
+        change.id
+    }
+
+    #[tokio::test]
+    async fn command_branch_create_delete_and_exact_replay_advance_authority_once() {
+        let state = committed_test_state();
+        let branch = kin_model::RefName::branch(b"route-lifecycle").unwrap();
+        let graph_root_before = state.graph.compute_root_hash();
+        let generation_before = state
+            .snapshot_generation
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let mut events = state.event_tx.subscribe();
+        let create = kin_cli::commands::branch::BranchRequest::Create {
+            name: branch.clone(),
+            operation_id: kin_model::OperationId::new(),
+            actor: AuthorId::new("branch-route-test"),
+        };
+        let (status, body) = post_branch_request(Arc::clone(&state), &create, None).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let created: kin_cli::commands::branch::BranchResponse =
+            serde_json::from_slice(&body).unwrap();
+        assert!(created.mutated);
+        assert!(!created.idempotent);
+        assert_eq!(created.authority_generation, Some(generation_before + 1));
+        assert!(created.operation_id.is_some());
+        assert_eq!(state.graph.compute_root_hash(), graph_root_before);
+        assert!(matches!(
+            events.recv().await.unwrap(),
+            DaemonEvent::RepositoryAuthorityChanged {
+                previous_generation,
+                new_generation,
+                ..
+            } if previous_generation == generation_before && new_generation == generation_before + 1
+        ));
+
+        let (status, body) = post_branch_request(Arc::clone(&state), &create, None).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let replay: kin_cli::commands::branch::BranchResponse =
+            serde_json::from_slice(&body).unwrap();
+        assert!(!replay.mutated);
+        assert!(replay.idempotent);
+        assert_eq!(replay.authority_generation, Some(generation_before + 1));
+        assert_eq!(state.graph.compute_root_hash(), graph_root_before);
+        assert!(events.try_recv().is_err());
+
+        let delete = kin_cli::commands::branch::BranchRequest::Delete {
+            name: branch.clone(),
+            operation_id: kin_model::OperationId::new(),
+            actor: AuthorId::new("branch-route-test"),
+        };
+        let (status, body) = post_branch_request(Arc::clone(&state), &delete, None).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let deleted: kin_cli::commands::branch::BranchResponse =
+            serde_json::from_slice(&body).unwrap();
+        assert!(deleted.mutated);
+        assert_eq!(deleted.authority_generation, Some(generation_before + 2));
+        assert_eq!(state.graph.compute_root_hash(), graph_root_before);
+        let (status, body) = post_branch_request(Arc::clone(&state), &delete, None).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let replay: kin_cli::commands::branch::BranchResponse =
+            serde_json::from_slice(&body).unwrap();
+        assert!(!replay.mutated);
+        assert!(replay.idempotent);
+        assert_eq!(replay.authority_generation, Some(generation_before + 2));
+        assert_eq!(state.graph.compute_root_hash(), graph_root_before);
+
+        let authority =
+            crate::local_repository_authority::ActiveLocalRepositoryAuthority::open(&state)
+                .unwrap();
+        let lease = authority.manager.read_authority();
+        assert_eq!(lease.roots().generation, generation_before + 2);
+        assert!(lease
+            .metadata()
+            .ref_state
+            .refs
+            .iter()
+            .all(|repository_ref| repository_ref.name != branch));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_branch_switch_replays_same_daemon_and_restart_then_checkout_is_coherent() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (state, layout, repository, main_change, feature_change) =
+            universal_branch_test_state("branch-switch-replay");
+        let request = kin_cli::commands::branch::BranchRequest::Switch {
+            name: kin_model::RefName::branch(b"feature").unwrap(),
+            operation_id: kin_model::OperationId::new(),
+            actor: AuthorId::new("branch-switch-route-test"),
+        };
+        let generation_before = state
+            .snapshot_generation
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let (status, body) = post_branch_request(Arc::clone(&state), &request, None).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let switched: kin_cli::commands::branch::BranchResponse =
+            serde_json::from_slice(&body).unwrap();
+        assert!(switched.mutated);
+        assert_eq!(switched.authority_generation, Some(generation_before + 1));
+        assert_eq!(
+            std::fs::read(repository.join("selected/compose.yaml")).unwrap(),
+            b"services:\n  api:\n    image: feature\n"
+        );
+        assert_eq!(
+            std::fs::read(repository.join("selected/data.bin")).unwrap(),
+            [0xff_u8, 0x00, 0x41, 0x10]
+        );
+        assert_eq!(
+            std::fs::read(repository.join("selected/notes.mystery")).unwrap(),
+            b"unsupported language bytes\n"
+        );
+        assert_ne!(
+            std::fs::metadata(repository.join("selected/run-tool"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o111,
+            0
+        );
+        assert_eq!(
+            std::fs::read_link(repository.join("selected/current-compose")).unwrap(),
+            FsPath::new("compose.yaml")
+        );
+
+        let (status, body) = post_branch_request(Arc::clone(&state), &request, None).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let replay: kin_cli::commands::branch::BranchResponse =
+            serde_json::from_slice(&body).unwrap();
+        assert!(!replay.mutated);
+        assert!(replay.idempotent);
+
+        let live_checkout = kin_cli::commands::checkout::CheckoutRequest {
+            path: Some("selected/compose.yaml".to_string()),
+            path_hex: None,
+            change_id: Some(feature_change.to_string()),
+            operation_id: kin_model::OperationId::new(),
+            actor: AuthorId::new("live-branch-then-checkout-test"),
+        };
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::post("/commands/checkout")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&live_checkout).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let checkout_response: kin_cli::commands::checkout::CheckoutResponse =
+            serde_json::from_slice(&body).unwrap();
+        let checkout_report = checkout_response.report.unwrap();
+        assert!(checkout_report.projection_only);
+        assert_eq!(checkout_report.authority_generation, generation_before + 1);
+
+        let authority = ActiveApiRepositoryAuthority::open_layout_for_test(&layout).unwrap();
+        let lease = authority.manager.read_authority();
+        let roots = lease.roots().clone();
+        let workspace = lease
+            .metadata()
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == authority.workspace_id)
+            .unwrap()
+            .clone();
+        let workspace_graph = lease
+            .workspace_graph_snapshot(&authority.workspace_id)
+            .unwrap()
+            .unwrap();
+        let daemon_graph = state.graph.to_snapshot();
+        assert_eq!(roots.generation, checkout_report.authority_generation);
+        assert_eq!(
+            state
+                .snapshot_generation
+                .load(std::sync::atomic::Ordering::SeqCst),
+            roots.generation
+        );
+        assert_eq!(workspace.generation, checkout_report.workspace_generation);
+        assert_eq!(workspace.tree, daemon_graph.resolved_tree);
+        assert_eq!(workspace_graph.resolved_tree, daemon_graph.resolved_tree);
+        assert_eq!(workspace_graph.entities, daemon_graph.entities);
+        assert_eq!(workspace_graph.relations, daemon_graph.relations);
+        drop(lease);
+        drop(authority);
+        drop(state);
+
+        let reopened = Arc::new(DaemonState::open(layout.clone()).unwrap());
+        let (status, body) = post_branch_request(Arc::clone(&reopened), &request, None).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let restart_replay: kin_cli::commands::branch::BranchResponse =
+            serde_json::from_slice(&body).unwrap();
+        assert!(restart_replay.idempotent);
+        assert_eq!(
+            reopened
+                .snapshot_generation
+                .load(std::sync::atomic::Ordering::SeqCst),
+            generation_before + 1
+        );
+
+        let checkout = kin_cli::commands::checkout::CheckoutRequest {
+            path: Some("selected/compose.yaml".to_string()),
+            path_hex: None,
+            change_id: Some(main_change.to_string()),
+            operation_id: kin_model::OperationId::new(),
+            actor: AuthorId::new("branch-then-checkout-test"),
+        };
+        let response = router(Arc::clone(&reopened))
+            .oneshot(
+                Request::post("/commands/checkout")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&checkout).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(
+            std::fs::read(repository.join("selected/compose.yaml")).unwrap(),
+            b"services:\n  api:\n    image: main\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_branch_exact_retry_heals_post_authority_crash_gap() {
+        let (state, _layout, repository, _main, _feature) =
+            universal_branch_test_state("branch-crash-gap");
+        let request = kin_cli::commands::branch::BranchRequest::Switch {
+            name: kin_model::RefName::branch(b"feature").unwrap(),
+            operation_id: kin_model::OperationId::new(),
+            actor: AuthorId::new("branch-crash-gap-test"),
+        };
+        let generation_before = state
+            .snapshot_generation
+            .load(std::sync::atomic::Ordering::SeqCst);
+        state
+            .repository_command_fail_after_authority_once
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let (status, body) = post_branch_request(Arc::clone(&state), &request, None).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(String::from_utf8_lossy(&body)
+            .contains("injected failure after branch authority commit"));
+        assert_eq!(
+            state
+                .snapshot_generation
+                .load(std::sync::atomic::Ordering::SeqCst),
+            generation_before
+        );
+        let authority =
+            crate::local_repository_authority::ActiveLocalRepositoryAuthority::open(&state)
+                .unwrap();
+        assert_eq!(
+            authority.manager.read_authority().roots().generation,
+            generation_before + 1
+        );
+        drop(authority);
+
+        let (status, body) = post_branch_request(Arc::clone(&state), &request, None).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let replay: kin_cli::commands::branch::BranchResponse =
+            serde_json::from_slice(&body).unwrap();
+        assert!(replay.idempotent);
+        assert_eq!(replay.authority_generation, Some(generation_before + 1));
+        assert_eq!(
+            state
+                .snapshot_generation
+                .load(std::sync::atomic::Ordering::SeqCst),
+            generation_before + 1
+        );
+        assert_eq!(
+            std::fs::read(repository.join("selected/compose.yaml")).unwrap(),
+            b"services:\n  api:\n    image: feature\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_branch_source_cas_integrity_failures_are_internal_without_mutation() {
+        let target_body = b"services:\n  api:\n    image: feature\n";
+        let target_digest = Hash256::from_bytes(kin_blobs::digest_bytes(target_body));
+        for (mode, corrupt) in [("missing", false), ("corrupt", true)] {
+            let label = format!("branch-source-cas-{mode}");
+            let (state, layout, repository, _main, _feature) = universal_branch_test_state(&label);
+            let authority = ActiveApiRepositoryAuthority::open(&state).unwrap();
+            let lease = authority.manager.read_authority();
+            let roots_before = lease.roots().clone();
+            let workspace_before = lease
+                .metadata()
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.workspace_id == authority.workspace_id)
+                .unwrap()
+                .clone();
+            let source_cas_path = repository_source_cas_path(
+                &layout,
+                authority.repository_id.as_str(),
+                target_digest,
+            );
+            assert_eq!(
+                authority.manager.load_source_blob(target_digest).unwrap(),
+                Some(target_body.to_vec())
+            );
+            drop(lease);
+            if corrupt {
+                std::fs::write(&source_cas_path, b"corrupt source bytes").unwrap();
+            } else {
+                std::fs::remove_file(&source_cas_path).unwrap();
+            }
+            let graph_root_before = state.graph.compute_root_hash();
+            let request = kin_cli::commands::branch::BranchRequest::Switch {
+                name: kin_model::RefName::branch(b"feature").unwrap(),
+                operation_id: kin_model::OperationId::new(),
+                actor: AuthorId::new("branch-source-cas-integrity-test"),
+            };
+            let (status, _) = post_branch_request(Arc::clone(&state), &request, None).await;
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{mode}");
+
+            let lease = authority.manager.read_authority();
+            let workspace_after = lease
+                .metadata()
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.workspace_id == authority.workspace_id)
+                .unwrap();
+            assert_eq!(lease.roots(), &roots_before, "{mode}");
+            assert_eq!(workspace_after, &workspace_before, "{mode}");
+            assert_eq!(state.graph.compute_root_hash(), graph_root_before, "{mode}");
+            assert_eq!(
+                state
+                    .snapshot_generation
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                roots_before.generation,
+                "{mode}"
+            );
+            assert_eq!(
+                std::fs::read(repository.join("selected/compose.yaml")).unwrap(),
+                b"services:\n  api:\n    image: main\n",
+                "{mode}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn command_branch_rejects_sessions_hosted_authority_and_stale_daemon_pre_cas() {
+        let state = committed_test_state();
+        let branch = kin_model::RefName::branch(b"must-not-land").unwrap();
+        let request = kin_cli::commands::branch::BranchRequest::Create {
+            name: branch.clone(),
+            operation_id: kin_model::OperationId::new(),
+            actor: AuthorId::new("branch-isolation-test"),
+        };
+        let generation_before = state
+            .snapshot_generation
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let unknown = kin_model::SessionId::new();
+        let expired = kin_model::SessionId::new();
+        state.session_scopes.write().await.insert(
+            expired,
+            crate::state::TemporalScope {
+                ref_string: "expired-branch".to_string(),
+                head: SemanticChangeId::from_hash(Hash256::from_bytes([0x92; 32])),
+                cached_graph: Arc::new(kin_db::InMemoryGraph::new()),
+                created_at: std::time::Instant::now() - Duration::from_secs(60),
+                ttl: Duration::from_secs(0),
+            },
+        );
+        for session_id in [unknown, expired] {
+            let (status, _) =
+                post_branch_request(Arc::clone(&state), &request, Some(session_id)).await;
+            assert_eq!(status, StatusCode::CONFLICT);
+        }
+        assert_eq!(
+            state
+                .snapshot_generation
+                .load(std::sync::atomic::Ordering::SeqCst),
+            generation_before
+        );
+
+        let external =
+            crate::local_repository_authority::ActiveLocalRepositoryAuthority::open(&state)
+                .unwrap();
+        let lease = external.manager.read_authority();
+        let roots = lease.roots().clone();
+        let workspace = lease
+            .metadata()
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == external.workspace_id)
+            .unwrap();
+        let external_ref = kin_model::RefName::branch(b"external-advance").unwrap();
+        let transaction = kin_model::RepositoryTransaction {
+            schema_version: kin_model::REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+            operation_id: kin_model::OperationId::new(),
+            repository_id: external.repository_id.clone(),
+            expected_generation: roots.generation,
+            expected_roots: roots,
+            actor: AuthorId::new("external-authority-test"),
+            reason: "advance outside daemon".to_string(),
+            external_objects: Vec::new(),
+            git_authority_delta: None,
+            changes: Vec::new(),
+            aliases: Vec::new(),
+            ref_mutations: vec![kin_model::RefMutation {
+                name: external_ref,
+                expected: kin_model::RefExpectation::MustNotExist,
+                new_target: Some(workspace.base_target.clone().unwrap()),
+                policy: kin_model::RefUpdatePolicy::FastForwardOnly,
+            }],
+            default_ref_mutation: None,
+            workspace_mutation: None,
+            local_overlay_delta: None,
+        };
+        drop(lease);
+        external
+            .manager
+            .commit_repository_transaction(transaction)
+            .unwrap();
+        let external_generation = external.manager.read_authority().roots().generation;
+        let (status, body) = post_branch_request(Arc::clone(&state), &request, None).await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        let lease = external.manager.read_authority();
+        assert_eq!(lease.roots().generation, external_generation);
+        assert!(lease
+            .metadata()
+            .ref_state
+            .refs
+            .iter()
+            .all(|repository_ref| repository_ref.name != branch));
+        drop(lease);
+        drop(external);
+
+        let hosted_dir =
+            std::env::temp_dir().join(format!("kin-daemon-hosted-branch-{}", uuid::Uuid::new_v4()));
+        let kin_dir = hosted_dir.join(".kin");
+        std::fs::create_dir_all(kin_dir.join("objects")).unwrap();
+        std::fs::create_dir_all(kin_dir.join("working")).unwrap();
+        let hosted_layout = kin_core::KinLayout::new(kin_dir);
+        kin_core::manifest::KinManifest::new()
+            .save(&hosted_layout.manifest_path())
+            .unwrap();
+        let backend_dir = hosted_dir.join("backend");
+        std::fs::create_dir_all(&backend_dir).unwrap();
+        let hosted = Arc::new(
+            DaemonState::open_with_backend(
+                hosted_layout,
+                Box::new(kin_db::LocalFileBackend::new(&backend_dir)),
+                "hosted-branch-test",
+                None,
+            )
+            .unwrap(),
+        );
+        let (status, _) = post_branch_request(hosted, &request, None).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn command_branch_uses_startup_pinned_identity_after_manifest_drift() {
+        let state = committed_test_state();
+        let original_repository_id = state.cached_repo_id.clone();
+        let branch = kin_model::RefName::branch(b"pinned-identity").unwrap();
+        let mut manifest =
+            kin_core::manifest::KinManifest::load(&state.layout.manifest_path()).unwrap();
+        manifest.repo_id = uuid::Uuid::new_v4().to_string();
+        manifest.workspace_id = uuid::Uuid::new_v4().to_string();
+        manifest.save(&state.layout.manifest_path()).unwrap();
+        let request = kin_cli::commands::branch::BranchRequest::Create {
+            name: branch.clone(),
+            operation_id: kin_model::OperationId::new(),
+            actor: AuthorId::new("branch-pinned-identity-test"),
+        };
+        let (status, body) = post_branch_request(Arc::clone(&state), &request, None).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let authority =
+            crate::local_repository_authority::ActiveLocalRepositoryAuthority::open(&state)
+                .unwrap();
+        assert_eq!(authority.repository_id.as_str(), original_repository_id);
+        assert!(authority
+            .manager
+            .read_authority()
+            .metadata()
+            .ref_state
+            .refs
+            .iter()
+            .any(|repository_ref| repository_ref.name == branch));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_branch_and_workspace_publication_reject_replaced_kindb_root() {
+        struct KindbSwapGuard {
+            canonical: PathBuf,
+            original: PathBuf,
+            replacement: PathBuf,
+        }
+
+        impl Drop for KindbSwapGuard {
+            fn drop(&mut self) {
+                if !self.original.exists() {
+                    return;
+                }
+                if self.canonical.exists() && !self.replacement.exists() {
+                    let _ = std::fs::rename(&self.canonical, &self.replacement);
+                }
+                if !self.canonical.exists() {
+                    let _ = std::fs::rename(&self.original, &self.canonical);
+                }
+            }
+        }
+
+        let state = committed_test_state();
+        let authority = ActiveApiRepositoryAuthority::open(&state).unwrap();
+        let repository_id = authority.repository_id.clone();
+        let roots_before = authority.manager.read_authority().roots().clone();
+        let graph_root_before = state.graph.compute_root_hash();
+        let generation_before = state
+            .snapshot_generation
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let branch = kin_model::RefName::branch(b"must-not-land-after-root-swap").unwrap();
+        let canonical = state.layout.kindb_dir();
+        let original = canonical.with_file_name(format!("kindb-original-{}", uuid::Uuid::new_v4()));
+        let replacement =
+            canonical.with_file_name(format!("kindb-replacement-{}", uuid::Uuid::new_v4()));
+        copy_test_directory(&canonical, &replacement);
+        std::fs::rename(&canonical, &original).unwrap();
+        std::fs::rename(&replacement, &canonical).unwrap();
+        let swap = KindbSwapGuard {
+            canonical: canonical.clone(),
+            original: original.clone(),
+            replacement: replacement.clone(),
+        };
+
+        let request = kin_cli::commands::branch::BranchRequest::Create {
+            name: branch.clone(),
+            operation_id: kin_model::OperationId::new(),
+            actor: AuthorId::new("kindb-root-swap-test"),
+        };
+        let (branch_status, branch_body) =
+            post_branch_request(Arc::clone(&state), &request, None).await;
+
+        let new_body = b"replacement root must not receive this body\n";
+        let new_hash = Hash256::from_bytes(state.blobs.write(new_body).unwrap().0);
+        let mut desired_artifacts = state
+            .graph
+            .resolved_tree()
+            .artifacts_by_path()
+            .cloned()
+            .collect::<Vec<_>>();
+        desired_artifacts.push(kin_model::ResolvedArtifact::new(
+            kin_model::ArtifactId::new(),
+            RepoPath::from_utf8("root-swap-background.txt").unwrap(),
+            TreeEntry::blob(new_hash, false),
+        ));
+        let desired = kin_model::ResolvedTree::from_artifacts(desired_artifacts).unwrap();
+        let authority_context =
+            crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(&state)
+                .unwrap();
+        let publication_error = crate::repository_commit::publish_workspace_tree(
+            state.blobs.as_ref(),
+            &authority_context,
+            &desired,
+            kin_model::OperationId::new(),
+            AuthorId::new("kindb-root-swap-background-test"),
+        )
+        .unwrap_err();
+
+        let original_authority = RepositoryAuthorityManager::open(
+            repository_id.clone(),
+            Arc::new(LocalFileBackend::new(&original)),
+        )
+        .unwrap();
+        let replacement_authority = RepositoryAuthorityManager::open(
+            repository_id,
+            Arc::new(LocalFileBackend::new(&canonical)),
+        )
+        .unwrap();
+        let original_lease = original_authority.read_authority();
+        let replacement_lease = replacement_authority.read_authority();
+        let original_ref_absent = original_lease
+            .metadata()
+            .ref_state
+            .refs
+            .iter()
+            .all(|repository_ref| repository_ref.name != branch);
+        let replacement_ref_absent = replacement_lease
+            .metadata()
+            .ref_state
+            .refs
+            .iter()
+            .all(|repository_ref| repository_ref.name != branch);
+
+        assert_eq!(
+            branch_status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "{}",
+            String::from_utf8_lossy(&branch_body)
+        );
+        assert!(
+            String::from_utf8_lossy(&branch_body).contains("changed since this backend opened"),
+            "{}",
+            String::from_utf8_lossy(&branch_body)
+        );
+        assert!(
+            publication_error
+                .to_string()
+                .contains("changed since this backend opened"),
+            "{publication_error}"
+        );
+        assert_eq!(original_lease.roots(), &roots_before);
+        assert_eq!(replacement_lease.roots(), &roots_before);
+        assert!(original_ref_absent);
+        assert!(replacement_ref_absent);
+        assert_eq!(state.graph.compute_root_hash(), graph_root_before);
+        assert_eq!(
+            state
+                .snapshot_generation
+                .load(std::sync::atomic::Ordering::SeqCst),
+            generation_before
+        );
+        drop(replacement_lease);
+        drop(original_lease);
+        drop(replacement_authority);
+        drop(original_authority);
+        drop(swap);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_branch_same_target_verifies_projection_without_generation_change() {
+        let (state, _layout, _repository, _main, _feature) =
+            universal_branch_test_state("branch-same-target-clean");
+        let authority = ActiveApiRepositoryAuthority::open(&state).unwrap();
+        let roots_before = authority.manager.read_authority().roots().clone();
+        let graph_root_before = state.graph.compute_root_hash();
+        let request = kin_cli::commands::branch::BranchRequest::Switch {
+            name: kin_model::RefName::branch(b"main").unwrap(),
+            operation_id: kin_model::OperationId::new(),
+            actor: AuthorId::new("branch-same-target-clean-test"),
+        };
+
+        let (status, body) = post_branch_request(Arc::clone(&state), &request, None).await;
+
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let response: kin_cli::commands::branch::BranchResponse =
+            serde_json::from_slice(&body).unwrap();
+        assert!(!response.mutated);
+        assert!(response.idempotent);
+        assert_eq!(response.authority_generation, Some(roots_before.generation));
+        assert_eq!(authority.manager.read_authority().roots(), &roots_before);
+        assert_eq!(state.graph.compute_root_hash(), graph_root_before);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_branch_same_target_validates_dirty_projection_before_generation_change() {
+        let (state, _layout, repository, _main, _feature) =
+            universal_branch_test_state("branch-same-target-drift");
+        let generation_before = state
+            .snapshot_generation
+            .load(std::sync::atomic::Ordering::SeqCst);
+        std::fs::write(
+            repository.join("selected/compose.yaml"),
+            b"uncommitted projection drift\n",
+        )
+        .unwrap();
+        let request = kin_cli::commands::branch::BranchRequest::Switch {
+            name: kin_model::RefName::branch(b"main").unwrap(),
+            operation_id: kin_model::OperationId::new(),
+            actor: AuthorId::new("branch-same-target-test"),
+        };
+        let (status, body) = post_branch_request(Arc::clone(&state), &request, None).await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        let authority =
+            crate::local_repository_authority::ActiveLocalRepositoryAuthority::open(&state)
+                .unwrap();
+        assert_eq!(
+            authority.manager.read_authority().roots().generation,
+            generation_before
+        );
+        assert_eq!(
+            std::fs::read(repository.join("selected/compose.yaml")).unwrap(),
+            b"uncommitted projection drift\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_branch_returns_conflict_for_untracked_target_path_without_mutation() {
+        let (state, _layout, repository, _main, _feature) =
+            universal_branch_test_state("branch-untracked-target");
+        let authority = ActiveApiRepositoryAuthority::open(&state).unwrap();
+        let roots_before = authority.manager.read_authority().roots().clone();
+        let graph_root_before = state.graph.compute_root_hash();
+        std::fs::write(
+            repository.join("selected/Dockerfile"),
+            b"untracked local Dockerfile\n",
+        )
+        .unwrap();
+        let request = kin_cli::commands::branch::BranchRequest::Switch {
+            name: kin_model::RefName::branch(b"feature").unwrap(),
+            operation_id: kin_model::OperationId::new(),
+            actor: AuthorId::new("branch-untracked-target-test"),
+        };
+
+        let (status, body) = post_branch_request(Arc::clone(&state), &request, None).await;
+
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(
+            String::from_utf8_lossy(&body).contains("untracked working-copy path"),
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(authority.manager.read_authority().roots(), &roots_before);
+        assert_eq!(state.graph.compute_root_hash(), graph_root_before);
+        assert_eq!(
+            std::fs::read(repository.join("selected/Dockerfile")).unwrap(),
+            b"untracked local Dockerfile\n"
+        );
+        assert_eq!(
+            std::fs::read(repository.join("selected/compose.yaml")).unwrap(),
+            b"services:\n  api:\n    image: main\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_checkout_returns_conflict_for_selected_directory_blocker_without_mutation() {
+        let (state, _layout, repository, _main, feature_change) =
+            universal_branch_test_state("checkout-directory-blocker");
+        let authority = ActiveApiRepositoryAuthority::open(&state).unwrap();
+        let roots_before = authority.manager.read_authority().roots().clone();
+        let graph_root_before = state.graph.compute_root_hash();
+        std::fs::remove_file(repository.join("selected/compose.yaml")).unwrap();
+        std::fs::create_dir(repository.join("selected/compose.yaml")).unwrap();
+        std::fs::write(
+            repository.join("selected/compose.yaml/local-only.txt"),
+            b"preserve me\n",
+        )
+        .unwrap();
+        let request = kin_cli::commands::checkout::CheckoutRequest {
+            path: Some("selected/compose.yaml".to_string()),
+            path_hex: None,
+            change_id: Some(feature_change.to_string()),
+            operation_id: kin_model::OperationId::new(),
+            actor: AuthorId::new("checkout-directory-blocker-test"),
+        };
+
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::post("/commands/checkout")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(
+            String::from_utf8_lossy(&body).contains("became a real directory"),
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(authority.manager.read_authority().roots(), &roots_before);
+        assert_eq!(state.graph.compute_root_hash(), graph_root_before);
+        assert_eq!(
+            std::fs::read(repository.join("selected/compose.yaml/local-only.txt")).unwrap(),
+            b"preserve me\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_checkout_projects_universal_selected_tree_and_replays_exactly() {
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
+        use std::process::Command;
+
+        fn git<const N: usize>(repository: &FsPath, args: [&str; N]) {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(repository)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {:?} failed\nstdout: {}\nstderr: {}",
+                args,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        install_test_registry_override();
+        let root = tempfile::tempdir().unwrap();
+        let repository = root.path().join("repository");
+        std::fs::create_dir_all(repository.join("selected/swap-dir")).unwrap();
+        git(&repository, ["init", "--initial-branch=main"]);
+        git(&repository, ["config", "user.email", "kin@example.invalid"]);
+        git(&repository, ["config", "user.name", "Kin Checkout Test"]);
+        std::fs::write(repository.join("selected/config.yaml"), b"main: true\n").unwrap();
+        std::fs::write(repository.join("selected/remove.txt"), b"main only\n").unwrap();
+        std::fs::write(repository.join("selected/swap-file"), b"main file\n").unwrap();
+        std::fs::write(
+            repository.join("selected/swap-dir/item.txt"),
+            b"main child\n",
+        )
+        .unwrap();
+        std::fs::write(repository.join("outside.txt"), b"outside base\n").unwrap();
+        git(&repository, ["add", "--all"]);
+        git(&repository, ["commit", "-s", "-m", "main tree"]);
+
+        git(&repository, ["switch", "-c", "feature"]);
+        std::fs::write(
+            repository.join("selected/config.yaml"),
+            b"services:\n  api:\n    build: .\n",
+        )
+        .unwrap();
+        std::fs::remove_file(repository.join("selected/remove.txt")).unwrap();
+        std::fs::remove_file(repository.join("selected/swap-file")).unwrap();
+        std::fs::create_dir(repository.join("selected/swap-file")).unwrap();
+        std::fs::write(
+            repository.join("selected/swap-file/nested.txt"),
+            b"feature child\n",
+        )
+        .unwrap();
+        std::fs::remove_file(repository.join("selected/swap-dir/item.txt")).unwrap();
+        std::fs::remove_dir(repository.join("selected/swap-dir")).unwrap();
+        std::fs::write(repository.join("selected/swap-dir"), b"feature file\n").unwrap();
+        std::fs::write(
+            repository.join("selected/compose.yaml"),
+            b"services:\n  worker:\n    image: scratch\n",
+        )
+        .unwrap();
+        std::fs::write(repository.join("selected/Dockerfile"), b"FROM scratch\n").unwrap();
+        std::fs::write(
+            repository.join("selected/data.bin"),
+            [0_u8, 0xff, 0x10, 0x00],
+        )
+        .unwrap();
+        std::fs::write(repository.join("selected/run-tool"), b"#!/bin/sh\nexit 0\n").unwrap();
+        let mut executable_permissions = std::fs::metadata(repository.join("selected/run-tool"))
+            .unwrap()
+            .permissions();
+        executable_permissions.set_mode(0o755);
+        std::fs::set_permissions(repository.join("selected/run-tool"), executable_permissions)
+            .unwrap();
+        std::fs::write(
+            repository.join("selected/notes.mystery"),
+            b"opaque unsupported-extension bytes\n",
+        )
+        .unwrap();
+        symlink("config.yaml", repository.join("selected/config-link")).unwrap();
+        git(&repository, ["add", "--all"]);
+        git(
+            &repository,
+            ["commit", "-s", "-m", "feature universal tree"],
+        );
+        git(&repository, ["switch", "main"]);
+
+        let layout = kin_core::init_from_git(&repository).unwrap().layout;
+        let authority = ActiveApiRepositoryAuthority::open_layout_for_test(&layout).unwrap();
+        let lease = authority.manager.read_authority();
+        let feature_ref = kin_model::RefName::branch(b"feature").unwrap();
+        let feature_target = lease
+            .resolve_ref_target(&feature_ref)
+            .unwrap()
+            .expect("feature ref exists");
+        let feature_change = lease
+            .resolve_target_change_id(&feature_target)
+            .expect("feature target resolves to semantic change");
+        drop(lease);
+        drop(authority);
+
+        let state = Arc::new(DaemonState::open(layout).unwrap());
+        std::fs::write(
+            repository.join("selected/config.yaml"),
+            b"selected dirty bytes\n",
+        )
+        .unwrap();
+        std::fs::write(repository.join("outside.txt"), b"outside dirty preserved\n").unwrap();
+        let operation_id = kin_model::OperationId::new();
+        let request = kin_cli::commands::checkout::CheckoutRequest {
+            path: Some("selected".to_string()),
+            path_hex: None,
+            change_id: Some(feature_change.to_string()),
+            operation_id,
+            actor: AuthorId::new("checkout-universal-route-test"),
+        };
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::post("/commands/checkout")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let first: kin_cli::commands::checkout::CheckoutResponse =
+            serde_json::from_slice(&body).unwrap();
+        let first_report = first.report.unwrap();
+        assert!(first.mutated);
+        assert!(!first_report.projection_only);
+        assert!(!first_report.idempotent);
+        assert_eq!(
+            std::fs::read(repository.join("selected/config.yaml")).unwrap(),
+            b"services:\n  api:\n    build: .\n"
+        );
+        assert_eq!(
+            std::fs::read(repository.join("selected/compose.yaml")).unwrap(),
+            b"services:\n  worker:\n    image: scratch\n"
+        );
+        assert_eq!(
+            std::fs::read(repository.join("selected/Dockerfile")).unwrap(),
+            b"FROM scratch\n"
+        );
+        assert_eq!(
+            std::fs::read(repository.join("selected/data.bin")).unwrap(),
+            [0_u8, 0xff, 0x10, 0x00]
+        );
+        assert_eq!(
+            std::fs::read(repository.join("selected/notes.mystery")).unwrap(),
+            b"opaque unsupported-extension bytes\n"
+        );
+        assert_ne!(
+            std::fs::metadata(repository.join("selected/run-tool"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o111,
+            0
+        );
+        assert_eq!(
+            std::fs::read_link(repository.join("selected/config-link")).unwrap(),
+            FsPath::new("config.yaml")
+        );
+        assert!(!repository.join("selected/remove.txt").exists());
+        assert_eq!(
+            std::fs::read(repository.join("selected/swap-file/nested.txt")).unwrap(),
+            b"feature child\n"
+        );
+        assert_eq!(
+            std::fs::read(repository.join("selected/swap-dir")).unwrap(),
+            b"feature file\n"
+        );
+        assert_eq!(
+            std::fs::read(repository.join("outside.txt")).unwrap(),
+            b"outside dirty preserved\n"
+        );
+
+        let replay = router(Arc::clone(&state))
+            .oneshot(
+                Request::post("/commands/checkout")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = replay.status();
+        let body = axum::body::to_bytes(replay.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let replay: kin_cli::commands::checkout::CheckoutResponse =
+            serde_json::from_slice(&body).unwrap();
+        assert!(!replay.mutated);
+        assert!(replay.report.unwrap().idempotent);
+        assert!(!repository.join("selected/remove.txt").exists());
+        assert_eq!(
+            std::fs::read(repository.join("outside.txt")).unwrap(),
+            b"outside dirty preserved\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn command_checkout_persists_same_tree_semantics_and_replays_after_restart() {
+        let initial = test_state();
+        let layout = initial.layout.clone();
+        let parent = install_repository_file(&initial, "src/lib.rs", b"pub fn stable() {}\n");
+        let entity = test_entity("semantic_only", "src/lib.rs");
+        let entity_id = entity.id;
+        let target = publish_same_tree_semantic_target(&layout, parent, entity.clone());
+        drop(initial);
+
+        let state = Arc::new(DaemonState::open(layout.clone()).unwrap());
+        let tree_before = state.graph.resolved_tree();
+        assert!(state.graph.get_entity(&entity_id).unwrap().is_none());
+        let operation_id = kin_model::OperationId::new();
+        let request = kin_cli::commands::checkout::CheckoutRequest {
+            path: Some("src/lib.rs".to_string()),
+            path_hex: None,
+            change_id: Some(target.to_string()),
+            operation_id,
+            actor: AuthorId::new("checkout-api-test"),
+        };
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::post("/commands/checkout")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let first: kin_cli::commands::checkout::CheckoutResponse =
+            serde_json::from_slice(&body).unwrap();
+        let first_report = first.report.unwrap();
+        assert!(!first_report.projection_only);
+        assert!(!first_report.idempotent);
+        assert_eq!(state.graph.resolved_tree(), tree_before);
+        assert_eq!(
+            state.graph.get_entity(&entity_id).unwrap(),
+            Some(entity.clone())
+        );
+
+        let authority = ActiveApiRepositoryAuthority::open(&state).unwrap();
+        let lease = authority.manager.read_authority();
+        let workspace = lease
+            .metadata()
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == authority.workspace_id)
+            .unwrap();
+        assert_eq!(workspace.tree, tree_before);
+        assert!(!workspace.semantic_overlay.is_empty());
+        let persisted_generation = lease.roots().generation;
+        let persisted_workspace_generation = workspace.generation;
+        drop(lease);
+        drop(authority);
+        drop(state);
+
+        let reopened = Arc::new(DaemonState::open(layout.clone()).unwrap());
+        assert_eq!(reopened.graph.resolved_tree(), tree_before);
+        assert_eq!(
+            reopened.graph.get_entity(&entity_id).unwrap(),
+            Some(entity.clone())
+        );
+        assert_eq!(
+            reopened
+                .snapshot_generation
+                .load(std::sync::atomic::Ordering::SeqCst),
+            persisted_generation
+        );
+        let replay = router(Arc::clone(&reopened))
+            .oneshot(
+                Request::post("/commands/checkout")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = replay.status();
+        let body = axum::body::to_bytes(replay.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let replay: kin_cli::commands::checkout::CheckoutResponse =
+            serde_json::from_slice(&body).unwrap();
+        let replay_report = replay.report.unwrap();
+        assert!(replay_report.idempotent);
+        assert_eq!(
+            replay_report.workspace_generation,
+            persisted_workspace_generation
+        );
+        assert_eq!(reopened.graph.get_entity(&entity_id).unwrap(), Some(entity));
+    }
+
+    #[tokio::test]
+    async fn command_checkout_rejects_session_scoped_authority_before_mutation() {
+        let state = test_state();
+        let roots_before = state.graph.compute_root_hash();
+        let generation_before = state
+            .snapshot_generation
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let session_id = kin_model::SessionId::new();
+        state
+            .set_session_scope(
+                &session_id,
+                "kin:session-checkout".to_string(),
+                SemanticChangeId::from_hash(Hash256::from_bytes([0x77; 32])),
+                Arc::new(kin_db::InMemoryGraph::new()),
+            )
+            .await;
+        let request = kin_cli::commands::checkout::CheckoutRequest {
+            path: Some("src/lib.rs".to_string()),
+            path_hex: None,
+            change_id: None,
+            operation_id: kin_model::OperationId::new(),
+            actor: AuthorId::new("checkout-session-test"),
+        };
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::post("/commands/checkout")
+                    .header("content-type", "application/json")
+                    .header("X-Kin-Session", session_id.to_string())
+                    .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(state.graph.compute_root_hash(), roots_before);
+        assert_eq!(
+            state
+                .snapshot_generation
+                .load(std::sync::atomic::Ordering::SeqCst),
+            generation_before
+        );
+    }
+
+    #[tokio::test]
+    async fn command_checkout_rejects_unknown_unscoped_and_expired_sessions_without_mutation() {
+        let state = committed_test_state();
+        let authority = ActiveApiRepositoryAuthority::open(&state).unwrap();
+        let lease = authority.manager.read_authority();
+        let roots_before = lease.roots().clone();
+        let workspace_before = lease
+            .metadata()
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == authority.workspace_id)
+            .unwrap()
+            .clone();
+        drop(lease);
+        drop(authority);
+        let graph_before = state.graph.to_snapshot();
+        let bytes_before = std::fs::read(state.layout.working_dir().join("README.md")).unwrap();
+        let unknown = kin_model::SessionId::new();
+        let unscoped = state
+            .coordinator
+            .register_session(
+                "codex",
+                "checkout-unscoped-test",
+                kin_model::SessionTransport::Cli,
+                None,
+                state.layout.working_dir().to_path_buf(),
+                kin_model::SessionCapabilities::default(),
+            )
+            .unwrap();
+        let expired = kin_model::SessionId::new();
+        state.session_scopes.write().await.insert(
+            expired,
+            crate::state::TemporalScope {
+                ref_string: "expired-checkout".to_string(),
+                head: SemanticChangeId::from_hash(Hash256::from_bytes([0x91; 32])),
+                cached_graph: Arc::new(kin_db::InMemoryGraph::new()),
+                created_at: std::time::Instant::now() - Duration::from_secs(60),
+                ttl: Duration::from_secs(0),
+            },
+        );
+
+        for session_id in [unknown, unscoped, expired] {
+            let request = kin_cli::commands::checkout::CheckoutRequest {
+                path: Some("README.md".to_string()),
+                path_hex: None,
+                change_id: None,
+                operation_id: kin_model::OperationId::new(),
+                actor: AuthorId::new("checkout-session-isolation-test"),
+            };
+            let response = router(Arc::clone(&state))
+                .oneshot(
+                    Request::post("/commands/checkout")
+                        .header("content-type", "application/json")
+                        .header("X-Kin-Session", session_id.to_string())
+                        .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+        }
+
+        let authority = ActiveApiRepositoryAuthority::open(&state).unwrap();
+        let lease = authority.manager.read_authority();
+        let workspace_after = lease
+            .metadata()
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == authority.workspace_id)
+            .unwrap();
+        assert_eq!(lease.roots(), &roots_before);
+        assert_eq!(workspace_after, &workspace_before);
+        assert_eq!(
+            state.graph.to_snapshot().resolved_tree,
+            graph_before.resolved_tree
+        );
+        assert_eq!(state.graph.to_snapshot().entities, graph_before.entities);
+        assert_eq!(state.graph.to_snapshot().relations, graph_before.relations);
+        assert_eq!(
+            std::fs::read(state.layout.working_dir().join("README.md")).unwrap(),
+            bytes_before
+        );
+    }
+
+    #[tokio::test]
+    async fn command_checkout_returns_typed_bad_request_and_conflict_statuses() {
+        let state = committed_test_state();
+        let request = |path: &str, change_id: Option<String>, operation_id| {
+            kin_cli::commands::checkout::CheckoutRequest {
+                path: Some(path.to_string()),
+                path_hex: None,
+                change_id,
+                operation_id,
+                actor: AuthorId::new("checkout-typed-errors-test"),
+            }
+        };
+        let unborn = test_state();
+        let unborn_request = request("README.md", None, kin_model::OperationId::new());
+        let response = router(unborn)
+            .oneshot(
+                Request::post("/commands/checkout")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&unborn_request).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+
+        for invalid in [
+            request("../outside", None, kin_model::OperationId::new()),
+            request(
+                "README.md",
+                Some("not-a-change".to_string()),
+                kin_model::OperationId::new(),
+            ),
+            request(
+                "README.md",
+                Some(Hash256::from_bytes([0x99; 32]).to_string()),
+                kin_model::OperationId::new(),
+            ),
+        ] {
+            let response = router(Arc::clone(&state))
+                .oneshot(
+                    Request::post("/commands/checkout")
+                        .header("content-type", "application/json")
+                        .body(Body::from(serde_json::to_vec(&invalid).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+
+        let missing = request("does/not/exist", None, kin_model::OperationId::new());
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::post("/commands/checkout")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&missing).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+
+        let operation_id = kin_model::OperationId::new();
+        let first = request("README.md", None, operation_id);
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::post("/commands/checkout")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&first).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let conflicting = request("does/not/exist", None, operation_id);
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::post("/commands/checkout")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&conflicting).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_checkout_source_cas_integrity_failures_are_internal_without_mutation() {
+        let target_body = b"services:\n  api:\n    image: feature\n";
+        let target_digest = Hash256::from_bytes(kin_blobs::digest_bytes(target_body));
+        for (mode, corrupt) in [("missing", false), ("corrupt", true)] {
+            let label = format!("checkout-source-cas-{mode}");
+            let (state, layout, repository, _main, feature_change) =
+                universal_branch_test_state(&label);
+            let authority = ActiveApiRepositoryAuthority::open(&state).unwrap();
+            let lease = authority.manager.read_authority();
+            let roots_before = lease.roots().clone();
+            let workspace_before = lease
+                .metadata()
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.workspace_id == authority.workspace_id)
+                .unwrap()
+                .clone();
+            let source_cas_path = repository_source_cas_path(
+                &layout,
+                authority.repository_id.as_str(),
+                target_digest,
+            );
+            assert_eq!(
+                authority.manager.load_source_blob(target_digest).unwrap(),
+                Some(target_body.to_vec())
+            );
+            drop(lease);
+            if corrupt {
+                std::fs::write(&source_cas_path, b"corrupt source bytes").unwrap();
+            } else {
+                std::fs::remove_file(&source_cas_path).unwrap();
+            }
+            let graph_root_before = state.graph.compute_root_hash();
+            let request = kin_cli::commands::checkout::CheckoutRequest {
+                path: Some("selected/compose.yaml".to_string()),
+                path_hex: None,
+                change_id: Some(feature_change.to_string()),
+                operation_id: kin_model::OperationId::new(),
+                actor: AuthorId::new("checkout-source-cas-integrity-test"),
+            };
+            let response = router(Arc::clone(&state))
+                .oneshot(
+                    Request::post("/commands/checkout")
+                        .header("content-type", "application/json")
+                        .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "{mode}"
+            );
+
+            let lease = authority.manager.read_authority();
+            let workspace_after = lease
+                .metadata()
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.workspace_id == authority.workspace_id)
+                .unwrap();
+            assert_eq!(lease.roots(), &roots_before, "{mode}");
+            assert_eq!(workspace_after, &workspace_before, "{mode}");
+            assert_eq!(state.graph.compute_root_hash(), graph_root_before, "{mode}");
+            assert_eq!(
+                state
+                    .snapshot_generation
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                roots_before.generation,
+                "{mode}"
+            );
+            assert_eq!(
+                std::fs::read(repository.join("selected/compose.yaml")).unwrap(),
+                b"services:\n  api:\n    image: main\n",
+                "{mode}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_checkout_projection_only_repairs_universal_bytes_and_replays_after_restart() {
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
+
+        let (state, layout, repository, _main, _feature) =
+            universal_branch_test_state("checkout-projection-only");
+        let authority = ActiveApiRepositoryAuthority::open(&state).unwrap();
+        let roots_before = authority.manager.read_authority().roots().clone();
+        drop(authority);
+        std::fs::write(
+            repository.join("selected/compose.yaml"),
+            b"dirty compose bytes\n",
+        )
+        .unwrap();
+        std::fs::write(repository.join("selected/data.bin"), b"dirty binary").unwrap();
+        let mut permissions = std::fs::metadata(repository.join("selected/run-tool"))
+            .unwrap()
+            .permissions();
+        permissions.set_mode(0o644);
+        std::fs::set_permissions(repository.join("selected/run-tool"), permissions).unwrap();
+        std::fs::remove_file(repository.join("selected/current-compose")).unwrap();
+        symlink("data.bin", repository.join("selected/current-compose")).unwrap();
+        std::fs::write(repository.join("outside.txt"), b"outside dirty preserved\n").unwrap();
+        let request = kin_cli::commands::checkout::CheckoutRequest {
+            path: Some("selected".to_string()),
+            path_hex: None,
+            change_id: None,
+            operation_id: kin_model::OperationId::new(),
+            actor: AuthorId::new("checkout-projection-only-test"),
+        };
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::post("/commands/checkout")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let response: kin_cli::commands::checkout::CheckoutResponse =
+            serde_json::from_slice(&body).unwrap();
+        assert!(response.report.unwrap().projection_only);
+        assert_eq!(
+            std::fs::read(repository.join("selected/compose.yaml")).unwrap(),
+            b"services:\n  api:\n    image: main\n"
+        );
+        assert_eq!(
+            std::fs::read(repository.join("selected/data.bin")).unwrap(),
+            [0_u8, 0xff, 0x10, 0x00]
+        );
+        assert_ne!(
+            std::fs::metadata(repository.join("selected/run-tool"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o111,
+            0
+        );
+        assert_eq!(
+            std::fs::read_link(repository.join("selected/current-compose")).unwrap(),
+            FsPath::new("compose.yaml")
+        );
+        assert_eq!(
+            std::fs::read(repository.join("outside.txt")).unwrap(),
+            b"outside dirty preserved\n"
+        );
+        let authority = ActiveApiRepositoryAuthority::open(&state).unwrap();
+        assert_eq!(authority.manager.read_authority().roots(), &roots_before);
+        drop(authority);
+
+        std::fs::write(
+            repository.join("selected/compose.yaml"),
+            b"post-completion edit\n",
+        )
+        .unwrap();
+        drop(state);
+        let reopened = Arc::new(DaemonState::open(layout.clone()).unwrap());
+        let replay = router(Arc::clone(&reopened))
+            .oneshot(
+                Request::post("/commands/checkout")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = replay.status();
+        let body = axum::body::to_bytes(replay.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let replay: kin_cli::commands::checkout::CheckoutResponse =
+            serde_json::from_slice(&body).unwrap();
+        let report = replay.report.unwrap();
+        assert!(report.projection_only);
+        assert!(report.idempotent);
+        assert!(!replay.mutated);
+        assert_eq!(
+            std::fs::read(repository.join("selected/compose.yaml")).unwrap(),
+            b"post-completion edit\n"
+        );
+        let authority = ActiveApiRepositoryAuthority::open(&reopened).unwrap();
+        assert_eq!(authority.manager.read_authority().roots(), &roots_before);
+    }
+
+    #[tokio::test]
+    async fn exact_source_route_reads_repository_cas_and_ignores_checkout_bytes() {
+        let state = test_state();
+        let repo_id = state.cached_repo_id.clone();
+        let change_id = install_repository_file(&state, "README.md", b"graph-owned source\n");
+        let app = router_with_auth(Arc::clone(&state), Some("exact-source-token".to_string()));
+        let path = format!("/repos/{repo_id}/archive/tar/{change_id}");
+
+        let unauthenticated = app
+            .clone()
+            .oneshot(Request::get(&path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+        let request = || {
+            Request::get(&path)
+                .header(header::AUTHORIZATION, "Bearer exact-source-token")
+                .body(Body::empty())
+                .unwrap()
+        };
+        let first = app.clone().oneshot(request()).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(
+            first.headers()["x-kin-source-change-id"],
+            change_id.to_string()
+        );
+        let manifest = first.headers()["x-kin-source-manifest-sha256"].clone();
+        let first = axum::body::to_bytes(first.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert!(!first.is_empty());
+        let first_digest: [u8; 32] = Sha256::digest(&first).into();
+        // The archive body deliberately retains the process-wide memory
+        // admission permit for as long as its bytes are alive. Release that
+        // first allocation before asking the single-flight endpoint to
+        // reproduce it, then compare the exact content identity.
+        drop(first);
+
+        std::fs::write(
+            state.layout.working_dir().join("README.md"),
+            b"unadmitted checkout decoy\n",
+        )
+        .unwrap();
+        let repeated = app.oneshot(request()).await.unwrap();
+        assert_eq!(repeated.status(), StatusCode::OK);
+        assert_eq!(repeated.headers()["x-kin-source-manifest-sha256"], manifest);
+        let repeated = axum::body::to_bytes(repeated.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let repeated_digest: [u8; 32] = Sha256::digest(&repeated).into();
+        assert_eq!(repeated_digest, first_digest);
     }
 
     #[tokio::test]
     async fn health_returns_ok_with_extended_fields() {
         let state = test_state();
+        let expected_generation = DaemonState::read_generation_marker(&state.layout);
         let app = router(state);
         let response = app
             .oneshot(Request::get("/health").body(Body::empty()).unwrap())
@@ -13161,14 +11714,13 @@ mod tests {
         assert!(!json.build.built_at.is_empty());
         assert!(
             !json.embed_persistence_unavailable,
-            "local SnapshotManager authority must retain embedding persistence"
+            "local repository authority must allow derived vector persistence"
         );
         assert!(
             !json.filesystem_reconcile_disabled,
             "local authority remains file-compatible unless explicitly disabled"
         );
-        // Additive freshness marker present; 0 before any snapshot is committed.
-        assert_eq!(json.graph_generation, 0);
+        assert_eq!(json.graph_generation, expected_generation);
         let coordination = json
             .coordination
             .expect("new daemon must attest coordination");
@@ -13253,7 +11805,12 @@ mod tests {
                 Request::post("/commands/commit")
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        json!({ "message": "must not infer emptyDir removals" }).to_string(),
+                        json!({
+                            "operation_id": kin_model::OperationId::new(),
+                            "timestamp": kin_model::Timestamp::now(),
+                            "message": "must not infer emptyDir removals"
+                        })
+                        .to_string(),
                     ))
                     .unwrap(),
             )
@@ -13264,7 +11821,7 @@ mod tests {
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["error"], "filesystem_reconcile_disabled");
+        assert_eq!(json["error"], "filesystem_admission_disabled");
         assert_eq!(json["endpoint"], "/commands/commit");
         assert_eq!(json["mutation_applied"], false);
         assert_eq!(state.graph.compute_root_hash(), root_before);
@@ -13278,6 +11835,146 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Relaxed),
             generation_before
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_commit_preserves_complete_arbitrary_repository_tree() {
+        use kin_model::RepositoryAuthorityStore as _;
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
+
+        let state = test_state();
+        let root = state.layout.working_dir();
+        std::fs::create_dir_all(root.join("assets")).unwrap();
+        std::fs::write(
+            root.join("compose.yaml"),
+            b"services:\n  app:\n    image: kin:test\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("Dockerfile"), b"FROM scratch\n").unwrap();
+        let mut executable = std::fs::metadata(root.join("Dockerfile"))
+            .unwrap()
+            .permissions();
+        executable.set_mode(0o755);
+        std::fs::set_permissions(root.join("Dockerfile"), executable).unwrap();
+        std::fs::write(root.join("assets/model.bin"), [0, 0xff, 0x41, 0]).unwrap();
+        std::fs::write(
+            root.join("deployment.kin-unknown"),
+            b"opaque=still-repository-truth\n",
+        )
+        .unwrap();
+        symlink("compose.yaml", root.join("current-compose")).unwrap();
+
+        let generation_before = ActiveApiRepositoryAuthority::open(&state)
+            .unwrap()
+            .manager
+            .read_authority()
+            .roots()
+            .generation;
+        let app = router(Arc::clone(&state));
+        let obsolete_dry_run = app
+            .clone()
+            .oneshot(
+                Request::post("/commands/commit")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "operation_id": kin_model::OperationId::new(),
+                            "timestamp": kin_model::Timestamp::now(),
+                            "message": "obsolete dry run must not commit",
+                            "dry_run": true
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(obsolete_dry_run.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            ActiveApiRepositoryAuthority::open(&state)
+                .unwrap()
+                .manager
+                .read_authority()
+                .roots()
+                .generation,
+            generation_before,
+            "removed dry-run payload must fail before filesystem admission"
+        );
+
+        let response = app
+            .oneshot(
+                Request::post("/commands/commit")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "operation_id": kin_model::OperationId::new(),
+                            "timestamp": kin_model::Timestamp::now(),
+                            "message": "commit the complete arbitrary repository"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(response["file_count"], 5);
+        let change_id = kin_model::SemanticChangeId::from_hash(
+            Hash256::from_hex(response["change_id"].as_str().unwrap()).unwrap(),
+        );
+
+        let authority = ActiveApiRepositoryAuthority::open(&state).unwrap();
+        let lease = authority.manager.read_authority();
+        let workspace = lease
+            .metadata()
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == authority.workspace_id)
+            .unwrap();
+        assert_eq!(workspace.tree.len(), 5);
+        assert_eq!(workspace.tree, state.graph.resolved_tree());
+        assert_eq!(
+            workspace
+                .tree
+                .artifact_at_path(&RepoPath::from_utf8("Dockerfile").unwrap())
+                .unwrap()
+                .entry,
+            TreeEntry::blob(
+                Hash256::from_bytes(kin_blobs::digest_bytes(b"FROM scratch\n")),
+                true
+            )
+        );
+        assert!(matches!(
+            workspace
+                .tree
+                .artifact_at_path(&RepoPath::from_utf8("current-compose").unwrap())
+                .unwrap()
+                .entry,
+            TreeEntry::Symlink { .. }
+        ));
+        assert_eq!(
+            authority
+                .manager
+                .get_repository_ref(
+                    &authority.repository_id,
+                    lease.metadata().ref_state.default_ref.as_ref().unwrap(),
+                )
+                .unwrap()
+                .unwrap()
+                .target,
+            kin_model::RefTarget::change(change_id)
+        );
+        assert!(lease
+            .snapshot()
+            .changes
+            .iter()
+            .any(|(_, change)| change.id == change_id));
     }
 
     #[tokio::test]
@@ -13297,7 +11994,7 @@ mod tests {
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["error"], "filesystem_reconcile_disabled");
+        assert_eq!(json["error"], "filesystem_admission_disabled");
         assert_eq!(json["endpoint"], "/lsp/sweep");
         assert_eq!(json["mutation_applied"], false);
         assert_eq!(state.graph.compute_root_hash(), root_before);
@@ -13333,1243 +12030,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn graph_commit_creates_missing_branch_for_first_hosted_publish() {
-        let state = test_state();
-        let entity = test_entity("served_fn", "src/lib.py");
-        let change_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x83; 32]));
-        let payload = serde_json::json!({
-            "change": {
-                "id": change_id,
-                "parents": [],
-                "timestamp": Timestamp::now(),
-                "author": "tester",
-                "message": "first hosted publish",
-                "entity_deltas": [{ "Added": entity }],
-                "relation_deltas": [],
-                "artifact_deltas": [],
-                "projected_files": [],
-                "spec_link": null,
-                "evidence": [],
-                "risk_summary": null,
-                "authored_on": "main",
-            },
-            "branch_name": "main",
-        });
-        let app = router(Arc::clone(&state));
-
-        let response = app
-            .clone()
-            .oneshot(
-                Request::post("/graph/commit")
-                    .header("content-type", "application/json")
-                    .body(Body::from(payload.to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let refs_path = format!("/repos/{}/refs", state.cached_repo_id);
-        let refs_response = app
-            .oneshot(Request::get(refs_path).body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(refs_response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(refs_response.into_body(), 8192)
-            .await
-            .unwrap();
-        let refs: RepoRefsResponse = serde_json::from_slice(&body).unwrap();
-        let change_id_string = change_id.to_string();
-        assert_eq!(refs.branch_name.as_deref(), Some("main"));
-        assert_eq!(refs.head_ref.as_deref(), Some(change_id_string.as_str()));
-        assert_eq!(state.graph.entity_count(), 1);
-    }
-
-    #[tokio::test]
-    async fn graph_commit_rejects_same_id_with_different_payload_before_mutation() {
-        let state = test_state();
-        let mut existing = kin_core::build_genesis_change();
-        existing.id = SemanticChangeId::from_hash(Hash256::from_bytes([0x84; 32]));
-        existing.message = "immutable original".to_string();
-        state.graph.create_change(&existing).unwrap();
-
-        let entity = test_entity("must_not_land", "src/lib.rs");
-        let mut conflicting = existing.clone();
-        conflicting.message = "conflicting replacement".to_string();
-        conflicting.entity_deltas = vec![kin_model::EntityDelta::Added(entity)];
-        let payload = serde_json::json!({
-            "change": conflicting,
-            "branch_name": "main",
-        });
-
-        let response = router(Arc::clone(&state))
-            .oneshot(
-                Request::post("/graph/commit")
-                    .header("content-type", "application/json")
-                    .body(Body::from(payload.to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::CONFLICT);
-        assert_eq!(state.graph.entity_count(), 0);
-        assert_eq!(
-            state
-                .graph
-                .get_change(&existing.id)
-                .unwrap()
-                .unwrap()
-                .message,
-            "immutable original"
-        );
-    }
-
-    #[tokio::test]
-    async fn graph_commit_stale_parent_returns_409_before_any_mutation() {
-        let state = test_state();
-        let live_head = install_release_test_branch(&state);
-        let entity = test_entity("must_not_land", "src/stale.rs");
-        let candidate_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x91; 32]));
-        let candidate = SemanticChange {
-            id: candidate_id,
-            parents: vec![SemanticChangeId::from_hash(Hash256::from_bytes([0x90; 32]))],
-            timestamp: Timestamp::now(),
-            author: AuthorId::new("tester"),
-            message: "stale candidate".to_string(),
-            entity_deltas: vec![EntityDelta::Added(entity)],
-            relation_deltas: vec![],
-            artifact_deltas: vec![],
-            projected_files: vec![],
-            spec_link: None,
-            evidence: vec![],
-            risk_summary: None,
-            authored_on: Some(BranchName::new("main")),
-        };
-        let root_before = state.graph.compute_root_hash();
-        let generation_before = state
-            .snapshot_generation
-            .load(std::sync::atomic::Ordering::SeqCst);
-
-        let response = router(Arc::clone(&state))
-            .oneshot(
-                Request::post("/graph/commit")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({ "change": candidate, "branch_name": "main" }).to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::CONFLICT);
-        let body = axum::body::to_bytes(response.into_body(), 4096)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["error"], "stale_branch_head");
-        assert_eq!(json["mutation_applied"], false);
-        assert_eq!(json["change_materialized"], false);
-        assert_eq!(json["actual_head"], live_head.to_string());
-        assert!(state.graph.get_change(&candidate_id).unwrap().is_none());
-        assert_eq!(state.graph.entity_count(), 0);
-        assert_eq!(state.graph.compute_root_hash(), root_before);
-        assert_eq!(
-            state
-                .snapshot_generation
-                .load(std::sync::atomic::Ordering::SeqCst),
-            generation_before
-        );
-
-        // The same stale response is not absence proof when the immutable
-        // change already exists but is detached from this branch.
-        state.graph.create_change(&candidate).unwrap();
-        let response = router(Arc::clone(&state))
-            .oneshot(
-                Request::post("/graph/commit")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({ "change": candidate, "branch_name": "main" }).to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::CONFLICT);
-        let body = axum::body::to_bytes(response.into_body(), 4096)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["error"], "stale_branch_head");
-        assert_eq!(json["mutation_applied"], false);
-        assert_eq!(json["change_materialized"], true);
-    }
-
-    #[tokio::test]
-    async fn graph_commit_local_exact_source_preflight_is_atomic_and_accepts_valid_cas() {
-        let valid_state = test_state();
-        let valid_parent = install_release_test_branch(&valid_state);
-        let valid_blob = valid_state.blobs.write(b"verified source\n").unwrap();
-        let valid_change = exact_source_test_change(
-            valid_parent,
-            0xb0,
-            "src/lib.rs",
-            ArtifactDeltaKind::AddedRegularFile,
-            Hash256::from_bytes(valid_blob.0),
-        );
-        let valid_response = router(Arc::clone(&valid_state))
-            .oneshot(
-                Request::post("/graph/commit")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({ "change": valid_change, "branch_name": "main" }).to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(valid_response.status(), StatusCode::OK);
-        assert!(valid_state
-            .graph
-            .get_change(&valid_change.id)
-            .unwrap()
-            .is_some());
-        assert_eq!(
-            valid_state
-                .graph
-                .get_branch(&BranchName::new("main"))
-                .unwrap()
-                .unwrap()
-                .head,
-            valid_change.id
-        );
-
-        for case in ["missing", "corrupt", "unsafe_path", "unsafe_symlink"] {
-            let state = test_state();
-            let parent = install_release_test_branch(&state);
-            let (file_id, kind, hash) = match case {
-                "missing" => (
-                    "src/missing.rs",
-                    ArtifactDeltaKind::AddedRegularFile,
-                    Hash256::from_bytes(kin_blobs::digest_bytes(b"missing source")),
-                ),
-                "corrupt" => {
-                    let blob = state.blobs.write(b"expected source").unwrap();
-                    let hash = Hash256::from_bytes(blob.0);
-                    std::fs::write(api_local_object_path(&state, hash), b"corrupt source").unwrap();
-                    ("src/corrupt.rs", ArtifactDeltaKind::AddedRegularFile, hash)
-                }
-                "unsafe_path" => {
-                    let blob = state.blobs.write(b"control overwrite").unwrap();
-                    (
-                        ".kin/authority",
-                        ArtifactDeltaKind::AddedRegularFile,
-                        Hash256::from_bytes(blob.0),
-                    )
-                }
-                "unsafe_symlink" => {
-                    let blob = state.blobs.write(b"../../outside").unwrap();
-                    (
-                        "src/escape",
-                        ArtifactDeltaKind::AddedSymlink,
-                        Hash256::from_bytes(blob.0),
-                    )
-                }
-                _ => unreachable!(),
-            };
-            let change = exact_source_test_change(parent, 0xb1, file_id, kind, hash);
-            let root_before = state.graph.compute_root_hash();
-            let generation_before = state
-                .snapshot_generation
-                .load(std::sync::atomic::Ordering::SeqCst);
-
-            let response = router(Arc::clone(&state))
-                .oneshot(
-                    Request::post("/graph/commit")
-                        .header("content-type", "application/json")
-                        .body(Body::from(
-                            json!({ "change": change, "branch_name": "main" }).to_string(),
-                        ))
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-
-            assert_eq!(
-                response.status(),
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "{case} must fail exact-source admission"
-            );
-            let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
-                .await
-                .unwrap();
-            assert!(
-                String::from_utf8_lossy(&body).contains("exact source"),
-                "unexpected {case} response: {}",
-                String::from_utf8_lossy(&body)
-            );
-            assert!(state.graph.get_change(&change.id).unwrap().is_none());
-            assert_eq!(
-                state
-                    .graph
-                    .get_branch(&BranchName::new("main"))
-                    .unwrap()
-                    .unwrap()
-                    .head,
-                parent
-            );
-            assert_eq!(state.graph.compute_root_hash(), root_before);
-            assert_eq!(
-                state
-                    .snapshot_generation
-                    .load(std::sync::atomic::Ordering::SeqCst),
-                generation_before
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn release_admission_rejects_nonexact_or_unmaterializable_source_tree_atomically() {
-        for case in [
-            "legacy_mode",
-            "missing",
-            "corrupt",
-            "unsafe_path",
-            "unsafe_symlink",
-        ] {
-            let state = test_state();
-            let parent = install_release_test_branch(&state);
-            let (file_id, kind, hash) = match case {
-                "legacy_mode" => (
-                    "src/legacy.rs",
-                    ArtifactDeltaKind::Added,
-                    Hash256::from_bytes(kin_blobs::digest_bytes(b"legacy source")),
-                ),
-                "missing" => (
-                    "src/missing.rs",
-                    ArtifactDeltaKind::AddedRegularFile,
-                    Hash256::from_bytes(kin_blobs::digest_bytes(b"missing source")),
-                ),
-                "corrupt" => {
-                    let blob = state.blobs.write(b"expected release source").unwrap();
-                    let hash = Hash256::from_bytes(blob.0);
-                    std::fs::write(api_local_object_path(&state, hash), b"corrupt source").unwrap();
-                    ("src/corrupt.rs", ArtifactDeltaKind::AddedRegularFile, hash)
-                }
-                "unsafe_path" => {
-                    let blob = state.blobs.write(b"control overwrite").unwrap();
-                    (
-                        ".kin/release",
-                        ArtifactDeltaKind::AddedRegularFile,
-                        Hash256::from_bytes(blob.0),
-                    )
-                }
-                "unsafe_symlink" => {
-                    let blob = state.blobs.write(b"../../outside").unwrap();
-                    (
-                        "src/escape",
-                        ArtifactDeltaKind::AddedSymlink,
-                        Hash256::from_bytes(blob.0),
-                    )
-                }
-                _ => unreachable!(),
-            };
-            let source = exact_source_test_change(parent, 0xb2, file_id, kind, hash);
-            install_source_test_head(&state, &source);
-            let release = release_test_change(source.id, 0xb3);
-            let root_before = state.graph.compute_root_hash();
-            let generation_before = state
-                .snapshot_generation
-                .load(std::sync::atomic::Ordering::SeqCst);
-
-            let response = router(Arc::clone(&state))
-                .oneshot(
-                    Request::post("/graph/commit")
-                        .header("content-type", "application/json")
-                        .body(Body::from(release_test_payload(&release).to_string()))
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-
-            assert_eq!(
-                response.status(),
-                StatusCode::FAILED_DEPENDENCY,
-                "{case} release source must fail closed"
-            );
-            let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
-                .await
-                .unwrap();
-            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-            assert_eq!(body["error"], "release_source_not_exact");
-            assert_eq!(body["source_head"], source.id.to_string());
-            assert_eq!(body["mutation_applied"], false);
-            assert!(state.graph.get_change(&release.id).unwrap().is_none());
-            assert_eq!(
-                state
-                    .graph
-                    .get_branch(&BranchName::new("main"))
-                    .unwrap()
-                    .unwrap()
-                    .head,
-                source.id
-            );
-            assert_eq!(state.graph.compute_root_hash(), root_before);
-            assert_eq!(
-                state
-                    .snapshot_generation
-                    .load(std::sync::atomic::Ordering::SeqCst),
-                generation_before
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn release_admission_accepts_materializable_exact_local_source_tree() {
-        let state = test_state();
-        let parent = install_release_test_branch(&state);
-        let blob = state.blobs.write(b"release exact source\n").unwrap();
-        let source = exact_source_test_change(
-            parent,
-            0xb4,
-            "src/release.rs",
-            ArtifactDeltaKind::AddedRegularFile,
-            Hash256::from_bytes(blob.0),
-        );
-        install_source_test_head(&state, &source);
-        let release = release_test_change(source.id, 0xb5);
-
-        let response = router(Arc::clone(&state))
-            .oneshot(
-                Request::post("/graph/commit")
-                    .header("content-type", "application/json")
-                    .body(Body::from(release_test_payload(&release).to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        assert!(state.graph.get_change(&release.id).unwrap().is_some());
-        assert_eq!(
-            state
-                .graph
-                .get_branch(&BranchName::new("main"))
-                .unwrap()
-                .unwrap()
-                .head,
-            release.id
-        );
-    }
-
-    #[tokio::test]
-    async fn release_admission_rejects_noncanonical_one_sided_markers() {
-        for case in ["author_only", "message_only"] {
-            let state = test_state();
-            let parent = install_release_test_branch(&state);
-            let mut candidate = release_test_change(parent, 0xb8);
-            match case {
-                "author_only" => candidate.message = "ordinary commit".to_string(),
-                "message_only" => candidate.author = AuthorId::new("ordinary-author"),
-                _ => unreachable!(),
-            }
-            let root_before = state.graph.compute_root_hash();
-
-            let response = router(Arc::clone(&state))
-                .oneshot(
-                    Request::post("/graph/commit")
-                        .header("content-type", "application/json")
-                        .body(Body::from(
-                            json!({ "change": candidate, "branch_name": "main" }).to_string(),
-                        ))
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-
-            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{case}");
-            let body = axum::body::to_bytes(response.into_body(), 4096)
-                .await
-                .unwrap();
-            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-            assert_eq!(body["error"], "invalid_release_marker", "{case}");
-            assert_eq!(body["mutation_applied"], false, "{case}");
-            assert!(state.graph.get_change(&candidate.id).unwrap().is_none());
-            assert_eq!(state.graph.compute_root_hash(), root_before);
-        }
-    }
-
-    #[tokio::test]
-    async fn release_admission_rejects_marker_count_not_bound_to_source() {
-        let state = test_state();
-        let parent = install_release_test_branch(&state);
-        let mut candidate = release_test_change(parent, 0xb9);
-        candidate.message = "release: test (1 entities snapshot)".to_string();
-        let root_before = state.graph.compute_root_hash();
-
-        let response = router(Arc::clone(&state))
-            .oneshot(
-                Request::post("/graph/commit")
-                    .header("content-type", "application/json")
-                    .body(Body::from(release_test_payload(&candidate).to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        let body = axum::body::to_bytes(response.into_body(), 4096)
-            .await
-            .unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(body["error"], "invalid_release_snapshot_count");
-        assert_eq!(body["marker_entity_count"], 1);
-        assert_eq!(body["source_entity_count"], 0);
-        assert_eq!(body["mutation_applied"], false);
-        assert!(state.graph.get_change(&candidate.id).unwrap().is_none());
-        assert_eq!(state.graph.compute_root_hash(), root_before);
-    }
-
-    #[tokio::test]
-    async fn release_admission_rejects_exact_file_directory_collision() {
-        let state = test_state();
-        let parent = install_release_test_branch(&state);
-        let file_hash = Hash256::from_bytes(state.blobs.write(b"file bytes").unwrap().0);
-        let child_hash = Hash256::from_bytes(state.blobs.write(b"child bytes").unwrap().0);
-        let mut source = exact_source_test_change(
-            parent,
-            0xb6,
-            "pkg",
-            ArtifactDeltaKind::AddedRegularFile,
-            file_hash,
-        );
-        source.artifact_deltas.push(ArtifactDelta {
-            file_id: FilePathId::new("pkg/lib.rs"),
-            kind: ArtifactDeltaKind::AddedRegularFile,
-            old_hash: None,
-            new_hash: Some(child_hash),
-        });
-        install_source_test_head(&state, &source);
-        let release = release_test_change(source.id, 0xb7);
-        let root_before = state.graph.compute_root_hash();
-        let generation_before = state
-            .snapshot_generation
-            .load(std::sync::atomic::Ordering::SeqCst);
-
-        let response = router(Arc::clone(&state))
-            .oneshot(
-                Request::post("/graph/commit")
-                    .header("content-type", "application/json")
-                    .body(Body::from(release_test_payload(&release).to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::FAILED_DEPENDENCY);
-        assert!(state.graph.get_change(&release.id).unwrap().is_none());
-        assert_eq!(
-            state
-                .graph
-                .get_branch(&BranchName::new("main"))
-                .unwrap()
-                .unwrap()
-                .head,
-            source.id
-        );
-        assert_eq!(state.graph.compute_root_hash(), root_before);
-        assert_eq!(
-            state
-                .snapshot_generation
-                .load(std::sync::atomic::Ordering::SeqCst),
-            generation_before
-        );
-    }
-
-    #[tokio::test]
-    async fn queued_release_observes_competing_head_and_returns_409() {
-        let state = test_state();
-        let original_head = install_release_test_branch(&state);
-        let release = release_test_change(original_head, 0x92);
-        let release_id = release.id;
-        let payload = release_test_payload(&release);
-
-        let guard = state.coordination_gate.lock().await;
-        let app = router(Arc::clone(&state));
-        let request = tokio::spawn(async move {
-            app.oneshot(
-                Request::post("/graph/commit")
-                    .header("content-type", "application/json")
-                    .body(Body::from(payload.to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap()
-        });
-        tokio::task::yield_now().await;
-
-        let mut competing = kin_core::build_genesis_change();
-        competing.id = SemanticChangeId::from_hash(Hash256::from_bytes([0x93; 32]));
-        competing.parents = vec![original_head];
-        competing.message = "competing branch advance".to_string();
-        state.graph.create_change(&competing).unwrap();
-        state
-            .graph
-            .update_branch_head(&BranchName::new("main"), &competing.id)
-            .unwrap();
-        drop(guard);
-
-        let response = request.await.unwrap();
-        assert_eq!(response.status(), StatusCode::CONFLICT);
-        let body = axum::body::to_bytes(response.into_body(), 4096)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["error"], "stale_branch_head");
-        assert_eq!(json["actual_head"], competing.id.to_string());
-        assert!(state.graph.get_change(&release_id).unwrap().is_none());
-        assert_eq!(
-            state
-                .graph
-                .get_branch(&BranchName::new("main"))
-                .unwrap()
-                .unwrap()
-                .head,
-            competing.id
-        );
-    }
-
-    #[tokio::test]
-    async fn live_overlay_deletion_cannot_make_strict_release_green() {
-        let state = test_state();
-        let entity = test_entity("historical_entity", "src/live.rs");
-        let source = install_release_entity_head(&state, &entity, 0x93);
-        let release = release_test_change_with_count(source.id, 0x94, 1);
-        let release_id = release.id;
-        let payload = json!({
-            "change": release,
-            "branch_name": "main",
-            "release_policy": {
-                "force": true,
-                "require_proof": true,
-                "require_approval": false,
-            },
-        });
-
-        let guard = state.coordination_gate.lock().await;
-        let app = router(Arc::clone(&state));
-        let request = tokio::spawn(async move {
-            app.oneshot(
-                Request::post("/graph/commit")
-                    .header("content-type", "application/json")
-                    .body(Body::from(payload.to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap()
-        });
-        tokio::task::yield_now().await;
-
-        // This ambient/live deletion is not a semantic change and therefore
-        // cannot alter policy for the immutable release parent.
-        state.graph.remove_entity(&entity.id).unwrap();
-        drop(guard);
-
-        let response = request.await.unwrap();
-        assert_eq!(response.status(), StatusCode::CONFLICT);
-        let body = axum::body::to_bytes(response.into_body(), 4096)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["error"], "release_policy_failed");
-        assert_eq!(json["gate"], "proof");
-        assert_eq!(json["source_head"], source.id.to_string());
-        assert_eq!(
-            json["missing_proof"],
-            serde_json::json!([entity.id.to_string()])
-        );
-        assert!(state.graph.get_change(&release_id).unwrap().is_none());
-        assert_eq!(
-            state
-                .graph
-                .get_branch(&BranchName::new("main"))
-                .unwrap()
-                .unwrap()
-                .head,
-            source.id
-        );
-    }
-
-    #[tokio::test]
-    async fn changed_stable_id_entity_cannot_reuse_an_unbound_old_run() {
-        let state = test_state();
-        let old = test_entity("stable_entity", "src/stable.rs");
-        let first = install_release_entity_head(&state, &old, 0xa0);
-
-        let old_run = kin_model::VerificationRun {
-            run_id: kin_model::VerificationRunId::new(),
-            test_ids: vec![],
-            status: kin_model::VerificationStatus::Passing,
-            runner: kin_model::TestRunner::Cargo,
-            started_at: Timestamp::now(),
-            finished_at: Some(Timestamp::now()),
-            duration_ms: Some(1),
-            evidence_blob: None,
-            exit_code: Some(0),
-        };
-        state.graph.create_verification_run(&old_run).unwrap();
-        state
-            .graph
-            .link_run_proves_entity(&old_run.run_id, &old.id)
-            .unwrap();
-
-        let mut changed = old.clone();
-        changed.signature = "def stable_entity(required)".to_string();
-        changed.fingerprint.signature_hash = Hash256::from_bytes([0x44; 32]);
-        let second = SemanticChange {
-            id: SemanticChangeId::from_hash(Hash256::from_bytes([0xa1; 32])),
-            parents: vec![first.id],
-            timestamp: Timestamp::now(),
-            author: AuthorId::new("agent-test"),
-            message: "change stable entity".to_string(),
-            entity_deltas: vec![EntityDelta::Modified {
-                old: old.clone(),
-                new: changed.clone(),
-            }],
-            relation_deltas: vec![],
-            artifact_deltas: vec![],
-            projected_files: vec![],
-            spec_link: None,
-            evidence: vec![],
-            risk_summary: None,
-            authored_on: Some(BranchName::new("main")),
-        };
-        state.graph.upsert_entity(&changed).unwrap();
-        state.graph.create_change(&second).unwrap();
-        state
-            .graph
-            .update_branch_head(&BranchName::new("main"), &second.id)
-            .unwrap();
-
-        let release = release_test_change_with_count(second.id, 0xa2, 1);
-        let response = router(Arc::clone(&state))
-            .oneshot(
-                Request::post("/graph/commit")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({
-                            "change": release,
-                            "branch_name": "main",
-                            "release_policy": {
-                                "force": true,
-                                "require_proof": true,
-                                "require_approval": false,
-                            },
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::CONFLICT);
-        let body = axum::body::to_bytes(response.into_body(), 4096)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["gate"], "proof");
-        assert_eq!(json["source_head"], second.id.to_string());
-        assert_eq!(
-            json["missing_proof"],
-            serde_json::json!([changed.id.to_string()])
-        );
-    }
-
-    #[test]
-    fn release_approval_scope_keeps_reachable_and_rejects_unrelated_approvals() {
-        let state = test_state();
-        let entity = test_entity("approved_entity", "src/approved.rs");
-        let source = install_release_entity_head(&state, &entity, 0xa3);
-        let root = source.parents[0];
-        let approver = ActorId::from_hash(Hash256::from_bytes([0xa4; 32]));
-        state
-            .graph
-            .create_actor(&Actor {
-                actor_id: approver,
-                kind: ActorKind::Human,
-                display_name: "release reviewer".to_string(),
-                external_refs: vec![],
-            })
-            .unwrap();
-
-        let mut unrelated = kin_core::build_genesis_change();
-        unrelated.id = SemanticChangeId::from_hash(Hash256::from_bytes([0xa5; 32]));
-        unrelated.parents = vec![root];
-        unrelated.author = AuthorId::new("agent-unrelated");
-        unrelated.message = "unrelated change".to_string();
-        state.graph.create_change(&unrelated).unwrap();
-        state
-            .graph
-            .create_approval(&Approval {
-                approval_id: ApprovalId::new(),
-                change_id: unrelated.id,
-                approver,
-                decision: ApprovalDecision::Approved,
-                reason: "not authority for the release source".to_string(),
-                timestamp: Timestamp::now(),
-            })
-            .unwrap();
-
-        let policy = DaemonReleasePolicy {
-            force: true,
-            require_proof: false,
-            require_approval: true,
-        };
-        let error = enforce_daemon_release_policy(&state.graph, &source.id, 1, &policy)
-            .expect_err("an unrelated approval must not authorize the source history");
-        assert_eq!(error.0, StatusCode::CONFLICT);
-        let body: serde_json::Value = serde_json::from_str(&error.1).unwrap();
-        assert_eq!(body["gate"], "approval");
-        assert_eq!(body["unapproved_changes"], json!([source.id.to_string()]));
-
-        state
-            .graph
-            .create_approval(&Approval {
-                approval_id: ApprovalId::new(),
-                change_id: source.id,
-                approver,
-                decision: ApprovalDecision::Approved,
-                reason: "reviewed immutable release source".to_string(),
-                timestamp: Timestamp::now(),
-            })
-            .unwrap();
-        enforce_daemon_release_policy(&state.graph, &source.id, 1, &policy)
-            .expect("the reachable human approval must satisfy the gate");
-    }
-
-    #[tokio::test]
-    async fn strict_release_retry_rechecks_parent_without_generation_or_event() {
-        let state = test_state();
-        let entity = test_entity("strict_retry", "src/retry.rs");
-        let source = install_release_entity_head(&state, &entity, 0xa6);
-        let release = release_test_change_with_count(source.id, 0xa7, 1);
-        let app = router(Arc::clone(&state));
-
-        let first = app
-            .clone()
-            .oneshot(
-                Request::post("/graph/commit")
-                    .header("content-type", "application/json")
-                    .body(Body::from(release_test_payload(&release).to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(first.status(), StatusCode::OK);
-        let generation = state
-            .snapshot_generation
-            .load(std::sync::atomic::Ordering::SeqCst);
-        let mut events = state.event_tx.subscribe();
-
-        let strict_retry = app
-            .oneshot(
-                Request::post("/graph/commit")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({
-                            "change": release,
-                            "branch_name": "main",
-                            "release_policy": {
-                                "force": true,
-                                "require_proof": true,
-                                "require_approval": false,
-                            },
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(strict_retry.status(), StatusCode::CONFLICT);
-        assert_eq!(
-            state
-                .snapshot_generation
-                .load(std::sync::atomic::Ordering::SeqCst),
-            generation,
-            "failed policy retry must not create a generation"
-        );
-        assert_eq!(
-            state
-                .graph
-                .get_branch(&BranchName::new("main"))
-                .unwrap()
-                .unwrap()
-                .head,
-            release.id
-        );
-        assert!(matches!(
-            events.try_recv(),
-            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
-        ));
-    }
-
-    #[tokio::test]
-    async fn exact_release_retry_is_idempotent() {
-        let state = test_state();
-        let head = install_release_test_branch(&state);
-        let release = release_test_change(head, 0x95);
-        let payload = release_test_payload(&release);
-        let app = router(Arc::clone(&state));
-
-        let mut committed_generation = None;
-
-        for _ in 0..2 {
-            let response = app
-                .clone()
-                .oneshot(
-                    Request::post("/graph/commit")
-                        .header("content-type", "application/json")
-                        .body(Body::from(payload.to_string()))
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-            let generation = state
-                .snapshot_generation
-                .load(std::sync::atomic::Ordering::SeqCst);
-            if let Some(committed_generation) = committed_generation {
-                assert_eq!(
-                    generation, committed_generation,
-                    "an already-finalized retry must not create another authority generation"
-                );
-            } else {
-                committed_generation = Some(generation);
-            }
-        }
-        assert_eq!(
-            state
-                .graph
-                .get_branch(&BranchName::new("main"))
-                .unwrap()
-                .unwrap()
-                .head,
-            release.id
-        );
-        let release_markers = state
-            .graph
-            .to_snapshot()
-            .changes
-            .values()
-            .filter(|change| change.author.to_string() == "kin-release")
-            .count();
-        assert_eq!(release_markers, 1, "retry created a second release marker");
-    }
-
-    #[tokio::test]
-    async fn exact_release_retry_reconciles_after_branch_advances() {
-        let state = test_state();
-        let head = install_release_test_branch(&state);
-        let release = release_test_change(head, 0x96);
-        let payload = release_test_payload(&release);
-        let app = router(Arc::clone(&state));
-
-        let first = app
-            .clone()
-            .oneshot(
-                Request::post("/graph/commit")
-                    .header("content-type", "application/json")
-                    .body(Body::from(payload.to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(first.status(), StatusCode::OK);
-
-        let descendant = SemanticChange {
-            id: SemanticChangeId::from_hash(Hash256::from_bytes([0x97; 32])),
-            parents: vec![release.id],
-            timestamp: Timestamp::now(),
-            author: AuthorId::new("later-human"),
-            message: "advance after release".to_string(),
-            entity_deltas: vec![],
-            relation_deltas: vec![],
-            artifact_deltas: vec![],
-            projected_files: vec![],
-            spec_link: None,
-            evidence: vec![],
-            risk_summary: None,
-            authored_on: Some(BranchName::new("main")),
-        };
-        state.graph.create_change(&descendant).unwrap();
-        state
-            .graph
-            .update_branch_head(&BranchName::new("main"), &descendant.id)
-            .unwrap();
-
-        let retry = app
-            .oneshot(
-                Request::post("/graph/commit")
-                    .header("content-type", "application/json")
-                    .body(Body::from(payload.to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(retry.status(), StatusCode::OK);
-        assert_eq!(
-            state
-                .graph
-                .get_branch(&BranchName::new("main"))
-                .unwrap()
-                .unwrap()
-                .head,
-            descendant.id,
-            "reconciling an older release marker must not rewind the branch"
-        );
-    }
-
-    #[tokio::test]
-    async fn graph_commit_retry_persists_after_pre_authority_save_failure() {
-        let state = test_state();
-        let head = install_release_test_branch(&state);
-        let release = release_test_change(head, 0x9a);
-        let payload = release_test_payload(&release);
-        let app = router(Arc::clone(&state));
-        let mut events = state.event_tx.subscribe();
-        state.fail_next_snapshot_save_for_test();
-
-        let first = app
-            .clone()
-            .oneshot(
-                Request::post("/graph/commit")
-                    .header("content-type", "application/json")
-                    .body(Body::from(payload.to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(first.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        let body = axum::body::to_bytes(first.into_body(), 4096).await.unwrap();
-        assert!(
-            String::from_utf8_lossy(&body).contains("injected pre-authority snapshot save failure")
-        );
-        assert_eq!(
-            state
-                .graph
-                .get_branch(&BranchName::new("main"))
-                .unwrap()
-                .unwrap()
-                .head,
-            release.id,
-            "the failed request has already advanced in-memory authority"
-        );
-        assert!(state.graph.has_unpersisted_changes());
-        assert!(matches!(
-            events.try_recv(),
-            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
-        ));
-
-        let retry = app
-            .oneshot(
-                Request::post("/graph/commit")
-                    .header("content-type", "application/json")
-                    .body(Body::from(payload.to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(retry.status(), StatusCode::OK);
-        assert!(!state.graph.has_unpersisted_changes());
-
-        let snapshot =
-            kin_db::SnapshotManager::open_read_only(state.layout.kindb_snapshot_path()).unwrap();
-        assert!(snapshot.graph().get_change(&release.id).unwrap().is_some());
-        assert_eq!(
-            snapshot
-                .graph()
-                .get_branch(&BranchName::new("main"))
-                .unwrap()
-                .unwrap()
-                .head,
-            release.id
-        );
-        match events.try_recv().expect("the durable retry must emit once") {
-            DaemonEvent::GraphRootChanged { new_root_hash, .. } => {
-                assert_eq!(new_root_hash, release.id.to_string())
-            }
-            other => panic!("retry emitted the wrong event: {other:?}"),
-        }
-        assert!(matches!(
-            events.try_recv(),
-            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
-        ));
-    }
-
-    #[tokio::test]
-    async fn graph_commit_retry_finalizes_committed_generation_without_recommit() {
-        let state = test_state();
-        let head = install_release_test_branch(&state);
-        let release = release_test_change(head, 0x9b);
-        let payload = release_test_payload(&release);
-        let app = router(Arc::clone(&state));
-        let mut events = state.event_tx.subscribe();
-        state.fail_next_finalization_for_test();
-
-        let first = app
-            .clone()
-            .oneshot(
-                Request::post("/graph/commit")
-                    .header("content-type", "application/json")
-                    .body(Body::from(payload.to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(first.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        let committed_generation = state
-            .snapshot_generation
-            .load(std::sync::atomic::Ordering::SeqCst);
-        assert!(committed_generation > kin_db::GENERATION_INIT);
-        assert_eq!(DaemonState::read_generation_marker(&state.layout), 0);
-        assert!(!state.graph.has_unpersisted_changes());
-        assert!(matches!(
-            events.try_recv(),
-            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
-        ));
-
-        let retry = app
-            .oneshot(
-                Request::post("/graph/commit")
-                    .header("content-type", "application/json")
-                    .body(Body::from(payload.to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(retry.status(), StatusCode::OK);
-        assert_eq!(
-            state
-                .snapshot_generation
-                .load(std::sync::atomic::Ordering::SeqCst),
-            committed_generation,
-            "finalization retry must not recommit graph authority"
-        );
-        assert_eq!(
-            DaemonState::read_generation_marker(&state.layout),
-            committed_generation
-        );
-        match events
-            .try_recv()
-            .expect("finalization retry must release the queued event")
-        {
-            DaemonEvent::GraphRootChanged { new_root_hash, .. } => {
-                assert_eq!(new_root_hash, release.id.to_string())
-            }
-            other => panic!("finalization retry emitted the wrong event: {other:?}"),
-        }
-        assert!(matches!(
-            events.try_recv(),
-            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
-        ));
-    }
-
-    #[tokio::test]
-    async fn identical_non_release_retry_with_missing_audit_effect_fails_closed() {
-        let state = test_state();
-        let head = install_release_test_branch(&state);
-        let mut change = kin_core::build_genesis_change();
-        change.id = SemanticChangeId::from_hash(Hash256::from_bytes([0x9c; 32]));
-        change.parents = vec![head];
-        change.author = AuthorId::new("non-release-client");
-        change.message = "ordinary commit with audit".to_string();
-        change.authored_on = Some(BranchName::new("main"));
-        state.graph.create_change(&change).unwrap();
-        state
-            .graph
-            .update_branch_head(&BranchName::new("main"), &change.id)
-            .unwrap();
-
-        let audit = kin_model::provenance::AuditEvent {
-            event_id: AuditEventId::new(),
-            actor_id: ActorId::new(),
-            action: "ordinary_commit".to_string(),
-            target_scope: None,
-            timestamp: Timestamp::now(),
-            details: Some("must not be silently skipped".to_string()),
-        };
-        let response = router(Arc::clone(&state))
-            .oneshot(
-                Request::post("/graph/commit")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({
-                            "change": change,
-                            "branch_name": "main",
-                            "audit_event": audit,
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::CONFLICT);
-        let body = axum::body::to_bytes(response.into_body(), 4096)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["error"], "stale_branch_head");
-        assert_eq!(json["mutation_applied"], false);
-        assert!(state.graph.query_audit_events(None, 10).unwrap().is_empty());
-        assert!(state.graph.has_unpersisted_changes());
-        assert_eq!(
-            state
-                .snapshot_generation
-                .load(std::sync::atomic::Ordering::SeqCst),
-            kin_db::GENERATION_INIT,
-            "the retry must not persist a head missing its requested audit effect"
-        );
-    }
-
-    #[tokio::test]
-    async fn release_policy_rejects_nonempty_change_before_mutation() {
-        let state = test_state();
-        let head = install_release_test_branch(&state);
-        let entity = test_entity("must_not_release", "src/release.rs");
-        let entity_id = entity.id;
-        let mut release = release_test_change(head, 0x96);
-        release.entity_deltas.push(EntityDelta::Added(entity));
-        let release_id = release.id;
-
-        let response = router(Arc::clone(&state))
-            .oneshot(
-                Request::post("/graph/commit")
-                    .header("content-type", "application/json")
-                    .body(Body::from(release_test_payload(&release).to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert!(state.graph.get_change(&release_id).unwrap().is_none());
-        assert!(state.graph.get_entity(&entity_id).unwrap().is_none());
-        assert_eq!(
-            state
-                .graph
-                .get_branch(&BranchName::new("main"))
-                .unwrap()
-                .unwrap()
-                .head,
-            head
-        );
-    }
-
-    #[tokio::test]
     async fn health_surfaces_graph_generation_marker() {
         // /health must read and surface the persisted snapshot generation marker
         // (.kin/kindb/head-generation) so the MCP envelope can express graph_as_of.
@@ -14595,15 +12055,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn readiness_returns_503_when_empty() {
+    async fn readiness_returns_200_for_initialized_empty_repository() {
         let state = test_state();
         let app = router(state);
         let response = app
             .oneshot(Request::get("/readiness").body(Body::empty()).unwrap())
             .await
             .unwrap();
-        // Empty graph → not ready
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        // Repository-v6 initialization itself is a valid empty repository.
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -14627,162 +12087,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn locate_endpoint_resolves_historical_ref_queries() {
-        std::env::set_var("KIN_BYPASS_EMBEDDING_COVERAGE_CHECK", "true");
-        let state = test_state();
-        let graph = state.graph.as_ref();
-        let add_git_ref = "1111111111111111111111111111111111111111";
-        let modify_git_ref = "2222222222222222222222222222222222222222";
-
-        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x31; 32]));
-        graph
-            .create_change(&SemanticChange {
-                id: genesis_id,
-                parents: vec![],
-                timestamp: Timestamp::now(),
-                author: AuthorId::new("test"),
-                message: "genesis".to_string(),
-                entity_deltas: vec![],
-                relation_deltas: vec![],
-                artifact_deltas: vec![],
-                projected_files: vec![],
-                spec_link: None,
-                evidence: vec![],
-                risk_summary: None,
-                authored_on: None,
-            })
-            .unwrap();
-
-        let entity_v1 = test_entity("handler", "src/lib.py");
-        let mut entity_v2 = entity_v1.clone();
-        entity_v2.name = "processor".to_string();
-        entity_v2.signature = "def processor()".to_string();
-        entity_v2.fingerprint.signature_hash = Hash256::from_bytes([0x04; 32]);
-
-        let add_id = kin_git::semantic_change_id_from_git_oid_hex(add_git_ref).unwrap();
-        graph
-            .create_change(&SemanticChange {
-                id: add_id,
-                parents: vec![genesis_id],
-                timestamp: Timestamp::now(),
-                author: AuthorId::new("test"),
-                message: "add handler".to_string(),
-                entity_deltas: vec![EntityDelta::Added(entity_v1.clone())],
-                relation_deltas: vec![],
-                artifact_deltas: vec![],
-                projected_files: vec![],
-                spec_link: None,
-                evidence: vec![],
-                risk_summary: None,
-                authored_on: None,
-            })
-            .unwrap();
-
-        let modify_id = kin_git::semantic_change_id_from_git_oid_hex(modify_git_ref).unwrap();
-        graph
-            .create_change(&SemanticChange {
-                id: modify_id,
-                parents: vec![add_id],
-                timestamp: Timestamp::now(),
-                author: AuthorId::new("test"),
-                message: "rename handler".to_string(),
-                entity_deltas: vec![EntityDelta::Modified {
-                    old: entity_v1,
-                    new: entity_v2,
-                }],
-                relation_deltas: vec![],
-                artifact_deltas: vec![],
-                projected_files: vec![],
-                spec_link: None,
-                evidence: vec![],
-                risk_summary: None,
-                authored_on: None,
-            })
-            .unwrap();
-
-        let app = router(state);
-
-        let historical = app
-            .clone()
-            .oneshot(
-                Request::post("/locate")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        serde_json::json!({
-                            "text": "handler failure",
-                            "explain": false,
-                            "max_files": 10,
-                            "max_files_explicit": true,
-                            "reference": format!("git:{add_git_ref}"),
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(historical.status(), StatusCode::OK);
-        let historical_body = axum::body::to_bytes(historical.into_body(), 4096)
-            .await
-            .unwrap();
-        let historical_json: kin_cli::commands::locate::LocateResult =
-            serde_json::from_slice(&historical_body).unwrap();
-        assert!(
-            historical_json
-                .files
-                .iter()
-                .any(|file| file.path == "src/lib.py"),
-            "historical locate should resolve the pre-rename symbol"
-        );
-
-        let current = app
-            .oneshot(
-                Request::post("/locate")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        serde_json::json!({
-                            "text": "handler failure",
-                            "explain": false,
-                            "max_files": 10,
-                            "max_files_explicit": true,
-                            "reference": format!("git:{modify_git_ref}"),
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(current.status(), StatusCode::OK);
-        let current_body = axum::body::to_bytes(current.into_body(), 4096)
-            .await
-            .unwrap();
-        let current_json: kin_cli::commands::locate::LocateResult =
-            serde_json::from_slice(&current_body).unwrap();
-        assert!(
-            current_json
-                .files
-                .iter()
-                .all(|file| file.path != "src/lib.py"),
-            "current locate should not match the historical symbol name"
-        );
-        std::env::remove_var("KIN_BYPASS_EMBEDDING_COVERAGE_CHECK");
-    }
-
-    #[tokio::test]
     async fn mcp_tools_call_semantic_search_uses_live_graph() {
         let state = test_state();
         let entity = test_entity("handler", "src/lib.py");
         state.graph.upsert_entity(&entity).unwrap();
-        let branch_name = BranchName::new("main");
-        state
-            .graph
-            .create_branch(&Branch {
-                name: branch_name.clone(),
-                head: kin_core::build_genesis_change().id,
-            })
-            .unwrap();
-        kin_core::write_current_branch(&state.layout, &branch_name).unwrap();
         state
             .is_initialized
             .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -14873,6 +12181,31 @@ mod tests {
         }
     }
 
+    /// Register a live, write-capable agent session and return its id.
+    ///
+    /// Beginning a transaction requires an existing session so a commit
+    /// attributes to a real actor. Every request rebuilds its registry from the
+    /// coordinator, so the session has to live there rather than on a registry
+    /// this test holds.
+    fn mcp_test_session(state: &Arc<DaemonState>) -> String {
+        state
+            .coordinator
+            .register_session(
+                "codex",
+                "mcp-transaction-test",
+                SessionTransport::Mcp,
+                None,
+                state.layout.working_dir().to_path_buf(),
+                SessionCapabilities {
+                    can_write: true,
+                    can_commit: true,
+                    ..SessionCapabilities::default()
+                },
+            )
+            .unwrap()
+            .to_string()
+    }
+
     #[tokio::test]
     async fn mcp_transaction_persists_across_calls() {
         // Regression: each /mcp/tools/call rebuilds a fresh SessionRegistry, so
@@ -14883,12 +12216,13 @@ mod tests {
         state
             .is_initialized
             .store(true, std::sync::atomic::Ordering::Relaxed);
+        let session_id = mcp_test_session(&state);
 
         // 1. begin
         let begin = mcp_call(
             router(Arc::clone(&state)),
             "kin_transaction_begin",
-            serde_json::json!({ "session_id": "sess-1", "scope": "file:src/lib.rs" }),
+            serde_json::json!({ "session_id": session_id, "scope": "file:src/lib.rs" }),
         )
         .await;
         assert_ne!(begin.is_error, Some(true), "begin failed: {begin:?}");
@@ -14955,20 +12289,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mcp_transaction_commit_lands_in_canonical_graph() {
-        // End-to-end: begin → stage → commit across separate calls must apply the
-        // staged entity to the canonical state.graph (commit is a mutating tool, so
-        // it routes there rather than a session's read-only scoped view).
+    async fn mcp_transaction_commit_lands_relation_in_repository_authority() {
+        // End-to-end: begin → stage → commit across separate calls must publish
+        // the relation through repository authority and then derive the live
+        // query graph from that committed state.
         let state = test_state();
+        let mut caller = test_entity("caller", "src/lib.rs");
+        caller.file_origin = None;
+        caller.span = None;
+        let mut callee = test_entity("callee", "src/lib.rs");
+        callee.file_origin = None;
+        callee.span = None;
+        install_repository_entities(&state, vec![caller.clone(), callee.clone()]);
         state
             .is_initialized
             .store(true, std::sync::atomic::Ordering::Relaxed);
-        let before = state.graph.entity_count();
+        let before = state.graph.relation_count();
+        let session_id = mcp_test_session(&state);
 
         let begin = mcp_call(
             router(Arc::clone(&state)),
             "kin_transaction_begin",
-            serde_json::json!({ "session_id": "sess-1", "scope": "file:src/lib.rs" }),
+            serde_json::json!({ "session_id": session_id, "scope": "file:src/lib.rs" }),
         )
         .await;
         let begin_json: serde_json::Value = serde_json::from_str(&mcp_result_text(&begin)).unwrap();
@@ -14980,9 +12322,15 @@ mod tests {
             serde_json::json!({
                 "transaction_id": tx_id,
                 "operations": [{
-                    "verb": "create",
+                    "verb": "add",
                     "target": "",
-                    "payload": { "Entity": test_entity("committed_fn", "src/lib.rs") },
+                    "payload": {
+                        "Relation": {
+                            "from": caller.id,
+                            "to": callee.id,
+                            "kind": RelationKind::Calls
+                        }
+                    },
                     "description": ""
                 }]
             }),
@@ -15003,14 +12351,23 @@ mod tests {
         );
 
         assert_eq!(
-            state.graph.entity_count(),
+            state.graph.relation_count(),
             before + 1,
-            "committed entity must land in the canonical graph"
+            "committed relation must land in the canonical graph"
+        );
+        let authority = crate::repository_commit::load_native_commit_base(
+            &crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(&state)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            authority.graph.relation_count(),
+            state.graph.relation_count()
         );
     }
 
     #[tokio::test]
-    async fn mcp_transaction_enforce_rejects_before_graph_apply_and_records_event() {
+    async fn mcp_transaction_enforce_rejects_before_repository_apply_and_records_event() {
         let state = test_state();
         *state
             .coordination_mode
@@ -15102,7 +12459,7 @@ mod tests {
         )
         .await;
         assert_eq!(commit.is_error, Some(true));
-        assert!(mcp_result_text(&commit).contains("before graph apply"));
+        assert!(mcp_result_text(&commit).contains("before repository publication"));
         assert_eq!(
             state.graph.entity_count(),
             before,
@@ -15113,7 +12470,10 @@ mod tests {
         let last: crate::state::CoordinationEventEnvelope =
             serde_json::from_str(records.lines().last().unwrap()).unwrap();
         assert_eq!(last.event, "transaction_outcome");
-        assert_eq!(last.outcome, "coordination_rejected_before_graph_apply");
+        assert_eq!(
+            last.outcome,
+            "coordination_rejected_before_repository_apply"
+        );
         assert_eq!(last.transaction_id.as_deref(), Some(tx_id.as_str()));
         assert_eq!(last.session_id, Some(caller.to_string()));
         assert_eq!(last.enforcement_mode, "enforce");
@@ -15266,7 +12626,7 @@ mod tests {
         let records = std::fs::read_to_string(state.coordination_events.path()).unwrap();
         let last: crate::state::CoordinationEventEnvelope =
             serde_json::from_str(records.lines().last().unwrap()).unwrap();
-        assert_eq!(last.outcome, "commit_failed_before_graph_apply");
+        assert_eq!(last.outcome, "commit_failed_before_repository_apply");
         assert!(last.blocking_intent_ids.is_empty());
     }
 
@@ -15390,11 +12750,13 @@ mod tests {
 
         // tx1 already durable.
         let registry_b = kin_mcp::SessionRegistry::new();
+        registry_b.register("sess", "kin-daemon-test");
         let tx1 = registry_b.begin_transaction("sess", "file:a.rs").unwrap();
         persist_mcp_transactions(&state, &registry_b);
 
         // Request B begins tx2 on top of the current store and persists.
         let registry_b2 = mcp_session_registry_snapshot(&state).unwrap();
+        registry_b2.register("sess", "kin-daemon-test");
         let tx2 = registry_b2.begin_transaction("sess", "file:b.rs").unwrap();
         persist_mcp_transactions(&state, &registry_b2);
 
@@ -15415,20 +12777,49 @@ mod tests {
     async fn mcp_transaction_commit_evicts_from_durable_store() {
         // A committed transaction is terminal and must not linger in the store.
         let state = test_state();
+        let mut caller = test_entity("caller", "src/lib.rs");
+        caller.file_origin = None;
+        caller.span = None;
+        let mut callee = test_entity("callee", "src/lib.rs");
+        callee.file_origin = None;
+        callee.span = None;
+        install_repository_entities(&state, vec![caller.clone(), callee.clone()]);
         state
             .is_initialized
             .store(true, std::sync::atomic::Ordering::Relaxed);
+        let session_id = mcp_test_session(&state);
 
         let begin = mcp_call(
             router(Arc::clone(&state)),
             "kin_transaction_begin",
-            serde_json::json!({ "session_id": "sess-1", "scope": "file:src/lib.rs" }),
+            serde_json::json!({ "session_id": session_id, "scope": "file:src/lib.rs" }),
         )
         .await;
         let begin_json: serde_json::Value = serde_json::from_str(&mcp_result_text(&begin)).unwrap();
         let tx_id = begin_json["transaction_id"].as_str().unwrap().to_string();
         assert!(state.mcp_transactions.lock().unwrap().contains_key(&tx_id));
 
+        let stage = mcp_call(
+            router(Arc::clone(&state)),
+            "kin_transaction_stage",
+            serde_json::json!({
+                "transaction_id": tx_id,
+                "operations": [{
+                    "verb": "add",
+                    "target": "",
+                    "payload": {
+                        "Relation": {
+                            "from": caller.id,
+                            "to": callee.id,
+                            "kind": RelationKind::Calls
+                        }
+                    },
+                    "description": ""
+                }]
+            }),
+        )
+        .await;
+        assert_ne!(stage.is_error, Some(true), "{}", mcp_result_text(&stage));
         let commit = mcp_call(
             router(Arc::clone(&state)),
             "kin_transaction_commit",
@@ -15451,18 +12842,16 @@ mod tests {
         // body are restored intact.
         install_test_registry_override();
         let dir = std::env::temp_dir().join(format!("kin-daemon-tx-restart-{}", Uuid::new_v4()));
-        let kin_dir = dir.join(".kin");
-        std::fs::create_dir_all(kin_dir.join("objects")).unwrap();
-        std::fs::create_dir_all(kin_dir.join("working")).unwrap();
-        kin_core::manifest::KinManifest::new()
-            .save(&kin_core::KinLayout::new(kin_dir.clone()).manifest_path())
-            .unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        let layout = kin_core::init(&dir)
+            .expect("restart fixture must initialize repository-v6 authority")
+            .layout;
 
         let tx_id;
         {
-            let state =
-                Arc::new(DaemonState::open(kin_core::KinLayout::new(kin_dir.clone())).unwrap());
+            let state = Arc::new(DaemonState::open(layout.clone()).unwrap());
             let registry = kin_mcp::SessionRegistry::new();
+            registry.register("sess-restart", "kin-daemon-test");
             let tx = registry
                 .begin_transaction("sess-restart", "file:src/lib.rs")
                 .unwrap();
@@ -15479,7 +12868,7 @@ mod tests {
         } // state dropped — models daemon shutdown.
 
         // Re-open on the SAME layout — models the restart.
-        let restarted = Arc::new(DaemonState::open(kin_core::KinLayout::new(kin_dir)).unwrap());
+        let restarted = Arc::new(DaemonState::open(layout).unwrap());
         let store = restarted
             .mcp_transactions
             .lock()
@@ -15503,7 +12892,7 @@ mod tests {
     async fn search_endpoint_uses_live_graph() {
         let state = test_state();
         let source = "def handler():\n    return 1\n";
-        install_branch_file(&state, "src/lib.py", source.as_bytes());
+        install_repository_file(&state, "src/lib.py", source.as_bytes());
         std::fs::create_dir_all(state.layout.working_dir().join("src")).unwrap();
         std::fs::write(
             state.layout.working_dir().join("src/lib.py"),
@@ -15623,19 +13012,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn command_status_endpoint_uses_live_graph() {
-        let state = test_state();
-        let entity = test_entity("handler", "src/lib.py");
-        state.graph.upsert_entity(&entity).unwrap();
-        let branch_name = BranchName::new("main");
-        state
-            .graph
-            .create_branch(&Branch {
-                name: branch_name.clone(),
-                head: kin_core::build_genesis_change().id,
-            })
-            .unwrap();
-        kin_core::write_current_branch(&state.layout, &branch_name).unwrap();
+    async fn command_status_endpoint_uses_repository_authority() {
+        install_test_registry_override();
+        let dir = std::env::temp_dir().join(format!("kin-daemon-status-state-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let initialized = kin_core::init(&dir).unwrap();
+        let state = Arc::new(DaemonState::open(initialized.layout).unwrap());
         state
             .is_initialized
             .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -15662,8 +13044,14 @@ mod tests {
         );
         let result: kin_cli::commands::status::CommandStatusResponse =
             serde_json::from_slice(&body).unwrap();
-        assert_eq!(result.summary.entities, 1);
-        assert!(result.text.contains("Entities: 1"));
+        assert_eq!(
+            result.report.schema,
+            kin_cli::commands::status::STATUS_SCHEMA
+        );
+        assert_eq!(result.report.repository.generation, 1);
+        assert_eq!(result.report.workspace.artifact_count, 0);
+        assert!(result.report.repository.source_cas_verified);
+        assert!(result.text.contains("Kin repository-v6 status"));
     }
 
     #[tokio::test]
@@ -15748,12 +13136,62 @@ mod tests {
     #[tokio::test]
     async fn session_workspace_endpoint_materializes_live_graph() {
         let state = test_state();
-        install_branch_file(&state, "src/lib.py", b"graph truth\n");
+        install_repository_file(&state, "src/lib.py", b"graph truth\n");
+        install_repository_file(
+            &state,
+            "compose.yaml",
+            b"services:\n  api:\n    image: kin:test\n",
+        );
+        install_repository_entry(&state, "bin/verify", b"#!/bin/sh\nexit 0\n", |hash| {
+            TreeEntry::blob(hash, true)
+        });
+        install_repository_file(
+            &state,
+            "assets/policy.unknown",
+            b"\x00\xffopaque repository bytes\x00",
+        );
+        #[cfg(unix)]
+        install_repository_entry(
+            &state,
+            "current-compose",
+            b"compose.yaml",
+            TreeEntry::symlink,
+        );
+
+        std::fs::create_dir_all(state.layout.working_dir().join("src")).unwrap();
+        std::fs::write(
+            state.layout.working_dir().join("src/lib.py"),
+            b"checkout drift must not become session authority\n",
+        )
+        .unwrap();
         state
             .is_initialized
             .store(true, std::sync::atomic::Ordering::Relaxed);
         let app = router(state.clone());
         let session_dir = state.layout.root().join("runs/session-api");
+        let scoped_session_dir = state.layout.root().join("runs/session-api-scoped");
+        let scoped = app
+            .clone()
+            .oneshot(
+                Request::post("/commands/session-workspace")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "session_dir": scoped_session_dir.display().to_string(),
+                            "strategy": null,
+                            "scope": "artifact:compose.yaml"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(scoped.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            !scoped_session_dir.exists(),
+            "unauthenticated scoped session selection must fail before publication"
+        );
 
         let response = app
             .oneshot(
@@ -15778,40 +13216,142 @@ mod tests {
             .unwrap();
         let result: kin_cli::commands::session_workspace::SessionWorkspaceResponse =
             serde_json::from_slice(&body).unwrap();
-        assert_eq!(result.source_kind, "blob-tree");
+        assert_eq!(result.source_kind, "exact-tree");
         assert_eq!(
             std::fs::read_to_string(session_dir.join("src/lib.py")).unwrap(),
             "graph truth\n"
         );
+        assert_eq!(
+            std::fs::read_to_string(session_dir.join("compose.yaml")).unwrap(),
+            "services:\n  api:\n    image: kin:test\n"
+        );
+        assert_eq!(
+            std::fs::read(session_dir.join("assets/policy.unknown")).unwrap(),
+            b"\x00\xffopaque repository bytes\x00"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            assert_ne!(
+                std::fs::metadata(session_dir.join("bin/verify"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o111,
+                0
+            );
+            assert_eq!(
+                std::fs::read_link(session_dir.join("current-compose")).unwrap(),
+                PathBuf::from("compose.yaml")
+            );
+        }
+        assert!(session_dir.join(".kin-session/base.json").is_file());
+        let base: kin_cli::commands::session_workspace::SessionWorkspaceBase =
+            serde_json::from_slice(
+                &std::fs::read(session_dir.join(".kin-session/base.json")).unwrap(),
+            )
+            .unwrap();
+        base.validate().unwrap();
+        assert_eq!(
+            base.materialized_artifact_ids.len(),
+            base.source_workspace.tree.len(),
+            "the complete materializable tree is represented in the session"
+        );
+        #[cfg(unix)]
+        assert_eq!(base.source_workspace.tree.len(), 5);
+        #[cfg(not(unix))]
+        assert_eq!(base.source_workspace.tree.len(), 4);
+        assert!(
+            !session_dir.join(".kin").exists(),
+            "session projection must not shadow owning-repository discovery"
+        );
     }
 
-    /// Serializes tests that mutate process-global env (`KIN_DAEMON_ALLOW_EXEC`,
-    /// `KIN_DAEMON_AUTH_TOKEN`, `KIN_DAEMON_REQUIRE_TOKEN`) so their
-    /// opposite expectations never race under the parallel test runner.
-    fn env_test_lock() -> std::sync::MutexGuard<'static, ()> {
-        crate::test_env_lock()
-    }
-
+    #[cfg(unix)]
     #[tokio::test]
-    async fn exec_endpoint_runs_against_live_graph_workspace() {
-        let _env = env_test_lock();
-        std::env::set_var("KIN_DAEMON_ALLOW_EXEC", "1");
+    async fn reconcile_endpoint_admits_complete_exact_session_tree_and_replays() {
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
 
-        let state = test_state();
-        install_branch_file(&state, "src/lib.py", b"daemon exec\n");
+        let state = test_state_with_verified_gitlink();
+        let deleted_path = RepoPath::from_utf8("delete.me").unwrap();
+        let gitlink_path = RepoPath::from_utf8("vendor/subrepo").unwrap();
+        #[cfg(target_os = "macos")]
+        let raw_path = RepoPath::from_bytes(b"assets/raw-\xff.bin".to_vec()).unwrap();
+
+        #[cfg(target_os = "macos")]
+        {
+            let raw_body = b"\x00raw graph-only bytes\xff";
+            let raw_hash = state.blobs.write(raw_body).unwrap();
+            state
+                .graph
+                .apply_transaction_delta(&TransactionDelta {
+                    tree_deltas: vec![kin_model::TreeDelta::Added {
+                        artifact_id: kin_model::ArtifactId::new(),
+                        new: kin_model::LocatedEntry::new(
+                            raw_path.clone(),
+                            TreeEntry::blob(Hash256::from_bytes(raw_hash.0), false),
+                        ),
+                    }],
+                    ..TransactionDelta::default()
+                })
+                .unwrap();
+            let install_plan = crate::repository_commit::plan_native_commit(
+                &state.graph,
+                &state.blobs,
+                &crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(
+                    &state,
+                )
+                .unwrap(),
+                kin_model::OperationId::new(),
+                Timestamp::now(),
+                AuthorId::new("reconcile-api-test"),
+                "install host-unrepresentable exact fixture".to_string(),
+            )
+            .unwrap();
+            let installed = crate::repository_commit::commit_native_plan(
+                &state.blobs,
+                &crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(
+                    &state,
+                )
+                .unwrap(),
+                install_plan,
+            )
+            .unwrap();
+            state
+                .record_repository_authority_commit(installed.receipt.generation)
+                .unwrap();
+            state.blobs.delete(&raw_hash).unwrap();
+            assert!(
+                state.blobs.read(&raw_hash).is_err(),
+                "the test must prove graph-only preservation from repository CAS, not an \
+                 accidentally warm ingestion CAS"
+            );
+        }
+
+        std::fs::create_dir_all(state.layout.working_dir().join("vendor/subrepo")).unwrap();
+        std::fs::write(
+            state
+                .layout
+                .working_dir()
+                .join("vendor/subrepo/arbitrary-descendant"),
+            b"nested checkout identity must be retained\n",
+        )
+        .unwrap();
+
         state
             .is_initialized
             .store(true, std::sync::atomic::Ordering::Relaxed);
-        let app = router(state);
-
-        let response = app
+        let app = router(Arc::clone(&state));
+        let session_dir = state.layout.root().join("runs/session-reconcile-api");
+        let materialize = app
+            .clone()
             .oneshot(
-                Request::post("/commands/exec")
+                Request::post("/commands/session-workspace")
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        serde_json::json!({
-                            "command": "cat src/lib.py",
-                            "keep": false,
+                        json!({
+                            "session_dir": session_dir.display().to_string(),
                             "strategy": null,
                             "scope": null
                         })
@@ -15821,228 +13361,254 @@ mod tests {
             )
             .await
             .unwrap();
-
-        let status = response.status();
-        let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
-            .await
-            .unwrap();
-        assert_eq!(
-            status,
-            StatusCode::OK,
-            "body: {}",
-            String::from_utf8_lossy(&body)
+        assert_eq!(materialize.status(), StatusCode::OK);
+        assert!(
+            !session_dir.join("vendor/subrepo").exists(),
+            "a Gitlink is exact graph membership, not a fake session file"
         );
-        let result: kin_cli::commands::exec::ExecResponse = serde_json::from_slice(&body).unwrap();
-        assert_eq!(result.stdout, "daemon exec\n");
-        assert_eq!(result.exit_code, 0);
-        assert!(!std::path::Path::new(&result.workspace_path).exists());
-
-        std::env::remove_var("KIN_DAEMON_ALLOW_EXEC");
-    }
-
-    #[tokio::test]
-    async fn branch_endpoint_mutates_live_graph() {
-        let state = test_state();
-        let branch_name = BranchName::new("main");
-        state
-            .graph
-            .create_branch(&Branch {
-                name: branch_name.clone(),
-                head: kin_core::build_genesis_change().id,
-            })
+        let base: kin_cli::commands::session_workspace::SessionWorkspaceBase =
+            serde_json::from_slice(
+                &std::fs::read(session_dir.join(".kin-session/base.json")).unwrap(),
+            )
             .unwrap();
-        kin_core::write_current_branch(&state.layout, &branch_name).unwrap();
-        state
-            .is_initialized
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        let app = router(state.clone());
+        base.validate().unwrap();
+        let base_gitlink_id = base
+            .source_workspace
+            .tree
+            .artifact_at_path(&gitlink_path)
+            .unwrap()
+            .artifact_id;
+        assert!(!base.materialized_artifact_ids.contains(&base_gitlink_id));
+        #[cfg(target_os = "macos")]
+        let base_raw_id = base
+            .source_workspace
+            .tree
+            .artifact_at_path(&raw_path)
+            .unwrap()
+            .artifact_id;
+        #[cfg(target_os = "macos")]
+        assert!(!base.materialized_artifact_ids.contains(&base_raw_id));
 
-        let response = app
+        std::fs::write(
+            session_dir.join("compose.yaml"),
+            b"services:\n  api:\n    image: kin:desired\n",
+        )
+        .unwrap();
+        std::fs::write(
+            session_dir.join("assets/policy.unknown"),
+            b"\x00\xfeopaque desired bytes\x00",
+        )
+        .unwrap();
+        let mut executable_permissions = std::fs::metadata(session_dir.join("bin/verify"))
+            .unwrap()
+            .permissions();
+        executable_permissions.set_mode(0o644);
+        std::fs::set_permissions(session_dir.join("bin/verify"), executable_permissions).unwrap();
+        std::fs::remove_file(session_dir.join("current-compose")).unwrap();
+        symlink("assets/policy.unknown", session_dir.join("current-compose")).unwrap();
+        std::fs::remove_file(session_dir.join("delete.me")).unwrap();
+        std::fs::create_dir_all(session_dir.join("notes")).unwrap();
+        std::fs::write(
+            session_dir.join("notes/new.odd"),
+            b"new arbitrary repository member\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(session_dir.join("vendor/subrepo")).unwrap();
+        std::fs::write(
+            session_dir.join("vendor/subrepo/untrusted-descendant"),
+            b"this must not become parent-repository membership\n",
+        )
+        .unwrap();
+
+        let request_body = json!({
+            "session_dir": session_dir,
+            "confirm_mass_deletion": false
+        })
+        .to_string();
+        let reconcile = app
+            .clone()
             .oneshot(
-                Request::post("/commands/branch")
+                Request::post("/reconcile")
                     .header("content-type", "application/json")
-                    .body(Body::from(
-                        serde_json::json!({ "command": "create", "name": "feature" }).to_string(),
-                    ))
+                    .body(Body::from(request_body.clone()))
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        assert!(state
-            .graph
-            .get_branch(&BranchName::new("feature"))
+        let status = reconcile.status();
+        let body = axum::body::to_bytes(reconcile.into_body(), 128 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let summary: kin_cli::commands::reconcile::ReconcileSummary =
+            serde_json::from_slice(&body).unwrap();
+        assert!(summary.changed);
+        assert!(!summary.idempotent_replay);
+        assert_eq!(summary.added, 1);
+        assert_eq!(summary.modified, 4);
+        assert_eq!(summary.removed, 1);
+        assert_eq!(summary.observed_materialized_artifacts, 6);
+        #[cfg(target_os = "macos")]
+        assert_eq!(summary.preserved_graph_only_artifacts, 2);
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(summary.preserved_graph_only_artifacts, 1);
+        assert_eq!(summary.semantic_files_enriched, 0);
+        assert_eq!(summary.semantic_enrichment_failures, 0);
+
+        let authority = ActiveApiRepositoryAuthority::open(&state).unwrap();
+        let lease = authority.manager.read_authority();
+        let workspace = lease
+            .metadata()
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == authority.workspace_id)
             .unwrap()
+            .clone();
+        drop(lease);
+        assert_eq!(workspace.tree_hash, summary.desired_tree_hash);
+        assert_eq!(workspace.tree, state.graph.resolved_tree());
+        assert_eq!(
+            workspace
+                .tree
+                .artifact_at_path(&gitlink_path)
+                .unwrap()
+                .artifact_id,
+            base_gitlink_id,
+            "graph-only Gitlink identity must remain stable"
+        );
+        assert_eq!(
+            workspace
+                .tree
+                .artifact_at_path(&gitlink_path)
+                .unwrap()
+                .entry,
+            TreeEntry::gitlink(kin_model::GitObjectId::sha1([0x44; 20]))
+        );
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            workspace
+                .tree
+                .artifact_at_path(&raw_path)
+                .unwrap()
+                .artifact_id,
+            base_raw_id,
+            "host-unrepresentable exact membership and identity must survive reconciliation"
+        );
+        assert!(
+            workspace.tree.artifact_at_path(&deleted_path).is_none(),
+            "a missing materialized session member is an exact deletion"
+        );
+        assert!(workspace
+            .tree
+            .artifact_at_path(&RepoPath::from_utf8("notes/new.odd").unwrap())
             .is_some());
-    }
 
-    #[tokio::test]
-    async fn graph_branch_mutations_reject_unknown_heads_without_authority_changes() {
-        let state = test_state();
-        let genesis = kin_core::build_genesis_change();
-        state.graph.create_change(&genesis).unwrap();
-        state
-            .graph
-            .create_branch(&Branch {
-                name: BranchName::new("main"),
-                head: genesis.id,
-            })
+        assert_eq!(
+            std::fs::read(state.layout.working_dir().join("compose.yaml")).unwrap(),
+            b"services:\n  api:\n    image: kin:desired\n"
+        );
+        assert_eq!(
+            std::fs::read(state.layout.working_dir().join("assets/policy.unknown")).unwrap(),
+            b"\x00\xfeopaque desired bytes\x00"
+        );
+        assert_eq!(
+            std::fs::metadata(state.layout.working_dir().join("bin/verify"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o111,
+            0
+        );
+        assert_eq!(
+            std::fs::read_link(state.layout.working_dir().join("current-compose")).unwrap(),
+            PathBuf::from("assets/policy.unknown")
+        );
+        assert!(!state.layout.working_dir().join("delete.me").exists());
+        assert_eq!(
+            std::fs::read(state.layout.working_dir().join("notes/new.odd")).unwrap(),
+            b"new arbitrary repository member\n"
+        );
+        assert_eq!(
+            std::fs::read(
+                state
+                    .layout
+                    .working_dir()
+                    .join("vendor/subrepo/arbitrary-descendant")
+            )
+            .unwrap(),
+            b"nested checkout identity must be retained\n",
+            "Gitlink descendants are outside parent-repository traversal and mutation"
+        );
+
+        let replay = app
+            .oneshot(
+                Request::post("/reconcile")
+                    .header("content-type", "application/json")
+                    .body(Body::from(request_body.clone()))
+                    .unwrap(),
+            )
+            .await
             .unwrap();
-        state
+        let status = replay.status();
+        let body = axum::body::to_bytes(replay.into_body(), 128 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let replay: kin_cli::commands::reconcile::ReconcileSummary =
+            serde_json::from_slice(&body).unwrap();
+        assert!(replay.idempotent_replay);
+        assert_eq!(replay.operation_id, summary.operation_id);
+        assert_eq!(replay.desired_tree_hash, summary.desired_tree_hash);
+        assert_eq!(replay.authority_generation, summary.authority_generation);
+
+        let restarted = Arc::new(DaemonState::open(state.layout.clone()).unwrap());
+        assert_eq!(
+            restarted.graph.resolved_tree(),
+            workspace.tree,
+            "repository-v6 restart must retain the complete exact reconciled tree"
+        );
+        restarted
             .is_initialized
             .store(true, std::sync::atomic::Ordering::Relaxed);
-        let missing = SemanticChangeId::from_hash(Hash256::from_bytes([0xbe; 32]));
-        let stale = SemanticChangeId::from_hash(Hash256::from_bytes([0xbf; 32]));
-        let root_before = state.graph.compute_root_hash();
-        let generation_before = state
-            .snapshot_generation
-            .load(std::sync::atomic::Ordering::SeqCst);
-        let app = router(Arc::clone(&state));
-
-        let create = app
-            .clone()
+        let restarted_replay = router(restarted)
             .oneshot(
-                Request::post("/graph/branches")
+                Request::post("/reconcile")
                     .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({ "name": "unknown", "head": missing.to_string() }).to_string(),
-                    ))
+                    .body(Body::from(request_body))
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(create.status(), StatusCode::NOT_FOUND);
-        let body = axum::body::to_bytes(create.into_body(), 4096)
+        let status = restarted_replay.status();
+        let body = axum::body::to_bytes(restarted_replay.into_body(), 128 * 1024)
             .await
             .unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(body["error"], "branch_head_not_found");
-        assert_eq!(body["mutation_applied"], false);
-        assert!(state
-            .graph
-            .get_branch(&BranchName::new("unknown"))
-            .unwrap()
-            .is_none());
-
-        let update = app
-            .clone()
-            .oneshot(
-                Request::put("/graph/branches/main/head")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({
-                            "head": missing.to_string(),
-                            "expected_head": genesis.id.to_string(),
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(update.status(), StatusCode::NOT_FOUND);
-        let body = axum::body::to_bytes(update.into_body(), 4096)
-            .await
-            .unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(body["error"], "branch_head_not_found");
-        assert_eq!(body["mutation_applied"], false);
-
-        let stale_update = app
-            .oneshot(
-                Request::put("/graph/branches/main/head")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({
-                            "head": missing.to_string(),
-                            "expected_head": stale.to_string(),
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(stale_update.status(), StatusCode::CONFLICT);
-        let body = axum::body::to_bytes(stale_update.into_body(), 4096)
-            .await
-            .unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(body["error"], "stale_branch_head");
-        assert_eq!(body["mutation_applied"], false);
-
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let restarted_replay: kin_cli::commands::reconcile::ReconcileSummary =
+            serde_json::from_slice(&body).unwrap();
+        assert!(restarted_replay.idempotent_replay);
         assert_eq!(
-            state
-                .graph
-                .get_branch(&BranchName::new("main"))
-                .unwrap()
-                .unwrap()
-                .head,
-            genesis.id
-        );
-        assert_eq!(state.graph.compute_root_hash(), root_before);
-        assert_eq!(
-            state
-                .snapshot_generation
-                .load(std::sync::atomic::Ordering::SeqCst),
-            generation_before
+            restarted_replay.desired_tree_hash,
+            summary.desired_tree_hash
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
-    async fn graph_branch_head_update_rejects_backward_and_sideways_moves() {
-        let state = test_state();
-        let genesis = kin_core::build_genesis_change();
-        let mut child = genesis.clone();
-        child.id = SemanticChangeId::from_hash(Hash256::from_bytes([0xc1; 32]));
-        child.parents = vec![genesis.id];
-        child.message = "child".to_string();
-        let mut sibling = child.clone();
-        sibling.id = SemanticChangeId::from_hash(Hash256::from_bytes([0xc2; 32]));
-        sibling.message = "sibling".to_string();
-        state.graph.create_change(&genesis).unwrap();
-        state.graph.create_change(&child).unwrap();
-        state.graph.create_change(&sibling).unwrap();
-        state
-            .graph
-            .create_branch(&Branch {
-                name: BranchName::new("main"),
-                head: genesis.id,
-            })
-            .unwrap();
-        state
-            .is_initialized
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        let app = router(Arc::clone(&state));
+    async fn reconcile_rejects_control_aliases_special_members_and_stale_bases() {
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
+        use std::os::unix::net::UnixListener;
 
-        let forward = app
-            .clone()
-            .oneshot(
-                Request::put("/graph/branches/main/head")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({
-                            "head": child.id.to_string(),
-                            "expected_head": genesis.id.to_string(),
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(forward.status(), StatusCode::OK);
-
-        for rejected in [genesis.id, sibling.id] {
-            let response = app
-                .clone()
+        async fn materialize(state: &Arc<DaemonState>, session_dir: &FsPath) {
+            let response = router(Arc::clone(state))
                 .oneshot(
-                    Request::put("/graph/branches/main/head")
+                    Request::post("/commands/session-workspace")
                         .header("content-type", "application/json")
                         .body(Body::from(
                             json!({
-                                "head": rejected.to_string(),
-                                "expected_head": child.id.to_string(),
+                                "session_dir": session_dir.display().to_string(),
+                                "strategy": null,
+                                "scope": null
                             })
                             .to_string(),
                         ))
@@ -16050,65 +13616,18 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            assert_eq!(response.status(), StatusCode::CONFLICT);
-            let body = axum::body::to_bytes(response.into_body(), 4096)
-                .await
-                .unwrap();
-            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-            assert_eq!(body["error"], "non_fast_forward_branch_update");
-            assert_eq!(body["mutation_applied"], false);
+            assert_eq!(response.status(), StatusCode::OK);
         }
-        assert_eq!(
-            state
-                .graph
-                .get_branch(&BranchName::new("main"))
-                .unwrap()
-                .unwrap()
-                .head,
-            child.id
-        );
-    }
 
-    #[tokio::test]
-    async fn v1_branch_head_mutation_is_explicitly_retired() {
-        let response = router(test_state())
-            .oneshot(
-                Request::put("/v1/graph/branches/main/head")
-                    .header("content-type", "application/json")
-                    .body(Body::from(json!({ "head": "legacy" }).to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::GONE);
-        assert_eq!(response.headers()["X-Kin-API-Version"], API_VERSION);
-        let body = axum::body::to_bytes(response.into_body(), 4096)
-            .await
-            .unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(body["error"], "v1_branch_head_update_retired");
-        assert_eq!(body["mutation_applied"], false);
-    }
-
-    #[tokio::test]
-    async fn checkout_requests_are_serialized_by_the_authority_gate() {
-        let state = test_state();
-        let (main, feature) = install_exact_checkout_branches(&state);
-        state
-            .is_initialized
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        let guard = state.coordination_gate.lock().await;
-        let app = router(Arc::clone(&state));
-        let mut first = tokio::spawn({
-            let app = app.clone();
-            async move {
-                app.oneshot(
-                    Request::post("/commands/checkout")
+        async fn reconcile_status(state: &Arc<DaemonState>, session_dir: &FsPath) -> StatusCode {
+            router(Arc::clone(state))
+                .oneshot(
+                    Request::post("/reconcile")
                         .header("content-type", "application/json")
                         .body(Body::from(
                             json!({
-                                "path": "src/shared.rs",
-                                "change_id": feature.id.to_string(),
+                                "session_dir": session_dir.display().to_string(),
+                                "confirm_mass_deletion": false
                             })
                             .to_string(),
                         ))
@@ -16116,165 +13635,78 @@ mod tests {
                 )
                 .await
                 .unwrap()
-            }
-        });
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), &mut first)
-                .await
-                .is_err(),
-            "first checkout must wait for the authority gate"
-        );
-        let mut second = tokio::spawn(async move {
-            app.oneshot(
-                Request::post("/commands/checkout")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({
-                            "path": "src/shared.rs",
-                            "change_id": main.id.to_string(),
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap()
-        });
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), &mut second)
-                .await
-                .is_err(),
-            "second checkout must queue behind the same authority gate"
-        );
-        assert_eq!(
-            std::fs::read(state.layout.working_dir().join("src/shared.rs")).unwrap(),
-            b"main checkout bytes\n"
-        );
-
-        drop(guard);
-        // On failure, surface the error body: this test flaked once on CI with a
-        // bare 500 and the discarded body was the only thing that could have
-        // named the cause. 300 solo repetitions under load pass, so whatever
-        // fails here is cross-test interference the next occurrence must
-        // identify itself.
-        for (label, handle) in [("first", &mut first), ("second", &mut second)] {
-            let response = handle.await.unwrap();
-            let status = response.status();
-            if status != StatusCode::OK {
-                let body = axum::body::to_bytes(response.into_body(), 65536)
-                    .await
-                    .unwrap();
-                panic!(
-                    "{label} checkout returned {status} after the gate released: {}",
-                    String::from_utf8_lossy(&body)
-                );
-            }
+                .status()
         }
-        assert_eq!(
-            std::fs::read(state.layout.working_dir().join("src/shared.rs")).unwrap(),
-            b"main checkout bytes\n",
-            "FIFO checkout A/B must leave the second target fully materialized"
-        );
-    }
 
-    #[tokio::test]
-    async fn branch_switch_and_head_update_wait_for_the_authority_gate() {
         let state = test_state();
-        let (_main, feature) = install_exact_checkout_branches(&state);
+        install_repository_file(&state, "README.md", b"exact base\n");
         state
             .is_initialized
             .store(true, std::sync::atomic::Ordering::Relaxed);
-        let advanced = SemanticChange {
-            id: SemanticChangeId::from_hash(Hash256::from_bytes([0xc0; 32])),
-            parents: vec![feature.id],
-            timestamp: Timestamp::now(),
-            author: AuthorId::new("branch-gate-test"),
-            message: "advance feature after switch barrier".to_string(),
-            entity_deltas: vec![],
-            relation_deltas: vec![],
-            artifact_deltas: vec![],
-            projected_files: vec![],
-            spec_link: None,
-            evidence: vec![],
-            risk_summary: None,
-            authored_on: Some(BranchName::new("feature")),
-        };
-        state.graph.create_change(&advanced).unwrap();
-        let guard = state.coordination_gate.lock().await;
-        let app = router(Arc::clone(&state));
-        let mut switch = tokio::spawn({
-            let app = app.clone();
-            async move {
-                app.oneshot(
-                    Request::post("/commands/branch")
-                        .header("content-type", "application/json")
-                        .body(Body::from(
-                            json!({ "command": "switch", "name": "feature" }).to_string(),
-                        ))
-                        .unwrap(),
-                )
-                .await
-                .unwrap()
-            }
-        });
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), &mut switch)
-                .await
-                .is_err(),
-            "branch switch must wait for the authority gate"
-        );
-        let mut update = tokio::spawn(async move {
-            app.oneshot(
-                Request::put("/graph/branches/feature/head")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({
-                            "head": advanced.id.to_string(),
-                            "expected_head": feature.id.to_string(),
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap()
-        });
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), &mut update)
-                .await
-                .is_err(),
-            "branch head update must wait for the same authority gate"
-        );
+
+        let symlink_session = state.layout.root().join("runs/session-control-symlink");
+        materialize(&state, &symlink_session).await;
+        let base_path = symlink_session.join(".kin-session/base.json");
+        let aliased_base = symlink_session.join("aliased-base.json");
+        std::fs::write(&aliased_base, std::fs::read(&base_path).unwrap()).unwrap();
+        std::fs::remove_file(&base_path).unwrap();
+        symlink("../aliased-base.json", &base_path).unwrap();
         assert_eq!(
-            kin_core::read_current_branch(&state.layout).unwrap(),
-            BranchName::new("main")
-        );
-        assert_eq!(
-            state
-                .graph
-                .get_branch(&BranchName::new("feature"))
-                .unwrap()
-                .unwrap()
-                .head,
-            feature.id
+            reconcile_status(&state, &symlink_session).await,
+            StatusCode::BAD_REQUEST,
+            "control metadata must never be read through a symlink"
         );
 
-        drop(guard);
-        assert_eq!(switch.await.unwrap().status(), StatusCode::OK);
-        assert_eq!(update.await.unwrap().status(), StatusCode::OK);
+        let hardlink_session = state.layout.root().join("runs/session-control-hardlink");
+        materialize(&state, &hardlink_session).await;
+        let base_path = hardlink_session.join(".kin-session/base.json");
+        let aliased_base = hardlink_session.join("aliased-base.json");
+        std::fs::write(&aliased_base, std::fs::read(&base_path).unwrap()).unwrap();
+        let mut aliased_permissions = std::fs::metadata(&aliased_base).unwrap().permissions();
+        aliased_permissions.set_mode(0o600);
+        std::fs::set_permissions(&aliased_base, aliased_permissions).unwrap();
+        std::fs::remove_file(&base_path).unwrap();
+        std::fs::hard_link(&aliased_base, &base_path).unwrap();
         assert_eq!(
-            kin_core::read_current_branch(&state.layout).unwrap(),
-            BranchName::new("feature")
+            reconcile_status(&state, &hardlink_session).await,
+            StatusCode::BAD_REQUEST,
+            "control metadata must be one unaliased regular file"
+        );
+
+        let special_session = state.layout.root().join("runs/session-special-member");
+        materialize(&state, &special_session).await;
+        let short_socket =
+            PathBuf::from("/tmp").join(format!("kin-reconcile-{}.sock", Uuid::new_v4().simple()));
+        let _listener = UnixListener::bind(&short_socket).unwrap();
+        std::fs::rename(&short_socket, special_session.join("member.sock")).unwrap();
+        assert_eq!(
+            reconcile_status(&state, &special_session).await,
+            StatusCode::BAD_REQUEST,
+            "special filesystem members cannot enter exact repository authority"
+        );
+
+        let stale_session = state.layout.root().join("runs/session-stale-base");
+        materialize(&state, &stale_session).await;
+        install_repository_file(&state, "new-authority.txt", b"authority moved\n");
+        let authority = ActiveApiRepositoryAuthority::open(&state).unwrap();
+        let generation = authority.manager.read_authority().roots().generation;
+        assert_eq!(
+            reconcile_status(&state, &stale_session).await,
+            StatusCode::CONFLICT,
+            "a stale session must never silently rebase"
         );
         assert_eq!(
-            state
-                .graph
-                .get_branch(&BranchName::new("feature"))
-                .unwrap()
-                .unwrap()
-                .head,
-            advanced.id
+            authority.manager.read_authority().roots().generation,
+            generation,
+            "rejected stale reconciliation must not mutate authority"
         );
+    }
+
+    /// Serializes tests that mutate process-global env
+    /// (`KIN_DAEMON_AUTH_TOKEN`, `KIN_DAEMON_REQUIRE_TOKEN`) so their
+    /// opposite expectations never race under the parallel test runner.
+    fn env_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::test_env_lock()
     }
 
     #[tokio::test]
@@ -16400,7 +13832,17 @@ mod tests {
     #[tokio::test]
     async fn trace_endpoint_uses_live_graph() {
         let state = test_state();
-        let entity = test_entity("handler", "src/lib.py");
+        let source = "def handler():\n    return 1\n";
+        install_repository_file(&state, "src/lib.py", source.as_bytes());
+        std::fs::create_dir_all(state.layout.working_dir().join("src")).unwrap();
+        std::fs::write(
+            state.layout.working_dir().join("src/lib.py"),
+            "def handler():\n    return 'checkout drift'\n",
+        )
+        .unwrap();
+        let mut entity = test_entity("handler", "src/lib.py");
+        entity.span.as_mut().unwrap().end_byte = source.len();
+        entity.span.as_mut().unwrap().end_line = 2;
         state.graph.upsert_entity(&entity).unwrap();
         state
             .is_initialized
@@ -16626,8 +14068,9 @@ mod tests {
     #[tokio::test]
     async fn review_endpoint_lists_live_review_state() {
         let state = test_state();
+        let repository_authority = state.local_repository_authority_binding().unwrap();
         let execution = kin_cli::commands::review::execute_review_request(
-            &state.layout,
+            &repository_authority,
             state.graph.as_ref(),
             kin_cli::commands::review::ReviewRequest::Create {
                 title: "Listed review".to_string(),
@@ -16719,8 +14162,18 @@ mod tests {
 
         let vector_path = kin_cli::backend::vector_index_path(&state.layout);
         let vectors = kin_db::VectorIndex::new(4).unwrap();
+        let descriptor = kin_db::vector::IndexDescriptor {
+            model_id: Some("fixture-embedder@1".to_string()),
+            graph_root: Some("fixture-graph-root".to_string()),
+        };
+        vectors.set_descriptor(descriptor.clone());
         vectors.save(&vector_path).unwrap();
-        state.graph.load_vector_index(&vector_path).unwrap();
+        assert!(matches!(
+            state
+                .graph
+                .load_vector_index_compatible(&vector_path, &descriptor),
+            kin_db::vector::VectorIndexLoad::Loaded(0)
+        ));
         state.graph.queue_missing_for_embedding();
         assert!(state.graph.pending_embeddings() > 0);
 
@@ -16752,34 +14205,28 @@ mod tests {
             .store(true, std::sync::atomic::Ordering::Relaxed);
 
         let entity = test_entity("handler", "src/lib.py");
-        let change_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x42; 32]));
-        state
-            .graph
-            .create_change(&SemanticChange {
-                id: change_id,
-                parents: vec![],
-                timestamp: Timestamp::now(),
-                author: AuthorId::new("test"),
-                message: "add handler".to_string(),
-                entity_deltas: vec![EntityDelta::Added(entity.clone())],
-                relation_deltas: vec![],
-                artifact_deltas: vec![],
-                projected_files: vec![],
-                spec_link: None,
-                evidence: vec![],
-                risk_summary: None,
-                authored_on: None,
-            })
-            .unwrap();
+        let mut change = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+            origin: kin_model::ChangeOrigin::Native,
+            parents: vec![],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("test"),
+            message: "add handler".to_string(),
+            entity_deltas: vec![EntityDelta::Added {
+                new: entity.clone(),
+            }],
+            relation_deltas: vec![],
+            tree_deltas: vec![],
+            admission_policy_delta: None,
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+        };
+        change.id = kin_core::compute_semantic_change_id(&change).unwrap();
+        state.graph.create_change(&change).unwrap();
         state.graph.upsert_entity(&entity).unwrap();
-        state
-            .graph
-            .create_branch(&Branch {
-                name: BranchName::new("main"),
-                head: change_id,
-            })
-            .unwrap();
-        kin_core::write_current_branch(&state.layout, &BranchName::new("main")).unwrap();
+        let change_ref = format!("change:{}", change.id);
 
         let app = router(state);
         let blame_response = app
@@ -16790,6 +14237,7 @@ mod tests {
                     .body(Body::from(
                         serde_json::json!({
                             "entity": "handler",
+                            "reference": change_ref.as_str(),
                         })
                         .to_string(),
                     ))
@@ -16813,6 +14261,7 @@ mod tests {
                     .body(Body::from(
                         serde_json::json!({
                             "entity": "handler",
+                            "reference": change_ref.as_str(),
                         })
                         .to_string(),
                     ))
@@ -16836,537 +14285,8 @@ mod tests {
             .any(|line| line.contains("add handler")));
     }
 
-    #[tokio::test]
-    async fn cold_shadow_review_uses_head_or_session_hydration_authority() {
-        for scoped in [false, true] {
-            let state = test_state();
-            state
-                .is_initialized
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-            let (base, head) = setup_daemon_shadow_hydration_fixture(&state);
-            let base_change = kin_git::semantic_change_id_from_git_oid_hex(&base).unwrap();
-            let head_change = kin_git::semantic_change_id_from_git_oid_hex(&head).unwrap();
-            let session_id = SessionId::new();
-            let scoped_graph = Arc::new(kin_db::InMemoryGraph::new());
-            if scoped {
-                state
-                    .set_session_scope(
-                        &session_id,
-                        head.clone(),
-                        head_change,
-                        Arc::clone(&scoped_graph),
-                    )
-                    .await;
-            }
-
-            let version_before = state.vfs_version.load(std::sync::atomic::Ordering::SeqCst);
-            let snapshot_path = state.layout.kindb_snapshot_path();
-            let mut events = state.event_tx.subscribe();
-            let app = router(Arc::clone(&state));
-            let mut request = Request::post("/review").header("content-type", "application/json");
-            if scoped {
-                request = request.header("x-kin-session", session_id.to_string());
-            }
-            let response = app
-                .oneshot(
-                    request
-                        .body(Body::from(
-                            serde_json::json!({
-                                "op": "shadow",
-                                "base": base,
-                                "head": head,
-                                "json": true,
-                            })
-                            .to_string(),
-                        ))
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-
-            let target_graph = if scoped {
-                scoped_graph.as_ref()
-            } else {
-                state.graph.as_ref()
-            };
-            assert!(target_graph.get_change(&base_change).unwrap().is_some());
-            assert!(target_graph.get_change(&head_change).unwrap().is_some());
-            assert!(!state.is_dirty());
-
-            if scoped {
-                assert!(state.graph.get_change(&base_change).unwrap().is_none());
-                assert!(state.graph.get_change(&head_change).unwrap().is_none());
-                assert_eq!(
-                    state.vfs_version.load(std::sync::atomic::Ordering::SeqCst),
-                    version_before
-                );
-                assert!(!snapshot_path.exists());
-                assert!(matches!(
-                    events.try_recv(),
-                    Err(tokio::sync::broadcast::error::TryRecvError::Empty)
-                ));
-            } else {
-                assert_eq!(
-                    state.vfs_version.load(std::sync::atomic::Ordering::SeqCst),
-                    version_before + 1
-                );
-                assert!(snapshot_path.exists());
-                match events
-                    .try_recv()
-                    .expect("HEAD shadow hydration must emit an event")
-                {
-                    DaemonEvent::GraphRootChanged { new_root_hash, .. } => {
-                        assert_eq!(new_root_hash, "review-hydration")
-                    }
-                    other => panic!("shadow review emitted the wrong event: {other:?}"),
-                }
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn post_hydration_render_error_still_publishes_head_graph_growth() {
-        let state = test_state();
-        state
-            .is_initialized
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        let git_head = setup_daemon_hydration_fixture(&state);
-        let imported_change = kin_git::semantic_change_id_from_git_oid_hex(&git_head).unwrap();
-        let version_before = state.vfs_version.load(std::sync::atomic::Ordering::SeqCst);
-        let mut events = state.event_tx.subscribe();
-        let app = router(Arc::clone(&state));
-
-        let response = app
-            .oneshot(
-                Request::post("/history")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        serde_json::json!({
-                            "entity": "entity_that_does_not_exist",
-                            "reference": git_head,
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        assert!(state.graph.get_change(&imported_change).unwrap().is_some());
-        assert_eq!(
-            state.vfs_version.load(std::sync::atomic::Ordering::SeqCst),
-            version_before + 1
-        );
-        assert!(!state.is_dirty());
-
-        let snapshot_path = state.layout.kindb_snapshot_path();
-        assert!(snapshot_path.exists());
-        let snapshot = kin_db::SnapshotManager::open(&snapshot_path).unwrap();
-        assert!(
-            snapshot
-                .graph()
-                .get_change(&imported_change)
-                .unwrap()
-                .is_some(),
-            "hydration must be durable before rendering reports its error"
-        );
-        match events.try_recv().expect("hydration must emit an event") {
-            DaemonEvent::GraphRootChanged { new_root_hash, .. } => {
-                assert_eq!(new_root_hash, "history-hydration")
-            }
-            other => panic!("history hydration emitted the wrong event: {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn cold_head_hydration_survives_restart_without_rehydrating() {
-        let state = test_state();
-        state
-            .is_initialized
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        let layout = state.layout.clone();
-        let git_head = setup_daemon_hydration_fixture(&state);
-        let imported_change = kin_git::semantic_change_id_from_git_oid_hex(&git_head).unwrap();
-
-        let response = router(Arc::clone(&state))
-            .oneshot(
-                Request::post("/history")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        serde_json::json!({
-                            "entity": "entity_that_does_not_exist",
-                            "reference": git_head,
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-
-        let committed_generation = state
-            .snapshot_generation
-            .load(std::sync::atomic::Ordering::SeqCst);
-        assert!(committed_generation > 0);
-        assert_eq!(
-            DaemonState::read_generation_marker(&layout),
-            committed_generation
-        );
-        assert!(state.graph.get_change(&imported_change).unwrap().is_some());
-        let index_path = layout.kindb_snapshot_path().with_extension("kidx");
-        let index_before_restart = kin_db::ReadIndex::load(&index_path).unwrap();
-        assert_eq!(
-            index_before_restart.entity_count,
-            state.graph.entity_count() as u32
-        );
-
-        drop(state);
-
-        let reopened = Arc::new(DaemonState::open(layout.clone()).unwrap());
-        reopened
-            .is_initialized
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        assert_eq!(
-            reopened
-                .snapshot_generation
-                .load(std::sync::atomic::Ordering::SeqCst),
-            committed_generation
-        );
-        assert_eq!(
-            DaemonState::read_generation_marker(&layout),
-            committed_generation
-        );
-        assert!(
-            reopened
-                .graph
-                .get_change(&imported_change)
-                .unwrap()
-                .is_some(),
-            "cold HEAD hydration must reopen from durable graph authority"
-        );
-        assert!(
-            !kin_cli::commands::ref_lookup::git_ref_requires_hydration(
-                reopened.graph.as_ref(),
-                &git_head,
-            ),
-            "the reopened graph must recognize the imported Git head"
-        );
-        let reopened_index = kin_db::ReadIndex::load(&index_path).unwrap();
-        assert_eq!(
-            reopened_index.entity_count,
-            reopened.graph.entity_count() as u32
-        );
-
-        let generation_before_warm_read = reopened
-            .snapshot_generation
-            .load(std::sync::atomic::Ordering::SeqCst);
-        let mut events = reopened.event_tx.subscribe();
-        let response = router(Arc::clone(&reopened))
-            .oneshot(
-                Request::post("/history")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        serde_json::json!({
-                            "entity": "hydrated_target",
-                            "reference": git_head,
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let status = response.status();
-        let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
-            .await
-            .unwrap();
-        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
-        assert_eq!(
-            reopened
-                .snapshot_generation
-                .load(std::sync::atomic::Ordering::SeqCst),
-            generation_before_warm_read,
-            "a warm ref query must not republish graph authority"
-        );
-        loop {
-            match events.try_recv() {
-                Ok(DaemonEvent::GraphRootChanged { new_root_hash, .. }) => panic!(
-                    "warm ref query after restart must not rehydrate, got new_root_hash={new_root_hash:?}"
-                ),
-                Ok(_) => continue,
-                Err(_) => break,
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn committed_hydration_emits_once_after_finalization_retry() {
-        let state = test_state();
-        state
-            .is_initialized
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        let git_head = setup_daemon_hydration_fixture(&state);
-        let generation_before = state
-            .snapshot_generation
-            .load(std::sync::atomic::Ordering::SeqCst);
-        let mut events = state.event_tx.subscribe();
-        state.fail_next_finalization_for_test();
-
-        let response = router(Arc::clone(&state))
-            .oneshot(
-                Request::post("/history")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        serde_json::json!({
-                            "entity": "entity_that_does_not_exist",
-                            "reference": git_head,
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(
-            state
-                .snapshot_generation
-                .load(std::sync::atomic::Ordering::SeqCst),
-            generation_before + 1,
-            "authority must remain committed when derived finalization fails"
-        );
-        assert!(state.is_dirty(), "the retry wakeup must remain armed");
-        assert!(matches!(
-            events.try_recv(),
-            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
-        ));
-
-        state
-            .save_snapshot()
-            .expect("retry must finalize the committed generation");
-        state.mark_clean();
-        match events
-            .try_recv()
-            .expect("successful finalization must release the queued event")
-        {
-            DaemonEvent::GraphRootChanged { new_root_hash, .. } => {
-                assert_eq!(new_root_hash, "history-hydration")
-            }
-            other => panic!("hydration retry emitted the wrong event: {other:?}"),
-        }
-        assert!(matches!(
-            events.try_recv(),
-            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
-        ));
-
-        state
-            .save_snapshot()
-            .expect("a later no-op save must remain healthy");
-        state.mark_clean();
-        assert!(matches!(
-            events.try_recv(),
-            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
-        ));
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn hydration_event_waits_for_own_persistence_generation() {
-        let state = test_state();
-        state
-            .is_initialized
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        let git_head = setup_daemon_hydration_fixture(&state);
-        let imported_change = kin_git::semantic_change_id_from_git_oid_hex(&git_head).unwrap();
-        let generation_before = state
-            .snapshot_generation
-            .load(std::sync::atomic::Ordering::SeqCst);
-        let mut events = state.event_tx.subscribe();
-
-        let (lock_held_tx, lock_held_rx) = std::sync::mpsc::sync_channel(0);
-        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
-        let state_for_older_save = Arc::clone(&state);
-        let older_save = tokio::task::spawn_blocking(move || {
-            let _persist_guard = state_for_older_save
-                .persist_lock
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            lock_held_tx.send(()).unwrap();
-            release_rx.recv().unwrap();
-        });
-        lock_held_rx.recv().unwrap();
-
-        let request_state = Arc::clone(&state);
-        let request_head = git_head.clone();
-        let request = tokio::spawn(async move {
-            router(request_state)
-                .oneshot(
-                    Request::post("/history")
-                        .header("content-type", "application/json")
-                        .body(Body::from(
-                            serde_json::json!({
-                                "entity": "entity_that_does_not_exist",
-                                "reference": request_head,
-                            })
-                            .to_string(),
-                        ))
-                        .unwrap(),
-                )
-                .await
-                .unwrap()
-        });
-
-        for _ in 0..100 {
-            if state.graph.get_change(&imported_change).unwrap().is_some() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        assert!(
-            state.graph.get_change(&imported_change).unwrap().is_some(),
-            "hydration must reach the save boundary while the older generation holds the lock"
-        );
-        assert!(
-            !state.persistence_event_is_queued_for_test(),
-            "the hydration event must not be visible to an older finalizer"
-        );
-        state.emit_pending_persistence_event_for_test();
-        assert!(matches!(
-            events.try_recv(),
-            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
-        ));
-
-        release_tx.send(()).unwrap();
-        older_save.await.unwrap();
-        let response = request.await.unwrap();
-        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(
-            state
-                .snapshot_generation
-                .load(std::sync::atomic::Ordering::SeqCst),
-            generation_before + 1
-        );
-        match events
-            .try_recv()
-            .expect("hydration generation finalization must emit the queued event")
-        {
-            DaemonEvent::GraphRootChanged { new_root_hash, .. } => {
-                assert_eq!(new_root_hash, "history-hydration")
-            }
-            other => panic!("hydration generation emitted the wrong event: {other:?}"),
-        }
-        assert!(matches!(
-            events.try_recv(),
-            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
-        ));
-    }
-
-    #[test]
-    fn event_bearing_noop_save_emits_after_concurrent_persistence() {
-        let state = test_state();
-        let git_head = setup_daemon_hydration_fixture(&state);
-        let prepared =
-            kin_cli::commands::ref_lookup::prepare_ref_importing_git_if_needed_with_report(
-                state.graph.as_ref(),
-                &state.layout,
-                Some(&git_head),
-            );
-        assert_eq!(prepared.hydrated_changes, 1);
-        prepared.into_result().unwrap();
-        state.bump_version();
-
-        let mut events = state.event_tx.subscribe();
-        state
-            .save_snapshot()
-            .expect("concurrent ordinary save must persist the hydrated graph");
-        state.mark_clean();
-        let persisted_generation = state
-            .snapshot_generation
-            .load(std::sync::atomic::Ordering::SeqCst);
-        assert!(matches!(
-            events.try_recv(),
-            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
-        ));
-
-        state
-            .save_snapshot_with_event(DaemonEvent::GraphRootChanged {
-                old_root_hash: None,
-                new_root_hash: "history-hydration".to_string(),
-            })
-            .expect("event-bearing no-op save must recognize already-durable authority");
-        state.mark_clean();
-        assert_eq!(
-            state
-                .snapshot_generation
-                .load(std::sync::atomic::Ordering::SeqCst),
-            persisted_generation,
-            "the event-bearing save should not invent another generation"
-        );
-        match events
-            .try_recv()
-            .expect("already-durable hydration must release its queued event")
-        {
-            DaemonEvent::GraphRootChanged { new_root_hash, .. } => {
-                assert_eq!(new_root_hash, "history-hydration")
-            }
-            other => panic!("event-bearing no-op save emitted the wrong event: {other:?}"),
-        }
-        assert!(matches!(
-            events.try_recv(),
-            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
-        ));
-    }
-
-    #[tokio::test]
-    async fn post_hydration_relative_ref_error_still_publishes_head_graph_growth() {
-        let state = test_state();
-        state
-            .is_initialized
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        let git_head = setup_daemon_hydration_fixture(&state);
-        let imported_change = kin_git::semantic_change_id_from_git_oid_hex(&git_head).unwrap();
-        let invalid_relative_ref = format!("{git_head}^2");
-        let version_before = state.vfs_version.load(std::sync::atomic::Ordering::SeqCst);
-        let mut events = state.event_tx.subscribe();
-        let app = router(Arc::clone(&state));
-
-        let response = app
-            .oneshot(
-                Request::post("/history")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        serde_json::json!({
-                            "entity": "hydrated_target",
-                            "reference": invalid_relative_ref,
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert!(state.graph.get_change(&imported_change).unwrap().is_some());
-        assert_eq!(
-            state.vfs_version.load(std::sync::atomic::Ordering::SeqCst),
-            version_before + 1
-        );
-        assert!(state.layout.kindb_snapshot_path().exists());
-        match events.try_recv().expect("hydration must emit an event") {
-            DaemonEvent::GraphRootChanged { new_root_hash, .. } => {
-                assert_eq!(new_root_hash, "history-hydration")
-            }
-            other => panic!("history hydration emitted the wrong event: {other:?}"),
-        }
-    }
-
-    // A blame/history request that resolves an already-present head imports
-    // nothing (hydrated_changes == 0), so neither handler may broadcast a
-    // hydration `GraphRootChanged`. A spurious event would wake every /events
-    // subscriber (the VFS daemon) for a read-only query that grew no graph
-    // state. This guards the gate on the new truthful count: the event fires
-    // only when an import actually happened.
+    // Blame and history are graph-only reads. They must never broadcast a
+    // `GraphRootChanged` event or mutate the selected authority.
     #[tokio::test]
     async fn warm_blame_and_history_emit_no_graph_root_changed_event() {
         let state = test_state();
@@ -17375,34 +14295,28 @@ mod tests {
             .store(true, std::sync::atomic::Ordering::Relaxed);
 
         let entity = test_entity("handler", "src/lib.py");
-        let change_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x43; 32]));
-        state
-            .graph
-            .create_change(&SemanticChange {
-                id: change_id,
-                parents: vec![],
-                timestamp: Timestamp::now(),
-                author: AuthorId::new("test"),
-                message: "add handler".to_string(),
-                entity_deltas: vec![EntityDelta::Added(entity.clone())],
-                relation_deltas: vec![],
-                artifact_deltas: vec![],
-                projected_files: vec![],
-                spec_link: None,
-                evidence: vec![],
-                risk_summary: None,
-                authored_on: None,
-            })
-            .unwrap();
+        let mut change = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+            origin: kin_model::ChangeOrigin::Native,
+            parents: vec![],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("test"),
+            message: "add handler".to_string(),
+            entity_deltas: vec![EntityDelta::Added {
+                new: entity.clone(),
+            }],
+            relation_deltas: vec![],
+            tree_deltas: vec![],
+            admission_policy_delta: None,
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+        };
+        change.id = kin_core::compute_semantic_change_id(&change).unwrap();
+        state.graph.create_change(&change).unwrap();
         state.graph.upsert_entity(&entity).unwrap();
-        state
-            .graph
-            .create_branch(&Branch {
-                name: BranchName::new("main"),
-                head: change_id,
-            })
-            .unwrap();
-        kin_core::write_current_branch(&state.layout, &BranchName::new("main")).unwrap();
+        let change_ref = format!("change:{}", change.id);
 
         // Subscribe before issuing any request so every broadcast is observable.
         let mut events = state.event_tx.subscribe();
@@ -17415,7 +14329,11 @@ mod tests {
                     Request::post(endpoint)
                         .header("content-type", "application/json")
                         .body(Body::from(
-                            serde_json::json!({ "entity": "handler" }).to_string(),
+                            serde_json::json!({
+                                "entity": "handler",
+                                "reference": change_ref.as_str(),
+                            })
+                            .to_string(),
                         ))
                         .unwrap(),
                 )
@@ -17424,8 +14342,7 @@ mod tests {
             assert_eq!(response.status(), StatusCode::OK, "{endpoint} must succeed");
         }
 
-        // No reference was supplied, so resolution imported nothing: neither
-        // handler may have broadcast a hydration GraphRootChanged.
+        // Neither handler may broadcast a GraphRootChanged for a read.
         loop {
             match events.try_recv() {
                 Ok(DaemonEvent::GraphRootChanged { new_root_hash, .. }) => panic!(
@@ -17737,28 +14654,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Status endpoint
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn status_returns_working_copy_state() {
-        let state = test_state();
-        let app = router(state);
-        let response = app
-            .oneshot(Request::get("/status").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), 4096)
-            .await
-            .unwrap();
-        let json: StatusResponse = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json.entity_adds, 0);
-        assert_eq!(json.entity_mods, 0);
-        assert_eq!(json.entity_removes, 0);
-    }
-
-    // -----------------------------------------------------------------------
     // Session endpoints
     // -----------------------------------------------------------------------
 
@@ -17833,6 +14728,7 @@ mod tests {
     async fn create_heartbeat_and_end_session() {
         let state = test_state();
         let app = router(state);
+        let requested_session_id = SessionId::new();
 
         let start_response = app
             .clone()
@@ -17841,6 +14737,7 @@ mod tests {
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::json!({
+                            "session_id": requested_session_id.to_string(),
                             "vendor": "claude-code",
                             "client_name": "daemon-test",
                             "transport": "mcp",
@@ -17868,6 +14765,28 @@ mod tests {
         assert_eq!(start_json.vendor, "claude-code");
         assert_eq!(start_json.status, "active");
         assert_eq!(start_json.client_name, "daemon-test");
+        assert_eq!(start_json.session_id, requested_session_id.to_string());
+
+        let duplicate_response = app
+            .clone()
+            .oneshot(
+                Request::post("/session")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "session_id": requested_session_id.to_string(),
+                            "vendor": "claude-code",
+                            "client_name": "duplicate",
+                            "transport": "mcp",
+                            "cwd": "/project"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(duplicate_response.status(), StatusCode::CONFLICT);
 
         let heartbeat_response = app
             .clone()
@@ -18181,209 +15100,46 @@ mod tests {
     // VFS endpoints
     // -----------------------------------------------------------------------
 
-    #[tokio::test]
-    async fn vfs_version_returns_zero_initially() {
-        let state = test_state();
-        let app = router(state);
-        let response = app
-            .oneshot(Request::get("/vfs/version").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), 4096)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["version"], 0);
-    }
-
-    #[tokio::test]
-    async fn vfs_tree_empty_graph() {
-        let state = test_state();
-        let app = router(state);
-        let response = app
-            .oneshot(Request::get("/vfs/tree").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), 4096)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(json["files"].as_object().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn vfs_snapshot_reuses_materialization_at_the_same_graph_key() {
-        let state = test_state();
-        install_branch_file(&state, "src/one.rs", b"one");
-        state.bump_version();
-
-        let first = current_vfs_snapshot(&state).await.unwrap();
-        let second = current_vfs_snapshot(&state).await.unwrap();
-
-        assert!(Arc::ptr_eq(&first, &second));
-        assert!(first.files.contains_key(&FilePathId::new("src/one.rs")));
-    }
-
-    #[tokio::test]
-    async fn concurrent_cold_vfs_readers_single_flight_one_materialization() {
-        use std::sync::atomic::Ordering;
-
-        const READERS: usize = 24;
-        let state = test_state();
-        install_branch_file(&state, "src/one.rs", b"one");
-        state.bump_version();
-
-        let start = Arc::new(tokio::sync::Barrier::new(READERS));
-        let mut readers = Vec::new();
-        for _ in 0..READERS {
-            let state = Arc::clone(&state);
-            let start = Arc::clone(&start);
-            readers.push(tokio::spawn(async move {
-                start.wait().await;
-                current_vfs_snapshot(&state).await.unwrap()
-            }));
+    #[test]
+    fn vfs_range_parser_rejects_malformed_multi_and_unsatisfiable_ranges() {
+        for malformed in [
+            "items=0-1",
+            "bytes=0-1,3-4",
+            "bytes=-4",
+            "bytes=4-",
+            "bytes=wat-9",
+        ] {
+            let headers =
+                HeaderMap::from_iter([(header::RANGE, HeaderValue::from_str(malformed).unwrap())]);
+            assert_eq!(
+                parse_vfs_byte_range(&headers, 10),
+                Err(VfsRangeError::Malformed),
+                "{malformed:?} must be rejected"
+            );
         }
 
-        let mut snapshots = Vec::new();
-        for reader in readers {
-            snapshots.push(reader.await.unwrap());
-        }
-        let first = &snapshots[0];
-        assert!(snapshots
-            .iter()
-            .all(|snapshot| Arc::ptr_eq(first, snapshot)));
-        assert_eq!(state.vfs_tree_build_count.load(Ordering::SeqCst), 1);
-    }
+        let mut duplicated = HeaderMap::new();
+        duplicated.append(header::RANGE, HeaderValue::from_static("bytes=0-1"));
+        duplicated.append(header::RANGE, HeaderValue::from_static("bytes=2-3"));
+        assert_eq!(
+            parse_vfs_byte_range(&duplicated, 10),
+            Err(VfsRangeError::Malformed)
+        );
 
-    #[tokio::test]
-    async fn old_vfs_builder_held_across_invalidation_cannot_publish_stale_snapshot() {
-        use std::sync::atomic::Ordering;
-
-        let state = test_state();
-        install_branch_file(&state, "src/one.rs", b"one");
-        state.bump_version();
-
-        let materialized = Arc::new(std::sync::Barrier::new(2));
-        let resume = Arc::new(std::sync::Barrier::new(2));
-        *state
-            .vfs_tree_build_test_hook
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            Some(crate::state::VfsTreeBuildTestHook {
-                materialized: Arc::clone(&materialized),
-                resume: Arc::clone(&resume),
-            });
-
-        let old_builder = {
-            let state = Arc::clone(&state);
-            tokio::spawn(async move { current_vfs_snapshot(&state).await.unwrap() })
-        };
-        tokio::task::spawn_blocking(move || materialized.wait())
-            .await
-            .unwrap();
-
-        // The first build has materialized the old head but has not reached publication.
-        // Complete a head change and cache invalidation before allowing it to continue.
-        advance_branch_with_file(&state, "src/two.rs", b"two", 0x7a);
-        state.bump_version();
-        tokio::task::spawn_blocking(move || resume.wait())
-            .await
-            .unwrap();
-
-        let observed = old_builder.await.unwrap();
-        assert!(observed.files.contains_key(&FilePathId::new("src/one.rs")));
-        assert!(observed.files.contains_key(&FilePathId::new("src/two.rs")));
-        assert_eq!(state.vfs_tree_build_count.load(Ordering::SeqCst), 2);
-
-        let cached = read_recover(&state.vfs_tree_cache)
-            .as_ref()
-            .cloned()
-            .expect("new-head snapshot cached");
-        assert!(Arc::ptr_eq(&observed, &cached));
-        assert_eq!(observed.key, current_vfs_cache_key(&state).unwrap());
-    }
-
-    #[tokio::test]
-    async fn vfs_snapshot_invalidates_on_head_change_without_serving_stale_tree() {
-        let state = test_state();
-        install_branch_file(&state, "src/one.rs", b"one");
-        state.bump_version();
-        let first = current_vfs_snapshot(&state).await.unwrap();
-
-        advance_branch_with_file(&state, "src/two.rs", b"two", 0x78);
-        state.bump_version();
-
-        assert!(read_recover(&state.vfs_tree_cache).is_none());
-
-        let refreshed = current_vfs_snapshot(&state).await.unwrap();
-        assert!(!Arc::ptr_eq(&first, &refreshed));
-        assert_ne!(first.key, refreshed.key);
-        assert!(refreshed.files.contains_key(&FilePathId::new("src/one.rs")));
-        assert!(refreshed.files.contains_key(&FilePathId::new("src/two.rs")));
-
-        let mut readers = Vec::new();
-        for _ in 0..16 {
-            let state = Arc::clone(&state);
-            readers.push(tokio::spawn(async move {
-                current_vfs_snapshot(&state).await.unwrap()
-            }));
-        }
-        for reader in readers {
-            let observed = reader.await.unwrap();
-            assert_eq!(observed.key, refreshed.key);
-            assert!(Arc::ptr_eq(&observed, &refreshed));
-        }
-    }
-
-    #[tokio::test]
-    async fn concurrent_vfs_readers_never_reuse_the_old_head_after_invalidation() {
-        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-
-        const READERS: usize = 16;
-        let state = test_state();
-        install_branch_file(&state, "src/one.rs", b"one");
-        state.bump_version();
-        let old = current_vfs_snapshot(&state).await.unwrap();
-
-        let start = Arc::new(tokio::sync::Barrier::new(READERS + 1));
-        let invalidated = Arc::new(AtomicBool::new(false));
-        let post_invalidation_reads = Arc::new(AtomicUsize::new(0));
-        let mut readers = Vec::new();
-        for _ in 0..READERS {
-            let state = Arc::clone(&state);
-            let start = Arc::clone(&start);
-            let invalidated = Arc::clone(&invalidated);
-            let post_invalidation_reads = Arc::clone(&post_invalidation_reads);
-            let old_key = old.key.clone();
-            readers.push(tokio::spawn(async move {
-                start.wait().await;
-                loop {
-                    let began_after_invalidation = invalidated.load(Ordering::Acquire);
-                    let observed = current_vfs_snapshot(&state).await.unwrap();
-                    if began_after_invalidation {
-                        assert_ne!(observed.key, old_key);
-                        assert!(observed.files.contains_key(&FilePathId::new("src/two.rs")));
-                        post_invalidation_reads.fetch_add(1, Ordering::Relaxed);
-                        break;
-                    }
-                    tokio::task::yield_now().await;
-                }
-            }));
+        for unsatisfiable in ["bytes=10-12", "bytes=7-6"] {
+            let headers = HeaderMap::from_iter([(
+                header::RANGE,
+                HeaderValue::from_str(unsatisfiable).unwrap(),
+            )]);
+            assert_eq!(
+                parse_vfs_byte_range(&headers, 10),
+                Err(VfsRangeError::Unsatisfiable)
+            );
         }
 
-        // Release the readers against the warm old-head cache, then publish a new head while
-        // those tasks are actively issuing snapshot requests.
-        start.wait().await;
-        advance_branch_with_file(&state, "src/two.rs", b"two", 0x79);
-        state.bump_version();
-        invalidated.store(true, Ordering::Release);
-
-        for reader in readers {
-            reader.await.unwrap();
-        }
-        assert_eq!(post_invalidation_reads.load(Ordering::Relaxed), READERS);
+        let clamped =
+            HeaderMap::from_iter([(header::RANGE, HeaderValue::from_static("bytes=7-99"))]);
+        assert_eq!(parse_vfs_byte_range(&clamped, 10), Ok(Some((7, 9))));
     }
 
     #[tokio::test]
@@ -18414,32 +15170,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[test]
-    fn vfs_read_rejects_projection_failures_instead_of_serving_raw_blob() {
-        let entity_id = EntityId::new();
-        let file_id = FilePathId::new("src/lib.rs");
-        let layout = FileLayout {
-            file_id: file_id.clone(),
-            parse_completeness: Default::default(),
-            imports: ImportSection {
-                byte_range: 0..0,
-                items: Vec::new(),
-            },
-            regions: vec![SourceRegion::EntityRef {
-                entity_id,
-                byte_range: 32..40,
-            }],
-        };
-        let mut merged_bodies = HashMap::new();
-        merged_bodies.insert(entity_id, b"new_body".to_vec());
-
-        let err = project_vfs_overlay_bytes(&file_id, b"short", Some(&layout), &merged_bodies)
-            .expect_err("invalid layouts must not fall back to raw blob bytes");
-
-        assert_eq!(err.0, StatusCode::INTERNAL_SERVER_ERROR);
-        assert!(err.1.contains("projection failed for src/lib.rs"));
     }
 
     // -----------------------------------------------------------------------
@@ -18568,6 +15298,17 @@ mod tests {
         }
     }
 
+    fn link_admitted_consumer_files(
+        files: &[kin_index::FileParseData],
+    ) -> Vec<kin_model::Relation> {
+        let artifact_ids: HashMap<String, kin_model::ArtifactId> = files
+            .iter()
+            .map(|file| (file.file_path.clone(), kin_model::ArtifactId::new()))
+            .collect();
+        kin_index::link_cross_file(files, &artifact_ids)
+            .expect("consumer fixture paths were explicitly admitted")
+    }
+
     /// The daemon's /spine/xref and /spine/impact serve real cross-repo edges
     /// materialized from a parsed + linked fixture through the production refresh
     /// path, and fail loud rather than return an empty impact.
@@ -18582,7 +15323,7 @@ mod tests {
             "use provider::do_work;\n\npub fn run_task() {\n    do_work();\n}\n",
         );
         let consumer_entities = consumer.entities.clone();
-        let consumer_relations = kin_index::link_cross_file(&[consumer]);
+        let consumer_relations = link_admitted_consumer_files(&[consumer]);
         let run_task_id = consumer_entities
             .iter()
             .find(|e| e.name == "run_task")
@@ -18676,7 +15417,7 @@ mod tests {
 
         let snapshot = app
             .clone()
-            .oneshot(Request::get("/v1/spine/edges").body(Body::empty()).unwrap())
+            .oneshot(Request::get("/spine/edges").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(snapshot.status(), StatusCode::OK);
@@ -18866,7 +15607,7 @@ mod tests {
         let app = router(state);
         let read_snapshot = |app: Router| async move {
             let response = app
-                .oneshot(Request::get("/v1/spine/edges").body(Body::empty()).unwrap())
+                .oneshot(Request::get("/spine/edges").body(Body::empty()).unwrap())
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK);
@@ -18933,7 +15674,7 @@ mod tests {
             "use provider::do_work;\n\npub fn run_task() {\n    do_work();\n}\n",
         );
         let consumer_entities = consumer.entities.clone();
-        let consumer_relations = kin_index::link_cross_file(&[consumer]);
+        let consumer_relations = link_admitted_consumer_files(&[consumer]);
         let run_task_id = consumer_entities
             .iter()
             .find(|e| e.name == "run_task")
@@ -18946,7 +15687,7 @@ mod tests {
             "use provider::do_work;\n\npub fn other_task() {\n    do_work();\n}\n",
         );
         let consumer2_entities = consumer2.entities.clone();
-        let consumer2_relations = kin_index::link_cross_file(&[consumer2]);
+        let consumer2_relations = link_admitted_consumer_files(&[consumer2]);
 
         // downstream: imports consumer::run_task (the 2nd hop).
         let downstream = parse_consumer_source(
@@ -18954,7 +15695,7 @@ mod tests {
             "use consumer::run_task;\n\npub fn orchestrate() {\n    run_task();\n}\n",
         );
         let downstream_entities = downstream.entities.clone();
-        let downstream_relations = kin_index::link_cross_file(&[downstream]);
+        let downstream_relations = link_admitted_consumer_files(&[downstream]);
         let orchestrate_id = downstream_entities
             .iter()
             .find(|e| e.name == "orchestrate")
@@ -19214,10 +15955,16 @@ mod tests {
         use kin_cli::backend::{get_spine_impact, get_spine_xref};
         use kin_mcp::handlers::common::{fetch_spine_impact_typed, fetch_spine_xref};
 
+        // The manifest-generated repository UUID is the local authority
+        // identity. Human fixture labels such as "provider" must never
+        // override or impersonate it.
+        let state = test_state();
+        let provider_repo_id = state.cached_repo_id.clone();
+
         // Fixture: provider exports do_work; consumer imports and calls it.
         let do_work_id = EntityId::new();
         let provider_entry = kin_spine::EntityEntry {
-            repo_id: "provider".to_string(),
+            repo_id: provider_repo_id.clone(),
             entity_id: do_work_id,
             name: "do_work".to_string(),
             kind: kin_model::EntityKind::Function,
@@ -19231,7 +15978,7 @@ mod tests {
             "use provider::do_work;\n\npub fn run_task() {\n    do_work();\n}\n",
         );
         let consumer_entities = consumer.entities.clone();
-        let consumer_relations = kin_index::link_cross_file(&[consumer]);
+        let consumer_relations = link_admitted_consumer_files(&[consumer]);
         let run_task_id = consumer_entities
             .iter()
             .find(|e| e.name == "run_task")
@@ -19240,8 +15987,6 @@ mod tests {
 
         // Pin the daemon's canonical graph identity without mutating process
         // environment shared by concurrently executing tests.
-        let state = test_state_with_repo_id(Some("provider"));
-        assert_eq!(state.cached_repo_id, "provider");
         let mut provider_entity = test_entity("do_work", "src/lib.rs");
         provider_entity.id = do_work_id;
         state.graph.upsert_entity(&provider_entity).unwrap();
@@ -19252,7 +15997,7 @@ mod tests {
         let provider_root = hex::encode(state.graph.compute_root_hash());
         {
             let spine = state.ensure_spine().expect("spine enabled in test");
-            spine.register_repo("provider", vec![provider_entry], &provider_root);
+            spine.register_repo(&provider_repo_id, vec![provider_entry], &provider_root);
             spine.register_repo(
                 "consumer",
                 consumer_entities
@@ -19294,28 +16039,38 @@ mod tests {
 
         // ── Surface 1: daemon HTTP (also the KinLab fetch contract). ──
         let http = reqwest::Client::new();
-        let http_xref: serde_json::Value = http
-            .get(format!("{base}/v1/spine/xref"))
+        let http_xref_response = http
+            .get(format!("{base}/spine/xref"))
             .query(&[("repo", "consumer"), ("entity", run_task_str.as_str())])
             .send()
             .await
-            .expect("daemon xref request")
-            .json()
-            .await
-            .expect("daemon xref json");
+            .expect("daemon xref request");
+        let http_xref_status = http_xref_response.status();
+        let http_xref_bytes = http_xref_response.bytes().await.expect("daemon xref body");
+        assert!(
+            http_xref_status.is_success(),
+            "daemon xref returned {http_xref_status}: {}",
+            String::from_utf8_lossy(&http_xref_bytes)
+        );
+        let http_xref: serde_json::Value =
+            serde_json::from_slice(&http_xref_bytes).expect("daemon xref json");
         let daemon_xref_to_provider = http_xref["edges"]
             .as_array()
-            .map(|edges| edges.iter().any(|e| e["dst_repo"] == "provider"))
+            .map(|edges| {
+                edges
+                    .iter()
+                    .any(|e| e["dst_repo"].as_str() == Some(provider_repo_id.as_str()))
+            })
             .unwrap_or(false);
         assert!(
             daemon_xref_to_provider,
-            "daemon /v1/spine/xref must resolve the consumer->provider edge: {http_xref}"
+            "daemon /spine/xref must resolve the consumer->provider edge: {http_xref}"
         );
 
         let http_impact: serde_json::Value = http
-            .get(format!("{base}/v1/spine/impact"))
+            .get(format!("{base}/spine/impact"))
             .query(&[
-                ("repo", "provider"),
+                ("repo", provider_repo_id.as_str()),
                 ("entity", do_work_str.as_str()),
                 ("depth", "5"),
             ])
@@ -19331,7 +16086,7 @@ mod tests {
             .unwrap_or(false);
         assert!(
             daemon_impact_hits_consumer,
-            "daemon /v1/spine/impact blast radius must include consumer: {http_impact}"
+            "daemon /spine/impact blast radius must include consumer: {http_impact}"
         );
 
         // ── Surface 2: the `kin xref` / `kin impact` CLI client code. ──
@@ -19342,13 +16097,16 @@ mod tests {
             kin_spine::SpineQuery::Found(response) => response,
             other => panic!("CLI get_spine_xref expected Found, got {other:?}"),
         };
-        let cli_xref_to_provider = cli_xref.edges.iter().any(|e| e.dst_repo == "provider");
+        let cli_xref_to_provider = cli_xref
+            .edges
+            .iter()
+            .any(|e| e.dst_repo == provider_repo_id);
         assert!(
             cli_xref_to_provider,
             "kin xref CLI must resolve consumer->provider: {cli_xref:?}"
         );
 
-        let cli_impact = match get_spine_impact(&layout, "provider", &do_work_id, 5)
+        let cli_impact = match get_spine_impact(&layout, &provider_repo_id, &do_work_id, 5)
             .await
             .expect("CLI get_spine_impact call")
         {
@@ -19370,13 +16128,13 @@ mod tests {
         let mcp_xref_to_provider = mcp_xref
             .edges
             .iter()
-            .any(|edge| edge.dst_repo == "provider");
+            .any(|edge| edge.dst_repo == provider_repo_id);
         assert!(
             mcp_xref_to_provider,
             "MCP fetch_spine_xref must resolve consumer->provider: {mcp_xref:?}"
         );
 
-        let mcp_impact = match fetch_spine_impact_typed("provider", &do_work_id, 5).await {
+        let mcp_impact = match fetch_spine_impact_typed(&provider_repo_id, &do_work_id, 5).await {
             kin_spine::SpineQuery::Found(impact) => impact,
             other => panic!("MCP fetch_spine_impact_typed expected Found, got {other:?}"),
         };
@@ -19427,13 +16185,13 @@ mod tests {
         assert_eq!(body["cross_repo"]["authority_complete"], true);
         assert_eq!(
             body["cross_repo"]["authority_anchor"]["repo_id"],
-            "provider"
+            provider_repo_id
         );
         assert!(body["cross_repo"]["authority_revision"]
             .as_str()
             .is_some_and(|revision| revision.starts_with("sha256:")));
         assert_eq!(
-            body["cross_repo"]["authority_roots"]["provider"],
+            body["cross_repo"]["authority_roots"][provider_repo_id.as_str()],
             provider_root
         );
         assert!(body["references"].as_array().is_some_and(|references| {
@@ -19448,7 +16206,8 @@ mod tests {
 
     #[tokio::test]
     async fn daemon_mcp_bulk_reachability_uses_exact_federated_authority() {
-        let state = test_state_with_repo_id(Some("provider"));
+        let state = test_state();
+        let provider_repo_id = state.cached_repo_id.clone();
         let target = test_entity("target", "src/lib.rs");
         let source = test_entity("caller", "src/app.rs");
         state.graph.upsert_entity(&target).unwrap();
@@ -19459,7 +16218,7 @@ mod tests {
         let spine = state.ensure_spine().expect("spine enabled in test");
         let provider_root = hex::encode(state.graph.compute_root_hash());
         assert_eq!(
-            spine.root_hash("provider").as_deref(),
+            spine.root_hash(&provider_repo_id).as_deref(),
             Some(provider_root.as_str())
         );
         spine.register_repo(
@@ -19475,7 +16234,7 @@ mod tests {
         spine.add_cross_repo_edge(kin_spine::CrossRepoEdge {
             src_repo: "consumer".to_string(),
             src_entity: source.id,
-            dst_repo: "provider".to_string(),
+            dst_repo: provider_repo_id.clone(),
             dst_entity: target.id,
             confidence: 0.9,
         });
@@ -19503,7 +16262,7 @@ mod tests {
         assert_eq!(body["results"][0]["federated_reference_count"], 1);
         assert_eq!(body["cross_repo"]["authority_complete"], true);
         assert_eq!(
-            body["cross_repo"]["authority_roots"]["provider"],
+            body["cross_repo"]["authority_roots"][provider_repo_id.as_str()],
             provider_root
         );
         assert_eq!(body["negative"]["safe_to_conclude_absent"], true);
@@ -19511,7 +16270,8 @@ mod tests {
 
     #[tokio::test]
     async fn xref_reads_retry_when_head_mutates_between_root_and_read_even_after_aba() {
-        let state = test_state_with_repo_id(Some("provider"));
+        let state = test_state();
+        let provider_repo_id = state.cached_repo_id.clone();
         let target = test_entity("target", "src/lib.rs");
         state.graph.upsert_entity(&target).unwrap();
         let stable_root = state.graph.compute_root_hash();
@@ -19524,7 +16284,7 @@ mod tests {
         // retry while each handler reads its detached snapshot.
         let spine = state.ensure_spine().expect("spine enabled in test");
         assert_eq!(
-            spine.root_hash("provider").as_deref(),
+            spine.root_hash(&provider_repo_id).as_deref(),
             Some(stable_root_hex.as_str())
         );
         assert!(
@@ -19569,7 +16329,7 @@ mod tests {
         assert!(command
             .spine
             .as_ref()
-            .is_some_and(|body| body.authority_complete_for("provider", &target.id)));
+            .is_some_and(|body| body.authority_complete_for(&provider_repo_id, &target.id)));
 
         let arguments = serde_json::from_value::<HashMap<String, serde_json::Value>>(json!({
             "entity_id": target.id.to_string(),
@@ -19648,7 +16408,7 @@ mod tests {
 
     #[test]
     fn mutation_wrapper_blocks_xref_during_stalled_head_and_session_batches() {
-        let state = test_state_with_repo_id(Some("provider"));
+        let state = test_state();
         let head_target = test_entity("head_target", "src/head.rs");
         state.graph.upsert_entity(&head_target).unwrap();
 
@@ -19702,7 +16462,7 @@ mod tests {
         assert!(
             prepare_xref_graph_read(&state, &scoped_graph, RequestGraphAuthority::SessionScope,)
                 .is_none(),
-            "session scope must not detach an intermediate hydration graph"
+            "session scope must not detach an intermediate graph mutation"
         );
         scope_release.wait();
         scope_writer.join().unwrap();
@@ -19716,7 +16476,7 @@ mod tests {
 
     #[tokio::test]
     async fn scoped_xref_fails_closed_when_selected_scope_is_replaced_mid_read() {
-        let state = test_state_with_repo_id(Some("provider"));
+        let state = test_state();
         let scoped_graph = Arc::new(kin_db::InMemoryGraph::new());
         let target = test_entity("historical_target", "src/lib.rs");
         scoped_graph.upsert_entity(&target).unwrap();
@@ -19855,7 +16615,7 @@ mod tests {
             "entity_id".to_string(),
             serde_json::json!(target.id.to_string()),
         )]);
-        let result = kin_mcp::handlers::entities::handle_find_references(&args, &graph)
+        let result = kin_mcp::handlers::entities::handle_find_references(&args, &graph, None)
             .await
             .unwrap();
         let kin_mcp::types::ContentBlock::Text { text } = result
@@ -19899,7 +16659,7 @@ mod tests {
             "entity_id".to_string(),
             serde_json::json!(target.id.to_string()),
         )]);
-        let result = kin_mcp::handlers::entities::handle_find_references(&args, &graph)
+        let result = kin_mcp::handlers::entities::handle_find_references(&args, &graph, None)
             .await
             .unwrap();
         let result = kin_mcp::finalize_with_envelope(
@@ -19946,7 +16706,7 @@ mod tests {
                 Some(value) => std::env::set_var("KIN_REPO_ID", value),
                 None => std::env::remove_var("KIN_REPO_ID"),
             }
-            let result = kin_mcp::handlers::entities::handle_find_references(&args, &graph)
+            let result = kin_mcp::handlers::entities::handle_find_references(&args, &graph, None)
                 .await
                 .unwrap();
             let result = kin_mcp::finalize_with_envelope(
@@ -20057,19 +16817,14 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn v1_prefix_routes_to_same_handler() {
+    async fn v1_prefix_is_not_routed() {
         let state = test_state();
         let app = router(state);
         let response = app
             .oneshot(Request::get("/v1/health").body(Body::empty()).unwrap())
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), 4096)
-            .await
-            .unwrap();
-        let json: HealthResponse = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json.status, "ok");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -20080,21 +16835,6 @@ mod tests {
             .oneshot(Request::get("/health").body(Body::empty()).unwrap())
             .await
             .unwrap();
-        assert_eq!(
-            response.headers().get("X-Kin-API-Version").unwrap(),
-            API_VERSION
-        );
-    }
-
-    #[tokio::test]
-    async fn v1_prefix_also_includes_api_version_header() {
-        let state = test_state();
-        let app = router(state);
-        let response = app
-            .oneshot(Request::get("/v1/status").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             response.headers().get("X-Kin-API-Version").unwrap(),
             API_VERSION
@@ -20151,7 +16891,7 @@ mod tests {
 
         let rejected = app
             .clone()
-            .oneshot(Request::get("/status").body(Body::empty()).unwrap())
+            .oneshot(Request::get("/session").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
@@ -20167,7 +16907,7 @@ mod tests {
 
         let accepted = app
             .oneshot(
-                Request::get("/status")
+                Request::get("/session")
                     .header("authorization", "Bearer secret-token")
                     .body(Body::empty())
                     .unwrap(),
@@ -20184,14 +16924,14 @@ mod tests {
 
         let rejected = app
             .clone()
-            .oneshot(Request::get("/v1/spine/edges").body(Body::empty()).unwrap())
+            .oneshot(Request::get("/spine/edges").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
 
         let accepted = app
             .oneshot(
-                Request::get("/v1/spine/edges")
+                Request::get("/spine/edges")
                     .header("authorization", "Bearer secret-token")
                     .body(Body::empty())
                     .unwrap(),
@@ -20215,7 +16955,7 @@ mod tests {
             "/ready",
             "/readiness",
             "/spine/health",
-            "/v1/health",
+            "/v2/health",
         ] {
             let response = app
                 .clone()
@@ -20334,7 +17074,7 @@ mod tests {
         // Daemon API route: rejected without a bearer token.
         let rejected = app
             .clone()
-            .oneshot(Request::get("/status").body(Body::empty()).unwrap())
+            .oneshot(Request::get("/session").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
@@ -20343,7 +17083,7 @@ mod tests {
         let accepted = app
             .clone()
             .oneshot(
-                Request::get("/status")
+                Request::get("/session")
                     .header("authorization", "Bearer secret-token")
                     .body(Body::empty())
                     .unwrap(),
@@ -20779,7 +17519,7 @@ mod tests {
         // A bracketed IPv6 loopback Host with a port is accepted (not 403/400).
         let allowed = app
             .oneshot(
-                Request::get("/status")
+                Request::get("/session")
                     .header(header::HOST, "[::1]:4219")
                     .body(Body::empty())
                     .unwrap(),
@@ -20896,30 +17636,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn command_exec_requires_capability_optin() {
-        // Default install (no KIN_DAEMON_ALLOW_EXEC) must refuse shell exec even
-        // for an initialized daemon — being initialized is not sufficient.
-        let _env = env_test_lock();
-        std::env::remove_var("KIN_DAEMON_ALLOW_EXEC");
-
-        let state = test_state();
-        state
-            .is_initialized
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        let app = router(state);
-        let response = app
-            .oneshot(
-                Request::post("/commands/exec")
-                    .header("content-type", "application/json")
-                    .body(Body::from(json!({ "command": "echo hi" }).to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    }
-
-    #[tokio::test]
     async fn loopback_token_provisioned_persisted_and_accepted() {
         let dir = std::env::temp_dir().join(format!("kin-daemon-token-{}", Uuid::new_v4()));
         std::fs::create_dir_all(dir.join(".kin")).unwrap();
@@ -20948,7 +17664,7 @@ mod tests {
         let accepted = app
             .clone()
             .oneshot(
-                Request::get("/status")
+                Request::get("/session")
                     .header("authorization", format!("Bearer {token}"))
                     .body(Body::empty())
                     .unwrap(),
@@ -20958,7 +17674,7 @@ mod tests {
         assert_eq!(accepted.status(), StatusCode::OK);
 
         let rejected = app
-            .oneshot(Request::get("/status").body(Body::empty()).unwrap())
+            .oneshot(Request::get("/session").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
@@ -21039,7 +17755,7 @@ mod tests {
 
         let http = reqwest::Client::new();
 
-        let no_token = http.get(format!("{base}/status")).send().await.unwrap();
+        let no_token = http.get(format!("{base}/session")).send().await.unwrap();
         assert_eq!(
             no_token.status(),
             StatusCode::UNAUTHORIZED,
@@ -21047,7 +17763,7 @@ mod tests {
         );
 
         let wrong_token = http
-            .get(format!("{base}/status"))
+            .get(format!("{base}/session"))
             .header("authorization", "Bearer not-the-real-token")
             .send()
             .await
@@ -21059,7 +17775,7 @@ mod tests {
         );
 
         let accepted = http
-            .get(format!("{base}/status"))
+            .get(format!("{base}/session"))
             .header("authorization", format!("Bearer {token}"))
             .send()
             .await
@@ -21541,615 +18257,5 @@ mod tests {
                 "degradations must serialize as an array"
             );
         }
-    }
-
-    // ---------------------------------------------------------------
-    // Rung-3 write veto (KIN_WRITE_VETO) — wired apply-path behavior.
-    //
-    // These exercise the real `vfs_write_notify` handler in-process (no daemon
-    // is spawned). `KIN_WRITE_VETO` is process-global, so the env-touching
-    // tests serialize on `VETO_ENV_LOCK` and restore the variable via an RAII
-    // guard so a leak never bleeds into another test. The lock is a
-    // `tokio::sync::Mutex` so the guard can be safely held across the handler's
-    // `.await` (a std `MutexGuard` would trip `clippy::await_holding_lock`).
-    // ---------------------------------------------------------------
-
-    static VETO_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-    struct EnvVarGuard(&'static str);
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            std::env::remove_var(self.0);
-        }
-    }
-
-    fn veto_file_target(state: &Arc<DaemonState>, rel: &str) -> (FilePathId, String) {
-        let abs = state.layout.working_dir().join(rel);
-        let file_id = kin_index::normalize_file_path_id(&abs, state.layout.working_dir());
-        (file_id, abs.to_string_lossy().into_owned())
-    }
-
-    fn write_disk_file(state: &Arc<DaemonState>, rel: &str, content: &str) {
-        let abs = state.layout.working_dir().join(rel);
-        if let Some(parent) = abs.parent() {
-            std::fs::create_dir_all(parent).unwrap();
-        }
-        std::fs::write(&abs, content).unwrap();
-    }
-
-    fn register_foreign_session(state: &Arc<DaemonState>, name: &str) -> SessionId {
-        state
-            .coordinator
-            .register_session(
-                name,
-                "task",
-                SessionTransport::Mcp,
-                None,
-                state.layout.working_dir().to_path_buf(),
-                SessionCapabilities {
-                    can_write: true,
-                    ..SessionCapabilities::default()
-                },
-            )
-            .unwrap()
-    }
-
-    async fn write_notify(app: Router, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
-        let mut request =
-            Request::post("/vfs/write-notify").header("content-type", "application/json");
-        if let Some(session_id) = body.get("session_id").and_then(serde_json::Value::as_str) {
-            request = request.header("X-Kin-Session", session_id);
-        }
-        let resp = app
-            .oneshot(request.body(Body::from(body.to_string())).unwrap())
-            .await
-            .unwrap();
-        let status = resp.status();
-        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
-            .await
-            .unwrap();
-        let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
-        (status, json)
-    }
-
-    #[tokio::test]
-    async fn graph_only_write_notify_fails_before_reindex_or_graph_mutation() {
-        let state = test_state();
-        state
-            .filesystem_reconcile_disabled
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        let (_, abs) = veto_file_target(&state, "src/graph_only.rs");
-        write_disk_file(
-            &state,
-            "src/graph_only.rs",
-            "pub fn must_not_enter_graph() -> u8 { 7 }\n",
-        );
-        let root_before = state.graph.compute_root_hash();
-        let entities_before = state.graph.entity_count();
-        let version_before = state.vfs_version.load(std::sync::atomic::Ordering::Relaxed);
-
-        let (status, json) = write_notify(
-            router(Arc::clone(&state)),
-            serde_json::json!({ "file_path": abs }),
-        )
-        .await;
-
-        assert_eq!(status, StatusCode::CONFLICT);
-        assert_eq!(json["error"], "filesystem_reconcile_disabled");
-        assert_eq!(json["reindexed"], false);
-        assert_eq!(state.graph.compute_root_hash(), root_before);
-        assert_eq!(state.graph.entity_count(), entities_before);
-        assert_eq!(
-            state.vfs_version.load(std::sync::atomic::Ordering::Relaxed),
-            version_before
-        );
-    }
-
-    #[tokio::test]
-    async fn write_notify_enforce_foreign_hard_intent_returns_409() {
-        let _lock = VETO_ENV_LOCK.lock().await;
-        let state = test_state();
-        let (file_id, abs) = veto_file_target(&state, "src/lib.py");
-        // The veto short-circuits before reconcile reads the file, so the file
-        // need not exist on disk for the rejection path.
-        let foreign = register_foreign_session(&state, "other-agent");
-        state
-            .coordinator
-            .register_intent(
-                &foreign,
-                vec![IntentScope::Artifact(file_id)],
-                LockType::Hard,
-                "rewriting lib",
-                None,
-            )
-            .unwrap();
-
-        let _env = EnvVarGuard("KIN_WRITE_VETO");
-        std::env::set_var("KIN_WRITE_VETO", "enforce");
-        *state
-            .coordination_mode
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            kin_mcp::CoordinationEnforcementMode::Enforce;
-        let caller = register_foreign_session(&state, "caller");
-        let (status, json) = write_notify(
-            router(state),
-            serde_json::json!({ "file_path": abs, "session_id": caller.to_string() }),
-        )
-        .await;
-
-        assert_eq!(status, StatusCode::CONFLICT);
-        assert_eq!(json["error"], "write_veto");
-        assert_eq!(json["conflict_type"], "HardCollision");
-        assert!(!json["blocking_intents"].as_array().unwrap().is_empty());
-        assert_eq!(
-            json["blocking_intents"][0]["session_id"],
-            foreign.to_string()
-        );
-    }
-
-    #[tokio::test]
-    async fn write_notify_off_keeps_soft_notification_without_annotation() {
-        // Explicit KIN_WRITE_VETO=off identity: with a foreign hard intent
-        // present the reconciler's own check still declines to fold the write
-        // (reindexed:false), NO 409 is produced, and — because the veto never
-        // evaluated — NO write_veto_warning is attached.
-        let _lock = VETO_ENV_LOCK.lock().await;
-        let _env = EnvVarGuard("KIN_WRITE_VETO");
-        std::env::set_var("KIN_WRITE_VETO", "off");
-
-        let state = test_state();
-        let (file_id, abs) = veto_file_target(&state, "src/lib.py");
-        write_disk_file(&state, "src/lib.py", "def foo():\n    return 1\n");
-        let foreign = register_foreign_session(&state, "other-agent");
-        state
-            .coordinator
-            .register_intent(
-                &foreign,
-                vec![IntentScope::Artifact(file_id)],
-                LockType::Hard,
-                "rewriting lib",
-                None,
-            )
-            .unwrap();
-
-        let (status, json) =
-            write_notify(router(state), serde_json::json!({ "file_path": abs })).await;
-
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(json["reindexed"], false);
-        assert!(json.get("write_veto_warning").is_none());
-    }
-
-    #[tokio::test]
-    async fn write_notify_warn_default_annotates_without_409() {
-        // Warn-by-default (KIN_WRITE_VETO unset): a foreign hard intent does NOT
-        // reject the write (status OK, no 409), but the response carries a
-        // write_veto_warning naming the blocking session so the agent sees the
-        // collision it would have hit under enforce.
-        let _lock = VETO_ENV_LOCK.lock().await;
-        let _env = EnvVarGuard("KIN_WRITE_VETO");
-        std::env::remove_var("KIN_WRITE_VETO");
-
-        let state = test_state();
-        let (file_id, abs) = veto_file_target(&state, "src/lib.py");
-        write_disk_file(&state, "src/lib.py", "def foo():\n    return 1\n");
-        let foreign = register_foreign_session(&state, "other-agent");
-        state
-            .coordinator
-            .register_intent(
-                &foreign,
-                vec![IntentScope::Artifact(file_id)],
-                LockType::Hard,
-                "rewriting lib",
-                None,
-            )
-            .unwrap();
-
-        let (status, json) =
-            write_notify(router(state), serde_json::json!({ "file_path": abs })).await;
-
-        assert_eq!(status, StatusCode::OK);
-        let warning = &json["write_veto_warning"];
-        assert_eq!(warning["would_block"], true);
-        assert_eq!(
-            warning["blocking_intents"][0]["session_id"],
-            foreign.to_string()
-        );
-    }
-
-    #[tokio::test]
-    async fn write_notify_warn_own_intent_allows_without_annotation() {
-        // Warn own-write guard at the handler: a session editing a file it has
-        // itself hard-locked is folded (reindexed:true) and NOT flagged — no
-        // write_veto_warning on an own write.
-        let _lock = VETO_ENV_LOCK.lock().await;
-        let _env = EnvVarGuard("KIN_WRITE_VETO");
-        std::env::remove_var("KIN_WRITE_VETO");
-
-        let state = test_state();
-        let (file_id, abs) = veto_file_target(&state, "src/lib.py");
-        write_disk_file(&state, "src/lib.py", "def foo():\n    return 1\n");
-        let caller = register_foreign_session(&state, "me");
-        state
-            .coordinator
-            .register_intent(
-                &caller,
-                vec![IntentScope::Artifact(file_id)],
-                LockType::Hard,
-                "editing my own file",
-                None,
-            )
-            .unwrap();
-
-        let (status, json) = write_notify(
-            router(state),
-            serde_json::json!({ "file_path": abs, "session_id": caller.to_string() }),
-        )
-        .await;
-
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(json["reindexed"], true);
-        assert!(json.get("write_veto_warning").is_none());
-    }
-
-    #[tokio::test]
-    async fn write_notify_enforce_own_intent_allows_write() {
-        // Own-write guard at the handler: a session editing a file it has
-        // itself hard-locked is allowed, and the write is folded into the graph.
-        let _lock = VETO_ENV_LOCK.lock().await;
-        let state = test_state();
-        let (file_id, abs) = veto_file_target(&state, "src/lib.py");
-        write_disk_file(&state, "src/lib.py", "def foo():\n    return 1\n");
-        let caller = register_foreign_session(&state, "me");
-        state
-            .coordinator
-            .register_intent(
-                &caller,
-                vec![IntentScope::Artifact(file_id)],
-                LockType::Hard,
-                "editing my own file",
-                None,
-            )
-            .unwrap();
-
-        let _env = EnvVarGuard("KIN_WRITE_VETO");
-        std::env::set_var("KIN_WRITE_VETO", "enforce");
-        *state
-            .coordination_mode
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            kin_mcp::CoordinationEnforcementMode::Enforce;
-        let (status, json) = write_notify(
-            router(state),
-            serde_json::json!({ "file_path": abs, "session_id": caller.to_string() }),
-        )
-        .await;
-
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(json["reindexed"], true);
-    }
-
-    #[tokio::test]
-    async fn write_notify_enforce_foreign_soft_intent_allows_write() {
-        // Soft intents are advisory: even under enforce, a foreign soft intent
-        // never vetoes the write.
-        let _lock = VETO_ENV_LOCK.lock().await;
-        let state = test_state();
-        let (file_id, abs) = veto_file_target(&state, "src/lib.py");
-        write_disk_file(&state, "src/lib.py", "def foo():\n    return 1\n");
-        let foreign = register_foreign_session(&state, "other-agent");
-        state
-            .coordinator
-            .register_intent(
-                &foreign,
-                vec![IntentScope::Artifact(file_id)],
-                LockType::Soft,
-                "watching lib",
-                None,
-            )
-            .unwrap();
-
-        let _env = EnvVarGuard("KIN_WRITE_VETO");
-        std::env::set_var("KIN_WRITE_VETO", "enforce");
-        *state
-            .coordination_mode
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            kin_mcp::CoordinationEnforcementMode::Enforce;
-        let caller = register_foreign_session(&state, "caller");
-        let (status, json) = write_notify(
-            router(state),
-            serde_json::json!({ "file_path": abs, "session_id": caller.to_string() }),
-        )
-        .await;
-
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(json["reindexed"], true);
-    }
-
-    #[tokio::test]
-    async fn write_notify_enforce_rejects_read_only_and_mismatched_callers() {
-        let _lock = VETO_ENV_LOCK.lock().await;
-        let state = test_state();
-        *state
-            .coordination_mode
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            kin_mcp::CoordinationEnforcementMode::Enforce;
-        let (_, abs) = veto_file_target(&state, "src/lib.py");
-        let read_only = state
-            .coordinator
-            .register_session(
-                "read-only",
-                "reader",
-                SessionTransport::Mcp,
-                None,
-                state.layout.working_dir().to_path_buf(),
-                SessionCapabilities::default(),
-            )
-            .unwrap();
-        let (status, json) = write_notify(
-            router(Arc::clone(&state)),
-            serde_json::json!({ "file_path": abs, "session_id": read_only.to_string() }),
-        )
-        .await;
-        assert_eq!(status, StatusCode::FORBIDDEN);
-        assert!(json["capability_violations"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|value| value == "can_write=false"));
-
-        let first = register_foreign_session(&state, "first");
-        let second = register_foreign_session(&state, "second");
-        let response = router(state)
-            .oneshot(
-                Request::post("/vfs/write-notify")
-                    .header("content-type", "application/json")
-                    .header("X-Kin-Session", first.to_string())
-                    .body(Body::from(
-                        serde_json::json!({
-                            "file_path": abs,
-                            "session_id": second.to_string()
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    }
-
-    async fn file_changed(app: Router, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
-        let mut request =
-            Request::post("/vfs/file-changed").header("content-type", "application/json");
-        if let Some(session_id) = body.get("session_id").and_then(serde_json::Value::as_str) {
-            request = request.header("X-Kin-Session", session_id);
-        }
-        let resp = app
-            .oneshot(request.body(Body::from(body.to_string())).unwrap())
-            .await
-            .unwrap();
-        let status = resp.status();
-        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
-            .await
-            .unwrap();
-        let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
-        (status, json)
-    }
-
-    #[tokio::test]
-    async fn graph_only_file_changed_fails_before_reconcile_or_graph_mutation() {
-        let state = test_state();
-        state
-            .filesystem_reconcile_disabled
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        let (_, abs) = veto_file_target(&state, "src/graph_only_changed.rs");
-        write_disk_file(
-            &state,
-            "src/graph_only_changed.rs",
-            "pub fn must_not_reconcile() -> u8 { 9 }\n",
-        );
-        let root_before = state.graph.compute_root_hash();
-        let entities_before = state.graph.entity_count();
-        let version_before = state.vfs_version.load(std::sync::atomic::Ordering::Relaxed);
-
-        let (status, json) = file_changed(
-            router(Arc::clone(&state)),
-            serde_json::json!({ "path": abs }),
-        )
-        .await;
-
-        assert_eq!(status, StatusCode::CONFLICT);
-        assert_eq!(json["error"], "filesystem_reconcile_disabled");
-        assert_eq!(json["reindexed"], false);
-        assert_eq!(state.graph.compute_root_hash(), root_before);
-        assert_eq!(state.graph.entity_count(), entities_before);
-        assert_eq!(
-            state.vfs_version.load(std::sync::atomic::Ordering::Relaxed),
-            version_before
-        );
-    }
-
-    #[tokio::test]
-    async fn file_changed_enforce_foreign_hard_intent_returns_409() {
-        // The veto must cover /vfs/file-changed too — otherwise enforce-mode is
-        // trivially bypassable by choosing this endpoint over /vfs/write-notify.
-        let _lock = VETO_ENV_LOCK.lock().await;
-        let state = test_state();
-        let (file_id, abs) = veto_file_target(&state, "src/lib.py");
-        let foreign = register_foreign_session(&state, "other-agent");
-        state
-            .coordinator
-            .register_intent(
-                &foreign,
-                vec![IntentScope::Artifact(file_id)],
-                LockType::Hard,
-                "rewriting lib",
-                None,
-            )
-            .unwrap();
-
-        let _env = EnvVarGuard("KIN_WRITE_VETO");
-        std::env::set_var("KIN_WRITE_VETO", "enforce");
-        *state
-            .coordination_mode
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            kin_mcp::CoordinationEnforcementMode::Enforce;
-        let caller = register_foreign_session(&state, "caller");
-        let (status, json) = file_changed(
-            router(state),
-            serde_json::json!({ "path": abs, "session_id": caller.to_string() }),
-        )
-        .await;
-
-        assert_eq!(status, StatusCode::CONFLICT);
-        assert_eq!(json["error"], "write_veto");
-        assert!(!json["blocking_intents"].as_array().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn file_changed_off_keeps_soft_notification_without_annotation() {
-        // Explicit KIN_WRITE_VETO=off identity for the file-changed path:
-        // foreign hard intent present, soft 200 {status:"error"}, no 409, and no
-        // write_veto_warning (the veto never evaluated).
-        let _lock = VETO_ENV_LOCK.lock().await;
-        let _env = EnvVarGuard("KIN_WRITE_VETO");
-        std::env::set_var("KIN_WRITE_VETO", "off");
-
-        let state = test_state();
-        let (file_id, abs) = veto_file_target(&state, "src/lib.py");
-        write_disk_file(&state, "src/lib.py", "def foo():\n    return 1\n");
-        let foreign = register_foreign_session(&state, "other-agent");
-        state
-            .coordinator
-            .register_intent(
-                &foreign,
-                vec![IntentScope::Artifact(file_id)],
-                LockType::Hard,
-                "rewriting lib",
-                None,
-            )
-            .unwrap();
-
-        let (status, json) = file_changed(router(state), serde_json::json!({ "path": abs })).await;
-
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(json["status"], "error");
-        assert!(json.get("write_veto_warning").is_none());
-    }
-
-    #[tokio::test]
-    async fn file_changed_warn_default_annotates_without_409() {
-        // Warn-by-default on /vfs/file-changed: a foreign hard intent is not
-        // rejected (status OK, no 409) but the soft response carries a
-        // write_veto_warning naming the blocking session.
-        let _lock = VETO_ENV_LOCK.lock().await;
-        let _env = EnvVarGuard("KIN_WRITE_VETO");
-        std::env::remove_var("KIN_WRITE_VETO");
-
-        let state = test_state();
-        let (file_id, abs) = veto_file_target(&state, "src/lib.py");
-        write_disk_file(&state, "src/lib.py", "def foo():\n    return 1\n");
-        let foreign = register_foreign_session(&state, "other-agent");
-        state
-            .coordinator
-            .register_intent(
-                &foreign,
-                vec![IntentScope::Artifact(file_id)],
-                LockType::Hard,
-                "rewriting lib",
-                None,
-            )
-            .unwrap();
-
-        let (status, json) = file_changed(router(state), serde_json::json!({ "path": abs })).await;
-
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(
-            json["write_veto_warning"]["blocking_intents"][0]["session_id"],
-            foreign.to_string()
-        );
-    }
-
-    #[tokio::test]
-    async fn file_changed_enforce_own_intent_allows_write() {
-        // The additive session_id field lets file-changed honor the own-write
-        // guard: a session editing a file it has itself hard-locked is allowed.
-        let _lock = VETO_ENV_LOCK.lock().await;
-        let state = test_state();
-        let (file_id, abs) = veto_file_target(&state, "src/lib.py");
-        write_disk_file(&state, "src/lib.py", "def foo():\n    return 1\n");
-        let caller = register_foreign_session(&state, "me");
-        state
-            .coordinator
-            .register_intent(
-                &caller,
-                vec![IntentScope::Artifact(file_id)],
-                LockType::Hard,
-                "editing my own file",
-                None,
-            )
-            .unwrap();
-
-        let _env = EnvVarGuard("KIN_WRITE_VETO");
-        std::env::set_var("KIN_WRITE_VETO", "enforce");
-        *state
-            .coordination_mode
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            kin_mcp::CoordinationEnforcementMode::Enforce;
-        let (status, json) = file_changed(
-            router(state),
-            serde_json::json!({ "path": abs, "session_id": caller.to_string() }),
-        )
-        .await;
-
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(json["status"], "reconciled");
-    }
-
-    #[test]
-    fn collect_pre_commit_entities_includes_inline_target_body_operations() {
-        let state = test_state();
-        let entity = test_entity("inline_projected_fn", "src/inline.rs");
-        state.graph.upsert_entity(&entity).unwrap();
-
-        let sessions = kin_mcp::SessionRegistry::new();
-        sessions.register("sess-inline", "test");
-        let tx = sessions
-            .begin_transaction("sess-inline", "entity:inline_projected_fn")
-            .unwrap();
-
-        let new_body = "def inline_projected_fn():\n    return 2";
-        let mut arguments: HashMap<String, serde_json::Value> = HashMap::new();
-        arguments.insert(
-            "transaction_id".into(),
-            serde_json::json!(tx.transaction_id),
-        );
-        arguments.insert(
-            "operations".into(),
-            serde_json::json!([{
-                "verb": "update",
-                "target": "inline_projected_fn",
-                "body": new_body,
-                "description": "inline body update"
-            }]),
-        );
-
-        let (entities, bodies) = collect_pre_commit_entities(&state, &sessions, &arguments);
-        assert_eq!(
-            entities.len(),
-            1,
-            "operations passed inline on commit must be collected for projection"
-        );
-        assert_eq!(entities[0].name, "inline_projected_fn");
-        assert_eq!(
-            bodies.get(&entities[0].id).map(Vec::as_slice),
-            Some(new_body.as_bytes())
-        );
     }
 }

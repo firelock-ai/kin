@@ -16,7 +16,7 @@ pub struct SupportJson {
     shallow_file_count: usize,
     structured_artifact_count: usize,
     opaque_artifact_count: usize,
-    file_hash_count: usize,
+    working_tree_entry_count: usize,
     text_indexed_entity_count: usize,
     text_index_coverage_percent: f64,
     indexed_embedding_count: usize,
@@ -42,7 +42,7 @@ impl SupportJson {
             shallow_file_count: stats.shallow_file_count,
             structured_artifact_count: stats.structured_artifact_count,
             opaque_artifact_count: stats.opaque_artifact_count,
-            file_hash_count: stats.file_hash_count,
+            working_tree_entry_count: stats.working_tree_entry_count,
             text_indexed_entity_count: stats.text_indexed_entity_count,
             text_index_coverage_percent: stats.text_index_coverage_percent,
             indexed_embedding_count: stats.indexed_embedding_count,
@@ -78,10 +78,10 @@ impl SupportJson {
 }
 
 pub fn inspect_support_graph(
-    layout: &kin_core::KinLayout,
+    binding: &kin_core::LocalRepositoryAuthorityBinding,
     graph: &kin_db::InMemoryGraph,
 ) -> Result<SupportJson> {
-    let health = super::graph_health::inspect_graph(layout, graph)?;
+    let health = super::graph_health::inspect_graph(binding, graph)?;
     let stats = graph.graph_stats();
     Ok(SupportJson::from_parts(&stats, health))
 }
@@ -133,7 +133,10 @@ fn render_support_json(report: &SupportJson) -> Vec<String> {
             report.structured_artifact_count
         ),
         format!("  opaque artifacts: {}", report.opaque_artifact_count),
-        format!("  file hashes: {}", report.file_hash_count),
+        format!(
+            "  working tree entries: {}",
+            report.working_tree_entry_count
+        ),
         format!(
             "  text index coverage: {} / {} entities ({:.1}%)",
             report.text_indexed_entity_count,
@@ -189,6 +192,58 @@ fn render_support_json(report: &SupportJson) -> Vec<String> {
     lines.push(String::new());
     lines.push("Health".to_string());
     lines.push(format!(
+        "  repository artifacts: {} authority / {} query graph",
+        report
+            .health
+            .repository_artifact_coverage
+            .authority_artifact_count,
+        report
+            .health
+            .repository_artifact_coverage
+            .graph_tree_artifact_count
+    ));
+    lines.push(format!(
+        "  query-facing artifact enrichment: {} / {} eligible",
+        report
+            .health
+            .repository_artifact_coverage
+            .enriched_artifact_count,
+        report
+            .health
+            .repository_artifact_coverage
+            .enrichable_artifact_count
+    ));
+    lines.push(format!(
+        "  exact-only artifacts: {}",
+        report
+            .health
+            .repository_artifact_coverage
+            .exact_only_artifact_count
+    ));
+    lines.push(format!(
+        "  repository artifact coverage: {}",
+        if report.health.repository_artifact_coverage.complete {
+            "complete"
+        } else {
+            "incomplete"
+        }
+    ));
+    if !report
+        .health
+        .repository_artifact_coverage
+        .issue_paths_sample
+        .is_empty()
+    {
+        lines.push(format!(
+            "  artifact issue sample: {}",
+            report
+                .health
+                .repository_artifact_coverage
+                .issue_paths_sample
+                .join(", ")
+        ));
+    }
+    lines.push(format!(
         "  supported entity-source files: {}",
         report.health.supported_entity_source_file_count
     ));
@@ -236,9 +291,33 @@ fn render_counts(counts: &BTreeMap<String, usize>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{render_support_report, SupportJson};
-    use crate::commands::graph_health::GraphHealthReport;
+    use crate::commands::graph_health::{GraphHealthReport, RepositoryArtifactCoverage};
     use kin_model::GraphStats;
     use std::collections::HashMap;
+
+    fn artifact_coverage(
+        authority: usize,
+        graph: usize,
+        enrichable: usize,
+        enriched: usize,
+        exact_only: usize,
+    ) -> RepositoryArtifactCoverage {
+        RepositoryArtifactCoverage {
+            authority_artifact_count: authority,
+            graph_tree_artifact_count: graph,
+            repository_tree_in_sync: authority == graph,
+            enrichable_artifact_count: enrichable,
+            enriched_artifact_count: enriched,
+            exact_only_artifact_count: exact_only,
+            missing_enrichment_path_count: enrichable.saturating_sub(enriched),
+            conflicting_enrichment_path_count: 0,
+            stale_enrichment_path_count: 0,
+            content_mismatch_path_count: 0,
+            orphan_entity_count: 0,
+            complete: authority == graph && enrichable == enriched,
+            issue_paths_sample: Vec::new(),
+        }
+    }
 
     #[test]
     fn human_report_renders_sorted_counts() {
@@ -253,7 +332,7 @@ mod tests {
             file_layout_count: 3,
             structured_artifact_count: 5,
             opaque_artifact_count: 6,
-            file_hash_count: 7,
+            working_tree_entry_count: 7,
             text_indexed_entity_count: 2,
             text_index_coverage_percent: 66.7,
             indexed_embedding_count: 1,
@@ -269,12 +348,12 @@ mod tests {
         };
 
         let health = GraphHealthReport {
+            repository_artifact_coverage: artifact_coverage(7, 7, 6, 6, 1),
             supported_entity_source_file_count: 2,
             supported_shallow_source_file_count: 1,
             graph_empty_for_supported_inputs: false,
             contaminated_entity_count: 0,
             contaminated_non_entity_count: 0,
-            contaminated_file_hash_count: 0,
             contaminated_path_count: 0,
             contaminated_paths_sample: Vec::new(),
             test_role_entity_count: 1,
@@ -297,7 +376,7 @@ mod tests {
                 "  shallow files: 4".to_string(),
                 "  structured artifacts: 5".to_string(),
                 "  opaque artifacts: 6".to_string(),
-                "  file hashes: 7".to_string(),
+                "  working tree entries: 7".to_string(),
                 "  text index coverage: 2 / 3 entities (66.7%)".to_string(),
                 "  embedding coverage: 1 / 3 entities (33.3%)".to_string(),
                 "  pending embeddings: 1".to_string(),
@@ -323,6 +402,10 @@ mod tests {
                 "  partial: 1".to_string(),
                 String::new(),
                 "Health".to_string(),
+                "  repository artifacts: 7 authority / 7 query graph".to_string(),
+                "  query-facing artifact enrichment: 6 / 6 eligible".to_string(),
+                "  exact-only artifacts: 1".to_string(),
+                "  repository artifact coverage: complete".to_string(),
                 "  supported entity-source files: 2".to_string(),
                 "  supported shallow-syntax files: 1".to_string(),
                 "  contaminated paths: 0".to_string(),
@@ -341,7 +424,7 @@ mod tests {
             file_layout_count: 1,
             structured_artifact_count: 2,
             opaque_artifact_count: 3,
-            file_hash_count: 4,
+            working_tree_entry_count: 4,
             text_indexed_entity_count: 1,
             text_index_coverage_percent: 50.0,
             indexed_embedding_count: 1,
@@ -359,12 +442,12 @@ mod tests {
         let payload = SupportJson::from_parts(
             &stats,
             GraphHealthReport {
+                repository_artifact_coverage: artifact_coverage(4, 4, 4, 4, 0),
                 supported_entity_source_file_count: 1,
                 supported_shallow_source_file_count: 0,
                 graph_empty_for_supported_inputs: false,
                 contaminated_entity_count: 0,
                 contaminated_non_entity_count: 0,
-                contaminated_file_hash_count: 0,
                 contaminated_path_count: 0,
                 contaminated_paths_sample: Vec::new(),
                 test_role_entity_count: 0,
@@ -379,6 +462,7 @@ mod tests {
         assert_eq!(payload.total_entities, 2);
         assert_eq!(payload.total_relations, 1);
         assert_eq!(payload.file_layout_count, 1);
+        assert_eq!(payload.working_tree_entry_count, 4);
         assert_eq!(payload.text_indexed_entity_count, 1);
         assert_eq!(payload.indexed_embedding_count, 1);
         assert_eq!(payload.entity_counts.get("Function"), Some(&2));

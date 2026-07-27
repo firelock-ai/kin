@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
+pub mod artifacts;
 pub mod common;
 
 // Handler submodules are public so each tool's rich `*_DESC` description const
@@ -10,10 +11,13 @@ pub mod common;
 pub mod bench;
 pub mod entities;
 pub mod provenance;
+pub(crate) mod repository_authority;
 pub mod review;
 pub mod sessions;
 pub mod verification;
 pub mod work;
+
+pub use repository_authority::LocalRepositoryAuthorityBinding;
 
 use std::collections::HashMap;
 
@@ -31,22 +35,40 @@ pub async fn handle_tool_call<G: GraphStore>(
     store: &G,
     sessions: &SessionRegistry,
     session_authority_mode: SessionAuthorityMode,
+    repository_authority: Option<&LocalRepositoryAuthorityBinding>,
 ) -> Result<ToolCallResult> {
     match tool_name {
+        // Exact repository membership and bytes
+        "kin_artifact_list" => {
+            artifacts::handle_artifact_list(arguments, store, repository_authority)
+        }
+        "kin_artifact_read" => {
+            artifacts::handle_artifact_read(arguments, store, repository_authority)
+        }
         // Entities
         "semantic_search" => entities::handle_semantic_search(arguments, store),
         "semantic_locate" => entities::handle_semantic_locate(arguments, store),
-        "get_entity" => entities::handle_get_entity(arguments, store),
+        "get_entity" => entities::handle_get_entity(arguments, store, repository_authority),
         "get_entity_source" | "get_entity_body" => {
-            entities::handle_get_entity_source(arguments, store)
+            entities::handle_get_entity_source(arguments, store, repository_authority)
         }
-        "get_entity_sources" => entities::handle_get_entity_sources(arguments, store),
-        "get_context_pack" => entities::handle_get_context_pack(arguments, store, sessions),
-        "trace_computation" => entities::handle_trace_computation(arguments, store, sessions),
+        "get_entity_sources" => {
+            entities::handle_get_entity_sources(arguments, store, repository_authority)
+        }
+        "get_context_pack" => {
+            entities::handle_get_context_pack(arguments, store, sessions, repository_authority)
+        }
+        "trace_computation" => {
+            entities::handle_trace_computation(arguments, store, sessions, repository_authority)
+        }
         "trace_data_flow" => entities::handle_trace_data_flow(arguments, store),
-        "find_references" => entities::handle_find_references(arguments, store).await,
+        "find_references" => {
+            entities::handle_find_references(arguments, store, repository_authority).await
+        }
         "bulk_check_references" => entities::handle_bulk_check_references(arguments, store),
-        "explore_codebase" => entities::handle_explore_codebase(arguments, store),
+        "explore_codebase" => {
+            entities::handle_explore_codebase(arguments, store, repository_authority)
+        }
         "dead_code" => entities::handle_dead_code(arguments, store),
         "find_dead_code_seeded" => entities::handle_find_dead_code_seeded(arguments, store),
         "graph_neighborhood" => entities::handle_graph_neighborhood(arguments, store),
@@ -54,7 +76,9 @@ pub async fn handle_tool_call<G: GraphStore>(
         "semantic_diff" => review::handle_semantic_diff(arguments, store),
         "impact_analysis" => review::handle_impact_analysis(arguments, store, sessions).await,
         "semantic_review" => review::handle_semantic_review(arguments, store, sessions),
-        "shadow_gate_report" => review::handle_shadow_gate_report(arguments, store),
+        "shadow_gate_report" => {
+            review::handle_shadow_gate_report(arguments, store, repository_authority)
+        }
         "entity_history" => review::handle_entity_history(arguments, store),
         // Sessions
         "register_session" => sessions::handle_register_session(arguments, sessions),
@@ -109,7 +133,9 @@ pub async fn handle_tool_call<G: GraphStore>(
         "kin_verify_entity" => verification::handle_verify_entity(arguments, store),
         "kin_coverage_summary" => verification::handle_coverage_summary(store),
         "kin_security_scan" => verification::handle_security_scan(arguments, store),
-        "kin_release_check" => verification::handle_release_check(arguments, store),
+        "kin_release_check" => {
+            verification::handle_release_check(arguments, store, repository_authority)
+        }
         "kin_contract_check" => verification::handle_contract_check(arguments, store),
         // Review mutations (Phase 11)
         "kin_review_create" => review::handle_review_create(arguments, store),
@@ -136,29 +162,30 @@ pub async fn handle_tool_call<G: GraphStore>(
 mod tests {
     use super::common::*;
     use super::*;
-    use kin_db::{InMemoryGraph, KinDbError};
-    use kin_model::branch::Branch;
+    use base64::Engine as _;
+    use kin_db::{InMemoryGraph, KinDbError, LocalFileBackend, RepositoryAuthorityManager};
     use kin_model::change::SemanticChange;
     use kin_model::entity::Entity;
     use kin_model::entity::{EntityKind, Visibility};
-    use kin_model::graph::{EntityFilter, SubGraph};
+    use kin_model::graph::{ChangeStore, EntityFilter, EntityStore, SubGraph};
     use kin_model::ids::*;
     use kin_model::relation::{Relation, RelationKind};
     use kin_model::session::{IntentScope, LockType, SessionCapabilities, SessionTransport};
     use std::collections::{HashMap, HashSet};
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::Arc;
     use tempfile::tempdir;
 
     #[derive(Default)]
-    struct EmptyStore {
+    pub(super) struct EmptyStore {
         entities_by_file: HashMap<String, Vec<Entity>>,
         entities_by_id: HashMap<EntityId, Entity>,
         relations_by_entity: HashMap<EntityId, Vec<Relation>>,
         dead_entities: Vec<Entity>,
         live_entity_ids: HashSet<EntityId>,
         file_hashes: HashMap<FilePathId, Hash256>,
-        branches: Vec<Branch>,
+        repository_refs: Vec<(kin_model::RefName, SemanticChangeId)>,
         changes_by_id: HashMap<SemanticChangeId, SemanticChange>,
         actors_by_id: HashMap<kin_model::provenance::ActorId, kin_model::provenance::Actor>,
         approvals_by_change: HashMap<SemanticChangeId, Vec<kin_model::provenance::Approval>>,
@@ -177,6 +204,395 @@ mod tests {
         TEST_FILE_HASHES.with(|map| {
             map.borrow_mut().insert(file_id.clone(), hash);
         });
+    }
+
+    fn build_exact_test_change(
+        entities: Vec<Entity>,
+        entries: Vec<(kin_model::ArtifactId, kin_model::RepoPath, Hash256)>,
+    ) -> SemanticChange {
+        exact_test_change(
+            vec![],
+            "admit exact MCP test tree",
+            entities
+                .into_iter()
+                .map(|new| kin_model::EntityDelta::Added { new })
+                .collect(),
+            entries
+                .into_iter()
+                .map(|(artifact_id, path, hash)| kin_model::TreeDelta::Added {
+                    artifact_id,
+                    new: kin_model::LocatedEntry::new(
+                        path,
+                        kin_model::TreeEntry::blob(hash, false),
+                    ),
+                })
+                .collect(),
+        )
+    }
+
+    fn exact_test_change(
+        parents: Vec<SemanticChangeId>,
+        message: &str,
+        entity_deltas: Vec<kin_model::EntityDelta>,
+        tree_deltas: Vec<kin_model::TreeDelta>,
+    ) -> SemanticChange {
+        let admission_policy_delta = parents.is_empty().then(|| {
+            kin_model::AdmissionPolicyDelta::initialize(kin_model::SharedAdmissionPolicy::empty(0))
+        });
+        let mut change = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+            parents,
+            timestamp: kin_model::Timestamp::now(),
+            author: AuthorId::new("kin-mcp-test"),
+            message: message.into(),
+            entity_deltas,
+            relation_deltas: vec![],
+            tree_deltas,
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            origin: kin_model::ChangeOrigin::Native,
+            admission_policy_delta,
+        };
+        change.id = kin_model::compute_semantic_change_id(&change).unwrap();
+        change
+    }
+
+    fn model_blob_hash(store: &kin_blobs::BlobStore, bytes: &[u8]) -> Hash256 {
+        let hash = store.write(bytes).unwrap();
+        Hash256::from_bytes(*hash.as_bytes())
+    }
+
+    fn open_test_repository_authority(
+        root: &std::path::Path,
+    ) -> (
+        kin_model::RepositoryId,
+        kin_model::WorkspaceId,
+        RepositoryAuthorityManager<LocalFileBackend>,
+    ) {
+        let layout = kin_core::KinLayout::new(root.join(".kin"));
+        let manifest = kin_core::KinManifest::load(&layout.manifest_path()).unwrap();
+        let repository_id = kin_model::RepositoryId::new(manifest.repo_id).unwrap();
+        let workspace_id = kin_model::WorkspaceId::from_uuid(
+            uuid::Uuid::parse_str(&manifest.workspace_id).unwrap(),
+        );
+        let authority = RepositoryAuthorityManager::open(
+            repository_id.clone(),
+            Arc::new(LocalFileBackend::new(layout.kindb_dir())),
+        )
+        .unwrap();
+        (repository_id, workspace_id, authority)
+    }
+
+    fn copy_test_source_bodies(
+        root: &std::path::Path,
+        authority: &RepositoryAuthorityManager<LocalFileBackend>,
+        changes: &[SemanticChange],
+    ) {
+        let legacy = kin_blobs::BlobStore::new(root.join(".kin/objects")).unwrap();
+        let mut copied = HashSet::new();
+        for hash in changes
+            .iter()
+            .flat_map(|change| change.tree_deltas.iter())
+            .filter_map(kin_model::TreeDelta::new_state)
+            .filter_map(|located| located.entry.blob_identity())
+        {
+            if !copied.insert(hash) {
+                continue;
+            }
+            let blob_hash = kin_blobs::Hash256::from_bytes(*hash.as_bytes());
+            if let Ok(bytes) = legacy.read(&blob_hash) {
+                authority.save_source_blob(hash, &bytes).unwrap();
+            }
+        }
+    }
+
+    fn test_source_blob_path(root: &std::path::Path, hash: Hash256) -> PathBuf {
+        let manifest =
+            kin_core::KinManifest::load(&root.join(".kin").join("manifest.json")).unwrap();
+        let digest = hash.to_string();
+        root.join(".kin")
+            .join("kindb")
+            .join(manifest.repo_id)
+            .join("source-blobs")
+            .join("sha256")
+            .join(&digest[..2])
+            .join(digest)
+    }
+
+    fn initialize_test_repository(root: &std::path::Path, initial_change: &SemanticChange) {
+        assert!(
+            initial_change.parents.is_empty(),
+            "test repository bootstrap requires a root change"
+        );
+        let kin_dir = root.join(".kin");
+        fs::create_dir_all(&kin_dir).unwrap();
+        fs::write(
+            kin_dir.join("version"),
+            kin_core::layout::KIN_LAYOUT_VERSION.to_string(),
+        )
+        .unwrap();
+        kin_core::KinConfig::default()
+            .save(&kin_dir.join("config.toml"))
+            .unwrap();
+        let manifest = kin_core::KinManifest::new();
+        manifest.save(&kin_dir.join("manifest.json")).unwrap();
+        fs::create_dir_all(kin_dir.join("kindb")).unwrap();
+
+        let repository_id = kin_model::RepositoryId::new(manifest.repo_id).unwrap();
+        let workspace_id = kin_model::WorkspaceId::from_uuid(
+            uuid::Uuid::parse_str(&manifest.workspace_id).unwrap(),
+        );
+        let authority = RepositoryAuthorityManager::open(
+            repository_id.clone(),
+            Arc::new(LocalFileBackend::new(kin_dir.join("kindb"))),
+        )
+        .unwrap();
+        copy_test_source_bodies(root, &authority, std::slice::from_ref(initial_change));
+
+        let shared_policy = initial_change
+            .admission_policy_delta
+            .as_ref()
+            .and_then(|delta| delta.new.clone())
+            .expect("root test change must initialize shared admission policy");
+        kin_core::initialize_repository_authority(
+            &authority,
+            repository_id,
+            workspace_id,
+            kin_model::AdmissionCase::Sensitive,
+            kin_model::RefName::branch(b"main").unwrap(),
+            shared_policy,
+            Some(initial_change.clone()),
+        )
+        .unwrap();
+    }
+
+    fn advance_test_repository(root: &std::path::Path, change: &SemanticChange) {
+        let (repository_id, workspace_id, authority) = open_test_repository_authority(root);
+        copy_test_source_bodies(root, &authority, std::slice::from_ref(change));
+
+        let lease = authority.read_authority();
+        let roots = lease.roots().clone();
+        let workspace = lease
+            .metadata()
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == workspace_id)
+            .cloned()
+            .unwrap();
+        let default_ref = lease.metadata().ref_state.default_ref.clone().unwrap();
+        let current_ref = lease
+            .metadata()
+            .ref_state
+            .refs
+            .iter()
+            .find(|repository_ref| repository_ref.name == default_ref)
+            .cloned()
+            .unwrap();
+        drop(lease);
+
+        let target_tree = workspace.tree.apply(&change.tree_deltas).unwrap();
+        let target_tree_hash = kin_model::compute_resolved_tree_hash(&target_tree).unwrap();
+        let shared_policy = change
+            .admission_policy_delta
+            .as_ref()
+            .and_then(|delta| delta.new.clone())
+            .unwrap_or_else(|| workspace.shared_admission_policy.clone());
+        let admission_policy = kin_model::EffectiveAdmissionPolicyStamp {
+            shared: shared_policy.stamp(),
+            local: workspace.admission_policy.local,
+        };
+        let new_target = kin_model::RefTarget::change(change.id);
+        let transaction = kin_model::RepositoryTransaction {
+            schema_version: kin_model::REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+            operation_id: kin_model::OperationId::new(),
+            repository_id,
+            expected_generation: roots.generation,
+            expected_roots: roots,
+            actor: AuthorId::new("kin-mcp-test"),
+            reason: "advance exact MCP test repository".into(),
+            external_objects: vec![],
+            git_authority_delta: None,
+            changes: vec![change.clone()],
+            aliases: vec![],
+            ref_mutations: vec![kin_model::RefMutation {
+                name: default_ref,
+                expected: kin_model::RefExpectation::MustEqual {
+                    target: current_ref.target,
+                },
+                new_target: Some(new_target.clone()),
+                policy: kin_model::RefUpdatePolicy::FastForwardOnly,
+            }],
+            default_ref_mutation: None,
+            workspace_mutation: Some(kin_model::WorkspaceMutation {
+                workspace_id,
+                expected: kin_model::WorkspaceExpectation::MustEqual {
+                    generation: workspace.generation,
+                    head: workspace.head.clone(),
+                    base_target: workspace.base_target.clone(),
+                    base_tree_hash: workspace.base_tree_hash,
+                    tree_hash: workspace.tree_hash,
+                    semantic_overlay_hash: workspace.semantic_overlay_hash,
+                    admission_policy: workspace.admission_policy,
+                },
+                new_generation: workspace.generation + 1,
+                new_head: workspace.head,
+                new_base_target: Some(new_target),
+                new_base_tree_hash: Some(target_tree_hash),
+                tree_deltas: change.tree_deltas.clone(),
+                new_tree_hash: target_tree_hash,
+                semantic_delta: kin_model::WorkspaceSemanticDelta::new(
+                    change.entity_deltas.clone(),
+                    change.relation_deltas.clone(),
+                )
+                .unwrap(),
+                new_shared_admission_policy: shared_policy,
+                new_admission_policy: admission_policy,
+            }),
+            local_overlay_delta: None,
+        };
+        authority
+            .commit_repository_transaction(transaction)
+            .unwrap();
+    }
+
+    fn initialize_release_test_repository(root: &std::path::Path, store: &EmptyStore) {
+        if store.repository_refs.is_empty() {
+            kin_core::init(root).unwrap();
+            return;
+        }
+
+        let roots = store
+            .changes_by_id
+            .values()
+            .filter(|change| change.parents.is_empty())
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(roots.len(), 1, "release fixture requires one history root");
+        let root_change = roots[0].clone();
+        initialize_test_repository(root, &root_change);
+
+        let (repository_id, _, authority) = open_test_repository_authority(root);
+        let lease = authority.read_authority();
+        let roots = lease.roots().clone();
+        let main = kin_model::RefName::branch(b"main").unwrap();
+        let initial_main = lease
+            .metadata()
+            .ref_state
+            .refs
+            .iter()
+            .find(|repository_ref| repository_ref.name == main)
+            .cloned()
+            .unwrap();
+        drop(lease);
+
+        let mut committed = HashSet::from([root_change.id]);
+        let mut remaining = store
+            .changes_by_id
+            .values()
+            .filter(|change| change.id != root_change.id)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut ordered = Vec::with_capacity(remaining.len());
+        while !remaining.is_empty() {
+            let index = remaining
+                .iter()
+                .position(|change| {
+                    change
+                        .parents
+                        .iter()
+                        .all(|parent| committed.contains(parent))
+                })
+                .expect("release fixture history must be connected and acyclic");
+            let change = remaining.remove(index);
+            committed.insert(change.id);
+            ordered.push(change);
+        }
+
+        let mut ref_mutations = Vec::new();
+        for (name, head) in &store.repository_refs {
+            let target = kin_model::RefTarget::change(*head);
+            if *name == main {
+                if target != initial_main.target {
+                    ref_mutations.push(kin_model::RefMutation {
+                        name: name.clone(),
+                        expected: kin_model::RefExpectation::MustEqual {
+                            target: initial_main.target.clone(),
+                        },
+                        new_target: Some(target),
+                        policy: kin_model::RefUpdatePolicy::ForceWithLease,
+                    });
+                }
+            } else {
+                ref_mutations.push(kin_model::RefMutation {
+                    name: name.clone(),
+                    expected: kin_model::RefExpectation::MustNotExist,
+                    new_target: Some(target),
+                    policy: kin_model::RefUpdatePolicy::FastForwardOnly,
+                });
+            }
+        }
+        if ordered.is_empty() && ref_mutations.is_empty() {
+            return;
+        }
+        let transaction = kin_model::RepositoryTransaction {
+            schema_version: kin_model::REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+            operation_id: kin_model::OperationId::new(),
+            repository_id,
+            expected_generation: roots.generation,
+            expected_roots: roots,
+            actor: AuthorId::new("kin-mcp-release-test"),
+            reason: "install exact release-check repository authority".into(),
+            external_objects: vec![],
+            git_authority_delta: None,
+            changes: ordered,
+            aliases: vec![],
+            ref_mutations,
+            default_ref_mutation: None,
+            workspace_mutation: None,
+            local_overlay_delta: None,
+        };
+        authority
+            .commit_repository_transaction(transaction)
+            .unwrap();
+    }
+
+    fn tool_result_json(result: ToolCallResult) -> serde_json::Value {
+        let text = match &result.content[0] {
+            crate::types::ContentBlock::Text { text } => text,
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
+    fn install_empty_store_exact_tree(store: &mut EmptyStore, root: &std::path::Path) {
+        let mut hashes = store.file_hashes.clone();
+        TEST_FILE_HASHES.with(|registered| {
+            hashes.extend(registered.borrow().clone());
+        });
+        let entries = hashes
+            .into_iter()
+            .map(|(file, hash)| {
+                (
+                    kin_model::ArtifactId::new(),
+                    kin_model::RepoPath::from_utf8(file.0).unwrap(),
+                    hash,
+                )
+            })
+            .collect();
+        let change =
+            build_exact_test_change(store.entities_by_id.values().cloned().collect(), entries);
+        store.changes_by_id.insert(change.id, change.clone());
+        initialize_test_repository(root, &change);
+    }
+
+    fn test_repository_authority(
+        root: &std::path::Path,
+    ) -> kin_core::LocalRepositoryAuthorityBinding {
+        let layout = kin_core::KinLayout::discover(root)
+            .expect("test repository authority must be discoverable");
+        kin_core::LocalRepositoryAuthorityBinding::from_layout(&layout)
+            .expect("test repository authority must open")
     }
 
     impl kin_model::graph::EntityStore for EmptyStore {
@@ -338,6 +754,21 @@ mod tests {
         fn delete_file_layout(&self, _: &FilePathId) -> std::result::Result<(), Self::Error> {
             Ok(())
         }
+        fn artifact_id_at_path(&self, _: &kin_model::RepoPath) -> Option<kin_model::ArtifactId> {
+            None
+        }
+        fn get_tree_entry(
+            &self,
+            _: &FilePathId,
+        ) -> std::result::Result<Option<kin_model::TreeEntry>, Self::Error> {
+            Ok(None)
+        }
+        fn apply_transaction_delta(
+            &self,
+            _: &kin_model::TransactionDelta,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
         fn traverse(
             &self,
             _: &kin_model::GraphNodeId,
@@ -363,15 +794,6 @@ mod tests {
             _: &FilePathId,
         ) -> std::result::Result<Option<kin_model::OpaqueArtifact>, Self::Error> {
             Ok(None)
-        }
-        fn get_file_hash(
-            &self,
-            file_id: &FilePathId,
-        ) -> std::result::Result<Option<kin_model::Hash256>, Self::Error> {
-            if let Some(hash) = self.file_hashes.get(file_id).copied() {
-                return Ok(Some(hash));
-            }
-            Ok(TEST_FILE_HASHES.with(|map| map.borrow().get(file_id).copied()))
         }
     }
 
@@ -406,28 +828,6 @@ mod tests {
             _: &SemanticChangeId,
         ) -> std::result::Result<Vec<SemanticChange>, Self::Error> {
             Ok(vec![])
-        }
-        fn get_branch(
-            &self,
-            name: &BranchName,
-        ) -> std::result::Result<Option<Branch>, Self::Error> {
-            Ok(self.branches.iter().find(|b| &b.name == name).cloned())
-        }
-        fn create_branch(&self, _: &Branch) -> std::result::Result<(), Self::Error> {
-            Ok(())
-        }
-        fn update_branch_head(
-            &self,
-            _: &BranchName,
-            _: &SemanticChangeId,
-        ) -> std::result::Result<(), Self::Error> {
-            Ok(())
-        }
-        fn delete_branch(&self, _: &BranchName) -> std::result::Result<(), Self::Error> {
-            Ok(())
-        }
-        fn list_branches(&self) -> std::result::Result<Vec<Branch>, Self::Error> {
-            Ok(self.branches.clone())
         }
     }
 
@@ -1043,6 +1443,7 @@ mod tests {
             &store,
             &sessions,
             SessionAuthorityMode::OfflineFallback,
+            None,
         )
         .await;
         assert!(result.is_err());
@@ -1067,6 +1468,7 @@ mod tests {
             &store,
             &sessions,
             SessionAuthorityMode::OfflineFallback,
+            None,
         )
         .await
         .unwrap();
@@ -1088,6 +1490,7 @@ mod tests {
             &store,
             &sessions,
             SessionAuthorityMode::OfflineFallback,
+            None,
         )
         .await
         .unwrap();
@@ -1102,6 +1505,7 @@ mod tests {
             &store,
             &sessions,
             SessionAuthorityMode::OfflineFallback,
+            None,
         )
         .await
         .unwrap();
@@ -1298,6 +1702,7 @@ mod tests {
         _env: EnvVarGuard,
         entity: Entity,
         hash: Hash256,
+        artifact_id: kin_model::ArtifactId,
     }
 
     /// Build an entity whose body is materialized only in a graph-owned blob
@@ -1315,6 +1720,7 @@ mod tests {
         let hash = blob_store.write(content.as_bytes()).unwrap();
 
         let file_id = kin_model::ids::FilePathId::new("validate.ts");
+        let artifact_id = kin_model::ArtifactId::new();
 
         let entity = Entity {
             id: EntityId::new(),
@@ -1354,6 +1760,7 @@ mod tests {
             _env: env,
             entity,
             hash,
+            artifact_id,
         }
     }
 
@@ -1367,6 +1774,7 @@ mod tests {
         let hash = blob_store.write(content.as_bytes()).unwrap();
 
         let file_id = kin_model::ids::FilePathId::new("validate.py");
+        let artifact_id = kin_model::ArtifactId::new();
         let signature = content
             .lines()
             .next()
@@ -1413,6 +1821,36 @@ mod tests {
             _env: env,
             entity,
             hash,
+            artifact_id,
+        }
+    }
+
+    impl GraphBackedSource {
+        fn install(&self, store: &InMemoryGraph) -> SemanticChangeId {
+            use kin_model::graph::{ChangeStore, EntityStore};
+
+            let change = build_exact_test_change(
+                vec![self.entity.clone()],
+                vec![(
+                    self.artifact_id,
+                    kin_model::RepoPath::from_utf8(
+                        self.entity.file_origin.as_ref().unwrap().0.clone(),
+                    )
+                    .unwrap(),
+                    self.hash,
+                )],
+            );
+            store
+                .apply_transaction_delta(&kin_model::TransactionDelta {
+                    entity_deltas: change.entity_deltas.clone(),
+                    relation_deltas: vec![],
+                    tree_deltas: change.tree_deltas.clone(),
+                    admission_policy_delta: None,
+                })
+                .unwrap();
+            store.create_change(&change).unwrap();
+            initialize_test_repository(self._dir.path(), &change);
+            change.id
         }
     }
 
@@ -1545,11 +1983,14 @@ mod tests {
         let entity = &source.entity;
 
         let mut store = EmptyStore::default();
+        store.entities_by_id.insert(entity.id, entity.clone());
         store
             .file_hashes
             .insert(entity.file_origin.clone().unwrap(), source.hash);
+        install_empty_store_exact_tree(&mut store, source._dir.path());
+        let authority = test_repository_authority(source._dir.path());
 
-        let value = entity_response_json(&store, entity).unwrap();
+        let value = entity_response_json(&store, entity, Some(&authority)).unwrap();
         let object = value.as_object().unwrap();
         let excerpt = object
             .get("source_excerpt")
@@ -1577,11 +2018,14 @@ mod tests {
         };
 
         let mut store = EmptyStore::default();
+        store.entities_by_id.insert(entity.id, entity.clone());
         store
             .file_hashes
             .insert(entity.file_origin.clone().unwrap(), source.hash);
+        install_empty_store_exact_tree(&mut store, source._dir.path());
+        let authority = test_repository_authority(source._dir.path());
 
-        let value = focal_context_json(&store, &entry, entity, false);
+        let value = focal_context_json(&store, &entry, entity, false, Some(&authority)).unwrap();
         let object = value.as_object().unwrap();
         let body = object.get("body").and_then(|value| value.as_str()).unwrap();
 
@@ -1609,11 +2053,14 @@ mod tests {
         };
 
         let mut store = EmptyStore::default();
+        store.entities_by_id.insert(entity.id, entity.clone());
         store
             .file_hashes
             .insert(entity.file_origin.clone().unwrap(), source.hash);
+        install_empty_store_exact_tree(&mut store, source._dir.path());
+        let authority = test_repository_authority(source._dir.path());
 
-        let value = focal_context_json(&store, &entry, entity, false);
+        let value = focal_context_json(&store, &entry, entity, false, Some(&authority)).unwrap();
         let object = value.as_object().unwrap();
 
         let marker = object.get("source").and_then(|v| v.as_str()).unwrap();
@@ -1643,11 +2090,14 @@ mod tests {
         };
 
         let mut store = EmptyStore::default();
+        store.entities_by_id.insert(entity.id, entity.clone());
         store
             .file_hashes
             .insert(entity.file_origin.clone().unwrap(), source.hash);
+        install_empty_store_exact_tree(&mut store, source._dir.path());
+        let authority = test_repository_authority(source._dir.path());
 
-        let value = focal_context_json(&store, &entry, entity, false);
+        let value = focal_context_json(&store, &entry, entity, false, Some(&authority)).unwrap();
         let object = value.as_object().unwrap();
         let body = object.get("body").and_then(|value| value.as_str()).unwrap();
 
@@ -1758,13 +2208,15 @@ mod tests {
         insert_trace_relation(&mut store, &reduce_step, &step, RelationKind::References);
         insert_trace_relation(&mut store, &step, &base_step, RelationKind::Calls);
         insert_trace_relation(&mut store, &base_step, &constant, RelationKind::Imports);
+        install_empty_store_exact_tree(&mut store, dir.path());
+        let authority = test_repository_authority(dir.path());
 
         let mut args = HashMap::new();
         args.insert("query".into(), serde_json::json!(entry.name));
         args.insert("strategy".into(), serde_json::json!("trace"));
         args.insert("token_budget".into(), serde_json::json!(8000));
 
-        let result = entities::handle_explore_codebase(&args, &store).unwrap();
+        let result = entities::handle_explore_codebase(&args, &store, Some(&authority)).unwrap();
         let text = match &result.content[0] {
             crate::types::ContentBlock::Text { text } => text.clone(),
         };
@@ -1823,13 +2275,15 @@ mod tests {
         let mut store = EmptyStore::default();
         store.entities_by_id.insert(step.id, step.clone());
         store.entities_by_id.insert(constant.id, constant.clone());
+        install_empty_store_exact_tree(&mut store, dir.path());
+        let authority = test_repository_authority(dir.path());
 
         let mut args = HashMap::new();
         args.insert("query".into(), serde_json::json!(step.name));
         args.insert("strategy".into(), serde_json::json!("trace"));
         args.insert("token_budget".into(), serde_json::json!(8000));
 
-        let result = entities::handle_explore_codebase(&args, &store).unwrap();
+        let result = entities::handle_explore_codebase(&args, &store, Some(&authority)).unwrap();
         let text = match &result.content[0] {
             crate::types::ContentBlock::Text { text } => text.clone(),
         };
@@ -1952,6 +2406,8 @@ mod tests {
         insert_trace_relation(&mut store, &step3, &step2, RelationKind::Calls);
         insert_trace_relation(&mut store, &step2, &step1, RelationKind::Calls);
         insert_trace_relation(&mut store, &step1, &constant, RelationKind::Imports);
+        install_empty_store_exact_tree(&mut store, dir.path());
+        let authority = test_repository_authority(dir.path());
 
         let mut args = HashMap::new();
         args.insert(
@@ -1961,7 +2417,7 @@ mod tests {
         args.insert("strategy".into(), serde_json::json!("trace"));
         args.insert("token_budget".into(), serde_json::json!(8000));
 
-        let result = entities::handle_explore_codebase(&args, &store).unwrap();
+        let result = entities::handle_explore_codebase(&args, &store, Some(&authority)).unwrap();
         let text = match &result.content[0] {
             crate::types::ContentBlock::Text { text } => text.clone(),
         };
@@ -2208,7 +2664,6 @@ mod tests {
         // an entity via kin_annotation_add must be recalled inside that entity's
         // get_context_pack response, through the real graph surfaces — no fake
         // or demo data, the same create/query path the product uses.
-        use kin_model::graph::EntityStore;
         let _lock = ENV_MUTEX
             .get_or_init(|| Mutex::new(()))
             .lock()
@@ -2217,11 +2672,8 @@ mod tests {
         let source = make_source_backed_entity(content);
         let entity = &source.entity;
         let store = InMemoryGraph::default();
-        store.upsert_entity(entity).unwrap();
-        store.set_file_hash(
-            &entity.file_origin.as_ref().unwrap().0,
-            *source.hash.as_bytes(),
-        );
+        source.install(&store);
+        let authority = test_repository_authority(source._dir.path());
 
         // Deposit via the real add handler against the entity scope.
         let mut add_args = HashMap::new();
@@ -2241,7 +2693,8 @@ mod tests {
         let mut args = HashMap::new();
         args.insert("entity_id".into(), serde_json::json!(entity.id.to_string()));
         args.insert("include_traffic".into(), serde_json::json!(false));
-        let result = entities::handle_get_context_pack(&args, &store, &sessions).unwrap();
+        let result =
+            entities::handle_get_context_pack(&args, &store, &sessions, Some(&authority)).unwrap();
         let text = match &result.content[0] {
             crate::types::ContentBlock::Text { text } => text.clone(),
         };
@@ -2264,7 +2717,6 @@ mod tests {
 
     #[test]
     fn handle_trace_computation_returns_focal_body_for_entity_id() {
-        use kin_model::graph::EntityStore;
         let _lock = ENV_MUTEX
             .get_or_init(|| Mutex::new(()))
             .lock()
@@ -2273,17 +2725,15 @@ mod tests {
         let source = make_source_backed_entity(content);
         let entity = &source.entity;
         let store = InMemoryGraph::default();
-        store.upsert_entity(entity).unwrap();
-        store.set_file_hash(
-            &entity.file_origin.as_ref().unwrap().0,
-            *source.hash.as_bytes(),
-        );
+        source.install(&store);
+        let authority = test_repository_authority(source._dir.path());
 
         let sessions = SessionRegistry::new();
         let mut args = HashMap::new();
         args.insert("entity_id".into(), serde_json::json!(entity.id.to_string()));
 
-        let result = entities::handle_trace_computation(&args, &store, &sessions).unwrap();
+        let result =
+            entities::handle_trace_computation(&args, &store, &sessions, Some(&authority)).unwrap();
         let text = match &result.content[0] {
             crate::types::ContentBlock::Text { text } => text.clone(),
         };
@@ -2305,7 +2755,6 @@ mod tests {
 
     #[test]
     fn handle_trace_computation_resolves_query_to_entity() {
-        use kin_model::graph::EntityStore;
         let _lock = ENV_MUTEX
             .get_or_init(|| Mutex::new(()))
             .lock()
@@ -2314,17 +2763,15 @@ mod tests {
         let source = make_source_backed_entity(content);
         let entity = &source.entity;
         let store = InMemoryGraph::default();
-        store.upsert_entity(entity).unwrap();
-        store.set_file_hash(
-            &entity.file_origin.as_ref().unwrap().0,
-            *source.hash.as_bytes(),
-        );
+        source.install(&store);
+        let authority = test_repository_authority(source._dir.path());
 
         let sessions = SessionRegistry::new();
         let mut args = HashMap::new();
         args.insert("query".into(), serde_json::json!(entity.name.clone()));
 
-        let result = entities::handle_trace_computation(&args, &store, &sessions).unwrap();
+        let result =
+            entities::handle_trace_computation(&args, &store, &sessions, Some(&authority)).unwrap();
         let text = match &result.content[0] {
             crate::types::ContentBlock::Text { text } => text.clone(),
         };
@@ -2343,13 +2790,13 @@ mod tests {
         let sessions = SessionRegistry::new();
         let args = HashMap::new();
 
-        let err = entities::handle_trace_computation(&args, &store, &sessions)
+        let err = entities::handle_trace_computation(&args, &store, &sessions, None)
             .expect_err("missing entity_id and query should error");
         assert!(matches!(err, McpError::InvalidParams(_)));
     }
 
     #[tokio::test]
-    async fn handle_transaction_handlers_lifecycle() {
+    async fn handle_transaction_handlers_lifecycle_fails_closed_without_exact_tree() {
         use crate::session::{McpMutationOperation, McpMutationPayload};
         use kin_db::InMemoryGraph;
         use kin_model::entity::{FingerprintAlgorithm, SemanticFingerprint};
@@ -2358,12 +2805,27 @@ mod tests {
 
         let store = InMemoryGraph::default();
         let sessions = SessionRegistry::new();
+        sessions.set_coordination_mode(crate::session::CoordinationEnforcementMode::Enforce);
         let session_authority = SessionAuthorityMode::OfflineFallback;
-        sessions.register("sess-test", "test");
+        let session = sessions.start_agent_session(
+            "codex",
+            "transaction-lifecycle-test",
+            SessionTransport::Mcp,
+            None,
+            PathBuf::from("/tmp"),
+            SessionCapabilities {
+                can_write: true,
+                can_commit: true,
+                ..SessionCapabilities::default()
+            },
+        );
 
         // 1. Begin transaction
         let mut begin_args = HashMap::new();
-        begin_args.insert("session_id".into(), serde_json::json!("sess-test"));
+        begin_args.insert(
+            "session_id".into(),
+            serde_json::json!(session.session_id.to_string()),
+        );
         begin_args.insert("scope".into(), serde_json::json!("src/lib.rs"));
         let begin_res =
             sessions::handle_transaction_begin(&begin_args, &sessions, session_authority)
@@ -2434,22 +2896,23 @@ mod tests {
         let val_val: serde_json::Value = serde_json::from_str(&val_text).unwrap();
         assert_eq!(val_val["state"].as_str().unwrap(), "validated");
 
-        // 4. Commit transaction
+        // 4. Commit transaction. A semantic entity cannot be introduced on a
+        // repository path that is absent from the exact staged tree. The
+        // legacy offline transaction payload has no source body/tree entry,
+        // so it must fail closed instead of creating dangling graph truth.
         let mut commit_args = HashMap::new();
         commit_args.insert("transaction_id".into(), serde_json::json!(tx_id));
         let commit_res =
             sessions::handle_transaction_commit(&commit_args, &store, &sessions, session_authority)
                 .await
                 .unwrap();
+        assert_eq!(commit_res.is_error, Some(true));
         let commit_text = match &commit_res.content[0] {
             crate::types::ContentBlock::Text { text } => text.clone(),
         };
-        let commit_val: serde_json::Value = serde_json::from_str(&commit_text).unwrap();
-        assert_eq!(commit_val["state"].as_str().unwrap(), "committed");
-
-        // Verify entity was added to the store
-        let retrieved = store.get_entity(&entity.id).unwrap().unwrap();
-        assert_eq!(retrieved.name, "test_fn");
+        assert!(commit_text.contains("absent from the staged tree"));
+        assert!(store.get_entity(&entity.id).unwrap().is_none());
+        assert_eq!(sessions.get_transaction(&tx_id).unwrap().state, "validated");
     }
 
     #[tokio::test]
@@ -2510,6 +2973,524 @@ mod tests {
     static ENV_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
 
     #[test]
+    fn exact_artifact_tools_preserve_every_repository_leaf_without_entities() {
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempdir().unwrap();
+        let kin_dir = dir.path().join(".kin");
+        fs::create_dir_all(&kin_dir).unwrap();
+        let _guard = EnvVarGuard::set("KIN_SOURCE_ROOT", dir.path());
+        let blobs = kin_blobs::BlobStore::new(kin_dir.join("objects")).unwrap();
+
+        let compose_path = kin_model::RepoPath::from_utf8("compose.yaml").unwrap();
+        let lock_path = kin_model::RepoPath::from_utf8("Cargo.lock").unwrap();
+        let unsupported_path = kin_model::RepoPath::from_utf8("legacy/handler.cob").unwrap();
+        let binary_path =
+            kin_model::RepoPath::from_bytes(b"assets/\xffpayload.bin".to_vec()).unwrap();
+        let executable_path = kin_model::RepoPath::from_utf8("bin/kin-hook").unwrap();
+        let symlink_path = kin_model::RepoPath::from_utf8("current-config").unwrap();
+        let gitlink_path = kin_model::RepoPath::from_utf8("vendor/external").unwrap();
+
+        let compose_bytes = b"services:\n  api:\n    image: kin:test\n";
+        let lock_bytes = b"# graph-owned lockfile\n";
+        let unsupported_bytes = b"IDENTIFICATION DIVISION.\n";
+        let binary_bytes = b"\x00\xff\x80\x01KIN";
+        let executable_bytes = b"#!/bin/sh\nexec kin \"$@\"\n";
+        let symlink_target = b"config/\xffproduction.yaml";
+
+        let compose_hash = model_blob_hash(&blobs, compose_bytes);
+        let lock_hash = model_blob_hash(&blobs, lock_bytes);
+        let unsupported_hash = model_blob_hash(&blobs, unsupported_bytes);
+        let binary_hash = model_blob_hash(&blobs, binary_bytes);
+        let executable_hash = model_blob_hash(&blobs, executable_bytes);
+        let symlink_hash = model_blob_hash(&blobs, symlink_target);
+
+        // A conflicting projection proves reads are content-addressed graph
+        // reads, never ambient working-tree reads.
+        fs::write(
+            dir.path().join("compose.yaml"),
+            b"filesystem fallback must never win\n",
+        )
+        .unwrap();
+
+        let compose_id = kin_model::ArtifactId::new();
+        let lock_id = kin_model::ArtifactId::new();
+        let unsupported_id = kin_model::ArtifactId::new();
+        let binary_id = kin_model::ArtifactId::new();
+        let executable_id = kin_model::ArtifactId::new();
+        let symlink_id = kin_model::ArtifactId::new();
+        let gitlink_id = kin_model::ArtifactId::new();
+        let gitlink_target = kin_model::GitObjectId::sha1([0x42; 20]);
+
+        let change = exact_test_change(
+            vec![],
+            "admit every exact repository leaf",
+            vec![],
+            vec![
+                kin_model::TreeDelta::Added {
+                    artifact_id: compose_id,
+                    new: kin_model::LocatedEntry::new(
+                        compose_path.clone(),
+                        kin_model::TreeEntry::blob(compose_hash, false),
+                    ),
+                },
+                kin_model::TreeDelta::Added {
+                    artifact_id: lock_id,
+                    new: kin_model::LocatedEntry::new(
+                        lock_path.clone(),
+                        kin_model::TreeEntry::blob(lock_hash, false),
+                    ),
+                },
+                kin_model::TreeDelta::Added {
+                    artifact_id: unsupported_id,
+                    new: kin_model::LocatedEntry::new(
+                        unsupported_path.clone(),
+                        kin_model::TreeEntry::blob(unsupported_hash, false),
+                    ),
+                },
+                kin_model::TreeDelta::Added {
+                    artifact_id: binary_id,
+                    new: kin_model::LocatedEntry::new(
+                        binary_path.clone(),
+                        kin_model::TreeEntry::blob(binary_hash, false),
+                    ),
+                },
+                kin_model::TreeDelta::Added {
+                    artifact_id: executable_id,
+                    new: kin_model::LocatedEntry::new(
+                        executable_path.clone(),
+                        kin_model::TreeEntry::blob(executable_hash, true),
+                    ),
+                },
+                kin_model::TreeDelta::Added {
+                    artifact_id: symlink_id,
+                    new: kin_model::LocatedEntry::new(
+                        symlink_path.clone(),
+                        kin_model::TreeEntry::symlink(symlink_hash),
+                    ),
+                },
+                kin_model::TreeDelta::Added {
+                    artifact_id: gitlink_id,
+                    new: kin_model::LocatedEntry::new(
+                        gitlink_path.clone(),
+                        kin_model::TreeEntry::gitlink(gitlink_target),
+                    ),
+                },
+            ],
+        );
+        let store = InMemoryGraph::default();
+        store.create_change(&change).unwrap();
+        let authority_change = exact_test_change(
+            vec![],
+            "seed exact MCP content authority",
+            vec![],
+            change
+                .tree_deltas
+                .iter()
+                .filter(|delta| {
+                    !matches!(
+                        delta.new_state().map(|located| located.entry),
+                        Some(kin_model::TreeEntry::Gitlink { .. })
+                    )
+                })
+                .cloned()
+                .collect(),
+        );
+        initialize_test_repository(dir.path(), &authority_change);
+        let authority = test_repository_authority(dir.path());
+        assert!(
+            store
+                .query_entities(&EntityFilter::default())
+                .unwrap()
+                .is_empty(),
+            "repository membership must not depend on parser-emitted entities"
+        );
+
+        let list = artifacts::handle_artifact_list(
+            &HashMap::from([(
+                "source_change_id".into(),
+                serde_json::json!(change.id.to_string()),
+            )]),
+            &store,
+            Some(&authority),
+        )
+        .unwrap();
+        let listed = tool_result_json(list);
+        assert_eq!(listed["artifact_count"], 7);
+        let listed_artifacts = listed["artifacts"].as_array().unwrap();
+        assert_eq!(listed_artifacts.len(), 7);
+
+        let find_path = |path: &kin_model::RepoPath| {
+            let wire = serde_json::to_value(path).unwrap();
+            listed_artifacts
+                .iter()
+                .find(|artifact| artifact["path"] == wire)
+                .unwrap()
+        };
+        assert_eq!(find_path(&compose_path)["entry"]["type"], "blob");
+        assert_eq!(find_path(&lock_path)["entry"]["type"], "blob");
+        assert_eq!(find_path(&unsupported_path)["entry"]["type"], "blob");
+        assert_eq!(find_path(&executable_path)["entry"]["executable"], true);
+        assert_eq!(find_path(&symlink_path)["entry"]["type"], "symlink");
+        assert_eq!(find_path(&gitlink_path)["entry"]["type"], "gitlink");
+        let binary_wire = find_path(&binary_path);
+        assert_eq!(
+            binary_wire["path"],
+            serde_json::to_value(&binary_path).unwrap()
+        );
+        assert_eq!(binary_wire["path_label_lossy"], true);
+        assert!(binary_wire["path_label"]
+            .as_str()
+            .unwrap()
+            .contains('\u{fffd}'));
+
+        let compose = tool_result_json(
+            artifacts::handle_artifact_read(
+                &HashMap::from([
+                    (
+                        "artifact_id".into(),
+                        serde_json::to_value(compose_id).unwrap(),
+                    ),
+                    (
+                        "source_change_id".into(),
+                        serde_json::json!(change.id.to_string()),
+                    ),
+                ]),
+                &store,
+                Some(&authority),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            compose["content_base64"],
+            base64::engine::general_purpose::STANDARD.encode(compose_bytes)
+        );
+        assert_eq!(
+            compose["text_utf8"],
+            std::str::from_utf8(compose_bytes).unwrap()
+        );
+        assert_ne!(compose["text_utf8"], "filesystem fallback must never win\n");
+
+        let binary = tool_result_json(
+            artifacts::handle_artifact_read(
+                &HashMap::from([
+                    ("path".into(), serde_json::to_value(&binary_path).unwrap()),
+                    (
+                        "source_change_id".into(),
+                        serde_json::json!(change.id.to_string()),
+                    ),
+                ]),
+                &store,
+                Some(&authority),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            binary["content_base64"],
+            base64::engine::general_purpose::STANDARD.encode(binary_bytes)
+        );
+        assert!(binary.get("text_utf8").is_none());
+
+        let executable = tool_result_json(
+            artifacts::handle_artifact_read(
+                &HashMap::from([
+                    (
+                        "artifact_id".into(),
+                        serde_json::to_value(executable_id).unwrap(),
+                    ),
+                    (
+                        "path".into(),
+                        serde_json::to_value(&executable_path).unwrap(),
+                    ),
+                    (
+                        "source_change_id".into(),
+                        serde_json::json!(change.id.to_string()),
+                    ),
+                ]),
+                &store,
+                Some(&authority),
+            )
+            .unwrap(),
+        );
+        assert_eq!(executable["artifact"]["entry"]["executable"], true);
+        assert_eq!(
+            executable["content_base64"],
+            base64::engine::general_purpose::STANDARD.encode(executable_bytes)
+        );
+
+        let symlink = tool_result_json(
+            artifacts::handle_artifact_read(
+                &HashMap::from([
+                    (
+                        "artifact_id".into(),
+                        serde_json::to_value(symlink_id).unwrap(),
+                    ),
+                    (
+                        "source_change_id".into(),
+                        serde_json::json!(change.id.to_string()),
+                    ),
+                ]),
+                &store,
+                Some(&authority),
+            )
+            .unwrap(),
+        );
+        assert_eq!(symlink["content_kind"], "symlink_target");
+        assert_eq!(
+            symlink["content_base64"],
+            base64::engine::general_purpose::STANDARD.encode(symlink_target)
+        );
+        assert!(symlink.get("text_utf8").is_none());
+
+        let gitlink = tool_result_json(
+            artifacts::handle_artifact_read(
+                &HashMap::from([
+                    (
+                        "artifact_id".into(),
+                        serde_json::to_value(gitlink_id).unwrap(),
+                    ),
+                    (
+                        "source_change_id".into(),
+                        serde_json::json!(change.id.to_string()),
+                    ),
+                ]),
+                &store,
+                Some(&authority),
+            )
+            .unwrap(),
+        );
+        assert_eq!(gitlink["content_kind"], "gitlink_reference");
+        assert_eq!(
+            gitlink["git_object_id"],
+            serde_json::to_value(gitlink_target).unwrap()
+        );
+        assert!(gitlink.get("content_base64").is_none());
+    }
+
+    #[test]
+    fn exact_artifact_tools_fail_loud_on_missing_tree_blob_or_identity() {
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempdir().unwrap();
+        let kin_dir = dir.path().join(".kin");
+        fs::create_dir_all(&kin_dir).unwrap();
+        let _guard = EnvVarGuard::set("KIN_SOURCE_ROOT", dir.path());
+
+        let path = kin_model::RepoPath::from_utf8("missing.bin").unwrap();
+        let artifact_id = kin_model::ArtifactId::new();
+        let blobs = kin_blobs::BlobStore::new(kin_dir.join("objects")).unwrap();
+        let missing_hash = model_blob_hash(&blobs, b"sealed then deliberately removed");
+        let change = exact_test_change(
+            vec![],
+            "reference a deliberately missing blob",
+            vec![],
+            vec![kin_model::TreeDelta::Added {
+                artifact_id,
+                new: kin_model::LocatedEntry::new(
+                    path.clone(),
+                    kin_model::TreeEntry::blob(missing_hash, false),
+                ),
+            }],
+        );
+        let store = InMemoryGraph::default();
+        store.create_change(&change).unwrap();
+        initialize_test_repository(dir.path(), &change);
+        let authority = test_repository_authority(dir.path());
+        fs::remove_file(test_source_blob_path(dir.path(), missing_hash)).unwrap();
+        fs::write(
+            dir.path().join("missing.bin"),
+            b"ambient bytes must not repair graph truth",
+        )
+        .unwrap();
+
+        let missing_blob = artifacts::handle_artifact_read(
+            &HashMap::from([
+                (
+                    "artifact_id".into(),
+                    serde_json::to_value(artifact_id).unwrap(),
+                ),
+                (
+                    "source_change_id".into(),
+                    serde_json::json!(change.id.to_string()),
+                ),
+            ]),
+            &store,
+            Some(&authority),
+        )
+        .expect_err("a graph tree entry with no content-addressed blob must fail");
+        assert!(missing_blob.to_string().contains("graph authority gap"));
+        assert!(missing_blob
+            .to_string()
+            .contains("absent from immutable source CAS"));
+        assert!(!missing_blob
+            .to_string()
+            .contains("ambient bytes must not repair graph truth"));
+
+        let absent_path = artifacts::handle_artifact_read(
+            &HashMap::from([
+                (
+                    "path".into(),
+                    serde_json::to_value(kin_model::RepoPath::from_utf8("not-present").unwrap())
+                        .unwrap(),
+                ),
+                (
+                    "source_change_id".into(),
+                    serde_json::json!(change.id.to_string()),
+                ),
+            ]),
+            &store,
+            Some(&authority),
+        )
+        .expect_err("an absent exact path must fail");
+        assert!(absent_path.to_string().contains("exact path is absent"));
+
+        let unknown_change = SemanticChangeId::from_hash(Hash256::from_bytes([0xee; 32]));
+        let missing_tree = artifacts::handle_artifact_list(
+            &HashMap::from([(
+                "source_change_id".into(),
+                serde_json::json!(unknown_change.to_string()),
+            )]),
+            &store,
+            Some(&authority),
+        )
+        .expect_err("an unknown graph head must not produce an empty repository");
+        assert!(missing_tree.to_string().contains("graph authority gap"));
+        assert!(missing_tree
+            .to_string()
+            .contains("cannot resolve exact repository tree"));
+    }
+
+    #[test]
+    fn exact_source_tracks_rename_identity_and_rejects_later_path_reuse() {
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let content = "export function validate_probe_range_1d8f8275() { return 42; }\n";
+        let source = make_source_backed_entity(content);
+        let store = InMemoryGraph::default();
+        let first_head = source.install(&store);
+        let authority = test_repository_authority(source._dir.path());
+        let old_path = kin_model::RepoPath::from_utf8("validate.ts").unwrap();
+        let renamed_path = kin_model::RepoPath::from_utf8("src/renamed.ts").unwrap();
+        let old_entry =
+            kin_model::LocatedEntry::new(old_path, kin_model::TreeEntry::blob(source.hash, false));
+        let renamed_entry = kin_model::LocatedEntry::new(
+            renamed_path.clone(),
+            kin_model::TreeEntry::blob(source.hash, false),
+        );
+        let mut renamed_entity = source.entity.clone();
+        let renamed_file = FilePathId::new("src/renamed.ts");
+        renamed_entity.file_origin = Some(renamed_file.clone());
+        renamed_entity.span.as_mut().unwrap().file = renamed_file;
+
+        let rename = exact_test_change(
+            vec![first_head],
+            "rename source without changing its identity",
+            vec![kin_model::EntityDelta::Modified {
+                old: source.entity.clone(),
+                new: renamed_entity.clone(),
+            }],
+            vec![kin_model::TreeDelta::Updated {
+                artifact_id: source.artifact_id,
+                old: old_entry,
+                new: renamed_entry.clone(),
+            }],
+        );
+        store.create_change(&rename).unwrap();
+        advance_test_repository(source._dir.path(), &rename);
+
+        let renamed_source =
+            entity_response_json(&store, &renamed_entity, Some(&authority)).unwrap();
+        assert_eq!(
+            renamed_source["artifact_id"],
+            serde_json::to_value(source.artifact_id).unwrap()
+        );
+        assert_eq!(
+            renamed_source["artifact_path"],
+            serde_json::to_value(&renamed_path).unwrap()
+        );
+        assert_eq!(
+            renamed_source["source_excerpt"],
+            content.trim_end_matches('\n')
+        );
+
+        let read_after_rename = tool_result_json(
+            artifacts::handle_artifact_read(
+                &HashMap::from([
+                    (
+                        "artifact_id".into(),
+                        serde_json::to_value(source.artifact_id).unwrap(),
+                    ),
+                    (
+                        "source_change_id".into(),
+                        serde_json::json!(rename.id.to_string()),
+                    ),
+                ]),
+                &store,
+                Some(&authority),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            read_after_rename["artifact"]["path"],
+            serde_json::to_value(&renamed_path).unwrap()
+        );
+        assert_eq!(
+            read_after_rename["content_base64"],
+            base64::engine::general_purpose::STANDARD.encode(content.as_bytes())
+        );
+
+        let replacement_id = kin_model::ArtifactId::new();
+        let reuse = exact_test_change(
+            vec![rename.id],
+            "replace the path with a different artifact identity",
+            vec![],
+            vec![
+                kin_model::TreeDelta::Removed {
+                    artifact_id: source.artifact_id,
+                    old: renamed_entry.clone(),
+                },
+                kin_model::TreeDelta::Added {
+                    artifact_id: replacement_id,
+                    new: renamed_entry,
+                },
+            ],
+        );
+        store.create_change(&reuse).unwrap();
+        advance_test_repository(source._dir.path(), &reuse);
+
+        let error = entity_response_json(&store, &renamed_entity, Some(&authority))
+            .expect_err("an old entity revision must not read a replacement artifact");
+        assert!(error
+            .to_string()
+            .contains("path 'src/renamed.ts' was reused"));
+
+        let replacement = tool_result_json(
+            artifacts::handle_artifact_read(
+                &HashMap::from([
+                    ("path".into(), serde_json::to_value(&renamed_path).unwrap()),
+                    (
+                        "source_change_id".into(),
+                        serde_json::json!(reuse.id.to_string()),
+                    ),
+                ]),
+                &store,
+                Some(&authority),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            replacement["artifact"]["artifact_id"],
+            serde_json::to_value(replacement_id).unwrap()
+        );
+    }
+
+    #[test]
     fn test_entity_served_from_blob_store_file_deleted() {
         let _lock = ENV_MUTEX
             .get_or_init(|| Mutex::new(()))
@@ -2563,9 +3544,12 @@ mod tests {
         };
 
         let mut store = EmptyStore::default();
+        store.entities_by_id.insert(entity.id, entity.clone());
         store.file_hashes.insert(file_id, hash);
+        install_empty_store_exact_tree(&mut store, dir.path());
+        let authority = test_repository_authority(dir.path());
 
-        let value = entity_response_json(&store, &entity).unwrap();
+        let value = entity_response_json(&store, &entity, Some(&authority)).unwrap();
         let object = value.as_object().unwrap();
         let excerpt = object
             .get("source_excerpt")
@@ -2596,6 +3580,12 @@ mod tests {
         let file_id = FilePathId::new(file_path);
         let graph_content = "export function test_disk() { return 42; }";
         let graph_hash = kin_blobs::digest(graph_content.as_bytes());
+        let legacy_store =
+            kin_blobs::BlobStore::new(dir.path().join(".kin").join("objects")).unwrap();
+        assert_eq!(
+            legacy_store.write(graph_content.as_bytes()).unwrap(),
+            graph_hash
+        );
 
         let entity = Entity {
             id: EntityId::new(),
@@ -2631,21 +3621,23 @@ mod tests {
         };
 
         let mut store = EmptyStore::default();
+        store.entities_by_id.insert(entity.id, entity.clone());
         store.file_hashes.insert(file_id, graph_hash);
+        install_empty_store_exact_tree(&mut store, dir.path());
+        let authority = test_repository_authority(dir.path());
+        fs::remove_file(test_source_blob_path(dir.path(), graph_hash)).unwrap();
 
         let before_misses = GRAPH_MISS_COUNT.load(std::sync::atomic::Ordering::SeqCst);
 
-        let value = entity_response_json(&store, &entity).unwrap();
-        let object = value.as_object().unwrap();
-
+        let error = entity_response_json(&store, &entity, Some(&authority))
+            .expect_err("a missing graph blob must fail the MCP read loudly");
+        let message = error.to_string();
         assert!(
-            object.get("source_excerpt").is_none(),
-            "graph blob-miss must not serve a disk excerpt"
+            message.contains("graph authority gap")
+                && message.contains("absent from immutable source CAS"),
+            "unexpected graph-miss error: {message}"
         );
-        assert_eq!(
-            object.get("source").unwrap().as_str().unwrap(),
-            "graph-miss"
-        );
+        assert!(!message.contains(disk_content));
 
         let after_misses = GRAPH_MISS_COUNT.load(std::sync::atomic::Ordering::SeqCst);
         assert!(after_misses >= before_misses + 1);
@@ -2668,13 +3660,7 @@ mod tests {
         let content = "export function test_mismatch() { return 42; }";
         let correct_hash = kin_blobs::digest(content.as_bytes());
 
-        // Write incorrect bytes to the correct hash path to simulate a corrupt blob
-        let bad_content = "corrupt content";
-        let hex = correct_hash.to_string();
-        let shard_dir = blob_store.root().join(&hex[..2]);
-        fs::create_dir_all(&shard_dir).unwrap();
-        let blob_file = shard_dir.join(&hex[2..]);
-        fs::write(&blob_file, bad_content.as_bytes()).unwrap();
+        assert_eq!(blob_store.write(content.as_bytes()).unwrap(), correct_hash);
 
         // The correct content exists on disk, but the graph blob is corrupt
         let file_path = "src/lib.rs";
@@ -2717,22 +3703,27 @@ mod tests {
         };
 
         let mut store = EmptyStore::default();
+        store.entities_by_id.insert(entity.id, entity.clone());
         store.file_hashes.insert(file_id, correct_hash);
+        install_empty_store_exact_tree(&mut store, dir.path());
+        let authority = test_repository_authority(dir.path());
+        fs::write(
+            test_source_blob_path(dir.path(), correct_hash),
+            b"corrupt content",
+        )
+        .unwrap();
 
         let before_misses = GRAPH_MISS_COUNT.load(std::sync::atomic::Ordering::SeqCst);
 
-        let value = entity_response_json(&store, &entity).unwrap();
-        let object = value.as_object().unwrap();
-
-        // The corrupt blob is discarded and the graph gap is reported — no disk read.
+        let error = entity_response_json(&store, &entity, Some(&authority))
+            .expect_err("a corrupt graph blob must fail the MCP read loudly");
+        let message = error.to_string();
         assert!(
-            object.get("source_excerpt").is_none(),
-            "corrupt blob must not fall back to disk"
+            message.contains("graph authority gap")
+                && message.contains("immutable source blob digest mismatch"),
+            "unexpected corrupt-blob error: {message}"
         );
-        assert_eq!(
-            object.get("source").unwrap().as_str().unwrap(),
-            "graph-miss"
-        );
+        assert!(!message.contains(content));
 
         let after_misses = GRAPH_MISS_COUNT.load(std::sync::atomic::Ordering::SeqCst);
         assert!(after_misses >= before_misses + 1);
@@ -2740,26 +3731,29 @@ mod tests {
 
     // ── Governance handlers: release_check + security_scan ──────────────────
 
-    fn gov_change_id(byte: u8) -> SemanticChangeId {
-        SemanticChangeId::from_hash(Hash256::from_bytes([byte; 32]))
-    }
-
-    fn gov_change(id: u8, parent: Option<u8>, author: &str) -> SemanticChange {
-        SemanticChange {
-            id: gov_change_id(id),
-            parents: parent.map(|p| vec![gov_change_id(p)]).unwrap_or_default(),
+    fn gov_change(sequence: u8, parent: Option<SemanticChangeId>, author: &str) -> SemanticChange {
+        let mut change = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+            parents: parent.into_iter().collect(),
             timestamp: kin_model::timestamp::Timestamp::now(),
             author: AuthorId::new(author),
-            message: format!("change {}", id),
+            message: format!("change {sequence}"),
             entity_deltas: vec![],
             relation_deltas: vec![],
-            artifact_deltas: vec![],
+            tree_deltas: vec![],
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],
             risk_summary: None,
-            authored_on: None,
-        }
+            origin: kin_model::ChangeOrigin::Native,
+            admission_policy_delta: parent.is_none().then(|| {
+                kin_model::AdmissionPolicyDelta::initialize(
+                    kin_model::SharedAdmissionPolicy::empty(0),
+                )
+            }),
+        };
+        change.id = kin_model::compute_semantic_change_id(&change).unwrap();
+        change
     }
 
     fn gov_approver_id() -> kin_model::provenance::ActorId {
@@ -2776,9 +3770,11 @@ mod tests {
         store.actors_by_id.insert(actor.actor_id, actor);
     }
 
-    fn add_gov_root(store: &mut EmptyStore) {
+    fn add_gov_root(store: &mut EmptyStore) -> SemanticChangeId {
         let root = gov_change(0, None, "kin");
+        let id = root.id;
         store.changes_by_id.insert(root.id, root);
+        id
     }
 
     fn gov_approval(
@@ -2825,20 +3821,42 @@ mod tests {
         }
     }
 
+    pub(super) fn release_check_result(
+        store: &EmptyStore,
+        args: &HashMap<String, serde_json::Value>,
+    ) -> crate::error::Result<ToolCallResult> {
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let dir = tempdir().unwrap();
+        initialize_release_test_repository(dir.path(), store);
+        let _guard = EnvVarGuard::set("KIN_SOURCE_ROOT", dir.path());
+        let layout = kin_core::KinLayout::discover(dir.path()).unwrap();
+        let authority = kin_core::LocalRepositoryAuthorityBinding::from_layout(&layout).unwrap();
+        verification::handle_release_check(args, store, Some(&authority))
+    }
+
+    pub(super) fn with_empty_test_repository<T>(
+        call: impl FnOnce(&kin_core::LocalRepositoryAuthorityBinding) -> T,
+    ) -> T {
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let dir = tempdir().unwrap();
+        let init = kin_core::init(dir.path()).unwrap();
+        let _guard = EnvVarGuard::set("KIN_SOURCE_ROOT", dir.path());
+        let authority =
+            kin_core::LocalRepositoryAuthorityBinding::from_layout(&init.layout).unwrap();
+        call(&authority)
+    }
+
     async fn call_release_check_with_args(
         store: &EmptyStore,
         args: HashMap<String, serde_json::Value>,
     ) -> serde_json::Value {
-        let sessions = SessionRegistry::new();
-        let result = handle_tool_call(
-            "kin_release_check",
-            &args,
-            store,
-            &sessions,
-            SessionAuthorityMode::OfflineFallback,
-        )
-        .await
-        .unwrap();
+        let result = release_check_result(store, &args).unwrap();
         let text = match &result.content[0] {
             crate::types::ContentBlock::Text { text } => text.clone(),
         };
@@ -2862,12 +3880,12 @@ mod tests {
         let entity = gov_entity("unbound", EntityKind::Function, Visibility::Public);
         store.entities_by_id.insert(entity.id, entity.clone());
         let mut root = gov_change(0, None, "kin");
-        root.entity_deltas = vec![kin_model::EntityDelta::Added(entity)];
+        root.entity_deltas = vec![kin_model::EntityDelta::Added { new: entity }];
+        root.id = kin_model::compute_semantic_change_id(&root).unwrap();
         store.changes_by_id.insert(root.id, root.clone());
-        store.branches.push(Branch {
-            name: BranchName::new("main"),
-            head: root.id,
-        });
+        store
+            .repository_refs
+            .push((kin_model::RefName::branch(b"main").unwrap(), root.id));
 
         let baseline = call_release_check_with_args(&store, HashMap::new()).await;
         assert_eq!(baseline["pass"], false);
@@ -2908,14 +3926,14 @@ mod tests {
             .insert(ambient_entity.id, ambient_entity);
 
         let mut source = gov_change(0, None, "kin");
-        source.entity_deltas = vec![kin_model::EntityDelta::Added(source_entity)];
-        let advanced = gov_change(1, Some(0), "human");
+        source.entity_deltas = vec![kin_model::EntityDelta::Added { new: source_entity }];
+        source.id = kin_model::compute_semantic_change_id(&source).unwrap();
+        let advanced = gov_change(1, Some(source.id), "human");
         store.changes_by_id.insert(source.id, source.clone());
         store.changes_by_id.insert(advanced.id, advanced.clone());
-        store.branches.push(Branch {
-            name: BranchName::new("main"),
-            head: advanced.id,
-        });
+        store
+            .repository_refs
+            .push((kin_model::RefName::branch(b"main").unwrap(), advanced.id));
 
         let response = call_release_check_with_args(
             &store,
@@ -2933,9 +3951,10 @@ mod tests {
         assert_eq!(response["pass"], false);
         assert_eq!(response["source_entity_count"], 1);
         let blockers = response["blockers"].as_array().unwrap();
-        assert!(blockers
-            .iter()
-            .any(|blocker| blocker.as_str().unwrap().contains("branch main moved")));
+        assert!(blockers.iter().any(|blocker| blocker
+            .as_str()
+            .unwrap()
+            .contains("branch refs/heads/main moved")));
         assert!(blockers.iter().any(|blocker| blocker
             .as_str()
             .unwrap()
@@ -2945,7 +3964,7 @@ mod tests {
     #[tokio::test]
     async fn release_check_requires_source_authority_when_no_branch_exists() {
         let store = EmptyStore::default();
-        let error = verification::handle_release_check(&HashMap::new(), &store).unwrap_err();
+        let error = release_check_result(&store, &HashMap::new()).unwrap_err();
         assert!(matches!(error, crate::error::McpError::InvalidParams(_)));
         assert!(error.to_string().contains("requires branch"));
     }
@@ -2955,13 +3974,12 @@ mod tests {
         // The false-green this fix targets: an agent change with NO approval must
         // fail the gate. (Previously it passed because any audit event sufficed.)
         let mut store = EmptyStore::default();
-        add_gov_root(&mut store);
-        let head = gov_change(1, Some(0), "claude-agent");
+        let root = add_gov_root(&mut store);
+        let head = gov_change(1, Some(root), "claude-agent");
         store.changes_by_id.insert(head.id, head.clone());
-        store.branches.push(Branch {
-            name: BranchName::new("main"),
-            head: head.id,
-        });
+        store
+            .repository_refs
+            .push((kin_model::RefName::branch(b"main").unwrap(), head.id));
 
         let response = call_release_check(&store, true).await;
         assert_eq!(response["pass"], false);
@@ -2977,9 +3995,9 @@ mod tests {
     #[tokio::test]
     async fn release_check_passes_when_agent_change_approved() {
         let mut store = EmptyStore::default();
-        add_gov_root(&mut store);
+        let root = add_gov_root(&mut store);
         register_gov_human_approver(&mut store);
-        let head = gov_change(1, Some(0), "claude-agent");
+        let head = gov_change(1, Some(root), "claude-agent");
         store.changes_by_id.insert(head.id, head.clone());
         store.approvals_by_change.insert(
             head.id,
@@ -2988,10 +4006,9 @@ mod tests {
                 kin_model::provenance::ApprovalDecision::Approved,
             )],
         );
-        store.branches.push(Branch {
-            name: BranchName::new("main"),
-            head: head.id,
-        });
+        store
+            .repository_refs
+            .push((kin_model::RefName::branch(b"main").unwrap(), head.id));
 
         let response = call_release_check(&store, true).await;
         assert_eq!(response["pass"], true, "approved agent change must pass");
@@ -3002,10 +4019,10 @@ mod tests {
         // c1 (agent, approved) <- c2 (agent, unapproved, HEAD): the later
         // unapproved mutation must block even though an earlier change is approved.
         let mut store = EmptyStore::default();
-        add_gov_root(&mut store);
+        let root = add_gov_root(&mut store);
         register_gov_human_approver(&mut store);
-        let c1 = gov_change(1, Some(0), "agent-a");
-        let c2 = gov_change(2, Some(1), "agent-a");
+        let c1 = gov_change(1, Some(root), "agent-a");
+        let c2 = gov_change(2, Some(c1.id), "agent-a");
         store.changes_by_id.insert(c1.id, c1.clone());
         store.changes_by_id.insert(c2.id, c2.clone());
         store.approvals_by_change.insert(
@@ -3015,10 +4032,9 @@ mod tests {
                 kin_model::provenance::ApprovalDecision::Approved,
             )],
         );
-        store.branches.push(Branch {
-            name: BranchName::new("main"),
-            head: c2.id,
-        });
+        store
+            .repository_refs
+            .push((kin_model::RefName::branch(b"main").unwrap(), c2.id));
 
         let response = call_release_check(&store, true).await;
         assert_eq!(response["pass"], false);
@@ -3038,13 +4054,12 @@ mod tests {
     #[tokio::test]
     async fn release_check_display_name_cannot_bypass_approval() {
         let mut store = EmptyStore::default();
-        add_gov_root(&mut store);
-        let head = gov_change(1, Some(0), "alice");
+        let root = add_gov_root(&mut store);
+        let head = gov_change(1, Some(root), "alice");
         store.changes_by_id.insert(head.id, head.clone());
-        store.branches.push(Branch {
-            name: BranchName::new("main"),
-            head: head.id,
-        });
+        store
+            .repository_refs
+            .push((kin_model::RefName::branch(b"main").unwrap(), head.id));
 
         let response = call_release_check(&store, true).await;
         assert_eq!(
@@ -3057,13 +4072,12 @@ mod tests {
     async fn release_check_approval_disabled_skips_gate() {
         // With require_approval=false, an unapproved agent change must NOT block.
         let mut store = EmptyStore::default();
-        add_gov_root(&mut store);
-        let head = gov_change(1, Some(0), "claude-agent");
+        let root = add_gov_root(&mut store);
+        let head = gov_change(1, Some(root), "claude-agent");
         store.changes_by_id.insert(head.id, head.clone());
-        store.branches.push(Branch {
-            name: BranchName::new("main"),
-            head: head.id,
-        });
+        store
+            .repository_refs
+            .push((kin_model::RefName::branch(b"main").unwrap(), head.id));
 
         let response = call_release_check(&store, false).await;
         assert_eq!(response["pass"], true);
@@ -3083,6 +4097,7 @@ mod tests {
             &store,
             &sessions,
             SessionAuthorityMode::OfflineFallback,
+            None,
         )
         .await
         .unwrap();
@@ -3113,6 +4128,7 @@ mod tests {
             &store,
             &sessions,
             SessionAuthorityMode::OfflineFallback,
+            None,
         )
         .await
         .unwrap();
@@ -3130,19 +4146,17 @@ mod tests {
         // so the sort is what makes the output stable. Two identical-state calls
         // must produce byte-identical blockers.
         let mut store = EmptyStore::default();
-        add_gov_root(&mut store);
-        let c_a = gov_change(0xAA, Some(0), "agent-a");
-        let c_b = gov_change(0xBB, Some(0), "agent-b");
+        let root = add_gov_root(&mut store);
+        let c_a = gov_change(0xAA, Some(root), "agent-a");
+        let c_b = gov_change(0xBB, Some(root), "agent-b");
         store.changes_by_id.insert(c_a.id, c_a.clone());
         store.changes_by_id.insert(c_b.id, c_b.clone());
-        store.branches.push(Branch {
-            name: BranchName::new("feature"),
-            head: c_a.id,
-        });
-        store.branches.push(Branch {
-            name: BranchName::new("main"),
-            head: c_b.id,
-        });
+        store
+            .repository_refs
+            .push((kin_model::RefName::branch(b"feature").unwrap(), c_a.id));
+        store
+            .repository_refs
+            .push((kin_model::RefName::branch(b"main").unwrap(), c_b.id));
 
         let first = call_release_check(&store, true).await;
         let second = call_release_check(&store, true).await;

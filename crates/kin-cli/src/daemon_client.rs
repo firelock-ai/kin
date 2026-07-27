@@ -22,6 +22,47 @@ use tracing::{info, warn};
 
 static BUILD_MISMATCH_REPORTED: AtomicBool = AtomicBool::new(false);
 
+/// Repository/session authority inherited by the CLI must not leak into a
+/// daemon process. Daemons receive their repository explicitly through
+/// `--repo`; retaining any of these variables can bind the worker to a prior
+/// projection or repository identity before argument processing. Daemon
+/// configuration such as bind host and bearer token is intentionally retained.
+const DAEMON_AMBIENT_AUTHORITY_ENV: &[&str] = &[
+    "DYLD_INSERT_LIBRARIES",
+    "LD_PRELOAD",
+    "KIN_VFS_WORKSPACE",
+    "KIN_VFS_WORKSPACE_ALIASES",
+    "KIN_VFS_SOCK",
+    "KIN_VFS_PIPE",
+    "KIN_VFS_CANARY",
+    "KIN_VFS_INTERPOSE_ACTIVE",
+    "KIN_VFS_LAST_DIR",
+    "_KIN_VFS_LAST_DIR",
+    "KIN_NO_VFS",
+    "KIN_SESSION",
+    "KIN_SESSION_ID",
+    "KIN_SESSION_DIR",
+    "KIN_DAEMON_URL",
+    "KIN_DAEMON_WATCH_PID",
+    "KIN_REPO_ID",
+    "KIN_REPO_IDS",
+    "KIN_PRIMARY_REPO_ID",
+    "KIN_MCP_REPO",
+    "KIN_SOURCE_ROOT",
+    "KIN_ORIGINAL_PATH",
+    "KIN_DISCOVERY_MODE",
+    "KIN_CONTENT_MODE",
+    "KIN_VFS_DISABLE",
+];
+
+fn scrub_daemon_process_authority(command: &mut Command) {
+    let host_path = kin_core::shims::unshimmed_path();
+    for key in DAEMON_AMBIENT_AUTHORITY_ENV {
+        command.env_remove(key);
+    }
+    command.env("PATH", host_path).env("KIN_VFS_DISABLE", "1");
+}
+
 /// Response from `GET /health`.
 #[derive(Debug, Deserialize)]
 pub struct HealthResponse {
@@ -138,17 +179,6 @@ pub struct DaemonEntitiesResponse {
     pub entities: Vec<DaemonEntityEntry>,
 }
 
-/// Response from `GET /status`.
-#[derive(Debug, Deserialize)]
-pub struct DaemonStatusResponse {
-    pub base_change: String,
-    pub entity_adds: usize,
-    pub entity_mods: usize,
-    pub entity_removes: usize,
-    pub relation_adds: usize,
-    pub relation_removes: usize,
-}
-
 /// Response from scope endpoints.
 #[derive(Debug, Deserialize)]
 pub struct ScopeResponse {
@@ -159,6 +189,7 @@ pub struct ScopeResponse {
 }
 
 /// Client for the kin daemon HTTP API.
+#[derive(Clone)]
 pub struct DaemonClient {
     base_url: String,
     client: reqwest::Client,
@@ -219,10 +250,11 @@ pub(crate) fn resolve_daemon_auth_token() -> Option<String> {
     daemon_auth_token_from_layout(&layout)
 }
 
-/// Layout-explicit variant for callers that already hold the repo's layout —
-/// the process working directory says nothing about which repo's daemon is
-/// being addressed (in-process library callers and tests run from arbitrary
-/// working directories).
+/// Layout-explicit variant for callers that already hold the repo's layout.
+///
+/// The explicit environment token is endpoint configuration and retains the
+/// same precedence as the daemon's own startup path. The layout token is the
+/// auto-provisioned fallback.
 pub(crate) fn resolve_daemon_auth_token_for_layout(layout: &KinLayout) -> Option<String> {
     daemon_auth_token_from_env().or_else(|| daemon_auth_token_from_layout(layout))
 }
@@ -243,6 +275,33 @@ fn daemon_auth_token_from_layout(layout: &KinLayout) -> Option<String> {
     (!token.is_empty()).then_some(token)
 }
 
+fn daemon_client_headers(
+    auth_token: Option<String>,
+    session_id: Option<&str>,
+) -> Result<reqwest::header::HeaderMap> {
+    let mut headers = reqwest::header::HeaderMap::new();
+    if let Some(session_id) = session_id.filter(|value| !value.trim().is_empty()) {
+        let header_val = reqwest::header::HeaderValue::from_str(session_id)
+            .context("invalid explicit Kin session header")?;
+        headers.insert("X-Kin-Session", header_val);
+    }
+    let build = kin_buildinfo::get();
+    if let Ok(value) = reqwest::header::HeaderValue::from_str(build.sha) {
+        headers.insert("X-Kin-CLI-Sha", value);
+    }
+    headers.insert(
+        "X-Kin-CLI-Dirty",
+        reqwest::header::HeaderValue::from_static(if build.dirty { "true" } else { "false" }),
+    );
+    if let Some(token) = auth_token {
+        let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+            .context("invalid daemon bearer token header")?;
+        value.set_sensitive(true);
+        headers.insert(reqwest::header::AUTHORIZATION, value);
+    }
+    Ok(headers)
+}
+
 impl DaemonClient {
     pub fn from_base_url(base_url: impl Into<String>) -> Result<Self> {
         Self::from_base_url_with_token(base_url, resolve_daemon_auth_token())
@@ -261,31 +320,26 @@ impl DaemonClient {
         base_url: impl Into<String>,
         auth_token: Option<String>,
     ) -> Result<Self> {
+        let ambient_session = std::env::var("KIN_SESSION_ID")
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+        Self::from_base_url_with_explicit_authority(
+            base_url,
+            auth_token,
+            ambient_session.as_deref(),
+        )
+    }
+
+    /// Construct a client whose endpoint, bearer token, and optional session
+    /// identity were already verified together. Unlike the compatibility
+    /// constructors, this never reads ambient session authority.
+    pub(crate) fn from_base_url_with_explicit_authority(
+        base_url: impl Into<String>,
+        auth_token: Option<String>,
+        session_id: Option<&str>,
+    ) -> Result<Self> {
         let base_url = base_url.into();
-        let mut headers = reqwest::header::HeaderMap::new();
-        if let Ok(session_id) = std::env::var("KIN_SESSION_ID") {
-            if !session_id.trim().is_empty() {
-                if let Ok(header_val) = reqwest::header::HeaderValue::from_str(&session_id) {
-                    headers.insert("X-Kin-Session", header_val);
-                }
-            }
-        }
-        let build = kin_buildinfo::get();
-        if let Ok(value) = reqwest::header::HeaderValue::from_str(build.sha) {
-            headers.insert("X-Kin-CLI-Sha", value);
-        }
-        headers.insert(
-            "X-Kin-CLI-Dirty",
-            reqwest::header::HeaderValue::from_static(if build.dirty { "true" } else { "false" }),
-        );
-        if let Some(token) = auth_token {
-            if let Ok(mut value) =
-                reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
-            {
-                value.set_sensitive(true);
-                headers.insert(reqwest::header::AUTHORIZATION, value);
-            }
-        }
+        let headers = daemon_client_headers(auth_token, session_id)?;
         let request_timeout = std::env::var("KIN_DAEMON_HTTP_TIMEOUT_SECS")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
@@ -377,22 +431,6 @@ impl DaemonClient {
         )
     }
 
-    /// Get the working copy status from the daemon.
-    pub async fn status(&self) -> anyhow::Result<DaemonStatusResponse> {
-        let resp = self
-            .send(
-                self.client.get(format!("{}/status", self.base_url)),
-                "send daemon status request",
-            )
-            .await?;
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("daemon error (HTTP {}): {}", status, body);
-        }
-        Ok(resp.json().await?)
-    }
-
     /// Search entities via the multi-repo API.
     ///
     /// Uses `GET /repos/{repo_id}/entities?query=<pattern>`.
@@ -427,6 +465,91 @@ impl DaemonClient {
     /// Return the base URL of the connected daemon.
     pub fn base_url(&self) -> &str {
         &self.base_url
+    }
+
+    /// POST one caller-idempotent JSON command, retrying once with the exact
+    /// same payload when transport or server acknowledgement is ambiguous.
+    ///
+    /// The client owns the daemon auth, build, and ambient session headers, so
+    /// command modules must use this rather than constructing a raw HTTP
+    /// client that silently changes request authority.
+    pub(crate) async fn post_idempotent_json<Req, Resp>(
+        &self,
+        path: &str,
+        payload: &Req,
+        context: &'static str,
+    ) -> Result<Resp>
+    where
+        Req: serde::Serialize + ?Sized,
+        Resp: serde::de::DeserializeOwned,
+    {
+        let url = format!(
+            "{}/{}",
+            self.base_url.trim_end_matches('/'),
+            path.trim_start_matches('/')
+        );
+        let payload = serde_json::to_vec(payload)
+            .with_context(|| format!("encode idempotent daemon request for {path}"))?;
+        let mut last_error = None;
+        for attempt in 0..2 {
+            let response = match self
+                .send(
+                    self.client
+                        .post(&url)
+                        .header(reqwest::header::CONTENT_TYPE, "application/json")
+                        .body(payload.clone()),
+                    context,
+                )
+                .await
+            {
+                Ok(response) => response,
+                Err(error) if attempt == 0 => {
+                    last_error = Some(error);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            if response.status().is_success() {
+                let body = match response.bytes().await {
+                    Ok(body) => body,
+                    Err(error) if attempt == 0 => {
+                        last_error = Some(
+                            anyhow::Error::new(error)
+                                .context(format!("read daemon response body for {path}")),
+                        );
+                        continue;
+                    }
+                    Err(error) => {
+                        return Err(anyhow::Error::new(error)
+                            .context(format!("read daemon response body for {path}")));
+                    }
+                };
+                match serde_json::from_slice(&body) {
+                    Ok(decoded) => return Ok(decoded),
+                    Err(error) if attempt == 0 => {
+                        last_error = Some(
+                            anyhow::Error::new(error)
+                                .context(format!("decode daemon response for {path}")),
+                        );
+                        continue;
+                    }
+                    Err(error) => {
+                        return Err(anyhow::Error::new(error)
+                            .context(format!("decode daemon response for {path}")));
+                    }
+                }
+            }
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            if status.is_server_error() && attempt == 0 {
+                last_error = Some(anyhow::anyhow!(
+                    "daemon command returned HTTP {status}: {body}"
+                ));
+                continue;
+            }
+            anyhow::bail!("daemon command failed (HTTP {status}): {body}");
+        }
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("daemon command produced no response")))
     }
 
     pub async fn locate(
@@ -1023,40 +1146,24 @@ impl DaemonClient {
         &self,
         request: &crate::commands::branch::BranchRequest,
     ) -> Result<crate::commands::branch::BranchResponse> {
-        let resp = self
-            .send(
-                self.client
-                    .post(format!("{}/commands/branch", self.base_url))
-                    .json(request),
-                "send daemon branch request",
-            )
-            .await?;
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            bail!("daemon branch error (HTTP {}): {}", status, body);
-        }
-        resp.json().await.context("parse daemon branch response")
+        self.post_idempotent_json(
+            "/commands/branch",
+            request,
+            "send daemon-owned repository branch request",
+        )
+        .await
     }
 
     pub async fn checkout(
         &self,
         request: &crate::commands::checkout::CheckoutRequest,
     ) -> Result<crate::commands::checkout::CheckoutResponse> {
-        let resp = self
-            .send(
-                self.client
-                    .post(format!("{}/commands/checkout", self.base_url))
-                    .json(request),
-                "send daemon checkout request",
-            )
-            .await?;
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            bail!("daemon checkout error (HTTP {}): {}", status, body);
-        }
-        resp.json().await.context("parse daemon checkout response")
+        self.post_idempotent_json(
+            "/commands/checkout",
+            request,
+            "send daemon-owned exact checkout request",
+        )
+        .await
     }
 
     pub async fn rename(
@@ -1099,26 +1206,6 @@ impl DaemonClient {
         resp.json()
             .await
             .context("parse daemon session workspace response")
-    }
-
-    pub async fn exec(
-        &self,
-        request: &crate::commands::exec::ExecRequest,
-    ) -> Result<crate::commands::exec::ExecResponse> {
-        let resp = self
-            .send(
-                self.client
-                    .post(format!("{}/commands/exec", self.base_url))
-                    .json(request),
-                "send daemon exec request",
-            )
-            .await?;
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            bail!("daemon exec error (HTTP {}): {}", status, body);
-        }
-        resp.json().await.context("parse daemon exec response")
     }
 
     pub async fn work(
@@ -1470,7 +1557,9 @@ pub fn daemon_is_up(kin_root: &Path) -> Option<u16> {
 }
 
 fn daemon_binary_supports_supervisor(path: &Path) -> bool {
-    let output = match Command::new(path).arg("--help").output() {
+    let mut command = Command::new(path);
+    scrub_daemon_process_authority(&mut command);
+    let output = match command.arg("--help").output() {
         Ok(output) => output,
         Err(error) => {
             warn!(
@@ -1514,7 +1603,9 @@ fn compact_probe_output(output: &std::process::Output) -> String {
 }
 
 fn daemon_binary_matches_cli_graph(path: &Path) -> Result<(), String> {
-    let output = Command::new(path)
+    let mut command = Command::new(path);
+    scrub_daemon_process_authority(&mut command);
+    let output = command
         .arg("--compat-json")
         .output()
         .map_err(|error| format!("compat probe failed to execute: {error}"))?;
@@ -1735,7 +1826,7 @@ fn health_status_is_serving(status: &str) -> bool {
     matches!(status, "ok" | "attention")
 }
 
-fn validate_health_repo(health: &HealthResponse, working_dir: &Path) -> Result<()> {
+pub(crate) fn validate_health_repo(health: &HealthResponse, working_dir: &Path) -> Result<()> {
     if !health_status_is_serving(&health.status) {
         bail!("daemon health status is {}", health.status);
     }
@@ -2143,6 +2234,7 @@ pub async fn ensure_supervisor_running() -> Result<String> {
     info!(binary = %daemon_bin.display(), "starting supervisor (OS-assigned port)");
 
     let mut cmd = std::process::Command::new(&daemon_bin);
+    scrub_daemon_process_authority(&mut cmd);
     cmd.args(["--supervisor", "--port", "0"]);
     let log = open_supervisor_log()?;
     let stderr = log
@@ -2447,6 +2539,7 @@ pub async fn ensure_daemon_running_with_idle_timeout(
     info!(binary = %daemon_bin.display(), repo = %working_dir.display(), "starting daemon (OS-assigned port)");
 
     let mut cmd = std::process::Command::new(&daemon_bin);
+    scrub_daemon_process_authority(&mut cmd);
     cmd.args(["--repo", &working_dir.display().to_string(), "--port", "0"]);
     let log_offset = daemon_log_len(kin_root);
     let log = open_daemon_log(kin_root)?;
@@ -2566,6 +2659,170 @@ mod urlencoding {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn idempotent_post_retries_exact_body_with_same_session_authority() {
+        use axum::{body::Bytes, http::StatusCode, routing::post, Router};
+
+        #[derive(Default)]
+        struct ObservedRequests {
+            bodies: Vec<Vec<u8>>,
+            sessions: Vec<Option<String>>,
+        }
+
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(ObservedRequests::default()));
+        let handler_observed = observed.clone();
+        let app = Router::new().route(
+            "/commands/test",
+            post(move |headers: axum::http::HeaderMap, body: Bytes| {
+                let observed = handler_observed.clone();
+                async move {
+                    let mut observed = observed.lock().unwrap();
+                    observed.bodies.push(body.to_vec());
+                    observed.sessions.push(
+                        headers
+                            .get("X-Kin-Session")
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_string),
+                    );
+                    let status = if observed.bodies.len() == 1 {
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    } else {
+                        StatusCode::OK
+                    };
+                    (status, axum::Json(serde_json::json!({"accepted": true})))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = DaemonClient::from_base_url_with_explicit_authority(
+            format!("http://{address}"),
+            Some("checkout-token".to_string()),
+            Some("session-checkout"),
+        )
+        .unwrap();
+        let request = serde_json::json!({
+            "operation_id": "stable-operation",
+            "path_hex": "7372632f6c69622e7273"
+        });
+
+        let response: serde_json::Value = client
+            .post_idempotent_json("/commands/test", &request, "test idempotent post")
+            .await
+            .unwrap();
+        server.abort();
+
+        assert_eq!(response, serde_json::json!({"accepted": true}));
+        let observed = observed.lock().unwrap();
+        assert_eq!(observed.bodies.len(), 2);
+        assert_eq!(observed.bodies[0], observed.bodies[1]);
+        assert_eq!(
+            observed.sessions,
+            vec![
+                Some("session-checkout".to_string()),
+                Some("session-checkout".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn explicit_client_headers_couple_token_and_requested_session_only() {
+        let headers = daemon_client_headers(Some("endpoint-token".to_string()), None).unwrap();
+        assert_eq!(
+            headers
+                .get(reqwest::header::AUTHORIZATION)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "Bearer endpoint-token"
+        );
+        assert!(
+            headers.get("X-Kin-Session").is_none(),
+            "an explicit no-session client must not manufacture ambient session authority"
+        );
+
+        let headers =
+            daemon_client_headers(Some("endpoint-token".to_string()), Some("session-explicit"))
+                .unwrap();
+        assert_eq!(
+            headers.get("X-Kin-Session").unwrap().to_str().unwrap(),
+            "session-explicit"
+        );
+        assert!(daemon_client_headers(Some("token\ninjection".to_string()), None).is_err());
+        assert!(daemon_client_headers(None, Some("session\ninjection")).is_err());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn explicit_auth_token_overrides_the_layout_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = KinLayout::new(dir.path().join(".kin"));
+        std::fs::create_dir_all(layout.root()).unwrap();
+        std::fs::write(layout.root().join("daemon.token"), "layout-token\n").unwrap();
+        let previous = std::env::var_os("KIN_DAEMON_AUTH_TOKEN");
+        std::env::set_var("KIN_DAEMON_AUTH_TOKEN", "explicit-token");
+
+        let resolved = resolve_daemon_auth_token_for_layout(&layout);
+
+        match previous {
+            Some(value) => std::env::set_var("KIN_DAEMON_AUTH_TOKEN", value),
+            None => std::env::remove_var("KIN_DAEMON_AUTH_TOKEN"),
+        }
+        assert_eq!(resolved.as_deref(), Some("explicit-token"));
+    }
+
+    #[test]
+    fn daemon_children_drop_inherited_repo_and_projection_authority() {
+        let mut command = Command::new("true");
+        for key in DAEMON_AMBIENT_AUTHORITY_ENV {
+            command.env(key, "poison");
+        }
+        command.env("KIN_DAEMON_AUTH_TOKEN", "configured-token");
+        command.env("KIN_DAEMON_BIND_HOST", "0.0.0.0");
+        command.env("PATH", "poison-path");
+
+        scrub_daemon_process_authority(&mut command);
+
+        for key in DAEMON_AMBIENT_AUTHORITY_ENV {
+            if *key == "KIN_VFS_DISABLE" {
+                continue;
+            }
+            let value = command
+                .get_envs()
+                .find(|(name, _)| *name == std::ffi::OsStr::new(key))
+                .map(|(_, value)| value);
+            assert_eq!(value, Some(None), "{key} was not removed");
+        }
+        let path = command
+            .get_envs()
+            .find(|(name, _)| *name == std::ffi::OsStr::new("PATH"))
+            .and_then(|(_, value)| value);
+        assert_ne!(path, Some(std::ffi::OsStr::new("poison-path")));
+        assert_eq!(
+            command
+                .get_envs()
+                .find(|(name, _)| *name == std::ffi::OsStr::new("KIN_VFS_DISABLE"))
+                .and_then(|(_, value)| value),
+            Some(std::ffi::OsStr::new("1"))
+        );
+        for (name, expected) in [
+            ("KIN_DAEMON_AUTH_TOKEN", "configured-token"),
+            ("KIN_DAEMON_BIND_HOST", "0.0.0.0"),
+        ] {
+            assert_eq!(
+                command
+                    .get_envs()
+                    .find(|(key, _)| *key == std::ffi::OsStr::new(name))
+                    .and_then(|(_, value)| value),
+                Some(std::ffi::OsStr::new(expected)),
+                "{name} daemon configuration was not preserved"
+            );
+        }
+    }
 
     #[test]
     fn daemon_log_tail_since_omits_stale_prior_run_lines() {

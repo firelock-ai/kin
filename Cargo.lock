@@ -396,6 +396,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "block2"
+version = "0.6.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cdeb9d870516001442e364c5220d3574d2da8dc765554b4a617230d33fa58ef5"
+dependencies = [
+ "objc2 0.6.4",
+]
+
+[[package]]
 name = "bstr"
 version = "1.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1115,7 +1124,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users 0.5.2",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1224,7 +1233,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1859,6 +1868,7 @@ dependencies = [
  "faster-hex",
  "gix-features",
  "sha1-checked",
+ "sha2 0.11.0",
  "thiserror 2.0.18",
 ]
 
@@ -2828,7 +2838,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "20fd6de4ccfcc187e38bc21cfa543cb5a302cb86a8b114eb7f0bf0dc9f8ac00f"
 dependencies = [
  "io-lifetimes 3.0.1",
- "windows-sys 0.59.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -3082,6 +3092,7 @@ dependencies = [
  "kin-mcp",
  "kin-migrate",
  "kin-model",
+ "kin-notify",
  "kin-parser",
  "kin-projection",
  "kin-ranking",
@@ -3151,6 +3162,7 @@ dependencies = [
  "gix",
  "kin-blobs",
  "kin-db",
+ "kin-git",
  "kin-index",
  "kin-model",
  "kin-parser",
@@ -3166,6 +3178,7 @@ dependencies = [
  "tracing",
  "unicode-normalization",
  "uuid",
+ "winapi-util",
  "windows-sys 0.61.2",
 ]
 
@@ -3173,13 +3186,13 @@ dependencies = [
 name = "kin-daemon"
 version = "0.3.6"
 dependencies = [
+ "anyhow",
  "async-stream",
  "axum",
  "base64 0.22.1",
  "chrono",
  "flate2",
  "fs2",
- "gix",
  "hex",
  "http-body",
  "kin-blobs",
@@ -3197,6 +3210,7 @@ dependencies = [
  "kin-projection",
  "kin-reconcile",
  "kin-registry",
+ "kin-remote",
  "kin-review",
  "kin-spine",
  "libc",
@@ -3223,15 +3237,19 @@ dependencies = [
 
 [[package]]
 name = "kin-db"
-version = "0.4.0"
+version = "0.6.1"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "ee9c3698de4a37b34577a1fa0b88ca4829af4858d17b6b4f6304d900eaae8b9a"
+checksum = "aebd1093ec20ec38a52fc39c074240ad96af63aa9a574e2173014e9bdb590bd8"
 dependencies = [
  "bincode",
+ "bstr",
  "bytes",
+ "cap-fs-ext",
+ "cap-std",
  "chrono",
  "directories 6.0.0",
  "fs2",
+ "gix-ignore",
  "half",
  "hashbrown 0.15.5",
  "hex",
@@ -3260,24 +3278,30 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "winapi-util",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "kin-git"
 version = "0.3.6"
 dependencies = [
+ "cap-std",
  "chrono",
  "gix",
  "hex",
  "kin-blobs",
- "kin-db",
  "kin-model",
  "pretty_assertions",
  "rayon",
+ "rustix",
+ "serde_json",
  "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.18",
  "tracing",
+ "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3287,6 +3311,7 @@ dependencies = [
  "hex",
  "kin-blobs",
  "kin-db",
+ "kin-git",
  "kin-model",
  "kin-parser",
  "kin-projection",
@@ -3294,6 +3319,7 @@ dependencies = [
  "notify",
  "pretty_assertions",
  "rayon",
+ "rustix",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -3302,6 +3328,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tree-sitter",
+ "uuid",
 ]
 
 [[package]]
@@ -3333,33 +3360,24 @@ name = "kin-integration-tests"
 version = "0.3.6"
 dependencies = [
  "kin-blobs",
- "kin-cli",
  "kin-context",
  "kin-core",
  "kin-daemon",
  "kin-db",
- "kin-git",
  "kin-index",
  "kin-migrate",
  "kin-model",
  "kin-parser",
  "kin-projection",
  "kin-reconcile",
- "kin-review",
- "kin-runtime",
- "pretty_assertions",
- "serde_json",
- "sha2 0.11.0",
  "tempfile",
- "tokio",
- "uuid",
 ]
 
 [[package]]
 name = "kin-lsp"
-version = "0.4.0"
+version = "0.6.0"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "eac57c8501983212e1923efdf64c76ad5e61dce24dd62d714cb1b15f71b2ce54"
+checksum = "5b754e534fd4aa0f82b7e4af738d27e55967ccd4dfeaf9956c0321b4425a058e"
 dependencies = [
  "kin-model",
  "serde",
@@ -3374,6 +3392,8 @@ dependencies = [
 name = "kin-mcp"
 version = "0.3.6"
 dependencies = [
+ "base64 0.22.1",
+ "hex",
  "kin-blobs",
  "kin-context",
  "kin-core",
@@ -3410,8 +3430,8 @@ dependencies = [
  "kin-infer",
  "kin-model",
  "kin-parser",
+ "kin-projection",
  "pretty_assertions",
- "rayon",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -3423,20 +3443,46 @@ dependencies = [
 
 [[package]]
 name = "kin-model"
-version = "0.4.0"
+version = "0.6.0"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "56123029e2cc463a2acc85d00bb4ae2146db7c5088097cadcc92a60d6d1a1b03"
+checksum = "41dd393ac2ce6fb40d662fcc0d816db8d0b536c8856c2c62bbb705e3ccbbca59"
 dependencies = [
  "chrono",
+ "gix-hash",
+ "gix-object",
  "hex",
  "kin-blobs",
  "kin-vector",
  "schemars",
  "serde",
  "serde_json",
+ "sha1 0.10.6",
  "sha2 0.10.9",
  "thiserror 2.0.18",
  "uuid",
+]
+
+[[package]]
+name = "kin-notifier-macos"
+version = "0.3.6"
+dependencies = [
+ "block2",
+ "objc2 0.6.4",
+ "objc2-app-kit",
+ "objc2-core-foundation",
+ "objc2-foundation",
+ "objc2-user-notifications",
+]
+
+[[package]]
+name = "kin-notify"
+version = "0.3.6"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "directories 5.0.1",
+ "serde",
+ "tempfile",
 ]
 
 [[package]]
@@ -3550,11 +3596,16 @@ dependencies = [
 name = "kin-remote"
 version = "0.3.6"
 dependencies = [
+ "base64 0.22.1",
  "chrono",
+ "kin-db",
  "kin-model",
  "pretty_assertions",
  "serde",
  "serde_json",
+ "sha1 0.10.6",
+ "sha2 0.11.0",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -3583,13 +3634,12 @@ name = "kin-runtime"
 version = "0.3.6"
 dependencies = [
  "chrono",
- "hex",
  "kin-blobs",
+ "kin-core",
  "kin-model",
  "pretty_assertions",
  "serde",
  "serde_json",
- "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.18",
  "tracing",
@@ -4033,7 +4083,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4104,6 +4154,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "objc2-app-kit"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d49e936b501e5c5bf01fda3a9452ff86dc3ea98ad5f283e1455153142d97518c"
+dependencies = [
+ "bitflags 2.13.0",
+ "objc2 0.6.4",
+ "objc2-foundation",
+]
+
+[[package]]
 name = "objc2-core-foundation"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4148,6 +4209,18 @@ checksum = "bb82bed227edf5201dfedf072bba4015a33d3d4a98519837295a90f0a23f676d"
 dependencies = [
  "objc2 0.6.4",
  "objc2-core-foundation",
+ "objc2-foundation",
+]
+
+[[package]]
+name = "objc2-user-notifications"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9df9128cbbfef73cda168416ccf7f837b62737d748333bfe9ab71c245d76613e"
+dependencies = [
+ "bitflags 2.13.0",
+ "block2",
+ "objc2 0.6.4",
  "objc2-foundation",
 ]
 
@@ -4497,9 +4570,9 @@ dependencies = [
 
 [[package]]
 name = "quinn-proto"
-version = "0.11.14"
+version = "0.11.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "434b42fec591c96ef50e21e886936e66d3cc3f737104fdb9b737c40ffb94c098"
+checksum = "4fcb935c5bec503c2f0e306bdd3e58bb9029dcb14fa8d9ac76e3a5256ac0763e"
 dependencies = [
  "aws-lc-rs",
  "bytes",
@@ -4528,7 +4601,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.59.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -4932,7 +5005,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5001,7 +5074,7 @@ dependencies = [
  "security-framework 3.7.0",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5578,7 +5651,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -16,6 +16,7 @@ pub use envelope::{
     ENVELOPE_VERSION,
 };
 pub use error::{McpError, Result};
+pub use handlers::LocalRepositoryAuthorityBinding;
 pub use negative::NEGATIVE_KEY;
 pub use server::{
     process_daemon_message, process_message, run_stdio, run_stdio_daemon, BoundRepo,

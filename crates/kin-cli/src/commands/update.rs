@@ -4414,6 +4414,30 @@ struct ComponentSpec {
     required: bool,
 }
 
+/// Directory name of the macOS notification bundle inside a release archive.
+///
+/// The bundle travels as a directory rather than as a component file because
+/// replacing only its executable would break the seal `codesign` places over
+/// the whole bundle, and an unsealed bundle is refused by the notification
+/// system. It is therefore deliberately NOT a `ComponentSpec`: the transaction
+/// swaps regular files with inode identities, which a directory cannot supply.
+///
+/// Archive walks skip it so that an archive carrying it can still be staged.
+/// The updater does not yet replace the bundle, so it keeps whatever version
+/// the installer wrote until a refresh step is added; a stale notifier still
+/// posts correctly, it simply misses newer notifier fixes.
+const NOTIFIER_BUNDLE_DIR: &str = "KinNotifier.app";
+
+/// Whether an archive entry belongs to the notification bundle.
+///
+/// Matching on a whole path component (rather than a prefix) cannot be widened
+/// by a crafted name like `KinNotifier.appx`, and the archive walker has already
+/// rejected `..`, absolute paths, and link records before this is consulted.
+fn is_notifier_bundle_entry(path: &Path) -> bool {
+    path.components()
+        .any(|component| component.as_os_str() == NOTIFIER_BUNDLE_DIR)
+}
+
 const MACOS_COMPONENTS: &[ComponentSpec] = &[
     // Keep the currently running executable last in the swap order. If a
     // platform refuses to rename it, every earlier swap is rolled back.
@@ -5506,6 +5530,12 @@ where
             return Ok(());
         }
         let path = entry.path;
+        // The notification bundle is not a swappable component; it is
+        // materialized after the transaction commits. Skipping it here is what
+        // keeps a macOS archive that carries it stageable at all.
+        if is_notifier_bundle_entry(&path) {
+            return Ok(());
+        }
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             anyhow::bail!("release archive contains a non-UTF-8 file name");
         };
@@ -10874,6 +10904,99 @@ cwd = {:?}
         .expect_err("missing VFS files must reject the archive");
         let message = format!("{err:#}");
         assert!(message.contains("kin-vfs"), "message: {message}");
+    }
+
+    /// A macOS release archive carries KinNotifier.app as a directory. The
+    /// stager must accept it, stage none of it as a component, and still reject
+    /// anything merely shaped like it.
+    #[test]
+    fn macos_archive_carrying_the_notifier_bundle_stages() {
+        let tmp = tempfile::tempdir().unwrap();
+        let archive = make_tar_gz(&[
+            ("kin-macos-aarch64/kin", b"new-kin"),
+            ("kin-macos-aarch64/kin-daemon", b"new-daemon"),
+            ("kin-macos-aarch64/kin-vfs", b"new-vfs"),
+            ("kin-macos-aarch64/libkin_vfs_shim.dylib", b"new-shim"),
+            (
+                "kin-macos-aarch64/KinNotifier.app/Contents/Info.plist",
+                b"<plist/>",
+            ),
+            (
+                "kin-macos-aarch64/KinNotifier.app/Contents/MacOS/KinNotifier",
+                b"notifier",
+            ),
+            (
+                "kin-macos-aarch64/KinNotifier.app/Contents/Resources/Kin.icns",
+                b"icns",
+            ),
+        ]);
+        stage_archive(
+            &archive,
+            "kin-macos-aarch64.tar.gz",
+            tmp.path(),
+            MACOS_COMPONENTS,
+        )
+        .expect("an archive carrying the notification bundle must stage");
+
+        // The bundle is materialized after the swap, so none of it may appear
+        // in the staging tree: a directory there would fail staging cleanup.
+        for staged in ["bin", "lib"] {
+            let dir = tmp.path().join(staged);
+            if let Ok(entries) = fs::read_dir(&dir) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    assert_ne!(
+                        name.to_string_lossy(),
+                        NOTIFIER_BUNDLE_DIR,
+                        "the bundle must never be staged"
+                    );
+                    assert!(
+                        entry.file_type().unwrap().is_file(),
+                        "staging must contain only regular files, found {name:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The skip must key on a whole path component. A file merely prefixed with
+    /// the bundle name is still an unexpected archive entry.
+    #[test]
+    fn a_name_resembling_the_notifier_bundle_is_still_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let archive = make_tar_gz(&[
+            ("kin-macos-aarch64/kin", b"new-kin"),
+            ("kin-macos-aarch64/kin-daemon", b"new-daemon"),
+            ("kin-macos-aarch64/kin-vfs", b"new-vfs"),
+            ("kin-macos-aarch64/libkin_vfs_shim.dylib", b"new-shim"),
+            ("kin-macos-aarch64/KinNotifier.appx/payload", b"smuggled"),
+        ]);
+        let error = stage_archive(
+            &archive,
+            "kin-macos-aarch64.tar.gz",
+            tmp.path(),
+            MACOS_COMPONENTS,
+        )
+        .expect_err("a lookalike directory must not inherit the bundle exemption");
+        assert!(format!("{error:#}").contains("unexpected file"));
+    }
+
+    #[test]
+    fn notifier_bundle_entries_are_recognized_by_whole_component() {
+        assert!(is_notifier_bundle_entry(Path::new(
+            "kin-macos-aarch64/KinNotifier.app/Contents/MacOS/KinNotifier"
+        )));
+        assert!(is_notifier_bundle_entry(Path::new("KinNotifier.app")));
+        // Prefix and suffix lookalikes must not match.
+        assert!(!is_notifier_bundle_entry(Path::new(
+            "kin-macos-aarch64/KinNotifier.appx/payload"
+        )));
+        assert!(!is_notifier_bundle_entry(Path::new(
+            "kin-macos-aarch64/NotKinNotifier.app/payload"
+        )));
+        assert!(!is_notifier_bundle_entry(Path::new(
+            "kin-macos-aarch64/kin"
+        )));
     }
 
     #[test]

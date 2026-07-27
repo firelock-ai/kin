@@ -1517,7 +1517,7 @@ mod tests {
     #[test]
     fn artifact_context_strings_include_object_class() {
         let shallow = SearchRecord::Resolved {
-            key: RetrievalKey::Artifact(ArtifactId::seed_from_path("src/lib.rs")),
+            key: RetrievalKey::Artifact(ArtifactId::new()),
             item: ResolvedRetrievalItem::ShallowFile(ShallowTrackedFile {
                 file_id: FilePathId::new("src/lib.rs"),
                 language_hint: "rust".to_string(),
@@ -1540,7 +1540,7 @@ mod tests {
         );
 
         let structured = SearchRecord::Resolved {
-            key: RetrievalKey::Artifact(ArtifactId::seed_from_path("Makefile")),
+            key: RetrievalKey::Artifact(ArtifactId::new()),
             item: ResolvedRetrievalItem::StructuredArtifact(StructuredArtifact {
                 file_id: FilePathId::new("Makefile"),
                 kind: ArtifactKind::Makefile,
@@ -1562,7 +1562,7 @@ mod tests {
         );
 
         let opaque = SearchRecord::Resolved {
-            key: RetrievalKey::Artifact(ArtifactId::seed_from_path("image.png")),
+            key: RetrievalKey::Artifact(ArtifactId::new()),
             item: ResolvedRetrievalItem::OpaqueArtifact(OpaqueArtifact {
                 file_id: FilePathId::new("image.png"),
                 content_hash: Hash256::from_bytes([4; 32]),

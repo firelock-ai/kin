@@ -176,7 +176,14 @@ if ((${#unexpected_cli_history_reads[@]} > 0)); then
   exit 1
 fi
 
-for command_file in status work note overview graph dead_code refs xref verify commit diff log audit approvals security branch checkout rename with exec session_workspace open shell; do
+for command_file in status work note overview graph dead_code refs xref verify commit diff log audit approvals security branch checkout rename session_workspace; do
+  # Every guarded command must still exist. A silently absent file would make
+  # its rule pass by scanning nothing, so a rename has to be reflected here.
+  if [[ ! -f "$repo_root/crates/kin-cli/src/commands/${command_file}.rs" ]]; then
+    echo "Guarded command path crates/kin-cli/src/commands/${command_file}.rs is missing:" >&2
+    echo "  update this list when a command module is renamed or removed" >&2
+    exit 1
+  fi
   unexpected_cli_command_graph_reads=()
   while IFS=: read -r file line _; do
     [[ -z "$file" ]] && continue

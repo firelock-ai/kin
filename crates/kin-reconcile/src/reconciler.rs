@@ -10,9 +10,9 @@ use kin_blobs::BlobStore;
 use kin_index::{FileEvent, IndexPipeline};
 use kin_model::preset::{BrokenAstBehavior, ReconcilePolicy, ValidationLevel};
 use kin_model::{
-    ConflictId, ConflictKind, ConflictObject, Entity, EntityId, EntityKind, FilePathId,
-    GraphNodeId, GraphOverlay, GraphStore, IntentScope, IntentSummary, ParseState, SessionId,
-    SourceRegion,
+    ConflictId, ConflictKind, ConflictObject, Entity, EntityDelta, EntityId, EntityKind,
+    FilePathId, GraphNodeId, GraphStore, IntentScope, IntentSummary, ParseState, Relation,
+    RelationDelta, RelationKind, SessionId, SourceRegion, TransactionDelta,
 };
 use kin_projection::{project_entity_mutations_with_policy, ProjectionState};
 
@@ -26,7 +26,7 @@ use crate::lkg::LkgStore;
 /// Outcome of reconciling a single file change.
 #[derive(Debug)]
 pub enum ReconcileOutcome {
-    /// File parsed cleanly; overlay updated with new/modified/removed entities.
+    /// File parsed cleanly; an exact transaction was derived.
     Updated {
         file_id: FilePathId,
         added: Vec<EntityId>,
@@ -51,12 +51,44 @@ pub enum ReconcileOutcome {
     },
 }
 
-/// The reconciliation engine. Keeps the working copy overlay and working
-/// directory files in sync.
+/// One filesystem reconciliation result.
+///
+/// The delta is self-contained and self-inverting: every modification and
+/// removal carries the complete old state observed in the graph. Callers must
+/// commit it through an atomic graph or repository-authority transaction.
+#[derive(Debug)]
+pub struct ReconcileResult {
+    pub outcome: ReconcileOutcome,
+    pub delta: TransactionDelta,
+}
+
+impl ReconcileResult {
+    fn validated(outcome: ReconcileOutcome, mut delta: TransactionDelta) -> Result<Self> {
+        delta.entity_deltas.sort_by_key(EntityDelta::target_id);
+        delta.relation_deltas.sort_by_key(RelationDelta::target_id);
+        delta
+            .tree_deltas
+            .sort_by_key(kin_model::TreeDelta::artifact_id);
+        kin_model::validate_transaction_delta(&delta)
+            .map_err(|error| ReconcileError::InvalidTransaction(error.to_string()))?;
+        Ok(Self { outcome, delta })
+    }
+
+    fn unchanged(outcome: ReconcileOutcome) -> Result<Self> {
+        Self::validated(outcome, TransactionDelta::default())
+    }
+
+    pub fn into_parts(self) -> (ReconcileOutcome, TransactionDelta) {
+        (self.outcome, self.delta)
+    }
+}
+
+/// The reconciliation engine. Derives exact transactions from filesystem
+/// input and projects committed transactions back to filesystem views.
 ///
 /// Two directions:
-/// - **File -> Overlay:** detect file edits, parse, update overlay
-/// - **Overlay -> File:** detect overlay mutations, project to working dir
+/// - **File -> Transaction:** detect file edits and return one exact delta
+/// - **Transaction -> File:** project committed mutations to a working view
 pub struct Reconciler {
     pipeline: IndexPipeline,
     lkg: LkgStore,
@@ -70,37 +102,6 @@ pub struct Reconciler {
     policy: ReconcilePolicy,
     /// Cache of tree-sitter Trees keyed by file path, used for incremental parsing.
     tree_cache: HashMap<FilePathId, tree_sitter::Tree>,
-}
-
-/// Apply overlay mutations into the primary graph, then clear the overlay.
-pub fn apply_overlay_to_graph<G: GraphStore>(
-    graph: &G,
-    overlay: &mut GraphOverlay,
-) -> std::result::Result<(), <G as GraphStore>::Error> {
-    for entity in overlay.entity_adds.values() {
-        graph.upsert_entity(entity)?;
-    }
-    for entity in overlay.entity_mods.values() {
-        graph.upsert_entity(entity)?;
-    }
-    for id in &overlay.entity_removes {
-        graph.remove_entity(id)?;
-    }
-    for relation in overlay.relation_adds.values() {
-        graph.upsert_relation(relation)?;
-    }
-    for id in &overlay.relation_removes {
-        graph.remove_relation(id)?;
-    }
-
-    overlay.entity_adds.clear();
-    overlay.entity_mods.clear();
-    overlay.entity_removes.clear();
-    overlay.relation_adds.clear();
-    overlay.relation_removes.clear();
-    overlay.entity_bodies.clear();
-
-    Ok(())
 }
 
 impl Reconciler {
@@ -199,11 +200,11 @@ impl Reconciler {
     }
 
     // ---------------------------------------------------------------
-    // Direction 1: File -> Overlay
+    // Direction 1: File -> Transaction
     // ---------------------------------------------------------------
 
     /// Reconcile a file change event. Parses the file, compares against
-    /// current graph state, and updates the overlay.
+    /// current graph state, and returns one exact transaction delta.
     ///
     /// If the parse produces errors, the LKG state is retained and no
     /// graph changes are made.
@@ -212,22 +213,23 @@ impl Reconciler {
         event: &FileEvent,
         blob_store: &BlobStore,
         graph: &G,
-        overlay: &mut GraphOverlay,
-    ) -> Result<ReconcileOutcome> {
-        let path = match event {
+    ) -> Result<ReconcileResult> {
+        let event_path = match event {
             FileEvent::Changed(path) | FileEvent::Removed(path) => path,
         };
+        let comparable_path = self.comparable_event_path(event_path);
+        let path = comparable_path.as_path();
         if !self.should_track_path(path) {
             debug!(
-                file = %path.display(),
+                file = %event_path.display(),
                 "excluded path reached reconcile; purging any existing graph state"
             );
-            return self.reconcile_file_removal(path, graph, overlay);
+            return self.reconcile_file_removal(path, graph);
         }
 
         match event {
-            FileEvent::Changed(path) => self.reconcile_file_edit(path, blob_store, graph, overlay),
-            FileEvent::Removed(path) => {
+            FileEvent::Changed(_) => self.reconcile_file_edit(path, blob_store, graph),
+            FileEvent::Removed(_) => {
                 // RACE CONDITION HARDENING: Verify the file is still absent
                 // before committing entity removals. Editors that do atomic
                 // saves (write temp → delete old → rename temp) produce a
@@ -240,9 +242,53 @@ impl Reconciler {
                         file = %path.display(),
                         "file exists at removal time — treating as edit (atomic-save race)"
                     );
-                    return self.reconcile_file_edit(path, blob_store, graph, overlay);
+                    return self.reconcile_file_edit(path, blob_store, graph);
                 }
-                self.reconcile_file_removal(path, graph, overlay)
+                self.reconcile_file_removal(path, graph)
+            }
+        }
+    }
+
+    /// Return a physical path that can be compared with the canonical
+    /// repository root without dereferencing the event entry itself.
+    ///
+    /// macOS reports temporary-directory events through `/var` even when the
+    /// repository root was opened through its canonical `/private/var` spelling.
+    /// Canonicalizing only the closest existing parent preserves the identity of
+    /// symlinks and removed paths while eliminating that alias. Missing parent
+    /// components are appended lexically after the existing ancestor resolves.
+    fn comparable_event_path(&self, path: &Path) -> PathBuf {
+        if path.strip_prefix(&self.working_dir).is_ok() {
+            return path.to_path_buf();
+        }
+
+        let Some(name) = path.file_name() else {
+            return path.to_path_buf();
+        };
+        let Some(mut ancestor) = path.parent() else {
+            return path.to_path_buf();
+        };
+        let mut missing = Vec::new();
+
+        loop {
+            match ancestor.canonicalize() {
+                Ok(mut canonical) => {
+                    for component in missing.iter().rev() {
+                        canonical.push(component);
+                    }
+                    canonical.push(name);
+                    return canonical;
+                }
+                Err(_) => {
+                    let Some(component) = ancestor.file_name() else {
+                        return path.to_path_buf();
+                    };
+                    missing.push(component.to_os_string());
+                    let Some(parent) = ancestor.parent() else {
+                        return path.to_path_buf();
+                    };
+                    ancestor = parent;
+                }
             }
         }
     }
@@ -266,16 +312,19 @@ impl Reconciler {
         event: &FileEvent,
         blob_store: &BlobStore,
         graph: &G,
-        overlay: &mut GraphOverlay,
         edit_hint: Option<&kin_parser::EditHint>,
-    ) -> Result<ReconcileOutcome> {
+    ) -> Result<ReconcileResult> {
         match (event, edit_hint) {
             (FileEvent::Changed(path), Some(hint)) => {
-                self.reconcile_file_edit_incremental(path, blob_store, graph, overlay, hint)
+                let comparable_path = self.comparable_event_path(path);
+                if !self.should_track_path(&comparable_path) {
+                    return self.reconcile_file_removal(&comparable_path, graph);
+                }
+                self.reconcile_file_edit_incremental(&comparable_path, blob_store, graph, hint)
             }
             // Delegate to reconcile_file_change which handles the
             // removal-but-file-exists race condition.
-            _ => self.reconcile_file_change(event, blob_store, graph, overlay),
+            _ => self.reconcile_file_change(event, blob_store, graph),
         }
     }
 
@@ -285,9 +334,8 @@ impl Reconciler {
         path: &Path,
         blob_store: &BlobStore,
         graph: &G,
-        overlay: &mut GraphOverlay,
         edit_hint: &kin_parser::EditHint,
-    ) -> Result<ReconcileOutcome> {
+    ) -> Result<ReconcileResult> {
         let file_id = kin_index::normalize_file_path_id(path, &self.working_dir);
         let old_tree = self.tree_cache.get(&file_id);
 
@@ -324,7 +372,7 @@ impl Reconciler {
                     // Still cache the tree even on broken AST — it's valid for
                     // incremental parse even if the content has errors.
                     self.tree_cache.insert(file_id, tree);
-                    return Ok(ReconcileOutcome::BrokenAst {
+                    return ReconcileResult::unchanged(ReconcileOutcome::BrokenAst {
                         file_id: result_file_id,
                         error_ranges: error_ranges.clone(),
                     });
@@ -363,22 +411,15 @@ impl Reconciler {
             }
         }
 
-        // Snapshot overlay and LKG before mutations for transactional rollback.
-        let overlay_snapshot = overlay.clone();
+        // Snapshot LKG before deriving the transaction so an error cannot publish
+        // partially advanced reconcile state.
         let lkg_snapshot = self.lkg.clone();
 
-        let result = self.reconcile_file_edit_inner(
-            &indexed,
-            &result_file_id,
-            path,
-            blob_store,
-            graph,
-            overlay,
-        );
+        let result =
+            self.reconcile_file_edit_inner(&indexed, &result_file_id, path, blob_store, graph);
 
-        // On error, restore both overlay and LKG to their pre-reconcile state.
+        // On error, restore LKG to its pre-reconcile state.
         if result.is_err() {
-            *overlay = overlay_snapshot;
             self.lkg = lkg_snapshot;
         } else {
             // Cache the tree for future incremental parses.
@@ -390,16 +431,14 @@ impl Reconciler {
 
     /// Reconcile a file edit (create or modify).
     ///
-    /// Transactional: if any error occurs after mutations begin, the overlay
-    /// is restored to its pre-reconcile state so partial failures never leave
-    /// the graph in an inconsistent state.
+    /// Transactional: if derivation fails, the local LKG baseline is restored
+    /// so a later attempt cannot observe partially advanced reconcile state.
     fn reconcile_file_edit<G: GraphStore>(
         &mut self,
         path: &Path,
         blob_store: &BlobStore,
         graph: &G,
-        overlay: &mut GraphOverlay,
-    ) -> Result<ReconcileOutcome> {
+    ) -> Result<ReconcileResult> {
         let indexed = self
             .pipeline
             .index_file_relative(path, blob_store, &self.working_dir)?;
@@ -425,7 +464,7 @@ impl Reconciler {
                         errors = error_ranges.len(),
                         "broken AST, retaining LKG state"
                     );
-                    return Ok(ReconcileOutcome::BrokenAst {
+                    return ReconcileResult::unchanged(ReconcileOutcome::BrokenAst {
                         file_id,
                         error_ranges: error_ranges.clone(),
                     });
@@ -472,16 +511,14 @@ impl Reconciler {
             }
         }
 
-        // Snapshot overlay and LKG before mutations for transactional rollback.
-        let overlay_snapshot = overlay.clone();
+        // Snapshot LKG before deriving the transaction so an error cannot publish
+        // partially advanced reconcile state.
         let lkg_snapshot = self.lkg.clone();
 
-        let result =
-            self.reconcile_file_edit_inner(&indexed, &file_id, path, blob_store, graph, overlay);
+        let result = self.reconcile_file_edit_inner(&indexed, &file_id, path, blob_store, graph);
 
-        // On error, restore both overlay and LKG to their pre-reconcile state.
+        // On error, restore LKG to its pre-reconcile state.
         if result.is_err() {
-            *overlay = overlay_snapshot;
             self.lkg = lkg_snapshot;
         }
 
@@ -489,7 +526,31 @@ impl Reconciler {
     }
 
     /// Inner implementation of reconcile_file_edit, separated so the caller
-    /// can snapshot/restore the overlay on error.
+    /// can restore internal LKG state on error.
+    ///
+    /// This entrypoint derives the same semantic/layout transaction from bytes
+    /// already parsed out of immutable repository CAS. It performs no host
+    /// filesystem read or membership inference, making it suitable for
+    /// graph-authority planners such as daemon-owned MCP commits.
+    pub fn reconcile_indexed_content<G: GraphStore>(
+        &mut self,
+        indexed: &kin_index::IndexedFile,
+        blob_store: &BlobStore,
+        graph: &G,
+    ) -> Result<ReconcileResult> {
+        let lkg_snapshot = self.lkg.clone();
+        let file_id = indexed.file_id.clone();
+        let display_path = PathBuf::from(&file_id.0);
+        let result =
+            self.reconcile_file_edit_inner(indexed, &file_id, &display_path, blob_store, graph);
+        if result.is_err() {
+            self.lkg = lkg_snapshot;
+        }
+        result
+    }
+
+    /// Inner implementation of reconcile_file_edit, separated so the caller
+    /// can restore internal LKG state on error.
     fn reconcile_file_edit_inner<G: GraphStore>(
         &mut self,
         indexed: &kin_index::IndexedFile,
@@ -497,8 +558,7 @@ impl Reconciler {
         path: &Path,
         blob_store: &BlobStore,
         graph: &G,
-        overlay: &mut GraphOverlay,
-    ) -> Result<ReconcileOutcome> {
+    ) -> Result<ReconcileResult> {
         // Get existing entities for this file from the graph
         let existing = self.get_file_entities(graph, file_id)?;
 
@@ -525,6 +585,8 @@ impl Reconciler {
         let mut modified = Vec::new();
         let mut removed = Vec::new();
         let mut stable_entity_ids = HashMap::new();
+        let mut delta = TransactionDelta::default();
+        let blob_hash = serde_json::Value::String(indexed.blob_hash.to_string());
 
         // Track which existing entities we've matched
         let mut matched_existing: HashMap<EntityId, bool> =
@@ -560,16 +622,24 @@ impl Reconciler {
                 Some(old) => {
                     matched_existing.insert(old.id, true);
 
-                    // Check if fingerprint actually changed
-                    if self.lkg.has_changed(&old.id, &new_entity.fingerprint) {
-                        // Real semantic change
-                        let mut updated = new_entity.clone();
-                        updated.id = old.id; // Preserve identity
-                        updated.lineage_parent = old.lineage_parent;
-                        updated.created_in = old.created_in;
-                        stable_entity_ids.insert(new_entity.id, old.id);
+                    let mut updated = new_entity.clone();
+                    updated.id = old.id;
+                    updated.lineage_parent = old.lineage_parent;
+                    updated.created_in = old.created_in;
+                    updated
+                        .metadata
+                        .extra
+                        .insert("blob_hash".into(), blob_hash.clone());
+                    stable_entity_ids.insert(new_entity.id, old.id);
 
-                        overlay.entity_mods.insert(old.id, updated.clone());
+                    // Compare the complete enrichment payload, not only the AST
+                    // fingerprint. Span and blob provenance must advance even for
+                    // source edits that are semantically equivalent.
+                    if updated != *old {
+                        delta.entity_deltas.push(EntityDelta::Modified {
+                            old: old.clone(),
+                            new: updated.clone(),
+                        });
                         self.lkg.record(updated.clone(), vec![]);
                         modified.push(old.id);
 
@@ -579,26 +649,30 @@ impl Reconciler {
                             "entity modified"
                         );
                     } else {
-                        // No semantic change (whitespace/formatting only)
-                        stable_entity_ids.insert(new_entity.id, old.id);
+                        self.lkg.record(old.clone(), vec![]);
                         debug!(
                             entity = %old.name,
-                            "no semantic change, skipping"
+                            "entity payload unchanged, skipping"
                         );
                     }
                 }
                 None => {
                     // New entity
-                    stable_entity_ids.insert(new_entity.id, new_entity.id);
-                    overlay
-                        .entity_adds
-                        .insert(new_entity.id, new_entity.clone());
-                    self.lkg.record(new_entity.clone(), vec![]);
-                    added.push(new_entity.id);
+                    let mut added_entity = new_entity.clone();
+                    added_entity
+                        .metadata
+                        .extra
+                        .insert("blob_hash".into(), blob_hash.clone());
+                    stable_entity_ids.insert(added_entity.id, added_entity.id);
+                    delta.entity_deltas.push(EntityDelta::Added {
+                        new: added_entity.clone(),
+                    });
+                    self.lkg.record(added_entity.clone(), vec![]);
+                    added.push(added_entity.id);
 
                     debug!(
-                        entity = %new_entity.name,
-                        id = %new_entity.id,
+                        entity = %added_entity.name,
+                        id = %added_entity.id,
                         "new entity added"
                     );
                 }
@@ -608,7 +682,13 @@ impl Reconciler {
         // Entities that existed before but are no longer in the file -> removed
         for (id, matched) in &matched_existing {
             if !matched {
-                overlay.entity_removes.push(*id);
+                let old = existing
+                    .iter()
+                    .find(|entity| entity.id == *id)
+                    .expect("matched-existing map is derived from existing entities");
+                delta
+                    .entity_deltas
+                    .push(EntityDelta::Removed { old: old.clone() });
                 self.lkg.remove(id);
                 removed.push(*id);
                 debug!(id = %id, "entity removed from file");
@@ -625,27 +705,36 @@ impl Reconciler {
         // edges, and agent-created Manual edges are never re-derived by a single-file
         // reconcile and must be preserved.  We therefore track origin alongside the
         // relation ID so the removal loop can apply the combined filter.
-        let file_entity_node_ids: std::collections::HashSet<GraphNodeId> =
-            existing.iter().map(|e| GraphNodeId::Entity(e.id)).collect();
+        let file_entity_node_ids: HashSet<GraphNodeId> = existing
+            .iter()
+            .map(|entity| GraphNodeId::Entity(entity.id))
+            .chain(stable_entity_ids.values().copied().map(GraphNodeId::Entity))
+            .collect();
+        let removed_entity_ids: HashSet<EntityId> = removed.iter().copied().collect();
+
         // Collect existing relations for all entities in this file.
-        let mut existing_relations: HashMap<
-            (GraphNodeId, GraphNodeId, kin_model::RelationKind),
-            (kin_model::RelationId, kin_model::RelationOrigin),
-        > = HashMap::new();
+        type RelationKey = (GraphNodeId, GraphNodeId, RelationKind);
+        let mut existing_relations: HashMap<RelationKey, Vec<Relation>> = HashMap::new();
         for entity in &existing {
-            if let Ok(rels) = graph.get_all_relations_for_entity(&entity.id) {
-                for rel in rels {
-                    existing_relations.insert((rel.src, rel.dst, rel.kind), (rel.id, rel.origin));
+            let relations = graph
+                .get_all_relations_for_entity(&entity.id)
+                .map_err(|error| ReconcileError::Graph(error.to_string()))?;
+            for relation in relations {
+                let bucket = existing_relations
+                    .entry((relation.src, relation.dst, relation.kind))
+                    .or_default();
+                if !bucket.iter().any(|existing| existing.id == relation.id) {
+                    bucket.push(relation);
                 }
             }
         }
+        for relations in existing_relations.values_mut() {
+            relations.sort_by_key(|relation| relation.id);
+        }
 
         // Build set of newly parsed relations keyed by (src, dst, kind).
-        let mut new_relation_keys: std::collections::HashSet<(
-            GraphNodeId,
-            GraphNodeId,
-            kin_model::RelationKind,
-        )> = std::collections::HashSet::new();
+        let mut new_relation_keys: HashSet<RelationKey> = HashSet::new();
+        let mut matched_relation_ids = HashSet::new();
         for relation in &indexed.relations {
             // Remap src/dst to stable IDs if they were matched to existing entities.
             let stable_src = relation
@@ -661,13 +750,35 @@ impl Reconciler {
                 .map(GraphNodeId::Entity)
                 .unwrap_or(relation.dst);
 
-            new_relation_keys.insert((stable_src, stable_dst, relation.kind));
+            let key = (stable_src, stable_dst, relation.kind);
+            if !new_relation_keys.insert(key) {
+                return Err(ReconcileError::InvalidTransaction(format!(
+                    "parser emitted duplicate {:?} relation from {} to {}",
+                    relation.kind, stable_src, stable_dst
+                )));
+            }
             let mut stable_relation = relation.clone();
             stable_relation.src = stable_src;
             stable_relation.dst = stable_dst;
-            overlay
-                .relation_adds
-                .insert(stable_relation.id, stable_relation);
+
+            if let Some(old) = existing_relations
+                .get(&key)
+                .and_then(|relations| relations.first())
+            {
+                matched_relation_ids.insert(old.id);
+                stable_relation.id = old.id;
+                stable_relation.created_in = old.created_in;
+                if stable_relation != *old {
+                    delta.relation_deltas.push(RelationDelta::Modified {
+                        old: old.clone(),
+                        new: stable_relation,
+                    });
+                }
+            } else {
+                delta.relation_deltas.push(RelationDelta::Added {
+                    new: stable_relation,
+                });
+            }
         }
 
         // Remove stale relations that no longer exist in the file.
@@ -676,18 +787,33 @@ impl Reconciler {
         //   2. both src and dst are entities of the file being reconciled.
         // This preserves cross-file linker edges, LSP-enrichment edges, and
         // agent-created Manual edges that a single-file re-parse cannot recreate.
-        for ((src, dst, kind), (rel_id, origin)) in &existing_relations {
-            if !new_relation_keys.contains(&(*src, *dst, *kind)) {
+        for ((src, dst, kind), relations) in &existing_relations {
+            for relation in relations {
+                if matched_relation_ids.contains(&relation.id) {
+                    continue;
+                }
+                let touches_removed_entity = [relation.src, relation.dst]
+                    .into_iter()
+                    .filter_map(|node| node.as_entity())
+                    .any(|entity_id| removed_entity_ids.contains(&entity_id));
                 let both_in_file =
                     file_entity_node_ids.contains(src) && file_entity_node_ids.contains(dst);
                 let parser_derived = matches!(
-                    origin,
+                    relation.origin,
                     kin_model::RelationOrigin::Parsed | kin_model::RelationOrigin::Inferred
                 );
-                if parser_derived && both_in_file {
-                    overlay.relation_removes.push(*rel_id);
+                let parser_authoritative = parser_derived
+                    && both_in_file
+                    && !new_relation_keys.contains(&(*src, *dst, *kind));
+                let duplicate_parser_relation = parser_derived
+                    && both_in_file
+                    && new_relation_keys.contains(&(*src, *dst, *kind));
+                if touches_removed_entity || parser_authoritative || duplicate_parser_relation {
+                    delta.relation_deltas.push(RelationDelta::Removed {
+                        old: relation.clone(),
+                    });
                     debug!(
-                        relation_id = %rel_id,
+                        relation_id = %relation.id,
                         src = %src,
                         dst = %dst,
                         "stale relation removed"
@@ -696,26 +822,22 @@ impl Reconciler {
             }
         }
 
-        // Store blob_hash in entity metadata for all added/modified entities
-        let blob_hash_str = format!("{}", indexed.blob_hash);
-        for entity in overlay.entity_adds.values_mut() {
-            if entity.file_origin.as_ref() == Some(file_id) {
-                entity.metadata.extra.insert(
-                    "blob_hash".into(),
-                    serde_json::Value::String(blob_hash_str.clone()),
-                );
-            }
-        }
-        for entity in overlay.entity_mods.values_mut() {
-            if entity.file_origin.as_ref() == Some(file_id) {
-                entity.metadata.extra.insert(
-                    "blob_hash".into(),
-                    serde_json::Value::String(blob_hash_str.clone()),
-                );
-            }
-        }
+        let added_count = added.len();
+        let modified_count = modified.len();
+        let removed_count = removed.len();
+        let warning_count = collision_warnings.len();
+        let result = ReconcileResult::validated(
+            ReconcileOutcome::Updated {
+                file_id: file_id.clone(),
+                added,
+                modified,
+                removed,
+                collision_warnings,
+            },
+            delta,
+        )?;
 
-        // Register file layout in projection state so project_overlay_to_files
+        // Register file layout in projection state so project_transaction_to_files
         // can splice mutations back into the file.
         //
         // RACE CONDITION HARDENING: Read from blob store (keyed by the hash
@@ -746,21 +868,15 @@ impl Reconciler {
 
         info!(
             file = %path.display(),
-            added = added.len(),
-            modified = modified.len(),
-            removed = removed.len(),
-            warnings = collision_warnings.len(),
+            added = added_count,
+            modified = modified_count,
+            removed = removed_count,
+            warnings = warning_count,
             git_shadow = self.policy.git_shadow,
             "reconciled file edit"
         );
 
-        Ok(ReconcileOutcome::Updated {
-            file_id: file_id.clone(),
-            added,
-            modified,
-            removed,
-            collision_warnings,
-        })
+        Ok(result)
     }
 
     /// Reconcile a file removal.
@@ -768,8 +884,7 @@ impl Reconciler {
         &mut self,
         path: &Path,
         graph: &G,
-        overlay: &mut GraphOverlay,
-    ) -> Result<ReconcileOutcome> {
+    ) -> Result<ReconcileResult> {
         let file_id = self.file_path_id(path);
         let existing = self.get_file_entities(graph, &file_id)?;
 
@@ -782,45 +897,93 @@ impl Reconciler {
         let collision_warnings = self.check_scopes(&affected_scopes)?;
 
         let mut removed = Vec::new();
+        let mut relations = HashMap::new();
 
         for entity in &existing {
-            overlay.entity_removes.push(entity.id);
+            for relation in graph
+                .get_all_relations_for_entity(&entity.id)
+                .map_err(|error| ReconcileError::Graph(error.to_string()))?
+            {
+                relations.insert(relation.id, relation);
+            }
             self.lkg.remove(&entity.id);
             removed.push(entity.id);
         }
+        let delta = TransactionDelta {
+            entity_deltas: existing
+                .into_iter()
+                .map(|old| EntityDelta::Removed { old })
+                .collect(),
+            relation_deltas: relations
+                .into_values()
+                .map(|old| RelationDelta::Removed { old })
+                .collect(),
+            ..TransactionDelta::default()
+        };
+        let removed_count = removed.len();
+        let warning_count = collision_warnings.len();
+        let result = ReconcileResult::validated(
+            ReconcileOutcome::FileRemoved {
+                file_id: file_id.clone(),
+                removed,
+                collision_warnings,
+            },
+            delta,
+        )?;
+        self.projection.remove_file(&file_id);
 
         info!(
             file = %path.display(),
-            removed = removed.len(),
-            warnings = collision_warnings.len(),
+            removed = removed_count,
+            warnings = warning_count,
             "reconciled file removal"
         );
 
-        Ok(ReconcileOutcome::FileRemoved {
-            file_id,
-            removed,
-            collision_warnings,
-        })
+        Ok(result)
     }
 
     // ---------------------------------------------------------------
-    // Direction 2: Overlay -> File
+    // Direction 2: Transaction -> File
     // ---------------------------------------------------------------
 
-    /// Result of projecting overlay mutations to files.
+    /// Project exact transaction mutations to files.
     ///
-    /// Includes the list of modified files and any collision warnings.
-    pub fn project_overlay_to_files(
+    /// `entity_bodies` is projection payload, not graph authority. Every key
+    /// must name an entity modified by `delta`; an unbound body fails loud.
+    /// Metadata-only modifications may omit a body and reuse the cached exact
+    /// span bytes.
+    pub fn project_transaction_to_files(
         &mut self,
-        overlay: &GraphOverlay,
+        delta: &TransactionDelta,
+        entity_bodies: &HashMap<EntityId, Vec<u8>>,
     ) -> Result<(Vec<FilePathId>, Vec<IntentSummary>)> {
-        if overlay.entity_mods.is_empty() {
+        kin_model::validate_transaction_delta(delta)
+            .map_err(|error| ReconcileError::InvalidTransaction(error.to_string()))?;
+
+        let modified_entities: HashMap<EntityId, &Entity> = delta
+            .entity_deltas
+            .iter()
+            .filter_map(|entity_delta| match entity_delta {
+                EntityDelta::Modified { new, .. } => Some((new.id, new)),
+                EntityDelta::Added { .. } | EntityDelta::Removed { .. } => None,
+            })
+            .collect();
+
+        if let Some(unbound) = entity_bodies
+            .keys()
+            .find(|entity_id| !modified_entities.contains_key(entity_id))
+        {
+            return Err(ReconcileError::InvalidTransaction(format!(
+                "projection body for entity {unbound} has no matching modification"
+            )));
+        }
+
+        if modified_entities.is_empty() {
             return Ok((vec![], vec![]));
         }
 
         // Check for collisions BEFORE body extraction — fail fast if blocked.
-        let affected_scopes: Vec<IntentScope> = overlay
-            .entity_mods
+        let affected_scopes: Vec<IntentScope> = modified_entities
             .keys()
             .map(|id| IntentScope::Entity(*id))
             .collect();
@@ -838,15 +1001,11 @@ impl Reconciler {
         // the file (written by a concurrent editor), causing span misalignment
         // and corrupt body extraction.
         let mut mutations: HashMap<EntityId, Vec<u8>> = HashMap::new();
-        for (id, entity) in &overlay.entity_mods {
-            // Prefer an explicitly supplied entity body (e.g. an MCP agent's new
-            // source text carried through `GraphOverlay.entity_bodies`). This is
-            // the channel that turns a graph mutation into a real file edit: when
-            // present we splice the agent's new text rather than re-extracting —
-            // and reproducing — the file's own bytes at the span (an identity
-            // no-op). Fall back to span-extraction only when no body was supplied
-            // (metadata-only edits, where the source text is unchanged).
-            let body = if let Some(supplied) = overlay.entity_bodies.get(id) {
+        for (id, entity) in modified_entities {
+            // Prefer an explicitly supplied entity body. This turns a graph
+            // mutation into a real file edit. Fall back to exact span extraction
+            // only for metadata-only modifications.
+            let body = if let Some(supplied) = entity_bodies.get(&id) {
                 supplied.clone()
             } else if let Some(ref span) = entity.span {
                 // Try cached content first (race-safe), fall back to disk.
@@ -857,13 +1016,13 @@ impl Reconciler {
                     if file_path.exists() {
                         std::fs::read(&file_path).map_err(|e| {
                             ReconcileError::BodyExtractionFailed {
-                                entity_id: *id,
+                                entity_id: id,
                                 reason: format!("failed to read {}: {}", file_path.display(), e),
                             }
                         })?
                     } else {
                         return Err(ReconcileError::BodyExtractionFailed {
-                            entity_id: *id,
+                            entity_id: id,
                             reason: format!("file not found and no cached content: {}", span.file),
                         });
                     }
@@ -874,7 +1033,7 @@ impl Reconciler {
                     contents[start..end].to_vec()
                 } else {
                     return Err(ReconcileError::BodyExtractionFailed {
-                        entity_id: *id,
+                        entity_id: id,
                         reason: format!(
                             "span {}..{} out of bounds for {} ({} bytes)",
                             start,
@@ -886,11 +1045,11 @@ impl Reconciler {
                 }
             } else {
                 return Err(ReconcileError::BodyExtractionFailed {
-                    entity_id: *id,
+                    entity_id: id,
                     reason: "entity has no source span".to_string(),
                 });
             };
-            mutations.insert(*id, body);
+            mutations.insert(id, body);
         }
 
         let modified = project_entity_mutations_with_policy(
@@ -904,7 +1063,7 @@ impl Reconciler {
         info!(
             files = modified.len(),
             warnings = collision_warnings.len(),
-            "projected overlay mutations to working directory"
+            "projected transaction mutations to working directory"
         );
 
         Ok((modified, collision_warnings))
@@ -914,35 +1073,36 @@ impl Reconciler {
     // Conflict detection
     // ---------------------------------------------------------------
 
-    /// Detect conflicts between overlay state and file state.
+    /// Detect conflicts between desired graph state and filesystem input.
     ///
     /// Called when both directions have pending changes for the same
-    /// entity (e.g., human edits a file while an assistant mutates the
-    /// overlay).
+    /// entity (e.g., human edits a file while an assistant commits a graph
+    /// transaction).
     pub fn detect_conflict(
         &self,
         entity_id: &EntityId,
-        overlay_entity: &Entity,
+        desired_entity: &Entity,
         file_entity: &Entity,
     ) -> Option<ConflictObject> {
         // If both sides changed the entity differently, emit a conflict
-        if overlay_entity.fingerprint.ast_hash != file_entity.fingerprint.ast_hash {
+        if desired_entity.fingerprint.ast_hash != file_entity.fingerprint.ast_hash {
             Some(ConflictObject {
                 id: ConflictId::new(),
                 kind: ConflictKind::StructuralCollision,
                 desired_state: format!(
-                    "Overlay: {} (sig: {})",
-                    overlay_entity.name, overlay_entity.signature
+                    "Graph: {} (sig: {})",
+                    desired_entity.name, desired_entity.signature
                 ),
                 current_state: format!(
                     "File: {} (sig: {})",
                     file_entity.name, file_entity.signature
                 ),
-                divergence_reason: "Entity modified in both overlay and working file".to_string(),
+                divergence_reason: "Entity modified in both graph transaction and filesystem input"
+                    .to_string(),
                 affected_entities: vec![*entity_id],
                 affected_files: file_entity.file_origin.iter().cloned().collect(),
                 suggested_resolutions: vec![
-                    "Accept overlay version".to_string(),
+                    "Accept graph version".to_string(),
                     "Accept file version".to_string(),
                     "Manual merge required".to_string(),
                 ],
@@ -1276,7 +1436,7 @@ impl Reconciler {
         kin_index::normalize_file_path_id(path, &self.working_dir)
     }
 
-    /// Get all entities for a file from the graph, falling back to overlay.
+    /// Get all entities for a file from graph authority.
     fn get_file_entities<G: GraphStore>(
         &self,
         graph: &G,
@@ -1728,15 +1888,15 @@ mod tests {
         let reconciler = Reconciler::new(dir.path().to_path_buf());
 
         let entity_id = EntityId::new();
-        let mut overlay_entity = make_entity("foo", "src/lib.rs");
-        overlay_entity.id = entity_id;
-        overlay_entity.fingerprint.ast_hash = Hash256::from_bytes([0x11; 32]);
+        let mut desired_entity = make_entity("foo", "src/lib.rs");
+        desired_entity.id = entity_id;
+        desired_entity.fingerprint.ast_hash = Hash256::from_bytes([0x11; 32]);
 
         let mut file_entity = make_entity("foo", "src/lib.rs");
         file_entity.id = entity_id;
         file_entity.fingerprint.ast_hash = Hash256::from_bytes([0x22; 32]);
 
-        let conflict = reconciler.detect_conflict(&entity_id, &overlay_entity, &file_entity);
+        let conflict = reconciler.detect_conflict(&entity_id, &desired_entity, &file_entity);
         assert!(conflict.is_some());
         let c = conflict.unwrap();
         assert_eq!(c.kind, ConflictKind::StructuralCollision);
@@ -1769,26 +1929,32 @@ mod tests {
     }
 
     #[test]
-    fn project_empty_overlay() {
+    fn project_empty_transaction() {
         let dir = tempfile::tempdir().unwrap();
         let mut reconciler = Reconciler::new(dir.path().to_path_buf());
-        let overlay = GraphOverlay::default();
-        let (modified, warnings) = reconciler.project_overlay_to_files(&overlay).unwrap();
+        let transaction = TransactionDelta::default();
+        let (modified, warnings) = reconciler
+            .project_transaction_to_files(&transaction, &HashMap::new())
+            .unwrap();
         assert!(modified.is_empty());
         assert!(warnings.is_empty());
     }
 
     #[test]
-    fn project_overlay_rejects_entity_without_source_span() {
+    fn project_transaction_rejects_entity_without_source_span() {
         let dir = tempfile::tempdir().unwrap();
         let mut reconciler = Reconciler::new(dir.path().to_path_buf());
-        let mut overlay = GraphOverlay::default();
         let mut entity = make_entity("missing_body", "src/lib.rs");
         entity.span = None;
         let entity_id = entity.id;
-        overlay.entity_mods.insert(entity_id, entity);
+        let mut old = entity.clone();
+        old.fingerprint.ast_hash = Hash256::from_bytes([0; 32]);
+        let transaction = TransactionDelta {
+            entity_deltas: vec![EntityDelta::Modified { old, new: entity }],
+            ..TransactionDelta::default()
+        };
 
-        let result = reconciler.project_overlay_to_files(&overlay);
+        let result = reconciler.project_transaction_to_files(&transaction, &HashMap::new());
         match result.unwrap_err() {
             ReconcileError::BodyExtractionFailed {
                 entity_id: failed_id,
@@ -1799,6 +1965,21 @@ mod tests {
             }
             other => panic!("expected BodyExtractionFailed, got: {:?}", other),
         }
+    }
+
+    #[test]
+    fn project_transaction_rejects_unbound_entity_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut reconciler = Reconciler::new(dir.path().to_path_buf());
+        let entity_id = EntityId::new();
+        let entity_bodies = HashMap::from([(entity_id, b"fn unbound() {}".to_vec())]);
+
+        let error = reconciler
+            .project_transaction_to_files(&TransactionDelta::default(), &entity_bodies)
+            .unwrap_err();
+
+        assert!(matches!(error, ReconcileError::InvalidTransaction(_)));
+        assert!(error.to_string().contains(&entity_id.to_string()));
     }
 
     // ---------------------------------------------------------------
@@ -2015,19 +2196,24 @@ mod tests {
     }
 
     #[test]
-    fn project_overlay_blocked_by_collision() {
-        // Verify that project_overlay_to_files rejects when checker blocks.
+    fn project_transaction_blocked_by_collision() {
+        // Verify that project_transaction_to_files rejects when checker blocks.
         let dir = tempfile::tempdir().unwrap();
         let mut reconciler = Reconciler::new(dir.path().to_path_buf());
         reconciler.set_traffic_checker(Box::new(MockTrafficChecker::blocked()));
         reconciler.set_session_id(SessionId::new());
 
         let entity_id = EntityId::new();
-        let mut overlay = GraphOverlay::default();
-        let entity = make_entity("blocked_fn", "src/lib.rs");
-        overlay.entity_mods.insert(entity_id, entity);
+        let mut entity = make_entity("blocked_fn", "src/lib.rs");
+        entity.id = entity_id;
+        let mut old = entity.clone();
+        old.fingerprint.ast_hash = Hash256::from_bytes([0; 32]);
+        let transaction = TransactionDelta {
+            entity_deltas: vec![EntityDelta::Modified { old, new: entity }],
+            ..TransactionDelta::default()
+        };
 
-        let result = reconciler.project_overlay_to_files(&overlay);
+        let result = reconciler.project_transaction_to_files(&transaction, &HashMap::new());
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
@@ -2782,8 +2968,8 @@ mod tests {
             ))
             .unwrap();
         // 5. Manual same-file: entity_a → OwnedBy → stale_entity.
-        //    Even though both endpoints are in file_a, Manual origin means reconcile
-        //    must NOT remove it (it was not produced by the parser).
+        //    Removing stale_entity requires this relation's complete old state to
+        //    be removed in the same exact transaction, regardless of origin.
         graph
             .upsert_relation(&make_rel(
                 manual_same_file_rel_id,
@@ -2794,15 +2980,14 @@ mod tests {
             ))
             .unwrap();
 
-        // Seed the reconciler LKG with the file_a entities so `has_changed` returns
-        // false for entity_a (no modification → no entity_mods in the overlay).
+        // Seed the reconciler LKG with the file_a entities.
         let mut reconciler = Reconciler::new(dir.path().to_path_buf());
         reconciler.lkg.record(entity_a.clone(), vec![]);
         reconciler.lkg.record(stale_entity.clone(), vec![]);
 
         // Construct an IndexedFile that represents a re-parse of file_a:
         //   - entity_a is present (same name/kind → matched, no fingerprint change)
-        //   - stale_entity is absent → will go into entity_removes
+        //   - stale_entity is absent → produces an exact removal
         //   - relations is empty → no same-file relations re-derived
         let indexed = IndexedFile {
             file_id: FilePathId::new(file_a),
@@ -2825,45 +3010,54 @@ mod tests {
             imports: vec![],
         };
 
-        let mut overlay = GraphOverlay::default();
-        reconciler
+        let result = reconciler
             .reconcile_file_edit_inner(
                 &indexed,
                 &FilePathId::new(file_a),
                 &file_a_path,
                 &blob_store,
                 &graph,
-                &mut overlay,
             )
             .expect("reconcile_file_edit_inner should succeed");
+        let removed_relation_ids: HashSet<_> = result
+            .delta
+            .relation_deltas
+            .iter()
+            .filter_map(|delta| match delta {
+                RelationDelta::Removed { old } => Some(old.id),
+                RelationDelta::Added { .. } | RelationDelta::Modified { .. } => None,
+            })
+            .collect();
 
         // --- Relation survival assertions ---
 
         assert!(
-            !overlay.relation_removes.contains(&cross_file_rel_id),
+            !removed_relation_ids.contains(&cross_file_rel_id),
             "cross-file Parsed edge must NOT be removed by single-file reconcile"
         );
         assert!(
-            !overlay.relation_removes.contains(&manual_rel_id),
+            !removed_relation_ids.contains(&manual_rel_id),
             "Manual relation must NOT be removed by reconcile"
         );
         assert!(
-            !overlay.relation_removes.contains(&lsp_rel_id),
+            !removed_relation_ids.contains(&lsp_rel_id),
             "Lsp relation must NOT be removed by reconcile"
         );
         assert!(
-            overlay.relation_removes.contains(&stale_same_file_rel_id),
+            removed_relation_ids.contains(&stale_same_file_rel_id),
             "stale same-file Parsed relation MUST be removed by reconcile"
         );
         assert!(
-            !overlay.relation_removes.contains(&manual_same_file_rel_id),
-            "Manual relation with both endpoints in file must NOT be removed"
+            removed_relation_ids.contains(&manual_same_file_rel_id),
+            "relation to a removed entity must be removed atomically"
         );
 
         // --- Entity removal assertion ---
         assert!(
-            overlay.entity_removes.contains(&stale_entity.id),
-            "stale_entity must be in entity_removes (absent from re-parse)"
+            result.delta.entity_deltas.iter().any(
+                |delta| matches!(delta, EntityDelta::Removed { old } if old.id == stale_entity.id)
+            ),
+            "stale_entity must have an exact removal (absent from re-parse)"
         );
     }
 }

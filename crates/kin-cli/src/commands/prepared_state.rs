@@ -1,16 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde::Serialize;
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const PREPARED_PUBLISH_SCHEMA: &str = "kin.prepared-state.publish.v1";
-const PREPARED_MATERIALIZE_SCHEMA: &str = "kin.prepared-state.materialize.v1";
-const PREPARED_MANIFEST_SCHEMA: &str = "kin.prepared-state.v1";
+/// Manifest field naming the repository-v6 store a prepared state carries.
+const REPOSITORY_ID_KEY: &str = "repository_id";
+/// Manifest field naming that store's authority generation.
+const AUTHORITY_GENERATION_KEY: &str = "authority_generation";
+
+const PREPARED_PUBLISH_SCHEMA: &str = "kin.prepared-state.publish.v2";
+const PREPARED_MATERIALIZE_SCHEMA: &str = "kin.prepared-state.materialize.v2";
+const PREPARED_MANIFEST_SCHEMA: &str = "kin.prepared-state.v2";
 const EMBEDDED_PREPARED_MANIFEST: &str = ".kin/bench/prepared-manifest.json";
 
 const VALIDATION_KEYS: &[&str] = &[
@@ -18,7 +23,7 @@ const VALIDATION_KEYS: &[&str] = &[
     "repo_identity",
     "git_head",
     "git_tree",
-    "init_pipeline_epoch",
+    "graph_build_pipeline_epoch",
     "parser_schema_epoch",
     "layout_schema_version",
     "graph_snapshot_version",
@@ -66,7 +71,8 @@ pub async fn publish(target: PathBuf, json: bool) -> Result<()> {
         bail!("not a Kin repository (no .kin/ found)");
     }
 
-    let manifest = expected_manifest(&repo_path)?;
+    let mut manifest = expected_manifest(&repo_path)?;
+    stamp_repository_authority_identity(&mut manifest, &kin_dir)?;
     if prepared_state_expects_vectors(&manifest) {
         require_complete_prepared_embeddings(&kin_dir)?;
     }
@@ -168,12 +174,13 @@ fn validate_prepared_state(prepared_dir: &Path, expected_manifest: &Value) -> Re
             bail!("prepared artifact missing {}", relative_path.display());
         }
     }
+    require_matching_repository_authority_identity(&prepared_dir.join(".kin"), &actual_manifest)?;
 
     // When the prepared state declares an embeddings-capable runtime, the
     // vector sidecar is part of the graph-native truth a reuse must restore.
-    // Without this check a vector-blind prepared dir (graph.kndb but no
-    // graph.kvec) validates as "good" and reuse silently re-opens with an empty
-    // index — the dormant-index trap. Non-embedded runtimes
+    // Without this check a vector-blind prepared dir (graph and text index but
+    // no graph.kvec) validates as "good" and reuse silently re-opens with an
+    // empty index — the dormant-index trap. Non-embedded runtimes
     // (embeddings_enabled = false) are valid and skip this requirement.
     if prepared_state_expects_vectors(&actual_manifest) {
         for relative_path in required_vector_entries() {
@@ -191,16 +198,138 @@ fn validate_prepared_state(prepared_dir: &Path, expected_manifest: &Value) -> Re
     Ok(actual_manifest)
 }
 
+/// The repository-v6 store a `.kin` directory carries, opened through the same
+/// retained-authority read path the daemon and CLI use.
+///
+/// Repository-v6 keeps the graph under `.kin/kindb/<repository-id>/snapshots/`
+/// and names the current generation in that namespace's authority record. The
+/// retired single-file `.kin/kindb/graph.kndb` is never written, so prepared
+/// state must resolve the snapshot through authority rather than address a
+/// fixed file name. Opening the manager also decodes and digest-checks that
+/// snapshot, which is a stronger guarantee than the path existing.
+struct PreparedRepositoryAuthority {
+    repository_id: String,
+    generation: u64,
+    #[cfg(feature = "vector")]
+    graph: kin_db::InMemoryGraph,
+}
+
+fn open_prepared_repository_authority(kin_dir: &Path) -> Result<PreparedRepositoryAuthority> {
+    let layout = kin_core::KinLayout::new(kin_dir.to_path_buf());
+    let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&layout)
+        .with_context(|| format!("open repository authority at {}", kin_dir.display()))?;
+    let manager = binding.open_manager().map_err(|error| {
+        anyhow!(
+            "open repository authority at {}: {error}",
+            kin_dir.display()
+        )
+    })?;
+    let lease = manager.read_authority();
+    let generation = lease.roots().generation;
+    let workspace_id = binding.workspace_id();
+    // Same workspace-scoped materialization the daemon loads its query graph
+    // from, so prepared-state coverage is measured against the graph a reuse
+    // will actually serve.
+    let workspace_snapshot = lease
+        .workspace_graph_snapshot(&workspace_id)
+        .map_err(|error| {
+            anyhow!(
+                "resolve workspace {workspace_id} graph at {}: {error}",
+                kin_dir.display()
+            )
+        })?
+        .ok_or_else(|| {
+            anyhow!(
+                "repository authority at {} has no manifest workspace {workspace_id}",
+                kin_dir.display()
+            )
+        })?;
+    // Decoding stays unconditional: it is the digest check that proves the
+    // authority snapshot is intact, even when no vector validation retains it.
+    let graph = kin_db::InMemoryGraph::from_snapshot(workspace_snapshot)
+        .map_err(|error| anyhow!("decode repository graph at {}: {error}", kin_dir.display()))?;
+    #[cfg(not(feature = "vector"))]
+    let _ = graph;
+    Ok(PreparedRepositoryAuthority {
+        repository_id: binding.repository_id().to_string(),
+        generation,
+        #[cfg(feature = "vector")]
+        graph,
+    })
+}
+
+/// Record which repository-v6 store and generation this prepared state carries.
+fn stamp_repository_authority_identity(manifest: &mut Value, kin_dir: &Path) -> Result<()> {
+    let authority = open_prepared_repository_authority(kin_dir)?;
+    let object = manifest
+        .as_object_mut()
+        .context("prepared manifest is not a JSON object")?;
+    object.insert(
+        REPOSITORY_ID_KEY.to_string(),
+        Value::String(authority.repository_id),
+    );
+    object.insert(
+        AUTHORITY_GENERATION_KEY.to_string(),
+        Value::from(authority.generation),
+    );
+    Ok(())
+}
+
+/// Reject a prepared state whose manifest does not describe the repository-v6
+/// store its own payload carries. Identity here is the repository id plus the
+/// authority generation, never a snapshot file path: the file name is a
+/// projection of the generation, so comparing paths would accept a payload from
+/// a different store that happens to sit at the same generation.
+fn require_matching_repository_authority_identity(kin_dir: &Path, manifest: &Value) -> Result<()> {
+    let authority = open_prepared_repository_authority(kin_dir)?;
+    let declared_repository = manifest
+        .get(REPOSITORY_ID_KEY)
+        .and_then(Value::as_str)
+        .with_context(|| format!("prepared manifest missing string field {REPOSITORY_ID_KEY}"))?;
+    if declared_repository != authority.repository_id {
+        bail!(
+            "repository identity mismatch: manifest declares {declared_repository}, prepared \
+             state carries {}",
+            authority.repository_id
+        );
+    }
+    let declared_generation = manifest
+        .get(AUTHORITY_GENERATION_KEY)
+        .and_then(Value::as_u64)
+        .with_context(|| {
+            format!("prepared manifest missing integer field {AUTHORITY_GENERATION_KEY}")
+        })?;
+    if declared_generation != authority.generation {
+        bail!(
+            "authority generation mismatch: manifest declares {declared_generation}, prepared \
+             state carries {}",
+            authority.generation
+        );
+    }
+    Ok(())
+}
+
 #[cfg(feature = "vector")]
 fn require_complete_prepared_embeddings(kin_dir: &Path) -> Result<()> {
-    let graph_path = kin_dir.join("kindb/graph.kndb");
-    let vector_path = kin_dir.join("kindb/graph.kvec");
-    let snapshot = kin_db::SnapshotManager::open_read_only(&graph_path)
-        .with_context(|| format!("open prepared graph {}", graph_path.display()))?;
-    let graph = snapshot.graph();
-    graph
-        .load_vector_index(&vector_path)
-        .with_context(|| format!("load prepared vector index {}", vector_path.display()))?;
+    let layout = kin_core::KinLayout::new(kin_dir.to_path_buf());
+    // The vector index is a derived sidecar that repository-v6 still keeps at
+    // `.kin/kindb/graph.kvec`, next to the other derived indexes, so its path
+    // stays layout-derived even though the graph itself moved into the
+    // per-repository authority namespace.
+    let vector_path = layout.kindb_vector_index_path();
+    let graph = open_prepared_repository_authority(kin_dir)?.graph;
+    let loaded = kin_db::SnapshotManager::load_vector_index_into_graph_if_valid(
+        &graph,
+        &layout.kindb_snapshot_path(),
+        None,
+    )
+    .with_context(|| format!("validate prepared vector index {}", vector_path.display()))?;
+    if !loaded {
+        bail!(
+            "prepared vector index {} is missing or incompatible with its graph/model metadata",
+            vector_path.display()
+        );
+    }
     let status = graph.embedding_status();
     if status.indexed != status.total || status.pending != 0 {
         bail!(
@@ -237,7 +366,7 @@ fn required_prepared_entries() -> &'static [PathBuf] {
             vec![
                 PathBuf::from(".kin"),
                 PathBuf::from(".kin/version"),
-                PathBuf::from(".kin/kindb/graph.kndb"),
+                PathBuf::from(".kin/manifest.json"),
                 PathBuf::from(".kin/kindb/text-index"),
                 PathBuf::from(EMBEDDED_PREPARED_MANIFEST),
             ]
@@ -402,28 +531,33 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// Build a prepared dir with the always-required base artifacts and a
-    /// manifest. `with_vectors` controls whether the optional vector sidecar is
-    /// written; the manifest flags control whether validation should require it.
+    /// Build a prepared dir over a real repository-v6 store, plus a manifest
+    /// stamped with that store's identity. `with_vectors` controls whether the
+    /// optional vector sidecar is written; the manifest flags control whether
+    /// validation should require it.
     fn make_prepared_dir(
         dir: &Path,
         embeddings_enabled: bool,
         vector_enabled: bool,
         with_vectors: bool,
     ) -> Value {
-        let kindb = dir.join(".kin/kindb");
-        fs::create_dir_all(kindb.join("text-index")).unwrap();
-        fs::write(dir.join(".kin/version"), "1").unwrap();
-        fs::write(kindb.join("graph.kndb"), b"kndb").unwrap();
+        let initialized = kin_core::init(dir).expect("initialize prepared repository");
+        let layout = initialized.layout;
+        let kindb = layout.kindb_dir();
+        fs::create_dir_all(layout.text_index_dir()).unwrap();
         if with_vectors {
-            fs::write(kindb.join("graph.kvec"), b"kvec").unwrap();
+            fs::write(layout.kindb_vector_index_path(), b"kvec").unwrap();
             fs::write(kindb.join("graph.kvec.meta.json"), b"{}").unwrap();
         }
+        let authority = open_prepared_repository_authority(layout.root())
+            .expect("read prepared repository authority");
 
         let mut manifest = json!({
             "schema": PREPARED_MANIFEST_SCHEMA,
             "embeddings_enabled": embeddings_enabled,
             "vector_enabled": vector_enabled,
+            REPOSITORY_ID_KEY: authority.repository_id,
+            AUTHORITY_GENERATION_KEY: authority.generation,
         });
         // Every validation key must be present (and matched) for the
         // expected/actual comparison to pass; fill the rest with stable stubs.
@@ -500,7 +634,7 @@ mod tests {
             .expect_err("invalid vector sidecar must be rejected when embeddings expected");
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("open prepared graph") || msg.contains("load prepared vector index"),
+            msg.contains("validate prepared vector index") && msg.contains("graph.kvec"),
             "error should explain coverage validation failed, got: {msg}"
         );
     }

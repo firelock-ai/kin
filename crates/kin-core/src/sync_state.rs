@@ -44,9 +44,8 @@ impl SyncStateStore {
     /// Persist to `.kin/sync_state.json`.
     pub fn save(&self, layout: &KinLayout) -> crate::Result<()> {
         let path = layout.sync_state_path();
-        let json = serde_json::to_string_pretty(self).map_err(|e| {
-            crate::KinError::io(&path, std::io::Error::new(std::io::ErrorKind::Other, e))
-        })?;
+        let json = serde_json::to_string_pretty(self)
+            .map_err(|e| crate::KinError::io(&path, std::io::Error::other(e)))?;
         std::fs::write(&path, json).map_err(|e| crate::KinError::io(&path, e))
     }
 

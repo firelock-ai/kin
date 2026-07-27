@@ -170,6 +170,22 @@ fn paint_impact(line: &str) -> String {
 fn paint_clone(line: &str) -> String {
     static EXTRACTED: OnceLock<Regex> = OnceLock::new();
     static DURATION: OnceLock<Regex> = OnceLock::new();
+    static ADMITTED_FIELD: OnceLock<Regex> = OnceLock::new();
+
+    if line.starts_with("Cloned Git transport and admitted exact Kin repository authority at ") {
+        return format!("{GREEN}{line}{RESET}");
+    }
+
+    // The indented field rows of the admission summary. The labels are
+    // enumerated rather than matched generically so an unrelated indented
+    // `label: value` line still passes through untouched.
+    let admitted_field = compiled(
+        &ADMITTED_FIELD,
+        r"^  (Repository|Workspace|Authority generation|Semantic enrichment): (.+)$",
+    );
+    if let Some(caps) = admitted_field.captures(line) {
+        return format!("  {DIM}{}:{RESET} {BRIGHT}{}{RESET}", &caps[1], &caps[2]);
+    }
 
     if line == "=== Kin Migration Complete ===" {
         return format!("{BOLD}{line}{RESET}");
@@ -306,6 +322,32 @@ mod tests {
 
         let empty = "  No local downstream impact found.";
         assert_eq!(paint_impact(empty), empty);
+    }
+
+    #[test]
+    fn clone_admission_summary_lines_are_painted() {
+        let admitted =
+            "Cloned Git transport and admitted exact Kin repository authority at demo-repo";
+        assert_painted(&paint_clone(admitted), admitted, GREEN);
+
+        let repository = "  Repository: 0c8f1d6a-4b2e-4f3a-9d51-6d0b7f2c1a44";
+        let painted = paint_clone(repository);
+        assert_painted(&painted, repository, &format!("{DIM}Repository:{RESET}"));
+        assert!(painted.contains(&format!("{BRIGHT}0c8f1d6a-4b2e-4f3a-9d51-6d0b7f2c1a44")));
+
+        let generation = "  Authority generation: 1";
+        assert_painted(
+            &paint_clone(generation),
+            generation,
+            &format!("{BRIGHT}1{RESET}"),
+        );
+
+        let enrichment = "  Semantic enrichment: not run";
+        assert_painted(
+            &paint_clone(enrichment),
+            enrichment,
+            &format!("{BRIGHT}not run{RESET}"),
+        );
     }
 
     #[test]

@@ -1,41 +1,69 @@
 {
-  "comment": "Replay-semantics surface pinned by scripts/verify-hydration-semantics.py. These functions re-author the entity/relation deltas persisted for multi-parent (merge) changes during history hydration, so editing one changes what Kin reports about the past on already-ingested repositories. A digest mismatch is not a failure to fix by regenerating: decide first whether replay semantics changed, and if so bump HYDRATION_SEMANTICS_VERSION and hydration_semantics_version together.",
-  "hydration_semantics_version": 3,
+  "comment": "Replay-semantics surface pinned by scripts/verify-hydration-semantics.py. These functions re-author the entity/relation deltas persisted for historical changes during Git admission, so editing one changes what Kin reports about the past on already-ingested repositories. A digest mismatch is not a failure to fix by regenerating: decide first whether replay semantics changed, and if so bump HYDRATION_SEMANTICS_VERSION and hydration_semantics_version together.",
+  "hydration_semantics_version": 4,
   "guarded": [
     {
-      "file": "crates/kin-cli/src/commands/init.rs",
-      "function": "replay_imported_secondary_parents",
-      "digest": "sha256:a35363a3609e9f63c7a1289f8d437ccb662152caa1a80f1e905926a2938e7866",
-      "reason": "Walks each secondary parent's unique ancestry to build the all-parent runtime baseline a merge is rebased onto. Its DFS order and visited-marking rule decide which changes contribute, and so decide the merge's persisted deltas.",
-      "owner": "kin-cli"
+      "file": "crates/kin-index/src/history.rs",
+      "function": "derive_historical_semantic_deltas",
+      "digest": "sha256:defd5579325f7b159b1aff73498622a72156c64579319d31ceec0b35f85fa2cf",
+      "reason": "Drives the whole parent-first replay: it decides the per-change baseline, which trees are enriched, and the exact EntityDelta/RelationDelta payload persisted for every historical change.",
+      "owner": "kin-index"
     },
     {
-      "file": "crates/kin-cli/src/commands/init.rs",
-      "function": "rebase_imported_merge_semantic_deltas",
-      "digest": "sha256:09ea99ef84c3bd580773e4ece8f819ddb71b963fdc33c7b46d21eadd1852a601",
-      "reason": "Diffs the all-parent baseline against the merge target and REPLACES the merge change's entity_deltas and relation_deltas outright. This function is the direct author of every merge change's persisted payload.",
-      "owner": "kin-cli"
+      "file": "crates/kin-index/src/history.rs",
+      "function": "semantic_state_for_tree",
+      "digest": "sha256:f91a92ef3090a8c8622badfb59bd59f4032729c5caf35e331f7014c72dc06e80",
+      "reason": "Turns one exact resolved tree plus CAS bodies into the entity/relation state a change is diffed from and to. Its classification, parse, and cross-file linking order decide what the past is said to contain.",
+      "owner": "kin-index"
     },
     {
-      "file": "crates/kin-cli/src/commands/init.rs",
-      "function": "apply_imported_change_to_runtime_state",
-      "digest": "sha256:a2789e4d2aa3de44f5dcd1ffeaf05cb77f16df4154969cf7cbb53ac087c21f0f",
-      "reason": "The live entity/relation fold the baseline replay is built from, kept field-for-field aligned with kin-model's authoritative replay_graph_state. A divergence here silently shifts the baseline every merge is diffed against.",
-      "owner": "kin-cli"
+      "file": "crates/kin-index/src/history.rs",
+      "function": "stabilize_historical_entities",
+      "digest": "sha256:257511e43f2742ae16e93bc62f4aa760211c98c8359e566200820c568035fd9a",
+      "reason": "Carries entity identity across changes. Whether an entity is recognized as the same one decides whether history records a modification or an unrelated add and remove pair.",
+      "owner": "kin-index"
     },
     {
-      "file": "crates/kin-cli/src/commands/init.rs",
-      "function": "imported_entities_exactly_equivalent",
-      "digest": "sha256:6b6a9824a6c69f477da250e81a88c9380002398f336e04bb94d5d86b3dce2977",
-      "reason": "Decides whether a baseline entity and its target counterpart are the same, and therefore whether the merge emits a Modified delta or nothing at all.",
-      "owner": "kin-cli"
+      "file": "crates/kin-index/src/history.rs",
+      "function": "historical_entity_id",
+      "digest": "sha256:14d296f75dc4272e185022e1b89e05fb881d69f1e3d3cd3e9e866ebc3d91d894",
+      "reason": "Derives the deterministic identity an entity keeps across replayed history. Changing the inputs to this digest renames every historical entity.",
+      "owner": "kin-index"
     },
     {
-      "file": "crates/kin-cli/src/commands/init.rs",
-      "function": "imported_relations_exactly_equivalent",
-      "digest": "sha256:cfad3ea32fd6f44d7a57badb4470c8dad5adb444a4f179cf7ef6b706dd28433f",
-      "reason": "The relation-side equivalence predicate: decides whether a relation is rewritten as a Removed+Added pair in the merge's persisted deltas.",
-      "owner": "kin-cli"
+      "file": "crates/kin-index/src/history.rs",
+      "function": "diff_entities",
+      "digest": "sha256:e08884968c21d70e5047d6a59bf376e9bb45a7453ee9fe389bcc5bdf452237b3",
+      "reason": "Emits the entity deltas persisted for a change. Its equivalence rule decides whether a change is recorded as touching an entity at all.",
+      "owner": "kin-index"
+    },
+    {
+      "file": "crates/kin-index/src/history.rs",
+      "function": "diff_relations",
+      "digest": "sha256:5ac6f2a728673b7c5304a2d7fce99bf5f3ab3dc83d6b81745c06c33d5531777a",
+      "reason": "Emits the relation deltas persisted for a change, and so authors the historical edge set every trace and cross-reference over the past reads.",
+      "owner": "kin-index"
+    },
+    {
+      "file": "crates/kin-git/src/semantic_import.rs",
+      "function": "apply_historical_semantic_deltas_unchecked",
+      "digest": "sha256:fb52c2fa33c8c43e90a32750ef21d0f11fab01552f9cffaf76bb7cf5aa6709ad",
+      "reason": "Writes the derived deltas onto the imported changes and recomputes their identities. This is the step that makes replayed semantics the persisted historical record.",
+      "owner": "kin-git"
+    },
+    {
+      "file": "crates/kin-git/src/semantic_import.rs",
+      "function": "build_semantic_git_import_plan",
+      "digest": "sha256:7a40b21ecef701fbbaaad7639ef2bcb070bca479d06bc440cf86b392eb78ae1e",
+      "reason": "Builds the parent-first change sequence and tree map replay consumes. Its ordering and tree selection decide the baseline every historical delta is computed against.",
+      "owner": "kin-git"
+    },
+    {
+      "file": "crates/kin-git/src/semantic_import.rs",
+      "function": "assign_artifact_identities",
+      "digest": "sha256:9665b558bbd0b395f455a9db301c7d1769ceb17ccbe99f7bd92ec62440cb50e3",
+      "reason": "Assigns the stable artifact identities trees and entities are keyed by across the imported history. Reassignment here silently repoints every historical file.",
+      "owner": "kin-git"
     }
   ]
 }

@@ -35,17 +35,16 @@ pub enum McpMutationPayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpMutationOperation {
     pub verb: String,
-    /// Legacy compat target; the tool schema declares it optional with default "".
-    #[serde(default)]
+    /// Exact repository entity ID for entity payloads; empty for relation
+    /// payloads, which identify themselves by endpoint and kind.
     pub target: String,
     pub payload: Option<McpMutationPayload>,
-    /// New full UTF-8 source text for an entity body edit. When present on an
-    /// entity update, the post-commit graph→file projection writes this text
-    /// into the working-directory file (via `GraphOverlay.entity_bodies`)
-    /// instead of re-splicing the file's own bytes at the entity span. This is
-    /// the channel that lets an agent express "this entity's new source is X" so
-    /// the file actually reflects the graph mutation. Absent for metadata-only
-    /// edits, relation/blob ops, and creates with no file placement yet.
+    /// New full UTF-8 source text for an entity body edit. The product daemon
+    /// splices this body into exact repository-CAS bytes in memory, reparses the
+    /// resulting complete file, and publishes semantic change + exact tree +
+    /// workspace/ref authority through one repository transaction. It is
+    /// absent for relation operations; source-bound metadata-only edits fail
+    /// closed because they cannot produce exact source truth.
     #[serde(default)]
     pub body: Option<String>,
     pub description: String,
@@ -74,6 +73,15 @@ pub struct McpTransaction {
     pub scope: String,
     pub state: String,
     pub staged_operations: Vec<McpMutationOperation>,
+    /// Canonical digest of the exact staged operation set being committed.
+    ///
+    /// Daemon-owned repository commits persist `state = "committing"` and
+    /// this digest before moving repository authority. A restart can then
+    /// distinguish an idempotent receipt recovery from a transaction whose
+    /// payload was changed after publication began. Unfenced active
+    /// transactions carry no digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_payload_hash: Option<String>,
 }
 
 /// Linearized outcome of an in-process intent registration attempt.
@@ -935,6 +943,7 @@ impl SessionRegistry {
             scope: scope.to_string(),
             state: "active".to_string(),
             staged_operations: Vec::new(),
+            commit_payload_hash: None,
         };
 
         self.transactions
@@ -999,7 +1008,7 @@ impl SessionRegistry {
             .lock()
             .expect("transactions lock poisoned");
         if let Some(tx) = map.get_mut(transaction_id) {
-            if tx.state != "active" && tx.state != "validated" {
+            if tx.state != "active" && tx.state != "validated" && tx.state != "committing" {
                 return Err(format!(
                     "Cannot commit transaction {} in state: {}",
                     transaction_id, tx.state
@@ -1034,6 +1043,71 @@ impl SessionRegistry {
             .expect("transactions lock poisoned")
             .get(transaction_id)
             .cloned()
+    }
+
+    /// Persistently fence one daemon-owned transaction before repository
+    /// authority can move.
+    ///
+    /// Re-entering with the same digest is idempotent and supports recovery
+    /// after a crash or an indeterminate durable-install acknowledgement.
+    /// Re-entering with a different digest fails closed.
+    pub fn prepare_transaction_commit(
+        &self,
+        transaction_id: &str,
+        payload_hash: &str,
+    ) -> std::result::Result<McpTransaction, String> {
+        let mut map = self
+            .transactions
+            .lock()
+            .expect("transactions lock poisoned");
+        let tx = map
+            .get_mut(transaction_id)
+            .ok_or_else(|| format!("Transaction not found: {transaction_id}"))?;
+        match tx.state.as_str() {
+            "active" | "validated" => {
+                tx.state = "committing".to_string();
+                tx.commit_payload_hash = Some(payload_hash.to_string());
+                Ok(tx.clone())
+            }
+            "committing"
+                if tx.commit_payload_hash.as_deref() == Some(payload_hash) =>
+            {
+                Ok(tx.clone())
+            }
+            "committing" => Err(format!(
+                "Cannot resume transaction {transaction_id}: the staged payload differs from the persisted committing payload"
+            )),
+            _ => Err(format!(
+                "Cannot prepare transaction {} in state: {}",
+                transaction_id, tx.state
+            )),
+        }
+    }
+
+    /// Return a failed pre-publication attempt to an editable state.
+    ///
+    /// This is only valid while no repository receipt exists. Once authority
+    /// may have moved, callers retain `committing` and recover by operation ID.
+    pub fn reset_transaction_commit(
+        &self,
+        transaction_id: &str,
+    ) -> std::result::Result<McpTransaction, String> {
+        let mut map = self
+            .transactions
+            .lock()
+            .expect("transactions lock poisoned");
+        let tx = map
+            .get_mut(transaction_id)
+            .ok_or_else(|| format!("Transaction not found: {transaction_id}"))?;
+        if tx.state != "committing" {
+            return Err(format!(
+                "Cannot reset transaction {} in state: {}",
+                transaction_id, tx.state
+            ));
+        }
+        tx.state = "active".to_string();
+        tx.commit_payload_hash = None;
+        Ok(tx.clone())
     }
 
     /// Snapshot every transaction currently held by this registry.
@@ -1078,17 +1152,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mutation_operation_deserializes_without_target() {
-        // The tool schema declares `target` optional with default "";
-        // the deserializer must accept schema-conformant payloads that omit it.
+    fn mutation_operation_rejects_missing_exact_target_field() {
         let json = serde_json::json!({
             "verb": "update",
-            "description": "schema-conformant op without target"
+            "description": "malformed op without target"
         });
-        let op: McpMutationOperation =
-            serde_json::from_value(json).expect("operation without target must deserialize");
-        assert_eq!(op.target, "");
-        assert_eq!(op.verb, "update");
+        let error = serde_json::from_value::<McpMutationOperation>(json)
+            .expect_err("operation without the schema-required target must fail");
+        assert!(error.to_string().contains("target"));
     }
 
     #[test]

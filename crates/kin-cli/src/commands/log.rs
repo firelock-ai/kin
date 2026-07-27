@@ -1,9 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
+//! Immutable repository-v6 history reads.
+//!
+//! Log resolves the active workspace base through one repository authority
+//! lease, then walks the graph-owned semantic change DAG. It never asks Git,
+//! legacy branch state, a daemon-owned graph, or checkout files for history.
+
+use std::collections::{BTreeSet, VecDeque};
+
 use anyhow::{Context, Result};
-use kin_model::ChangeStore;
+use kin_model::{
+    AuthorId, ChangeOrigin, RefTarget, RepositoryId, RootBundle, SemanticChangeId, Timestamp,
+    WorkspaceHead, WorkspaceId,
+};
 use serde::{Deserialize, Serialize};
+
+use super::repository_authority::ActiveRepositoryAuthority;
+
+pub const LOG_SCHEMA: &str = "kin.log.v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogRequest {
@@ -14,74 +29,210 @@ pub struct LogRequest {
 pub struct LogResponse {
     #[serde(default)]
     pub lines: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report: Option<LogReport>,
 }
 
-pub async fn run(count: usize) -> Result<()> {
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LogEntry {
+    pub change_id: SemanticChangeId,
+    pub depth: usize,
+    pub origin: ChangeOrigin,
+    /// Exact parent order from the immutable semantic change.
+    pub parents: Vec<SemanticChangeId>,
+    pub timestamp: Timestamp,
+    pub author: AuthorId,
+    pub message: String,
+    pub entity_delta_count: usize,
+    pub relation_delta_count: usize,
+    pub tree_delta_count: usize,
+    pub admission_policy_changed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LogReport {
+    pub schema: String,
+    pub authority: String,
+    pub repository_id: RepositoryId,
+    pub authority_generation: u64,
+    pub roots: RootBundle,
+    pub workspace_id: WorkspaceId,
+    pub workspace_generation: u64,
+    pub workspace_head: WorkspaceHead,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_target: Option<RefTarget>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_change: Option<SemanticChangeId>,
+    pub requested_count: usize,
+    pub truncated: bool,
+    pub entries: Vec<LogEntry>,
+}
+
+pub fn inspect(
+    binding: &kin_core::LocalRepositoryAuthorityBinding,
+    count: usize,
+) -> Result<LogReport> {
+    let authority = ActiveRepositoryAuthority::open(binding)?;
+    let lease = authority.manager().read_authority();
+    let metadata = lease.metadata();
+    let snapshot = lease.snapshot();
+    let workspace = metadata
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.workspace_id == authority.workspace_id)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "repository {} has no workspace {} in repository-v6 authority",
+                authority.repository_id,
+                authority.workspace_id
+            )
+        })?;
+    workspace
+        .validate()
+        .context("active repository-v6 workspace is invalid")?;
+
+    let start_target = workspace.base_target.clone();
+    let start_change = start_target
+        .as_ref()
+        .map(|target| lease.resolve_target_change_id(target))
+        .transpose()
+        .context("resolve active repository-v6 workspace history")?;
+
+    let mut entries = Vec::with_capacity(count.min(snapshot.changes.len()));
+    let mut scheduled = BTreeSet::new();
+    let mut pending = VecDeque::new();
+    if let Some(change_id) = start_change {
+        scheduled.insert(change_id);
+        pending.push_back((change_id, 0_usize));
+    }
+
+    while entries.len() < count {
+        let Some((change_id, depth)) = pending.pop_front() else {
+            break;
+        };
+        let change = snapshot.changes.get(&change_id).ok_or_else(|| {
+            anyhow::anyhow!(
+                "repository-v6 history target {} is absent from the immutable change DAG",
+                change_id
+            )
+        })?;
+        if change.id != change_id {
+            anyhow::bail!(
+                "repository-v6 history key {} contains mismatched change {}",
+                change_id,
+                change.id
+            );
+        }
+        for parent in &change.parents {
+            if !snapshot.changes.contains_key(parent) {
+                anyhow::bail!(
+                    "repository-v6 change {} names absent parent {}",
+                    change_id,
+                    parent
+                );
+            }
+            if scheduled.insert(*parent) {
+                pending.push_back((*parent, depth + 1));
+            }
+        }
+        entries.push(LogEntry {
+            change_id,
+            depth,
+            origin: change.origin,
+            parents: change.parents.clone(),
+            timestamp: change.timestamp.clone(),
+            author: change.author.clone(),
+            message: change.message.clone(),
+            entity_delta_count: change.entity_deltas.len(),
+            relation_delta_count: change.relation_deltas.len(),
+            tree_delta_count: change.tree_deltas.len(),
+            admission_policy_changed: change.admission_policy_delta.is_some(),
+        });
+    }
+
+    Ok(LogReport {
+        schema: LOG_SCHEMA.to_string(),
+        authority: "repository-v6".to_string(),
+        repository_id: authority.repository_id.clone(),
+        authority_generation: lease.roots().generation,
+        roots: lease.roots().clone(),
+        workspace_id: workspace.workspace_id,
+        workspace_generation: workspace.generation,
+        workspace_head: workspace.head.clone(),
+        start_target,
+        start_change,
+        requested_count: count,
+        truncated: !pending.is_empty(),
+        entries,
+    })
+}
+
+pub fn run(count: usize, json: bool) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let response = run_daemon_log(&layout, &LogRequest { count }).await?;
-    for line in response.lines {
-        println!("{line}");
+    let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&layout)?;
+    let report = inspect(&binding, count)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        for line in render_lines(&report) {
+            println!("{line}");
+        }
     }
     Ok(())
 }
 
-async fn run_daemon_log(layout: &kin_core::KinLayout, request: &LogRequest) -> Result<LogResponse> {
-    let daemon_url = std::env::var("KIN_DAEMON_URL")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .map(Some)
-        .unwrap_or(crate::daemon_client::resolve_daemon_url(layout).await?);
-    let base_url = daemon_url.ok_or_else(|| {
-        anyhow::anyhow!("Kin daemon is required for log but no daemon endpoint is available")
-    })?;
-    let client = crate::daemon_client::DaemonClient::from_base_url(base_url)?;
-    client.log(request).await.context("daemon log failed")
-}
-
 pub fn build_log_response(
-    layout: &kin_core::KinLayout,
-    graph: &kin_db::InMemoryGraph,
+    binding: &kin_core::LocalRepositoryAuthorityBinding,
+    _graph: &kin_db::InMemoryGraph,
     request: &LogRequest,
 ) -> Result<LogResponse> {
-    let current = kin_core::read_current_branch(layout)?;
-    let branch = graph
-        .get_branch(&current)?
-        .ok_or_else(|| anyhow::anyhow!("branch '{}' not found", current))?;
+    let report = inspect(binding, request.count)?;
+    Ok(LogResponse {
+        lines: render_lines(&report),
+        report: Some(report),
+    })
+}
 
-    let mut lines = vec![
-        format!("Semantic change log (branch: {}):", branch.name),
-        format!("  Head: {}", branch.head),
-    ];
-
-    // Walk the change DAG from head
-    let mut current_id = Some(branch.head);
-    let mut shown = 0usize;
-
-    while let Some(id) = current_id {
-        if shown >= request.count {
-            break;
-        }
-        if let Some(change) = graph.get_change(&id)? {
+fn render_lines(report: &LogReport) -> Vec<String> {
+    if report.entries.is_empty() {
+        return vec!["(no changes)".to_string()];
+    }
+    let mut lines = Vec::new();
+    for (position, entry) in report.entries.iter().enumerate() {
+        if position > 0 {
             lines.push(String::new());
-            lines.push(format!("  {} - {}", change.id, change.message));
-            lines.push(format!("    Author: {}", change.author));
-            lines.push(format!("    Time: {}", change.timestamp));
-            lines.push(format!(
-                "    Entities: {} added/modified/removed",
-                change.entity_deltas.len()
-            ));
-            shown += 1;
-            current_id = change.parents.first().copied();
-        } else {
-            break;
         }
+        lines.push(format!("change {}", entry.change_id));
+        lines.push(format!("Author: {}", entry.author));
+        lines.push(format!("Date:   {}", entry.timestamp));
+        lines.push(format!("Origin: {}", render_origin(entry.origin)));
+        if !entry.parents.is_empty() {
+            lines.push(format!(
+                "Parents: {}",
+                entry
+                    .parents
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ));
+        }
+        lines.push(format!(
+            "Deltas: entities={} relations={} tree={} policy={}",
+            entry.entity_delta_count,
+            entry.relation_delta_count,
+            entry.tree_delta_count,
+            entry.admission_policy_changed
+        ));
+        lines.push(format!("    {}", entry.message.replace('\n', "\n    ")));
     }
+    lines
+}
 
-    if shown == 0 {
-        lines.push(String::new());
-        lines.push("  (no changes found)".to_string());
+fn render_origin(origin: ChangeOrigin) -> String {
+    match origin {
+        ChangeOrigin::Native => "native".to_string(),
+        ChangeOrigin::GitCommit { oid } => format!("git commit {oid}"),
     }
-
-    Ok(LogResponse { lines })
 }

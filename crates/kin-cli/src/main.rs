@@ -36,6 +36,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Show which Git-replacement commands are ready on repository-v6
+    Capabilities {
+        /// Output the versioned capability inventory as JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// Initialize a new Kin repository
     Init {
         /// Directory to initialize (defaults to current directory)
@@ -43,26 +49,14 @@ enum Command {
         /// Output machine-readable JSON status instead of human text
         #[arg(long, default_value_t = false)]
         json: bool,
-        /// Skip the Git repository check (init even if .git/ exists)
-        #[arg(long, default_value_t = false)]
-        force: bool,
-        /// Show detailed classification, parsing, and role assignment info
-        #[arg(short, long, default_value_t = false)]
-        verbose: bool,
-        /// Skip LSP enrichment (faster init, tree-sitter only)
-        #[arg(long, default_value_t = false)]
-        no_lsp: bool,
-        /// Git history import depth for detected Git repositories: `off`, `recent`, or `full`
-        #[arg(long, default_value = "recent", value_parser = ["off", "recent", "full"])]
-        git_history: String,
     },
-    /// Show working copy status
+    /// Show coherent repository-v6 workspace status
     Status {
         /// Output machine-readable JSON for editor integrations
         #[arg(long, default_value_t = false)]
         json: bool,
     },
-    /// Create a semantic commit
+    /// [OPEN GATE] Create an exact semantic and artifact commit
     Commit {
         /// Commit message
         #[arg(short, long)]
@@ -70,52 +64,39 @@ enum Command {
         /// Suppress progress output (only print final summary)
         #[arg(short, long)]
         quiet: bool,
-        /// Run the full pipeline but do not save the snapshot or update branch head
-        #[arg(long)]
-        dry_run: bool,
     },
-    /// Show semantic change log
+    /// Show the immutable repository-v6 change log
     Log {
         /// Maximum number of entries
         #[arg(short = 'n', long, default_value = "10")]
         count: usize,
+        /// Output the exact authority-backed report as JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
-    /// Branch operations
+    /// Repository-v6 branch operations (see subcommand readiness)
     Branch {
         #[command(subcommand)]
         action: BranchAction,
     },
-    /// Show entity diff between changes
+    /// Show exact repository-v6 artifact and semantic changes
     Diff {
-        /// Base change ID
+        /// Base ref, change ID, Git object ID, HEAD, or ref-hex:<hex>
         base: Option<String>,
-        /// Head change ID
+        /// Head ref, change ID, Git object ID, WORKSPACE, or ref-hex:<hex>
         head: Option<String>,
+        /// Output the exact authority-backed report as JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
-    /// ⚠ WARNING: Remove Kin metadata from this repository.
+    /// Verify graph-derived projection, install exact Git, and detach Kin.
     ///
-    /// By default (safe): stops the daemon and removes .kin/ graph + metadata.
-    /// Working files are left exactly as they are.
-    ///
-    /// With --revert-files (DESTRUCTIVE): additionally overwrites every working
-    /// file with the pre-init snapshot copy, destroying any uncommitted changes.
-    /// Requires typing "revert" to confirm unless --yes is also given.
-    /// A backup of current files is created before any mutation.
-    ///
-    /// Eject never touches .git: Kin only restores files it snapshotted at init,
-    /// and Git history is left intact. After eject the directory is a plain Git
-    /// repository again.
+    /// Every graph-owned artifact and blob must match one durable authority
+    /// generation before metadata can be detached.
     Eject {
-        /// DESTRUCTIVE: overwrite working files with the pre-init snapshot and
-        /// delete the Kin graph. Requires typing "revert" to confirm (or --yes).
-        #[arg(long)]
-        revert_files: bool,
-        /// Skip typed confirmation for --revert-files (for non-interactive use).
+        /// Skip the typed "eject" confirmation.
         #[arg(long)]
         yes: bool,
-        /// Deprecated: use --yes. Kept for compatibility; has no effect without --revert-files.
-        #[arg(long, hide = true)]
-        force: bool,
     },
     /// Show downstream impact of an entity
     Impact {
@@ -322,8 +303,9 @@ enum Command {
     /// Embeddings enable semantic similarity
     /// search in `kin locate` and `kin search --semantic`.
     ///
-    /// Fast init + progressive embedding: `kin init` builds the graph instantly,
-    /// then `kin embed` adds vector search capability as a separate step.
+    /// Repository admission and enrichment are separate: `kin init` commits
+    /// repository authority; `kin embed` adds vectors for graph-owned entities
+    /// after semantic enrichment exists.
     ///
     /// If a repo was indexed with an older model at a different dimension, pass
     /// `--rebuild` to drop the stale index and re-embed every entity at the
@@ -346,7 +328,7 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Build a semantic rename plan for an entity and its references
+    /// [OPEN GATE] Build a semantic rename plan from graph and source-CAS truth
     Rename {
         /// Entity name or symbol under the cursor
         symbol: String,
@@ -470,7 +452,7 @@ enum Command {
         #[command(subcommand)]
         action: SpecAction,
     },
-    /// Semantic merge from another branch
+    /// [OPEN GATE] Merge semantic and exact-tree changes from another branch
     Merge {
         /// Branch to merge from
         branch: String,
@@ -478,9 +460,9 @@ enum Command {
         #[arg(short, long, default_value = "structural")]
         strategy: String,
     },
-    /// Show active merge conflicts
+    /// [OPEN GATE] Show repository-v6 merge conflicts
     Conflicts,
-    /// Resolve merge conflicts
+    /// [OPEN GATE] Resolve repository-v6 merge conflicts
     Resolve {
         /// Keep your (target branch) version of a conflicting entity
         #[arg(long, value_name = "ENTITY")]
@@ -501,7 +483,7 @@ enum Command {
         #[arg(long)]
         abort: bool,
     },
-    /// Stash working copy state
+    /// [OPEN GATE] Stash exact repository-v6 workspace state
     Stash {
         #[command(subcommand)]
         action: StashAction,
@@ -516,11 +498,6 @@ enum Command {
         /// and semantic changes as `kin:<id>`, `change:<id>`, or bare change IDs.
         #[arg(long = "ref", value_name = "REF")]
         reference: Option<String>,
-    },
-    /// Manage workspaces
-    Workspace {
-        #[command(subcommand)]
-        action: WorkspaceAction,
     },
     /// MCP server commands
     Mcp {
@@ -549,13 +526,13 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Plan or prepare a publish to the default remote
+    /// [OPEN GATE] Plan or prepare an exact publish to the default remote
     Push {
         /// Remote name (defaults to configured default or detected origin)
         #[arg(long)]
         remote: Option<String>,
     },
-    /// Pull changes from a remote
+    /// [OPEN GATE] Pull exact changes from a remote
     #[command(visible_alias = "fetch")]
     Pull {
         /// Remote name (defaults to configured default)
@@ -564,20 +541,18 @@ enum Command {
     },
     /// Clone a repository
     Clone {
-        /// Repository URL (Git or Kin)
+        /// Git repository URL (native Kin transport is an explicit open gate)
         url: String,
         /// Target directory (defaults to repo name)
         path: Option<String>,
     },
-    /// Import a repository (git URL or local path) into Kin
-    Import {
-        /// Repository URL (https/git) or local path
-        url: String,
-    },
-    /// Restore a file from a specific change
+    /// [OPEN GATE] Restore an exact path or subtree from immutable repository-v6 history
     Checkout {
-        /// File path to restore
-        path: String,
+        /// UTF-8 repository path to restore
+        path: Option<String>,
+        /// Byte-exact repository path as canonical lowercase hexadecimal
+        #[arg(long, conflicts_with = "path")]
+        path_hex: Option<String>,
         /// Change ID (defaults to current branch head)
         #[arg(long)]
         change: Option<String>,
@@ -587,12 +562,14 @@ enum Command {
         #[command(subcommand)]
         action: VerifyAction,
     },
-    /// Run a command in a graph-backed session workspace
-    #[command(visible_alias = "run")]
+    /// [OPEN GATE] Run a command in an exact graph-backed session workspace
     Exec {
         /// Command to run (put kin flags before it: `kin exec --keep -- npm test`)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         command: Vec<String>,
+        /// Interpret the command through the platform shell instead of preserving argv boundaries
+        #[arg(long)]
+        shell: bool,
         /// Keep the session workspace after the run and defer reconcile
         #[arg(long)]
         keep: bool,
@@ -667,14 +644,14 @@ enum Command {
         #[arg(long)]
         propagate: bool,
     },
-    /// Analyze semver impact of changes
+    /// [OPEN GATE] Analyze semver impact from immutable repository-v6 changes
     Semver,
     /// Cross-repo release orchestration and per-repo release snapshots
     Release {
         #[command(subcommand)]
         action: ReleaseAction,
     },
-    /// Create a release snapshot (alias of `kin release snapshot`)
+    /// [OPEN GATE] Create a repository-v6 release snapshot
     Tag {
         /// Release tag
         tag: String,
@@ -688,7 +665,7 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
-    /// Rollback to a previous change
+    /// [OPEN GATE] Commit an exact inverse of a previous change
     #[command(visible_alias = "revert")]
     Rollback {
         /// Change ID to rollback to
@@ -703,38 +680,25 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// Run schema migrations
+    /// Migrate an existing Git repository into graph-owned Kin truth
     Migrate {
         /// Source repository path (defaults to current directory)
         source: Option<String>,
-        /// Migration depth: shallow (HEAD only) or deep (full history)
-        #[arg(short, long, default_value = "shallow")]
-        depth: String,
-        /// Resume an interrupted migration from the last checkpoint
+        /// Distinct destination (defaults to an in-place migration)
         #[arg(long)]
-        resume: bool,
+        target: Option<PathBuf>,
     },
     /// Inspect and bound the on-disk embedding cache
     Cache {
         #[command(subcommand)]
         action: CacheAction,
     },
-    /// Reclaim space from the global ~/.kin warm-start cache
-    Gc {
-        /// Report what would be reclaimed without deleting anything
-        #[arg(long)]
-        dry_run: bool,
-        /// Reclaim cache bundles older than this many days (default 14).
-        /// The active (current) bundle of each repo is always preserved.
-        #[arg(long, value_name = "DAYS")]
-        max_age_days: Option<u64>,
-    },
     /// Inspect and validate the semantic graph
     Graph {
         #[command(subcommand)]
         action: GraphAction,
     },
-    /// Git interop commands
+    /// Exact Git interoperability projections
     Git {
         #[command(subcommand)]
         action: GitAction,
@@ -777,9 +741,9 @@ enum Command {
         #[command(subcommand)]
         action: TodoAction,
     },
-    /// Launch an editor in a materialized session workspace
+    /// [OPEN GATE] Launch an editor in an exact graph-derived session workspace
     Open {
-        /// Editor to launch: code, cursor, or any editor command
+        /// Editor to launch: code or cursor
         editor: String,
         /// In native mode, block filesystem discovery commands and require Kin discovery
         #[arg(long)]
@@ -787,11 +751,8 @@ enum Command {
         /// In native mode, block both filesystem discovery and direct file reads
         #[arg(long, conflicts_with = "restrict_discovery")]
         restrict_filesystem: bool,
-        /// Wait for the editor to exit, then reconcile and clean up automatically
-        #[arg(long)]
-        wait: bool,
     },
-    /// Launch an assistant with Kin guidance injected
+    /// [OPEN GATE] Launch an assistant in a graph-derived session
     With {
         /// Assistant to launch: claude, codex, gemini
         assistant: String,
@@ -813,15 +774,15 @@ enum Command {
         #[arg(last = true)]
         task: Vec<String>,
     },
-    /// Reconcile session workspace changes back into the graph
+    /// [OPEN GATE] Admit one exact disposable-session observation into repository-v6 authority
     Reconcile {
         /// Session ID (defaults to most recent session)
         session: Option<String>,
-        /// Remove the session workspace after successful reconciliation
+        /// Confirm an observation that removes more than 75% of a non-trivial tree
         #[arg(long)]
-        cleanup: bool,
+        confirm_mass_deletion: bool,
     },
-    /// Open an interactive shell in a materialized session workspace
+    /// [OPEN GATE] Open a shell in an exact graph-derived session workspace
     Shell {
         /// Materialization strategy
         #[arg(long)]
@@ -938,12 +899,10 @@ enum Command {
         /// Emit the machine-readable health report as JSON
         #[arg(long, default_value_t = false)]
         json: bool,
-        /// Check for graph⇄file drift: on-disk source files that no longer match
-        /// graph truth (edited out of band, deleted, or added)
+        /// [OPEN GATE] Compare an explicit projection observation with graph truth
         #[arg(long, default_value_t = false)]
         drift: bool,
-        /// Restore drifted and missing files from graph truth. Implies --drift;
-        /// explicit invocation only — never runs automatically
+        /// [OPEN GATE] Rematerialize a projection from graph truth. Implies --drift
         #[arg(long, default_value_t = false)]
         heal: bool,
     },
@@ -970,6 +929,33 @@ enum Command {
         #[arg(long, default_value_t = false)]
         check: bool,
     },
+    /// Send a user-facing notification through Kin's own identity
+    Notify {
+        #[command(subcommand)]
+        action: Option<NotifyAction>,
+        /// Notification title
+        #[arg(long)]
+        title: Option<String>,
+        /// Notification body
+        #[arg(long)]
+        body: Option<String>,
+        /// Urgency: info (silent), warn (silent), or urgent (sound, breaks through Focus)
+        #[arg(long, default_value = "info", value_parser = ["info", "warn", "urgent"])]
+        level: String,
+        /// Suppression and replacement identity; reposting under the same key
+        /// replaces the previous notification instead of stacking another
+        #[arg(long)]
+        key: Option<String>,
+        /// With --key: re-notify only after this many seconds have passed
+        #[arg(long)]
+        cooldown: Option<u64>,
+        /// With --key: notify once, then stay quiet until `kin notify clear`
+        #[arg(long, default_value_t = false)]
+        latch: bool,
+        /// Emit the outcome as JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// Manage secrets (org and repo level)
     Secret {
         #[command(subcommand)]
@@ -994,6 +980,24 @@ enum Command {
 }
 
 #[derive(Subcommand)]
+enum NotifyAction {
+    /// Release a latch or cooldown so the next send is delivered
+    Clear {
+        /// The suppression key to forget
+        key: String,
+        /// Emit the result as JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Report which backend would deliver and what is currently held back
+    Status {
+        /// Emit the report as JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum ResourcesAction {
     /// Report the detected resource plan and live daemon embedding state
     Inspect {
@@ -1008,22 +1012,38 @@ enum ResourcesAction {
 
 #[derive(Subcommand)]
 enum BranchAction {
-    /// List branches
-    List,
-    /// Create a new branch
+    /// List byte-exact repository-v6 branch refs
+    List {
+        /// Output exact ref names and targets as JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Create a ref with compare-and-swap
     Create {
-        /// Branch name
-        name: String,
+        /// UTF-8 short branch name or fully-qualified refs/heads/... name
+        #[arg(required_unless_present = "ref_hex", conflicts_with = "ref_hex")]
+        name: Option<String>,
+        /// Canonical lowercase hex for a fully-qualified byte-exact branch ref
+        #[arg(long, value_name = "LOWER_HEX")]
+        ref_hex: Option<String>,
     },
-    /// Delete a branch
+    /// Delete a ref with force-with-lease
     Delete {
-        /// Branch name
-        name: String,
+        /// UTF-8 short branch name or fully-qualified refs/heads/... name
+        #[arg(required_unless_present = "ref_hex", conflicts_with = "ref_hex")]
+        name: Option<String>,
+        /// Canonical lowercase hex for a fully-qualified byte-exact branch ref
+        #[arg(long, value_name = "LOWER_HEX")]
+        ref_hex: Option<String>,
     },
-    /// Switch to a branch
+    /// Switch workspace authority and projection atomically
     Switch {
-        /// Branch name
-        name: String,
+        /// UTF-8 short branch name or fully-qualified refs/heads/... name
+        #[arg(required_unless_present = "ref_hex", conflicts_with = "ref_hex")]
+        name: Option<String>,
+        /// Canonical lowercase hex for a fully-qualified byte-exact branch ref
+        #[arg(long, value_name = "LOWER_HEX")]
+        ref_hex: Option<String>,
     },
 }
 
@@ -1096,33 +1116,6 @@ enum GraphAction {
     Status,
     /// Structural integrity validation
     Validate,
-    /// Recover missing atomic graph authority from explicitly verified graph artifacts
-    RecoverAuthority {
-        /// Explicit repository root containing `.kin/`
-        #[arg(long, value_name = "PATH")]
-        repo: PathBuf,
-        /// Exact legacy head generation expected before recovery
-        #[arg(long)]
-        expected_head_generation: u64,
-        /// Exact SHA-256 of the legacy `graph.kndb` input
-        #[arg(long, value_name = "SHA256")]
-        expected_snapshot_sha256: String,
-        /// Exact recovered graph Merkle root expected after replay
-        #[arg(long, value_name = "HEX")]
-        expected_root: String,
-        /// Expected legacy delta identity, repeated as `GENERATION=SHA256`
-        #[arg(long, value_name = "GENERATION=SHA256")]
-        expected_delta: Vec<String>,
-        /// Canonical repository UUID; always required and checked against any manifest
-        #[arg(long, value_name = "UUID")]
-        repo_id: String,
-        /// Confirm every daemon, VFS, and legacy graph writer for this repo is quiesced
-        #[arg(long, default_value_t = false)]
-        confirm_quiesced: bool,
-        /// Output machine-readable JSON
-        #[arg(long, default_value_t = false)]
-        json: bool,
-    },
     /// Look up an entity by name and show its relations
     Inspect {
         /// Entity name or UUID to inspect
@@ -1183,26 +1176,11 @@ enum CacheAction {
 
 #[derive(Subcommand)]
 enum GitAction {
-    /// Export current state to Git
+    /// Export exact objects, refs, aliases, and source CAS to a new Git repo
     Export {
-        /// Target directory
+        /// New target directory (must be outside the Kin working repository)
         #[arg(short, long)]
-        output: Option<String>,
-        /// Allow exporting directly into the checked-out Git working repository
-        #[arg(long, default_value_t = false)]
-        in_place: bool,
-    },
-    /// Import from Git history (deprecated: use `kin init` or `kin migrate` instead)
-    #[command(hide = true)]
-    Import {
-        /// Git repository path
-        path: Option<String>,
-    },
-    /// Sync with Git remote
-    Sync {
-        /// Allow exporting directly into the checked-out Git working repository
-        #[arg(long, default_value_t = false)]
-        in_place: bool,
+        output: PathBuf,
     },
 }
 
@@ -1233,7 +1211,7 @@ enum RemoteAction {
         #[arg(long, default_value_t = false)]
         default: bool,
     },
-    /// Show the push plan for a remote
+    /// [OPEN GATE] Show an exact closure and lease-protected push plan
     PlanPush {
         /// Remote name (defaults to configured default or detected origin)
         #[arg(long)]
@@ -1467,10 +1445,7 @@ enum AssistantAction {
 
 #[derive(Subcommand)]
 enum StashAction {
-    /// Snapshot current working state (non-destructive by default).
-    ///
-    /// Files are snapshotted into .kin/stashes/ but are NOT removed from the
-    /// working tree unless --remove-from-tree is given.
+    /// [OPEN GATE] Snapshot exact repository-v6 workspace state.
     Push {
         /// DESTRUCTIVE: delete source files from the working tree after
         /// snapshotting. Requires typing "remove" to confirm (or --yes).
@@ -1480,38 +1455,10 @@ enum StashAction {
         #[arg(long)]
         yes: bool,
     },
-    /// Restore the most recent stash entry
+    /// [OPEN GATE] Restore the most recent exact stash transaction
     Pop,
-    /// List stash entries
+    /// [OPEN GATE] List repository-v6 stash transactions
     List,
-}
-
-#[derive(Subcommand)]
-enum WorkspaceAction {
-    /// List workspaces
-    List,
-    /// Create a new workspace
-    Create {
-        /// Workspace name
-        name: String,
-    },
-    /// Switch to a workspace
-    Switch {
-        /// Workspace name
-        name: String,
-    },
-    /// Delete a workspace
-    Delete {
-        /// Workspace name
-        name: String,
-    },
-    /// Rename a workspace
-    Rename {
-        /// Current workspace name
-        old_name: String,
-        /// New workspace name
-        new_name: String,
-    },
 }
 
 #[derive(Subcommand)]
@@ -1899,8 +1846,7 @@ enum ReleaseAction {
         /// Repo to gate (e.g. kin, kin-db).
         repo: String,
     },
-    /// Create a release snapshot of the current entity graph state (the original
-    /// `kin release <tag>` behavior; also available as `kin tag <tag>`).
+    /// [OPEN GATE] Create a release snapshot bound to exact repository roots.
     Snapshot {
         /// Release tag
         tag: String,
@@ -1996,44 +1942,45 @@ fn main() -> Result<()> {
     let result = runtime.block_on(
         (async move {
             match cli.command {
-                Command::Init {
-                    path,
-                    json,
-                    force,
-                    verbose,
-                    no_lsp,
-                    git_history,
-                } => commands::init::run(path, json, force, verbose, no_lsp, git_history).await,
-                Command::Status { json } => {
-                    if json {
-                        commands::status::run_json().await
-                    } else {
-                        commands::status::run().await
-                    }
-                }
+                Command::Capabilities { json } => commands::capabilities::run(json),
+                Command::Init { path, json } => commands::init::run(path, json).await,
+                Command::Status { json } => commands::status::run(json),
                 Command::Resources { action } => match action {
                     ResourcesAction::Inspect { json, profile } => {
                         commands::resources::run(json, profile).await
                     }
                 },
-                Command::Commit {
-                    message,
-                    quiet,
-                    dry_run: _,
-                } => commands::commit::run(message, quiet).await,
-                Command::Log { count } => commands::log::run(count).await,
+                Command::Commit { message, quiet } => {
+                    commands::capabilities::require_ready("commit")?;
+                    commands::commit::run(message, quiet).await
+                }
+                Command::Log { count, json } => commands::log::run(count, json),
                 Command::Branch { action } => match action {
-                    BranchAction::List => commands::branch::list().await,
-                    BranchAction::Create { name } => commands::branch::create(name).await,
-                    BranchAction::Delete { name } => commands::branch::delete(name).await,
-                    BranchAction::Switch { name } => commands::branch::switch(name).await,
+                    BranchAction::List { json } => commands::branch::list(json).await,
+                    BranchAction::Create { name, ref_hex } => {
+                        commands::branch::create(commands::branch::parse_branch_ref(
+                            name.as_deref(),
+                            ref_hex.as_deref(),
+                        )?)
+                        .await
+                    }
+                    BranchAction::Delete { name, ref_hex } => {
+                        commands::branch::delete(commands::branch::parse_branch_ref(
+                            name.as_deref(),
+                            ref_hex.as_deref(),
+                        )?)
+                        .await
+                    }
+                    BranchAction::Switch { name, ref_hex } => {
+                        commands::branch::switch(commands::branch::parse_branch_ref(
+                            name.as_deref(),
+                            ref_hex.as_deref(),
+                        )?)
+                        .await
+                    }
                 },
-                Command::Diff { base, head } => commands::diff::run(base, head).await,
-                Command::Eject {
-                    revert_files,
-                    yes,
-                    force,
-                } => commands::eject::run(revert_files, yes || force).await,
+                Command::Diff { base, head, json } => commands::diff::run(base, head, json),
+                Command::Eject { yes } => commands::eject::run(yes).await,
                 Command::Impact {
                     entity,
                     depth,
@@ -2339,14 +2286,7 @@ fn main() -> Result<()> {
                     rebuild,
                     json,
                 } => commands::embed::run(batch_size, json, max_seconds, rebuild).await,
-                Command::Rename {
-                    symbol,
-                    new_name,
-                    file,
-                    line,
-                    column,
-                    json,
-                } => commands::rename::run(symbol, new_name, file, line, column, json).await,
+                Command::Rename { .. } => commands::capabilities::require_ready("rename"),
                 Command::Refs {
                     entity,
                     kind,
@@ -2490,39 +2430,13 @@ fn main() -> Result<()> {
                     SpecAction::List => commands::spec::list().await,
                     SpecAction::Show { id } => commands::spec::show(id).await,
                 },
-                Command::Merge { branch, strategy } => commands::merge::run(branch, strategy).await,
-                Command::Conflicts => commands::conflicts::run().await,
-                Command::Resolve {
-                    ours,
-                    theirs,
-                    all_ours,
-                    all_theirs,
-                    do_continue,
-                    abort,
-                } => {
-                    commands::resolve::run(ours, theirs, all_ours, all_theirs, do_continue, abort)
-                        .await
-                }
-                Command::Stash { action } => match action {
-                    StashAction::Push {
-                        remove_from_tree,
-                        yes,
-                    } => commands::stash::push(remove_from_tree, yes).await,
-                    StashAction::Pop => commands::stash::pop().await,
-                    StashAction::List => commands::stash::list().await,
-                },
+                Command::Merge { .. } => commands::capabilities::require_ready("merge"),
+                Command::Conflicts => commands::capabilities::require_ready("conflicts"),
+                Command::Resolve { .. } => commands::capabilities::require_ready("resolve"),
+                Command::Stash { action: _ } => commands::capabilities::require_ready("stash"),
                 Command::Blame { entity, reference } => {
                     commands::blame::run(entity, reference).await
                 }
-                Command::Workspace { action } => match action {
-                    WorkspaceAction::List => commands::workspace::list().await,
-                    WorkspaceAction::Create { name } => commands::workspace::create(name).await,
-                    WorkspaceAction::Switch { name } => commands::workspace::switch(name).await,
-                    WorkspaceAction::Delete { name } => commands::workspace::delete(name).await,
-                    WorkspaceAction::Rename { old_name, new_name } => {
-                        commands::workspace::rename(old_name, new_name).await
-                    }
-                },
                 Command::Mcp { action } => match action {
                     McpAction::Start { global, repo } => commands::mcp::start(global, repo).await,
                 },
@@ -2557,7 +2471,9 @@ fn main() -> Result<()> {
                         )
                         .await
                     }
-                    RemoteAction::PlanPush { remote } => commands::remote::plan_push(remote).await,
+                    RemoteAction::PlanPush { .. } => {
+                        commands::capabilities::require_ready("remote plan-push")
+                    }
                     RemoteAction::Lease {
                         remote,
                         actor_id,
@@ -2576,11 +2492,17 @@ fn main() -> Result<()> {
                     let registry = std::env::var("KIN_REGISTRY_URL").unwrap_or(registry);
                     commands::publish::run(packages, registry, dry_run).await
                 }
-                Command::Push { remote } => commands::push::run(remote).await,
-                Command::Pull { remote } => commands::pull::run(remote).await,
+                Command::Push { remote: _ } => commands::capabilities::require_ready("push"),
+                Command::Pull { remote: _ } => commands::capabilities::require_ready("pull"),
                 Command::Clone { url, path } => commands::clone::run(url, path).await,
-                Command::Import { url } => commands::import::run(url).await,
-                Command::Checkout { path, change } => commands::checkout::run(path, change).await,
+                Command::Checkout {
+                    path,
+                    path_hex,
+                    change,
+                } => {
+                    commands::capabilities::require_ready("checkout")?;
+                    commands::checkout::run(path, path_hex, change).await
+                }
                 Command::Verify { action } => match action {
                     VerifyAction::Entity { entity } => commands::verify::run(entity).await,
                     VerifyAction::Plan { entity, depth } => {
@@ -2597,13 +2519,7 @@ fn main() -> Result<()> {
                         depth,
                     } => commands::verify::run_verification(entity, runner, depth).await,
                 },
-                Command::Exec {
-                    command,
-                    keep,
-                    discard,
-                    strategy,
-                    scope,
-                } => commands::exec::run_full(command, keep, discard, strategy, scope).await,
+                Command::Exec { .. } => commands::capabilities::require_ready("exec"),
                 Command::Telemetry { action } => match action {
                     TelemetryAction::Status => commands::telemetry::run_status().await,
                     TelemetryAction::Consent => commands::telemetry::run_consent().await,
@@ -2658,7 +2574,7 @@ fn main() -> Result<()> {
                 Command::Security { propagate } => {
                     commands::security::run_with_options(propagate).await
                 }
-                Command::Semver => commands::release::semver().await,
+                Command::Semver => commands::capabilities::require_ready("semver"),
                 Command::Release { action } => match action {
                     ReleaseAction::Plan { offline } => commands::release_orch::plan(offline).await,
                     ReleaseAction::Apply {
@@ -2668,48 +2584,14 @@ fn main() -> Result<()> {
                         no_lock,
                     } => commands::release_orch::apply(crate_name, version, repos, !no_lock).await,
                     ReleaseAction::Intent { repo } => commands::release_orch::intent(repo).await,
-                    ReleaseAction::Snapshot {
-                        tag,
-                        require_proof,
-                        require_approval,
-                        force,
-                    } => {
-                        commands::release::release_with_options(
-                            tag,
-                            commands::release::ReleaseOptions {
-                                force,
-                                require_proof,
-                                require_approval,
-                            },
-                        )
-                        .await
+                    ReleaseAction::Snapshot { .. } => {
+                        commands::capabilities::require_ready("release snapshot")
                     }
                 },
-                Command::Tag {
-                    tag,
-                    require_proof,
-                    require_approval,
-                    force,
-                } => {
-                    commands::release::release_with_options(
-                        tag,
-                        commands::release::ReleaseOptions {
-                            force,
-                            require_proof,
-                            require_approval,
-                        },
-                    )
-                    .await
-                }
-                Command::Rollback { change_id, feature } => {
-                    commands::release::rollback_with_options(change_id, feature).await
-                }
+                Command::Tag { .. } => commands::capabilities::require_ready("tag"),
+                Command::Rollback { .. } => commands::capabilities::require_ready("rollback"),
                 Command::Bench { args } => commands::bench::bench_proxy(&args),
-                Command::Migrate {
-                    source,
-                    depth,
-                    resume,
-                } => commands::migrate::run(source, depth, resume).await,
+                Command::Migrate { source, target } => commands::migrate::run(source, target).await,
                 Command::Cache { action } => match action {
                     CacheAction::Status { json } => commands::cache::status(json).await,
                     CacheAction::Gc {
@@ -2718,37 +2600,9 @@ fn main() -> Result<()> {
                         prune_stale_schema,
                     } => commands::cache::gc(dry_run, budget_gb, prune_stale_schema).await,
                 },
-                Command::Gc {
-                    dry_run,
-                    max_age_days,
-                } => commands::gc::run(dry_run, max_age_days).await,
                 Command::Graph { action } => match action {
                     GraphAction::Status => commands::graph::status().await,
                     GraphAction::Validate => commands::graph::validate().await,
-                    GraphAction::RecoverAuthority {
-                        repo,
-                        expected_head_generation,
-                        expected_snapshot_sha256,
-                        expected_root,
-                        expected_delta,
-                        repo_id,
-                        confirm_quiesced,
-                        json,
-                    } => {
-                        commands::graph_recover::recover_authority(
-                            commands::graph_recover::RecoverAuthorityOptions {
-                                repo,
-                                expected_head_generation,
-                                expected_snapshot_sha256,
-                                expected_root,
-                                expected_deltas: expected_delta,
-                                repo_id,
-                                confirm_quiesced,
-                                json,
-                            },
-                        )
-                        .await
-                    }
                     GraphAction::Inspect { name, json } => {
                         commands::graph::inspect(name, json).await
                     }
@@ -2759,11 +2613,7 @@ fn main() -> Result<()> {
                     GraphAction::Viz { port, open } => commands::graph_viz::run(port, open).await,
                 },
                 Command::Git { action } => match action {
-                    GitAction::Export { output, in_place } => {
-                        commands::git::export(output, in_place).await
-                    }
-                    GitAction::Import { path } => commands::git::import(path).await,
-                    GitAction::Sync { in_place } => commands::git::sync(in_place).await,
+                    GitAction::Export { output } => commands::git::export(output),
                 },
                 Command::Intent { action } => match action {
                     IntentAction::List => commands::intent::list().await,
@@ -2854,40 +2704,16 @@ fn main() -> Result<()> {
                 Command::Todo { action } => match action {
                     TodoAction::Import { path } => commands::note::todo_import(path).await,
                 },
-                Command::Open {
-                    editor,
-                    restrict_discovery,
-                    restrict_filesystem,
-                    wait,
-                } => {
-                    commands::open::run(editor, restrict_discovery, restrict_filesystem, wait).await
-                }
-                Command::Reconcile { session, cleanup } => {
-                    commands::reconcile::run(session, cleanup).await
-                }
-                Command::With {
-                    assistant,
+                Command::Open { .. } => commands::capabilities::require_ready("open"),
+                Command::Reconcile {
                     session,
-                    passive_guidance,
-                    restrict_discovery,
-                    restrict_filesystem,
-                    task,
+                    confirm_mass_deletion,
                 } => {
-                    commands::with::run(
-                        assistant,
-                        task,
-                        session,
-                        passive_guidance,
-                        restrict_discovery,
-                        restrict_filesystem,
-                    )
-                    .await
+                    commands::capabilities::require_ready("reconcile")?;
+                    commands::reconcile::run(session, confirm_mass_deletion).await
                 }
-                Command::Shell {
-                    strategy,
-                    restrict_discovery,
-                    restrict_filesystem,
-                } => commands::shell::run(strategy, restrict_discovery, restrict_filesystem).await,
+                Command::With { .. } => commands::capabilities::require_ready("with"),
+                Command::Shell { .. } => commands::capabilities::require_ready("shell"),
                 Command::Overview { compact, json } => {
                     if json {
                         commands::overview::run_json().await
@@ -2953,10 +2779,51 @@ fn main() -> Result<()> {
                     // `--drift`/`--heal` run the graph⇄file drift tripwire; bare
                     // `kin doctor` stays the first-run config health check.
                     if drift || heal {
-                        commands::doctor_drift::run(heal, json).await
+                        commands::capabilities::require_ready("doctor --drift")
                     } else {
                         commands::setup::doctor(fix, json).await
                     }
+                }
+                Command::Notify {
+                    action,
+                    title,
+                    body,
+                    level,
+                    key,
+                    cooldown,
+                    latch,
+                    json,
+                } => {
+                    let code = match action {
+                        Some(NotifyAction::Clear { key, json }) => {
+                            commands::notify::clear(&key, json)
+                        }
+                        Some(NotifyAction::Status { json }) => commands::notify::status(json),
+                        None => {
+                            // clap cannot express "required unless a subcommand
+                            // was given", so the pairing is checked here.
+                            match (title.as_deref(), body.as_deref()) {
+                                (Some(title), Some(body)) => commands::notify::send(
+                                    title,
+                                    body,
+                                    &level,
+                                    key.as_deref(),
+                                    cooldown,
+                                    latch,
+                                    json,
+                                ),
+                                _ => Err(anyhow::anyhow!(
+                                    "--title and --body are both required to send a notification"
+                                )),
+                            }
+                        }
+                    }?;
+                    // Suppressed and undelivered are reported through the exit
+                    // code so callers can branch without parsing output.
+                    if code != 0 {
+                        std::process::exit(code);
+                    }
+                    Ok(())
                 }
                 Command::Setup {
                     action,
@@ -3090,6 +2957,65 @@ mod tests {
     }
 
     #[test]
+    fn workspace_is_not_a_cli_surface() {
+        on_cli_test_stack(|| {
+            for args in [
+                vec!["kin", "workspace"],
+                vec!["kin", "workspace", "list"],
+                vec!["kin", "workspace", "create", "demo"],
+                vec!["kin", "workspace", "switch", "demo"],
+                vec!["kin", "workspace", "delete", "demo"],
+                vec!["kin", "workspace", "rename", "demo", "renamed"],
+            ] {
+                assert!(
+                    Cli::try_parse_from(args).is_err(),
+                    "the descriptor-only workspace command must not be parseable"
+                );
+            }
+
+            let mut command = Cli::command();
+            let help = command.render_long_help().to_string();
+            for supported in [
+                "Run a command in an exact graph-backed session workspace",
+                "Launch an editor in an exact graph-derived session workspace",
+                "Open a shell in an exact graph-derived session workspace",
+            ] {
+                assert!(
+                    help.contains(supported),
+                    "supported graph-backed session surface missing from help: {supported}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn git_interop_exposes_only_exact_export() {
+        on_cli_test_stack(|| {
+            for args in [
+                &["kin", "import", "https://example.com/repo.git"][..],
+                &["kin", "git", "import"][..],
+                &["kin", "git", "sync"][..],
+                &["kin", "git", "sync", "--in-place"][..],
+            ] {
+                assert!(
+                    Cli::try_parse_from(args).is_err(),
+                    "removed Git compatibility command must not be parseable: {args:?}"
+                );
+            }
+
+            let cli = Cli::try_parse_from(["kin", "git", "export", "--output", "../export.git"])
+                .expect("exact Git export remains the explicit interoperability surface");
+            assert!(matches!(
+                cli.command,
+                Command::Git {
+                    action: GitAction::Export { output }
+                } if output.as_path() == std::path::Path::new("../export.git")
+            ));
+            assert!(Cli::try_parse_from(["kin", "git", "export", "--in-place"]).is_err());
+        });
+    }
+
+    #[test]
     fn update_release_expectation_tuple_is_complete_and_works_with_check_only() {
         on_cli_test_stack(|| {
             let digest = "a".repeat(64);
@@ -3169,6 +3095,52 @@ mod tests {
                 "--ack-restart",
             ])
             .is_err());
+        });
+    }
+
+    #[test]
+    fn exec_shell_mode_is_explicit_and_direct_mode_preserves_cli_parts() {
+        on_cli_test_stack(|| {
+            let direct = Cli::try_parse_from([
+                "kin",
+                "exec",
+                "--",
+                "printf",
+                "value with spaces",
+                "literal;semicolon",
+            ])
+            .unwrap();
+            match direct.command {
+                Command::Exec { command, shell, .. } => {
+                    assert!(!shell);
+                    assert_eq!(
+                        command,
+                        vec!["printf", "value with spaces", "literal;semicolon"]
+                    );
+                }
+                _ => panic!("expected exec command"),
+            }
+
+            let shell = Cli::try_parse_from([
+                "kin",
+                "exec",
+                "--shell",
+                "--",
+                "printf '%s' \"$KIN_REPO_ID\"",
+            ])
+            .unwrap();
+            match shell.command {
+                Command::Exec { command, shell, .. } => {
+                    assert!(shell);
+                    assert_eq!(command, vec!["printf '%s' \"$KIN_REPO_ID\""]);
+                }
+                _ => panic!("expected exec command"),
+            }
+
+            assert!(
+                Cli::try_parse_from(["kin", "run", "--", "true"]).is_err(),
+                "the pre-release `run` compatibility alias must not remain"
+            );
         });
     }
 }

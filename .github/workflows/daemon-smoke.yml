@@ -101,6 +101,21 @@ jobs:
               format!("hello, {name}")
           }
           RS
+          # `kin init` fails closed on a populated directory that is not a Git
+          # repository: Kin never derives authority from filesystem contents it
+          # did not admit. Commit the fixture so initialization takes the exact
+          # Git admission path. The runner carries no git identity, so pass one
+          # per invocation, and clear any inherited git environment so the
+          # fixture repository is the only thing these commands can address.
+          (
+            cd "$WS"
+            unset GIT_DIR GIT_INDEX_FILE GIT_WORK_TREE GIT_COMMON_DIR \
+              GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
+            git init -q -b main
+            git add -A
+            git -c user.name='Kin CI' -c user.email='ci@kinlab.ai' \
+              commit -q -m 'Seed daemon smoke fixture'
+          )
           echo "::endgroup::"
 
           echo "::group::Initialize a Kin workspace"

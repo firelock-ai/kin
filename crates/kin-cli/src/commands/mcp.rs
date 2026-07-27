@@ -144,7 +144,7 @@ async fn bind_first_kin_repo_against(
     // all — as the client's new repository.
     let candidates: Vec<PathBuf> = roots
         .iter()
-        .filter_map(|root| kin_core::KinLayout::discover_with_daemon_url(root, None))
+        .filter_map(|root| kin_core::KinLayout::discover(root))
         .map(|layout| canonical_path(layout.working_dir()))
         .collect();
     let bound_repo_still_open = bound_repo.as_deref().is_some_and(|bound| {
@@ -223,8 +223,7 @@ async fn bind_first_kin_repo_against(
 fn bound_repo_working_dir() -> Option<PathBuf> {
     current_daemon_url()?;
     let cwd = std::env::current_dir().ok()?;
-    kin_core::KinLayout::discover_with_daemon_url(&cwd, None)
-        .map(|layout| canonical_path(layout.working_dir()))
+    kin_core::KinLayout::discover(&cwd).map(|layout| canonical_path(layout.working_dir()))
 }
 
 fn current_daemon_url() -> Option<String> {
