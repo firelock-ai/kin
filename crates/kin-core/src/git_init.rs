@@ -41,7 +41,10 @@ use crate::init::{
 use crate::layout::KinLayout;
 use crate::manifest::KinManifest;
 
-#[cfg(test)]
+// Gated on unix as well as test because exact Git admission is unix-only, so
+// the tests that drive this injection are too. Leaving it on every test build
+// would make it dead code on Windows, which CI rejects under `-D warnings`.
+#[cfg(all(unix, test))]
 std::thread_local! {
     static WITHHELD_STAGED_BODY: std::cell::Cell<Option<Hash256>> =
         const { std::cell::Cell::new(None) };
@@ -49,22 +52,22 @@ std::thread_local! {
 
 /// Drop one captured body on its way into the staged repository, so a test can
 /// prove admission refuses a graph that cannot answer for its own content.
-#[cfg(test)]
+#[cfg(all(unix, test))]
 fn withhold_staged_body(digest: Hash256) {
     WITHHELD_STAGED_BODY.set(Some(digest));
 }
 
-#[cfg(test)]
+#[cfg(all(unix, test))]
 fn clear_withheld_staged_body() {
     WITHHELD_STAGED_BODY.set(None);
 }
 
-#[cfg(test)]
+#[cfg(all(unix, test))]
 fn staged_body_is_withheld(digest: Hash256) -> bool {
     WITHHELD_STAGED_BODY.with(|withheld| withheld.get() == Some(digest))
 }
 
-#[cfg(not(test))]
+#[cfg(not(all(unix, test)))]
 const fn staged_body_is_withheld(_digest: Hash256) -> bool {
     false
 }

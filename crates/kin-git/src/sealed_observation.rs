@@ -325,7 +325,11 @@ fn append_bytes(buffer: &mut Vec<u8>, bytes: &[u8]) {
     buffer.extend_from_slice(bytes);
 }
 
-#[cfg(test)]
+// Every case here builds a real Git repository carrying symlinks, executable
+// bits, and non-UTF-8 paths, which is unix-only. Gating the module rather than
+// each item keeps its helpers from becoming dead code on Windows, which CI
+// rejects under `-D warnings`.
+#[cfg(all(test, unix))]
 mod tests {
     use std::fs;
     use std::path::Path;
