@@ -5687,6 +5687,17 @@ fn collect_pre_commit_entities(
     let mut entities = Vec::new();
     let mut supplied_bodies: HashMap<kin_model::EntityId, Vec<u8>> = HashMap::new();
     for op in &transaction.staged_operations {
+        if kin_mcp::session::is_target_body_update(op) {
+            if let Ok(existing) =
+                kin_mcp::handlers::sessions::resolve_target_entity(state.graph.as_ref(), &op.target)
+            {
+                if let Some(body) = op.body.as_ref() {
+                    supplied_bodies.insert(existing.id, body.clone().into_bytes());
+                }
+                entities.push(existing);
+            }
+            continue;
+        }
         let Some(kin_mcp::McpMutationPayload::Entity(payload_entity)) = op.payload.as_ref() else {
             continue;
         };
@@ -5771,7 +5782,20 @@ fn transaction_coordination_context(
                 push(IntentScope::Entity(*from));
                 push(IntentScope::Entity(*to));
             }
-            Some(kin_mcp::McpMutationPayload::Blob(_)) | None => {}
+            Some(kin_mcp::McpMutationPayload::Blob(_)) => {}
+            None => {
+                if kin_mcp::session::is_target_body_update(operation) {
+                    if let Ok(existing) = kin_mcp::handlers::sessions::resolve_target_entity(
+                        state.graph.as_ref(),
+                        &operation.target,
+                    ) {
+                        push(IntentScope::Entity(existing.id));
+                        if let Some(file) = existing.file_origin {
+                            push(IntentScope::Artifact(file));
+                        }
+                    }
+                }
+            }
         }
     }
     let labels = touched.iter().map(format_scope).collect();

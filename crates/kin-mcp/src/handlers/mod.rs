@@ -2359,6 +2359,7 @@ mod tests {
         let store = InMemoryGraph::default();
         let sessions = SessionRegistry::new();
         let session_authority = SessionAuthorityMode::OfflineFallback;
+        sessions.register("sess-test", "test");
 
         // 1. Begin transaction
         let mut begin_args = HashMap::new();

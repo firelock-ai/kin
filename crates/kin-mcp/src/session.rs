@@ -51,6 +51,22 @@ pub struct McpMutationOperation {
     pub description: String,
 }
 
+/// A payload-less operation that expresses "this entity's new source is
+/// `body`": verb update/modify, `target` naming the entity (name or id), and a
+/// non-empty `body`. The graph delta is a same-entity modification resolved
+/// fail-closed server-side, and the post-commit projection writes the body to
+/// the entity's working-directory file. This is the minimal write surface for
+/// agents, which know names and source text but not Kin's entity structs.
+pub fn is_target_body_update(op: &McpMutationOperation) -> bool {
+    op.payload.is_none()
+        && matches!(op.verb.trim().to_lowercase().as_str(), "update" | "modify")
+        && !op.target.trim().is_empty()
+        && op
+            .body
+            .as_deref()
+            .is_some_and(|body| !body.trim().is_empty())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpTransaction {
     pub transaction_id: String,
@@ -203,9 +219,13 @@ pub fn validate_staged_operations(
             ));
         }
         let Some(payload) = op.payload.as_ref() else {
+            if is_target_body_update(op) {
+                continue;
+            }
             return Err(format!(
-                "operation #{idx} ('{}'): missing payload; an entity, relation, or blob payload \
-                 is required — a payload-less operation is silently dropped at commit",
+                "operation #{idx} ('{}'): missing payload; provide an entity, relation, or blob \
+                 payload, or express an entity source edit as verb 'update' with `target` (entity \
+                 name or id) and `body` (the entity's full new source text)",
                 op.verb
             ));
         };
@@ -252,6 +272,9 @@ pub fn uncommittable_reason(op: &McpMutationOperation) -> Option<String> {
         ));
     }
     let Some(payload) = op.payload.as_ref() else {
+        if is_target_body_update(op) {
+            return None;
+        }
         return Some("missing payload".to_string());
     };
     match payload {
@@ -877,11 +900,34 @@ impl SessionRegistry {
 
     // ── Transaction API ──
 
+    /// Whether `session_id` names a live session in either registry: a rich
+    /// agent session or a legacy registered assistant session. Transactions
+    /// must belong to a real session so commits attribute to a real actor.
+    pub fn has_session(&self, session_id: &str) -> bool {
+        if uuid::Uuid::parse_str(session_id)
+            .ok()
+            .map(SessionId)
+            .and_then(|id| self.get_agent_session(&id))
+            .is_some()
+        {
+            return true;
+        }
+        self.sessions
+            .lock()
+            .expect("sessions lock poisoned")
+            .contains_key(session_id)
+    }
+
     pub fn begin_transaction(
         &self,
         session_id: &str,
         scope: &str,
     ) -> std::result::Result<McpTransaction, String> {
+        if !self.has_session(session_id) {
+            return Err(format!(
+                "Session not found: {session_id}. Start a session with kin_session_start first."
+            ));
+        }
         let transaction_id = EntityId::new().to_string();
         let transaction = McpTransaction {
             transaction_id: transaction_id.clone(),
@@ -1539,6 +1585,7 @@ mod tests {
     #[test]
     fn transaction_lifecycle() {
         let registry = SessionRegistry::new();
+        registry.register("sess-1", "test");
         let tx = registry.begin_transaction("sess-1", "src/lib.rs").unwrap();
         assert_eq!(tx.session_id, "sess-1");
         assert_eq!(tx.scope, "src/lib.rs");
@@ -1626,9 +1673,10 @@ mod tests {
     #[test]
     fn validate_staged_operations_rejects_missing_payload() {
         // The commit path silently skips payload-less ops; stage time must not.
+        // (A payload-less UPDATE with target and body is the one valid form.)
         let err = validate_staged_operations(&[op("create", None)]).unwrap_err();
         assert!(err.contains("missing payload"), "{err}");
-        assert!(err.contains("silently dropped at commit"), "{err}");
+        assert!(err.contains("entity source edit"), "{err}");
     }
 
     #[test]
@@ -1771,5 +1819,80 @@ mod tests {
         );
         assert!(reasons[1].contains("operation #1"), "{reasons:?}");
         assert!(reasons[1].contains("blob payloads"), "{reasons:?}");
+    }
+}
+
+#[cfg(test)]
+mod target_body_update_tests {
+    use super::*;
+
+    fn target_op(verb: &str, target: &str, body: Option<&str>) -> McpMutationOperation {
+        McpMutationOperation {
+            verb: verb.to_string(),
+            target: target.to_string(),
+            payload: None,
+            body: body.map(str::to_string),
+            description: "test".to_string(),
+        }
+    }
+
+    #[test]
+    fn target_body_update_is_recognized_and_committable() {
+        let op = target_op("update", "resolve_binary", Some("fn resolve_binary() {}"));
+        assert!(is_target_body_update(&op));
+        assert!(uncommittable_reason(&op).is_none());
+        assert!(validate_staged_operations(std::slice::from_ref(&op)).is_ok());
+    }
+
+    #[test]
+    fn target_body_update_requires_verb_target_and_body() {
+        let wrong_verb = target_op("create", "resolve_binary", Some("x"));
+        assert!(!is_target_body_update(&wrong_verb));
+        assert!(validate_staged_operations(std::slice::from_ref(&wrong_verb)).is_err());
+
+        let no_target = target_op("update", "", Some("x"));
+        assert!(!is_target_body_update(&no_target));
+        assert!(validate_staged_operations(std::slice::from_ref(&no_target)).is_err());
+
+        let empty_body = target_op("update", "resolve_binary", Some("   "));
+        assert!(!is_target_body_update(&empty_body));
+        assert!(validate_staged_operations(std::slice::from_ref(&empty_body)).is_err());
+
+        let no_body = target_op("update", "resolve_binary", None);
+        assert!(!is_target_body_update(&no_body));
+        assert!(validate_staged_operations(std::slice::from_ref(&no_body)).is_err());
+    }
+
+    #[test]
+    fn begin_transaction_requires_a_known_session() {
+        let registry = SessionRegistry::new();
+        assert!(
+            registry.begin_transaction("", "scope").is_err(),
+            "empty session id must be rejected"
+        );
+        assert!(
+            registry
+                .begin_transaction("no-such-session", "scope")
+                .is_err(),
+            "unknown session id must be rejected"
+        );
+
+        let session = registry.start_agent_session(
+            "anthropic",
+            "test",
+            SessionTransport::Mcp,
+            None,
+            PathBuf::from("/tmp"),
+            SessionCapabilities::default(),
+        );
+        let ok = registry.begin_transaction(&session.session_id.to_string(), "scope");
+        assert!(ok.is_ok(), "known agent session must be accepted: {ok:?}");
+
+        let legacy = registry.register("legacy-session", "legacy");
+        let ok = registry.begin_transaction(&legacy, "scope");
+        assert!(
+            ok.is_ok(),
+            "legacy registered session must be accepted: {ok:?}"
+        );
     }
 }

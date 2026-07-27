@@ -480,6 +480,41 @@ fn intent_scope_to_string(scope: &kin_model::session::IntentScope) -> String {
     }
 }
 
+/// Resolve a target-body update's entity by id or exact name, fail closed.
+///
+/// A uuid target must exist; a name target must match exactly one entity by
+/// exact name (broad substring matches are filtered out). Anything else is an
+/// error, because a mutation that guesses its target is worse than one that
+/// fails.
+pub fn resolve_target_entity<G: GraphStore>(
+    store: &G,
+    target: &str,
+) -> std::result::Result<kin_model::Entity, String> {
+    let target = target.trim();
+    if let Ok(uuid) = uuid::Uuid::parse_str(target) {
+        return match store.get_entity(&kin_model::ids::EntityId(uuid)) {
+            Ok(Some(entity)) => Ok(entity),
+            _ => Err(format!(
+                "target entity id '{target}' not found in the graph"
+            )),
+        };
+    }
+    let mut matches = store
+        .query_entities(&kin_model::EntityFilter {
+            name_pattern: Some(target.to_string()),
+            ..Default::default()
+        })
+        .map_err(|error| format!("target lookup for '{target}' failed: {error}"))?;
+    matches.retain(|entity| entity.name == target);
+    match matches.len() {
+        0 => Err(format!("target entity '{target}' not found in the graph")),
+        1 => Ok(matches.remove(0)),
+        n => Err(format!(
+            "target entity '{target}' is ambiguous ({n} exact-name matches); use the entity id"
+        )),
+    }
+}
+
 pub const TRANSACTION_BEGIN_DESC: &str = "\
 Begin a new semantic graph mutation transaction. Transactions allow you to stage \
 multiple mutations (inserts, updates, deletes) and commit them atomically. Returns \
@@ -522,12 +557,17 @@ pub async fn handle_transaction_begin(
 }
 
 pub const TRANSACTION_STAGE_DESC: &str = "\
-Stage one or more mutation operations onto an active transaction. Each operation is \
-validated at stage time — anything the commit path would silently drop (a missing or \
-unknown verb, a missing payload, a nameless entity, a relation update/modify, or a blob \
-payload) is rejected immediately with an actionable error instead of vanishing at \
-commit. This rejection is identical in daemon and in-process modes. Accepted operations \
-are queued and can be validated or committed together.";
+Stage one or more mutation operations onto an active transaction. The simplest write is \
+a payload-less entity source edit: {verb: \"update\", target: \"<entity name or id>\", \
+body: \"<the entity's full new source text>\", description: \"...\"}. The entity is \
+resolved fail-closed server-side (exact name or id; ambiguity is an error) and on \
+commit the graph-to-file projection writes the body into the entity's working-directory \
+file. Structured payloads (full entity, relation add/remove) are also accepted. Each \
+operation is validated at stage time: anything the commit path would silently drop (a \
+missing or unknown verb, a missing payload, a nameless entity, a relation \
+update/modify, or a blob payload) is rejected immediately with an actionable error \
+instead of vanishing at commit. This rejection is identical in daemon and in-process \
+modes. Accepted operations are queued and can be validated or committed together.";
 
 pub async fn handle_transaction_stage(
     args: &HashMap<String, serde_json::Value>,
@@ -673,7 +713,17 @@ fn transaction_touched_scopes<G: GraphStore>(
                 push_scope_once(&mut scopes, kin_model::IntentScope::Entity(*from));
                 push_scope_once(&mut scopes, kin_model::IntentScope::Entity(*to));
             }
-            Some(McpMutationPayload::Blob(_)) | None => {}
+            Some(McpMutationPayload::Blob(_)) => {}
+            None => {
+                if crate::session::is_target_body_update(operation) {
+                    if let Ok(existing) = resolve_target_entity(store, &operation.target) {
+                        push_scope_once(&mut scopes, kin_model::IntentScope::Entity(existing.id));
+                        if let Some(file) = existing.file_origin {
+                            push_scope_once(&mut scopes, kin_model::IntentScope::Artifact(file));
+                        }
+                    }
+                }
+            }
         }
     }
     scopes
@@ -774,6 +824,26 @@ pub async fn handle_transaction_commit<G: GraphStore>(
 
     for op in tx.staged_operations {
         let verb = op.verb.to_lowercase();
+        if crate::session::is_target_body_update(&op) {
+            // The body carries the change: the graph delta is a same-entity
+            // modification and the post-commit projection writes the new
+            // source into the working file. Resolution is fail-closed so a
+            // typo or an ambiguous name cannot modify the wrong entity.
+            match resolve_target_entity(store, &op.target) {
+                Ok(existing) => {
+                    entity_deltas.push(kin_model::change::EntityDelta::Modified {
+                        old: existing.clone(),
+                        new: existing,
+                    });
+                }
+                Err(error) => {
+                    return Ok(ToolCallResult::error(format!(
+                        "Cannot commit transaction {transaction_id}: {error}"
+                    )));
+                }
+            }
+            continue;
+        }
         if let Some(payload) = op.payload {
             match payload {
                 McpMutationPayload::Entity(entity) => {
