@@ -1835,11 +1835,17 @@ mod tests {
         std::fs::remove_file(&tracked).unwrap();
         let _tracked_listener = UnixListener::bind(&tracked).unwrap();
 
+        // The walk itself refuses: a tracked path Kin cannot represent makes
+        // the scan incomplete, so there is no completion proof to publish with
+        // and graph truth is retained.
         let error = admit_file_event(&state, &FileEvent::Changed(tracked))
             .expect_err("tracked special type must fail instead of erasing graph truth");
-        assert!(error
-            .to_string()
-            .contains("tracked repository path changed"));
+        assert!(
+            error
+                .to_string()
+                .contains("tracked path changed to an unsupported special filesystem entry"),
+            "{error}"
+        );
         assert_eq!(tree_entry(&state, "tracked.sock"), Some(old_entry));
     }
 
