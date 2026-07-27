@@ -152,10 +152,13 @@ pub async fn build_impact_response(
     }
 
     let target = &matches[0];
-    let mut lines = vec![
-        format!("Impact analysis for '{}' ({:?}):", target.name, target.kind),
-        format!("  Depth: {}", request.depth),
-    ];
+    let target_at = entity_location(target)
+        .map(|loc| format!(" @ {loc}"))
+        .unwrap_or_default();
+    let mut lines = vec![format!(
+        "Impact analysis for '{}' ({:?}){}:",
+        target.name, target.kind, target_at
+    )];
     if matches.len() > 1 {
         lines.push(format!(
             "  Note: {} matches; showing the deterministic first match. Use --json with --file/--kind/--signature for fail-closed resolution.",
@@ -163,17 +166,48 @@ pub async fn build_impact_response(
         ));
     }
 
-    // 1. Local Impact
+    // 1. Local Impact, grouped by traversal distance so a reader can tell the
+    // direct callers from the transitive ripple. get_downstream_impact(id, d)
+    // is one breadth-first walk capped at d, so the set at hop d minus the set
+    // at hop d-1 is exactly the entities first reached at distance d; reusing
+    // the same traversal per hop keeps the grouped listing consistent with the
+    // flat listing it replaces.
     let local_impacted = graph.get_downstream_impact(&target.id, request.depth)?;
     if local_impacted.is_empty() {
         lines.push("  No local downstream impact found.".to_string());
     } else {
         lines.push(format!(
-            "  {} local entities impacted:",
-            local_impacted.len()
+            "  {} local entities impacted within {} hop{}:",
+            local_impacted.len(),
+            request.depth,
+            if request.depth == 1 { "" } else { "s" }
         ));
-        for e in &local_impacted {
-            lines.push(format!("    - {} ({:?}, {})", e.name, e.kind, e.language));
+        let mut listed: std::collections::HashSet<EntityId> = std::collections::HashSet::new();
+        for hop in 1..=request.depth {
+            let reached = if hop == request.depth {
+                local_impacted.clone()
+            } else {
+                graph.get_downstream_impact(&target.id, hop)?
+            };
+            let fresh: Vec<&kin_model::Entity> = reached
+                .iter()
+                .filter(|entity| !listed.contains(&entity.id))
+                .collect();
+            if fresh.is_empty() {
+                continue;
+            }
+            lines.push(if hop == 1 {
+                "  1 hop (direct callers):".to_string()
+            } else {
+                format!("  {hop} hops:")
+            });
+            for entity in fresh {
+                listed.insert(entity.id);
+                let at = entity_location(entity)
+                    .map(|loc| format!(" @ {loc}"))
+                    .unwrap_or_default();
+                lines.push(format!("    - {} ({:?}){}", entity.name, entity.kind, at));
+            }
         }
     }
 
@@ -207,6 +241,20 @@ fn resolve_entities(
         // callers explicitly opt into exact, fail-closed identity resolution.
         if request.require_unique {
             matches.retain(|entity| entity.name == request.entity);
+        } else {
+            // Broad matching is for discovery: "resolve" should still find
+            // resolve_binary. But when the query names an entity exactly,
+            // substring cousins (try_resolve_binary alongside resolve_binary)
+            // force an ambiguity note onto an unambiguous ask, so an
+            // exact-name hit narrows the set to the exact matches.
+            let exact: Vec<kin_model::Entity> = matches
+                .iter()
+                .filter(|entity| entity.name == request.entity)
+                .cloned()
+                .collect();
+            if !exact.is_empty() {
+                matches = exact;
+            }
         }
         matches
     };
@@ -223,6 +271,18 @@ fn resolve_entities(
         });
     }
     Ok(matches)
+}
+
+/// `path:line` for an entity, or just the path when the graph carries no span.
+///
+/// Location is projection metadata for the human reading the listing; the
+/// analysis itself is keyed on graph identity, never on paths.
+fn entity_location(entity: &kin_model::Entity) -> Option<String> {
+    let path = entity.file_origin.as_ref().map(|f| f.0.clone())?;
+    Some(match entity.span.as_ref().map(|s| s.start_line) {
+        Some(line) => format!("{path}:{line}"),
+        None => path,
+    })
 }
 
 /// Actionable guidance when `kin impact <symbol>` can't resolve the symbol in
@@ -469,6 +529,132 @@ mod tests {
         assert_eq!(
             response.ranked.unwrap().root_identity.signature,
             "fn handle(value: String)"
+        );
+    }
+
+    fn entity_at(name: &str, file: &str, line: u32) -> Entity {
+        let mut e = entity(name, file);
+        e.span = Some(kin_model::SourceSpan {
+            file: FilePathId::new(file),
+            start_byte: 0,
+            end_byte: 0,
+            start_line: line,
+            start_col: 0,
+            end_line: line,
+            end_col: 0,
+        });
+        e
+    }
+
+    #[tokio::test]
+    async fn exact_name_query_is_not_forced_ambiguous_by_substring_cousins() {
+        let graph = kin_db::InMemoryGraph::new();
+        graph
+            .upsert_entity(&entity("resolve_binary", "src/a.rs"))
+            .unwrap();
+        graph
+            .upsert_entity(&entity("try_resolve_binary", "src/b.rs"))
+            .unwrap();
+        // Falsification guard: broad name matching really does return both, so
+        // without exact-name preference this response would carry the note.
+        let broad = graph
+            .query_entities(&kin_model::EntityFilter {
+                name_pattern: Some("resolve_binary".to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(broad.len(), 2, "substring cousin must broad-match");
+
+        let dir = tempfile::tempdir().unwrap();
+        let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
+        let response = build_impact_response(
+            &layout,
+            &graph,
+            &ImpactRequest {
+                entity: "resolve_binary".to_string(),
+                depth: 3,
+                file: None,
+                kind: None,
+                signature: None,
+                require_unique: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.resolution, "resolved");
+        assert_eq!(response.query.match_count, 1);
+        assert!(
+            !response.lines.iter().any(|line| line.contains("Note:")),
+            "exact-name query must not carry an ambiguity note: {:?}",
+            response.lines
+        );
+        assert!(response.lines[0].contains("'resolve_binary'"));
+    }
+
+    #[tokio::test]
+    async fn impact_listing_groups_entities_by_hop_with_locations() {
+        let graph = kin_db::InMemoryGraph::new();
+        let target = entity_at("changed", "src/lib.rs", 10);
+        let direct = entity_at("direct_caller", "src/direct.rs", 20);
+        let indirect = entity_at("indirect_caller", "src/indirect.rs", 30);
+        for e in [&target, &direct, &indirect] {
+            graph.upsert_entity(e).unwrap();
+        }
+        for (src, dst) in [(&direct, &target), (&indirect, &direct)] {
+            graph
+                .upsert_relation(&Relation {
+                    id: RelationId::from_content(&src.id.to_string(), &dst.id.to_string(), "calls"),
+                    kind: RelationKind::Calls,
+                    src: GraphNodeId::Entity(src.id),
+                    dst: GraphNodeId::Entity(dst.id),
+                    confidence: 1.0,
+                    origin: RelationOrigin::Parsed,
+                    created_in: None,
+                    import_source: None,
+                    evidence: Vec::new(),
+                })
+                .unwrap();
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
+        let response = build_impact_response(
+            &layout,
+            &graph,
+            &ImpactRequest {
+                entity: "changed".to_string(),
+                depth: 3,
+                file: None,
+                kind: None,
+                signature: None,
+                require_unique: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        let lines = &response.lines;
+        let pos = |needle: &str| {
+            lines
+                .iter()
+                .position(|line| line.contains(needle))
+                .unwrap_or_else(|| panic!("missing '{needle}' in {lines:?}"))
+        };
+        assert!(lines[0].contains("@ src/lib.rs:10"), "{lines:?}");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("2 local entities impacted within 3 hops:")),
+            "{lines:?}"
+        );
+        let h1 = pos("1 hop (direct callers):");
+        let d = pos("- direct_caller (Function) @ src/direct.rs:20");
+        let h2 = pos("2 hops:");
+        let i = pos("- indirect_caller (Function) @ src/indirect.rs:30");
+        assert!(
+            h1 < d && d < h2 && h2 < i,
+            "hop groups out of order: {lines:?}"
         );
     }
 }
