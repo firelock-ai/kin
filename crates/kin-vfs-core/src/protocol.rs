@@ -5,31 +5,47 @@
 //!
 //! This is the single source of truth. Both `kin-vfs-daemon` and `kin-vfs-shim`
 //! re-export these types rather than defining their own copies.
+//!
+//! Path identity on this protocol is byte-exact: every request path is a
+//! validated [`VfsPath`], every directory-entry name a validated
+//! [`crate::path::VfsName`], and invalidation pushes carry canonical path
+//! bytes. Malformed paths (absolute, `.`/`..`, NUL, empty components) are
+//! rejected at decode time.
 
 use crate::canary::InterposeStatus;
+use crate::path::VfsPath;
 use crate::{DirEntry, VirtualStat};
 use serde::{Deserialize, Serialize};
 
 /// Protocol version. Bump when making breaking wire-format changes.
-pub const VFS_PROTOCOL_VERSION: u32 = 1;
+///
+/// v3: byte-exact path authority — request paths and directory-entry names
+/// are raw validated bytes (no `String` path identity), invalidations carry
+/// canonical path bytes, and `ErrorCode::UnsupportedBoundary` reports gitlink
+/// repository boundaries.
+pub const VFS_PROTOCOL_VERSION: u32 = 3;
 
 /// Request from VFS shim to daemon.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum VfsRequest {
-    /// Get metadata for a repo-relative graph path (empty string is root).
-    Stat { path: String },
+    /// Get metadata for a repo-relative graph path (root is the empty path).
+    Stat { path: VfsPath },
 
     /// List directory contents for a repo-relative graph path.
-    ReadDir { path: String },
+    ReadDir { path: VfsPath },
 
     /// Read file content (full or range) by repo-relative graph path.
-    Read { path: String, offset: u64, len: u64 },
+    Read {
+        path: VfsPath,
+        offset: u64,
+        len: u64,
+    },
 
     /// Read symbolic link target by repo-relative graph path.
-    ReadLink { path: String },
+    ReadLink { path: VfsPath },
 
     /// Check if a repo-relative graph path is accessible.
-    Access { path: String, mode: u32 },
+    Access { path: VfsPath, mode: u32 },
 
     /// Keepalive ping.
     Ping,
@@ -62,14 +78,14 @@ pub enum VfsResponse {
     /// Metadata.
     Stat(VirtualStat),
 
-    /// Directory listing.
+    /// Directory listing with byte-exact entry names.
     DirEntries(Vec<DirEntry>),
 
     /// File content (or range).
     Content { data: Vec<u8>, total_size: u64 },
 
-    /// Symlink target.
-    LinkTarget(String),
+    /// Symlink target (exact stored bytes).
+    LinkTarget(Vec<u8>),
 
     /// Access check result.
     Accessible(bool),
@@ -80,8 +96,9 @@ pub enum VfsResponse {
     /// Error.
     Error { code: ErrorCode, message: String },
 
-    /// Push invalidation from daemon to shim.
-    Invalidate { paths: Vec<String> },
+    /// Push invalidation from daemon to shim, carrying canonical path bytes.
+    /// An empty list means "everything may have changed".
+    Invalidate { paths: Vec<VfsPath> },
 
     /// Acknowledge an interposition canary [`VfsRequest::Announce`] or
     /// [`VfsRequest::CanaryExpect`].
@@ -97,6 +114,10 @@ pub enum ErrorCode {
     PermissionDenied,
     IsDirectory,
     NotDirectory,
+    InvalidInput,
+    /// The path names a nested-repository (gitlink) boundary with no child
+    /// projection; its contents cannot be served without fabricating state.
+    UnsupportedBoundary,
     IoError,
     Internal,
 }
