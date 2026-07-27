@@ -1,13 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use std::process::Command;
-
 #[cfg(test)]
 use std::path::Path;
+#[cfg(test)]
+use std::process::Command;
 
-use anyhow::Result;
-use kin_core::{KinConfig, KinLayout, RemoteHostKind, RemoteRefConfig, RemoteTransportKind};
+use anyhow::{Context, Result};
+use kin_core::{
+    GitRemoteTransportConfig, KinConfig, KinLayout, RemoteHostKind, RemoteRefConfig,
+    RemoteTransportKind,
+};
 use kin_model::provenance::ApprovalDecision;
 use kin_model::{ProvenanceStore, SessionCapabilities, SessionLease, SessionTransport};
 use serde::{Deserialize, Serialize};
@@ -300,6 +303,11 @@ pub(crate) fn upsert_remote_config(
     entry: RemoteRefConfig,
     make_default: bool,
 ) -> Result<()> {
+    // Config is part of the repository namespace handed to exact eject. Share
+    // the projection lock so a writer that began before detach cannot mutate
+    // the archived config or bind a replacement `.kin` epoch after waiting.
+    let projection_freeze = kin_core::ExactProjectionFreeze::acquire_existing(layout.working_dir())
+        .context("freeze the existing repository projection before updating remote config")?;
     let config_path = layout.config_path();
     let mut config = KinConfig::load_or_default(&config_path)?;
     if let Some(existing) = config
@@ -317,7 +325,9 @@ pub(crate) fn upsert_remote_config(
         config.remote.default = Some(entry.name.clone());
     }
 
-    Ok(config.save(&config_path)?)
+    config.save(&config_path)?;
+    drop(projection_freeze);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -390,15 +400,15 @@ pub async fn list() -> Result<()> {
         }
     }
 
-    if config.remote.refs.is_empty() {
-        if let Some(origin) = detect_git_origin_remote() {
-            println!("\nDetected compatibility remote:");
+    if config.remote.refs.is_empty() && !config.git.remotes.is_empty() {
+        println!("\nSealed Git coexistence remotes:");
+        for sealed in &config.git.remotes {
             println!(
                 "  {} -> {} ({}, {})",
-                origin.name,
-                origin.url.as_deref().unwrap_or("-"),
-                origin.host,
-                origin.transport
+                sealed.name,
+                sealed.publish_url().unwrap_or("-"),
+                sealed.host_kind(),
+                RemoteTransportKind::GitExport
             );
         }
     }
@@ -525,7 +535,20 @@ pub(crate) async fn load_push_plan(requested_remote: Option<&str>) -> Result<Pus
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
     let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&layout)?;
     let config = KinConfig::load_or_default(&layout.config_path())?;
-    let remote = resolve_remote(&config, requested_remote)?;
+
+    let snap =
+        crate::backend::open_snapshot_explicit_admin_read_only(&layout, "kin remote").await?;
+    let graph = &*snap.graph();
+    let authority =
+        crate::commands::repository_authority::ActiveRepositoryAuthority::open(&binding)?;
+    let workspace = authority.workspace()?;
+    let branch_name = match &workspace.head {
+        kin_model::WorkspaceHead::Symbolic { target } => target.to_string(),
+        kin_model::WorkspaceHead::Detached { .. } => "(detached)".to_string(),
+    };
+    let current_branch = workspace_branch_short_name(&workspace.head);
+
+    let remote = resolve_remote(&config, requested_remote, current_branch.as_deref())?;
     let fallback_org_id = std::env::var("KIN_ORG_ID")
         .ok()
         .filter(|value| !value.trim().is_empty())
@@ -552,17 +575,6 @@ pub(crate) async fn load_push_plan(requested_remote: Option<&str>) -> Result<Pus
         .as_ref()
         .map(|target| target.repo_id.clone())
         .unwrap_or_else(|| fallback_repo_id.clone());
-
-    let snap =
-        crate::backend::open_snapshot_explicit_admin_read_only(&layout, "kin remote").await?;
-    let graph = &*snap.graph();
-    let authority =
-        crate::commands::repository_authority::ActiveRepositoryAuthority::open(&binding)?;
-    let workspace = authority.workspace()?;
-    let branch_name = match &workspace.head {
-        kin_model::WorkspaceHead::Symbolic { target } => target.to_string(),
-        kin_model::WorkspaceHead::Detached { .. } => "(detached)".to_string(),
-    };
 
     let (local_head, approved, semantic_state_note) = if let Some(head) =
         authority.current_change_id()?
@@ -691,20 +703,76 @@ pub(crate) fn render_push_plan(plan: &PushPlanContext, execute_git_export: bool)
     }
 }
 
-fn resolve_remote(config: &KinConfig, requested: Option<&str>) -> Result<RemoteRefConfig> {
+/// The short branch name sealed Git tracking config is keyed by, taken from the
+/// graph-owned workspace head. A detached or non-branch head has no tracking
+/// entry and resolves to `None`.
+fn workspace_branch_short_name(head: &kin_model::WorkspaceHead) -> Option<String> {
+    let kin_model::WorkspaceHead::Symbolic { target } = head else {
+        return None;
+    };
+    if !target.is_branch() {
+        return None;
+    }
+    target
+        .as_utf8()
+        .and_then(|name| name.strip_prefix("refs/heads/"))
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+}
+
+fn resolve_remote(
+    config: &KinConfig,
+    requested: Option<&str>,
+    current_branch: Option<&str>,
+) -> Result<RemoteRefConfig> {
     if let Some(remote) = config.resolve_remote(requested) {
         return Ok(remote.clone());
     }
 
-    if requested.is_none() {
-        if let Some(origin) = detect_git_origin_remote() {
-            return Ok(origin);
-        }
-    }
+    let sealed = match requested {
+        Some(name) => config
+            .git
+            .remotes
+            .iter()
+            .find(|remote| remote.name == name)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no Kin remote or sealed Git remote named '{name}'. Configure one with `kin remote add {name} --host <host> --transport git-export --url <url>`."
+                )
+            })?,
+        None => config
+            .git
+            .publish_remote_for_branch(current_branch)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no Kin remote is configured and sealed Git coexistence config designates no publish remote{}. Configure one with `kin remote add <name> --host <host> --transport git-export --url <url> --default`.",
+                    current_branch
+                        .map(|branch| format!(" for branch '{branch}'"))
+                        .unwrap_or_default()
+                )
+            })?,
+    };
 
-    Err(anyhow::anyhow!(
-        "no remote found. Configure one with `kin remote add origin --host github --transport git-export --url <url> --default`."
-    ))
+    sealed_git_remote_ref(sealed).ok_or_else(|| {
+        anyhow::anyhow!(
+            "sealed Git remote '{}' carries no transport URL, so there is nothing to publish through.",
+            sealed.name
+        )
+    })
+}
+
+/// Map one sealed, credential-free Git remote onto the compatibility remote
+/// the push planner consumes. Sealed config is validated on load, so a URL that
+/// reaches here already carries no credentials or userinfo.
+fn sealed_git_remote_ref(sealed: &GitRemoteTransportConfig) -> Option<RemoteRefConfig> {
+    Some(RemoteRefConfig {
+        name: sealed.name.clone(),
+        host: sealed.host_kind(),
+        transport: RemoteTransportKind::GitExport,
+        url: Some(sealed.publish_url()?.to_string()),
+        publish_review_state: false,
+        publish_proofs: false,
+    })
 }
 
 pub(crate) fn resolve_repo_id(layout: &KinLayout) -> Result<String> {
@@ -771,40 +839,6 @@ async fn fetch_native_remote_status(
             .get("remoteHead")
             .and_then(Value::as_str)
             .map(str::to_string),
-    })
-}
-
-pub(crate) fn detect_git_origin_remote() -> Option<RemoteRefConfig> {
-    let output = Command::new("git")
-        .args(["remote", "get-url", "origin"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-
-    let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if url.is_empty() {
-        return None;
-    }
-
-    let host = if url.contains("kinlab") {
-        RemoteHostKind::KinLab
-    } else if url.contains("gitlab") {
-        RemoteHostKind::GitLab
-    } else if url.contains("bitbucket") {
-        RemoteHostKind::Bitbucket
-    } else {
-        RemoteHostKind::GitHub
-    };
-
-    Some(RemoteRefConfig {
-        name: "origin".to_string(),
-        host,
-        transport: RemoteTransportKind::GitExport,
-        url: Some(url),
-        publish_review_state: false,
-        publish_proofs: false,
     })
 }
 
@@ -876,10 +910,308 @@ mod tests {
     use super::{
         ensure_git_remote, evaluate_push_plan, explicit_native_remote_target, format_push_decision,
         map_to_remote_ref, native_remote_endpoint, resolve_native_remote_bearer_token_with,
-        resolve_native_remote_target, NativeRemoteTarget, PushPlanContext,
+        resolve_native_remote_target, resolve_remote, upsert_remote_config,
+        workspace_branch_short_name, NativeRemoteTarget, PushPlanContext,
     };
-    use kin_core::{RemoteHostKind, RemoteRefConfig, RemoteTransportKind};
+    use kin_core::{
+        GitBranchTrackingConfig, GitRemoteTransportConfig, KinConfig, RemoteHostKind,
+        RemoteRefConfig, RemoteTransportKind,
+    };
     use std::process::Command;
+
+    fn test_remote(name: &str) -> RemoteRefConfig {
+        RemoteRefConfig {
+            name: name.to_string(),
+            host: RemoteHostKind::KinLab,
+            transport: RemoteTransportKind::NativeKin,
+            url: Some(format!("kinlab://test/{name}")),
+            publish_review_state: true,
+            publish_proofs: true,
+        }
+    }
+
+    fn sealed_remote(name: &str, url: &str) -> GitRemoteTransportConfig {
+        GitRemoteTransportConfig {
+            name: name.to_string(),
+            fetch_urls: vec![url.to_string()],
+            push_urls: Vec::new(),
+            fetch_refspecs: vec![format!("+refs/heads/*:refs/remotes/{name}/*")],
+            push_refspecs: Vec::new(),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn blocked_remote_writer_cannot_bind_a_replacement_kin_epoch() {
+        let outer = tempfile::tempdir().unwrap();
+        let repository = outer.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        let initialized = kin_core::init(&repository).unwrap();
+        let layout = initialized.layout.clone();
+        let freeze = kin_core::ExactProjectionFreeze::acquire_existing(&repository).unwrap();
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let writer_layout = layout.clone();
+        let writer = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            finished_tx
+                .send(upsert_remote_config(
+                    &writer_layout,
+                    test_remote("stale-writer"),
+                    true,
+                ))
+                .unwrap();
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        assert!(
+            finished_rx
+                .recv_timeout(std::time::Duration::from_millis(500))
+                .is_err(),
+            "remote config writer must wait behind the held projection freeze"
+        );
+
+        let detached = outer.path().join("detached-kin");
+        std::fs::rename(layout.root(), &detached).unwrap();
+        let replacement = kin_core::init(&repository).unwrap();
+        let replacement_config_before = std::fs::read(replacement.layout.config_path()).unwrap();
+        let detached_config_before = std::fs::read(detached.join("config.toml")).unwrap();
+
+        drop(freeze);
+        let error = finished_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("blocked remote writer must wake after projection freeze release")
+            .expect_err("stale remote writer must reject the replacement Kin epoch");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("replaced")
+                || rendered.contains("changed identity")
+                || rendered.contains("unavailable"),
+            "unexpected stale remote-writer error: {rendered}"
+        );
+        writer.join().unwrap();
+
+        assert_eq!(
+            std::fs::read(replacement.layout.config_path()).unwrap(),
+            replacement_config_before,
+            "stale writer must not mutate replacement repository config"
+        );
+        assert_eq!(
+            std::fs::read(detached.join("config.toml")).unwrap(),
+            detached_config_before,
+            "stale writer must not mutate detached repository config"
+        );
+        assert!(
+            KinConfig::load(&replacement.layout.config_path())
+                .unwrap()
+                .remote
+                .refs
+                .is_empty(),
+            "replacement repository must not inherit the stale remote update"
+        );
+    }
+
+    #[test]
+    fn remote_resolution_fails_closed_without_sealed_git_config() {
+        let config = KinConfig::default();
+        assert!(config.remote.refs.is_empty());
+        assert!(config.git.remotes.is_empty());
+
+        let error = resolve_remote(&config, None, Some("main"))
+            .expect_err("resolution must fail closed rather than read a remote out of Git");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("sealed Git coexistence config designates no publish remote"),
+            "unexpected fail-closed error: {rendered}"
+        );
+        assert!(
+            !rendered.contains("origin"),
+            "fail-closed resolution must not name a conventional remote: {rendered}"
+        );
+    }
+
+    #[test]
+    fn sealed_branch_tracking_selects_the_publish_remote() {
+        let mut config = KinConfig::default();
+        config.git.remotes = vec![
+            sealed_remote("origin", "https://github.invalid/acme/mirror.git"),
+            sealed_remote("release", "https://gitlab.invalid/acme/app.git"),
+        ];
+        config.git.branches = vec![GitBranchTrackingConfig {
+            branch: "main".into(),
+            remote: Some("origin".into()),
+            merge_refs: vec!["refs/heads/main".into()],
+            push_remote: Some("release".into()),
+        }];
+        config.validate().expect("sealed fixture must validate");
+
+        let resolved =
+            resolve_remote(&config, None, Some("main")).expect("sealed tracking must resolve");
+        assert_eq!(resolved.name, "release");
+        assert_eq!(
+            resolved.url.as_deref(),
+            Some("https://gitlab.invalid/acme/app.git")
+        );
+        assert_eq!(resolved.host, RemoteHostKind::GitLab);
+        assert_eq!(resolved.transport, RemoteTransportKind::GitExport);
+    }
+
+    #[test]
+    fn untracked_branch_falls_back_to_the_sealed_push_default() {
+        let mut config = KinConfig::default();
+        config.git.remotes = vec![
+            sealed_remote("origin", "https://github.invalid/acme/mirror.git"),
+            sealed_remote("release", "https://bitbucket.invalid/acme/app.git"),
+        ];
+        config.git.remote_push_default = Some("release".into());
+        config.validate().expect("sealed fixture must validate");
+
+        let resolved = resolve_remote(&config, None, Some("feature/unpublished"))
+            .expect("push default must resolve for an untracked branch");
+        assert_eq!(resolved.name, "release");
+        assert_eq!(resolved.host, RemoteHostKind::Bitbucket);
+    }
+
+    #[test]
+    fn a_branch_publishing_to_the_local_repository_resolves_no_remote() {
+        let mut config = KinConfig::default();
+        config.git.remotes = vec![sealed_remote(
+            "origin",
+            "https://github.invalid/acme/app.git",
+        )];
+        config.git.branches = vec![GitBranchTrackingConfig {
+            branch: "main".into(),
+            remote: Some(".".into()),
+            merge_refs: vec!["refs/heads/main".into()],
+            push_remote: None,
+        }];
+        config.validate().expect("sealed fixture must validate");
+
+        resolve_remote(&config, None, Some("main"))
+            .expect_err("a branch tracking the local repository names no transport remote");
+    }
+
+    #[test]
+    fn a_single_sealed_remote_resolves_without_a_conventional_name() {
+        let mut config = KinConfig::default();
+        config.git.remotes = vec![sealed_remote(
+            "upstream",
+            "https://git.acme.invalid/acme/app.git",
+        )];
+        config.validate().expect("sealed fixture must validate");
+
+        let resolved = resolve_remote(&config, None, Some("main"))
+            .expect("an unambiguous sealed remote must resolve");
+        assert_eq!(resolved.name, "upstream");
+    }
+
+    #[test]
+    fn ambiguous_sealed_remotes_fail_closed() {
+        let mut config = KinConfig::default();
+        config.git.remotes = vec![
+            sealed_remote("origin", "https://github.invalid/acme/app.git"),
+            sealed_remote("upstream", "https://github.invalid/acme/fork.git"),
+        ];
+        config.validate().expect("sealed fixture must validate");
+
+        resolve_remote(&config, None, Some("main"))
+            .expect_err("two sealed remotes with no tracking must not pick one by convention");
+    }
+
+    #[test]
+    fn requested_remote_resolves_against_sealed_config() {
+        let mut config = KinConfig::default();
+        config.git.remotes = vec![sealed_remote("release", "https://kinlab.ai/acme/app.git")];
+        config.validate().expect("sealed fixture must validate");
+
+        let resolved = resolve_remote(&config, Some("release"), None)
+            .expect("an explicitly requested sealed remote must resolve");
+        assert_eq!(resolved.name, "release");
+        assert_eq!(resolved.host, RemoteHostKind::KinLab);
+
+        let error = resolve_remote(&config, Some("absent"), None)
+            .expect_err("an unknown remote name must fail closed");
+        assert!(
+            format!("{error:#}").contains("no Kin remote or sealed Git remote named 'absent'"),
+            "unexpected unknown-remote error"
+        );
+    }
+
+    #[test]
+    fn a_sealed_remote_without_a_transport_url_fails_closed() {
+        let mut config = KinConfig::default();
+        config.git.remotes = vec![GitRemoteTransportConfig {
+            name: "archive".into(),
+            fetch_urls: Vec::new(),
+            push_urls: Vec::new(),
+            fetch_refspecs: Vec::new(),
+            push_refspecs: Vec::new(),
+        }];
+        config.validate().expect("sealed fixture must validate");
+
+        let error = resolve_remote(&config, None, None)
+            .expect_err("a sealed remote with no URL has nothing to publish through");
+        assert!(
+            format!("{error:#}").contains("carries no transport URL"),
+            "unexpected empty-transport error"
+        );
+    }
+
+    #[test]
+    fn sealed_push_urls_win_over_fetch_urls() {
+        let mut config = KinConfig::default();
+        config.git.remotes = vec![GitRemoteTransportConfig {
+            name: "release".into(),
+            fetch_urls: vec!["https://github.invalid/acme/read-only.git".into()],
+            push_urls: vec!["https://gitlab.invalid/acme/write.git".into()],
+            fetch_refspecs: Vec::new(),
+            push_refspecs: Vec::new(),
+        }];
+        config.validate().expect("sealed fixture must validate");
+
+        let resolved =
+            resolve_remote(&config, None, None).expect("the sole sealed remote must resolve");
+        assert_eq!(
+            resolved.url.as_deref(),
+            Some("https://gitlab.invalid/acme/write.git")
+        );
+        assert_eq!(resolved.host, RemoteHostKind::GitLab);
+    }
+
+    #[test]
+    fn configured_kin_remotes_outrank_sealed_git_remotes() {
+        let mut config = KinConfig::default();
+        config.remote.refs = vec![test_remote("hosted")];
+        config.remote.default = Some("hosted".into());
+        config.git.remotes = vec![sealed_remote(
+            "origin",
+            "https://github.invalid/acme/app.git",
+        )];
+        config.validate().expect("sealed fixture must validate");
+
+        let resolved = resolve_remote(&config, None, Some("main"))
+            .expect("an explicit Kin remote must resolve first");
+        assert_eq!(resolved.name, "hosted");
+        assert_eq!(resolved.transport, RemoteTransportKind::NativeKin);
+    }
+
+    #[test]
+    fn workspace_head_supplies_the_short_tracking_branch_name() {
+        let branch = kin_model::WorkspaceHead::Symbolic {
+            target: kin_model::RefName::branch("feature/publish").unwrap(),
+        };
+        assert_eq!(
+            workspace_branch_short_name(&branch).as_deref(),
+            Some("feature/publish")
+        );
+
+        let tag = kin_model::WorkspaceHead::Symbolic {
+            target: kin_model::RefName::tag("v1").unwrap(),
+        };
+        assert_eq!(workspace_branch_short_name(&tag), None);
+    }
 
     #[test]
     fn maps_config_remote_to_runtime_remote() {

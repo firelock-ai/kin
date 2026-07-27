@@ -297,6 +297,42 @@ pub struct GitRemoteTransportConfig {
     pub push_refspecs: Vec<String>,
 }
 
+impl GitRemoteTransportConfig {
+    /// The URL Git would publish through: the first sealed push URL when Git
+    /// recorded one, otherwise the first sealed fetch URL. `None` means Git
+    /// sealed the remote without any transport URL.
+    pub fn publish_url(&self) -> Option<&str> {
+        self.push_urls
+            .first()
+            .or_else(|| self.fetch_urls.first())
+            .map(String::as_str)
+    }
+
+    /// Classify the hosting service from the sealed URL's host labels.
+    ///
+    /// Classification reads the parsed host rather than matching substrings of
+    /// the whole URL, so a repository path segment cannot masquerade as a host.
+    pub fn host_kind(&self) -> RemoteHostKind {
+        let Some(host) = self
+            .publish_url()
+            .and_then(|url| gix::Url::try_from(url).ok())
+            .and_then(|url| url.host().map(str::to_ascii_lowercase))
+        else {
+            return RemoteHostKind::GitHub;
+        };
+        let has_label = |label: &str| host.split('.').any(|part| part == label);
+        if has_label("kinlab") {
+            RemoteHostKind::KinLab
+        } else if has_label("gitlab") {
+            RemoteHostKind::GitLab
+        } else if has_label("bitbucket") {
+            RemoteHostKind::Bitbucket
+        } else {
+            RemoteHostKind::GitHub
+        }
+    }
+}
+
 impl fmt::Debug for GitRemoteTransportConfig {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -370,6 +406,43 @@ impl fmt::Debug for GitCoexistenceConfig {
 }
 
 impl GitCoexistenceConfig {
+    /// The sealed remote Git would publish `branch` through.
+    ///
+    /// Resolution reads only sealed configuration, in Git's own precedence:
+    /// the branch's `pushRemote`, then its tracking `remote`, then
+    /// `remote.pushDefault`. A branch that publishes to `.` resolves to `None`
+    /// because it names the local repository, not a transport remote. When no
+    /// sealed entry designates a remote at all, a repository holding exactly
+    /// one sealed remote resolves to that remote; anything else resolves to
+    /// `None` rather than guessing a conventional name.
+    pub fn publish_remote_for_branch(
+        &self,
+        branch: Option<&str>,
+    ) -> Option<&GitRemoteTransportConfig> {
+        let tracking = branch.and_then(|branch| {
+            self.branches
+                .iter()
+                .find(|candidate| candidate.branch == branch)
+        });
+        let designated = [
+            tracking.and_then(|entry| entry.push_remote.as_deref()),
+            tracking.and_then(|entry| entry.remote.as_deref()),
+            self.remote_push_default.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .next();
+
+        match designated {
+            Some(".") => None,
+            Some(name) => self.remotes.iter().find(|remote| remote.name == name),
+            None => match self.remotes.as_slice() {
+                [only] => Some(only),
+                _ => None,
+            },
+        }
+    }
+
     /// Validate that manually edited or reopened local config remains inside
     /// the same credential-free subset admitted from Git.
     pub fn validate(&self) -> Result<()> {
@@ -1435,6 +1508,125 @@ mod tests {
     }
 
     #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+    fn sealed_remote(name: &str, url: &str) -> GitRemoteTransportConfig {
+        GitRemoteTransportConfig {
+            name: name.to_string(),
+            fetch_urls: vec![url.to_string()],
+            push_urls: Vec::new(),
+            fetch_refspecs: Vec::new(),
+            push_refspecs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn sealed_host_classification_reads_the_url_host_not_the_path() {
+        assert_eq!(
+            sealed_remote("origin", "https://github.invalid/acme/gitlab.git").host_kind(),
+            RemoteHostKind::GitHub
+        );
+        assert_eq!(
+            sealed_remote("origin", "https://gitlab.acme.invalid/team/repo.git").host_kind(),
+            RemoteHostKind::GitLab
+        );
+        assert_eq!(
+            sealed_remote("origin", "https://kinlab.ai/acme/repo.git").host_kind(),
+            RemoteHostKind::KinLab
+        );
+        assert_eq!(
+            sealed_remote("origin", "https://bitbucket.org/acme/repo.git").host_kind(),
+            RemoteHostKind::Bitbucket
+        );
+    }
+
+    #[test]
+    fn sealed_tracking_resolves_a_publish_remote_in_git_precedence() {
+        let mut git = GitCoexistenceConfig {
+            remotes: vec![
+                sealed_remote("origin", "https://github.invalid/acme/mirror.git"),
+                sealed_remote("release", "https://github.invalid/acme/app.git"),
+            ],
+            branches: vec![GitBranchTrackingConfig {
+                branch: "main".into(),
+                remote: Some("origin".into()),
+                merge_refs: vec!["refs/heads/main".into()],
+                push_remote: Some("release".into()),
+            }],
+            remote_push_default: None,
+            push_default: None,
+        };
+        git.validate().unwrap();
+
+        assert_eq!(
+            git.publish_remote_for_branch(Some("main"))
+                .map(|remote| remote.name.as_str()),
+            Some("release")
+        );
+
+        git.branches[0].push_remote = None;
+        assert_eq!(
+            git.publish_remote_for_branch(Some("main"))
+                .map(|remote| remote.name.as_str()),
+            Some("origin")
+        );
+
+        git.remote_push_default = Some("release".into());
+        assert_eq!(
+            git.publish_remote_for_branch(Some("untracked"))
+                .map(|remote| remote.name.as_str()),
+            Some("release")
+        );
+
+        git.remote_push_default = None;
+        assert!(git.publish_remote_for_branch(Some("untracked")).is_none());
+        assert!(git.publish_remote_for_branch(None).is_none());
+    }
+
+    #[test]
+    fn a_local_publish_target_resolves_no_transport_remote() {
+        let git = GitCoexistenceConfig {
+            remotes: vec![sealed_remote(
+                "origin",
+                "https://github.invalid/acme/app.git",
+            )],
+            branches: Vec::new(),
+            remote_push_default: Some(".".into()),
+            push_default: None,
+        };
+        git.validate().unwrap();
+
+        assert!(git.publish_remote_for_branch(Some("main")).is_none());
+    }
+
+    #[test]
+    fn sealed_publish_url_prefers_the_push_url() {
+        let remote = GitRemoteTransportConfig {
+            name: "origin".into(),
+            fetch_urls: vec!["https://github.invalid/acme/read.git".into()],
+            push_urls: vec!["https://github.invalid/acme/write.git".into()],
+            fetch_refspecs: Vec::new(),
+            push_refspecs: Vec::new(),
+        };
+        assert_eq!(
+            remote.publish_url(),
+            Some("https://github.invalid/acme/write.git")
+        );
+
+        let fetch_only = sealed_remote("origin", "https://github.invalid/acme/read.git");
+        assert_eq!(
+            fetch_only.publish_url(),
+            Some("https://github.invalid/acme/read.git")
+        );
+
+        let sealed_without_urls = GitRemoteTransportConfig {
+            name: "archive".into(),
+            fetch_urls: Vec::new(),
+            push_urls: Vec::new(),
+            fetch_refspecs: Vec::new(),
+            push_refspecs: Vec::new(),
+        };
+        assert_eq!(sealed_without_urls.publish_url(), None);
+    }
+
     fn named_config(name: &str) -> KinConfig {
         KinConfig {
             name: Some(name.to_string()),
