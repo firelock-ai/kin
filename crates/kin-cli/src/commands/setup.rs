@@ -10900,6 +10900,8 @@ pub async fn run_wizard(opts: WizardOptions) -> Result<()> {
 
     print_intent_followups(&plan);
 
+    request_notification_authorization(interactive);
+
     // The final checklist is the real first-run health engine — not a parallel
     // set of hardcoded probes. Every line below reflects probed state.
     println!();
@@ -10911,6 +10913,61 @@ pub async fn run_wizard(opts: WizardOptions) -> Result<()> {
     print_next_steps(intent, plan.install_shell_hook, &configured_assistants);
 
     Ok(())
+}
+
+/// Ask macOS for permission to post notifications, once, from the one place a
+/// person is definitely present.
+///
+/// This is deliberately confined to interactive setup. macOS records a
+/// dismissed authorization prompt as a permanent denial, and an app denied that
+/// way is not listed in System Settings, so there is no supported way to undo
+/// it. A prompt raised by a background job at 3am would therefore burn the
+/// bundle identity with nobody there to answer, which is why nothing else in
+/// Kin ever requests authorization.
+///
+/// Never fails setup: an unavailable or declined notifier only costs the nicer
+/// sender identity, and the router still delivers through its fallback.
+fn request_notification_authorization(interactive: bool) {
+    if !cfg!(target_os = "macos") || !interactive {
+        return;
+    }
+    let Ok(notifier) = kin_notify::Notifier::new() else {
+        return;
+    };
+    let executable = notifier.notifier_path();
+    if !executable.is_file() {
+        return;
+    }
+
+    // Only ask when the decision has not already been made; re-running setup
+    // must not nag, and macOS answers from the stored decision anyway.
+    let already_decided = std::process::Command::new(&executable)
+        .arg("--status")
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| !String::from_utf8_lossy(&out.stdout).contains("not_determined"))
+        .unwrap_or(true);
+    if already_decided {
+        return;
+    }
+
+    println!();
+    println!("  macOS will ask whether Kin may send you notifications.");
+    println!("  These are update and health alerts; Kin posts nothing else.");
+    let granted = std::process::Command::new(&executable)
+        .arg("--request-authorization")
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+    if granted {
+        println!("  {} Notifications will arrive as Kin", style("✓").green());
+    } else {
+        println!(
+            "  {} Notifications declined; Kin will stay quiet",
+            style("·").dim()
+        );
+    }
 }
 
 /// Decide the first-run intent: explicit flag, else interactive menu, else the

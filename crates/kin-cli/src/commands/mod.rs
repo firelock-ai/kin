@@ -42,6 +42,7 @@ pub mod log;
 pub mod mcp;
 pub mod migrate;
 pub mod note;
+pub mod notify;
 pub mod overview;
 pub mod pipeline;
 pub mod prepared_state;

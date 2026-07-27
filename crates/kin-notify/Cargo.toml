@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+
+[package]
+name = "kin-notify"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The single path every user-facing Kin notification takes"
+repository.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+chrono = { workspace = true }
+directories = "5"
+serde = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

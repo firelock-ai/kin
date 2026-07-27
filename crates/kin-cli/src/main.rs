@@ -929,6 +929,33 @@ enum Command {
         #[arg(long, default_value_t = false)]
         check: bool,
     },
+    /// Send a user-facing notification through Kin's own identity
+    Notify {
+        #[command(subcommand)]
+        action: Option<NotifyAction>,
+        /// Notification title
+        #[arg(long)]
+        title: Option<String>,
+        /// Notification body
+        #[arg(long)]
+        body: Option<String>,
+        /// Urgency: info (silent), warn (silent), or urgent (sound, breaks through Focus)
+        #[arg(long, default_value = "info", value_parser = ["info", "warn", "urgent"])]
+        level: String,
+        /// Suppression and replacement identity; reposting under the same key
+        /// replaces the previous notification instead of stacking another
+        #[arg(long)]
+        key: Option<String>,
+        /// With --key: re-notify only after this many seconds have passed
+        #[arg(long)]
+        cooldown: Option<u64>,
+        /// With --key: notify once, then stay quiet until `kin notify clear`
+        #[arg(long, default_value_t = false)]
+        latch: bool,
+        /// Emit the outcome as JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// Manage secrets (org and repo level)
     Secret {
         #[command(subcommand)]
@@ -949,6 +976,24 @@ enum Command {
     Resources {
         #[command(subcommand)]
         action: ResourcesAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum NotifyAction {
+    /// Release a latch or cooldown so the next send is delivered
+    Clear {
+        /// The suppression key to forget
+        key: String,
+        /// Emit the result as JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Report which backend would deliver and what is currently held back
+    Status {
+        /// Emit the report as JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
 }
 
@@ -2738,6 +2783,47 @@ fn main() -> Result<()> {
                     } else {
                         commands::setup::doctor(fix, json).await
                     }
+                }
+                Command::Notify {
+                    action,
+                    title,
+                    body,
+                    level,
+                    key,
+                    cooldown,
+                    latch,
+                    json,
+                } => {
+                    let code = match action {
+                        Some(NotifyAction::Clear { key, json }) => {
+                            commands::notify::clear(&key, json)
+                        }
+                        Some(NotifyAction::Status { json }) => commands::notify::status(json),
+                        None => {
+                            // clap cannot express "required unless a subcommand
+                            // was given", so the pairing is checked here.
+                            match (title.as_deref(), body.as_deref()) {
+                                (Some(title), Some(body)) => commands::notify::send(
+                                    title,
+                                    body,
+                                    &level,
+                                    key.as_deref(),
+                                    cooldown,
+                                    latch,
+                                    json,
+                                ),
+                                _ => Err(anyhow::anyhow!(
+                                    "--title and --body are both required to send a notification"
+                                )),
+                            }
+                        }
+                    }?;
+                    // Suppressed and undelivered are reported through the exit
+                    // code so callers can branch without parsing output.
+                    if code != 0 {
+                        std::process::exit(code);
+                    }
+                    Ok(())
                 }
                 Command::Setup {
                     action,
