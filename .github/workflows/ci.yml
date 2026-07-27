@@ -278,11 +278,11 @@ jobs:
           printf 'fn probe() {}\n' > probe.rs
           git add probe.rs
           git commit -qm "probe"
-          kin.exe init > kin-init.txt
-          kin.exe status --json > kin-status.json
+          kin.exe init > "$RUNNER_TEMP/kin-init.txt"
+          kin.exe status --json > "$RUNNER_TEMP/kin-status.json"
           node <<'NODE'
           const fs = require("fs");
-          const status = JSON.parse(fs.readFileSync("kin-status.json", "utf8"));
+          const status = JSON.parse(fs.readFileSync(`${process.env.RUNNER_TEMP}/kin-status.json`, "utf8"));
           if (status.build?.daemon_source_known !== true) {
             throw new Error("Windows status did not return known daemon build provenance");
           }
