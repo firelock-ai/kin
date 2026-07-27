@@ -270,6 +270,21 @@ fn host_entry_matches_graph(
     Ok(observed == expected)
 }
 
+/// Report whether one host event names a path beneath a graph-only member.
+///
+/// An unreadable or unmappable event is deliberately reported as not beneath
+/// one: the later admission path re-resolves it and owns the refusal, and a
+/// transient resolution failure must never silently drop a real observation.
+fn event_is_beneath_graph_only_member(state: &DaemonState, event: &FileEvent) -> bool {
+    let path = match event {
+        FileEvent::Changed(path) | FileEvent::Removed(path) => path,
+    };
+    match repo_path(path, state.layout.working_dir()) {
+        Ok(Some(repo_path)) => is_within_graph_only_member(state, &repo_path).unwrap_or(false),
+        Ok(None) | Err(_) => false,
+    }
+}
+
 fn is_within_graph_only_member(state: &DaemonState, path: &RepoPath) -> Result<bool> {
     for artifact in state.graph.resolved_tree().artifacts_by_path() {
         if kin_core::source_projection_disposition(&artifact.path, artifact.entry)?
@@ -324,7 +339,40 @@ fn invalid_tree_transition(error: impl std::fmt::Display) -> DaemonError {
     ))
 }
 
-fn exact_tree_admission(state: &DaemonState) -> Result<ExactTreeAdmission> {
+/// Report whether one repository path was named by an observation, either
+/// exactly or as a descendant of an observed directory.
+fn observation_covers_path(observed: &BTreeSet<RepoPath>, path: &RepoPath) -> bool {
+    observed.iter().any(|root| {
+        path == root
+            || path
+                .as_bytes()
+                .strip_prefix(root.as_bytes())
+                .is_some_and(|suffix| suffix.starts_with(b"/"))
+    })
+}
+
+/// Derive one complete exact-tree transition from the working copy.
+///
+/// `observation` bounds what may be admitted. `None` is an explicit admission
+/// seam such as `/commands/commit`: everything the working copy holds crosses
+/// the compare-and-swap, including paths the workspace has never tracked.
+///
+/// `Some(paths)` is the ambient watcher path and is bounded twice. Only the
+/// observed paths and their descendants may move, so one unrelated host event
+/// cannot sweep the rest of the working copy into repository authority. And
+/// only members the workspace already tracks may move at all, so ambient
+/// observation revises graph-owned history but never enlarges it: a host path
+/// the repository has never tracked becomes repository truth when a person
+/// commits it, not because a watcher noticed it. That is what keeps untracked
+/// host content from dirtying a workspace or gating a transition.
+///
+/// The scan itself stays complete either way, so a rename keeps one stable
+/// artifact identity even when its two halves arrive in different notification
+/// batches. Only the planned transition is bounded.
+fn exact_tree_admission(
+    state: &DaemonState,
+    observation: Option<&BTreeSet<RepoPath>>,
+) -> Result<ExactTreeAdmission> {
     let working_dir = state.layout.working_dir();
     let previous = state.graph.resolved_tree();
     let tracked_paths = previous
@@ -350,6 +398,15 @@ fn exact_tree_admission(state: &DaemonState) -> Result<ExactTreeAdmission> {
     .map_err(kin_index::IndexError::from)?;
     let mut observed =
         crate::commit_deltas::observed_tree_from_complete_scan(&state.blobs, &scan, &previous)?;
+    if let Some(observation) = observation {
+        for artifact in previous.artifacts_by_path() {
+            if observation_covers_path(observation, &artifact.path) {
+                continue;
+            }
+            observed.insert(artifact.path.clone(), artifact.entry);
+        }
+        observed.retain(|path, _| previous.artifact_id_at_path(path).is_some());
+    }
     let mut deltas = kin_core::plan_observed_tree_deltas(&previous, observed.clone())?;
 
     let removed_count = deltas
@@ -760,9 +817,16 @@ pub async fn run_loop(
         "reconciliation loop started"
     );
 
-    if let Err(e) = sync_filesystem_with_graph(&state).await {
-        error!(error = %e, "initial filesystem sync failed");
-    }
+    // Startup deliberately admits nothing. Repository authority is already
+    // complete when the daemon opens it, and the working copy is a derived
+    // view of that authority. Sweeping the working copy here would publish
+    // whatever bytes happen to sit on disk into the repository-v6 workspace
+    // before any command runs, so a command that spawned this daemon would
+    // observe ambiently ingested content as graph-owned workspace state.
+    // Working-copy content crosses the compare-and-swap only through live
+    // watcher-observed edits below and through explicit admission seams such
+    // as `/commands/commit`. Divergence introduced while no daemon was
+    // running stays projection drift until one of those seams admits it.
 
     let interval = Duration::from_millis(config.poll_interval_ms);
     let mut cancel = cancel;
@@ -861,6 +925,13 @@ pub async fn run_loop(
             incoming_events.extend(retry_queue.drain(..).map(FileEvent::Changed));
         }
         incoming_events.extend(watcher.drain());
+        // A graph-only repository member owns its own host subtree. Admission
+        // already refuses to traverse one, so an event beneath it carries no
+        // observation of this repository's source projection. Waking the tick
+        // on such an event would still run a complete working-copy admission
+        // and sweep unobserved host content into repository authority, so it
+        // is dropped before it can schedule any work.
+        incoming_events.retain(|event| !event_is_beneath_graph_only_member(&state, event));
         enqueue_file_events(&mut pending_events, incoming_events);
 
         if pending_events.is_empty() {
@@ -923,8 +994,18 @@ pub async fn run_loop(
 
         // One complete observation produces one exact tree transaction. This
         // coalesces remove/create watcher pairs (including pairs split across
-        // notify batches) before either path can lose its ArtifactId.
-        let exact_admission = match exact_tree_admission(&state) {
+        // notify batches) before either path can lose its ArtifactId. The
+        // observed paths bound what the transaction may admit, so an ambient
+        // tick publishes only host state it actually saw change.
+        let observation = watcher_batch
+            .iter()
+            .filter_map(|event| match event {
+                FileEvent::Changed(path) | FileEvent::Removed(path) => {
+                    repo_path(path, state.layout.working_dir()).ok().flatten()
+                }
+            })
+            .collect::<BTreeSet<_>>();
+        let exact_admission = match exact_tree_admission(&state, Some(&observation)) {
             Ok(admission) => admission,
             Err(error) => {
                 warn!(
@@ -2128,7 +2209,10 @@ pub(crate) async fn sync_filesystem_with_graph_under_coordination(
     }
 
     let graph_mutation = state.begin_graph_authority_mutation();
-    let exact_admission = exact_tree_admission(state)?;
+    // An explicit admission seam. Everything the working copy holds crosses
+    // the compare-and-swap here, which is why `/commands/commit` calls it
+    // rather than relying on whatever the watcher happened to observe.
+    let exact_admission = exact_tree_admission(state, None)?;
     if exact_admission.deltas.is_empty() {
         drop(graph_mutation);
         return Ok(());

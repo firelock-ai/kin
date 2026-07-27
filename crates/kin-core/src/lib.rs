@@ -62,9 +62,10 @@ pub use sync_state::SyncStateStore;
 pub use tree::{
     materialize_source_entry, materialize_source_tree, prepare_source_tree, reconcile_source_tree,
     reconcile_source_tree_and_commit_repository_transaction, replace_source_tree,
-    resolve_change_tree, should_preserve_checkout_path, source_projection_disposition,
-    validate_portable_source_paths, validate_portable_source_symlink, validate_source_entry,
-    validate_source_paths, validate_source_tree, verify_repository_workspace_projection,
+    report_repository_workspace_projection_drift, resolve_change_tree,
+    should_preserve_checkout_path, source_projection_disposition, validate_portable_source_paths,
+    validate_portable_source_symlink, validate_source_entry, validate_source_paths,
+    validate_source_tree, verify_repository_workspace_projection,
     verify_unchanged_source_tree_and_commit_repository_transaction, ExactProjectionDetachTarget,
     ExactProjectionEjectOutcome, ExactProjectionFreeze, ExactProjectionGitStage,
     ExactProjectionVerification, ExactSessionProjection, SourceProjectionDisposition,

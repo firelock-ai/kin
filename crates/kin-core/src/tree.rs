@@ -592,6 +592,51 @@ pub fn verify_repository_workspace_projection(
     }
 }
 
+/// Report every tracked path whose working copy no longer matches the exact
+/// workspace tree that graph authority owns.
+///
+/// This is the read-only half of a workspace transition. It compares each
+/// tracked member of `tree` against the working copy using content loaded from
+/// repository authority, mutates neither the filesystem nor authority, and
+/// admits nothing. Working-copy paths the tree does not track are never read:
+/// untracked host content is not graph-owned, so it cannot drift and must not
+/// gate a transition. The returned messages describe the diverged tracked
+/// paths in repository order and are empty when the derived view still matches
+/// graph authority.
+pub fn report_repository_workspace_projection_drift(
+    root: &Path,
+    tree: &ResolvedTree,
+    authority: &RepositoryAuthorityManager<LocalFileBackend>,
+) -> Result<Vec<String>> {
+    #[cfg(any(unix, windows))]
+    {
+        let projection =
+            ExactProjectionFreeze::acquire_existing_for_repository_transition(root, authority)?;
+        let owned = load_repository_projection_entries(authority, tree, "current workspace")?;
+        let entries = validated_source_entries(
+            owned
+                .iter()
+                .map(|entry| (&entry.path, entry.kind, entry.content.as_slice())),
+        )?;
+        validate_repository_projection_entries_match_tree("current workspace", tree, &entries)?;
+        validate_projection_proof_paths(tree.artifacts_by_path().map(|artifact| &artifact.path))?;
+        let mut drift = Vec::new();
+        for entry in &entries {
+            match projection.projection.validate_frozen_entry_unchanged(entry) {
+                Ok(_) => {}
+                Err(KinError::ProjectionConflict(message)) => drift.push(message),
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(drift)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (root, tree, authority);
+        Err(unsupported_safe_projection_error())
+    }
+}
+
 /// Restore one exact repository path or component-aware subtree while
 /// publishing only its repository-v6 workspace mutation.
 ///

@@ -71,6 +71,18 @@ fn branch_bad_request(message: impl Into<String>) -> anyhow::Error {
     anyhow::Error::new(BranchBadRequest(message.into()))
 }
 
+/// Refuse a transition over uncommitted state that graph authority already
+/// owns. Only admitted state reaches this: unadmitted working-copy bytes are
+/// reported as projection drift instead, so the wording never describes host
+/// content that has not crossed the repository-v6 compare-and-swap.
+fn graph_owned_changes(workspace: &kin_model::WorkspaceState) -> anyhow::Error {
+    branch_conflict(format!(
+        "workspace {} has graph-owned changes; commit or explicitly preserve them before \
+         switching branches",
+        workspace.workspace_id
+    ))
+}
+
 pub(crate) fn execute(
     state: &DaemonState,
     request: &BranchRequest,
@@ -520,12 +532,14 @@ fn switch(
     let roots = lease.roots().clone();
     let metadata = lease.metadata();
     let workspace = local_workspace(authority, metadata)?.clone();
+    // A transition admits nothing, so this reads persisted authority alone. It
+    // fires only where graph authority already owns uncommitted state: a
+    // non-empty semantic overlay, or a workspace tree that admission moved off
+    // its base. Admission only ever moves members the workspace already
+    // tracks, so untracked host content can never reach this refusal, and the
+    // wording never describes bytes that have not crossed the compare-and-swap.
     if workspace.is_dirty() {
-        return Err(branch_conflict(format!(
-            "workspace {} has graph-owned changes; commit or explicitly preserve them before \
-             switching branches",
-            workspace.workspace_id
-        )));
+        return Err(graph_owned_changes(&workspace));
     }
     let target = lease
         .resolve_ref_target(name)
@@ -672,6 +686,26 @@ fn switch(
         }),
         local_overlay_delta: None,
     };
+    // Validate the derived view before materializing anything over it. This
+    // reads the working copy only at paths the workspace tree already tracks
+    // and compares them against the content repository authority owns, so it
+    // reports edits made outside Kin's seams without treating any of them as
+    // graph-owned state. Untracked host paths are never read and never gate
+    // the transition.
+    let drift = kin_core::report_repository_workspace_projection_drift(
+        state.layout.working_dir(),
+        &workspace.tree,
+        &authority.manager,
+    )
+    .with_context(|| format!("validate exact workspace projection before switching to {name}"))?;
+    if let Some(first) = drift.first() {
+        return Err(kin_core::KinError::ProjectionConflict(format!(
+            "{first}; {} tracked path(s) diverge from the graph-owned workspace projection; \
+             reconcile them into graph authority or discard them before switching branches",
+            drift.len()
+        ))
+        .into());
+    }
     let (materialized, receipt, authority_freeze) =
         kin_core::tree::transition_repository_workspace_tree_and_commit_repository_transaction(
             state.layout.working_dir(),

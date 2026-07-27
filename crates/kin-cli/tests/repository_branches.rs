@@ -814,6 +814,118 @@ fn branch_switch_rejects_local_tracked_edits_and_preserves_authority() {
 
 #[cfg(unix)]
 #[test]
+fn branch_switch_rejects_admitted_graph_owned_workspace_changes() {
+    let root = tempdir().expect("temp root");
+    let home = root.path().join("home");
+    let repo = root.path().join("repo");
+    fs::create_dir_all(&home).expect("create home");
+    initialize_git_repo(&repo);
+    add_feature_branch(&repo);
+    let layout = initialize_kin_repo(&repo, &home);
+    let (repository_id, manager) = open_authority(&layout);
+    admit_uncommitted_workspace_edit(&repository_id, &manager, b"unchanged.txt", b"admitted\n");
+    let before = manager.read_authority().roots().clone();
+
+    let switched = run_kin(&repo, &home, &["branch", "switch", "feature"]);
+    assert!(!switched.status.success());
+    let stderr = String::from_utf8_lossy(&switched.stderr);
+    assert!(
+        stderr.contains("has graph-owned changes"),
+        "admitted workspace state must refuse as graph-owned, got {stderr}"
+    );
+    assert_eq!(
+        manager.read_authority().roots(),
+        &before,
+        "refused switch advanced repository authority"
+    );
+}
+
+/// Publish one uncommitted edit to a tracked workspace member straight through
+/// repository authority, exactly as an admission seam does. This produces the
+/// graph-owned dirty state a transition must refuse without depending on
+/// whichever host events a watcher happens to deliver.
+#[cfg(unix)]
+fn admit_uncommitted_workspace_edit(
+    repository_id: &RepositoryId,
+    manager: &RepositoryAuthorityManager<LocalFileBackend>,
+    path: &[u8],
+    body: &[u8],
+) {
+    let lease = manager.read_authority();
+    let roots = lease.roots().clone();
+    let workspace = lease
+        .metadata()
+        .workspaces
+        .first()
+        .expect("local workspace")
+        .clone();
+    drop(lease);
+
+    let repo_path =
+        kin_model::RepoPath::from_bytes(path.to_vec()).expect("tracked repository path");
+    let artifact = workspace
+        .tree
+        .artifact_at_path(&repo_path)
+        .expect("tracked workspace member")
+        .clone();
+    let digest = kin_model::Hash256::from_bytes(kin_blobs::digest_bytes(body));
+    manager
+        .save_source_blob(digest, body)
+        .expect("save admitted source bytes");
+    let entry = kin_model::TreeEntry::blob(digest, false);
+    let deltas = vec![kin_model::TreeDelta::Updated {
+        artifact_id: artifact.artifact_id,
+        old: artifact.located_entry(),
+        new: kin_model::LocatedEntry::new(repo_path, entry),
+    }];
+    let tree = workspace
+        .tree
+        .apply(&deltas)
+        .expect("apply admitted workspace edit");
+    let tree_hash = kin_model::compute_resolved_tree_hash(&tree).expect("hash admitted tree");
+    manager
+        .commit_repository_transaction(RepositoryTransaction {
+            schema_version: REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+            operation_id: OperationId::new(),
+            repository_id: repository_id.clone(),
+            expected_generation: roots.generation,
+            expected_roots: roots,
+            actor: AuthorId::new("workspace-admission"),
+            reason: "admit exact graph-owned workspace tree".to_string(),
+            external_objects: Vec::new(),
+            git_authority_delta: None,
+            changes: Vec::new(),
+            aliases: Vec::new(),
+            ref_mutations: Vec::new(),
+            default_ref_mutation: None,
+            workspace_mutation: Some(kin_model::WorkspaceMutation {
+                workspace_id: workspace.workspace_id,
+                expected: kin_model::WorkspaceExpectation::MustEqual {
+                    generation: workspace.generation,
+                    head: workspace.head.clone(),
+                    base_target: workspace.base_target.clone(),
+                    base_tree_hash: workspace.base_tree_hash,
+                    tree_hash: workspace.tree_hash,
+                    semantic_overlay_hash: workspace.semantic_overlay_hash,
+                    admission_policy: workspace.admission_policy,
+                },
+                new_generation: workspace.generation + 1,
+                new_head: workspace.head,
+                new_base_target: workspace.base_target,
+                new_base_tree_hash: workspace.base_tree_hash,
+                tree_deltas: deltas,
+                new_tree_hash: tree_hash,
+                semantic_delta: kin_model::WorkspaceSemanticDelta::default(),
+                new_shared_admission_policy: workspace.shared_admission_policy.clone(),
+                new_admission_policy: workspace.admission_policy,
+            }),
+            local_overlay_delta: None,
+        })
+        .expect("commit admitted workspace edit");
+}
+
+#[cfg(unix)]
+#[test]
 fn branch_switch_preserves_graph_only_gitlinks_without_traversing_nested_checkout() {
     let root = tempdir().expect("temp root");
     let home = root.path().join("home");
