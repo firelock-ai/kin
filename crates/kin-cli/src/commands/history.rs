@@ -47,12 +47,12 @@ async fn run_daemon_history(
 }
 
 pub fn execute_history_request(
-    layout: &kin_core::KinLayout,
+    binding: &kin_core::LocalRepositoryAuthorityBinding,
     graph: &kin_db::InMemoryGraph,
     request: &HistoryRequest,
 ) -> Result<HistoryResponse> {
     let head =
-        crate::commands::ref_lookup::resolve_ref(graph, layout, request.reference.as_deref())?;
+        crate::commands::ref_lookup::resolve_ref(graph, binding, request.reference.as_deref())?;
     let target = match request.reference.as_deref() {
         Some(_) => {
             crate::commands::ref_lookup::resolve_entity_query_at_ref(graph, &request.entity, &head)?

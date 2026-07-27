@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 
+use kin_core::LocalRepositoryAuthorityBinding;
 use kin_model::graph::GraphStore;
 
 use crate::error::{McpError, Result};
@@ -184,6 +185,7 @@ fn release_optional_entity_count(
 pub fn handle_release_check<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
+    repository_authority: Option<&LocalRepositoryAuthorityBinding>,
 ) -> Result<ToolCallResult> {
     let require_proof = release_optional_bool(args, "require_proof", false)?;
     let require_approval = release_optional_bool(args, "require_approval", false)?;
@@ -194,8 +196,15 @@ pub fn handle_release_check<G: GraphStore>(
         .transpose()?;
     let expected_entity_count = release_optional_entity_count(args)?;
 
-    let layout = super::artifacts::active_layout()?;
-    let authority = super::repository_authority::ActiveRepositoryAuthority::open(&layout)?;
+    let repository_authority = repository_authority.ok_or_else(|| {
+        McpError::Context(
+            "graph authority gap: release checks require a startup-pinned local repository \
+             authority binding"
+                .to_string(),
+        )
+    })?;
+    let authority =
+        super::repository_authority::ActiveRepositoryAuthority::open(repository_authority)?;
     let mut branches = authority
         .repository_refs()
         .into_iter()
@@ -310,7 +319,8 @@ pub fn handle_release_check<G: GraphStore>(
     // This tool is advisory and cannot hold the daemon's mutation gate, but it
     // must at least detect a branch move that happened while the source checks
     // above were running. Publication still performs the authoritative CAS.
-    let final_authority = super::repository_authority::ActiveRepositoryAuthority::open(&layout)?;
+    let final_authority =
+        super::repository_authority::ActiveRepositoryAuthority::open(repository_authority)?;
     let final_branch = final_authority.repository_ref(&branch.name);
     let final_branch_head = final_branch
         .as_ref()
@@ -416,7 +426,7 @@ mod tests {
 
         for (key, value) in cases {
             let args = HashMap::from([(key.to_string(), value)]);
-            let error = handle_release_check(&args, &store)
+            let error = handle_release_check(&args, &store, None)
                 .expect_err("present release parameters must not silently default on bad types");
             assert!(matches!(error, McpError::InvalidParams(_)));
             assert!(

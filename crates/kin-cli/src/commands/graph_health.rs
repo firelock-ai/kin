@@ -71,13 +71,13 @@ struct ContaminationSummary {
 }
 
 pub(crate) fn inspect_graph(
-    layout: &kin_core::KinLayout,
+    binding: &kin_core::LocalRepositoryAuthorityBinding,
     graph: &kin_db::InMemoryGraph,
 ) -> Result<GraphHealthReport> {
     let stats = graph.graph_stats();
     let supported_inputs = collect_supported_inputs(graph);
     let contamination = collect_contamination(graph)?;
-    let artifact_coverage = collect_repository_artifact_coverage(layout, graph)?;
+    let artifact_coverage = collect_repository_artifact_coverage(binding, graph)?;
     Ok(build_graph_health_report(
         &stats,
         &supported_inputs,
@@ -93,10 +93,10 @@ struct EnrichmentFacets {
 }
 
 fn collect_repository_artifact_coverage(
-    layout: &kin_core::KinLayout,
+    binding: &kin_core::LocalRepositoryAuthorityBinding,
     graph: &kin_db::InMemoryGraph,
 ) -> Result<RepositoryArtifactCoverage> {
-    let authority = ActiveRepositoryAuthority::open(layout)?;
+    let authority = ActiveRepositoryAuthority::open(binding)?;
     let workspace = authority.workspace()?;
     workspace.validate()?;
     collect_repository_artifact_coverage_for_tree(&workspace.tree, graph)

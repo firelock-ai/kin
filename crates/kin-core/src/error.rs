@@ -33,6 +33,15 @@ pub enum KinError {
     )]
     RepositoryPublishedButUncertain { path: String, detail: String },
 
+    #[error("repository authority conflict: {0}")]
+    RepositoryConflict(String),
+
+    #[error("repository projection conflict: {0}")]
+    ProjectionConflict(String),
+
+    #[error("repository authority commit outcome is indeterminate: {0}")]
+    RepositoryCommitIndeterminate(String),
+
     #[error("not a kin repository: {0}")]
     NotARepository(String),
 

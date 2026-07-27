@@ -167,7 +167,7 @@ fn print_verify_response(response: VerifyCommandResponse) -> Result<()> {
 }
 
 pub fn execute_verify_command(
-    layout: &kin_core::KinLayout,
+    binding: &kin_core::LocalRepositoryAuthorityBinding,
     graph: &kin_db::InMemoryGraph,
     request: &VerifyCommandRequest,
 ) -> Result<VerifyCommandResponse> {
@@ -182,7 +182,7 @@ pub fn execute_verify_command(
             })
         }
         VerifyCommandRequest::PlanChange { change_id, depth } => {
-            let change = resolve_change(graph, layout, change_id.as_deref())?;
+            let change = resolve_change(graph, binding, change_id.as_deref())?;
             let plan = build_change_verification_plan(graph, &change, *depth)?;
             Ok(VerifyCommandResponse {
                 lines: change_verification_plan_lines(&plan),
@@ -314,6 +314,7 @@ fn verify_summary_lines(graph: &kin_db::InMemoryGraph) -> Result<Vec<String>> {
 
 pub fn execute_verify_run(
     layout: &kin_core::KinLayout,
+    binding: &kin_core::LocalRepositoryAuthorityBinding,
     graph: &kin_db::InMemoryGraph,
     request: &VerifyRunRequest,
 ) -> Result<VerifyRunResponse> {
@@ -358,7 +359,7 @@ pub fn execute_verify_run(
         }
     };
 
-    let evidence_blob = store_evidence_blob(layout, &evidence_text);
+    let evidence_blob = store_evidence_blob(binding, &evidence_text);
     let run_id = VerificationRunId::new();
     let verification_run = VerificationRun {
         run_id,
@@ -779,7 +780,7 @@ fn change_verification_plan_lines(plan: &ChangeVerificationPlan) -> Vec<String> 
 
 fn resolve_change<G>(
     graph: &G,
-    layout: &kin_core::KinLayout,
+    binding: &kin_core::LocalRepositoryAuthorityBinding,
     change_id: Option<&str>,
 ) -> Result<SemanticChange>
 where
@@ -788,7 +789,7 @@ where
 {
     let change_id = match change_id {
         Some(hash) => parse_change_id(hash)?,
-        None => crate::commands::repository_authority::ActiveRepositoryAuthority::open(layout)?
+        None => crate::commands::repository_authority::ActiveRepositoryAuthority::open(binding)?
             .current_change_id()?
             .ok_or_else(|| anyhow!("repository-v6 workspace head is unborn"))?,
     };
@@ -914,7 +915,10 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
-fn store_evidence_blob(layout: &kin_core::KinLayout, evidence_text: &str) -> Option<Hash256> {
+fn store_evidence_blob(
+    binding: &kin_core::LocalRepositoryAuthorityBinding,
+    evidence_text: &str,
+) -> Option<Hash256> {
     use sha2::{Digest, Sha256};
 
     let mut hasher = Sha256::new();
@@ -925,7 +929,7 @@ fn store_evidence_blob(layout: &kin_core::KinLayout, evidence_text: &str) -> Opt
     let hash = Hash256::from_bytes(bytes);
 
     let authority =
-        crate::commands::repository_authority::ActiveRepositoryAuthority::open(layout).ok()?;
+        crate::commands::repository_authority::ActiveRepositoryAuthority::open(binding).ok()?;
     authority
         .save_source_blob(hash, evidence_text.as_bytes())
         .ok()?;
@@ -989,6 +993,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         kin_core::init(dir.path()).unwrap();
         let layout = kin_core::KinLayout::discover(dir.path()).unwrap();
+        let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&layout).unwrap();
         let snap = crate::backend::open_kindb_snapshot(&layout).unwrap();
         let graph = snap.graph();
 
@@ -1027,6 +1032,7 @@ mod tests {
 
         let response = execute_verify_run(
             &layout,
+            &binding,
             graph.as_ref(),
             &VerifyRunRequest {
                 entity: "checkout".into(),

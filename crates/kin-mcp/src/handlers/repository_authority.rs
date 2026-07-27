@@ -4,12 +4,14 @@
 //! Read-only access to the active repository-v6 authority.
 //!
 //! MCP handlers must not reconstruct refs, workspace state, aliases, or source
-//! bytes from legacy sidecars or the working directory. This module opens one
-//! durable repository authority and provides the small set of fail-closed
-//! lookups the handlers need.
+//! bytes from legacy sidecars or the working directory. Product dispatch binds
+//! repository identity and a storage capability once at process/daemon startup,
+//! then every handler reuses that retained capability. Reopening from a mutable
+//! manifest or `.kin/kindb` path inside a request would bless namespace swaps
+//! and let one daemon silently change which repository it serves.
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::path::PathBuf;
 
 use kin_db::{LocalFileBackend, RepositoryAuthorityManager};
 use kin_model::{
@@ -19,6 +21,26 @@ use kin_model::{
 
 use crate::error::{McpError, Result};
 
+pub use kin_core::LocalRepositoryAuthorityBinding;
+
+/// Discover and pin a repository once for the explicit offline stdio loop.
+///
+/// A process launched outside a Kin repository has no binding; handlers that
+/// require exact repository authority will then fail loudly. An invalid
+/// repository that *is* discovered remains a startup error.
+pub(crate) fn discover_for_process() -> Result<Option<LocalRepositoryAuthorityBinding>> {
+    let start = std::env::var_os("KIN_SOURCE_ROOT")
+        .map(PathBuf::from)
+        .map(Ok)
+        .unwrap_or_else(std::env::current_dir)?;
+    let Some(layout) = kin_core::KinLayout::discover(&start) else {
+        return Ok(None);
+    };
+    LocalRepositoryAuthorityBinding::from_layout(&layout)
+        .map(Some)
+        .map_err(|error| McpError::Context(format!("graph authority gap: {error}")))
+}
+
 pub(crate) struct ActiveRepositoryAuthority {
     manager: RepositoryAuthorityManager<LocalFileBackend>,
     pub repository_id: RepositoryId,
@@ -26,38 +48,16 @@ pub(crate) struct ActiveRepositoryAuthority {
 }
 
 impl ActiveRepositoryAuthority {
-    pub(crate) fn open(layout: &kin_core::KinLayout) -> Result<Self> {
-        let manifest = kin_core::KinManifest::load(&layout.manifest_path()).map_err(|error| {
+    pub(crate) fn open(binding: &LocalRepositoryAuthorityBinding) -> Result<Self> {
+        let manager = binding.open_manager().map_err(|error| {
             McpError::Context(format!(
-                "graph authority gap: cannot load repository manifest: {error}"
+                "graph authority gap: cannot open retained repository authority: {error}"
             ))
         })?;
-        let repository_id = RepositoryId::new(manifest.repo_id).map_err(|error| {
-            McpError::Context(format!(
-                "graph authority gap: repository manifest has an invalid identity: {error}"
-            ))
-        })?;
-        let workspace_uuid = uuid::Uuid::parse_str(&manifest.workspace_id).map_err(|error| {
-            McpError::Context(format!(
-                "graph authority gap: repository manifest has an invalid workspace identity: \
-                 {error}"
-            ))
-        })?;
-        let workspace_id = WorkspaceId::from_uuid(workspace_uuid);
-        let manager = RepositoryAuthorityManager::open(
-            repository_id.clone(),
-            Arc::new(LocalFileBackend::new(layout.kindb_dir())),
-        )
-        .map_err(|error| {
-            McpError::Context(format!(
-                "graph authority gap: cannot open repository authority: {error}"
-            ))
-        })?;
-
         Ok(Self {
             manager,
-            repository_id,
-            workspace_id,
+            repository_id: binding.repository_id().clone(),
+            workspace_id: binding.workspace_id(),
         })
     }
 

@@ -23,6 +23,7 @@ thread_local! {
 }
 
 use crate::error::{McpError, Result};
+use kin_core::LocalRepositoryAuthorityBinding;
 use kin_spine::{classify_spine_probe, SpineProbe, SpineQuery};
 
 // ── Parameter extraction helpers ──
@@ -416,12 +417,17 @@ pub fn collect_primary_trace_chain<G: GraphStore>(
     Ok(chain)
 }
 
-pub fn trace_body<G: GraphStore>(store: &G, entity: &Entity) -> Result<String> {
+pub fn trace_body<G: GraphStore>(
+    store: &G,
+    entity: &Entity,
+    repository_authority: Option<&LocalRepositoryAuthorityBinding>,
+) -> Result<String> {
     Ok(read_entity_source_excerpt_detailed(
         store,
         entity,
         MCP_SOURCE_MAX_LINES,
         MCP_SOURCE_MAX_CHARS,
+        repository_authority,
     )?
     .map(|source| source.body)
     .unwrap_or_else(|| entity.signature.clone()))
@@ -791,12 +797,15 @@ pub fn evaluate_trace_chain<G: GraphStore>(
     store: &G,
     chain: &[Entity],
     input_literal: i64,
+    repository_authority: Option<&LocalRepositoryAuthorityBinding>,
 ) -> Result<Option<Vec<TraceEvaluationStep>>> {
     let mut constant_values = HashMap::new();
     for step in chain {
-        let body = trace_body(store, step)?;
+        let body = trace_body(store, step, repository_authority)?;
         for constant in trace_constants_for_step(store, step, &body)? {
-            if let Some(value) = parse_trace_constant_value(&trace_body(store, &constant)?) {
+            if let Some(value) =
+                parse_trace_constant_value(&trace_body(store, &constant, repository_authority)?)
+            {
                 constant_values
                     .entry(constant.name.clone())
                     .or_insert(value);
@@ -808,7 +817,7 @@ pub fn evaluate_trace_chain<G: GraphStore>(
     let mut evaluation = Vec::new();
 
     for step in chain.iter().rev() {
-        let body = trace_body(store, step)?;
+        let body = trace_body(store, step, repository_authority)?;
         let Some((value, detail)) =
             evaluate_trace_step_body(&body, input_literal, &function_values, &constant_values)
         else {
@@ -921,6 +930,7 @@ pub fn collect_graph_reference_rows<G: GraphStore>(
     store: &G,
     entity_id: &EntityId,
     relation_kinds: &[RelationKind],
+    repository_authority: Option<&LocalRepositoryAuthorityBinding>,
 ) -> Result<Vec<ReferenceRow>> {
     let allowed: std::collections::HashSet<_> = relation_kinds.iter().copied().collect();
     let mut grouped: HashMap<String, ReferenceRow> = HashMap::new();
@@ -944,7 +954,7 @@ pub fn collect_graph_reference_rows<G: GraphStore>(
 
         let file_path = entity.file_origin.as_ref().map(|path| path.0.clone());
         let key = reference_row_key(file_path.as_deref(), &entity.name);
-        let snippet = read_bounded_entity_snippet(store, &entity)?;
+        let snippet = read_bounded_entity_snippet(store, &entity, repository_authority)?;
         let entry = grouped.entry(key).or_insert_with(|| ReferenceRow {
             entity_id: Some(source_entity_id.to_string()),
             name: entity.name.clone(),
@@ -1032,6 +1042,7 @@ fn graph_source_gap(message: impl Into<String>) -> McpError {
 fn resolve_entity_source_authority<G: GraphStore>(
     store: &G,
     entity: &Entity,
+    repository_authority: Option<&LocalRepositoryAuthorityBinding>,
 ) -> Result<Option<(ExactEntitySource, Vec<u8>, SourceSpan)>> {
     LAST_READ_STALE.with(|f| f.set(false));
     LAST_READ_SOURCE.with(|f| f.set("unknown"));
@@ -1049,9 +1060,14 @@ fn resolve_entity_source_authority<G: GraphStore>(
         )));
     }
 
-    let layout = super::artifacts::active_layout().map_err(record_graph_source_gap)?;
-    let authority = super::repository_authority::ActiveRepositoryAuthority::open(&layout)
-        .map_err(record_graph_source_gap)?;
+    let authority = super::repository_authority::ActiveRepositoryAuthority::open(
+        repository_authority.ok_or_else(|| {
+            graph_source_gap(
+                "this MCP runtime has no startup-pinned local repository authority binding",
+            )
+        })?,
+    )
+    .map_err(record_graph_source_gap)?;
     let source_change_id = authority.current_source_change_id()?;
     let revision = store
         .resolve_entity_revision_at(&entity.id, &source_change_id)
@@ -1160,8 +1176,11 @@ pub fn read_entity_source_excerpt_detailed<G: GraphStore>(
     entity: &Entity,
     max_lines: usize,
     max_chars: usize,
+    repository_authority: Option<&LocalRepositoryAuthorityBinding>,
 ) -> Result<Option<ExactEntitySource>> {
-    let Some((mut source, bytes, span)) = resolve_entity_source_authority(store, entity)? else {
+    let Some((mut source, bytes, span)) =
+        resolve_entity_source_authority(store, entity, repository_authority)?
+    else {
         return Ok(None);
     };
     let text = std::str::from_utf8(&bytes).map_err(|error| {
@@ -1208,12 +1227,14 @@ pub const RETRIEVAL_SNIPPET_MAX_CHARS: usize = 800;
 pub fn read_bounded_entity_snippet<G: GraphStore>(
     store: &G,
     entity: &Entity,
+    repository_authority: Option<&LocalRepositoryAuthorityBinding>,
 ) -> Result<Option<String>> {
     Ok(read_entity_source_excerpt_detailed(
         store,
         entity,
         RETRIEVAL_SNIPPET_MAX_LINES,
         RETRIEVAL_SNIPPET_MAX_CHARS,
+        repository_authority,
     )?
     .map(|source| source.body))
 }
@@ -1479,6 +1500,7 @@ pub fn clip_rendered_text_with_cap(text: &str, max_lines: usize, max_chars: usiz
 pub fn entity_response_json<G: GraphStore>(
     store: &G,
     entity: &Entity,
+    repository_authority: Option<&LocalRepositoryAuthorityBinding>,
 ) -> Result<serde_json::Value> {
     let mut value = serde_json::to_value(entity).map_err(McpError::Json)?;
     let Some(obj) = value.as_object_mut() else {
@@ -1497,6 +1519,7 @@ pub fn entity_response_json<G: GraphStore>(
         entity,
         MCP_SOURCE_MAX_LINES,
         MCP_SOURCE_MAX_CHARS,
+        repository_authority,
     )? {
         obj.insert("source_excerpt".into(), serde_json::json!(source.body));
         obj.insert(
@@ -1521,6 +1544,7 @@ pub fn focal_context_json<G: GraphStore>(
     entry: &kin_model::ContextEntry,
     entity: &Entity,
     compact: bool,
+    repository_authority: Option<&LocalRepositoryAuthorityBinding>,
 ) -> Result<serde_json::Value> {
     let start_line = entity.span.as_ref().map(|span| span.start_line);
     let end_line = entity.span.as_ref().map(|span| span.end_line);
@@ -1529,6 +1553,7 @@ pub fn focal_context_json<G: GraphStore>(
         entity,
         MCP_SOURCE_MAX_LINES,
         MCP_SOURCE_MAX_CHARS,
+        repository_authority,
     )?;
     let is_stale = LAST_READ_STALE.with(|f| f.get());
     let source = LAST_READ_SOURCE.with(|f| f.get());

@@ -22,6 +22,7 @@ use kin_model::{
 };
 use sha2::{Digest, Sha256};
 
+use crate::local_repository_authority::LocalRepositoryAuthorityContext;
 use crate::repository_commit::{
     commit_native_plan_with_projection, load_native_commit_base, load_native_source_blob,
     plan_native_commit_from_base, recover_native_commit, NativeCommitBase, NativeCommitResult,
@@ -31,6 +32,11 @@ use crate::state::DaemonState;
 struct ExactMcpPlan {
     native: crate::repository_commit::NativeCommitPlan,
     layouts: Vec<FileLayout>,
+}
+
+fn authority_context(state: &DaemonState) -> Result<LocalRepositoryAuthorityContext, String> {
+    LocalRepositoryAuthorityContext::from_state(state)
+        .map_err(|error| format!("open startup-pinned repository authority: {error}"))
 }
 
 /// Commit one daemon-owned MCP transaction through exact repository authority.
@@ -110,6 +116,7 @@ fn commit_exact_transaction_inner(
     })?;
     let operation_id = OperationId::from_uuid(operation_uuid);
     let payload_hash = transaction_payload_hash(&transaction)?;
+    let authority_context = authority_context(state)?;
 
     // A non-terminal committing marker means authority may already have moved.
     // Recover by the caller-stable operation ID before attempting any new plan.
@@ -119,7 +126,7 @@ fn commit_exact_transaction_inner(
                 "Cannot recover transaction {transaction_id}: staged payload does not match its durable committing fence"
             ));
         }
-        if let Some(recovered) = recover_native_commit(&state.layout, operation_id)
+        if let Some(recovered) = recover_native_commit(&authority_context, operation_id)
             .map_err(|error| format!("recover exact MCP repository receipt: {error}"))?
         {
             return finalize_committed_transaction(
@@ -148,10 +155,11 @@ fn commit_exact_transaction_inner(
             .map_err(|error| format!("persist receipt-less committing reset: {error}"))?;
     }
 
-    let base = load_native_commit_base(&state.layout)
+    let base = load_native_commit_base(&authority_context)
         .map_err(|error| format!("load exact MCP commit base: {error}"))?;
     require_live_graph_matches_authority(state.graph.as_ref(), &base.graph)?;
-    let plan = plan_exact_transaction(state, &transaction, operation_id, &base)?;
+    let plan =
+        plan_exact_transaction(state, &authority_context, &transaction, operation_id, &base)?;
 
     // Publication fence: from this point until receipt recovery or an explicit
     // reset, the staged operation set is immutable and durable.
@@ -168,10 +176,11 @@ fn commit_exact_transaction_inner(
     let committed = match commit_native_plan_with_projection(
         &state.layout,
         state.blobs.as_ref(),
+        &authority_context,
         plan.native,
     ) {
         Ok(committed) => committed,
-        Err(commit_error) => match recover_native_commit(&state.layout, operation_id) {
+        Err(commit_error) => match recover_native_commit(&authority_context, operation_id) {
             Ok(Some(recovered)) => recovered,
             Ok(None) => {
                 sessions
@@ -307,6 +316,7 @@ fn semantic_workspace_matches(left: &kin_db::InMemoryGraph, right: &kin_db::InMe
 
 fn plan_exact_transaction(
     state: &DaemonState,
+    authority_context: &LocalRepositoryAuthorityContext,
     transaction: &kin_mcp::McpTransaction,
     operation_id: OperationId,
     base: &NativeCommitBase,
@@ -470,7 +480,7 @@ fn plan_exact_transaction(
                 ))
             }
         };
-        let original = load_native_source_blob(&state.layout, old_hash)
+        let original = load_native_source_blob(authority_context, old_hash)
             .map_err(|error| format!("load exact source body for {file_id}: {error}"))?;
         std::str::from_utf8(&original).map_err(|error| {
             format!(
@@ -577,9 +587,9 @@ fn plan_exact_transaction(
 
     let message = format!("MCP transaction {}", transaction.transaction_id);
     let native = plan_native_commit_from_base(
-        &state.layout,
         &prospective,
         state.blobs.as_ref(),
+        authority_context,
         operation_id,
         kin_model::Timestamp::now(),
         kin_model::AuthorId::new(format!("mcp:{}", transaction.session_id)),
@@ -706,7 +716,8 @@ fn finalize_committed_transaction(
     planned_layouts: Vec<FileLayout>,
     coordination: Option<&kin_mcp::CoordinationWritePreflight>,
 ) -> Result<kin_mcp::ToolCallResult, String> {
-    let authority = load_native_commit_base(&state.layout)
+    let authority_context = authority_context(state)?;
+    let authority = load_native_commit_base(&authority_context)
         .map_err(|error| format!("reload committed MCP repository authority: {error}"))?;
     if authority.roots != committed.receipt.roots_after {
         return Err(format!(
@@ -879,6 +890,7 @@ fn rebuild_changed_layouts(
     authority: &NativeCommitBase,
     change: &kin_model::SemanticChange,
 ) -> Result<Vec<FileLayout>, String> {
+    let authority_context = authority_context(state)?;
     let pipeline = kin_index::IndexPipeline::new();
     let mut layouts = Vec::new();
     for file_id in changed_file_ids(change)? {
@@ -891,7 +903,7 @@ fn rebuild_changed_layouts(
         let hash = artifact.entry.blob_identity().ok_or_else(|| {
             format!("recovered changed artifact {file_id} is an unmaterializable gitlink")
         })?;
-        let body = load_native_source_blob(&state.layout, hash)
+        let body = load_native_source_blob(&authority_context, hash)
             .map_err(|error| format!("load recovered exact body for {file_id}: {error}"))?;
         let indexed = pipeline
             .index_any_content(
@@ -990,6 +1002,36 @@ mod tests {
         (dir, state)
     }
 
+    fn test_authority_context(layout: &kin_core::KinLayout) -> LocalRepositoryAuthorityContext {
+        LocalRepositoryAuthorityContext::from_layout_for_test(layout).unwrap()
+    }
+
+    fn load_native_commit_base(
+        layout: &kin_core::KinLayout,
+    ) -> crate::error::Result<NativeCommitBase> {
+        crate::repository_commit::load_native_commit_base(&test_authority_context(layout))
+    }
+
+    fn load_native_source_blob(
+        layout: &kin_core::KinLayout,
+        hash: Hash256,
+    ) -> crate::error::Result<Vec<u8>> {
+        crate::repository_commit::load_native_source_blob(&test_authority_context(layout), hash)
+    }
+
+    fn commit_native_plan_with_projection(
+        layout: &kin_core::KinLayout,
+        blobs: &kin_blobs::BlobStore,
+        plan: crate::repository_commit::NativeCommitPlan,
+    ) -> crate::error::Result<NativeCommitResult> {
+        crate::repository_commit::commit_native_plan_with_projection(
+            layout,
+            blobs,
+            &test_authority_context(layout),
+            plan,
+        )
+    }
+
     fn git(repo: &Path, args: &[&str]) -> String {
         let output = Command::new("git")
             .current_dir(repo)
@@ -1059,9 +1101,9 @@ mod tests {
             .expect("source fixture must contain requested entity");
 
         let plan = crate::repository_commit::plan_native_commit(
-            &state.layout,
             state.graph.as_ref(),
             state.blobs.as_ref(),
+            &authority_context(state).unwrap(),
             OperationId::new(),
             Timestamp::now(),
             AuthorId::new("exact-mcp-test"),
@@ -1086,9 +1128,9 @@ mod tests {
         project_tree: bool,
     ) -> NativeCommitResult {
         let plan = crate::repository_commit::plan_native_commit(
-            &state.layout,
             state.graph.as_ref(),
             state.blobs.as_ref(),
+            &authority_context(state).unwrap(),
             OperationId::new(),
             Timestamp::now(),
             AuthorId::new("exact-mcp-test"),
@@ -1098,8 +1140,12 @@ mod tests {
         let committed = if project_tree {
             commit_native_plan_with_projection(&state.layout, state.blobs.as_ref(), plan).unwrap()
         } else {
-            crate::repository_commit::commit_native_plan(&state.layout, state.blobs.as_ref(), plan)
-                .unwrap()
+            crate::repository_commit::commit_native_plan(
+                state.blobs.as_ref(),
+                &authority_context(state).unwrap(),
+                plan,
+            )
+            .unwrap()
         };
         state
             .graph
@@ -1505,7 +1551,7 @@ mod tests {
         git(repo, &["config", "commit.gpgsign", "false"]);
         std::fs::write(repo.join(".subtarget"), b"subrepository target\n").unwrap();
         git(repo, &["add", ".subtarget"]);
-        git(repo, &["commit", "-m", "subrepository target"]);
+        git(repo, &["commit", "-s", "-m", "subrepository target"]);
         let gitlink_target = git(repo, &["rev-parse", "HEAD"]);
         git(repo, &["switch", "--orphan", "main"]);
         if repo.join(".subtarget").exists() {
@@ -1525,7 +1571,7 @@ mod tests {
                 &format!("160000,{gitlink_target},modules/dependency"),
             ],
         );
-        git(repo, &["commit", "-m", "source with exact gitlink"]);
+        git(repo, &["commit", "-s", "-m", "source with exact gitlink"]);
 
         let layout = kin_core::init_from_git(repo).unwrap().layout;
         let state = Arc::new(DaemonState::open(layout).unwrap());

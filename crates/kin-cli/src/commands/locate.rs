@@ -1494,6 +1494,7 @@ pub fn run_with_graph_capture_with_priority_files(
         extra_priority_files,
         None,
         SnippetOptions::default(),
+        None,
     )
 }
 
@@ -1507,6 +1508,7 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
     extra_priority_files: Vec<(String, f32)>,
     vector_source: Option<&kin_db::InMemoryGraph>,
     snippet_opts: SnippetOptions,
+    repository_authority: Option<&kin_core::LocalRepositoryAuthorityBinding>,
 ) -> Result<LocateResult> {
     let _span = tracing::info_span!(
         "kin.locate.run_with_graph",
@@ -3553,17 +3555,17 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
     // Project bounded inline snippets from graph-owned content (no extra IO on
     // the working tree). No-op unless requested; the early budget-exhausted
     // return above carries no symbols, so it needs no snippets.
-    attach_snippets(&mut result, graph, &snippet_opts)?;
+    attach_snippets(&mut result, graph, &snippet_opts, repository_authority)?;
     // Re-project the ranked symbols into the graph-native PRIMARY surface: a
     // single globally-ranked entity list (file demoted to provenance). Reuses the
     // snippet projection's bounds; the daemon caches the full ranking and windows
     // one page. No-op unless the agent/JSON surface requested snippets.
-    build_entity_view(&mut result, graph, &snippet_opts)?;
+    build_entity_view(&mut result, graph, &snippet_opts, repository_authority)?;
     Ok(result)
 }
 
 pub fn run_with_graph_capture_at_ref(
-    layout: &kin_core::KinLayout,
+    binding: &kin_core::LocalRepositoryAuthorityBinding,
     vector_source: &kin_db::InMemoryGraph,
     _blob_store: &kin_blobs::BlobStore,
     head: &SemanticChangeId,
@@ -3574,8 +3576,10 @@ pub fn run_with_graph_capture_at_ref(
     max_files_explicit: bool,
     snippet_opts: SnippetOptions,
 ) -> Result<LocateResult> {
-    let authority = crate::commands::repository_authority::ActiveRepositoryAuthority::open(layout)?;
+    let authority =
+        crate::commands::repository_authority::ActiveRepositoryAuthority::open(binding)?;
     run_with_repository_authority_capture_at_ref(
+        Some(binding),
         authority.manager(),
         vector_source,
         head,
@@ -3589,6 +3593,7 @@ pub fn run_with_graph_capture_at_ref(
 }
 
 fn run_with_repository_authority_capture_at_ref<B>(
+    repository_authority: Option<&kin_core::LocalRepositoryAuthorityBinding>,
     authority: &kin_db::RepositoryAuthorityManager<B>,
     vector_source: &kin_db::InMemoryGraph,
     head: &SemanticChangeId,
@@ -3624,6 +3629,7 @@ where
         extra_priority_files,
         Some(vector_source),
         snippet_opts,
+        repository_authority,
     )
 }
 
@@ -15169,6 +15175,7 @@ pub fn attach_snippets(
     result: &mut LocateResult,
     graph: &kin_db::InMemoryGraph,
     opts: &SnippetOptions,
+    repository_authority: Option<&kin_core::LocalRepositoryAuthorityBinding>,
 ) -> Result<()> {
     if !opts.enabled {
         return Ok(());
@@ -15202,6 +15209,7 @@ pub fn attach_snippets(
                 entity,
                 opts.max_lines,
                 opts.max_chars,
+                repository_authority,
             )? {
                 sym.snippet = Some(source.body);
                 filled += 1;
@@ -15242,9 +15250,14 @@ fn bounded_entity_body_with_note(
     entity: &kin_model::Entity,
     max_lines: usize,
     max_chars: usize,
+    repository_authority: Option<&kin_core::LocalRepositoryAuthorityBinding>,
 ) -> Result<Option<String>> {
     let Some(source) = kin_mcp::handlers::common::read_entity_source_excerpt_detailed(
-        graph, entity, max_lines, max_chars,
+        graph,
+        entity,
+        max_lines,
+        max_chars,
+        repository_authority,
     )?
     else {
         return Ok(None);
@@ -15284,6 +15297,7 @@ pub fn build_entity_view(
     result: &mut LocateResult,
     graph: &kin_db::InMemoryGraph,
     opts: &SnippetOptions,
+    repository_authority: Option<&kin_core::LocalRepositoryAuthorityBinding>,
 ) -> Result<()> {
     if !opts.enabled {
         return Ok(());
@@ -15314,8 +15328,14 @@ pub fn build_entity_view(
             // Bodies belong to definitions; references/re-exports stay
             // coordinates-only (the symbol already reused its snippet, if any).
             let body = if sym.definition {
-                bounded_entity_body_with_note(graph, entity, opts.max_lines, opts.max_chars)?
-                    .or_else(|| sym.snippet.clone())
+                bounded_entity_body_with_note(
+                    graph,
+                    entity,
+                    opts.max_lines,
+                    opts.max_chars,
+                    repository_authority,
+                )?
+                .or_else(|| sym.snippet.clone())
             } else {
                 None
             };
@@ -15901,6 +15921,9 @@ mod tests {
                             base_target: prior_target,
                             base_tree_hash: prior_tree_hash,
                             tree_hash: prior_tree_hash.unwrap(),
+                            semantic_overlay_hash: kin_model::WorkspaceSemanticOverlay::default()
+                                .identity_hash()
+                                .unwrap(),
                             admission_policy: admission_policy.clone(),
                         }
                     },
@@ -15910,8 +15933,13 @@ mod tests {
                     },
                     new_base_target: Some(target.clone()),
                     new_base_tree_hash: Some(tree_hash),
-                    tree_deltas: change.tree_deltas,
+                    tree_deltas: change.tree_deltas.clone(),
                     new_tree_hash: tree_hash,
+                    semantic_delta: kin_model::WorkspaceSemanticDelta::new(
+                        change.entity_deltas.clone(),
+                        change.relation_deltas.clone(),
+                    )
+                    .unwrap(),
                     new_shared_admission_policy: shared_policy.clone(),
                     new_admission_policy: admission_policy.clone(),
                 }),
@@ -16461,7 +16489,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        build_entity_view(&mut result, &graph, &SnippetOptions::default()).unwrap();
+        build_entity_view(&mut result, &graph, &SnippetOptions::default(), None).unwrap();
         assert!(
             result.entities.is_empty(),
             "disabled snippet opts must leave the entity surface untouched"
@@ -23147,6 +23175,7 @@ mod tests {
         load_complete_test_vectors(&current_graph, &[entity_v2.clone()]);
 
         let historical = run_with_repository_authority_capture_at_ref(
+            None,
             &authority,
             &current_graph,
             &add_id,
@@ -23169,6 +23198,7 @@ mod tests {
         );
 
         let current = run_with_repository_authority_capture_at_ref(
+            None,
             &authority,
             &current_graph,
             &modify_id,

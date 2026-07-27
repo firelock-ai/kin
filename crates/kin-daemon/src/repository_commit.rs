@@ -16,13 +16,14 @@ use kin_model::{
     compute_resolved_tree_hash, compute_semantic_change_id, AuthorId, ChangeOrigin,
     EffectiveAdmissionPolicyStamp, Hash256, ModelError, OperationId, RefExpectation, RefMutation,
     RefName, RefTarget, RefUpdatePolicy, RepositoryCommitOutcome, RepositoryCommitReceipt,
-    RepositoryId, RepositoryTransaction, RootBundle, SemanticChange, SemanticChangeId,
-    SharedAdmissionPolicy, Timestamp, WorkspaceExpectation, WorkspaceHead, WorkspaceId,
-    WorkspaceMutation, REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+    RepositoryTransaction, RootBundle, SemanticChange, SemanticChangeId, SharedAdmissionPolicy,
+    Timestamp, WorkspaceExpectation, WorkspaceHead, WorkspaceId, WorkspaceMutation,
+    WorkspaceSemanticDelta, REPOSITORY_TRANSACTION_SCHEMA_VERSION,
 };
 
 use crate::commit_deltas::compute_deltas_vs_repository_authority;
 use crate::error::{DaemonError, Result};
+use crate::local_repository_authority::LocalRepositoryAuthorityContext;
 
 type ProjectionEntry = (kin_model::RepoPath, kin_model::TreeEntry, Arc<[u8]>);
 
@@ -106,13 +107,14 @@ pub struct SessionWorkspaceAdmissionResult {
 /// onto a newer workspace. The only accepted moved-authority state is the
 /// exact durable receipt for this session's caller-stable operation and
 /// transaction hash.
-pub fn plan_session_workspace_admission(
-    layout: &kin_core::KinLayout,
+pub(crate) fn plan_session_workspace_admission(
     blobs: &kin_blobs::BlobStore,
+    authority_context: &LocalRepositoryAuthorityContext,
     base: &kin_cli::commands::session_workspace::SessionWorkspaceBase,
     desired_tree: &kin_model::ResolvedTree,
 ) -> Result<SessionWorkspaceAdmissionPlan> {
-    let (repository_id, workspace_id) = repository_identity(layout)?;
+    let repository_id = authority_context.repository_id().clone();
+    let workspace_id = authority_context.workspace_id();
     if base.repository_id != repository_id
         || base.source_workspace.repository_id != repository_id
         || base.source_workspace.workspace_id != workspace_id
@@ -130,7 +132,7 @@ pub fn plan_session_workspace_admission(
         ));
     }
 
-    let authority = open_authority(layout, repository_id.clone())?;
+    let authority = authority_context.open().map_err(DaemonError::Graph)?;
     let mut source_lengths = std::collections::BTreeMap::new();
     let (shared_policy, _) = SharedAdmissionPolicy::derive_from_tree(
         Some(&base.source_workspace.shared_admission_policy),
@@ -194,6 +196,7 @@ pub fn plan_session_workspace_admission(
                 base_target: base.source_workspace.base_target.clone(),
                 base_tree_hash: base.source_workspace.base_tree_hash,
                 tree_hash: base.source_workspace.tree_hash,
+                semantic_overlay_hash: base.source_workspace.semantic_overlay_hash,
                 admission_policy: base.source_workspace.admission_policy,
             },
             new_generation,
@@ -202,6 +205,7 @@ pub fn plan_session_workspace_admission(
             new_base_tree_hash: base.source_workspace.base_tree_hash,
             tree_deltas: deltas.clone(),
             new_tree_hash: tree_hash,
+            semantic_delta: WorkspaceSemanticDelta::default(),
             new_shared_admission_policy: shared_policy.clone(),
             new_admission_policy: EffectiveAdmissionPolicyStamp {
                 shared: shared_policy.stamp(),
@@ -275,19 +279,20 @@ pub fn plan_session_workspace_admission(
 
 /// Persist session-observed immutable bodies and linearize the exact primary
 /// projection with one workspace-only repository transaction.
-pub fn commit_session_workspace_admission(
+pub(crate) fn commit_session_workspace_admission(
     layout: &kin_core::KinLayout,
     blobs: &kin_blobs::BlobStore,
+    authority_context: &LocalRepositoryAuthorityContext,
     plan: SessionWorkspaceAdmissionPlan,
 ) -> Result<SessionWorkspaceAdmissionResult> {
-    let (repository_id, _) = repository_identity(layout)?;
+    let repository_id = authority_context.repository_id().clone();
     if plan.transaction.repository_id != repository_id {
         return Err(invalid(format!(
             "session admission plan belongs to {}, not {}",
             plan.transaction.repository_id, repository_id
         )));
     }
-    let authority = open_authority(layout, repository_id)?;
+    let authority = authority_context.open().map_err(DaemonError::Graph)?;
     for hash in &plan.source_hashes {
         let blob_hash = kin_blobs::Hash256::from_bytes(*hash.as_bytes());
         match blobs.read(&blob_hash) {
@@ -351,15 +356,16 @@ pub fn commit_session_workspace_admission(
 /// non-authoritative ingestion CAS, copies newly referenced bodies into
 /// repository CAS, and compare-and-swaps the workspace. It never creates a
 /// history node or advances a ref.
-pub fn publish_workspace_tree(
-    layout: &kin_core::KinLayout,
+pub(crate) fn publish_workspace_tree(
     blobs: &kin_blobs::BlobStore,
+    authority_context: &LocalRepositoryAuthorityContext,
     desired_tree: &kin_model::ResolvedTree,
     operation_id: OperationId,
     actor: AuthorId,
 ) -> Result<Option<WorkspaceAdmissionResult>> {
-    let (repository_id, workspace_id) = repository_identity(layout)?;
-    let authority = open_authority(layout, repository_id.clone())?;
+    let repository_id = authority_context.repository_id().clone();
+    let workspace_id = authority_context.workspace_id();
+    let authority = authority_context.open().map_err(DaemonError::Graph)?;
     let lease = authority.read_authority();
     let workspace = lease
         .metadata()
@@ -436,6 +442,7 @@ pub fn publish_workspace_tree(
                 base_target: workspace.base_target.clone(),
                 base_tree_hash: workspace.base_tree_hash,
                 tree_hash: workspace.tree_hash,
+                semantic_overlay_hash: workspace.semantic_overlay_hash,
                 admission_policy: workspace.admission_policy,
             },
             new_generation,
@@ -444,6 +451,7 @@ pub fn publish_workspace_tree(
             new_base_tree_hash: workspace.base_tree_hash,
             tree_deltas: tree_deltas.clone(),
             new_tree_hash: tree_hash,
+            semantic_delta: WorkspaceSemanticDelta::default(),
             new_shared_admission_policy: shared_policy.clone(),
             new_admission_policy: EffectiveAdmissionPolicyStamp {
                 shared: shared_policy.stamp(),
@@ -483,19 +491,19 @@ pub fn publish_workspace_tree(
 /// Construct one exact native transaction without mutating repository
 /// authority.
 #[allow(clippy::too_many_arguments)]
-pub fn plan_native_commit(
-    layout: &kin_core::KinLayout,
+pub(crate) fn plan_native_commit(
     graph: &kin_db::InMemoryGraph,
     blobs: &kin_blobs::BlobStore,
+    authority_context: &LocalRepositoryAuthorityContext,
     operation_id: OperationId,
     timestamp: Timestamp,
     author: AuthorId,
     message: String,
 ) -> Result<NativeCommitPlan> {
     plan_native_commit_inner(
-        layout,
         graph,
         blobs,
+        authority_context,
         operation_id,
         timestamp,
         author,
@@ -512,10 +520,10 @@ pub fn plan_native_commit(
 /// on generation N+1. Publication still performs the storage CAS, so a move
 /// after planning also fails closed.
 #[allow(clippy::too_many_arguments)]
-pub fn plan_native_commit_from_base(
-    layout: &kin_core::KinLayout,
+pub(crate) fn plan_native_commit_from_base(
     graph: &kin_db::InMemoryGraph,
     blobs: &kin_blobs::BlobStore,
+    authority_context: &LocalRepositoryAuthorityContext,
     operation_id: OperationId,
     timestamp: Timestamp,
     author: AuthorId,
@@ -523,9 +531,9 @@ pub fn plan_native_commit_from_base(
     base: &NativeCommitBase,
 ) -> Result<NativeCommitPlan> {
     plan_native_commit_inner(
-        layout,
         graph,
         blobs,
+        authority_context,
         operation_id,
         timestamp,
         author,
@@ -536,9 +544,9 @@ pub fn plan_native_commit_from_base(
 
 #[allow(clippy::too_many_arguments)]
 fn plan_native_commit_inner(
-    layout: &kin_core::KinLayout,
     graph: &kin_db::InMemoryGraph,
     blobs: &kin_blobs::BlobStore,
+    authority_context: &LocalRepositoryAuthorityContext,
     operation_id: OperationId,
     timestamp: Timestamp,
     author: AuthorId,
@@ -548,8 +556,9 @@ fn plan_native_commit_inner(
     if message.trim().is_empty() {
         return Err(invalid("native commit message must not be empty"));
     }
-    let (repository_id, workspace_id) = repository_identity(layout)?;
-    let authority = open_authority(layout, repository_id.clone())?;
+    let repository_id = authority_context.repository_id().clone();
+    let workspace_id = authority_context.workspace_id();
+    let authority = authority_context.open().map_err(DaemonError::Graph)?;
     let lease = authority.read_authority();
     if expected_roots.is_some_and(|expected| expected != lease.roots()) {
         return Err(invalid(
@@ -592,6 +601,21 @@ fn plan_native_commit_inner(
         None => None,
     };
 
+    let authority_workspace_graph =
+        lease
+            .workspace_graph_snapshot(&workspace_id)?
+            .ok_or_else(|| {
+                invalid(format!(
+                    "repository authority has no graph snapshot for workspace {workspace_id}"
+                ))
+            })?;
+    let desired_workspace_graph = graph.to_snapshot();
+    let workspace_semantic_delta = kin_core::diff_workspace_semantics(
+        &authority_workspace_graph.entities,
+        &authority_workspace_graph.relations,
+        &desired_workspace_graph.entities,
+        &desired_workspace_graph.relations,
+    )?;
     let deltas = compute_deltas_vs_repository_authority(graph, lease.snapshot(), parent.as_ref())?;
     let mut source_lengths = std::collections::BTreeMap::new();
     let (shared_policy, admission_policy_delta) = SharedAdmissionPolicy::derive_from_tree(
@@ -657,6 +681,7 @@ fn plan_native_commit_inner(
             base_target: workspace.base_target.clone(),
             base_tree_hash: workspace.base_tree_hash,
             tree_hash: workspace.tree_hash,
+            semantic_overlay_hash: workspace.semantic_overlay_hash,
             admission_policy: workspace.admission_policy,
         },
         new_generation: workspace_generation,
@@ -665,6 +690,7 @@ fn plan_native_commit_inner(
         new_base_tree_hash: Some(tree_hash),
         tree_deltas: workspace_tree_deltas,
         new_tree_hash: tree_hash,
+        semantic_delta: workspace_semantic_delta,
         new_shared_admission_policy: shared_policy.clone(),
         new_admission_policy: EffectiveAdmissionPolicyStamp {
             shared: shared_policy.stamp(),
@@ -727,9 +753,11 @@ fn plan_native_commit_inner(
 /// Dirty workspace authority is a separate uncommitted state and must never be
 /// folded into an MCP semantic commit implicitly. Callers must explicitly
 /// commit or discard it first.
-pub fn load_native_commit_base(layout: &kin_core::KinLayout) -> Result<NativeCommitBase> {
-    let (repository_id, workspace_id) = repository_identity(layout)?;
-    let authority = open_authority(layout, repository_id)?;
+pub(crate) fn load_native_commit_base(
+    authority_context: &LocalRepositoryAuthorityContext,
+) -> Result<NativeCommitBase> {
+    let workspace_id = authority_context.workspace_id();
+    let authority = authority_context.open().map_err(DaemonError::Graph)?;
     let lease = authority.read_authority();
     let workspace = lease
         .metadata()
@@ -762,9 +790,11 @@ pub fn load_native_commit_base(layout: &kin_core::KinLayout) -> Result<NativeCom
 }
 
 /// Load one immutable source body directly from repository-owned CAS.
-pub fn load_native_source_blob(layout: &kin_core::KinLayout, hash: Hash256) -> Result<Vec<u8>> {
-    let (repository_id, _) = repository_identity(layout)?;
-    let authority = open_authority(layout, repository_id)?;
+pub(crate) fn load_native_source_blob(
+    authority_context: &LocalRepositoryAuthorityContext,
+    hash: Hash256,
+) -> Result<Vec<u8>> {
+    let authority = authority_context.open().map_err(DaemonError::Graph)?;
     authority.load_source_blob(hash)?.ok_or_else(|| {
         invalid(format!(
             "repository source CAS is missing exact body {hash}"
@@ -776,12 +806,11 @@ pub fn load_native_source_blob(layout: &kin_core::KinLayout, hash: Hash256) -> R
 ///
 /// A daemon can use this after restart or an indeterminate local persistence
 /// acknowledgement. No transaction is rebuilt and no branch is advanced.
-pub fn recover_native_commit(
-    layout: &kin_core::KinLayout,
+pub(crate) fn recover_native_commit(
+    authority_context: &LocalRepositoryAuthorityContext,
     operation_id: OperationId,
 ) -> Result<Option<NativeCommitResult>> {
-    let (repository_id, _) = repository_identity(layout)?;
-    let authority = open_authority(layout, repository_id)?;
+    let authority = authority_context.open().map_err(DaemonError::Graph)?;
     let lease = authority.read_authority();
     let Some(receipt) = lease
         .metadata()
@@ -832,19 +861,24 @@ pub fn recover_native_commit(
 
 /// Persist immutable bodies, then atomically publish the complete repository
 /// transaction.
-pub fn commit_native_plan(
-    layout: &kin_core::KinLayout,
+///
+/// Product commit paths use [`commit_native_plan_with_projection`], which also
+/// linearizes the working-tree transition. This bare variant exists so tests
+/// can exercise repository authority publication on its own.
+#[cfg(test)]
+pub(crate) fn commit_native_plan(
     blobs: &kin_blobs::BlobStore,
+    authority_context: &LocalRepositoryAuthorityContext,
     plan: NativeCommitPlan,
 ) -> Result<NativeCommitResult> {
-    let (repository_id, _) = repository_identity(layout)?;
+    let repository_id = authority_context.repository_id().clone();
     if plan.transaction.repository_id != repository_id {
         return Err(invalid(format!(
             "native plan belongs to {}, not {}",
             plan.transaction.repository_id, repository_id
         )));
     }
-    let authority = open_authority(layout, repository_id)?;
+    let authority = authority_context.open().map_err(DaemonError::Graph)?;
     for hash in &plan.source_hashes {
         let body = blobs.read(&kin_blobs::Hash256::from_bytes(*hash.as_bytes()))?;
         authority.save_source_blob(*hash, &body)?;
@@ -869,19 +903,20 @@ pub fn commit_native_plan(
 /// the repository transaction: a pre-commit failure restores the prior tree,
 /// while recovery after a durable authority commit finalizes the target tree.
 /// No graph-commit-then-best-effort-projection state is observable.
-pub fn commit_native_plan_with_projection(
+pub(crate) fn commit_native_plan_with_projection(
     layout: &kin_core::KinLayout,
     blobs: &kin_blobs::BlobStore,
+    authority_context: &LocalRepositoryAuthorityContext,
     plan: NativeCommitPlan,
 ) -> Result<NativeCommitResult> {
-    let (repository_id, _) = repository_identity(layout)?;
+    let repository_id = authority_context.repository_id().clone();
     if plan.transaction.repository_id != repository_id {
         return Err(invalid(format!(
             "native plan belongs to {}, not {}",
             plan.transaction.repository_id, repository_id
         )));
     }
-    let authority = open_authority(layout, repository_id)?;
+    let authority = authority_context.open().map_err(DaemonError::Graph)?;
     for hash in &plan.source_hashes {
         let body = blobs.read(&kin_blobs::Hash256::from_bytes(*hash.as_bytes()))?;
         authority.save_source_blob(*hash, &body)?;
@@ -984,26 +1019,6 @@ fn materializable_artifact_count(tree: &kin_model::ResolvedTree) -> Result<usize
     Ok(count)
 }
 
-fn repository_identity(layout: &kin_core::KinLayout) -> Result<(RepositoryId, WorkspaceId)> {
-    let manifest = kin_core::manifest::KinManifest::load(&layout.manifest_path())?;
-    let repository_id = RepositoryId::new(manifest.repo_id)
-        .map_err(|error| invalid(format!("invalid repository identity: {error}")))?;
-    let workspace_uuid = uuid::Uuid::parse_str(&manifest.workspace_id)
-        .map_err(|error| invalid(format!("invalid workspace identity: {error}")))?;
-    Ok((repository_id, WorkspaceId::from_uuid(workspace_uuid)))
-}
-
-fn open_authority(
-    layout: &kin_core::KinLayout,
-    repository_id: RepositoryId,
-) -> Result<RepositoryAuthorityManager<LocalFileBackend>> {
-    RepositoryAuthorityManager::open(
-        repository_id,
-        Arc::new(LocalFileBackend::new(layout.kindb_dir())),
-    )
-    .map_err(DaemonError::Graph)
-}
-
 fn resolve_symbolic_commit_base(
     metadata: &kin_db::PersistedRepositoryAuthority,
     head: &WorkspaceHead,
@@ -1103,6 +1118,68 @@ mod tests {
             Arc::new(LocalFileBackend::new(init.layout.kindb_dir())),
         )
         .unwrap()
+    }
+
+    fn test_authority_context(layout: &kin_core::KinLayout) -> LocalRepositoryAuthorityContext {
+        LocalRepositoryAuthorityContext::from_layout_for_test(layout).unwrap()
+    }
+
+    fn publish_workspace_tree(
+        layout: &kin_core::KinLayout,
+        blobs: &kin_blobs::BlobStore,
+        desired_tree: &ResolvedTree,
+        operation_id: OperationId,
+        actor: AuthorId,
+    ) -> Result<Option<WorkspaceAdmissionResult>> {
+        super::publish_workspace_tree(
+            blobs,
+            &test_authority_context(layout),
+            desired_tree,
+            operation_id,
+            actor,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn plan_native_commit(
+        layout: &kin_core::KinLayout,
+        graph: &kin_db::InMemoryGraph,
+        blobs: &kin_blobs::BlobStore,
+        operation_id: OperationId,
+        timestamp: Timestamp,
+        author: AuthorId,
+        message: String,
+    ) -> Result<NativeCommitPlan> {
+        super::plan_native_commit(
+            graph,
+            blobs,
+            &test_authority_context(layout),
+            operation_id,
+            timestamp,
+            author,
+            message,
+        )
+    }
+
+    fn commit_native_plan(
+        layout: &kin_core::KinLayout,
+        blobs: &kin_blobs::BlobStore,
+        plan: NativeCommitPlan,
+    ) -> Result<NativeCommitResult> {
+        super::commit_native_plan(blobs, &test_authority_context(layout), plan)
+    }
+
+    fn commit_native_plan_with_projection(
+        layout: &kin_core::KinLayout,
+        blobs: &kin_blobs::BlobStore,
+        plan: NativeCommitPlan,
+    ) -> Result<NativeCommitResult> {
+        super::commit_native_plan_with_projection(
+            layout,
+            blobs,
+            &test_authority_context(layout),
+            plan,
+        )
     }
 
     #[test]

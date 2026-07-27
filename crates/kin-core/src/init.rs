@@ -16,8 +16,8 @@ use kin_model::{
     Hash256, OperationId, RefExpectation, RefMutation, RefName, RefTarget, RefUpdatePolicy,
     RepositoryAuthorityStore, RepositoryCommitReceipt, RepositoryId, RepositoryTransaction,
     RootBundle, SemanticChange, SemanticChangeId, SharedAdmissionPolicy, WorkspaceExpectation,
-    WorkspaceHead, WorkspaceId, WorkspaceMutation, WorkspaceSnapshotBinding,
-    REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+    WorkspaceHead, WorkspaceId, WorkspaceMutation, WorkspaceSemanticDelta,
+    WorkspaceSnapshotBinding, REPOSITORY_TRANSACTION_SCHEMA_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -34,7 +34,7 @@ const INIT_STAGE_OWNER_SCHEMA_VERSION: u32 = 1;
 const MAX_INIT_STAGE_OWNER_BYTES: u64 = 16 * 1024;
 
 /// Result of creating a repository authority envelope.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RepositoryBootstrap {
     pub receipt: RepositoryCommitReceipt,
     pub workspace: WorkspaceSnapshotBinding,
@@ -960,6 +960,17 @@ fn build_repository_bootstrap_transaction(
         .as_ref()
         .map(|change| change.tree_deltas.clone())
         .unwrap_or_default();
+    let semantic_delta = initial_change
+        .as_ref()
+        .map(|change| {
+            WorkspaceSemanticDelta::new(
+                change.entity_deltas.clone(),
+                change.relation_deltas.clone(),
+            )
+        })
+        .transpose()
+        .map_err(|error| KinError::Other(error.to_string()))?
+        .unwrap_or_default();
     let tree = kin_model::ResolvedTree::default()
         .apply(&tree_deltas)
         .map_err(|error| KinError::Other(error.to_string()))?;
@@ -985,6 +996,7 @@ fn build_repository_bootstrap_transaction(
         new_base_tree_hash: base_tree_hash,
         tree_deltas,
         new_tree_hash: tree_hash,
+        semantic_delta,
         new_shared_admission_policy: shared_policy,
         new_admission_policy: admission_policy,
     };

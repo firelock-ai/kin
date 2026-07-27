@@ -139,6 +139,7 @@ pub async fn run(session_id: Option<String>, confirm_mass_deletion: bool) -> Res
 
 pub fn observe_session_workspace(
     layout: &kin_core::KinLayout,
+    binding: &kin_core::LocalRepositoryAuthorityBinding,
     session_dir: &Path,
     blobs: &kin_blobs::BlobStore,
     confirm_mass_deletion: bool,
@@ -150,7 +151,7 @@ pub fn observe_session_workspace(
         let base: SessionWorkspaceBase =
             serde_json::from_slice(&base_bytes).context("decode exact session base")?;
         base.validate().context("validate exact session base")?;
-        validate_base_authority_preflight(layout, &base)?;
+        validate_base_authority_preflight(binding, &base)?;
 
         let mut graph_only_paths = Vec::new();
         for artifact in base.source_workspace.tree.artifacts_by_path() {
@@ -172,13 +173,13 @@ pub fn observe_session_workspace(
             bail!("session projection changed between exact observations");
         }
         retained.revalidate_visible(layout, &base_bytes)?;
-        validate_base_authority_preflight(layout, &base)?;
+        validate_base_authority_preflight(binding, &base)?;
 
         let desired_tree = build_desired_tree(&base, &first)?;
         let deltas = kin_core::exact_tree_correction(&base.source_workspace.tree, &desired_tree)
             .context("plan exact session tree transition")?;
         if deltas.is_empty() {
-            validate_base_is_current(layout, &base)?;
+            validate_base_is_current(binding, &base)?;
         }
         enforce_mass_deletion(
             base.source_workspace.tree.len(),
@@ -264,10 +265,10 @@ fn validate_session_leaf(name: &str) -> Result<()> {
 }
 
 fn validate_base_authority_preflight(
-    layout: &kin_core::KinLayout,
+    binding: &kin_core::LocalRepositoryAuthorityBinding,
     base: &SessionWorkspaceBase,
 ) -> Result<()> {
-    let authority = ActiveRepositoryAuthority::open(layout)?;
+    let authority = ActiveRepositoryAuthority::open(binding)?;
     if authority.repository_id != base.repository_id {
         bail!("session base repository identity does not match this repository");
     }
@@ -315,10 +316,10 @@ fn validate_base_authority_preflight(
 }
 
 fn validate_base_is_current(
-    layout: &kin_core::KinLayout,
+    binding: &kin_core::LocalRepositoryAuthorityBinding,
     base: &SessionWorkspaceBase,
 ) -> Result<()> {
-    let authority = ActiveRepositoryAuthority::open(layout)?;
+    let authority = ActiveRepositoryAuthority::open(binding)?;
     let (workspace, roots) = authority.workspace_with_roots()?;
     if authority.repository_id != base.repository_id
         || roots != base.authority_roots

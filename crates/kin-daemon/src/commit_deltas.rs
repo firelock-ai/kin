@@ -20,13 +20,15 @@
 //! already reflects the current working state — diffing against the DAG
 //! baseline captures exactly what changed since the last commit.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use kin_db::{GraphSnapshot, InMemoryGraph};
 use kin_model::{
-    graph::ResolvedGraphState, ChangeStore, EntityDelta, Hash256, RelationDelta, RepoPath,
-    ResolvedTree, SemanticChangeId, TreeDelta, TreeEntry,
+    graph::ResolvedGraphState, ArtifactId, ChangeStore, Entity, EntityDelta, EntityId, EntityStore,
+    GraphNodeId, Hash256, Relation, RelationDelta, RelationId, RepoPath, ResolvedTree,
+    SemanticChangeId, TransactionDelta, TreeDelta, TreeEntry,
 };
+use sha2::{Digest, Sha256};
 
 use crate::error::{DaemonError, Result};
 
@@ -85,6 +87,340 @@ pub fn compute_deltas_vs_repository_authority(
         },
     };
     compute_deltas_from_resolved_state(graph, committed)
+}
+
+/// Build the complete derived-graph transition for one selected-path checkout.
+///
+/// Exact tree membership comes from the repository checkout plan. Semantic
+/// entities and every relation touching a selected entity or artifact are
+/// spliced from the immutable target change. Unsupported/config/binary members
+/// naturally carry only tree deltas. This makes a missing semantic parser an
+/// honest absence of enrichment rather than permission to leave stale entities
+/// attached to replaced bytes.
+pub fn compute_selected_checkout_delta(
+    graph: &InMemoryGraph,
+    selected: &RepoPath,
+    target: &ResolvedGraphState,
+    expected_previous_tree: &ResolvedTree,
+    desired_tree: &ResolvedTree,
+) -> Result<TransactionDelta> {
+    let current = graph.to_snapshot();
+    if current.resolved_tree != *expected_previous_tree && current.resolved_tree != *desired_tree {
+        return Err(DaemonError::IncompatibleRepo(format!(
+            "daemon query tree matches neither checkout base nor desired authority for {selected}"
+        )));
+    }
+
+    let current_selected_entities = selected_entity_ids(current.entities.values(), selected)?;
+    let target_selected_entities = selected_entity_ids(target.entities.values(), selected)?;
+    let current_selected_artifacts = selected_artifact_ids(&current.resolved_tree, selected);
+    let target_selected_artifacts = selected_artifact_ids(&target.tree, selected);
+
+    let mut desired_entities = current.entities.clone();
+    for entity_id in &current_selected_entities {
+        desired_entities.remove(entity_id);
+    }
+    let mut occupied_entity_ids = desired_entities.keys().copied().collect::<HashSet<_>>();
+    let mut entity_remap = HashMap::new();
+    let mut ordered_target_entities = target_selected_entities.iter().copied().collect::<Vec<_>>();
+    ordered_target_entities.sort_unstable();
+    for entity_id in &ordered_target_entities {
+        let entity = target
+            .entities
+            .get(entity_id)
+            .expect("selected entity IDs come from target entity map");
+        let desired_id = if occupied_entity_ids.contains(entity_id) {
+            collision_copy_entity_id(entity, &occupied_entity_ids)
+        } else {
+            *entity_id
+        };
+        occupied_entity_ids.insert(desired_id);
+        entity_remap.insert(*entity_id, desired_id);
+    }
+    for entity_id in &ordered_target_entities {
+        let mut entity = target
+            .entities
+            .get(entity_id)
+            .expect("selected entity IDs come from target entity map")
+            .clone();
+        entity.id = *entity_remap
+            .get(entity_id)
+            .expect("every selected target entity has a remap");
+        entity.lineage_parent = remap_retained_entity_reference(
+            entity.lineage_parent,
+            &entity_remap,
+            &occupied_entity_ids,
+        );
+        entity.superseded_by = remap_retained_entity_reference(
+            entity.superseded_by,
+            &entity_remap,
+            &occupied_entity_ids,
+        );
+        desired_entities.insert(entity.id, entity);
+    }
+
+    let artifact_remap = selected_artifact_remap(&target.tree, desired_tree, selected)?;
+    let mut desired_relations = current.relations.clone();
+    desired_relations.retain(|_, relation| {
+        !relation_touches_selected(
+            relation,
+            &current_selected_entities,
+            &current_selected_artifacts,
+        )
+    });
+
+    let mut occupied_relation_ids = desired_relations.keys().copied().collect::<HashSet<_>>();
+    let mut target_relations = target
+        .relations
+        .values()
+        .filter(|relation| {
+            relation_touches_selected(
+                relation,
+                &target_selected_entities,
+                &target_selected_artifacts,
+            )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    target_relations.sort_by_key(|relation| relation.id);
+    for mut relation in target_relations {
+        let original_id = relation.id;
+        let original_src = relation.src;
+        let original_dst = relation.dst;
+        relation.src = remap_checkout_node(relation.src, &entity_remap, &artifact_remap);
+        relation.dst = remap_checkout_node(relation.dst, &entity_remap, &artifact_remap);
+        if !checkout_node_exists(relation.src, &desired_entities, desired_tree, &current)
+            || !checkout_node_exists(relation.dst, &desired_entities, desired_tree, &current)
+        {
+            // A selected historical edge may point outside the selected
+            // subtree to a node that is absent from the current mixed graph.
+            // Omitting that stale edge is truthful; inventing or resurrecting
+            // the unselected endpoint is not.
+            continue;
+        }
+        if relation.src != original_src || relation.dst != original_dst {
+            relation.id =
+                collision_copy_relation_id(&relation, original_id, &occupied_relation_ids);
+        } else if desired_relations
+            .get(&relation.id)
+            .is_some_and(|retained| retained != &relation)
+        {
+            relation.id =
+                collision_copy_relation_id(&relation, original_id, &occupied_relation_ids);
+        }
+        if let Some(retained) = desired_relations.get(&relation.id) {
+            if retained != &relation {
+                return Err(DaemonError::IncompatibleRepo(format!(
+                    "checkout of {selected} would reuse relation identity {} across the selection boundary",
+                    relation.id
+                )));
+            }
+        } else {
+            occupied_relation_ids.insert(relation.id);
+            desired_relations.insert(relation.id, relation);
+        }
+    }
+
+    let semantic_delta = kin_core::diff_workspace_semantics(
+        &current.entities,
+        &current.relations,
+        &desired_entities,
+        &desired_relations,
+    )?;
+    let delta = TransactionDelta {
+        entity_deltas: semantic_delta.entity_deltas().to_vec(),
+        relation_deltas: semantic_delta.relation_deltas().to_vec(),
+        tree_deltas: kin_core::exact_tree_correction(&current.resolved_tree, desired_tree)?,
+        admission_policy_delta: None,
+    };
+
+    let preflight = InMemoryGraph::from_snapshot(current).map_err(DaemonError::Graph)?;
+    preflight
+        .apply_transaction_delta(&delta)
+        .map_err(DaemonError::Graph)?;
+    if preflight.resolved_tree() != *desired_tree {
+        return Err(DaemonError::IncompatibleRepo(format!(
+            "checkout preflight for {selected} did not resolve to exact desired tree"
+        )));
+    }
+    Ok(delta)
+}
+
+fn selected_entity_ids<'a>(
+    entities: impl Iterator<Item = &'a Entity>,
+    selected: &RepoPath,
+) -> Result<HashSet<EntityId>> {
+    let mut selected_ids = HashSet::new();
+    for entity in entities {
+        let Some(file_origin) = &entity.file_origin else {
+            continue;
+        };
+        let path = RepoPath::from_utf8(file_origin.0.clone()).map_err(|error| {
+            DaemonError::IncompatibleRepo(format!(
+                "entity {} has invalid repository file origin '{}': {error}",
+                entity.id, file_origin
+            ))
+        })?;
+        if checkout_path_contains(selected, &path) {
+            selected_ids.insert(entity.id);
+        }
+    }
+    Ok(selected_ids)
+}
+
+fn selected_artifact_ids(tree: &ResolvedTree, selected: &RepoPath) -> HashSet<ArtifactId> {
+    tree.artifacts_by_path()
+        .filter(|artifact| checkout_path_contains(selected, &artifact.path))
+        .map(|artifact| artifact.artifact_id)
+        .collect()
+}
+
+fn selected_artifact_remap(
+    target: &ResolvedTree,
+    desired: &ResolvedTree,
+    selected: &RepoPath,
+) -> Result<HashMap<ArtifactId, ArtifactId>> {
+    let mut remap = HashMap::new();
+    for artifact in target
+        .artifacts_by_path()
+        .filter(|artifact| checkout_path_contains(selected, &artifact.path))
+    {
+        let desired_artifact = desired.artifact_at_path(&artifact.path).ok_or_else(|| {
+            DaemonError::IncompatibleRepo(format!(
+                "desired checkout tree lost selected target artifact {}",
+                artifact.path
+            ))
+        })?;
+        if desired_artifact.entry != artifact.entry {
+            return Err(DaemonError::IncompatibleRepo(format!(
+                "desired checkout entry at {} differs from target history",
+                artifact.path
+            )));
+        }
+        remap.insert(artifact.artifact_id, desired_artifact.artifact_id);
+    }
+    Ok(remap)
+}
+
+fn relation_touches_selected(
+    relation: &Relation,
+    entities: &HashSet<EntityId>,
+    artifacts: &HashSet<ArtifactId>,
+) -> bool {
+    [relation.src, relation.dst]
+        .into_iter()
+        .any(|node| match node {
+            GraphNodeId::Entity(entity_id) => entities.contains(&entity_id),
+            GraphNodeId::Artifact(artifact_id) => artifacts.contains(&artifact_id),
+            _ => false,
+        })
+}
+
+fn remap_checkout_node(
+    node: GraphNodeId,
+    entity_remap: &HashMap<EntityId, EntityId>,
+    artifact_remap: &HashMap<ArtifactId, ArtifactId>,
+) -> GraphNodeId {
+    match node {
+        GraphNodeId::Entity(entity_id) => entity_remap
+            .get(&entity_id)
+            .copied()
+            .map(GraphNodeId::Entity)
+            .unwrap_or(node),
+        GraphNodeId::Artifact(artifact_id) => artifact_remap
+            .get(&artifact_id)
+            .copied()
+            .map(GraphNodeId::Artifact)
+            .unwrap_or(node),
+        _ => node,
+    }
+}
+
+fn remap_retained_entity_reference(
+    reference: Option<EntityId>,
+    remap: &HashMap<EntityId, EntityId>,
+    occupied: &HashSet<EntityId>,
+) -> Option<EntityId> {
+    reference.and_then(|entity_id| {
+        remap
+            .get(&entity_id)
+            .copied()
+            .or_else(|| occupied.contains(&entity_id).then_some(entity_id))
+    })
+}
+
+fn collision_copy_entity_id(entity: &Entity, occupied: &HashSet<EntityId>) -> EntityId {
+    for counter in 0_u64.. {
+        let mut hasher = Sha256::new();
+        hasher.update(b"kin.checkout-collision-copy-entity.v1\0");
+        hasher.update(entity.id.0.as_bytes());
+        if let Some(path) = &entity.file_origin {
+            hasher.update(path.0.as_bytes());
+        }
+        hasher.update(counter.to_le_bytes());
+        let digest = hasher.finalize();
+        let mut bytes = [0_u8; 16];
+        bytes.copy_from_slice(&digest[..16]);
+        bytes[6] = (bytes[6] & 0x0f) | 0x40;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        let candidate = EntityId(uuid::Uuid::from_bytes(bytes));
+        if !occupied.contains(&candidate) {
+            return candidate;
+        }
+    }
+    unreachable!("u64 entity remap namespace exhausted")
+}
+
+fn collision_copy_relation_id(
+    relation: &Relation,
+    original_id: RelationId,
+    occupied: &HashSet<RelationId>,
+) -> RelationId {
+    for counter in 0_u64.. {
+        let mut hasher = Sha256::new();
+        hasher.update(b"kin.checkout-collision-copy-relation.v1\0");
+        hasher.update(original_id.0.as_bytes());
+        hasher.update(relation.src.to_string().as_bytes());
+        hasher.update([0]);
+        hasher.update(relation.dst.to_string().as_bytes());
+        hasher.update([0]);
+        hasher.update(format!("{:?}", relation.kind).as_bytes());
+        hasher.update(counter.to_le_bytes());
+        let digest = hasher.finalize();
+        let mut bytes = [0_u8; 16];
+        bytes.copy_from_slice(&digest[..16]);
+        bytes[6] = (bytes[6] & 0x0f) | 0x40;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        let candidate = RelationId::from_bytes(bytes);
+        if !occupied.contains(&candidate) {
+            return candidate;
+        }
+    }
+    unreachable!("u64 relation remap namespace exhausted")
+}
+
+fn checkout_node_exists(
+    node: GraphNodeId,
+    desired_entities: &HashMap<EntityId, Entity>,
+    desired_tree: &ResolvedTree,
+    current: &GraphSnapshot,
+) -> bool {
+    match node {
+        GraphNodeId::Entity(entity_id) => desired_entities.contains_key(&entity_id),
+        GraphNodeId::Artifact(artifact_id) => desired_tree.get(&artifact_id).is_some(),
+        GraphNodeId::Test(test_id) => current.test_cases.contains_key(&test_id),
+        GraphNodeId::Contract(contract_id) => current.contracts.contains_key(&contract_id),
+        GraphNodeId::Work(work_id) => current.work_items.contains_key(&work_id),
+        GraphNodeId::VerificationRun(run_id) => current.verification_runs.contains_key(&run_id),
+    }
+}
+
+fn checkout_path_contains(selected: &RepoPath, path: &RepoPath) -> bool {
+    path == selected
+        || path
+            .as_bytes()
+            .strip_prefix(selected.as_bytes())
+            .is_some_and(|suffix| suffix.starts_with(b"/"))
 }
 
 fn compute_deltas_from_resolved_state(
@@ -207,8 +543,8 @@ mod tests {
 
     use kin_blobs::BlobStore;
     use kin_model::{
-        AuthorId, EntityKind, EntityMetadata, FingerprintAlgorithm, LanguageId, ResolvedArtifact,
-        SemanticFingerprint, Timestamp, Visibility,
+        AuthorId, EntityKind, EntityMetadata, FingerprintAlgorithm, LanguageId, RelationKind,
+        RelationOrigin, ResolvedArtifact, SemanticFingerprint, Timestamp, Visibility,
     };
 
     #[test]
@@ -330,11 +666,21 @@ mod tests {
     }
 
     fn make_entity(name: &str, file_path: &str, ast_hash: [u8; 32]) -> kin_model::entity::Entity {
+        make_entity_with_id(EntityId::new(), name, file_path, LanguageId::Rust, ast_hash)
+    }
+
+    fn make_entity_with_id(
+        id: EntityId,
+        name: &str,
+        file_path: &str,
+        language: LanguageId,
+        ast_hash: [u8; 32],
+    ) -> kin_model::entity::Entity {
         kin_model::entity::Entity {
-            id: kin_model::EntityId::new(),
+            id,
             kind: EntityKind::Function,
             name: name.to_string(),
-            language: LanguageId::Rust,
+            language,
             fingerprint: SemanticFingerprint {
                 algorithm: FingerprintAlgorithm::V1TreeSitter,
                 ast_hash: Hash256::from_bytes(ast_hash),
@@ -354,6 +700,245 @@ mod tests {
             created_in: None,
             superseded_by: None,
         }
+    }
+
+    fn relation(
+        id: RelationId,
+        src: GraphNodeId,
+        dst: GraphNodeId,
+        kind: RelationKind,
+    ) -> Relation {
+        Relation {
+            id,
+            kind,
+            src,
+            dst,
+            confidence: 1.0,
+            origin: RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn selected_checkout_remaps_entity_artifact_and_relation_collisions() {
+        let selected = RepoPath::from_utf8("selected").unwrap();
+        let shared_entity_id = EntityId::new();
+        let current_selected_id = EntityId::new();
+        let python_id = EntityId::new();
+        let shared_artifact_id = ArtifactId::new();
+        let current_selected_artifact_id = ArtifactId::new();
+        let python_artifact_id = ArtifactId::new();
+        let remapped_artifact_id = ArtifactId::new();
+        let relation_id = RelationId::new();
+        let retained = make_entity_with_id(
+            shared_entity_id,
+            "retained",
+            "outside.rs",
+            LanguageId::Rust,
+            [0x11; 32],
+        );
+        let current_selected = make_entity_with_id(
+            current_selected_id,
+            "old",
+            "selected/old.rs",
+            LanguageId::Rust,
+            [0x12; 32],
+        );
+        let target_rust = make_entity_with_id(
+            shared_entity_id,
+            "replacement",
+            "selected/new.rs",
+            LanguageId::Rust,
+            [0x13; 32],
+        );
+        let target_python = make_entity_with_id(
+            python_id,
+            "helper",
+            "selected/tool.py",
+            LanguageId::Python,
+            [0x14; 32],
+        );
+        let retained_relation = relation(
+            relation_id,
+            GraphNodeId::Entity(shared_entity_id),
+            GraphNodeId::Entity(shared_entity_id),
+            RelationKind::DependsOn,
+        );
+        let target_relation = relation(
+            relation_id,
+            GraphNodeId::Entity(shared_entity_id),
+            GraphNodeId::Entity(python_id),
+            RelationKind::Calls,
+        );
+        let outside_entry = TreeEntry::blob(Hash256::from_bytes([0x21; 32]), false);
+        let old_entry = TreeEntry::blob(Hash256::from_bytes([0x22; 32]), false);
+        let rust_entry = TreeEntry::blob(Hash256::from_bytes([0x23; 32]), false);
+        let python_entry = TreeEntry::blob(Hash256::from_bytes([0x24; 32]), false);
+        let current_tree = resolved_tree(vec![
+            (
+                shared_artifact_id,
+                RepoPath::from_utf8("outside.rs").unwrap(),
+                outside_entry,
+            ),
+            (
+                current_selected_artifact_id,
+                RepoPath::from_utf8("selected/old.rs").unwrap(),
+                old_entry,
+            ),
+        ]);
+        let target_tree = resolved_tree(vec![
+            (
+                shared_artifact_id,
+                RepoPath::from_utf8("selected/new.rs").unwrap(),
+                rust_entry,
+            ),
+            (
+                python_artifact_id,
+                RepoPath::from_utf8("selected/tool.py").unwrap(),
+                python_entry,
+            ),
+        ]);
+        let desired_tree = resolved_tree(vec![
+            (
+                shared_artifact_id,
+                RepoPath::from_utf8("outside.rs").unwrap(),
+                outside_entry,
+            ),
+            (
+                remapped_artifact_id,
+                RepoPath::from_utf8("selected/new.rs").unwrap(),
+                rust_entry,
+            ),
+            (
+                python_artifact_id,
+                RepoPath::from_utf8("selected/tool.py").unwrap(),
+                python_entry,
+            ),
+        ]);
+        let graph = InMemoryGraph::new();
+        graph
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: vec![
+                    EntityDelta::Added {
+                        new: retained.clone(),
+                    },
+                    EntityDelta::Added {
+                        new: current_selected,
+                    },
+                ],
+                relation_deltas: vec![RelationDelta::Added {
+                    new: retained_relation.clone(),
+                }],
+                tree_deltas: kin_core::exact_tree_correction(
+                    &ResolvedTree::default(),
+                    &current_tree,
+                )
+                .unwrap(),
+                admission_policy_delta: None,
+            })
+            .unwrap();
+        let target = ResolvedGraphState {
+            entities: HashMap::from([
+                (target_rust.id, target_rust),
+                (target_python.id, target_python.clone()),
+            ]),
+            relations: HashMap::from([(target_relation.id, target_relation)]),
+            entity_revisions: Default::default(),
+            tree: target_tree,
+            entity_tombstones: Default::default(),
+            relation_tombstones: Default::default(),
+        };
+
+        let delta = compute_selected_checkout_delta(
+            &graph,
+            &selected,
+            &target,
+            &current_tree,
+            &desired_tree,
+        )
+        .unwrap();
+        graph.apply_transaction_delta(&delta).unwrap();
+        let installed = graph.to_snapshot();
+        assert_eq!(installed.resolved_tree, desired_tree);
+        assert_eq!(
+            installed.entities.get(&shared_entity_id),
+            Some(&retained),
+            "the retained entity keeps its original identity"
+        );
+        let copied = installed
+            .entities
+            .values()
+            .find(|entity| entity.name == "replacement")
+            .unwrap();
+        assert_ne!(copied.id, shared_entity_id);
+        assert_eq!(installed.entities.get(&python_id), Some(&target_python));
+        assert_eq!(
+            installed.relations.get(&relation_id),
+            Some(&retained_relation),
+            "the retained edge keeps its original identity"
+        );
+        let copied_relation = installed
+            .relations
+            .values()
+            .find(|candidate| candidate.kind == RelationKind::Calls)
+            .unwrap();
+        assert_ne!(copied_relation.id, relation_id);
+        assert_eq!(copied_relation.src, GraphNodeId::Entity(copied.id));
+        assert_eq!(copied_relation.dst, GraphNodeId::Entity(python_id));
+    }
+
+    #[test]
+    fn selected_checkout_omits_stale_cross_boundary_relation_without_losing_semantics() {
+        let selected = RepoPath::from_utf8("src").unwrap();
+        let selected_id = EntityId::new();
+        let absent_outside_id = EntityId::new();
+        let artifact_id = ArtifactId::new();
+        let entry = TreeEntry::blob(Hash256::from_bytes([0x31; 32]), false);
+        let tree = resolved_tree(vec![(
+            artifact_id,
+            RepoPath::from_utf8("src/lib.rs").unwrap(),
+            entry,
+        )]);
+        let target_entity = make_entity_with_id(
+            selected_id,
+            "selected",
+            "src/lib.rs",
+            LanguageId::Rust,
+            [0x32; 32],
+        );
+        let stale = relation(
+            RelationId::new(),
+            GraphNodeId::Entity(selected_id),
+            GraphNodeId::Entity(absent_outside_id),
+            RelationKind::Calls,
+        );
+        let graph = InMemoryGraph::new();
+        graph
+            .apply_transaction_delta(&TransactionDelta {
+                tree_deltas: kin_core::exact_tree_correction(&ResolvedTree::default(), &tree)
+                    .unwrap(),
+                ..TransactionDelta::default()
+            })
+            .unwrap();
+        let target = ResolvedGraphState {
+            entities: HashMap::from([(selected_id, target_entity.clone())]),
+            relations: HashMap::from([(stale.id, stale)]),
+            entity_revisions: Default::default(),
+            tree: tree.clone(),
+            entity_tombstones: Default::default(),
+            relation_tombstones: Default::default(),
+        };
+
+        let delta =
+            compute_selected_checkout_delta(&graph, &selected, &target, &tree, &tree).unwrap();
+        assert!(delta.tree_deltas.is_empty());
+        assert_eq!(delta.entity_deltas.len(), 1);
+        assert!(delta.relation_deltas.is_empty());
+        graph.apply_transaction_delta(&delta).unwrap();
+        assert_eq!(graph.get_entity(&selected_id).unwrap(), Some(target_entity));
+        assert!(graph.to_snapshot().relations.is_empty());
     }
 
     fn genesis_change() -> kin_model::SemanticChange {

@@ -8,14 +8,12 @@
 //! directly. Configuration, lockfiles, binaries, unsupported languages,
 //! symlinks, and gitlinks remain visible even when no parser emits an entity.
 
-use std::collections::HashMap;
-use std::path::PathBuf;
-
 use base64::Engine as _;
 use kin_model::{
     ArtifactId, GraphStore, RepoPath, ResolvedArtifact, ResolvedTree, SemanticChangeId, TreeEntry,
 };
 use serde::Serialize;
+use std::collections::HashMap;
 
 use crate::error::{McpError, Result};
 use crate::types::ToolCallResult;
@@ -63,28 +61,20 @@ impl From<&ResolvedArtifact> for ArtifactWire {
 
 #[derive(Debug)]
 pub(crate) struct ExactTreeSelection {
-    pub layout: Option<kin_core::KinLayout>,
     pub source_change_id: Option<SemanticChangeId>,
     pub tree: ResolvedTree,
 }
 
-/// Resolve the configured repository layout without inspecting source files.
-///
-/// `KIN_SOURCE_ROOT` is the explicit binding installed by MCP/daemon launch.
-/// The current directory is only a repository-location fallback. `discover`
-/// reads Kin control metadata; it is not a semantic answer authority.
-pub(crate) fn active_layout() -> Result<kin_core::KinLayout> {
-    let start = std::env::var_os("KIN_SOURCE_ROOT")
-        .map(PathBuf::from)
-        .map(Ok)
-        .unwrap_or_else(std::env::current_dir)?;
-    kin_core::KinLayout::discover(&start).ok_or_else(|| {
-        McpError::Context(format!(
-            "graph authority gap: no Kin repository layout is bound at '{}'; \
-             set KIN_SOURCE_ROOT or run MCP from the repository",
-            start.display()
-        ))
-    })
+fn require_repository_authority(
+    binding: Option<&super::repository_authority::LocalRepositoryAuthorityBinding>,
+) -> Result<super::repository_authority::ActiveRepositoryAuthority> {
+    super::repository_authority::ActiveRepositoryAuthority::open(binding.ok_or_else(|| {
+        McpError::Context(
+            "graph authority gap: this MCP runtime has no startup-pinned local repository \
+             authority binding"
+                .to_string(),
+        )
+    })?)
 }
 
 fn explicit_source_change_id(
@@ -103,14 +93,9 @@ fn explicit_source_change_id(
 pub(crate) fn resolve_tree_selection<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
-    require_layout: bool,
+    repository_authority: Option<&super::repository_authority::LocalRepositoryAuthorityBinding>,
 ) -> Result<ExactTreeSelection> {
     let explicit = explicit_source_change_id(args)?;
-    let layout = if explicit.is_none() || require_layout {
-        Some(active_layout()?)
-    } else {
-        None
-    };
     let (source_change_id, tree) = match explicit {
         Some(id) => {
             let tree = store.resolve_tree_at(&id).map_err(|error| {
@@ -122,11 +107,7 @@ pub(crate) fn resolve_tree_selection<G: GraphStore>(
             (Some(id), tree)
         }
         None => {
-            let authority = super::repository_authority::ActiveRepositoryAuthority::open(
-                layout
-                    .as_ref()
-                    .expect("layout is required when the source change is implicit"),
-            )?;
+            let authority = require_repository_authority(repository_authority)?;
             let workspace = authority.workspace()?;
             let source_change_id = workspace
                 .base_target
@@ -137,7 +118,6 @@ pub(crate) fn resolve_tree_selection<G: GraphStore>(
         }
     };
     Ok(ExactTreeSelection {
-        layout,
         source_change_id,
         tree,
     })
@@ -196,8 +176,9 @@ fn select_artifact<'a>(
 pub fn handle_artifact_list<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
+    repository_authority: Option<&super::repository_authority::LocalRepositoryAuthorityBinding>,
 ) -> Result<ToolCallResult> {
-    let selection = resolve_tree_selection(args, store, false)?;
+    let selection = resolve_tree_selection(args, store, repository_authority)?;
     let offset = args
         .get("offset")
         .and_then(serde_json::Value::as_u64)
@@ -232,8 +213,9 @@ pub fn handle_artifact_list<G: GraphStore>(
 pub fn handle_artifact_read<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
+    repository_authority: Option<&super::repository_authority::LocalRepositoryAuthorityBinding>,
 ) -> Result<ToolCallResult> {
-    let selection = resolve_tree_selection(args, store, true)?;
+    let selection = resolve_tree_selection(args, store, repository_authority)?;
     let artifact = select_artifact(args, &selection.tree)?;
     let mut result = serde_json::json!({
         "source_change_id": selection.source_change_id,
@@ -246,11 +228,7 @@ pub fn handle_artifact_read<G: GraphStore>(
             result["git_object_id"] = serde_json::to_value(target).map_err(McpError::Json)?;
         }
         TreeEntry::Blob { hash, .. } | TreeEntry::Symlink { target_blob: hash } => {
-            let layout = selection
-                .layout
-                .as_ref()
-                .expect("artifact reads always require a bound layout");
-            let authority = super::repository_authority::ActiveRepositoryAuthority::open(layout)?;
+            let authority = require_repository_authority(repository_authority)?;
             let bytes = authority.load_source_blob(hash).map_err(|error| {
                 McpError::Context(format!(
                     "graph authority gap: blob {} for artifact {:?} at {} is unavailable or \

@@ -36,11 +36,11 @@ fn capability_json_keeps_the_bounded_dogfood_bar_explicit() {
         serde_json::from_slice(&output.stdout).expect("capability stdout should be JSON");
     assert_eq!(report["schema"], "kin.git-replacement-capabilities.v1");
     assert_eq!(report["substrate"], "repository-v6");
-    assert_eq!(report["bounded_dogfood_ready"], true);
-    assert_eq!(report["bounded_dogfood_required_ready"], 11);
-    assert_eq!(report["bounded_dogfood_required_total"], 11);
+    assert_eq!(report["bounded_dogfood_ready"], false);
+    assert_eq!(report["bounded_dogfood_required_ready"], 10);
+    assert_eq!(report["bounded_dogfood_required_total"], 12);
     assert_eq!(report["full_git_replacement_ready"], false);
-    assert_eq!(report["ready_commands"], 14);
+    assert_eq!(report["ready_commands"], 12);
     assert_eq!(report["command_total"], 32);
 
     let commands = report["commands"]
@@ -63,6 +63,7 @@ fn capability_json_keeps_the_bounded_dogfood_bar_explicit() {
             "branch list",
             "branch switch",
             "commit",
+            "checkout",
             "diff",
             "eject",
             "git export",
@@ -104,7 +105,27 @@ fn remaining_open_gate_commands_fail_before_repository_discovery() {
     std::fs::create_dir_all(&home).expect("create home");
 
     let output = kin_command(&home)
-        .args(["checkout", "main"])
+        .args(["commit", "--message", "must remain sealed"])
+        .current_dir(root.path())
+        .output()
+        .expect("run gated commit");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("`kin commit` is fail-closed on repository-v6"));
+    assert!(stderr.contains("kin capabilities --json"));
+
+    let output = kin_command(&home)
+        .arg("reconcile")
+        .current_dir(root.path())
+        .output()
+        .expect("run gated reconcile");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("`kin reconcile` is fail-closed on repository-v6"));
+    assert!(stderr.contains("kin capabilities --json"));
+
+    let output = kin_command(&home)
+        .args(["checkout", "src/lib.rs"])
         .current_dir(root.path())
         .output()
         .expect("run gated checkout");

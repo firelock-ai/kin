@@ -7,8 +7,6 @@
 //! refs, workspace state, aliases, or source bytes from legacy sidecars, Git,
 //! or the working directory.
 
-use std::sync::Arc;
-
 use anyhow::{anyhow, Context, Result};
 use kin_db::{LocalFileBackend, RepositoryAuthorityManager, RepositoryAuthorityState};
 use kin_model::{
@@ -23,22 +21,12 @@ pub(crate) struct ActiveRepositoryAuthority {
 }
 
 impl ActiveRepositoryAuthority {
-    pub(crate) fn open(layout: &kin_core::KinLayout) -> Result<Self> {
-        layout
-            .check_version()
-            .context("repository layout is not repository-v6 compatible")?;
-        let manifest = kin_core::KinManifest::load(&layout.manifest_path())
-            .context("load repository manifest")?;
-        let repository_id = RepositoryId::new(manifest.repo_id)
-            .map_err(|error| anyhow!("repository manifest has an invalid identity: {error}"))?;
-        let workspace_uuid = uuid::Uuid::parse_str(&manifest.workspace_id)
-            .context("repository manifest has an invalid workspace identity")?;
-        let workspace_id = WorkspaceId::from_uuid(workspace_uuid);
-        let manager = RepositoryAuthorityManager::open(
-            repository_id.clone(),
-            Arc::new(LocalFileBackend::new(layout.kindb_dir())),
-        )
-        .context("open repository-v6 authority")?;
+    pub(crate) fn open(binding: &kin_core::LocalRepositoryAuthorityBinding) -> Result<Self> {
+        let repository_id = binding.repository_id().clone();
+        let workspace_id = binding.workspace_id();
+        let manager = binding
+            .open_manager()
+            .context("open repository-v6 authority through retained local binding")?;
 
         Ok(Self {
             manager,

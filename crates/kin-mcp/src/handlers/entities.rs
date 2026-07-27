@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 
+use kin_core::LocalRepositoryAuthorityBinding;
 use kin_model::entity::EntityKind;
 use kin_model::graph::{EntityFilter, GraphStore};
 use kin_model::relation::RelationKind;
@@ -151,13 +152,14 @@ get_entity_source when you actually need to read the code.";
 pub fn handle_get_entity<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
+    repository_authority: Option<&LocalRepositoryAuthorityBinding>,
 ) -> Result<ToolCallResult> {
     let id_str = get_string_param(args, "entity_id")?;
     let entity_id = parse_entity_id(&id_str)?;
 
     match store.get_entity(&entity_id).map_err(McpError::graph)? {
         Some(entity) => {
-            let value = entity_response_json(store, &entity)?;
+            let value = entity_response_json(store, &entity, repository_authority)?;
             let json = serde_json::to_string_pretty(&value).map_err(McpError::Json)?;
             Ok(ToolCallResult::text(json))
         }
@@ -187,15 +189,21 @@ trace_data_flow when you also need the entity's neighborhood rather than just it
 pub fn handle_get_entity_source<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
+    repository_authority: Option<&LocalRepositoryAuthorityBinding>,
 ) -> Result<ToolCallResult> {
     let id_str = get_string_param(args, "entity_id")?;
     let entity_id = parse_entity_id(&id_str)?;
 
     match store.get_entity(&entity_id).map_err(McpError::graph)? {
         Some(entity) => {
-            let exact_source =
-                read_entity_source_excerpt_detailed(store, &entity, 10_000, 1_000_000)?
-                    .ok_or_else(|| McpError::Context("entity source body unavailable".into()))?;
+            let exact_source = read_entity_source_excerpt_detailed(
+                store,
+                &entity,
+                10_000,
+                1_000_000,
+                repository_authority,
+            )?
+            .ok_or_else(|| McpError::Context("entity source body unavailable".into()))?;
             let is_stale = LAST_READ_STALE.with(|f| f.get());
             let source = LAST_READ_SOURCE.with(|f| f.get());
             let span = entity.span.as_ref();
@@ -455,7 +463,11 @@ pub fn assemble_entity_sources_response(
 /// cannot fail the batch. Field formatting matches the daemon path's
 /// `GraphSourceRecord` (debug-formatted kind, `to_string` language, raw
 /// file path) so the row shape is identical whichever path resolved it.
-fn resolve_entity_source_generic<G: GraphStore>(store: &G, id: &str) -> ResolvedEntitySource {
+fn resolve_entity_source_generic<G: GraphStore>(
+    store: &G,
+    id: &str,
+    repository_authority: Option<&LocalRepositoryAuthorityBinding>,
+) -> ResolvedEntitySource {
     let entity_id = match parse_entity_id(id) {
         Ok(entity_id) => entity_id,
         Err(_) => {
@@ -472,6 +484,7 @@ fn resolve_entity_source_generic<G: GraphStore>(store: &G, id: &str) -> Resolved
                 &entity,
                 DEFAULT_SOURCE_MAX_LINES,
                 DEFAULT_SOURCE_MAX_BYTES,
+                repository_authority,
             ) {
                 Ok(Some(source)) => ResolvedEntitySource::Found(EntitySourceRow {
                     id: entity.id.to_string(),
@@ -521,11 +534,12 @@ fn resolve_entity_source_generic<G: GraphStore>(store: &G, id: &str) -> Resolved
 pub fn handle_get_entity_sources<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
+    repository_authority: Option<&LocalRepositoryAuthorityBinding>,
 ) -> Result<ToolCallResult> {
     let (entity_ids, opts) = parse_batch_source_args(args)?;
     let resolved = entity_ids
         .iter()
-        .map(|id| resolve_entity_source_generic(store, id))
+        .map(|id| resolve_entity_source_generic(store, id, repository_authority))
         .collect();
     Ok(assemble_entity_sources_response(resolved, &opts))
 }
@@ -548,6 +562,7 @@ pub fn handle_get_context_pack<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
     sessions: &SessionRegistry,
+    repository_authority: Option<&LocalRepositoryAuthorityBinding>,
 ) -> Result<ToolCallResult> {
     use kin_context::{build_context_pack_with_traffic, ContextOptions};
     use kin_model::context::TokenBudget;
@@ -588,7 +603,7 @@ pub fn handle_get_context_pack<G: GraphStore>(
     let focal_entity = store.get_entity(&entity_id).map_err(McpError::graph)?;
 
     let focal_json = if let (Some(entry), Some(entity)) = (focal_entry, &focal_entity) {
-        focal_context_json(store, entry, entity, compact)?
+        focal_context_json(store, entry, entity, compact, repository_authority)?
     } else {
         serde_json::json!(null)
     };
@@ -616,6 +631,7 @@ pub fn handle_get_context_pack<G: GraphStore>(
                     &e,
                     MCP_SOURCE_MAX_LINES,
                     MCP_SOURCE_MAX_CHARS,
+                    repository_authority,
                 )?;
                 let is_stale = LAST_READ_STALE.with(|f| f.get());
                 let source = LAST_READ_SOURCE.with(|f| f.get());
@@ -713,6 +729,7 @@ pub fn handle_trace_computation<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
     sessions: &SessionRegistry,
+    repository_authority: Option<&LocalRepositoryAuthorityBinding>,
 ) -> Result<ToolCallResult> {
     let mut merged: HashMap<String, serde_json::Value> = args.clone();
 
@@ -744,7 +761,7 @@ pub fn handle_trace_computation<G: GraphStore>(
         .entry("compact".into())
         .or_insert(serde_json::json!(false));
 
-    handle_get_context_pack(&merged, store, sessions)
+    handle_get_context_pack(&merged, store, sessions, repository_authority)
 }
 
 pub const FIND_REFERENCES_DESC: &str = "\
@@ -892,11 +909,13 @@ fn daemon_spine_xref(
 pub async fn handle_find_references<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
+    repository_authority: Option<&LocalRepositoryAuthorityBinding>,
 ) -> Result<ToolCallResult> {
     handle_find_references_with_authority_source(
         args,
         store,
         FindReferencesAuthoritySource::Environment,
+        repository_authority,
     )
     .await
 }
@@ -910,11 +929,13 @@ pub async fn handle_find_references_with_authority<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
     authority: FindReferencesAuthority<'_>,
+    repository_authority: Option<&LocalRepositoryAuthorityBinding>,
 ) -> Result<ToolCallResult> {
     handle_find_references_with_authority_source(
         args,
         store,
         FindReferencesAuthoritySource::Daemon(authority),
+        repository_authority,
     )
     .await
 }
@@ -923,6 +944,7 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
     authority_source: FindReferencesAuthoritySource<'_>,
+    repository_authority: Option<&LocalRepositoryAuthorityBinding>,
 ) -> Result<ToolCallResult> {
     let relation_kinds = if let Some(raw_kinds) = get_optional_string_array(args, "relation_kinds")
     {
@@ -960,7 +982,8 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
         return Ok(ToolCallResult::error("Entity not found"));
     };
 
-    let mut rows = collect_graph_reference_rows(store, &target.id, &relation_kinds)?;
+    let mut rows =
+        collect_graph_reference_rows(store, &target.id, &relation_kinds, repository_authority)?;
     // ── Federated Xrefs via Spine ─────────────────────────────────────
     let cross_repo_query = match authority_source {
         FindReferencesAuthoritySource::Environment => match cross_repo_repo_id() {
@@ -1472,6 +1495,7 @@ get_context_pack, find_references, trace_data_flow) let you go deeper precisely.
 pub fn handle_explore_codebase<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
+    repository_authority: Option<&LocalRepositoryAuthorityBinding>,
 ) -> Result<ToolCallResult> {
     use kin_context::{build_context_pack, estimate_tokens, ContextOptions};
     use kin_model::context::TokenBudget;
@@ -1651,7 +1675,7 @@ pub fn handle_explore_codebase<G: GraphStore>(
 
                         let outgoing_calls =
                             outgoing_related_entities(store, &step.id, &[RelationKind::Calls])?;
-                        let step_body = trace_body(store, step)?;
+                        let step_body = trace_body(store, step, repository_authority)?;
                         let constants = trace_constants_for_step(store, step, &step_body)?;
 
                         if !push_with_budget(
@@ -1711,7 +1735,8 @@ pub fn handle_explore_codebase<G: GraphStore>(
                                     output.push_str("  ... (truncated)\n");
                                     break;
                                 }
-                                let constant_body = trace_body(store, constant)?;
+                                let constant_body =
+                                    trace_body(store, constant, repository_authority)?;
                                 if !push_indented_body(
                                     &mut output,
                                     &mut tokens_used,
@@ -1727,7 +1752,9 @@ pub fn handle_explore_codebase<G: GraphStore>(
                 }
 
                 if let Some(input_literal) = trace_query.input_literal {
-                    if let Some(evaluation) = evaluate_trace_chain(store, &chain, input_literal)? {
+                    if let Some(evaluation) =
+                        evaluate_trace_chain(store, &chain, input_literal, repository_authority)?
+                    {
                         if push_with_budget(
                             &mut output,
                             &mut tokens_used,
@@ -2739,14 +2766,14 @@ mod tests {
 
         let missing = HashMap::new();
         assert!(matches!(
-            handle_get_entity_sources(&missing, &store).unwrap_err(),
+            handle_get_entity_sources(&missing, &store, None).unwrap_err(),
             McpError::InvalidParams(_)
         ));
 
         let mut empty_list = HashMap::new();
         empty_list.insert("entity_ids".to_string(), serde_json::json!([]));
         assert!(matches!(
-            handle_get_entity_sources(&empty_list, &store).unwrap_err(),
+            handle_get_entity_sources(&empty_list, &store, None).unwrap_err(),
             McpError::InvalidParams(_)
         ));
 
@@ -2758,7 +2785,7 @@ mod tests {
         let mut over = HashMap::new();
         over.insert("entity_ids".to_string(), serde_json::json!(too_many));
         assert!(matches!(
-            handle_get_entity_sources(&over, &store).unwrap_err(),
+            handle_get_entity_sources(&over, &store, None).unwrap_err(),
             McpError::InvalidParams(_)
         ));
 
@@ -2769,7 +2796,7 @@ mod tests {
             .collect();
         let mut ok = HashMap::new();
         ok.insert("entity_ids".to_string(), serde_json::json!(at_bound));
-        let env = parsed_response(&handle_get_entity_sources(&ok, &store).unwrap());
+        let env = parsed_response(&handle_get_entity_sources(&ok, &store, None).unwrap());
         assert_eq!(env["total_requested"], 50);
         assert_eq!(env["returned"], 0);
         assert_eq!(env["results"][0]["reason"], "not_found");
@@ -2963,7 +2990,7 @@ mod tests {
             serde_json::json!(target_id.to_string()),
         );
 
-        let body = parsed_response(&handle_find_references(&args, &store).await.unwrap());
+        let body = parsed_response(&handle_find_references(&args, &store, None).await.unwrap());
         assert_eq!(body["total_upstream"], 1);
         let refs = body["references"].as_array().unwrap();
         assert_eq!(refs.len(), 1);
@@ -2991,7 +3018,7 @@ mod tests {
             serde_json::json!(target_id.to_string()),
         );
 
-        let body = parsed_response(&handle_find_references(&args, &store).await.unwrap());
+        let body = parsed_response(&handle_find_references(&args, &store, None).await.unwrap());
         assert_eq!(body["total_upstream"], 0);
         assert!(body["references"].as_array().unwrap().is_empty());
     }
@@ -3023,6 +3050,7 @@ mod tests {
                 graph_root: &registered_root,
                 spine: Some(&spine),
             },
+            None,
         )
         .await
         .unwrap();
@@ -3048,6 +3076,7 @@ mod tests {
                 graph_root: &live_root,
                 spine: Some(&spine),
             },
+            None,
         )
         .await
         .unwrap();
@@ -3111,6 +3140,7 @@ mod tests {
                 graph_root: &provider_root,
                 spine: Some(&spine),
             },
+            None,
         )
         .await
         .unwrap();
@@ -3139,6 +3169,7 @@ mod tests {
                     graph_root: &provider_root,
                     spine: Some(&spine),
                 },
+                None,
             )
             .await
             .unwrap(),
@@ -3177,6 +3208,7 @@ mod tests {
                 graph_root: &provider_root,
                 spine: Some(&spine),
             },
+            None,
         )
         .await
         .unwrap();

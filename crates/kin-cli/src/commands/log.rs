@@ -68,8 +68,11 @@ pub struct LogReport {
     pub entries: Vec<LogEntry>,
 }
 
-pub fn inspect(layout: &kin_core::KinLayout, count: usize) -> Result<LogReport> {
-    let authority = ActiveRepositoryAuthority::open(layout)?;
+pub fn inspect(
+    binding: &kin_core::LocalRepositoryAuthorityBinding,
+    count: usize,
+) -> Result<LogReport> {
+    let authority = ActiveRepositoryAuthority::open(binding)?;
     let lease = authority.manager().read_authority();
     let metadata = lease.metadata();
     let snapshot = lease.snapshot();
@@ -167,7 +170,8 @@ pub fn inspect(layout: &kin_core::KinLayout, count: usize) -> Result<LogReport> 
 pub fn run(count: usize, json: bool) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let report = inspect(&layout, count)?;
+    let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&layout)?;
+    let report = inspect(&binding, count)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
@@ -179,11 +183,11 @@ pub fn run(count: usize, json: bool) -> Result<()> {
 }
 
 pub fn build_log_response(
-    layout: &kin_core::KinLayout,
+    binding: &kin_core::LocalRepositoryAuthorityBinding,
     _graph: &kin_db::InMemoryGraph,
     request: &LogRequest,
 ) -> Result<LogResponse> {
-    let report = inspect(layout, request.count)?;
+    let report = inspect(binding, request.count)?;
     Ok(LogResponse {
         lines: render_lines(&report),
         report: Some(report),

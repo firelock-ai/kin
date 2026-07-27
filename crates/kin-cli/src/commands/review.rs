@@ -163,7 +163,7 @@ pub async fn run_json(
 }
 
 pub async fn execute_review_request(
-    layout: &kin_core::KinLayout,
+    binding: &kin_core::LocalRepositoryAuthorityBinding,
     graph: &kin_db::InMemoryGraph,
     request: ReviewRequest,
 ) -> Result<ReviewExecution> {
@@ -176,7 +176,7 @@ pub async fn execute_review_request(
             json,
         } => Ok(ReviewExecution {
             response: build_review_run_response(
-                layout, graph, change, entities, files, changes, json,
+                binding, graph, change, entities, files, changes, json,
             )?,
             mutated: false,
         }),
@@ -189,7 +189,7 @@ pub async fn execute_review_request(
             json,
         } => Ok(ReviewExecution {
             response: build_shadow_run_response(
-                layout, graph, base, head, title, source_url, author, json,
+                binding, graph, base, head, title, source_url, author, json,
             )?,
             mutated: false,
         }),
@@ -231,7 +231,7 @@ pub async fn execute_review_request(
 }
 
 fn build_review_run_response(
-    layout: &kin_core::KinLayout,
+    binding: &kin_core::LocalRepositoryAuthorityBinding,
     graph: &kin_db::InMemoryGraph,
     change: Option<String>,
     entities: Option<String>,
@@ -240,7 +240,7 @@ fn build_review_run_response(
     json: bool,
 ) -> Result<ReviewResponse> {
     let (review, file_hint, text_prefix, change_context) =
-        compute_review(layout, graph, change, entities, files, changes)?;
+        compute_review(binding, graph, change, entities, files, changes)?;
 
     if json {
         let findings = review
@@ -295,7 +295,7 @@ struct ShadowReviewResponseJson<'a> {
 
 #[allow(clippy::too_many_arguments)]
 fn build_shadow_run_response(
-    layout: &kin_core::KinLayout,
+    binding: &kin_core::LocalRepositoryAuthorityBinding,
     graph: &kin_db::InMemoryGraph,
     base: String,
     head: String,
@@ -308,10 +308,10 @@ fn build_shadow_run_response(
     // already be present in graph authority through an explicit import, clone,
     // fetch, or native change transaction.
     let resolved_head =
-        crate::commands::ref_lookup::resolve_ref(graph, layout, Some(head.as_str()))
+        crate::commands::ref_lookup::resolve_ref(graph, binding, Some(head.as_str()))
             .with_context(|| format!("resolve shadow head ref '{}'", head))?;
     let resolved_base =
-        crate::commands::ref_lookup::resolve_ref(graph, layout, Some(base.as_str()))
+        crate::commands::ref_lookup::resolve_ref(graph, binding, Some(base.as_str()))
             .with_context(|| format!("resolve shadow base ref '{}'", base))?;
 
     let request = kin_review::ShadowRequest {
@@ -349,7 +349,7 @@ fn shadow_response_from_report(
 }
 
 fn compute_review(
-    layout: &kin_core::KinLayout,
+    binding: &kin_core::LocalRepositoryAuthorityBinding,
     graph: &kin_db::InMemoryGraph,
     change: Option<String>,
     entities: Option<String>,
@@ -423,7 +423,7 @@ fn compute_review(
         Some(h) => kin_model::SemanticChangeId::from_hash(
             kin_model::Hash256::from_hex(&h).map_err(|e| anyhow::anyhow!("invalid hash: {}", e))?,
         ),
-        None => crate::commands::repository_authority::ActiveRepositoryAuthority::open(layout)?
+        None => crate::commands::repository_authority::ActiveRepositoryAuthority::open(binding)?
             .current_change_id()?
             .ok_or_else(|| anyhow::anyhow!("repository-v6 workspace head is unborn"))?,
     };
@@ -1116,7 +1116,18 @@ fn inline_comment_severity(kind: kin_review::InlineCommentKind) -> &'static str 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kin_db::LocalFileBackend;
     use kin_model::ProvenanceStore;
+    use kin_model::{RepositoryId, WorkspaceId};
+    use std::sync::Arc;
+
+    fn absent_binding(layout: &kin_core::KinLayout) -> kin_core::LocalRepositoryAuthorityBinding {
+        kin_core::LocalRepositoryAuthorityBinding::from_parts(
+            RepositoryId::new("review-test").unwrap(),
+            WorkspaceId::new(),
+            Arc::new(LocalFileBackend::new(layout.kindb_dir())),
+        )
+    }
 
     #[test]
     fn command_effect_contract_comment_severity_is_warning() {
@@ -1253,9 +1264,10 @@ mod tests {
             kin_model::SemanticChangeId::from_hash(kin_model::Hash256::from_bytes([0xa1; 32]));
         let branch_b_change =
             kin_model::SemanticChangeId::from_hash(kin_model::Hash256::from_bytes([0xb2; 32]));
+        let binding = absent_binding(&layout);
 
         let error = build_shadow_run_response(
-            &layout,
+            &binding,
             &graph,
             branch_a.clone(),
             branch_b.clone(),
@@ -1325,9 +1337,10 @@ mod tests {
         head.id = kin_model::compute_semantic_change_id(&head).unwrap();
         let head_id = head.id;
         graph.create_change(&head).unwrap();
+        let binding = absent_binding(&layout);
 
         let response = build_shadow_run_response(
-            &layout,
+            &binding,
             &graph,
             format!("kin:{base_id}"),
             format!("kin:{head_id}"),

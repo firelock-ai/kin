@@ -1115,7 +1115,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users 0.5.2",
- "windows-sys 0.60.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1224,7 +1224,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3175,6 +3175,7 @@ dependencies = [
 name = "kin-daemon"
 version = "0.3.6"
 dependencies = [
+ "anyhow",
  "async-stream",
  "axum",
  "base64 0.22.1",
@@ -3225,9 +3226,9 @@ dependencies = [
 
 [[package]]
 name = "kin-db"
-version = "0.5.0"
+version = "0.6.0"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "35a30ab06c0b2c26706c2c82192fd13ee4dc63bcbb26befe513d24f32f0054f6"
+checksum = "932d9062fa094e16a3400ac9b7361300deb950157fae813eedc0e9a9bf0df796"
 dependencies = [
  "bincode",
  "bstr",
@@ -3362,9 +3363,9 @@ dependencies = [
 
 [[package]]
 name = "kin-lsp"
-version = "0.5.0"
+version = "0.6.0"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "52769ad5dc035fe2968ae3524ec0962169dd9468d656da00b4fe69ca9e712e54"
+checksum = "5b754e534fd4aa0f82b7e4af738d27e55967ccd4dfeaf9956c0321b4425a058e"
 dependencies = [
  "kin-model",
  "serde",
@@ -3430,9 +3431,9 @@ dependencies = [
 
 [[package]]
 name = "kin-model"
-version = "0.5.0"
+version = "0.6.0"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "416099f3dbf0a55962fefebcd90deaedd3c1bedc72950c4f9502711a6dc00227"
+checksum = "41dd393ac2ce6fb40d662fcc0d816db8d0b536c8856c2c62bbb705e3ccbbca59"
 dependencies = [
  "chrono",
  "gix-hash",
@@ -4047,7 +4048,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4946,7 +4947,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.60.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5015,7 +5016,7 @@ dependencies = [
  "security-framework 3.7.0",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.60.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5592,7 +5593,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.60.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -6525,7 +6526,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

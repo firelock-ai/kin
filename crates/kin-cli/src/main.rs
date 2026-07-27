@@ -56,7 +56,7 @@ enum Command {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
-    /// Create an exact semantic and artifact commit
+    /// [OPEN GATE] Create an exact semantic and artifact commit
     Commit {
         /// Commit message
         #[arg(short, long)]
@@ -546,10 +546,13 @@ enum Command {
         /// Target directory (defaults to repo name)
         path: Option<String>,
     },
-    /// [OPEN GATE] Restore an artifact from an immutable repository-v6 tree
+    /// [OPEN GATE] Restore an exact path or subtree from immutable repository-v6 history
     Checkout {
-        /// File path to restore
-        path: String,
+        /// UTF-8 repository path to restore
+        path: Option<String>,
+        /// Byte-exact repository path as canonical lowercase hexadecimal
+        #[arg(long, conflicts_with = "path")]
+        path_hex: Option<String>,
         /// Change ID (defaults to current branch head)
         #[arg(long)]
         change: Option<String>,
@@ -771,7 +774,7 @@ enum Command {
         #[arg(last = true)]
         task: Vec<String>,
     },
-    /// Admit one exact disposable-session observation into repository-v6 authority
+    /// [OPEN GATE] Admit one exact disposable-session observation into repository-v6 authority
     Reconcile {
         /// Session ID (defaults to most recent session)
         session: Option<String>,
@@ -1902,19 +1905,34 @@ fn main() -> Result<()> {
                         commands::resources::run(json, profile).await
                     }
                 },
-                Command::Commit { message, quiet } => commands::commit::run(message, quiet).await,
+                Command::Commit { message, quiet } => {
+                    commands::capabilities::require_ready("commit")?;
+                    commands::commit::run(message, quiet).await
+                }
                 Command::Log { count, json } => commands::log::run(count, json),
                 Command::Branch { action } => match action {
-                    BranchAction::List { json } => commands::branch::list(json),
-                    BranchAction::Create { name, ref_hex } => commands::branch::create(
-                        commands::branch::parse_branch_ref(name.as_deref(), ref_hex.as_deref())?,
-                    ),
-                    BranchAction::Delete { name, ref_hex } => commands::branch::delete(
-                        commands::branch::parse_branch_ref(name.as_deref(), ref_hex.as_deref())?,
-                    ),
-                    BranchAction::Switch { name, ref_hex } => commands::branch::switch(
-                        commands::branch::parse_branch_ref(name.as_deref(), ref_hex.as_deref())?,
-                    ),
+                    BranchAction::List { json } => commands::branch::list(json).await,
+                    BranchAction::Create { name, ref_hex } => {
+                        commands::branch::create(commands::branch::parse_branch_ref(
+                            name.as_deref(),
+                            ref_hex.as_deref(),
+                        )?)
+                        .await
+                    }
+                    BranchAction::Delete { name, ref_hex } => {
+                        commands::branch::delete(commands::branch::parse_branch_ref(
+                            name.as_deref(),
+                            ref_hex.as_deref(),
+                        )?)
+                        .await
+                    }
+                    BranchAction::Switch { name, ref_hex } => {
+                        commands::branch::switch(commands::branch::parse_branch_ref(
+                            name.as_deref(),
+                            ref_hex.as_deref(),
+                        )?)
+                        .await
+                    }
                 },
                 Command::Diff { base, head, json } => commands::diff::run(base, head, json),
                 Command::Eject { yes } => commands::eject::run(yes).await,
@@ -2432,7 +2450,14 @@ fn main() -> Result<()> {
                 Command::Push { remote: _ } => commands::capabilities::require_ready("push"),
                 Command::Pull { remote: _ } => commands::capabilities::require_ready("pull"),
                 Command::Clone { url, path } => commands::clone::run(url, path).await,
-                Command::Checkout { .. } => commands::capabilities::require_ready("checkout"),
+                Command::Checkout {
+                    path,
+                    path_hex,
+                    change,
+                } => {
+                    commands::capabilities::require_ready("checkout")?;
+                    commands::checkout::run(path, path_hex, change).await
+                }
                 Command::Verify { action } => match action {
                     VerifyAction::Entity { entity } => commands::verify::run(entity).await,
                     VerifyAction::Plan { entity, depth } => {
@@ -2638,7 +2663,10 @@ fn main() -> Result<()> {
                 Command::Reconcile {
                     session,
                     confirm_mass_deletion,
-                } => commands::reconcile::run(session, confirm_mass_deletion).await,
+                } => {
+                    commands::capabilities::require_ready("reconcile")?;
+                    commands::reconcile::run(session, confirm_mass_deletion).await
+                }
                 Command::With { .. } => commands::capabilities::require_ready("with"),
                 Command::Shell { .. } => commands::capabilities::require_ready("shell"),
                 Command::Overview { compact, json } => {

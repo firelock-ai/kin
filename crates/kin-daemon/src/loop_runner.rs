@@ -293,9 +293,11 @@ fn publish_exact_workspace_tree(
     state: &DaemonState,
     desired_tree: &kin_model::ResolvedTree,
 ) -> Result<()> {
+    let authority_context =
+        crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(state)?;
     let Some(admission) = crate::repository_commit::publish_workspace_tree(
-        &state.layout,
         state.blobs.as_ref(),
+        &authority_context,
         desired_tree,
         kin_model::OperationId::new(),
         kin_model::AuthorId::new(kin_core::whoami()),
@@ -584,6 +586,7 @@ fn admit_file_event_with_exact_tree(
     }
 }
 
+#[cfg(test)]
 fn admit_file_event(state: &DaemonState, event: &FileEvent) -> Result<AdmittedFileEvent> {
     admit_file_event_with_exact_tree(state, event, None)
 }
@@ -1013,11 +1016,13 @@ pub async fn run_loop(
                     file_id,
                     content,
                     blob_hash,
+                    entry,
                     ..
                 } => {
                     let Some(file_id) = file_id else {
                         debug!(
                             file = %repo_path,
+                            ?entry,
                             "admitted byte-exact non-UTF-8 path without UTF-8 semantic enrichment"
                         );
                         if tree_changed {
@@ -2185,11 +2190,13 @@ pub(crate) async fn sync_filesystem_with_graph_under_coordination(
                 file_id,
                 content,
                 blob_hash,
+                entry,
                 ..
             } => {
                 let Some(file_id) = file_id else {
                     debug!(
                         file = %repo_path,
+                        ?entry,
                         "admitted byte-exact non-UTF-8 path without UTF-8 semantic enrichment"
                     );
                     continue;

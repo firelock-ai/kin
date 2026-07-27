@@ -55,24 +55,27 @@ struct ActiveApiRepositoryAuthority {
 }
 
 impl ActiveApiRepositoryAuthority {
-    fn open(layout: &kin_core::KinLayout) -> Result<Self, (StatusCode, String)> {
-        layout.check_version().map_err(repository_authority_error)?;
-        let manifest = kin_core::KinManifest::load(&layout.manifest_path())
+    fn open(state: &DaemonState) -> Result<Self, (StatusCode, String)> {
+        let binding = state
+            .local_repository_authority_binding()
             .map_err(repository_authority_error)?;
-        let repository_id =
-            RepositoryId::new(manifest.repo_id).map_err(repository_authority_error)?;
-        let workspace_uuid =
-            Uuid::parse_str(&manifest.workspace_id).map_err(repository_authority_error)?;
-        let workspace_id = WorkspaceId::from_uuid(workspace_uuid);
-        let manager = RepositoryAuthorityManager::open(
-            repository_id.clone(),
-            Arc::new(LocalFileBackend::new(layout.kindb_dir())),
-        )
-        .map_err(repository_authority_error)?;
+        let manager = binding.open_manager().map_err(repository_authority_error)?;
         Ok(Self {
             manager,
-            repository_id,
-            workspace_id,
+            repository_id: binding.repository_id().clone(),
+            workspace_id: binding.workspace_id(),
+        })
+    }
+
+    #[cfg(test)]
+    fn open_layout_for_test(layout: &kin_core::KinLayout) -> Result<Self, (StatusCode, String)> {
+        let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(layout)
+            .map_err(repository_authority_error)?;
+        let manager = binding.open_manager().map_err(repository_authority_error)?;
+        Ok(Self {
+            manager,
+            repository_id: binding.repository_id().clone(),
+            workspace_id: binding.workspace_id(),
         })
     }
 
@@ -1486,6 +1489,7 @@ where
     F: FnMut(usize),
 {
     let spine = state.ensure_spine();
+    let repository_authority = mcp_repository_authority_binding(state)?;
     for attempt_number in 0..XREF_STABLE_READ_ATTEMPTS {
         let Some(attempt) = prepare_xref_graph_read(state, &selected_graph, authority) else {
             continue;
@@ -1499,6 +1503,7 @@ where
                 graph_root: &attempt.root,
                 spine,
             },
+            repository_authority.as_ref(),
         )
         .await;
         if xref_graph_read_is_still_current(state, session_id, &selected_graph, authority, &attempt)
@@ -1514,6 +1519,34 @@ where
     Err(kin_mcp::McpError::Other(
         "graph authority changed repeatedly during find_references; retry".to_string(),
     ))
+}
+
+fn mcp_repository_authority_binding(
+    state: &DaemonState,
+) -> kin_mcp::Result<Option<kin_core::LocalRepositoryAuthorityBinding>> {
+    if state.storage_backend.is_some() {
+        return Ok(None);
+    }
+    state
+        .local_repository_authority_binding()
+        .map(Some)
+        .map_err(|error| {
+            kin_mcp::McpError::Context(format!(
+                "graph authority gap: daemon local repository binding is unavailable: {error}"
+            ))
+        })
+}
+
+fn require_mcp_local_repository_authority(
+    state: &DaemonState,
+) -> kin_mcp::Result<kin_core::LocalRepositoryAuthorityBinding> {
+    mcp_repository_authority_binding(state)?.ok_or_else(|| {
+        kin_mcp::McpError::Context(
+            "graph authority gap: this MCP operation requires startup-pinned local repository \
+             authority, but the daemon is serving hosted snapshot authority"
+                .to_string(),
+        )
+    })
 }
 
 async fn mcp_bulk_check_references_with_stable_authority<F>(
@@ -1815,6 +1848,9 @@ async fn set_scope(
 
     // Offload the heavy computation to a blocking thread to keep the main event loop responsive
     let state_clone = Arc::clone(&state);
+    let repository_authority = state
+        .local_repository_authority_binding()
+        .map_err(repository_authority_error)?;
     let ref_string = req.ref_string.clone();
     let timeout = scope_build_timeout();
     let scope_task =
@@ -1824,11 +1860,11 @@ async fn set_scope(
             // from a colocated Git checkout.
             let head = kin_cli::commands::ref_lookup::resolve_ref(
                 state_clone.graph.as_ref(),
-                &state_clone.layout,
+                &repository_authority,
                 Some(&ref_string),
             )
             .map_err(|err| (StatusCode::BAD_REQUEST, format!("{:#}", err)))?;
-            let authority = ActiveApiRepositoryAuthority::open(&state_clone.layout)?;
+            let authority = ActiveApiRepositoryAuthority::open(&state_clone)?;
             let historical =
                 kin_core::build_graph_at_ref(&authority.manager, &head).map_err(internal_error)?;
 
@@ -1983,7 +2019,11 @@ async fn command_status(
         ));
     }
 
-    let report = kin_cli::commands::status::inspect(&state.layout).map_err(internal_error)?;
+    let repository_authority = state
+        .local_repository_authority_binding()
+        .map_err(repository_authority_error)?;
+    let report = kin_cli::commands::status::inspect(&state.layout, &repository_authority)
+        .map_err(internal_error)?;
     let daemon_build = kin_buildinfo::get();
     let build = kin_cli::commands::status::BuildStatus {
         cli_sha: request
@@ -2127,9 +2167,15 @@ async fn command_graph(
 
     let session_id = extract_session_id_from_headers(&headers)?;
     let graph = resolve_session_graph(&state, session_id.as_ref()).await;
-    let response =
-        kin_cli::commands::graph::execute_graph_command(&state.layout, graph.as_ref(), &request)
-            .map_err(internal_error)?;
+    let repository_authority = state
+        .local_repository_authority_binding()
+        .map_err(repository_authority_error)?;
+    let response = kin_cli::commands::graph::execute_graph_command(
+        &repository_authority,
+        graph.as_ref(),
+        &request,
+    )
+    .map_err(internal_error)?;
     Ok(Json(response))
 }
 
@@ -2238,8 +2284,11 @@ async fn command_trace_data_flow(
 
     let session_id = extract_session_id_from_headers(&headers)?;
     let graph = resolve_session_graph(&state, session_id.as_ref()).await;
+    let repository_authority = state
+        .local_repository_authority_binding()
+        .map_err(repository_authority_error)?;
     let response = kin_cli::commands::trace_data_flow::build_trace_data_flow_response(
-        &state.layout,
+        &repository_authority,
         graph.as_ref(),
         &request,
     )
@@ -2344,7 +2393,10 @@ async fn command_diff(
         ));
     }
 
-    let response = kin_cli::commands::diff::build_diff_response(&state.layout, &request)
+    let repository_authority = state
+        .local_repository_authority_binding()
+        .map_err(repository_authority_error)?;
+    let response = kin_cli::commands::diff::build_diff_response(&repository_authority, &request)
         .map_err(internal_error)?;
     Ok(Json(response))
 }
@@ -2367,8 +2419,11 @@ async fn command_log(
 
     let session_id = extract_session_id_from_headers(&headers)?;
     let graph = resolve_session_graph(&state, session_id.as_ref()).await;
+    let repository_authority = state
+        .local_repository_authority_binding()
+        .map_err(repository_authority_error)?;
     let response =
-        kin_cli::commands::log::build_log_response(&state.layout, graph.as_ref(), &request)
+        kin_cli::commands::log::build_log_response(&repository_authority, graph.as_ref(), &request)
             .map_err(internal_error)?;
     Ok(Json(response))
 }
@@ -2444,6 +2499,7 @@ async fn command_security(
 
 /// POST /commands/branch — run branch lifecycle commands in the repo daemon.
 async fn command_branch(
+    headers: axum::http::HeaderMap,
     State(state): State<Arc<DaemonState>>,
     Json(request): Json<kin_cli::commands::branch::BranchRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
@@ -2456,6 +2512,21 @@ async fn command_branch(
             "daemon not fully initialized".to_string(),
         ));
     }
+    if state.storage_backend.is_some() {
+        return Err((
+            StatusCode::CONFLICT,
+            "local repository branch authority is unavailable for hosted snapshot authority"
+                .to_string(),
+        ));
+    }
+    if extract_session_id_from_headers(&headers)?.is_some() {
+        return Err((
+            StatusCode::CONFLICT,
+            "primary repository branch commands do not accept X-Kin-Session; run against HEAD \
+             authority without ambient session scope"
+                .to_string(),
+        ));
+    }
 
     let requires_authority_gate =
         !matches!(&request, kin_cli::commands::branch::BranchRequest::List);
@@ -2465,23 +2536,11 @@ async fn command_branch(
         None
     };
 
-    let response = kin_cli::commands::branch::execute_branch_request(
-        &state.layout,
-        state.graph.as_ref(),
-        &request,
-    )
-    .map_err(internal_error)?;
-    if response.mutated {
-        state.bump_version();
-        state.emit_event(DaemonEvent::GraphRootChanged {
-            old_root_hash: None,
-            new_root_hash: "branch-state".to_string(),
-        });
-    }
+    let response = crate::repository_branch::execute(&state, &request)?;
     Ok(Json(response))
 }
 
-/// POST /commands/checkout — restore files through daemon-owned graph state.
+/// POST /commands/checkout — restore one exact repository-authority path.
 async fn command_checkout(
     headers: axum::http::HeaderMap,
     State(state): State<Arc<DaemonState>>,
@@ -2496,35 +2555,25 @@ async fn command_checkout(
             "daemon not fully initialized".to_string(),
         ));
     }
-
-    let _coordination = state.coordination_gate.lock().await;
-    let session_id = extract_session_id_from_headers(&headers)?;
-    let (graph, authority) = state
-        .graph_for_request_with_authority(session_id.as_ref())
-        .await;
-    if authority == RequestGraphAuthority::SessionScope {
+    if state.storage_backend.is_some() {
         return Err((
             StatusCode::CONFLICT,
-            "checkout cannot project a session-scoped graph into the primary working tree; \
-             materialize and mutate the session workspace instead"
+            "exact local checkout is unavailable for hosted snapshot authority".to_string(),
+        ));
+    }
+
+    let session_id = extract_session_id_from_headers(&headers)?;
+    if session_id.is_some() {
+        return Err((
+            StatusCode::CONFLICT,
+            "checkout does not accept X-Kin-Session because it mutates the primary repository \
+             workspace; materialize and mutate a session workspace instead"
                 .to_string(),
         ));
     }
 
-    let response = kin_cli::commands::checkout::execute_checkout_request(
-        &state.layout,
-        graph.as_ref(),
-        &request,
-    )
-    .map_err(internal_error)?;
-    if response.mutated {
-        state.mark_dirty();
-        state.bump_version();
-        state.emit_event(DaemonEvent::GraphRootChanged {
-            old_root_hash: None,
-            new_root_hash: "checkout-state".to_string(),
-        });
-    }
+    let _coordination = state.coordination_gate.lock().await;
+    let response = crate::repository_checkout::execute(&state, &request)?;
     Ok(Json(response))
 }
 
@@ -2567,8 +2616,12 @@ async fn command_session_workspace(
         ));
     }
 
+    let repository_authority = state
+        .local_repository_authority_binding()
+        .map_err(repository_authority_error)?;
     let response = kin_cli::commands::session_workspace::materialize_session_workspace(
         &state.layout,
+        &repository_authority,
         &request,
     )
     .map_err(session_reconcile_error)?;
@@ -2604,8 +2657,12 @@ async fn reconcile_session_workspace(
 
     let _coordination = state.coordination_gate.lock().await;
     let graph_mutation = state.begin_graph_authority_mutation();
+    let repository_authority = state
+        .local_repository_authority_binding()
+        .map_err(repository_authority_error)?;
     let observation = kin_cli::commands::reconcile::observe_session_workspace(
         &state.layout,
+        &repository_authority,
         &request.session_dir,
         state.blobs.as_ref(),
         request.confirm_mass_deletion,
@@ -2640,80 +2697,86 @@ async fn reconcile_session_workspace(
         ));
     }
 
-    let (authority_generation, workspace_generation, idempotent_replay) =
-        if observation.deltas.is_empty() {
-            (
-                observation.base.authority_roots.generation,
-                observation.base.source_workspace.generation,
-                false,
-            )
-        } else {
-            let plan = crate::repository_commit::plan_session_workspace_admission(
-                &state.layout,
-                state.blobs.as_ref(),
-                &observation.base,
-                &observation.desired_tree,
-            )
-            .map_err(repository_commit_error)?;
-            let committed = crate::repository_commit::commit_session_workspace_admission(
-                &state.layout,
-                state.blobs.as_ref(),
-                plan,
-            )
-            .map_err(repository_commit_error)?;
+    let (authority_generation, workspace_generation, idempotent_replay) = if observation
+        .deltas
+        .is_empty()
+    {
+        (
+            observation.base.authority_roots.generation,
+            observation.base.source_workspace.generation,
+            false,
+        )
+    } else {
+        let authority_context =
+            crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(&state)
+                .map_err(repository_commit_error)?;
+        let plan = crate::repository_commit::plan_session_workspace_admission(
+            state.blobs.as_ref(),
+            &authority_context,
+            &observation.base,
+            &observation.desired_tree,
+        )
+        .map_err(repository_commit_error)?;
+        let committed = crate::repository_commit::commit_session_workspace_admission(
+            &state.layout,
+            state.blobs.as_ref(),
+            &authority_context,
+            plan,
+        )
+        .map_err(repository_commit_error)?;
 
-            let live_generation = state
-                .snapshot_generation
-                .load(std::sync::atomic::Ordering::SeqCst);
-            if committed.receipt.generation > live_generation {
-                state
-                    .record_repository_authority_commit(committed.receipt.generation)
-                    .map_err(repository_commit_error)?;
-            } else if committed.receipt.generation < live_generation {
-                return Err((
-                    StatusCode::CONFLICT,
-                    format!(
-                        "daemon generation {live_generation} is newer than recovered session \
+        let live_generation = state
+            .snapshot_generation
+            .load(std::sync::atomic::Ordering::SeqCst);
+        if committed.receipt.generation > live_generation {
+            state
+                .record_repository_authority_commit(committed.receipt.generation)
+                .map_err(repository_commit_error)?;
+        } else if committed.receipt.generation < live_generation {
+            return Err((
+                StatusCode::CONFLICT,
+                format!(
+                    "daemon generation {live_generation} is newer than recovered session \
                          receipt {}",
-                        committed.receipt.generation
-                    ),
-                ));
-            }
+                    committed.receipt.generation
+                ),
+            ));
+        }
 
-            let graph_tree = state.graph.resolved_tree();
-            if graph_tree == observation.base.source_workspace.tree {
-                state
-                    .graph
-                    .apply_transaction_delta(&TransactionDelta {
-                        tree_deltas: observation.deltas.clone(),
-                        ..TransactionDelta::default()
-                    })
-                    .map_err(internal_error)?;
-            } else if graph_tree != observation.desired_tree {
-                return Err((
-                    StatusCode::CONFLICT,
-                    "repository receipt is durable but the daemon query tree cannot be advanced \
+        let graph_tree = state.graph.resolved_tree();
+        if graph_tree == observation.base.source_workspace.tree {
+            state
+                .graph
+                .apply_transaction_delta(&TransactionDelta {
+                    tree_deltas: observation.deltas.clone(),
+                    ..TransactionDelta::default()
+                })
+                .map_err(internal_error)?;
+        } else if graph_tree != observation.desired_tree {
+            return Err((
+                StatusCode::CONFLICT,
+                "repository receipt is durable but the daemon query tree cannot be advanced \
                      from the retained session base; restart to reload exact authority"
-                        .to_string(),
-                ));
-            }
+                    .to_string(),
+            ));
+        }
 
-            state.mark_dirty();
-            state.bump_version();
-            state.emit_event(DaemonEvent::GraphRootChanged {
-                old_root_hash: Some(previous_tree_hash.to_string()),
-                new_root_hash: desired_tree_hash.to_string(),
-            });
-            (
-                committed.receipt.generation,
-                observation
-                    .base
-                    .source_workspace
-                    .generation
-                    .saturating_add(1),
-                committed.idempotent_replay,
-            )
-        };
+        state.mark_dirty();
+        state.bump_version();
+        state.emit_event(DaemonEvent::GraphRootChanged {
+            old_root_hash: Some(previous_tree_hash.to_string()),
+            new_root_hash: desired_tree_hash.to_string(),
+        });
+        (
+            committed.receipt.generation,
+            observation
+                .base
+                .source_workspace
+                .generation
+                .saturating_add(1),
+            committed.idempotent_replay,
+        )
+    };
 
     drop(graph_mutation);
     Ok(Json(kin_cli::commands::reconcile::ReconcileSummary {
@@ -2803,10 +2866,13 @@ async fn command_commit(
         .map_err(internal_error)?;
 
     let graph = &*state.graph;
+    let authority_context =
+        crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(&state)
+            .map_err(repository_commit_error)?;
     let plan = crate::repository_commit::plan_native_commit(
-        &state.layout,
         graph,
         state.blobs.as_ref(),
+        &authority_context,
         request.operation_id,
         request.timestamp,
         kin_model::AuthorId::new(kin_core::whoami()),
@@ -2879,6 +2945,7 @@ async fn command_commit(
     let committed = crate::repository_commit::commit_native_plan_with_projection(
         &state.layout,
         state.blobs.as_ref(),
+        &authority_context,
         plan,
     )
     .map_err(repository_commit_error)?;
@@ -3447,15 +3514,19 @@ async fn locate(
         // Explicit --ref always takes precedence over session scope. Ref
         // resolution is a graph-only read; import and repair are explicit
         // repository transactions.
+        let repository_authority = state
+            .local_repository_authority_binding()
+            .map_err(repository_authority_error)?;
         let head = kin_cli::commands::ref_lookup::resolve_ref(
             state.graph.as_ref(),
-            &state.layout,
+            &repository_authority,
             Some(reference),
         )
         .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
         if multi_query {
             run_multiquery_locate_at_ref(
                 &state,
+                &repository_authority,
                 &head,
                 reference,
                 &variants,
@@ -3467,7 +3538,7 @@ async fn locate(
             )
         } else {
             kin_cli::commands::locate::run_with_graph_capture_at_ref(
-                &state.layout,
+                &repository_authority,
                 state.graph.as_ref(),
                 state.blobs.as_ref(),
                 &head,
@@ -3549,6 +3620,9 @@ async fn run_fused_locate_for_state(
     max_files_explicit: bool,
     snippet_opts: kin_cli::commands::locate::SnippetOptions,
 ) -> Result<kin_cli::commands::locate::LocateResult, String> {
+    let repository_authority = state
+        .local_repository_authority_binding()
+        .map_err(|error| error.to_string())?;
     // When a session scope is active, discover historical test artifact
     // priority files to match the ref-scoped path's behavior.
     let scope_ref_string = if let Some(sid) = session_id {
@@ -3588,6 +3662,7 @@ async fn run_fused_locate_for_state(
         extra_priority_files,
         vector_source,
         snippet_opts,
+        Some(&repository_authority),
     )
     .map_err(|error| error.to_string())
 }
@@ -3734,6 +3809,7 @@ async fn run_multiquery_fused_locate(
 #[allow(clippy::too_many_arguments)]
 fn run_multiquery_locate_at_ref(
     state: &Arc<DaemonState>,
+    repository_authority: &kin_core::LocalRepositoryAuthorityBinding,
     head: &kin_model::SemanticChangeId,
     reference: &str,
     variants: &[String],
@@ -3747,7 +3823,7 @@ fn run_multiquery_locate_at_ref(
     for (index, variant) in variants.iter().enumerate() {
         per_variant.push(
             kin_cli::commands::locate::run_with_graph_capture_at_ref(
-                &state.layout,
+                repository_authority,
                 state.graph.as_ref(),
                 state.blobs.as_ref(),
                 head,
@@ -3843,7 +3919,7 @@ async fn search(
         kin_cli::commands::search::collect_daemon_search_response(graph.as_ref(), &req)
             .map_err(internal_error)?;
     if req.show_body {
-        attach_search_bodies(&state.layout, &mut result, req.body_limit.unwrap_or(10));
+        attach_search_bodies(&state, &mut result, req.body_limit.unwrap_or(10));
     }
     Ok(Json(result))
 }
@@ -3889,9 +3965,16 @@ async fn trace(
 
     let session_id = extract_session_id_from_headers(&headers)?;
     let graph = resolve_session_graph(&state, session_id.as_ref()).await;
-    let result =
-        kin_cli::commands::trace::build_trace_response(&state.layout, graph.as_ref(), &req)
-            .map_err(internal_error)?;
+    let repository_authority = state
+        .local_repository_authority_binding()
+        .map_err(repository_authority_error)?;
+    let result = kin_cli::commands::trace::build_trace_response(
+        &state.layout,
+        &repository_authority,
+        graph.as_ref(),
+        &req,
+    )
+    .map_err(internal_error)?;
     Ok(Json(result))
 }
 
@@ -3952,16 +4035,22 @@ async fn review(
     } else {
         resolve_session_graph(&state, session_id.as_ref()).await
     };
-    let execution =
-        kin_cli::commands::review::execute_review_request(&state.layout, graph.as_ref(), req)
-            .await
-            .map_err(|error| {
-                if kin_cli::commands::ref_lookup::is_ref_resolution_error(&error) {
-                    (StatusCode::BAD_REQUEST, format!("{error:#}"))
-                } else {
-                    internal_error(error)
-                }
-            })?;
+    let repository_authority = state
+        .local_repository_authority_binding()
+        .map_err(repository_authority_error)?;
+    let execution = kin_cli::commands::review::execute_review_request(
+        &repository_authority,
+        graph.as_ref(),
+        req,
+    )
+    .await
+    .map_err(|error| {
+        if kin_cli::commands::ref_lookup::is_ref_resolution_error(&error) {
+            (StatusCode::BAD_REQUEST, format!("{error:#}"))
+        } else {
+            internal_error(error)
+        }
+    })?;
     if execution.mutated {
         state.bump_version();
         state.emit_event(DaemonEvent::GraphRootChanged {
@@ -4213,15 +4302,21 @@ async fn blame(
 
     let session_id = extract_session_id_from_headers(&headers)?;
     let graph = resolve_session_graph(&state, session_id.as_ref()).await;
-    let response =
-        kin_cli::commands::blame::execute_blame_request(&state.layout, graph.as_ref(), &req)
-            .map_err(|error| {
-                if kin_cli::commands::ref_lookup::is_ref_resolution_error(&error) {
-                    (StatusCode::BAD_REQUEST, format!("{error:#}"))
-                } else {
-                    internal_error(error)
-                }
-            })?;
+    let repository_authority = state
+        .local_repository_authority_binding()
+        .map_err(repository_authority_error)?;
+    let response = kin_cli::commands::blame::execute_blame_request(
+        &repository_authority,
+        graph.as_ref(),
+        &req,
+    )
+    .map_err(|error| {
+        if kin_cli::commands::ref_lookup::is_ref_resolution_error(&error) {
+            (StatusCode::BAD_REQUEST, format!("{error:#}"))
+        } else {
+            internal_error(error)
+        }
+    })?;
     Ok(Json(response))
 }
 
@@ -4243,15 +4338,21 @@ async fn history(
 
     let session_id = extract_session_id_from_headers(&headers)?;
     let graph = resolve_session_graph(&state, session_id.as_ref()).await;
-    let response =
-        kin_cli::commands::history::execute_history_request(&state.layout, graph.as_ref(), &req)
-            .map_err(|error| {
-                if kin_cli::commands::ref_lookup::is_ref_resolution_error(&error) {
-                    (StatusCode::BAD_REQUEST, format!("{error:#}"))
-                } else {
-                    internal_error(error)
-                }
-            })?;
+    let repository_authority = state
+        .local_repository_authority_binding()
+        .map_err(repository_authority_error)?;
+    let response = kin_cli::commands::history::execute_history_request(
+        &repository_authority,
+        graph.as_ref(),
+        &req,
+    )
+    .map_err(|error| {
+        if kin_cli::commands::ref_lookup::is_ref_resolution_error(&error) {
+            (StatusCode::BAD_REQUEST, format!("{error:#}"))
+        } else {
+            internal_error(error)
+        }
+    })?;
     Ok(Json(response))
 }
 /// state whose generation has not yet been persisted.
@@ -4283,10 +4384,14 @@ async fn verify_run(
     let _coordination = state.coordination_gate.lock().await;
 
     let state_for_verify = Arc::clone(&state);
+    let repository_authority = state
+        .local_repository_authority_binding()
+        .map_err(repository_authority_error)?;
     let response = tokio::task::spawn_blocking(move || {
         with_graph_authority_mutation(state_for_verify.as_ref(), || {
             let response = kin_cli::commands::verify::execute_verify_run(
                 &state_for_verify.layout,
+                &repository_authority,
                 state_for_verify.graph.as_ref(),
                 &req,
             )
@@ -4320,8 +4425,11 @@ async fn command_verify(
         ));
     }
 
+    let repository_authority = state
+        .local_repository_authority_binding()
+        .map_err(repository_authority_error)?;
     let response = kin_cli::commands::verify::execute_verify_command(
-        &state.layout,
+        &repository_authority,
         state.graph.as_ref(),
         &req,
     )
@@ -4330,11 +4438,11 @@ async fn command_verify(
 }
 
 fn attach_search_bodies(
-    layout: &kin_core::KinLayout,
+    state: &DaemonState,
     response: &mut kin_cli::commands::search::DaemonSearchResponse,
     max_lines: usize,
 ) {
-    let Ok(authority) = ActiveApiRepositoryAuthority::open(layout) else {
+    let Ok(authority) = ActiveApiRepositoryAuthority::open(state) else {
         return;
     };
     let lease = authority.manager.read_authority();
@@ -4402,8 +4510,12 @@ async fn support(
 
     let session_id = extract_session_id_from_headers(&headers)?;
     let graph = resolve_session_graph(&state, session_id.as_ref()).await;
-    let result = kin_cli::commands::support::inspect_support_graph(&state.layout, graph.as_ref())
-        .map_err(internal_error)?;
+    let repository_authority = state
+        .local_repository_authority_binding()
+        .map_err(repository_authority_error)?;
+    let result =
+        kin_cli::commands::support::inspect_support_graph(&repository_authority, graph.as_ref())
+            .map_err(internal_error)?;
     Ok(Json(result))
 }
 
@@ -4908,6 +5020,14 @@ fn build_semantic_locate_result(
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(true)
         && !file_granularity;
+    let repository_authority = if include_snippet {
+        match require_mcp_local_repository_authority(state) {
+            Ok(binding) => Some(binding),
+            Err(error) => return kin_mcp::ToolCallResult::error(error.to_string()),
+        }
+    } else {
+        None
+    };
 
     let graph_version = state.vfs_version.load(std::sync::atomic::Ordering::SeqCst);
     let granularity_token = format!("sem:{}", if file_granularity { "file" } else { "entity" });
@@ -5064,7 +5184,11 @@ fn build_semantic_locate_result(
         // read and no silent graph-gap downgrade.
         let snippet = if include_snippet {
             if let kin_db::ResolvedRetrievalItem::Entity(entity) = &item {
-                match kin_mcp::handlers::common::read_bounded_entity_snippet(graph, entity) {
+                match kin_mcp::handlers::common::read_bounded_entity_snippet(
+                    graph,
+                    entity,
+                    repository_authority.as_ref(),
+                ) {
                     Ok(snippet) => snippet,
                     Err(error) => {
                         return kin_mcp::ToolCallResult::error(format!(
@@ -5515,9 +5639,13 @@ async fn mcp_tools_call(
                 "missing required parameter: entity_id".to_string(),
             )));
         };
+        let repository_authority = match require_mcp_local_repository_authority(&state) {
+            Ok(binding) => binding,
+            Err(error) => return Ok(Json(kin_mcp::ToolCallResult::error(error.to_string()))),
+        };
         let result =
             entity_source_tool_result(kin_cli::commands::graph::build_entity_source_outcome(
-                &state.layout,
+                &repository_authority,
                 graph.as_ref(),
                 entity_id,
             ));
@@ -5534,13 +5662,17 @@ async fn mcp_tools_call(
             Ok(parsed) => parsed,
             Err(error) => return Ok(Json(kin_mcp::ToolCallResult::error(error.to_string()))),
         };
+        let repository_authority = match require_mcp_local_repository_authority(&state) {
+            Ok(binding) => binding,
+            Err(error) => return Ok(Json(kin_mcp::ToolCallResult::error(error.to_string()))),
+        };
         let resolved = entity_ids
             .iter()
             .map(|entity_id| {
                 resolved_entity_source_from_outcome(
                     entity_id,
                     kin_cli::commands::graph::build_entity_source_outcome(
-                        &state.layout,
+                        &repository_authority,
                         graph.as_ref(),
                         entity_id,
                     ),
@@ -5597,8 +5729,12 @@ async fn mcp_tools_call(
             direction: parsed_direction,
             limit_per_step,
         };
+        let repository_authority = match require_mcp_local_repository_authority(&state) {
+            Ok(binding) => binding,
+            Err(error) => return Ok(Json(kin_mcp::ToolCallResult::error(error.to_string()))),
+        };
         let result = match kin_cli::commands::trace_data_flow::build_trace_data_flow_response(
-            &state.layout,
+            &repository_authority,
             graph.as_ref(),
             &req,
         ) {
@@ -5866,6 +6002,7 @@ async fn mcp_tools_call(
             "coordination enforcement rejected transaction before repository publication: {evidence}"
         ))
     } else {
+        let repository_authority = mcp_repository_authority_binding(&state);
         let handled = if request.name == "find_references" {
             mcp_find_references_with_stable_authority(
                 &state,
@@ -5894,14 +6031,20 @@ async fn mcp_tools_call(
                 transaction_preflight.as_ref(),
             ))
         } else {
-            kin_mcp::handlers::handle_tool_call(
-                &request.name,
-                &request.arguments,
-                graph.as_ref(),
-                &sessions,
-                kin_mcp::SessionAuthorityMode::OfflineFallback,
-            )
-            .await
+            match repository_authority {
+                Ok(repository_authority) => {
+                    kin_mcp::handlers::handle_tool_call(
+                        &request.name,
+                        &request.arguments,
+                        graph.as_ref(),
+                        &sessions,
+                        kin_mcp::SessionAuthorityMode::OfflineFallback,
+                        repository_authority.as_ref(),
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
+            }
         };
         match handled {
             Ok(result) => result,
@@ -6018,7 +6161,7 @@ async fn repository_authority_snapshot(
     repo_id: &str,
 ) -> Result<kin_db::GraphSnapshot, (StatusCode, String)> {
     if repo_id == state.cached_repo_id {
-        let authority = ActiveApiRepositoryAuthority::open(&state.layout)?;
+        let authority = ActiveApiRepositoryAuthority::open(state)?;
         return Ok(authority.manager.read_authority().snapshot().clone());
     }
 
@@ -6208,7 +6351,12 @@ fn repository_transfer_authority(
     let backend: Arc<dyn StorageBackend> = if let Some(backend) = &state.storage_backend {
         Arc::clone(backend)
     } else if repo_id == state.cached_repo_id {
-        Arc::new(LocalFileBackend::new(state.layout.kindb_dir()))
+        state.local_repository_backend().ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "local daemon is missing its startup storage capability".to_string(),
+            )
+        })?
     } else {
         return Err((
             StatusCode::NOT_FOUND,
@@ -6730,7 +6878,7 @@ async fn repo_provenance_verify(
 fn active_workspace_tree(
     state: &DaemonState,
 ) -> Result<(ActiveApiRepositoryAuthority, WorkspaceTreeSnapshot), (StatusCode, String)> {
-    let authority = ActiveApiRepositoryAuthority::open(&state.layout)?;
+    let authority = ActiveApiRepositoryAuthority::open(state)?;
     let snapshot = authority.workspace_tree_snapshot()?;
     Ok((authority, snapshot))
 }
@@ -7967,7 +8115,7 @@ fn load_exact_source_entries(
     tree: kin_model::ResolvedTree,
 ) -> Result<Vec<ExactSourceEntry>, (StatusCode, String)> {
     if repo_id == state.cached_repo_id {
-        let authority = ActiveApiRepositoryAuthority::open(&state.layout)?;
+        let authority = ActiveApiRepositoryAuthority::open(state)?;
         return load_exact_source_entries_with(tree, |path, digest, _remaining_bytes| {
             authority.manager.load_source_blob(digest).map_err(|error| {
                 (
@@ -9412,6 +9560,187 @@ mod tests {
         Arc::new(DaemonState::open(layout).unwrap())
     }
 
+    fn committed_test_state() -> Arc<DaemonState> {
+        let initial = test_state();
+        let layout = initial.layout.clone();
+        install_repository_file(&initial, "README.md", b"branch authority fixture\n");
+        drop(initial);
+        let state = Arc::new(DaemonState::open(layout).unwrap());
+        std::fs::write(
+            state.layout.working_dir().join("README.md"),
+            b"branch authority fixture\n",
+        )
+        .unwrap();
+        state
+    }
+
+    #[cfg(unix)]
+    fn run_test_git<const N: usize>(repository: &FsPath, args: [&str; N]) {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(repository)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?} failed\nstdout: {}\nstderr: {}",
+            args,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    fn universal_branch_test_state(
+        label: &str,
+    ) -> (
+        Arc<DaemonState>,
+        kin_core::KinLayout,
+        PathBuf,
+        SemanticChangeId,
+        SemanticChangeId,
+    ) {
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
+
+        install_test_registry_override();
+        let repository =
+            std::env::temp_dir().join(format!("kin-daemon-{label}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(repository.join("selected")).unwrap();
+        run_test_git(&repository, ["init", "--initial-branch=main"]);
+        run_test_git(&repository, ["config", "user.email", "kin@example.invalid"]);
+        run_test_git(
+            &repository,
+            ["config", "user.name", "Kin Branch Route Test"],
+        );
+        std::fs::write(
+            repository.join("selected/compose.yaml"),
+            b"services:\n  api:\n    image: main\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repository.join("selected/data.bin"),
+            [0_u8, 0xff, 0x10, 0x00],
+        )
+        .unwrap();
+        std::fs::write(repository.join("selected/run-tool"), b"#!/bin/sh\nexit 0\n").unwrap();
+        let mut permissions = std::fs::metadata(repository.join("selected/run-tool"))
+            .unwrap()
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(repository.join("selected/run-tool"), permissions).unwrap();
+        symlink("compose.yaml", repository.join("selected/current-compose")).unwrap();
+        std::fs::write(repository.join("outside.txt"), b"outside main\n").unwrap();
+        run_test_git(&repository, ["add", "--all"]);
+        run_test_git(&repository, ["commit", "-s", "-m", "main universal tree"]);
+
+        run_test_git(&repository, ["switch", "-c", "feature"]);
+        std::fs::write(
+            repository.join("selected/compose.yaml"),
+            b"services:\n  api:\n    image: feature\n",
+        )
+        .unwrap();
+        std::fs::write(repository.join("selected/Dockerfile"), b"FROM scratch\n").unwrap();
+        std::fs::write(
+            repository.join("selected/notes.mystery"),
+            b"unsupported language bytes\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repository.join("selected/data.bin"),
+            [0xff_u8, 0x00, 0x41, 0x10],
+        )
+        .unwrap();
+        run_test_git(&repository, ["add", "--all"]);
+        run_test_git(
+            &repository,
+            ["commit", "-s", "-m", "feature universal tree"],
+        );
+        run_test_git(&repository, ["switch", "main"]);
+
+        let layout = kin_core::init_from_git(&repository).unwrap().layout;
+        let authority = ActiveApiRepositoryAuthority::open_layout_for_test(&layout).unwrap();
+        let lease = authority.manager.read_authority();
+        let resolve = |name: &[u8]| {
+            let name = kin_model::RefName::branch(name).unwrap();
+            let target = lease.resolve_ref_target(&name).unwrap().unwrap();
+            lease.resolve_target_change_id(&target).unwrap()
+        };
+        let main_change = resolve(b"main");
+        let feature_change = resolve(b"feature");
+        drop(lease);
+        drop(authority);
+        let state = Arc::new(DaemonState::open(layout.clone()).unwrap());
+        (state, layout, repository, main_change, feature_change)
+    }
+
+    #[cfg(unix)]
+    fn repository_source_cas_path(
+        layout: &kin_core::KinLayout,
+        repository_id: &str,
+        digest: Hash256,
+    ) -> PathBuf {
+        let digest = digest.to_string();
+        layout
+            .kindb_dir()
+            .join(repository_id)
+            .join("source-blobs")
+            .join("sha256")
+            .join(&digest[..2])
+            .join(digest)
+    }
+
+    #[cfg(unix)]
+    fn copy_test_directory(source: &FsPath, destination: &FsPath) {
+        std::fs::create_dir(destination).unwrap();
+        for entry in std::fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            let source_path = entry.path();
+            let destination_path = destination.join(entry.file_name());
+            let file_type = entry.file_type().unwrap();
+            if file_type.is_dir() {
+                copy_test_directory(&source_path, &destination_path);
+            } else if file_type.is_file() {
+                std::fs::copy(&source_path, &destination_path).unwrap();
+            } else {
+                panic!(
+                    "authority-copy fixture does not support special member {}",
+                    source_path.display()
+                );
+            }
+        }
+        std::fs::set_permissions(
+            destination,
+            std::fs::metadata(source).unwrap().permissions(),
+        )
+        .unwrap();
+    }
+
+    async fn post_branch_request(
+        state: Arc<DaemonState>,
+        request: &kin_cli::commands::branch::BranchRequest,
+        session_id: Option<kin_model::SessionId>,
+    ) -> (StatusCode, Vec<u8>) {
+        let mut request_builder =
+            Request::post("/commands/branch").header("content-type", "application/json");
+        if let Some(session_id) = session_id {
+            request_builder = request_builder.header("X-Kin-Session", session_id.to_string());
+        }
+        let response = router(state)
+            .oneshot(
+                request_builder
+                    .body(Body::from(serde_json::to_vec(request).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        (status, body.to_vec())
+    }
+
     #[cfg(unix)]
     fn test_state_with_verified_gitlink() -> Arc<DaemonState> {
         use std::os::unix::fs::{symlink, PermissionsExt as _};
@@ -9471,7 +9800,7 @@ mod tests {
                 "160000,4444444444444444444444444444444444444444,vendor/subrepo",
             ],
         );
-        git(&dir, ["commit", "-m", "exact session fixture"]);
+        git(&dir, ["commit", "-s", "-m", "exact session fixture"]);
         std::fs::create_dir_all(dir.join("vendor/subrepo")).unwrap();
 
         let layout = kin_core::init_from_git(&dir).unwrap().layout;
@@ -9631,19 +9960,25 @@ mod tests {
             })
             .unwrap();
         let plan = crate::repository_commit::plan_native_commit(
-            &state.layout,
             &state.graph,
             &state.blobs,
+            &crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(state)
+                .unwrap(),
             kin_model::OperationId::new(),
             Timestamp::now(),
             AuthorId::new("api-test"),
             format!("install {rel_path}"),
         )
         .unwrap();
-        crate::repository_commit::commit_native_plan(&state.layout, &state.blobs, plan)
-            .unwrap()
-            .change
-            .id
+        crate::repository_commit::commit_native_plan(
+            &state.blobs,
+            &crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(state)
+                .unwrap(),
+            plan,
+        )
+        .unwrap()
+        .change
+        .id
     }
 
     fn install_repository_entities(
@@ -9661,18 +9996,23 @@ mod tests {
             })
             .unwrap();
         let plan = crate::repository_commit::plan_native_commit(
-            &state.layout,
             &state.graph,
             &state.blobs,
+            &crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(state)
+                .unwrap(),
             kin_model::OperationId::new(),
             Timestamp::now(),
             AuthorId::new("api-test"),
             "install graph-only relation endpoints".to_string(),
         )
         .unwrap();
-        let committed =
-            crate::repository_commit::commit_native_plan(&state.layout, &state.blobs, plan)
-                .unwrap();
+        let committed = crate::repository_commit::commit_native_plan(
+            &state.blobs,
+            &crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(state)
+                .unwrap(),
+            plan,
+        )
+        .unwrap();
         state
             .graph
             .create_changes(vec![committed.change.clone()])
@@ -9681,6 +10021,1576 @@ mod tests {
             .record_repository_authority_commit(committed.receipt.generation)
             .unwrap();
         committed.change.id
+    }
+
+    fn publish_same_tree_semantic_target(
+        layout: &kin_core::KinLayout,
+        parent: SemanticChangeId,
+        entity: Entity,
+    ) -> SemanticChangeId {
+        let authority = ActiveApiRepositoryAuthority::open_layout_for_test(layout).unwrap();
+        let lease = authority.manager.read_authority();
+        let roots = lease.roots().clone();
+        let mut change = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+            origin: kin_model::ChangeOrigin::Native,
+            parents: vec![parent],
+            author: AuthorId::new("checkout-history-test"),
+            message: "same-tree semantic target".to_string(),
+            timestamp: Timestamp::now(),
+            entity_deltas: vec![EntityDelta::Added { new: entity }],
+            relation_deltas: Vec::new(),
+            tree_deltas: Vec::new(),
+            admission_policy_delta: None,
+            projected_files: Vec::new(),
+            spec_link: None,
+            evidence: Vec::new(),
+            risk_summary: None,
+        };
+        change.id = kin_core::compute_semantic_change_id(&change).unwrap();
+        let target_ref = kin_model::RefName::branch(b"semantic-target").unwrap();
+        let transaction = kin_model::RepositoryTransaction {
+            schema_version: kin_model::REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+            operation_id: kin_model::OperationId::new(),
+            repository_id: authority.repository_id,
+            expected_generation: roots.generation,
+            expected_roots: roots,
+            actor: AuthorId::new("checkout-history-test"),
+            reason: "publish same-tree checkout target".to_string(),
+            external_objects: Vec::new(),
+            git_authority_delta: None,
+            changes: vec![change.clone()],
+            aliases: Vec::new(),
+            ref_mutations: vec![kin_model::RefMutation {
+                name: target_ref,
+                expected: kin_model::RefExpectation::MustNotExist,
+                new_target: Some(kin_model::RefTarget::change(change.id)),
+                policy: kin_model::RefUpdatePolicy::FastForwardOnly,
+            }],
+            default_ref_mutation: None,
+            workspace_mutation: None,
+            local_overlay_delta: None,
+        };
+        drop(lease);
+        authority
+            .manager
+            .commit_repository_transaction(transaction)
+            .unwrap();
+        change.id
+    }
+
+    #[tokio::test]
+    async fn command_branch_create_delete_and_exact_replay_advance_authority_once() {
+        let state = committed_test_state();
+        let branch = kin_model::RefName::branch(b"route-lifecycle").unwrap();
+        let graph_root_before = state.graph.compute_root_hash();
+        let generation_before = state
+            .snapshot_generation
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let mut events = state.event_tx.subscribe();
+        let create = kin_cli::commands::branch::BranchRequest::Create {
+            name: branch.clone(),
+            operation_id: kin_model::OperationId::new(),
+            actor: AuthorId::new("branch-route-test"),
+        };
+        let (status, body) = post_branch_request(Arc::clone(&state), &create, None).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let created: kin_cli::commands::branch::BranchResponse =
+            serde_json::from_slice(&body).unwrap();
+        assert!(created.mutated);
+        assert!(!created.idempotent);
+        assert_eq!(created.authority_generation, Some(generation_before + 1));
+        assert!(created.operation_id.is_some());
+        assert_eq!(state.graph.compute_root_hash(), graph_root_before);
+        assert!(matches!(
+            events.recv().await.unwrap(),
+            DaemonEvent::RepositoryAuthorityChanged {
+                previous_generation,
+                new_generation,
+                ..
+            } if previous_generation == generation_before && new_generation == generation_before + 1
+        ));
+
+        let (status, body) = post_branch_request(Arc::clone(&state), &create, None).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let replay: kin_cli::commands::branch::BranchResponse =
+            serde_json::from_slice(&body).unwrap();
+        assert!(!replay.mutated);
+        assert!(replay.idempotent);
+        assert_eq!(replay.authority_generation, Some(generation_before + 1));
+        assert_eq!(state.graph.compute_root_hash(), graph_root_before);
+        assert!(events.try_recv().is_err());
+
+        let delete = kin_cli::commands::branch::BranchRequest::Delete {
+            name: branch.clone(),
+            operation_id: kin_model::OperationId::new(),
+            actor: AuthorId::new("branch-route-test"),
+        };
+        let (status, body) = post_branch_request(Arc::clone(&state), &delete, None).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let deleted: kin_cli::commands::branch::BranchResponse =
+            serde_json::from_slice(&body).unwrap();
+        assert!(deleted.mutated);
+        assert_eq!(deleted.authority_generation, Some(generation_before + 2));
+        assert_eq!(state.graph.compute_root_hash(), graph_root_before);
+        let (status, body) = post_branch_request(Arc::clone(&state), &delete, None).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let replay: kin_cli::commands::branch::BranchResponse =
+            serde_json::from_slice(&body).unwrap();
+        assert!(!replay.mutated);
+        assert!(replay.idempotent);
+        assert_eq!(replay.authority_generation, Some(generation_before + 2));
+        assert_eq!(state.graph.compute_root_hash(), graph_root_before);
+
+        let authority =
+            crate::local_repository_authority::ActiveLocalRepositoryAuthority::open(&state)
+                .unwrap();
+        let lease = authority.manager.read_authority();
+        assert_eq!(lease.roots().generation, generation_before + 2);
+        assert!(lease
+            .metadata()
+            .ref_state
+            .refs
+            .iter()
+            .all(|repository_ref| repository_ref.name != branch));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_branch_switch_replays_same_daemon_and_restart_then_checkout_is_coherent() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (state, layout, repository, main_change, feature_change) =
+            universal_branch_test_state("branch-switch-replay");
+        let request = kin_cli::commands::branch::BranchRequest::Switch {
+            name: kin_model::RefName::branch(b"feature").unwrap(),
+            operation_id: kin_model::OperationId::new(),
+            actor: AuthorId::new("branch-switch-route-test"),
+        };
+        let generation_before = state
+            .snapshot_generation
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let (status, body) = post_branch_request(Arc::clone(&state), &request, None).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let switched: kin_cli::commands::branch::BranchResponse =
+            serde_json::from_slice(&body).unwrap();
+        assert!(switched.mutated);
+        assert_eq!(switched.authority_generation, Some(generation_before + 1));
+        assert_eq!(
+            std::fs::read(repository.join("selected/compose.yaml")).unwrap(),
+            b"services:\n  api:\n    image: feature\n"
+        );
+        assert_eq!(
+            std::fs::read(repository.join("selected/data.bin")).unwrap(),
+            [0xff_u8, 0x00, 0x41, 0x10]
+        );
+        assert_eq!(
+            std::fs::read(repository.join("selected/notes.mystery")).unwrap(),
+            b"unsupported language bytes\n"
+        );
+        assert_ne!(
+            std::fs::metadata(repository.join("selected/run-tool"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o111,
+            0
+        );
+        assert_eq!(
+            std::fs::read_link(repository.join("selected/current-compose")).unwrap(),
+            FsPath::new("compose.yaml")
+        );
+
+        let (status, body) = post_branch_request(Arc::clone(&state), &request, None).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let replay: kin_cli::commands::branch::BranchResponse =
+            serde_json::from_slice(&body).unwrap();
+        assert!(!replay.mutated);
+        assert!(replay.idempotent);
+
+        let live_checkout = kin_cli::commands::checkout::CheckoutRequest {
+            path: Some("selected/compose.yaml".to_string()),
+            path_hex: None,
+            change_id: Some(feature_change.to_string()),
+            operation_id: kin_model::OperationId::new(),
+            actor: AuthorId::new("live-branch-then-checkout-test"),
+        };
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::post("/commands/checkout")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&live_checkout).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let checkout_response: kin_cli::commands::checkout::CheckoutResponse =
+            serde_json::from_slice(&body).unwrap();
+        let checkout_report = checkout_response.report.unwrap();
+        assert!(checkout_report.projection_only);
+        assert_eq!(checkout_report.authority_generation, generation_before + 1);
+
+        let authority = ActiveApiRepositoryAuthority::open_layout_for_test(&layout).unwrap();
+        let lease = authority.manager.read_authority();
+        let roots = lease.roots().clone();
+        let workspace = lease
+            .metadata()
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == authority.workspace_id)
+            .unwrap()
+            .clone();
+        let workspace_graph = lease
+            .workspace_graph_snapshot(&authority.workspace_id)
+            .unwrap()
+            .unwrap();
+        let daemon_graph = state.graph.to_snapshot();
+        assert_eq!(roots.generation, checkout_report.authority_generation);
+        assert_eq!(
+            state
+                .snapshot_generation
+                .load(std::sync::atomic::Ordering::SeqCst),
+            roots.generation
+        );
+        assert_eq!(workspace.generation, checkout_report.workspace_generation);
+        assert_eq!(workspace.tree, daemon_graph.resolved_tree);
+        assert_eq!(workspace_graph.resolved_tree, daemon_graph.resolved_tree);
+        assert_eq!(workspace_graph.entities, daemon_graph.entities);
+        assert_eq!(workspace_graph.relations, daemon_graph.relations);
+        drop(lease);
+        drop(authority);
+        drop(state);
+
+        let reopened = Arc::new(DaemonState::open(layout.clone()).unwrap());
+        let (status, body) = post_branch_request(Arc::clone(&reopened), &request, None).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let restart_replay: kin_cli::commands::branch::BranchResponse =
+            serde_json::from_slice(&body).unwrap();
+        assert!(restart_replay.idempotent);
+        assert_eq!(
+            reopened
+                .snapshot_generation
+                .load(std::sync::atomic::Ordering::SeqCst),
+            generation_before + 1
+        );
+
+        let checkout = kin_cli::commands::checkout::CheckoutRequest {
+            path: Some("selected/compose.yaml".to_string()),
+            path_hex: None,
+            change_id: Some(main_change.to_string()),
+            operation_id: kin_model::OperationId::new(),
+            actor: AuthorId::new("branch-then-checkout-test"),
+        };
+        let response = router(Arc::clone(&reopened))
+            .oneshot(
+                Request::post("/commands/checkout")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&checkout).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(
+            std::fs::read(repository.join("selected/compose.yaml")).unwrap(),
+            b"services:\n  api:\n    image: main\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_branch_exact_retry_heals_post_authority_crash_gap() {
+        let (state, _layout, repository, _main, _feature) =
+            universal_branch_test_state("branch-crash-gap");
+        let request = kin_cli::commands::branch::BranchRequest::Switch {
+            name: kin_model::RefName::branch(b"feature").unwrap(),
+            operation_id: kin_model::OperationId::new(),
+            actor: AuthorId::new("branch-crash-gap-test"),
+        };
+        let generation_before = state
+            .snapshot_generation
+            .load(std::sync::atomic::Ordering::SeqCst);
+        state
+            .repository_command_fail_after_authority_once
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let (status, body) = post_branch_request(Arc::clone(&state), &request, None).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(String::from_utf8_lossy(&body)
+            .contains("injected failure after branch authority commit"));
+        assert_eq!(
+            state
+                .snapshot_generation
+                .load(std::sync::atomic::Ordering::SeqCst),
+            generation_before
+        );
+        let authority =
+            crate::local_repository_authority::ActiveLocalRepositoryAuthority::open(&state)
+                .unwrap();
+        assert_eq!(
+            authority.manager.read_authority().roots().generation,
+            generation_before + 1
+        );
+        drop(authority);
+
+        let (status, body) = post_branch_request(Arc::clone(&state), &request, None).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let replay: kin_cli::commands::branch::BranchResponse =
+            serde_json::from_slice(&body).unwrap();
+        assert!(replay.idempotent);
+        assert_eq!(replay.authority_generation, Some(generation_before + 1));
+        assert_eq!(
+            state
+                .snapshot_generation
+                .load(std::sync::atomic::Ordering::SeqCst),
+            generation_before + 1
+        );
+        assert_eq!(
+            std::fs::read(repository.join("selected/compose.yaml")).unwrap(),
+            b"services:\n  api:\n    image: feature\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_branch_source_cas_integrity_failures_are_internal_without_mutation() {
+        let target_body = b"services:\n  api:\n    image: feature\n";
+        let target_digest = Hash256::from_bytes(kin_blobs::digest_bytes(target_body));
+        for (mode, corrupt) in [("missing", false), ("corrupt", true)] {
+            let label = format!("branch-source-cas-{mode}");
+            let (state, layout, repository, _main, _feature) = universal_branch_test_state(&label);
+            let authority = ActiveApiRepositoryAuthority::open(&state).unwrap();
+            let lease = authority.manager.read_authority();
+            let roots_before = lease.roots().clone();
+            let workspace_before = lease
+                .metadata()
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.workspace_id == authority.workspace_id)
+                .unwrap()
+                .clone();
+            let source_cas_path = repository_source_cas_path(
+                &layout,
+                authority.repository_id.as_str(),
+                target_digest,
+            );
+            assert_eq!(
+                authority.manager.load_source_blob(target_digest).unwrap(),
+                Some(target_body.to_vec())
+            );
+            drop(lease);
+            if corrupt {
+                std::fs::write(&source_cas_path, b"corrupt source bytes").unwrap();
+            } else {
+                std::fs::remove_file(&source_cas_path).unwrap();
+            }
+            let graph_root_before = state.graph.compute_root_hash();
+            let request = kin_cli::commands::branch::BranchRequest::Switch {
+                name: kin_model::RefName::branch(b"feature").unwrap(),
+                operation_id: kin_model::OperationId::new(),
+                actor: AuthorId::new("branch-source-cas-integrity-test"),
+            };
+            let (status, _) = post_branch_request(Arc::clone(&state), &request, None).await;
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{mode}");
+
+            let lease = authority.manager.read_authority();
+            let workspace_after = lease
+                .metadata()
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.workspace_id == authority.workspace_id)
+                .unwrap();
+            assert_eq!(lease.roots(), &roots_before, "{mode}");
+            assert_eq!(workspace_after, &workspace_before, "{mode}");
+            assert_eq!(state.graph.compute_root_hash(), graph_root_before, "{mode}");
+            assert_eq!(
+                state
+                    .snapshot_generation
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                roots_before.generation,
+                "{mode}"
+            );
+            assert_eq!(
+                std::fs::read(repository.join("selected/compose.yaml")).unwrap(),
+                b"services:\n  api:\n    image: main\n",
+                "{mode}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn command_branch_rejects_sessions_hosted_authority_and_stale_daemon_pre_cas() {
+        let state = committed_test_state();
+        let branch = kin_model::RefName::branch(b"must-not-land").unwrap();
+        let request = kin_cli::commands::branch::BranchRequest::Create {
+            name: branch.clone(),
+            operation_id: kin_model::OperationId::new(),
+            actor: AuthorId::new("branch-isolation-test"),
+        };
+        let generation_before = state
+            .snapshot_generation
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let unknown = kin_model::SessionId::new();
+        let expired = kin_model::SessionId::new();
+        state.session_scopes.write().await.insert(
+            expired,
+            crate::state::TemporalScope {
+                ref_string: "expired-branch".to_string(),
+                head: SemanticChangeId::from_hash(Hash256::from_bytes([0x92; 32])),
+                cached_graph: Arc::new(kin_db::InMemoryGraph::new()),
+                created_at: std::time::Instant::now() - Duration::from_secs(60),
+                ttl: Duration::from_secs(0),
+            },
+        );
+        for session_id in [unknown, expired] {
+            let (status, _) =
+                post_branch_request(Arc::clone(&state), &request, Some(session_id)).await;
+            assert_eq!(status, StatusCode::CONFLICT);
+        }
+        assert_eq!(
+            state
+                .snapshot_generation
+                .load(std::sync::atomic::Ordering::SeqCst),
+            generation_before
+        );
+
+        let external =
+            crate::local_repository_authority::ActiveLocalRepositoryAuthority::open(&state)
+                .unwrap();
+        let lease = external.manager.read_authority();
+        let roots = lease.roots().clone();
+        let workspace = lease
+            .metadata()
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == external.workspace_id)
+            .unwrap();
+        let external_ref = kin_model::RefName::branch(b"external-advance").unwrap();
+        let transaction = kin_model::RepositoryTransaction {
+            schema_version: kin_model::REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+            operation_id: kin_model::OperationId::new(),
+            repository_id: external.repository_id.clone(),
+            expected_generation: roots.generation,
+            expected_roots: roots,
+            actor: AuthorId::new("external-authority-test"),
+            reason: "advance outside daemon".to_string(),
+            external_objects: Vec::new(),
+            git_authority_delta: None,
+            changes: Vec::new(),
+            aliases: Vec::new(),
+            ref_mutations: vec![kin_model::RefMutation {
+                name: external_ref,
+                expected: kin_model::RefExpectation::MustNotExist,
+                new_target: Some(workspace.base_target.clone().unwrap()),
+                policy: kin_model::RefUpdatePolicy::FastForwardOnly,
+            }],
+            default_ref_mutation: None,
+            workspace_mutation: None,
+            local_overlay_delta: None,
+        };
+        drop(lease);
+        external
+            .manager
+            .commit_repository_transaction(transaction)
+            .unwrap();
+        let external_generation = external.manager.read_authority().roots().generation;
+        let (status, body) = post_branch_request(Arc::clone(&state), &request, None).await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        let lease = external.manager.read_authority();
+        assert_eq!(lease.roots().generation, external_generation);
+        assert!(lease
+            .metadata()
+            .ref_state
+            .refs
+            .iter()
+            .all(|repository_ref| repository_ref.name != branch));
+        drop(lease);
+        drop(external);
+
+        let hosted_dir =
+            std::env::temp_dir().join(format!("kin-daemon-hosted-branch-{}", uuid::Uuid::new_v4()));
+        let kin_dir = hosted_dir.join(".kin");
+        std::fs::create_dir_all(kin_dir.join("objects")).unwrap();
+        std::fs::create_dir_all(kin_dir.join("working")).unwrap();
+        let hosted_layout = kin_core::KinLayout::new(kin_dir);
+        kin_core::manifest::KinManifest::new()
+            .save(&hosted_layout.manifest_path())
+            .unwrap();
+        let backend_dir = hosted_dir.join("backend");
+        std::fs::create_dir_all(&backend_dir).unwrap();
+        let hosted = Arc::new(
+            DaemonState::open_with_backend(
+                hosted_layout,
+                Box::new(kin_db::LocalFileBackend::new(&backend_dir)),
+                "hosted-branch-test",
+                None,
+            )
+            .unwrap(),
+        );
+        let (status, _) = post_branch_request(hosted, &request, None).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn command_branch_uses_startup_pinned_identity_after_manifest_drift() {
+        let state = committed_test_state();
+        let original_repository_id = state.cached_repo_id.clone();
+        let branch = kin_model::RefName::branch(b"pinned-identity").unwrap();
+        let mut manifest =
+            kin_core::manifest::KinManifest::load(&state.layout.manifest_path()).unwrap();
+        manifest.repo_id = uuid::Uuid::new_v4().to_string();
+        manifest.workspace_id = uuid::Uuid::new_v4().to_string();
+        manifest.save(&state.layout.manifest_path()).unwrap();
+        let request = kin_cli::commands::branch::BranchRequest::Create {
+            name: branch.clone(),
+            operation_id: kin_model::OperationId::new(),
+            actor: AuthorId::new("branch-pinned-identity-test"),
+        };
+        let (status, body) = post_branch_request(Arc::clone(&state), &request, None).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let authority =
+            crate::local_repository_authority::ActiveLocalRepositoryAuthority::open(&state)
+                .unwrap();
+        assert_eq!(authority.repository_id.as_str(), original_repository_id);
+        assert!(authority
+            .manager
+            .read_authority()
+            .metadata()
+            .ref_state
+            .refs
+            .iter()
+            .any(|repository_ref| repository_ref.name == branch));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_branch_and_workspace_publication_reject_replaced_kindb_root() {
+        struct KindbSwapGuard {
+            canonical: PathBuf,
+            original: PathBuf,
+            replacement: PathBuf,
+        }
+
+        impl Drop for KindbSwapGuard {
+            fn drop(&mut self) {
+                if !self.original.exists() {
+                    return;
+                }
+                if self.canonical.exists() && !self.replacement.exists() {
+                    let _ = std::fs::rename(&self.canonical, &self.replacement);
+                }
+                if !self.canonical.exists() {
+                    let _ = std::fs::rename(&self.original, &self.canonical);
+                }
+            }
+        }
+
+        let state = committed_test_state();
+        let authority = ActiveApiRepositoryAuthority::open(&state).unwrap();
+        let repository_id = authority.repository_id.clone();
+        let roots_before = authority.manager.read_authority().roots().clone();
+        let graph_root_before = state.graph.compute_root_hash();
+        let generation_before = state
+            .snapshot_generation
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let branch = kin_model::RefName::branch(b"must-not-land-after-root-swap").unwrap();
+        let canonical = state.layout.kindb_dir();
+        let original = canonical.with_file_name(format!("kindb-original-{}", uuid::Uuid::new_v4()));
+        let replacement =
+            canonical.with_file_name(format!("kindb-replacement-{}", uuid::Uuid::new_v4()));
+        copy_test_directory(&canonical, &replacement);
+        std::fs::rename(&canonical, &original).unwrap();
+        std::fs::rename(&replacement, &canonical).unwrap();
+        let swap = KindbSwapGuard {
+            canonical: canonical.clone(),
+            original: original.clone(),
+            replacement: replacement.clone(),
+        };
+
+        let request = kin_cli::commands::branch::BranchRequest::Create {
+            name: branch.clone(),
+            operation_id: kin_model::OperationId::new(),
+            actor: AuthorId::new("kindb-root-swap-test"),
+        };
+        let (branch_status, branch_body) =
+            post_branch_request(Arc::clone(&state), &request, None).await;
+
+        let new_body = b"replacement root must not receive this body\n";
+        let new_hash = Hash256::from_bytes(state.blobs.write(new_body).unwrap().0);
+        let mut desired_artifacts = state
+            .graph
+            .resolved_tree()
+            .artifacts_by_path()
+            .cloned()
+            .collect::<Vec<_>>();
+        desired_artifacts.push(kin_model::ResolvedArtifact::new(
+            kin_model::ArtifactId::new(),
+            RepoPath::from_utf8("root-swap-background.txt").unwrap(),
+            TreeEntry::blob(new_hash, false),
+        ));
+        let desired = kin_model::ResolvedTree::from_artifacts(desired_artifacts).unwrap();
+        let authority_context =
+            crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(&state)
+                .unwrap();
+        let publication_error = crate::repository_commit::publish_workspace_tree(
+            state.blobs.as_ref(),
+            &authority_context,
+            &desired,
+            kin_model::OperationId::new(),
+            AuthorId::new("kindb-root-swap-background-test"),
+        )
+        .unwrap_err();
+
+        let original_authority = RepositoryAuthorityManager::open(
+            repository_id.clone(),
+            Arc::new(LocalFileBackend::new(&original)),
+        )
+        .unwrap();
+        let replacement_authority = RepositoryAuthorityManager::open(
+            repository_id,
+            Arc::new(LocalFileBackend::new(&canonical)),
+        )
+        .unwrap();
+        let original_lease = original_authority.read_authority();
+        let replacement_lease = replacement_authority.read_authority();
+        let original_ref_absent = original_lease
+            .metadata()
+            .ref_state
+            .refs
+            .iter()
+            .all(|repository_ref| repository_ref.name != branch);
+        let replacement_ref_absent = replacement_lease
+            .metadata()
+            .ref_state
+            .refs
+            .iter()
+            .all(|repository_ref| repository_ref.name != branch);
+
+        assert_eq!(
+            branch_status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "{}",
+            String::from_utf8_lossy(&branch_body)
+        );
+        assert!(
+            String::from_utf8_lossy(&branch_body).contains("changed since this backend opened"),
+            "{}",
+            String::from_utf8_lossy(&branch_body)
+        );
+        assert!(
+            publication_error
+                .to_string()
+                .contains("changed since this backend opened"),
+            "{publication_error}"
+        );
+        assert_eq!(original_lease.roots(), &roots_before);
+        assert_eq!(replacement_lease.roots(), &roots_before);
+        assert!(original_ref_absent);
+        assert!(replacement_ref_absent);
+        assert_eq!(state.graph.compute_root_hash(), graph_root_before);
+        assert_eq!(
+            state
+                .snapshot_generation
+                .load(std::sync::atomic::Ordering::SeqCst),
+            generation_before
+        );
+        drop(replacement_lease);
+        drop(original_lease);
+        drop(replacement_authority);
+        drop(original_authority);
+        drop(swap);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_branch_same_target_verifies_projection_without_generation_change() {
+        let (state, _layout, _repository, _main, _feature) =
+            universal_branch_test_state("branch-same-target-clean");
+        let authority = ActiveApiRepositoryAuthority::open(&state).unwrap();
+        let roots_before = authority.manager.read_authority().roots().clone();
+        let graph_root_before = state.graph.compute_root_hash();
+        let request = kin_cli::commands::branch::BranchRequest::Switch {
+            name: kin_model::RefName::branch(b"main").unwrap(),
+            operation_id: kin_model::OperationId::new(),
+            actor: AuthorId::new("branch-same-target-clean-test"),
+        };
+
+        let (status, body) = post_branch_request(Arc::clone(&state), &request, None).await;
+
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let response: kin_cli::commands::branch::BranchResponse =
+            serde_json::from_slice(&body).unwrap();
+        assert!(!response.mutated);
+        assert!(response.idempotent);
+        assert_eq!(response.authority_generation, Some(roots_before.generation));
+        assert_eq!(authority.manager.read_authority().roots(), &roots_before);
+        assert_eq!(state.graph.compute_root_hash(), graph_root_before);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_branch_same_target_validates_dirty_projection_before_generation_change() {
+        let (state, _layout, repository, _main, _feature) =
+            universal_branch_test_state("branch-same-target-drift");
+        let generation_before = state
+            .snapshot_generation
+            .load(std::sync::atomic::Ordering::SeqCst);
+        std::fs::write(
+            repository.join("selected/compose.yaml"),
+            b"uncommitted projection drift\n",
+        )
+        .unwrap();
+        let request = kin_cli::commands::branch::BranchRequest::Switch {
+            name: kin_model::RefName::branch(b"main").unwrap(),
+            operation_id: kin_model::OperationId::new(),
+            actor: AuthorId::new("branch-same-target-test"),
+        };
+        let (status, body) = post_branch_request(Arc::clone(&state), &request, None).await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        let authority =
+            crate::local_repository_authority::ActiveLocalRepositoryAuthority::open(&state)
+                .unwrap();
+        assert_eq!(
+            authority.manager.read_authority().roots().generation,
+            generation_before
+        );
+        assert_eq!(
+            std::fs::read(repository.join("selected/compose.yaml")).unwrap(),
+            b"uncommitted projection drift\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_branch_returns_conflict_for_untracked_target_path_without_mutation() {
+        let (state, _layout, repository, _main, _feature) =
+            universal_branch_test_state("branch-untracked-target");
+        let authority = ActiveApiRepositoryAuthority::open(&state).unwrap();
+        let roots_before = authority.manager.read_authority().roots().clone();
+        let graph_root_before = state.graph.compute_root_hash();
+        std::fs::write(
+            repository.join("selected/Dockerfile"),
+            b"untracked local Dockerfile\n",
+        )
+        .unwrap();
+        let request = kin_cli::commands::branch::BranchRequest::Switch {
+            name: kin_model::RefName::branch(b"feature").unwrap(),
+            operation_id: kin_model::OperationId::new(),
+            actor: AuthorId::new("branch-untracked-target-test"),
+        };
+
+        let (status, body) = post_branch_request(Arc::clone(&state), &request, None).await;
+
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(
+            String::from_utf8_lossy(&body).contains("untracked working-copy path"),
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(authority.manager.read_authority().roots(), &roots_before);
+        assert_eq!(state.graph.compute_root_hash(), graph_root_before);
+        assert_eq!(
+            std::fs::read(repository.join("selected/Dockerfile")).unwrap(),
+            b"untracked local Dockerfile\n"
+        );
+        assert_eq!(
+            std::fs::read(repository.join("selected/compose.yaml")).unwrap(),
+            b"services:\n  api:\n    image: main\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_checkout_returns_conflict_for_selected_directory_blocker_without_mutation() {
+        let (state, _layout, repository, _main, feature_change) =
+            universal_branch_test_state("checkout-directory-blocker");
+        let authority = ActiveApiRepositoryAuthority::open(&state).unwrap();
+        let roots_before = authority.manager.read_authority().roots().clone();
+        let graph_root_before = state.graph.compute_root_hash();
+        std::fs::remove_file(repository.join("selected/compose.yaml")).unwrap();
+        std::fs::create_dir(repository.join("selected/compose.yaml")).unwrap();
+        std::fs::write(
+            repository.join("selected/compose.yaml/local-only.txt"),
+            b"preserve me\n",
+        )
+        .unwrap();
+        let request = kin_cli::commands::checkout::CheckoutRequest {
+            path: Some("selected/compose.yaml".to_string()),
+            path_hex: None,
+            change_id: Some(feature_change.to_string()),
+            operation_id: kin_model::OperationId::new(),
+            actor: AuthorId::new("checkout-directory-blocker-test"),
+        };
+
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::post("/commands/checkout")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(
+            String::from_utf8_lossy(&body).contains("became a real directory"),
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(authority.manager.read_authority().roots(), &roots_before);
+        assert_eq!(state.graph.compute_root_hash(), graph_root_before);
+        assert_eq!(
+            std::fs::read(repository.join("selected/compose.yaml/local-only.txt")).unwrap(),
+            b"preserve me\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_checkout_projects_universal_selected_tree_and_replays_exactly() {
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
+        use std::process::Command;
+
+        fn git<const N: usize>(repository: &FsPath, args: [&str; N]) {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(repository)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {:?} failed\nstdout: {}\nstderr: {}",
+                args,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        install_test_registry_override();
+        let root = tempfile::tempdir().unwrap();
+        let repository = root.path().join("repository");
+        std::fs::create_dir_all(repository.join("selected/swap-dir")).unwrap();
+        git(&repository, ["init", "--initial-branch=main"]);
+        git(&repository, ["config", "user.email", "kin@example.invalid"]);
+        git(&repository, ["config", "user.name", "Kin Checkout Test"]);
+        std::fs::write(repository.join("selected/config.yaml"), b"main: true\n").unwrap();
+        std::fs::write(repository.join("selected/remove.txt"), b"main only\n").unwrap();
+        std::fs::write(repository.join("selected/swap-file"), b"main file\n").unwrap();
+        std::fs::write(
+            repository.join("selected/swap-dir/item.txt"),
+            b"main child\n",
+        )
+        .unwrap();
+        std::fs::write(repository.join("outside.txt"), b"outside base\n").unwrap();
+        git(&repository, ["add", "--all"]);
+        git(&repository, ["commit", "-s", "-m", "main tree"]);
+
+        git(&repository, ["switch", "-c", "feature"]);
+        std::fs::write(
+            repository.join("selected/config.yaml"),
+            b"services:\n  api:\n    build: .\n",
+        )
+        .unwrap();
+        std::fs::remove_file(repository.join("selected/remove.txt")).unwrap();
+        std::fs::remove_file(repository.join("selected/swap-file")).unwrap();
+        std::fs::create_dir(repository.join("selected/swap-file")).unwrap();
+        std::fs::write(
+            repository.join("selected/swap-file/nested.txt"),
+            b"feature child\n",
+        )
+        .unwrap();
+        std::fs::remove_file(repository.join("selected/swap-dir/item.txt")).unwrap();
+        std::fs::remove_dir(repository.join("selected/swap-dir")).unwrap();
+        std::fs::write(repository.join("selected/swap-dir"), b"feature file\n").unwrap();
+        std::fs::write(
+            repository.join("selected/compose.yaml"),
+            b"services:\n  worker:\n    image: scratch\n",
+        )
+        .unwrap();
+        std::fs::write(repository.join("selected/Dockerfile"), b"FROM scratch\n").unwrap();
+        std::fs::write(
+            repository.join("selected/data.bin"),
+            [0_u8, 0xff, 0x10, 0x00],
+        )
+        .unwrap();
+        std::fs::write(repository.join("selected/run-tool"), b"#!/bin/sh\nexit 0\n").unwrap();
+        let mut executable_permissions = std::fs::metadata(repository.join("selected/run-tool"))
+            .unwrap()
+            .permissions();
+        executable_permissions.set_mode(0o755);
+        std::fs::set_permissions(repository.join("selected/run-tool"), executable_permissions)
+            .unwrap();
+        std::fs::write(
+            repository.join("selected/notes.mystery"),
+            b"opaque unsupported-extension bytes\n",
+        )
+        .unwrap();
+        symlink("config.yaml", repository.join("selected/config-link")).unwrap();
+        git(&repository, ["add", "--all"]);
+        git(
+            &repository,
+            ["commit", "-s", "-m", "feature universal tree"],
+        );
+        git(&repository, ["switch", "main"]);
+
+        let layout = kin_core::init_from_git(&repository).unwrap().layout;
+        let authority = ActiveApiRepositoryAuthority::open_layout_for_test(&layout).unwrap();
+        let lease = authority.manager.read_authority();
+        let feature_ref = kin_model::RefName::branch(b"feature").unwrap();
+        let feature_target = lease
+            .resolve_ref_target(&feature_ref)
+            .unwrap()
+            .expect("feature ref exists");
+        let feature_change = lease
+            .resolve_target_change_id(&feature_target)
+            .expect("feature target resolves to semantic change");
+        drop(lease);
+        drop(authority);
+
+        let state = Arc::new(DaemonState::open(layout).unwrap());
+        std::fs::write(
+            repository.join("selected/config.yaml"),
+            b"selected dirty bytes\n",
+        )
+        .unwrap();
+        std::fs::write(repository.join("outside.txt"), b"outside dirty preserved\n").unwrap();
+        let operation_id = kin_model::OperationId::new();
+        let request = kin_cli::commands::checkout::CheckoutRequest {
+            path: Some("selected".to_string()),
+            path_hex: None,
+            change_id: Some(feature_change.to_string()),
+            operation_id,
+            actor: AuthorId::new("checkout-universal-route-test"),
+        };
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::post("/commands/checkout")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let first: kin_cli::commands::checkout::CheckoutResponse =
+            serde_json::from_slice(&body).unwrap();
+        let first_report = first.report.unwrap();
+        assert!(first.mutated);
+        assert!(!first_report.projection_only);
+        assert!(!first_report.idempotent);
+        assert_eq!(
+            std::fs::read(repository.join("selected/config.yaml")).unwrap(),
+            b"services:\n  api:\n    build: .\n"
+        );
+        assert_eq!(
+            std::fs::read(repository.join("selected/compose.yaml")).unwrap(),
+            b"services:\n  worker:\n    image: scratch\n"
+        );
+        assert_eq!(
+            std::fs::read(repository.join("selected/Dockerfile")).unwrap(),
+            b"FROM scratch\n"
+        );
+        assert_eq!(
+            std::fs::read(repository.join("selected/data.bin")).unwrap(),
+            [0_u8, 0xff, 0x10, 0x00]
+        );
+        assert_eq!(
+            std::fs::read(repository.join("selected/notes.mystery")).unwrap(),
+            b"opaque unsupported-extension bytes\n"
+        );
+        assert_ne!(
+            std::fs::metadata(repository.join("selected/run-tool"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o111,
+            0
+        );
+        assert_eq!(
+            std::fs::read_link(repository.join("selected/config-link")).unwrap(),
+            FsPath::new("config.yaml")
+        );
+        assert!(!repository.join("selected/remove.txt").exists());
+        assert_eq!(
+            std::fs::read(repository.join("selected/swap-file/nested.txt")).unwrap(),
+            b"feature child\n"
+        );
+        assert_eq!(
+            std::fs::read(repository.join("selected/swap-dir")).unwrap(),
+            b"feature file\n"
+        );
+        assert_eq!(
+            std::fs::read(repository.join("outside.txt")).unwrap(),
+            b"outside dirty preserved\n"
+        );
+
+        let replay = router(Arc::clone(&state))
+            .oneshot(
+                Request::post("/commands/checkout")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = replay.status();
+        let body = axum::body::to_bytes(replay.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let replay: kin_cli::commands::checkout::CheckoutResponse =
+            serde_json::from_slice(&body).unwrap();
+        assert!(!replay.mutated);
+        assert!(replay.report.unwrap().idempotent);
+        assert!(!repository.join("selected/remove.txt").exists());
+        assert_eq!(
+            std::fs::read(repository.join("outside.txt")).unwrap(),
+            b"outside dirty preserved\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn command_checkout_persists_same_tree_semantics_and_replays_after_restart() {
+        let initial = test_state();
+        let layout = initial.layout.clone();
+        let parent = install_repository_file(&initial, "src/lib.rs", b"pub fn stable() {}\n");
+        let entity = test_entity("semantic_only", "src/lib.rs");
+        let entity_id = entity.id;
+        let target = publish_same_tree_semantic_target(&layout, parent, entity.clone());
+        drop(initial);
+
+        let state = Arc::new(DaemonState::open(layout.clone()).unwrap());
+        let tree_before = state.graph.resolved_tree();
+        assert!(state.graph.get_entity(&entity_id).unwrap().is_none());
+        let operation_id = kin_model::OperationId::new();
+        let request = kin_cli::commands::checkout::CheckoutRequest {
+            path: Some("src/lib.rs".to_string()),
+            path_hex: None,
+            change_id: Some(target.to_string()),
+            operation_id,
+            actor: AuthorId::new("checkout-api-test"),
+        };
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::post("/commands/checkout")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let first: kin_cli::commands::checkout::CheckoutResponse =
+            serde_json::from_slice(&body).unwrap();
+        let first_report = first.report.unwrap();
+        assert!(!first_report.projection_only);
+        assert!(!first_report.idempotent);
+        assert_eq!(state.graph.resolved_tree(), tree_before);
+        assert_eq!(
+            state.graph.get_entity(&entity_id).unwrap(),
+            Some(entity.clone())
+        );
+
+        let authority = ActiveApiRepositoryAuthority::open(&state).unwrap();
+        let lease = authority.manager.read_authority();
+        let workspace = lease
+            .metadata()
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == authority.workspace_id)
+            .unwrap();
+        assert_eq!(workspace.tree, tree_before);
+        assert!(!workspace.semantic_overlay.is_empty());
+        let persisted_generation = lease.roots().generation;
+        let persisted_workspace_generation = workspace.generation;
+        drop(lease);
+        drop(authority);
+        drop(state);
+
+        let reopened = Arc::new(DaemonState::open(layout.clone()).unwrap());
+        assert_eq!(reopened.graph.resolved_tree(), tree_before);
+        assert_eq!(
+            reopened.graph.get_entity(&entity_id).unwrap(),
+            Some(entity.clone())
+        );
+        assert_eq!(
+            reopened
+                .snapshot_generation
+                .load(std::sync::atomic::Ordering::SeqCst),
+            persisted_generation
+        );
+        let replay = router(Arc::clone(&reopened))
+            .oneshot(
+                Request::post("/commands/checkout")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = replay.status();
+        let body = axum::body::to_bytes(replay.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let replay: kin_cli::commands::checkout::CheckoutResponse =
+            serde_json::from_slice(&body).unwrap();
+        let replay_report = replay.report.unwrap();
+        assert!(replay_report.idempotent);
+        assert_eq!(
+            replay_report.workspace_generation,
+            persisted_workspace_generation
+        );
+        assert_eq!(reopened.graph.get_entity(&entity_id).unwrap(), Some(entity));
+    }
+
+    #[tokio::test]
+    async fn command_checkout_rejects_session_scoped_authority_before_mutation() {
+        let state = test_state();
+        let roots_before = state.graph.compute_root_hash();
+        let generation_before = state
+            .snapshot_generation
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let session_id = kin_model::SessionId::new();
+        state
+            .set_session_scope(
+                &session_id,
+                "kin:session-checkout".to_string(),
+                SemanticChangeId::from_hash(Hash256::from_bytes([0x77; 32])),
+                Arc::new(kin_db::InMemoryGraph::new()),
+            )
+            .await;
+        let request = kin_cli::commands::checkout::CheckoutRequest {
+            path: Some("src/lib.rs".to_string()),
+            path_hex: None,
+            change_id: None,
+            operation_id: kin_model::OperationId::new(),
+            actor: AuthorId::new("checkout-session-test"),
+        };
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::post("/commands/checkout")
+                    .header("content-type", "application/json")
+                    .header("X-Kin-Session", session_id.to_string())
+                    .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(state.graph.compute_root_hash(), roots_before);
+        assert_eq!(
+            state
+                .snapshot_generation
+                .load(std::sync::atomic::Ordering::SeqCst),
+            generation_before
+        );
+    }
+
+    #[tokio::test]
+    async fn command_checkout_rejects_unknown_unscoped_and_expired_sessions_without_mutation() {
+        let state = committed_test_state();
+        let authority = ActiveApiRepositoryAuthority::open(&state).unwrap();
+        let lease = authority.manager.read_authority();
+        let roots_before = lease.roots().clone();
+        let workspace_before = lease
+            .metadata()
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == authority.workspace_id)
+            .unwrap()
+            .clone();
+        drop(lease);
+        drop(authority);
+        let graph_before = state.graph.to_snapshot();
+        let bytes_before = std::fs::read(state.layout.working_dir().join("README.md")).unwrap();
+        let unknown = kin_model::SessionId::new();
+        let unscoped = state
+            .coordinator
+            .register_session(
+                "codex",
+                "checkout-unscoped-test",
+                kin_model::SessionTransport::Cli,
+                None,
+                state.layout.working_dir().to_path_buf(),
+                kin_model::SessionCapabilities::default(),
+            )
+            .unwrap();
+        let expired = kin_model::SessionId::new();
+        state.session_scopes.write().await.insert(
+            expired,
+            crate::state::TemporalScope {
+                ref_string: "expired-checkout".to_string(),
+                head: SemanticChangeId::from_hash(Hash256::from_bytes([0x91; 32])),
+                cached_graph: Arc::new(kin_db::InMemoryGraph::new()),
+                created_at: std::time::Instant::now() - Duration::from_secs(60),
+                ttl: Duration::from_secs(0),
+            },
+        );
+
+        for session_id in [unknown, unscoped, expired] {
+            let request = kin_cli::commands::checkout::CheckoutRequest {
+                path: Some("README.md".to_string()),
+                path_hex: None,
+                change_id: None,
+                operation_id: kin_model::OperationId::new(),
+                actor: AuthorId::new("checkout-session-isolation-test"),
+            };
+            let response = router(Arc::clone(&state))
+                .oneshot(
+                    Request::post("/commands/checkout")
+                        .header("content-type", "application/json")
+                        .header("X-Kin-Session", session_id.to_string())
+                        .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+        }
+
+        let authority = ActiveApiRepositoryAuthority::open(&state).unwrap();
+        let lease = authority.manager.read_authority();
+        let workspace_after = lease
+            .metadata()
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == authority.workspace_id)
+            .unwrap();
+        assert_eq!(lease.roots(), &roots_before);
+        assert_eq!(workspace_after, &workspace_before);
+        assert_eq!(
+            state.graph.to_snapshot().resolved_tree,
+            graph_before.resolved_tree
+        );
+        assert_eq!(state.graph.to_snapshot().entities, graph_before.entities);
+        assert_eq!(state.graph.to_snapshot().relations, graph_before.relations);
+        assert_eq!(
+            std::fs::read(state.layout.working_dir().join("README.md")).unwrap(),
+            bytes_before
+        );
+    }
+
+    #[tokio::test]
+    async fn command_checkout_returns_typed_bad_request_and_conflict_statuses() {
+        let state = committed_test_state();
+        let request = |path: &str, change_id: Option<String>, operation_id| {
+            kin_cli::commands::checkout::CheckoutRequest {
+                path: Some(path.to_string()),
+                path_hex: None,
+                change_id,
+                operation_id,
+                actor: AuthorId::new("checkout-typed-errors-test"),
+            }
+        };
+        let unborn = test_state();
+        let unborn_request = request("README.md", None, kin_model::OperationId::new());
+        let response = router(unborn)
+            .oneshot(
+                Request::post("/commands/checkout")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&unborn_request).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+
+        for invalid in [
+            request("../outside", None, kin_model::OperationId::new()),
+            request(
+                "README.md",
+                Some("not-a-change".to_string()),
+                kin_model::OperationId::new(),
+            ),
+            request(
+                "README.md",
+                Some(Hash256::from_bytes([0x99; 32]).to_string()),
+                kin_model::OperationId::new(),
+            ),
+        ] {
+            let response = router(Arc::clone(&state))
+                .oneshot(
+                    Request::post("/commands/checkout")
+                        .header("content-type", "application/json")
+                        .body(Body::from(serde_json::to_vec(&invalid).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+
+        let missing = request("does/not/exist", None, kin_model::OperationId::new());
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::post("/commands/checkout")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&missing).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+
+        let operation_id = kin_model::OperationId::new();
+        let first = request("README.md", None, operation_id);
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::post("/commands/checkout")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&first).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let conflicting = request("does/not/exist", None, operation_id);
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::post("/commands/checkout")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&conflicting).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_checkout_source_cas_integrity_failures_are_internal_without_mutation() {
+        let target_body = b"services:\n  api:\n    image: feature\n";
+        let target_digest = Hash256::from_bytes(kin_blobs::digest_bytes(target_body));
+        for (mode, corrupt) in [("missing", false), ("corrupt", true)] {
+            let label = format!("checkout-source-cas-{mode}");
+            let (state, layout, repository, _main, feature_change) =
+                universal_branch_test_state(&label);
+            let authority = ActiveApiRepositoryAuthority::open(&state).unwrap();
+            let lease = authority.manager.read_authority();
+            let roots_before = lease.roots().clone();
+            let workspace_before = lease
+                .metadata()
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.workspace_id == authority.workspace_id)
+                .unwrap()
+                .clone();
+            let source_cas_path = repository_source_cas_path(
+                &layout,
+                authority.repository_id.as_str(),
+                target_digest,
+            );
+            assert_eq!(
+                authority.manager.load_source_blob(target_digest).unwrap(),
+                Some(target_body.to_vec())
+            );
+            drop(lease);
+            if corrupt {
+                std::fs::write(&source_cas_path, b"corrupt source bytes").unwrap();
+            } else {
+                std::fs::remove_file(&source_cas_path).unwrap();
+            }
+            let graph_root_before = state.graph.compute_root_hash();
+            let request = kin_cli::commands::checkout::CheckoutRequest {
+                path: Some("selected/compose.yaml".to_string()),
+                path_hex: None,
+                change_id: Some(feature_change.to_string()),
+                operation_id: kin_model::OperationId::new(),
+                actor: AuthorId::new("checkout-source-cas-integrity-test"),
+            };
+            let response = router(Arc::clone(&state))
+                .oneshot(
+                    Request::post("/commands/checkout")
+                        .header("content-type", "application/json")
+                        .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "{mode}"
+            );
+
+            let lease = authority.manager.read_authority();
+            let workspace_after = lease
+                .metadata()
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.workspace_id == authority.workspace_id)
+                .unwrap();
+            assert_eq!(lease.roots(), &roots_before, "{mode}");
+            assert_eq!(workspace_after, &workspace_before, "{mode}");
+            assert_eq!(state.graph.compute_root_hash(), graph_root_before, "{mode}");
+            assert_eq!(
+                state
+                    .snapshot_generation
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                roots_before.generation,
+                "{mode}"
+            );
+            assert_eq!(
+                std::fs::read(repository.join("selected/compose.yaml")).unwrap(),
+                b"services:\n  api:\n    image: main\n",
+                "{mode}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_checkout_projection_only_repairs_universal_bytes_and_replays_after_restart() {
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
+
+        let (state, layout, repository, _main, _feature) =
+            universal_branch_test_state("checkout-projection-only");
+        let authority = ActiveApiRepositoryAuthority::open(&state).unwrap();
+        let roots_before = authority.manager.read_authority().roots().clone();
+        drop(authority);
+        std::fs::write(
+            repository.join("selected/compose.yaml"),
+            b"dirty compose bytes\n",
+        )
+        .unwrap();
+        std::fs::write(repository.join("selected/data.bin"), b"dirty binary").unwrap();
+        let mut permissions = std::fs::metadata(repository.join("selected/run-tool"))
+            .unwrap()
+            .permissions();
+        permissions.set_mode(0o644);
+        std::fs::set_permissions(repository.join("selected/run-tool"), permissions).unwrap();
+        std::fs::remove_file(repository.join("selected/current-compose")).unwrap();
+        symlink("data.bin", repository.join("selected/current-compose")).unwrap();
+        std::fs::write(repository.join("outside.txt"), b"outside dirty preserved\n").unwrap();
+        let request = kin_cli::commands::checkout::CheckoutRequest {
+            path: Some("selected".to_string()),
+            path_hex: None,
+            change_id: None,
+            operation_id: kin_model::OperationId::new(),
+            actor: AuthorId::new("checkout-projection-only-test"),
+        };
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::post("/commands/checkout")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let response: kin_cli::commands::checkout::CheckoutResponse =
+            serde_json::from_slice(&body).unwrap();
+        assert!(response.report.unwrap().projection_only);
+        assert_eq!(
+            std::fs::read(repository.join("selected/compose.yaml")).unwrap(),
+            b"services:\n  api:\n    image: main\n"
+        );
+        assert_eq!(
+            std::fs::read(repository.join("selected/data.bin")).unwrap(),
+            [0_u8, 0xff, 0x10, 0x00]
+        );
+        assert_ne!(
+            std::fs::metadata(repository.join("selected/run-tool"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o111,
+            0
+        );
+        assert_eq!(
+            std::fs::read_link(repository.join("selected/current-compose")).unwrap(),
+            FsPath::new("compose.yaml")
+        );
+        assert_eq!(
+            std::fs::read(repository.join("outside.txt")).unwrap(),
+            b"outside dirty preserved\n"
+        );
+        let authority = ActiveApiRepositoryAuthority::open(&state).unwrap();
+        assert_eq!(authority.manager.read_authority().roots(), &roots_before);
+        drop(authority);
+
+        std::fs::write(
+            repository.join("selected/compose.yaml"),
+            b"post-completion edit\n",
+        )
+        .unwrap();
+        drop(state);
+        let reopened = Arc::new(DaemonState::open(layout.clone()).unwrap());
+        let replay = router(Arc::clone(&reopened))
+            .oneshot(
+                Request::post("/commands/checkout")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = replay.status();
+        let body = axum::body::to_bytes(replay.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let replay: kin_cli::commands::checkout::CheckoutResponse =
+            serde_json::from_slice(&body).unwrap();
+        let report = replay.report.unwrap();
+        assert!(report.projection_only);
+        assert!(report.idempotent);
+        assert!(!replay.mutated);
+        assert_eq!(
+            std::fs::read(repository.join("selected/compose.yaml")).unwrap(),
+            b"post-completion edit\n"
+        );
+        let authority = ActiveApiRepositoryAuthority::open(&reopened).unwrap();
+        assert_eq!(authority.manager.read_authority().roots(), &roots_before);
     }
 
     #[tokio::test]
@@ -9910,7 +11820,7 @@ mod tests {
         .unwrap();
         symlink("compose.yaml", root.join("current-compose")).unwrap();
 
-        let generation_before = ActiveApiRepositoryAuthority::open(&state.layout)
+        let generation_before = ActiveApiRepositoryAuthority::open(&state)
             .unwrap()
             .manager
             .read_authority()
@@ -9937,7 +11847,7 @@ mod tests {
             .unwrap();
         assert_eq!(obsolete_dry_run.status(), StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(
-            ActiveApiRepositoryAuthority::open(&state.layout)
+            ActiveApiRepositoryAuthority::open(&state)
                 .unwrap()
                 .manager
                 .read_authority()
@@ -9974,7 +11884,7 @@ mod tests {
             Hash256::from_hex(response["change_id"].as_str().unwrap()).unwrap(),
         );
 
-        let authority = ActiveApiRepositoryAuthority::open(&state.layout).unwrap();
+        let authority = ActiveApiRepositoryAuthority::open(&state).unwrap();
         let lease = authority.manager.read_authority();
         let workspace = lease
             .metadata()
@@ -10373,7 +12283,11 @@ mod tests {
             before + 1,
             "committed relation must land in the canonical graph"
         );
-        let authority = crate::repository_commit::load_native_commit_base(&state.layout).unwrap();
+        let authority = crate::repository_commit::load_native_commit_base(
+            &crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(&state)
+                .unwrap(),
+        )
+        .unwrap();
         assert_eq!(
             authority.graph.relation_count(),
             state.graph.relation_count()
@@ -11307,9 +13221,12 @@ mod tests {
                 })
                 .unwrap();
             let install_plan = crate::repository_commit::plan_native_commit(
-                &state.layout,
                 &state.graph,
                 &state.blobs,
+                &crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(
+                    &state,
+                )
+                .unwrap(),
                 kin_model::OperationId::new(),
                 Timestamp::now(),
                 AuthorId::new("reconcile-api-test"),
@@ -11317,8 +13234,11 @@ mod tests {
             )
             .unwrap();
             let installed = crate::repository_commit::commit_native_plan(
-                &state.layout,
                 &state.blobs,
+                &crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(
+                    &state,
+                )
+                .unwrap(),
                 install_plan,
             )
             .unwrap();
@@ -11459,7 +13379,7 @@ mod tests {
         assert_eq!(summary.semantic_files_enriched, 0);
         assert_eq!(summary.semantic_enrichment_failures, 0);
 
-        let authority = ActiveApiRepositoryAuthority::open(&state.layout).unwrap();
+        let authority = ActiveApiRepositoryAuthority::open(&state).unwrap();
         let lease = authority.manager.read_authority();
         let workspace = lease
             .metadata()
@@ -11692,7 +13612,7 @@ mod tests {
         let stale_session = state.layout.root().join("runs/session-stale-base");
         materialize(&state, &stale_session).await;
         install_repository_file(&state, "new-authority.txt", b"authority moved\n");
-        let authority = ActiveApiRepositoryAuthority::open(&state.layout).unwrap();
+        let authority = ActiveApiRepositoryAuthority::open(&state).unwrap();
         let generation = authority.manager.read_authority().roots().generation;
         assert_eq!(
             reconcile_status(&state, &stale_session).await,
@@ -12072,8 +13992,9 @@ mod tests {
     #[tokio::test]
     async fn review_endpoint_lists_live_review_state() {
         let state = test_state();
+        let repository_authority = state.local_repository_authority_binding().unwrap();
         let execution = kin_cli::commands::review::execute_review_request(
-            &state.layout,
+            &repository_authority,
             state.graph.as_ref(),
             kin_cli::commands::review::ReviewRequest::Create {
                 title: "Listed review".to_string(),
@@ -14618,7 +16539,7 @@ mod tests {
             "entity_id".to_string(),
             serde_json::json!(target.id.to_string()),
         )]);
-        let result = kin_mcp::handlers::entities::handle_find_references(&args, &graph)
+        let result = kin_mcp::handlers::entities::handle_find_references(&args, &graph, None)
             .await
             .unwrap();
         let kin_mcp::types::ContentBlock::Text { text } = result
@@ -14662,7 +16583,7 @@ mod tests {
             "entity_id".to_string(),
             serde_json::json!(target.id.to_string()),
         )]);
-        let result = kin_mcp::handlers::entities::handle_find_references(&args, &graph)
+        let result = kin_mcp::handlers::entities::handle_find_references(&args, &graph, None)
             .await
             .unwrap();
         let result = kin_mcp::finalize_with_envelope(
@@ -14709,7 +16630,7 @@ mod tests {
                 Some(value) => std::env::set_var("KIN_REPO_ID", value),
                 None => std::env::remove_var("KIN_REPO_ID"),
             }
-            let result = kin_mcp::handlers::entities::handle_find_references(&args, &graph)
+            let result = kin_mcp::handlers::entities::handle_find_references(&args, &graph, None)
                 .await
                 .unwrap();
             let result = kin_mcp::finalize_with_envelope(

@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use crate::daemon_delegate;
 use crate::envelope::{self, Envelope};
 use crate::error::{McpError, Result};
-use crate::handlers::handle_tool_call;
+use crate::handlers::{handle_tool_call, LocalRepositoryAuthorityBinding};
 use crate::session::SessionRegistry;
 use crate::tools::tool_definitions;
 use crate::types::*;
@@ -28,6 +28,11 @@ pub struct McpServerConfig {
     pub allowed_tools: Option<HashSet<String>>,
     pub session_authority_mode: SessionAuthorityMode,
     pub snapshot_path: Option<PathBuf>,
+    /// Startup-pinned local authority for the explicit offline runtime.
+    ///
+    /// Product daemon mode dispatches inside the daemon and supplies its own
+    /// retained binding; it never populates this stdio-side field.
+    pub repository_authority: Option<LocalRepositoryAuthorityBinding>,
 }
 
 /// How the stdio server should present session authority.
@@ -57,6 +62,7 @@ impl Default for McpServerConfig {
             allowed_tools: None,
             session_authority_mode: SessionAuthorityMode::DaemonRequired,
             snapshot_path: None,
+            repository_authority: None,
         }
     }
 }
@@ -95,8 +101,12 @@ impl PersistableMcpStore for kin_db::InMemoryGraph {
 /// through to local graph handlers.
 pub async fn run_stdio<G: PersistableMcpStore + 'static>(
     store: G,
-    config: McpServerConfig,
+    mut config: McpServerConfig,
 ) -> Result<()> {
+    if !config.session_authority_mode.requires_daemon() && config.repository_authority.is_none() {
+        config.repository_authority =
+            crate::handlers::repository_authority::discover_for_process()?;
+    }
     let sessions = SessionRegistry::new();
     let stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
@@ -903,6 +913,7 @@ async fn handle_tools_call<G: PersistableMcpStore>(
         store,
         sessions,
         config.session_authority_mode,
+        config.repository_authority.as_ref(),
     ));
     let outcome = std::future::poll_fn(|cx| {
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

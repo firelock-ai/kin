@@ -11,9 +11,13 @@ use std::io::{Read, Write};
 use std::path::Path;
 #[cfg(any(unix, windows))]
 use std::path::PathBuf;
+#[cfg(test)]
 use std::sync::Arc;
 
-use kin_db::{LocalFileBackend, RepositoryAuthorityManager, RepositoryAuthorityState};
+use kin_db::{
+    LocalFileBackend, LocalRepositoryAuthorityFreeze, RepositoryAuthorityManager,
+    RepositoryAuthorityState,
+};
 use kin_model::{
     compute_resolved_tree_hash, GraphStore, Hash256, OperationId, RepoPath,
     RepositoryCommitOutcome, RepositoryCommitReceipt, RepositoryId, RepositoryTransaction,
@@ -226,6 +230,35 @@ fn validate_checkout_projection_workspace(
     Ok(())
 }
 
+fn repository_authority_state_contains_commit(
+    authority: &RepositoryAuthorityState,
+    marker: &ReconciliationAuthorityCommit,
+) -> Result<bool> {
+    if authority.metadata().repository_id != marker.repository_id {
+        return Err(KinError::Other(format!(
+            "projection recovery marker names repository {}, but frozen authority names {}",
+            marker.repository_id,
+            authority.metadata().repository_id
+        )));
+    }
+    let Some(operation) = authority
+        .metadata()
+        .operation_log
+        .iter()
+        .find(|operation| operation.operation_id == marker.operation_id)
+    else {
+        return Ok(false);
+    };
+    if operation.transaction_hash != marker.transaction_hash {
+        return Err(KinError::Other(format!(
+            "repository operation {} exists with a different transaction identity during \
+             exact-source projection recovery",
+            marker.operation_id
+        )));
+    }
+    Ok(true)
+}
+
 /// Preserve control-plane and generated dependency/build directories during
 /// exact tree cleanup. This policy is shared by full projection and workspace
 /// transitions so neither path treats generated state as graph-owned source.
@@ -426,7 +459,10 @@ pub fn reconcile_source_tree_and_commit_repository_transaction<'a, 'b>(
         &previous_entries,
         &entries,
         &should_preserve_checkout_path,
-        ReconciledProjectionOptions::default(),
+        ReconciledProjectionOptions {
+            open_mode: ProjectionOpenMode::ExistingRepositoryFrozen(authority),
+            ..ReconciledProjectionOptions::default()
+        },
         || {},
         || {},
         || {},
@@ -464,7 +500,11 @@ pub fn transition_repository_workspace_tree_and_commit_repository_transaction(
     target_tree: &ResolvedTree,
     authority: &RepositoryAuthorityManager<LocalFileBackend>,
     transaction: RepositoryTransaction,
-) -> Result<(usize, RepositoryCommitReceipt)> {
+) -> Result<(
+    usize,
+    RepositoryCommitReceipt,
+    LocalRepositoryAuthorityFreeze,
+)> {
     transition_repository_workspace_tree_and_commit_with_hooks(
         root,
         previous_tree,
@@ -475,7 +515,81 @@ pub fn transition_repository_workspace_tree_and_commit_repository_transaction(
         || {},
         || {},
         None,
+        commit_repository_transaction_exact_and_freeze,
     )
+    .map(|(count, (receipt, freeze))| (count, receipt, freeze))
+}
+
+/// Verify that the complete current repository workspace still matches its
+/// exact derived projection without publishing a repository transaction.
+///
+/// This is the no-op counterpart to a workspace transition. It is used when a
+/// command such as switching to the already-active branch has no authority
+/// delta to commit but still must not report success over dirty tracked bytes,
+/// changed modes or symlink targets, or an invalid graph-only Gitlink
+/// representation. The projection lock is acquired before the repository
+/// freeze, preserving the global lock order, and the returned freeze proves
+/// that the verified tree belonged to the retained repository authority.
+pub fn verify_repository_workspace_projection(
+    root: &Path,
+    tree: &ResolvedTree,
+    authority: &RepositoryAuthorityManager<LocalFileBackend>,
+) -> Result<(usize, LocalRepositoryAuthorityFreeze)> {
+    #[cfg(any(unix, windows))]
+    {
+        let projection =
+            ExactProjectionFreeze::acquire_existing_for_repository_transition(root, authority)?;
+        let expected_roots = authority.read_authority().roots().clone();
+        let owned = load_repository_projection_entries(authority, tree, "current workspace")?;
+        let entries = validated_source_entries(
+            owned
+                .iter()
+                .map(|entry| (&entry.path, entry.kind, entry.content.as_slice())),
+        )?;
+        validate_repository_projection_entries_match_tree("current workspace", tree, &entries)?;
+        validate_projection_proof_paths(tree.artifacts_by_path().map(|artifact| &artifact.path))?;
+        let authority_freeze = authority
+            .freeze_current_authority(&expected_roots)
+            .map_err(|error| {
+                classify_repository_authority_freeze_error(
+                    "freeze verified repository workspace authority",
+                    error,
+                )
+            })?;
+
+        let entry_refs = entries.iter().collect::<Vec<_>>();
+        let materialized_identities = projection
+            .projection
+            .validate_frozen_entries_unchanged(&entry_refs)?;
+        let mut graph_only_proofs = Vec::new();
+        for artifact in tree.artifacts_by_path() {
+            let disposition = source_projection_disposition(&artifact.path, artifact.entry)?;
+            if disposition != SourceProjectionDisposition::Materialized {
+                graph_only_proofs.push((
+                    artifact.path.clone(),
+                    disposition,
+                    projection
+                        .projection
+                        .verify_frozen_graph_only(&artifact.path, disposition)?,
+                ));
+            }
+        }
+        projection
+            .projection
+            .revalidate_frozen_entries_unchanged(&entry_refs, &materialized_identities)?;
+        for (path, disposition, proof) in &graph_only_proofs {
+            projection
+                .projection
+                .revalidate_frozen_graph_only(path, *disposition, proof)?;
+        }
+        projection.revalidate_namespace()?;
+        Ok((entries.len(), authority_freeze))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (root, tree, authority);
+        Err(unsupported_safe_projection_error())
+    }
 }
 
 /// Restore one exact repository path or component-aware subtree while
@@ -494,7 +608,11 @@ pub fn checkout_repository_workspace_subtree_and_commit_repository_transaction(
     target_tree: &ResolvedTree,
     authority: &RepositoryAuthorityManager<LocalFileBackend>,
     transaction: RepositoryTransaction,
-) -> Result<(usize, RepositoryCommitReceipt)> {
+) -> Result<(
+    usize,
+    RepositoryCommitReceipt,
+    LocalRepositoryAuthorityFreeze,
+)> {
     checkout_repository_workspace_subtree_and_commit_with_hooks(
         root,
         selected,
@@ -511,7 +629,7 @@ pub fn checkout_repository_workspace_subtree_and_commit_repository_transaction(
 /// Test seam for exact selected-path namespace and authority races.
 #[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
-pub fn checkout_repository_workspace_subtree_and_commit_with_hooks(
+pub(crate) fn checkout_repository_workspace_subtree_and_commit_with_hooks(
     root: &Path,
     selected: &RepoPath,
     previous_tree: &ResolvedTree,
@@ -521,7 +639,11 @@ pub fn checkout_repository_workspace_subtree_and_commit_with_hooks(
     after_read_only_preflight: impl FnOnce(),
     after_identity_revalidation: impl FnOnce(),
     after_projection_mutation: impl FnOnce(),
-) -> Result<(usize, RepositoryCommitReceipt)> {
+) -> Result<(
+    usize,
+    RepositoryCommitReceipt,
+    LocalRepositoryAuthorityFreeze,
+)> {
     validate_checkout_repository_transaction(selected, previous_tree, target_tree, &transaction)?;
     transition_repository_workspace_tree_and_commit_with_hooks(
         root,
@@ -533,7 +655,9 @@ pub fn checkout_repository_workspace_subtree_and_commit_with_hooks(
         after_identity_revalidation,
         after_projection_mutation,
         Some(selected),
+        commit_repository_transaction_exact_and_freeze,
     )
+    .map(|(count, (receipt, freeze))| (count, receipt, freeze))
 }
 
 /// Repair a selected derived projection when repository workspace authority
@@ -548,7 +672,11 @@ pub fn repair_repository_workspace_subtree_projection(
     tree: &ResolvedTree,
     authority: &RepositoryAuthorityManager<LocalFileBackend>,
     receipt: CheckoutProjectionReceipt,
-) -> Result<(usize, CheckoutProjectionReceipt)> {
+) -> Result<(
+    usize,
+    CheckoutProjectionReceipt,
+    LocalRepositoryAuthorityFreeze,
+)> {
     repair_repository_workspace_subtree_projection_with_hooks(
         root,
         tree,
@@ -563,7 +691,7 @@ pub fn repair_repository_workspace_subtree_projection(
 /// Test seam for projection-only checkout races and rollback.
 #[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
-pub fn repair_repository_workspace_subtree_projection_with_hooks(
+pub(crate) fn repair_repository_workspace_subtree_projection_with_hooks(
     root: &Path,
     tree: &ResolvedTree,
     authority: &RepositoryAuthorityManager<LocalFileBackend>,
@@ -571,7 +699,11 @@ pub fn repair_repository_workspace_subtree_projection_with_hooks(
     after_read_only_preflight: impl FnOnce(),
     after_identity_revalidation: impl FnOnce(),
     after_projection_mutation: impl FnOnce(),
-) -> Result<(usize, CheckoutProjectionReceipt)> {
+) -> Result<(
+    usize,
+    CheckoutProjectionReceipt,
+    LocalRepositoryAuthorityFreeze,
+)> {
     receipt.validate()?;
     let tree_hash =
         compute_resolved_tree_hash(tree).map_err(|error| KinError::Other(error.to_string()))?;
@@ -589,13 +721,14 @@ pub fn repair_repository_workspace_subtree_projection_with_hooks(
     )?;
     validate_repository_projection_entries_match_tree("checkout", tree, &entries)?;
     let committed = receipt.clone();
-    project_reconciled_source_tree_and_commit(
+    let mut authority_freeze = None;
+    let (count, committed) = project_reconciled_source_tree_and_commit(
         root,
         &entries,
         &entries,
         &should_preserve_checkout_path,
         ReconciledProjectionOptions {
-            open_mode: ProjectionOpenMode::ExistingFrozen,
+            open_mode: ProjectionOpenMode::ExistingRepositoryFrozen(authority),
             graph_only_transition: Some(GraphOnlyWorkspaceTransition {
                 previous_tree: tree,
                 target_tree: tree,
@@ -606,6 +739,7 @@ pub fn repair_repository_workspace_subtree_projection_with_hooks(
                 authority,
                 receipt: &receipt,
             }),
+            checkout_projection_freeze: Some(&mut authority_freeze),
         },
         after_read_only_preflight,
         after_identity_revalidation,
@@ -613,7 +747,14 @@ pub fn repair_repository_workspace_subtree_projection_with_hooks(
         None,
         Some(receipt.clone()),
         move || ProjectionAuthorityCommit::Committed(committed),
-    )
+    )?;
+    let authority_freeze = authority_freeze.ok_or_else(|| {
+        KinError::Other(
+            "checkout projection repair completed without retaining repository authority"
+                .to_string(),
+        )
+    })?;
+    Ok((count, committed, authority_freeze))
 }
 
 /// Recover any retained selected-checkout WAL and read its authenticated local
@@ -621,39 +762,113 @@ pub fn repair_repository_workspace_subtree_projection_with_hooks(
 /// state.
 pub fn recover_checkout_projection_receipt(
     root: &Path,
+    authority: &RepositoryAuthorityManager<LocalFileBackend>,
     operation_id: OperationId,
 ) -> Result<Option<CheckoutProjectionReceipt>> {
     #[cfg(any(unix, windows))]
     {
-        let freeze = ExactProjectionFreeze::acquire_existing_for_transition(root)?;
+        let freeze =
+            ExactProjectionFreeze::acquire_existing_for_repository_transition(root, authority)?;
         freeze
             .projection
             .load_checkout_projection_receipt(operation_id)
     }
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = (root, operation_id);
+        let _ = (root, authority, operation_id);
         Err(unsupported_safe_projection_error())
     }
 }
 
-/// Recover any authenticated repository workspace projection transaction
-/// without starting a new mutation.
-pub fn recover_repository_workspace_projection(root: &Path) -> Result<()> {
+/// Replay one already-committed repository transaction and recover its exact
+/// workspace projection without inverting the authority lock order.
+///
+/// The projection freeze is acquired first. Only then is the transaction
+/// replayed into an exact repository-authority freeze, and any authenticated
+/// projection WAL is finalized while both freezes remain retained. The
+/// returned repository freeze lets the daemon keep that same authority stable
+/// through graph finalization.
+pub fn replay_repository_workspace_transaction_and_recover_projection(
+    root: &Path,
+    authority: &RepositoryAuthorityManager<LocalFileBackend>,
+    transaction: RepositoryTransaction,
+) -> Result<(RepositoryCommitReceipt, LocalRepositoryAuthorityFreeze)> {
+    replay_repository_workspace_transaction_and_recover_projection_with_hooks(
+        root,
+        authority,
+        transaction,
+        || {},
+        || {},
+    )
+}
+
+fn replay_repository_workspace_transaction_and_recover_projection_with_hooks(
+    root: &Path,
+    authority: &RepositoryAuthorityManager<LocalFileBackend>,
+    transaction: RepositoryTransaction,
+    after_projection_freeze: impl FnOnce(),
+    after_authority_freeze: impl FnOnce(),
+) -> Result<(RepositoryCommitReceipt, LocalRepositoryAuthorityFreeze)> {
     #[cfg(any(unix, windows))]
     {
-        let freeze = ExactProjectionFreeze::acquire_existing_for_transition(root)?;
-        freeze.revalidate_namespace()
+        let projection_freeze = ExactProjectionFreeze::acquire_existing_for_replay_recovery(root)?;
+        after_projection_freeze();
+
+        let transaction_hash = transaction
+            .transaction_hash()
+            .map_err(|error| KinError::Other(error.to_string()))?;
+        let installed =
+            installed_repository_receipt(authority, transaction.operation_id, transaction_hash)
+                .ok_or_else(|| {
+                    KinError::Other(format!(
+                "repository operation {} is not committed and cannot enter projection replay",
+                transaction.operation_id
+            ))
+                })?;
+        let (receipt, authority_freeze) =
+            commit_repository_transaction_exact_and_freeze(authority, transaction).into_result()?;
+        receipt
+            .validate()
+            .map_err(|error| KinError::Other(error.to_string()))?;
+        if receipt.transaction_hash != installed.transaction_hash
+            || receipt.roots_before != installed.roots_before
+            || receipt.roots_after != installed.roots_after
+            || receipt.generation != installed.generation
+            || !matches!(receipt.outcome, RepositoryCommitOutcome::IdempotentReplay)
+        {
+            return Err(KinError::Other(format!(
+                "repository operation {} did not replay its exact installed receipt",
+                receipt.operation_id
+            )));
+        }
+        if authority_freeze.roots() != &receipt.roots_after {
+            return Err(KinError::Other(format!(
+                "repository operation {} replay freeze does not name its committed roots",
+                receipt.operation_id
+            )));
+        }
+        after_authority_freeze();
+        projection_freeze
+            .projection
+            .recover_reconciliation_transactions_with_authority(authority_freeze.authority())?;
+        projection_freeze.revalidate_namespace()?;
+        Ok((receipt, authority_freeze))
     }
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = root;
+        let _ = (
+            root,
+            authority,
+            transaction,
+            after_projection_freeze,
+            after_authority_freeze,
+        );
         Err(unsupported_safe_projection_error())
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn transition_repository_workspace_tree_and_commit_with_hooks(
+fn transition_repository_workspace_tree_and_commit_with_hooks<T>(
     root: &Path,
     previous_tree: &ResolvedTree,
     target_tree: &ResolvedTree,
@@ -663,7 +878,11 @@ fn transition_repository_workspace_tree_and_commit_with_hooks(
     after_identity_revalidation: impl FnOnce(),
     after_projection_mutation: impl FnOnce(),
     checkout_scope: Option<&RepoPath>,
-) -> Result<(usize, RepositoryCommitReceipt)> {
+    commit: impl FnOnce(
+        &RepositoryAuthorityManager<LocalFileBackend>,
+        RepositoryTransaction,
+    ) -> ProjectionAuthorityCommit<T>,
+) -> Result<(usize, T)> {
     let previous_owned =
         load_repository_projection_entries(authority, previous_tree, "previous workspace")?;
     let target_owned =
@@ -705,7 +924,7 @@ fn transition_repository_workspace_tree_and_commit_with_hooks(
         &entries,
         &should_preserve_checkout_path,
         ReconciledProjectionOptions {
-            open_mode: ProjectionOpenMode::ExistingFrozen,
+            open_mode: ProjectionOpenMode::ExistingRepositoryFrozen(authority),
             graph_only_transition: Some(GraphOnlyWorkspaceTransition {
                 previous_tree,
                 target_tree,
@@ -713,15 +932,16 @@ fn transition_repository_workspace_tree_and_commit_with_hooks(
             }),
             checkout_scope,
             checkout_projection_authority: None,
+            checkout_projection_freeze: None,
         },
         after_read_only_preflight,
         after_identity_revalidation,
         after_projection_mutation,
         Some(marker),
         None,
-        || commit_repository_transaction_exact(authority, transaction),
+        || commit(authority, transaction),
     )
-    .map(|(_, receipt)| (materialized_count, receipt))
+    .map(|(_, committed)| (materialized_count, committed))
 }
 
 fn validate_checkout_repository_transaction(
@@ -1725,10 +1945,86 @@ impl ExactProjectionFreeze {
     /// Unlike ordinary projection open, this never creates or repairs `.kin`
     /// control state. Unlike eject freeze, it may recover a prior repository
     /// transition because branch retry is itself the recovery boundary.
+    #[cfg(test)]
     fn acquire_existing_for_transition(root: &Path) -> Result<Self> {
         #[cfg(any(unix, windows))]
         {
             let projection = ProjectionRoot::open_existing_for_reconciliation(
+                root,
+                PROJECTION_LOCK_WAIT_DEADLINE,
+            )?;
+            let root_identity = tracked_open_directory_identity(&projection.root)
+                .map_err(|error| KinError::io(root, error))?;
+            let freeze = Self {
+                projection,
+                root_identity,
+            };
+            freeze.revalidate_namespace()?;
+            Ok(freeze)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = root;
+            Err(unsupported_safe_projection_error())
+        }
+    }
+
+    /// Acquire a repository workspace transition boundary and recover any
+    /// authenticated WAL through the caller's retained storage capability.
+    ///
+    /// Lock order is projection then repository authority. The authority
+    /// freeze revalidates KinDB's startup-pinned storage root before recovery
+    /// can inspect or clean a WAL; an identically copied path replacement is
+    /// therefore rejected instead of being treated as the original repo.
+    fn acquire_existing_for_repository_transition(
+        root: &Path,
+        authority: &RepositoryAuthorityManager<LocalFileBackend>,
+    ) -> Result<Self> {
+        #[cfg(any(unix, windows))]
+        {
+            let projection = ProjectionRoot::open_existing_for_replay_recovery(
+                root,
+                PROJECTION_LOCK_WAIT_DEADLINE,
+            )?;
+            let root_identity = tracked_open_directory_identity(&projection.root)
+                .map_err(|error| KinError::io(root, error))?;
+            let freeze = Self {
+                projection,
+                root_identity,
+            };
+            freeze.revalidate_namespace()?;
+
+            let expected_roots = authority.read_authority().roots().clone();
+            let authority_freeze = authority
+                .freeze_current_authority(&expected_roots)
+                .map_err(|error| {
+                    classify_repository_authority_freeze_error(
+                        "freeze retained repository authority before projection recovery",
+                        error,
+                    )
+                })?;
+            freeze
+                .projection
+                .recover_reconciliation_transactions_with_authority(authority_freeze.authority())?;
+            drop(authority_freeze);
+            freeze.revalidate_namespace()?;
+            Ok(freeze)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (root, authority);
+            Err(unsupported_safe_projection_error())
+        }
+    }
+
+    /// Acquire the projection lock without recovering its repository WAL.
+    ///
+    /// Replay recovery must freeze repository authority only after this guard
+    /// exists, then finalize the retained WAL while both guards are alive.
+    fn acquire_existing_for_replay_recovery(root: &Path) -> Result<Self> {
+        #[cfg(any(unix, windows))]
+        {
+            let projection = ProjectionRoot::open_existing_for_replay_recovery(
                 root,
                 PROJECTION_LOCK_WAIT_DEADLINE,
             )?;
@@ -2970,19 +3266,51 @@ fn commit_repository_transaction_exact(
                     ) {
                         return ProjectionAuthorityCommit::Committed(receipt);
                     }
-                    let error = KinError::Other(format!(
+                    let detail = format!(
                         "commit repository projection authority: {first_error}; exact retry: {second_error}"
-                    ));
+                    );
                     if repository_commit_error_is_definitely_prepublication(&second_error) {
-                        ProjectionAuthorityCommit::DefinitelyNotCommitted(error)
+                        ProjectionAuthorityCommit::DefinitelyNotCommitted(
+                            KinError::RepositoryConflict(detail),
+                        )
                     } else {
-                        ProjectionAuthorityCommit::Indeterminate(KinError::Other(format!(
-                            "{error}; exact projection and authenticated recovery WAL were retained because authority commit outcome is uncertain"
-                        )))
+                        ProjectionAuthorityCommit::Indeterminate(
+                            KinError::RepositoryCommitIndeterminate(format!(
+                                "{detail}; exact projection and authenticated recovery WAL were retained because authority commit outcome is uncertain"
+                            )),
+                        )
                     }
                 }
             }
         }
+    }
+}
+
+fn commit_repository_transaction_exact_and_freeze(
+    authority: &RepositoryAuthorityManager<LocalFileBackend>,
+    transaction: RepositoryTransaction,
+) -> ProjectionAuthorityCommit<(RepositoryCommitReceipt, LocalRepositoryAuthorityFreeze)> {
+    match authority.commit_repository_transaction_and_freeze(transaction.clone()) {
+        Ok(committed) => ProjectionAuthorityCommit::Committed(committed),
+        Err(first_error) => match authority.commit_repository_transaction_and_freeze(transaction) {
+            Ok(committed) => ProjectionAuthorityCommit::Committed(committed),
+            Err(second_error) => {
+                let detail = format!(
+                    "commit and freeze repository projection authority: {first_error}; exact retry: {second_error}"
+                );
+                if repository_commit_error_is_definitely_prepublication(&second_error) {
+                    ProjectionAuthorityCommit::DefinitelyNotCommitted(KinError::RepositoryConflict(
+                        detail,
+                    ))
+                } else {
+                    ProjectionAuthorityCommit::Indeterminate(
+                        KinError::RepositoryCommitIndeterminate(format!(
+                            "{detail}; exact projection and authenticated recovery WAL were retained because authority commit outcome is uncertain"
+                        )),
+                    )
+                }
+            }
+        },
     }
 }
 
@@ -3030,6 +3358,18 @@ fn repository_commit_error_is_definitely_prepublication(error: &kin_db::KinDbErr
             if message.starts_with("generation mismatch for repo ")
                 && message.ends_with("(another writer committed since last load)")
     )
+}
+
+fn classify_repository_authority_freeze_error(
+    context: &str,
+    error: kin_db::KinDbError,
+) -> KinError {
+    match error {
+        kin_db::KinDbError::Model(kin_model::ModelError::Conflict(message)) => {
+            KinError::RepositoryConflict(format!("{context}: {message}"))
+        }
+        error => KinError::Other(format!("{context}: {error}")),
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -3537,9 +3877,11 @@ fn project_reconciled_source_tree(
 }
 
 #[derive(Clone, Copy)]
-enum ProjectionOpenMode {
+enum ProjectionOpenMode<'a> {
     CreateOrOpen,
+    #[cfg(test)]
     ExistingFrozen,
+    ExistingRepositoryFrozen(&'a RepositoryAuthorityManager<LocalFileBackend>),
 }
 
 #[derive(Clone, Copy)]
@@ -3549,12 +3891,12 @@ struct GraphOnlyWorkspaceTransition<'a> {
     scope: Option<&'a RepoPath>,
 }
 
-#[derive(Clone, Copy)]
 struct ReconciledProjectionOptions<'a> {
-    open_mode: ProjectionOpenMode,
+    open_mode: ProjectionOpenMode<'a>,
     graph_only_transition: Option<GraphOnlyWorkspaceTransition<'a>>,
     checkout_scope: Option<&'a RepoPath>,
     checkout_projection_authority: Option<CheckoutProjectionAuthority<'a>>,
+    checkout_projection_freeze: Option<&'a mut Option<LocalRepositoryAuthorityFreeze>>,
 }
 
 impl Default for ReconciledProjectionOptions<'_> {
@@ -3564,6 +3906,7 @@ impl Default for ReconciledProjectionOptions<'_> {
             graph_only_transition: None,
             checkout_scope: None,
             checkout_projection_authority: None,
+            checkout_projection_freeze: None,
         }
     }
 }
@@ -3834,13 +4177,19 @@ fn project_reconciled_source_tree_and_commit<T>(
     {
         let frozen = match options.open_mode {
             ProjectionOpenMode::CreateOrOpen => None,
+            #[cfg(test)]
             ProjectionOpenMode::ExistingFrozen => Some(
                 ExactProjectionFreeze::acquire_existing_for_transition(root)?,
+            ),
+            ProjectionOpenMode::ExistingRepositoryFrozen(authority) => Some(
+                ExactProjectionFreeze::acquire_existing_for_repository_transition(root, authority)?,
             ),
         };
         let opened = match options.open_mode {
             ProjectionOpenMode::CreateOrOpen => Some(ProjectionRoot::open(root)?),
+            #[cfg(test)]
             ProjectionOpenMode::ExistingFrozen => None,
+            ProjectionOpenMode::ExistingRepositoryFrozen(_) => None,
         };
         let projection = frozen
             .as_ref()
@@ -3848,22 +4197,33 @@ fn project_reconciled_source_tree_and_commit<T>(
             .or(opened.as_ref())
             .expect("one projection authority is open");
         let checkout_scope = options.checkout_scope;
-        let _checkout_authority_freeze = options
+        let mut checkout_authority_freeze = options
             .checkout_projection_authority
             .map(|binding| {
                 let frozen = binding
                     .authority
                     .freeze_current_authority(&binding.receipt.authority_roots)
                     .map_err(|error| {
-                        KinError::Other(format!(
-                            "freeze checkout projection authority at generation {}: {error}",
-                            binding.receipt.authority_roots.generation
-                        ))
+                        classify_repository_authority_freeze_error(
+                            &format!(
+                                "freeze checkout projection authority at generation {}",
+                                binding.receipt.authority_roots.generation
+                            ),
+                            error,
+                        )
                     })?;
                 validate_checkout_projection_workspace(frozen.authority(), binding.receipt)?;
                 Ok::<_, KinError>(frozen)
             })
             .transpose()?;
+        if let Some(retained) = options.checkout_projection_freeze {
+            if retained.is_some() {
+                return Err(KinError::Other(
+                    "checkout projection authority retention slot was already occupied".to_string(),
+                ));
+            }
+            *retained = checkout_authority_freeze.take();
+        }
         if let Some(expected) = &checkout_projection_commit {
             if let Some(installed) =
                 projection.load_checkout_projection_receipt(expected.operation_id)?
@@ -4368,7 +4728,6 @@ struct ProjectionRoot {
     display_root: PathBuf,
     projection_control_name: OsString,
     display_projection_control: PathBuf,
-    repository_authority_kindb: Option<PathBuf>,
     kin_control_identity: TrackedEntryIdentity,
     control_identity: TrackedEntryIdentity,
     authority_key: [u8; 32],
@@ -5751,6 +6110,15 @@ fn read_projection_lock_holder(control: &cap_std::fs::Dir) -> Option<String> {
 }
 
 #[cfg(any(unix, windows))]
+#[derive(Clone, Copy)]
+enum ExistingReconciliationDisposition {
+    Refuse,
+    #[cfg(test)]
+    Recover,
+    Retain,
+}
+
+#[cfg(any(unix, windows))]
 impl ProjectionRoot {
     fn open(root: &Path) -> Result<Self> {
         Self::open_with_projection_lock_deadline(root, PROJECTION_LOCK_WAIT_DEADLINE)
@@ -5761,7 +6129,6 @@ impl ProjectionRoot {
         Self::open_with_control_directory(
             root,
             std::ffi::OsStr::new(SESSION_PROJECTION_CONTROL_DIRECTORY),
-            None,
             PROJECTION_LOCK_WAIT_DEADLINE,
         )
     }
@@ -5771,7 +6138,6 @@ impl ProjectionRoot {
             root,
             display_root,
             std::ffi::OsStr::new(SESSION_PROJECTION_CONTROL_DIRECTORY),
-            None,
             PROJECTION_LOCK_WAIT_DEADLINE,
         )
     }
@@ -5780,18 +6146,12 @@ impl ProjectionRoot {
         root: &Path,
         lock_deadline: std::time::Duration,
     ) -> Result<Self> {
-        Self::open_with_control_directory(
-            root,
-            std::ffi::OsStr::new(".kin"),
-            Some(root.join(".kin").join("kindb")),
-            lock_deadline,
-        )
+        Self::open_with_control_directory(root, std::ffi::OsStr::new(".kin"), lock_deadline)
     }
 
     fn open_with_control_directory(
         root: &Path,
         projection_control_name: &std::ffi::OsStr,
-        repository_authority_kindb: Option<PathBuf>,
         lock_deadline: std::time::Duration,
     ) -> Result<Self> {
         let capability = open_projection_root_nofollow(root)?;
@@ -5799,7 +6159,6 @@ impl ProjectionRoot {
             capability,
             root,
             projection_control_name,
-            repository_authority_kindb,
             lock_deadline,
         )
     }
@@ -5808,7 +6167,6 @@ impl ProjectionRoot {
         capability: cap_std::fs::Dir,
         root: &Path,
         projection_control_name: &std::ffi::OsStr,
-        repository_authority_kindb: Option<PathBuf>,
         lock_deadline: std::time::Duration,
     ) -> Result<Self> {
         let display_projection_control = root.join(projection_control_name);
@@ -5844,7 +6202,6 @@ impl ProjectionRoot {
             display_root: root.to_path_buf(),
             projection_control_name: projection_control_name.to_os_string(),
             display_projection_control,
-            repository_authority_kindb,
             kin_control_identity,
             control_identity,
             authority_key,
@@ -5861,51 +6218,40 @@ impl ProjectionRoot {
     }
 
     fn open_existing_for_freeze(root: &Path, lock_deadline: std::time::Duration) -> Result<Self> {
-        let capability = open_projection_root_nofollow(root)?;
-        let display_projection_control = root.join(".kin");
-        let kin_control = open_directory_nofollow(&capability, std::ffi::OsStr::new(".kin"))
-            .map_err(|error| KinError::io(&display_projection_control, error))?;
-        let kin_control_identity = tracked_open_directory_identity(&kin_control)
-            .map_err(|error| KinError::io(&display_projection_control, error))?;
-        let display_control = display_projection_control.join(RECONCILIATION_CONTROL_DIRECTORY);
-        let control = open_directory_nofollow(
-            &kin_control,
-            std::ffi::OsStr::new(RECONCILIATION_CONTROL_DIRECTORY),
+        Self::open_existing_with_reconciliation_disposition(
+            root,
+            lock_deadline,
+            ExistingReconciliationDisposition::Refuse,
         )
-        .map_err(|error| KinError::io(&display_control, error))?;
-        let control_identity = tracked_open_directory_identity(&control)
-            .map_err(|error| KinError::io(&display_control, error))?;
-        let (projection_lock, projection_lock_identity) =
-            acquire_existing_reconciliation_projection_lock(
-                &control,
-                &display_control,
-                lock_deadline,
-            )?;
-        let authority_key = load_existing_reconciliation_authority_key(&control, &display_control)?;
-        let projection = Self {
-            root: capability,
-            kin_control,
-            control,
-            projection_lock,
-            projection_lock_identity,
-            display_root: root.to_path_buf(),
-            projection_control_name: std::ffi::OsString::from(".kin"),
-            display_projection_control,
-            repository_authority_kindb: Some(root.join(".kin").join("kindb")),
-            kin_control_identity,
-            control_identity,
-            authority_key,
-        };
-        projection.revalidate_projection_lock()?;
-        #[cfg(unix)]
-        projection.recover_exact_eject()?;
-        projection.refuse_reconciliation_transactions()?;
-        Ok(projection)
     }
 
+    #[cfg(test)]
     fn open_existing_for_reconciliation(
         root: &Path,
         lock_deadline: std::time::Duration,
+    ) -> Result<Self> {
+        Self::open_existing_with_reconciliation_disposition(
+            root,
+            lock_deadline,
+            ExistingReconciliationDisposition::Recover,
+        )
+    }
+
+    fn open_existing_for_replay_recovery(
+        root: &Path,
+        lock_deadline: std::time::Duration,
+    ) -> Result<Self> {
+        Self::open_existing_with_reconciliation_disposition(
+            root,
+            lock_deadline,
+            ExistingReconciliationDisposition::Retain,
+        )
+    }
+
+    fn open_existing_with_reconciliation_disposition(
+        root: &Path,
+        lock_deadline: std::time::Duration,
+        disposition: ExistingReconciliationDisposition,
     ) -> Result<Self> {
         let capability = open_projection_root_nofollow(root)?;
         let display_projection_control = root.join(".kin");
@@ -5937,7 +6283,6 @@ impl ProjectionRoot {
             display_root: root.to_path_buf(),
             projection_control_name: std::ffi::OsString::from(".kin"),
             display_projection_control,
-            repository_authority_kindb: Some(root.join(".kin").join("kindb")),
             kin_control_identity,
             control_identity,
             authority_key,
@@ -5945,7 +6290,16 @@ impl ProjectionRoot {
         projection.revalidate_projection_lock()?;
         #[cfg(unix)]
         projection.recover_exact_eject()?;
-        projection.recover_reconciliation_transactions()?;
+        match disposition {
+            ExistingReconciliationDisposition::Refuse => {
+                projection.refuse_reconciliation_transactions()?
+            }
+            #[cfg(test)]
+            ExistingReconciliationDisposition::Recover => {
+                projection.recover_reconciliation_transactions()?
+            }
+            ExistingReconciliationDisposition::Retain => {}
+        }
         Ok(projection)
     }
 
@@ -6757,44 +7111,6 @@ impl ProjectionRoot {
         Ok(())
     }
 
-    fn repository_authority_commit_is_installed(
-        &self,
-        marker: &ReconciliationAuthorityCommit,
-    ) -> Result<bool> {
-        let authority_kindb = self.repository_authority_kindb.as_ref().ok_or_else(|| {
-            KinError::Other(format!(
-                "session projection recovery at {} unexpectedly contains a repository-authority commit marker",
-                self.display_root.display()
-            ))
-        })?;
-        let manager = RepositoryAuthorityManager::open(
-            marker.repository_id.clone(),
-            Arc::new(LocalFileBackend::new(authority_kindb)),
-        )
-        .map_err(|error| {
-            KinError::Other(format!(
-                "open repository authority while recovering exact-source projection: {error}"
-            ))
-        })?;
-        let lease = manager.read_authority();
-        let Some(operation) = lease
-            .metadata()
-            .operation_log
-            .iter()
-            .find(|operation| operation.operation_id == marker.operation_id)
-        else {
-            return Ok(false);
-        };
-        if operation.transaction_hash != marker.transaction_hash {
-            return Err(KinError::Other(format!(
-                "repository operation {} exists with a different transaction identity during \
-                 exact-source projection recovery",
-                marker.operation_id
-            )));
-        }
-        Ok(true)
-    }
-
     fn checkout_projection_receipt_name(operation_id: OperationId) -> OsString {
         OsString::from(format!(
             "{CHECKOUT_PROJECTION_RECEIPT_PREFIX}{}.json",
@@ -6969,9 +7285,10 @@ impl ProjectionRoot {
         Ok(())
     }
 
-    fn checkout_projection_commit_is_installed(
+    fn checkout_projection_commit_is_installed_with_authority(
         &self,
         marker: &CheckoutProjectionReceipt,
+        authority: Option<&RepositoryAuthorityState>,
     ) -> Result<bool> {
         let Some(installed) = self.load_checkout_projection_receipt(marker.operation_id)? else {
             return Ok(false);
@@ -6982,38 +7299,15 @@ impl ProjectionRoot {
                 marker.operation_id
             )));
         }
-        self.validate_checkout_projection_authority(marker)?;
-        Ok(true)
-    }
-
-    fn validate_checkout_projection_authority(
-        &self,
-        marker: &CheckoutProjectionReceipt,
-    ) -> Result<()> {
-        let authority_kindb = self.repository_authority_kindb.as_ref().ok_or_else(|| {
+        let authority = authority.ok_or_else(|| {
             KinError::Other(format!(
-                "session projection recovery at {} unexpectedly contains a checkout authority marker",
+                "checkout projection recovery at {} requires an explicitly retained frozen \
+                 repository authority; refusing ambient path reopen",
                 self.display_root.display()
             ))
         })?;
-        let manager = RepositoryAuthorityManager::open(
-            marker.repository_id.clone(),
-            Arc::new(LocalFileBackend::new(authority_kindb)),
-        )
-        .map_err(|error| {
-            KinError::Other(format!(
-                "open repository authority while validating checkout projection: {error}"
-            ))
-        })?;
-        let frozen = manager
-            .freeze_current_authority(&marker.authority_roots)
-            .map_err(|error| {
-                KinError::Other(format!(
-                    "freeze checkout projection authority at generation {}: {error}",
-                    marker.authority_roots.generation
-                ))
-            })?;
-        validate_checkout_projection_workspace(frozen.authority(), marker)
+        validate_checkout_projection_workspace(authority, marker)?;
+        Ok(true)
     }
 
     fn authenticate_reconciliation_manifest(
@@ -7407,6 +7701,20 @@ impl ProjectionRoot {
     }
 
     fn recover_reconciliation_transactions(&self) -> Result<()> {
+        self.recover_reconciliation_transactions_with_optional_authority(None)
+    }
+
+    fn recover_reconciliation_transactions_with_authority(
+        &self,
+        authority: &RepositoryAuthorityState,
+    ) -> Result<()> {
+        self.recover_reconciliation_transactions_with_optional_authority(Some(authority))
+    }
+
+    fn recover_reconciliation_transactions_with_optional_authority(
+        &self,
+        authority: Option<&RepositoryAuthorityState>,
+    ) -> Result<()> {
         self.revalidate_projection_lock()?;
         let root_identity = tracked_open_directory_identity(&self.root)
             .map_err(|error| KinError::io(&self.display_root, error))?;
@@ -7495,11 +7803,22 @@ impl ProjectionRoot {
                 continue;
             }
             let authority_committed = match &manifest.authority_commit {
-                Some(marker) => self.repository_authority_commit_is_installed(marker)?,
+                Some(marker) => {
+                    let authority = authority.ok_or_else(|| {
+                        KinError::Other(format!(
+                            "repository projection recovery at {} requires an explicitly retained \
+                             frozen repository authority; refusing ambient path reopen",
+                            self.display_root.display()
+                        ))
+                    })?;
+                    repository_authority_state_contains_commit(authority, marker)?
+                }
                 None => false,
             };
             let checkout_committed = match &manifest.checkout_projection_commit {
-                Some(marker) => self.checkout_projection_commit_is_installed(marker)?,
+                Some(marker) => {
+                    self.checkout_projection_commit_is_installed_with_authority(marker, authority)?
+                }
                 None => false,
             };
             if authority_committed || checkout_committed {
@@ -8580,7 +8899,7 @@ impl ProjectionRoot {
                         break;
                     }
                     Ok(_) => {
-                        return Err(KinError::Other(format!(
+                        return Err(KinError::ProjectionConflict(format!(
                             "untracked working-copy path {} blocks exact workspace target {}",
                             self.display_root.join(&relative).display(),
                             entry.file_id
@@ -8606,7 +8925,7 @@ impl ProjectionRoot {
                     if previous.relation(&relative) != TrackedPathRelation::Ancestor
                         || removed.relation(&relative) != TrackedPathRelation::Ancestor
                     {
-                        return Err(KinError::Other(format!(
+                        return Err(KinError::ProjectionConflict(format!(
                             "untracked working-copy directory {} conflicts with exact workspace target {}",
                             self.display_root.join(&relative).display(),
                             entry.file_id
@@ -8621,7 +8940,7 @@ impl ProjectionRoot {
                 }
                 Ok(_) if previous.relation(&relative) == TrackedPathRelation::Exact => {}
                 Ok(_) => {
-                    return Err(KinError::Other(format!(
+                    return Err(KinError::ProjectionConflict(format!(
                         "untracked working-copy path {} conflicts with exact workspace target {}",
                         self.display_root.join(&relative).display(),
                         entry.file_id
@@ -8655,7 +8974,7 @@ impl ProjectionRoot {
                 .map_err(|error| KinError::io(self.display_root.join(&relative), error))?;
             if metadata.is_dir() && !metadata_is_reparse(&metadata) {
                 if removed.relation(&relative) != TrackedPathRelation::Ancestor {
-                    return Err(KinError::Other(format!(
+                    return Err(KinError::ProjectionConflict(format!(
                         "untracked working-copy directory {} blocks exact workspace reconciliation",
                         self.display_root.join(&relative).display()
                     )));
@@ -8663,7 +8982,7 @@ impl ProjectionRoot {
                 let child = self.open_existing_directory(directory, &name, &relative)?;
                 self.validate_removable_directory_contents(&child, &relative, removed)?;
             } else if removed.relation(&relative) != TrackedPathRelation::Exact {
-                return Err(KinError::Other(format!(
+                return Err(KinError::ProjectionConflict(format!(
                     "untracked working-copy path {} blocks exact workspace reconciliation",
                     self.display_root.join(&relative).display()
                 )));
@@ -8707,7 +9026,7 @@ impl ProjectionRoot {
                     )?;
                 }
                 Ok(_) => {
-                    return Err(KinError::Other(format!(
+                    return Err(KinError::ProjectionConflict(format!(
                         "selected checkout path {} is blocked by a non-directory working-copy ancestor {}; select that ancestor explicitly",
                         file_id,
                         self.display_root.join(&relative).display()
@@ -8726,7 +9045,7 @@ impl ProjectionRoot {
             Ok(metadata) => metadata,
         };
         if metadata.is_dir() && !metadata_is_reparse(&metadata) {
-            return Err(KinError::Other(format!(
+            return Err(KinError::ProjectionConflict(format!(
                 "selected tracked checkout path {} became a real directory; refusing to remove possibly untracked descendants",
                 self.display_root.join(&relative).display()
             )));
@@ -8736,7 +9055,7 @@ impl ProjectionRoot {
         } else if metadata.is_file() {
             ExistingObjectKind::File
         } else {
-            return Err(KinError::Other(format!(
+            return Err(KinError::ProjectionConflict(format!(
                 "selected checkout path {} has an unsupported working-copy object kind",
                 self.display_root.join(&relative).display()
             )));
@@ -8784,7 +9103,7 @@ impl ProjectionRoot {
                             )?;
                         }
                         Ok(_) => {
-                            return Err(KinError::Other(format!(
+                            return Err(KinError::ProjectionConflict(format!(
                                 "working-copy ancestor {} appeared after selected checkout preflight",
                                 self.display_root.join(&relative).display()
                             )));
@@ -8795,7 +9114,7 @@ impl ProjectionRoot {
                 match parent.symlink_metadata(name) {
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
                     Err(error) => Err(KinError::io(self.display_root.join(path), error)),
-                    Ok(_) => Err(KinError::Other(format!(
+                    Ok(_) => Err(KinError::ProjectionConflict(format!(
                         "working-copy path {} appeared after selected checkout preflight",
                         self.display_root.join(path).display()
                     ))),
@@ -8820,7 +9139,7 @@ impl ProjectionRoot {
                     &self.display_root.join(relative),
                 )?;
                 if actual_identity != *identity || actual_state != *state {
-                    return Err(KinError::Other(format!(
+                    return Err(KinError::ProjectionConflict(format!(
                         "selected working-copy path {} changed after exact checkout preflight",
                         self.display_root.join(relative).display()
                     )));
@@ -8843,7 +9162,7 @@ impl ProjectionRoot {
         for (entry, expected_identity) in entries.iter().zip(expected_identities) {
             let actual_identity = self.validate_tracked_entry_unchanged(entry)?;
             if actual_identity != *expected_identity {
-                return Err(KinError::Other(format!(
+                return Err(KinError::ProjectionConflict(format!(
                     "tracked working-copy path {} changed object identity after exact workspace preflight; reconciliation refused",
                     self.display_root
                         .join(projection_path(entry.file_id)?)
@@ -8878,7 +9197,7 @@ impl ProjectionRoot {
             let actual_identity = self.validate_frozen_entry_unchanged(entry)?;
             if actual_identity != *expected_identity {
                 let path = validate_projection_proof_path(entry.file_id)?;
-                return Err(KinError::Other(format!(
+                return Err(KinError::ProjectionConflict(format!(
                     "tracked working-copy path {} changed object identity after exact projection verification",
                     self.display_root.join(path.relative).display()
                 )));
@@ -8921,14 +9240,14 @@ impl ProjectionRoot {
                     .metadata()
                     .map_err(|error| KinError::io(display, error))?;
                 if !metadata.is_file() {
-                    return Err(KinError::Other(format!(
+                    return Err(KinError::ProjectionConflict(format!(
                         "exact-source object {} changed kind",
                         display.display()
                     )));
                 }
                 #[cfg(windows)]
                 if metadata_is_reparse(&metadata) {
-                    return Err(KinError::Other(format!(
+                    return Err(KinError::ProjectionConflict(format!(
                         "exact-source object {} became a reparse point",
                         display.display()
                     )));
@@ -8938,7 +9257,7 @@ impl ProjectionRoot {
                     use std::os::unix::fs::PermissionsExt;
 
                     if (metadata.permissions().mode() & 0o111 != 0) != executable {
-                        return Err(KinError::Other(format!(
+                        return Err(KinError::ProjectionConflict(format!(
                             "exact-source object {} changed executable mode",
                             display.display()
                         )));
@@ -8949,7 +9268,7 @@ impl ProjectionRoot {
                 if !reader_matches_bytes(&mut file, entry.content)
                     .map_err(|error| KinError::io(display, error))?
                 {
-                    return Err(KinError::Other(format!(
+                    return Err(KinError::ProjectionConflict(format!(
                         "exact-source object {} changed content",
                         display.display()
                     )));
@@ -8970,7 +9289,7 @@ impl ProjectionRoot {
                         .symlink_metadata(name)
                         .map_err(|error| KinError::io(display, error))?;
                     if !metadata_is_reparse(&metadata) {
-                        return Err(KinError::Other(format!(
+                        return Err(KinError::ProjectionConflict(format!(
                             "exact-source object {} changed kind",
                             display.display()
                         )));
@@ -8978,7 +9297,7 @@ impl ProjectionRoot {
                     let target = rustix::fs::readlinkat(parent, name, Vec::new())
                         .map_err(|error| KinError::io(display, error.into()))?;
                     if target.as_bytes() != entry.content {
-                        return Err(KinError::Other(format!(
+                        return Err(KinError::ProjectionConflict(format!(
                             "exact-source symbolic link {} changed target",
                             display.display()
                         )));
@@ -10500,7 +10819,7 @@ impl ProjectionRoot {
     ) -> Result<TrackedEntryIdentity> {
         let display = self.display_root.join(&path.relative);
         let conflict = |reason: &str| {
-            KinError::Other(format!(
+            KinError::ProjectionConflict(format!(
                 "tracked working-copy path {} differs from prior workspace source ({reason}); exact workspace reconciliation refused",
                 display.display()
             ))
@@ -11547,6 +11866,32 @@ mod tests {
         .unwrap()
     }
 
+    #[cfg(unix)]
+    fn copy_test_directory(source: &Path, destination: &Path) {
+        std::fs::create_dir(destination).unwrap();
+        for entry in std::fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            let source_path = entry.path();
+            let destination_path = destination.join(entry.file_name());
+            let file_type = entry.file_type().unwrap();
+            if file_type.is_dir() {
+                copy_test_directory(&source_path, &destination_path);
+            } else if file_type.is_file() {
+                std::fs::copy(&source_path, &destination_path).unwrap();
+            } else {
+                panic!(
+                    "authority-copy fixture does not support special member {}",
+                    source_path.display()
+                );
+            }
+        }
+        std::fs::set_permissions(
+            destination,
+            std::fs::metadata(source).unwrap().permissions(),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn local_generation_cas_miss_is_definitely_prepublication() {
         let conflict = kin_db::KinDbError::StorageError(
@@ -11559,6 +11904,25 @@ mod tests {
         assert!(!repository_commit_error_is_definitely_prepublication(
             &kin_db::KinDbError::StorageError("disk synchronization failed".to_string())
         ));
+    }
+
+    #[test]
+    fn authority_freeze_classifier_preserves_conflict_and_internal_boundaries() {
+        let conflict = classify_repository_authority_freeze_error(
+            "freeze fixture",
+            kin_db::KinDbError::Model(kin_model::ModelError::Conflict(
+                "authority moved".to_string(),
+            )),
+        );
+        assert!(matches!(conflict, KinError::RepositoryConflict(_)));
+
+        let replacement = classify_repository_authority_freeze_error(
+            "freeze fixture",
+            kin_db::KinDbError::StorageError(
+                "local storage root changed since this backend opened".to_string(),
+            ),
+        );
+        assert!(matches!(replacement, KinError::Other(_)));
     }
 
     #[cfg(unix)]
@@ -11844,6 +12208,7 @@ mod tests {
                     base_target: workspace.base_target.clone(),
                     base_tree_hash: workspace.base_tree_hash,
                     tree_hash: target_hash,
+                    semantic_overlay_hash: workspace.semantic_overlay_hash,
                     admission_policy: workspace.admission_policy,
                 },
                 new_generation: workspace.generation + 1,
@@ -11852,6 +12217,7 @@ mod tests {
                 new_base_tree_hash: Some(target_hash),
                 tree_deltas: crate::exact_tree_correction(&workspace.tree, &target_tree).unwrap(),
                 new_tree_hash: target_hash,
+                semantic_delta: kin_model::WorkspaceSemanticDelta::default(),
                 new_shared_admission_policy: SharedAdmissionPolicy::empty(0),
                 new_admission_policy: workspace.admission_policy,
             }),
@@ -11899,6 +12265,7 @@ mod tests {
                     }),
                     checkout_scope: None,
                     checkout_projection_authority: None,
+                    checkout_projection_freeze: None,
                 },
                 || {},
                 || {},
@@ -11945,6 +12312,7 @@ mod tests {
                     }),
                     checkout_scope: None,
                     checkout_projection_authority: None,
+                    checkout_projection_freeze: None,
                 },
                 || {},
                 || {},
@@ -11988,6 +12356,7 @@ mod tests {
                 }),
                 checkout_scope: None,
                 checkout_projection_authority: None,
+                checkout_projection_freeze: None,
             },
             || {
                 std::fs::create_dir(root.path().join("vendor")).unwrap();
@@ -12790,6 +13159,7 @@ mod tests {
                 }),
                 checkout_scope: None,
                 checkout_projection_authority: None,
+                checkout_projection_freeze: None,
             },
             || {},
             || {},
@@ -12855,6 +13225,7 @@ mod tests {
                 }),
                 checkout_scope: None,
                 checkout_projection_authority: None,
+                checkout_projection_freeze: None,
             },
             || {},
             || {},
@@ -12888,9 +13259,146 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn repository_transition_recovery_rejects_identical_replacement_authority_root() {
+        let root = tempfile::tempdir().unwrap();
+        let initialized = crate::init(root.path()).unwrap();
+        let canonical_kindb = initialized.layout.kindb_dir();
+        let detached_kindb = root.path().join("detached-kindb");
+        let replacement_kindb = root.path().join("replacement-kindb");
+        let retained = RepositoryAuthorityManager::open(
+            initialized.repository_id.clone(),
+            Arc::new(LocalFileBackend::new(&canonical_kindb)),
+        )
+        .unwrap();
+        let lease = retained.read_authority();
+        let roots_before = lease.roots().clone();
+        let default_ref = lease.metadata().ref_state.default_ref.clone().unwrap();
+        drop(lease);
+        let transaction = RepositoryTransaction {
+            schema_version: REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+            operation_id: OperationId::new(),
+            repository_id: initialized.repository_id.clone(),
+            expected_generation: roots_before.generation,
+            expected_roots: roots_before.clone(),
+            actor: AuthorId::new("retained-recovery-root-test"),
+            reason: "discriminate retained authority during WAL recovery".to_string(),
+            external_objects: Vec::new(),
+            git_authority_delta: None,
+            changes: Vec::new(),
+            aliases: Vec::new(),
+            ref_mutations: Vec::new(),
+            default_ref_mutation: Some(DefaultRefMutation {
+                expected: DefaultRefExpectation::MustEqual { name: default_ref },
+                new_default: Some(RefName::branch(b"replacement-only").unwrap()),
+            }),
+            workspace_mutation: None,
+            local_overlay_delta: None,
+        };
+        let marker = ReconciliationAuthorityCommit {
+            repository_id: transaction.repository_id.clone(),
+            operation_id: transaction.operation_id,
+            transaction_hash: transaction.transaction_hash().unwrap(),
+        };
+        let path = repo_path("compose.yaml");
+        let previous_body = b"services:\n  old: {}\n";
+        let target_body = b"services:\n  replacement-only: {}\n";
+        std::fs::write(root.path().join("compose.yaml"), previous_body).unwrap();
+        let previous =
+            validated_source_entries([(&path, regular(), previous_body.as_slice())]).unwrap();
+        let target =
+            validated_source_entries([(&path, regular(), target_body.as_slice())]).unwrap();
+
+        let error = project_reconciled_source_tree_and_commit(
+            root.path(),
+            &previous,
+            &target,
+            &should_preserve_checkout_path,
+            ReconciledProjectionOptions::default(),
+            || {},
+            || {},
+            || {},
+            Some(marker),
+            None,
+            || {
+                ProjectionAuthorityCommit::<()>::Indeterminate(KinError::Other(
+                    "retain authenticated WAL for replacement-root test".to_string(),
+                ))
+            },
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("retain authenticated WAL for replacement-root test"));
+        assert_eq!(
+            std::fs::read(root.path().join("compose.yaml")).unwrap(),
+            target_body
+        );
+
+        copy_test_directory(&canonical_kindb, &replacement_kindb);
+        let replacement = RepositoryAuthorityManager::open(
+            initialized.repository_id.clone(),
+            Arc::new(LocalFileBackend::new(&replacement_kindb)),
+        )
+        .unwrap();
+        let replacement_receipt = replacement
+            .commit_repository_transaction(transaction.clone())
+            .unwrap();
+        drop(replacement);
+        std::fs::rename(&canonical_kindb, &detached_kindb).unwrap();
+        std::fs::rename(&replacement_kindb, &canonical_kindb).unwrap();
+
+        let recovery_error = ExactProjectionFreeze::acquire_existing_for_repository_transition(
+            root.path(),
+            &retained,
+        )
+        .unwrap_err();
+        let target_after_rejection = std::fs::read(root.path().join("compose.yaml")).unwrap();
+        let wal_retained = std::fs::read_dir(root.path().join(".kin/reconciliation"))
+            .unwrap()
+            .any(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("tx-")
+            });
+        let detached = RepositoryAuthorityManager::open(
+            initialized.repository_id.clone(),
+            Arc::new(LocalFileBackend::new(&detached_kindb)),
+        )
+        .unwrap();
+        let detached_roots = detached.read_authority().roots().clone();
+        let installed = RepositoryAuthorityManager::open(
+            initialized.repository_id,
+            Arc::new(LocalFileBackend::new(&canonical_kindb)),
+        )
+        .unwrap();
+        let installed_roots = installed.read_authority().roots().clone();
+        drop(installed);
+        drop(detached);
+        std::fs::rename(&canonical_kindb, &replacement_kindb).unwrap();
+        std::fs::rename(&detached_kindb, &canonical_kindb).unwrap();
+
+        assert!(
+            recovery_error
+                .to_string()
+                .contains("changed since this backend opened"),
+            "{recovery_error}"
+        );
+        assert_eq!(target_after_rejection, target_body);
+        assert!(
+            wal_retained,
+            "rejected recovery must leave the WAL untouched"
+        );
+        assert_eq!(detached_roots, roots_before);
+        assert_eq!(installed_roots, replacement_receipt.roots_after);
+    }
+
     #[cfg(any(unix, windows))]
     #[test]
-    fn recovery_keeps_projection_when_exact_authority_operation_committed() {
+    fn replay_recovers_committed_projection_in_projection_then_authority_order() {
         let root = tempfile::tempdir().unwrap();
         let initialized = crate::init(root.path()).unwrap();
         let manager = RepositoryAuthorityManager::open(
@@ -12927,6 +13435,7 @@ mod tests {
             operation_id: transaction.operation_id,
             transaction_hash: transaction.transaction_hash().unwrap(),
         };
+        let replay_transaction = transaction.clone();
         let owned = repo_path("compose.yaml");
         std::fs::write(root.path().join("compose.yaml"), b"services:\n  old: {}\n").unwrap();
         let previous =
@@ -12970,7 +13479,22 @@ mod tests {
                 .to_string_lossy()
                 .starts_with("tx-")));
 
-        drop(ProjectionRoot::open(root.path()).unwrap());
+        let acquisition_order = std::cell::RefCell::new(Vec::new());
+        let (receipt, authority_freeze) =
+            replay_repository_workspace_transaction_and_recover_projection_with_hooks(
+                root.path(),
+                &manager,
+                replay_transaction,
+                || acquisition_order.borrow_mut().push("projection"),
+                || acquisition_order.borrow_mut().push("authority"),
+            )
+            .unwrap();
+        assert_eq!(acquisition_order.into_inner(), ["projection", "authority"]);
+        assert!(matches!(
+            receipt.outcome,
+            RepositoryCommitOutcome::IdempotentReplay
+        ));
+        assert_eq!(authority_freeze.roots(), &receipt.roots_after);
 
         assert_eq!(
             std::fs::read(root.path().join("compose.yaml")).unwrap(),
@@ -12983,6 +13507,129 @@ mod tests {
                 .file_name()
                 .to_string_lossy()
                 .starts_with("tx-")));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn repository_workspace_transition_returns_freeze_that_blocks_competing_writer() {
+        let root = tempfile::tempdir().unwrap();
+        let initialized = crate::init(root.path()).unwrap();
+        let manager = RepositoryAuthorityManager::open(
+            initialized.repository_id.clone(),
+            Arc::new(LocalFileBackend::new(initialized.layout.kindb_dir())),
+        )
+        .unwrap();
+        let lease = manager.read_authority();
+        let roots = lease.roots().clone();
+        let workspace = lease.metadata().workspaces.first().unwrap().clone();
+        drop(lease);
+        assert!(workspace.tree.is_empty());
+
+        let path = repo_path("compose.yaml");
+        let body = b"services:\n  api:\n    image: scratch\n";
+        let entry = exact_blob(body, false);
+        let target_tree = exact_tree(&path, entry);
+        let target_hash = compute_resolved_tree_hash(&target_tree).unwrap();
+        manager
+            .save_source_blob(entry.blob_identity().unwrap(), body)
+            .unwrap();
+        let transaction = RepositoryTransaction {
+            schema_version: REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+            operation_id: OperationId::new(),
+            repository_id: initialized.repository_id.clone(),
+            expected_generation: roots.generation,
+            expected_roots: roots,
+            actor: AuthorId::new("workspace-transition-freeze-test"),
+            reason: "install exact workspace tree while retaining authority".to_string(),
+            external_objects: Vec::new(),
+            git_authority_delta: None,
+            changes: Vec::new(),
+            aliases: Vec::new(),
+            ref_mutations: Vec::new(),
+            default_ref_mutation: None,
+            workspace_mutation: Some(WorkspaceMutation {
+                workspace_id: workspace.workspace_id,
+                expected: WorkspaceExpectation::MustEqual {
+                    generation: workspace.generation,
+                    head: workspace.head.clone(),
+                    base_target: workspace.base_target.clone(),
+                    base_tree_hash: workspace.base_tree_hash,
+                    tree_hash: workspace.tree_hash,
+                    semantic_overlay_hash: workspace.semantic_overlay_hash,
+                    admission_policy: workspace.admission_policy,
+                },
+                new_generation: workspace.generation + 1,
+                new_head: workspace.head.clone(),
+                new_base_target: workspace.base_target.clone(),
+                new_base_tree_hash: workspace.base_tree_hash,
+                tree_deltas: crate::exact_tree_correction(&workspace.tree, &target_tree).unwrap(),
+                new_tree_hash: target_hash,
+                semantic_delta: kin_model::WorkspaceSemanticDelta::default(),
+                new_shared_admission_policy: workspace.shared_admission_policy.clone(),
+                new_admission_policy: workspace.admission_policy,
+            }),
+            local_overlay_delta: None,
+        };
+        let competing_transaction = RepositoryTransaction {
+            operation_id: OperationId::new(),
+            actor: AuthorId::new("competing-workspace-writer"),
+            reason: "compete with retained workspace transition authority".to_string(),
+            ..transaction.clone()
+        };
+        let competing = RepositoryAuthorityManager::open(
+            initialized.repository_id.clone(),
+            Arc::new(LocalFileBackend::new(initialized.layout.kindb_dir())),
+        )
+        .unwrap();
+
+        let (materialized, receipt, authority_freeze) =
+            transition_repository_workspace_tree_and_commit_repository_transaction(
+                root.path(),
+                &workspace.tree,
+                &target_tree,
+                &manager,
+                transaction,
+            )
+            .unwrap();
+        assert_eq!(materialized, 1);
+        assert_eq!(
+            std::fs::read(root.path().join("compose.yaml")).unwrap(),
+            body
+        );
+        assert_eq!(authority_freeze.roots(), &receipt.roots_after);
+        assert_eq!(authority_freeze.authority().roots(), &receipt.roots_after);
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            finished_tx
+                .send(competing.commit_repository_transaction(competing_transaction))
+                .unwrap();
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        assert!(
+            finished_rx
+                .recv_timeout(std::time::Duration::from_millis(200))
+                .is_err(),
+            "a competing repository writer must remain blocked while the returned freeze lives"
+        );
+
+        drop(authority_freeze);
+        finished_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("the competing writer must resume after the transition freeze is dropped")
+            .expect_err("the stale competing writer must lose the successor compare-and-swap");
+        writer.join().unwrap();
+
+        let reopened = RepositoryAuthorityManager::open(
+            initialized.repository_id,
+            Arc::new(LocalFileBackend::new(initialized.layout.kindb_dir())),
+        )
+        .unwrap();
+        assert_eq!(reopened.read_authority().roots(), &receipt.roots_after);
     }
 
     #[cfg(any(unix, windows))]

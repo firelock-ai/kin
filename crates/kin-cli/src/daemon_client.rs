@@ -467,6 +467,91 @@ impl DaemonClient {
         &self.base_url
     }
 
+    /// POST one caller-idempotent JSON command, retrying once with the exact
+    /// same payload when transport or server acknowledgement is ambiguous.
+    ///
+    /// The client owns the daemon auth, build, and ambient session headers, so
+    /// command modules must use this rather than constructing a raw HTTP
+    /// client that silently changes request authority.
+    pub(crate) async fn post_idempotent_json<Req, Resp>(
+        &self,
+        path: &str,
+        payload: &Req,
+        context: &'static str,
+    ) -> Result<Resp>
+    where
+        Req: serde::Serialize + ?Sized,
+        Resp: serde::de::DeserializeOwned,
+    {
+        let url = format!(
+            "{}/{}",
+            self.base_url.trim_end_matches('/'),
+            path.trim_start_matches('/')
+        );
+        let payload = serde_json::to_vec(payload)
+            .with_context(|| format!("encode idempotent daemon request for {path}"))?;
+        let mut last_error = None;
+        for attempt in 0..2 {
+            let response = match self
+                .send(
+                    self.client
+                        .post(&url)
+                        .header(reqwest::header::CONTENT_TYPE, "application/json")
+                        .body(payload.clone()),
+                    context,
+                )
+                .await
+            {
+                Ok(response) => response,
+                Err(error) if attempt == 0 => {
+                    last_error = Some(error);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            if response.status().is_success() {
+                let body = match response.bytes().await {
+                    Ok(body) => body,
+                    Err(error) if attempt == 0 => {
+                        last_error = Some(
+                            anyhow::Error::new(error)
+                                .context(format!("read daemon response body for {path}")),
+                        );
+                        continue;
+                    }
+                    Err(error) => {
+                        return Err(anyhow::Error::new(error)
+                            .context(format!("read daemon response body for {path}")));
+                    }
+                };
+                match serde_json::from_slice(&body) {
+                    Ok(decoded) => return Ok(decoded),
+                    Err(error) if attempt == 0 => {
+                        last_error = Some(
+                            anyhow::Error::new(error)
+                                .context(format!("decode daemon response for {path}")),
+                        );
+                        continue;
+                    }
+                    Err(error) => {
+                        return Err(anyhow::Error::new(error)
+                            .context(format!("decode daemon response for {path}")));
+                    }
+                }
+            }
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            if status.is_server_error() && attempt == 0 {
+                last_error = Some(anyhow::anyhow!(
+                    "daemon command returned HTTP {status}: {body}"
+                ));
+                continue;
+            }
+            anyhow::bail!("daemon command failed (HTTP {status}): {body}");
+        }
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("daemon command produced no response")))
+    }
+
     pub async fn locate(
         &self,
         request: &LocateRequest,
@@ -1061,40 +1146,24 @@ impl DaemonClient {
         &self,
         request: &crate::commands::branch::BranchRequest,
     ) -> Result<crate::commands::branch::BranchResponse> {
-        let resp = self
-            .send(
-                self.client
-                    .post(format!("{}/commands/branch", self.base_url))
-                    .json(request),
-                "send daemon branch request",
-            )
-            .await?;
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            bail!("daemon branch error (HTTP {}): {}", status, body);
-        }
-        resp.json().await.context("parse daemon branch response")
+        self.post_idempotent_json(
+            "/commands/branch",
+            request,
+            "send daemon-owned repository branch request",
+        )
+        .await
     }
 
     pub async fn checkout(
         &self,
         request: &crate::commands::checkout::CheckoutRequest,
     ) -> Result<crate::commands::checkout::CheckoutResponse> {
-        let resp = self
-            .send(
-                self.client
-                    .post(format!("{}/commands/checkout", self.base_url))
-                    .json(request),
-                "send daemon checkout request",
-            )
-            .await?;
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            bail!("daemon checkout error (HTTP {}): {}", status, body);
-        }
-        resp.json().await.context("parse daemon checkout response")
+        self.post_idempotent_json(
+            "/commands/checkout",
+            request,
+            "send daemon-owned exact checkout request",
+        )
+        .await
     }
 
     pub async fn rename(
@@ -2590,6 +2659,75 @@ mod urlencoding {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn idempotent_post_retries_exact_body_with_same_session_authority() {
+        use axum::{body::Bytes, http::StatusCode, routing::post, Router};
+
+        #[derive(Default)]
+        struct ObservedRequests {
+            bodies: Vec<Vec<u8>>,
+            sessions: Vec<Option<String>>,
+        }
+
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(ObservedRequests::default()));
+        let handler_observed = observed.clone();
+        let app = Router::new().route(
+            "/commands/test",
+            post(move |headers: axum::http::HeaderMap, body: Bytes| {
+                let observed = handler_observed.clone();
+                async move {
+                    let mut observed = observed.lock().unwrap();
+                    observed.bodies.push(body.to_vec());
+                    observed.sessions.push(
+                        headers
+                            .get("X-Kin-Session")
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_string),
+                    );
+                    let status = if observed.bodies.len() == 1 {
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    } else {
+                        StatusCode::OK
+                    };
+                    (status, axum::Json(serde_json::json!({"accepted": true})))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = DaemonClient::from_base_url_with_explicit_authority(
+            format!("http://{address}"),
+            Some("checkout-token".to_string()),
+            Some("session-checkout"),
+        )
+        .unwrap();
+        let request = serde_json::json!({
+            "operation_id": "stable-operation",
+            "path_hex": "7372632f6c69622e7273"
+        });
+
+        let response: serde_json::Value = client
+            .post_idempotent_json("/commands/test", &request, "test idempotent post")
+            .await
+            .unwrap();
+        server.abort();
+
+        assert_eq!(response, serde_json::json!({"accepted": true}));
+        let observed = observed.lock().unwrap();
+        assert_eq!(observed.bodies.len(), 2);
+        assert_eq!(observed.bodies[0], observed.bodies[1]);
+        assert_eq!(
+            observed.sessions,
+            vec![
+                Some("session-checkout".to_string()),
+                Some("session-checkout".to_string())
+            ]
+        );
+    }
 
     #[test]
     fn explicit_client_headers_couple_token_and_requested_session_only() {

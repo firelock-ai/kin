@@ -59,6 +59,7 @@ tar = { workspace = true }
 flate2 = { workspace = true }
 zip = { workspace = true }
 reqwest = { workspace = true }
+anyhow = { workspace = true }
 which = "8"
 fs2 = { workspace = true }
 sysinfo = "0.39"

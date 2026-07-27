@@ -128,6 +128,7 @@ async fn run_daemon_trace(
 #[allow(clippy::too_many_arguments)]
 pub fn build_trace_response(
     layout: &kin_core::KinLayout,
+    binding: &kin_core::LocalRepositoryAuthorityBinding,
     graph: &impl GraphStore,
     request: &TraceRequest,
 ) -> Result<TraceResponse> {
@@ -138,6 +139,7 @@ pub fn build_trace_response(
     Ok(TraceResponse {
         lines: build_trace_lines(
             layout,
+            binding,
             graph,
             &request.entity,
             request.compact,
@@ -202,6 +204,7 @@ pub fn build_trace_json_response(
 #[allow(clippy::too_many_arguments)]
 fn build_trace_lines(
     layout: &kin_core::KinLayout,
+    binding: &kin_core::LocalRepositoryAuthorityBinding,
     graph: &impl GraphStore,
     entity: &str,
     compact: bool,
@@ -219,6 +222,7 @@ fn build_trace_lines(
 
     build_trace_lines_with_graph(
         layout,
+        binding,
         graph,
         entity,
         compact,
@@ -263,6 +267,7 @@ pub async fn run_json(
 #[allow(clippy::too_many_arguments)]
 fn build_trace_lines_with_graph(
     layout: &kin_core::KinLayout,
+    binding: &kin_core::LocalRepositoryAuthorityBinding,
     graph: &impl GraphStore,
     entity: &str,
     compact: bool,
@@ -341,7 +346,7 @@ fn build_trace_lines_with_graph(
     }
 
     if let Some(content) =
-        render_entity_source(layout, graph, target, focal_max_lines, snippet_max_chars)?
+        render_entity_source(binding, graph, target, focal_max_lines, snippet_max_chars)?
     {
         if !compact {
             lines.push("\n--- Focal ---".to_string());
@@ -414,7 +419,7 @@ fn build_trace_lines_with_graph(
                     let same_file = dep.file_origin == target.file_origin;
                     if same_file && expanded_same_file < 4 {
                         if let Some(content) = render_neighbor_source(
-                            layout,
+                            binding,
                             graph,
                             &dep,
                             focal_max_lines,
@@ -635,7 +640,7 @@ fn entity_mentions_qualifier(entity: &Entity, qualifier_hint: &str) -> bool {
 }
 
 fn render_entity_source(
-    layout: &kin_core::KinLayout,
+    binding: &kin_core::LocalRepositoryAuthorityBinding,
     graph: &impl GraphStore,
     entity: &Entity,
     max_lines: usize,
@@ -655,7 +660,7 @@ fn render_entity_source(
             span.file.0
         );
     }
-    let bytes = crate::commands::graph::read_entity_file_bytes_from_graph(layout, graph, entity)?;
+    let bytes = crate::commands::graph::read_entity_file_bytes_from_graph(binding, graph, entity)?;
     let start = span.start_byte;
     let end = span.end_byte;
     if start >= end || end > bytes.len() {
@@ -691,13 +696,13 @@ fn display_read_path(_layout: &kin_core::KinLayout, rel_path: &str) -> String {
 }
 
 fn render_neighbor_source(
-    layout: &kin_core::KinLayout,
+    binding: &kin_core::LocalRepositoryAuthorityBinding,
     graph: &impl GraphStore,
     entity: &Entity,
     max_lines: usize,
     max_chars: usize,
 ) -> Result<Option<String>> {
-    let Some(content) = render_entity_source(layout, graph, entity, max_lines, max_chars)? else {
+    let Some(content) = render_entity_source(binding, graph, entity, max_lines, max_chars)? else {
         return Ok(None);
     };
     Ok(Some(format!("// same-file neighbor\n{}", content)))
@@ -814,12 +819,21 @@ mod tests {
         select_best_match, trace_not_found_guidance,
     };
     use kin_core::normalize_trace_name;
-    use kin_db::InMemoryGraph;
+    use kin_db::{InMemoryGraph, LocalFileBackend};
     use kin_model::EntityStore;
     use kin_model::{
         Entity, EntityId, EntityKind, EntityMetadata, EntityRole, FingerprintAlgorithm, Hash256,
-        LanguageId, SemanticFingerprint, Visibility,
+        LanguageId, RepositoryId, SemanticFingerprint, Visibility, WorkspaceId,
     };
+    use std::sync::Arc;
+
+    fn absent_binding(layout: &kin_core::KinLayout) -> kin_core::LocalRepositoryAuthorityBinding {
+        kin_core::LocalRepositoryAuthorityBinding::from_parts(
+            RepositoryId::new("trace-test").unwrap(),
+            WorkspaceId::new(),
+            Arc::new(LocalFileBackend::new(layout.kindb_dir())),
+        )
+    }
 
     #[test]
     fn trace_not_found_guidance_keeps_signal_and_offers_discovery() {
@@ -1026,8 +1040,10 @@ issues.map((iss) => util.finalizeItem(iss, ctx, core.config()));
             Some(layout) => layout,
             None => return,
         };
+        let binding = absent_binding(&layout);
         let response = super::build_trace_response(
             &layout,
+            &binding,
             &graph,
             &super::TraceRequest {
                 entity: "definitelyMissingEntity".to_string(),

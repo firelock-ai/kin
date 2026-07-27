@@ -129,8 +129,11 @@ impl CommandStatusRequest {
     }
 }
 
-pub fn inspect(layout: &kin_core::KinLayout) -> Result<StatusReport> {
-    let authority = ActiveRepositoryAuthority::open(layout)?;
+pub fn inspect(
+    layout: &kin_core::KinLayout,
+    binding: &kin_core::LocalRepositoryAuthorityBinding,
+) -> Result<StatusReport> {
+    let authority = ActiveRepositoryAuthority::open(binding)?;
     let lease = authority.manager().read_authority();
     let metadata = lease.metadata();
     let snapshot = lease.snapshot();
@@ -200,7 +203,8 @@ pub fn run(json: bool) -> Result<()> {
             "not a Kin repository (no .kin/ found)\nhint: run `kin init .` to initialize one"
         )
     })?;
-    let report = inspect(&layout)?;
+    let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&layout)?;
+    let report = inspect(&layout, &binding)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {

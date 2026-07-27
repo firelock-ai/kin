@@ -46,7 +46,7 @@ pub(crate) fn parse_change_id(input: &str) -> Result<SemanticChangeId> {
 
 pub fn resolve_ref<G>(
     graph: &G,
-    layout: &kin_core::KinLayout,
+    binding: &kin_core::LocalRepositoryAuthorityBinding,
     reference: Option<&str>,
 ) -> Result<SemanticChangeId>
 where
@@ -62,7 +62,7 @@ where
     }
 
     let (core, hops) = split_relative_hops(reference)?;
-    let head = resolve_ref_core(graph, layout, reference, core)?;
+    let head = resolve_ref_core(graph, binding, reference, core)?;
     apply_parent_hops(graph, reference, head, &hops)
 }
 
@@ -180,7 +180,7 @@ where
 
 fn resolve_ref_core<G>(
     graph: &G,
-    layout: &kin_core::KinLayout,
+    binding: &kin_core::LocalRepositoryAuthorityBinding,
     original: &str,
     core: &str,
 ) -> Result<SemanticChangeId>
@@ -208,7 +208,7 @@ where
         }
     }
 
-    let authority = ActiveRepositoryAuthority::open(layout).map_err(|error| {
+    let authority = ActiveRepositoryAuthority::open(binding).map_err(|error| {
         ref_error(
             original,
             format!("repository-v6 authority is unavailable: {error:#}"),
@@ -361,9 +361,22 @@ fn name_matches_pattern(name: &str, pattern: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    use kin_db::LocalFileBackend;
     use kin_model::{AuthorId, ChangeOrigin, ChangeStore, SemanticChange, Timestamp};
 
-    fn change(id: SemanticChangeId, parents: Vec<SemanticChangeId>) -> SemanticChange {
+    /// Build a change whose declared identity matches its immutable payload.
+    ///
+    /// Repository authority rejects a change whose id does not recompute from
+    /// its own content, so the identity is derived rather than invented.
+    fn change(parents: Vec<SemanticChangeId>) -> SemanticChange {
+        let mut change = change_with_id(change_id(0), parents);
+        change.id = kin_core::compute_semantic_change_id(&change).unwrap();
+        change
+    }
+
+    fn change_with_id(id: SemanticChangeId, parents: Vec<SemanticChangeId>) -> SemanticChange {
         SemanticChange {
             id,
             origin: ChangeOrigin::Native,
@@ -386,17 +399,28 @@ mod tests {
         SemanticChangeId::from_hash(Hash256::from_bytes([byte; 32]))
     }
 
+    fn absent_binding(layout: &kin_core::KinLayout) -> kin_core::LocalRepositoryAuthorityBinding {
+        kin_core::LocalRepositoryAuthorityBinding::from_parts(
+            kin_model::RepositoryId::new("absent-ref-lookup").unwrap(),
+            kin_model::WorkspaceId::new(),
+            Arc::new(LocalFileBackend::new(layout.kindb_dir())),
+        )
+    }
+
     #[test]
     fn explicit_semantic_change_and_parent_hops_need_no_file_or_git_fallback() {
         let graph = kin_db::InMemoryGraph::new();
-        let parent = change_id(0x21);
-        let head = change_id(0x22);
-        graph.create_change(&change(parent, Vec::new())).unwrap();
-        graph.create_change(&change(head, vec![parent])).unwrap();
+        let parent_change = change(Vec::new());
+        let head_change = change(vec![parent_change.id]);
+        let parent = parent_change.id;
+        let head = head_change.id;
+        graph.create_change(&parent_change).unwrap();
+        graph.create_change(&head_change).unwrap();
         let layout = kin_core::KinLayout::new(std::path::PathBuf::from("/absent/.kin"));
+        let binding = absent_binding(&layout);
 
         assert_eq!(
-            resolve_ref(&graph, &layout, Some(&format!("kin:{head}^"))).unwrap(),
+            resolve_ref(&graph, &binding, Some(&format!("kin:{head}^"))).unwrap(),
             parent
         );
     }
@@ -405,7 +429,8 @@ mod tests {
     fn head_without_repository_authority_is_a_classified_failure() {
         let graph = kin_db::InMemoryGraph::new();
         let layout = kin_core::KinLayout::new(std::path::PathBuf::from("/absent/.kin"));
-        let error = resolve_ref(&graph, &layout, None).unwrap_err();
+        let binding = absent_binding(&layout);
+        let error = resolve_ref(&graph, &binding, None).unwrap_err();
         assert!(is_ref_resolution_error(&error));
         assert!(error.to_string().contains("repository-v6 authority"));
     }
@@ -414,13 +439,21 @@ mod tests {
     fn full_git_oid_is_not_converted_into_a_synthetic_change_id() {
         let graph = kin_db::InMemoryGraph::new();
         let layout = kin_core::KinLayout::new(std::path::PathBuf::from("/absent/.kin"));
+        let binding = absent_binding(&layout);
         let error = resolve_ref(
             &graph,
-            &layout,
+            &binding,
             Some("1111111111111111111111111111111111111111"),
         )
         .unwrap_err();
         assert!(is_ref_resolution_error(&error));
-        assert!(error.to_string().contains("repository-v6 authority"));
+        // The object ID must reach exact alias authority and be refused there.
+        // Silently widening it into a semantic change id would invent history.
+        assert!(
+            error
+                .to_string()
+                .contains("has no imported repository-v6 alias"),
+            "{error:#}"
+        );
     }
 }

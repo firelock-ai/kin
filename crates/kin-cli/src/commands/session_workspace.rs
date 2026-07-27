@@ -162,6 +162,7 @@ impl SessionWorkspaceBase {
 
 pub fn create_session_workspace_from_authority(
     layout: &kin_core::KinLayout,
+    binding: &kin_core::LocalRepositoryAuthorityBinding,
     session_dir: &Path,
     strategy: Option<MaterializeStrategy>,
     scope: Option<&str>,
@@ -183,7 +184,7 @@ pub fn create_session_workspace_from_authority(
     // replacement `.kin`.
     let projection_freeze = kin_core::ExactProjectionFreeze::acquire_existing(layout.working_dir())
         .context("freeze the existing repository projection before creating a session")?;
-    let authority = ActiveRepositoryAuthority::open(layout)?;
+    let authority = ActiveRepositoryAuthority::open(binding)?;
     let (source_workspace, authority_roots) = authority.workspace_with_roots()?;
     let selected_tree = select_materialized_tree(&source_workspace.tree, scope)?;
     let selected_artifacts = selected_tree
@@ -283,6 +284,7 @@ pub fn create_session_workspace_from_authority(
 
 pub fn materialize_session_workspace(
     layout: &kin_core::KinLayout,
+    binding: &kin_core::LocalRepositoryAuthorityBinding,
     request: &SessionWorkspaceRequest,
 ) -> Result<SessionWorkspaceResponse> {
     let strategy = request
@@ -292,8 +294,13 @@ pub fn materialize_session_workspace(
         .transpose()
         .map_err(anyhow::Error::msg)?;
     let root = PathBuf::from(&request.session_dir);
-    let workspace =
-        create_session_workspace_from_authority(layout, &root, strategy, request.scope.as_deref())?;
+    let workspace = create_session_workspace_from_authority(
+        layout,
+        binding,
+        &root,
+        strategy,
+        request.scope.as_deref(),
+    )?;
     Ok(SessionWorkspaceResponse {
         root: workspace.root().display().to_string(),
         strategy: workspace.strategy().to_string(),

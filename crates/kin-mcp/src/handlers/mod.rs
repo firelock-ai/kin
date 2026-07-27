@@ -17,6 +17,8 @@ pub mod sessions;
 pub mod verification;
 pub mod work;
 
+pub use repository_authority::LocalRepositoryAuthorityBinding;
+
 use std::collections::HashMap;
 
 use kin_model::graph::GraphStore;
@@ -33,25 +35,40 @@ pub async fn handle_tool_call<G: GraphStore>(
     store: &G,
     sessions: &SessionRegistry,
     session_authority_mode: SessionAuthorityMode,
+    repository_authority: Option<&LocalRepositoryAuthorityBinding>,
 ) -> Result<ToolCallResult> {
     match tool_name {
         // Exact repository membership and bytes
-        "kin_artifact_list" => artifacts::handle_artifact_list(arguments, store),
-        "kin_artifact_read" => artifacts::handle_artifact_read(arguments, store),
+        "kin_artifact_list" => {
+            artifacts::handle_artifact_list(arguments, store, repository_authority)
+        }
+        "kin_artifact_read" => {
+            artifacts::handle_artifact_read(arguments, store, repository_authority)
+        }
         // Entities
         "semantic_search" => entities::handle_semantic_search(arguments, store),
         "semantic_locate" => entities::handle_semantic_locate(arguments, store),
-        "get_entity" => entities::handle_get_entity(arguments, store),
+        "get_entity" => entities::handle_get_entity(arguments, store, repository_authority),
         "get_entity_source" | "get_entity_body" => {
-            entities::handle_get_entity_source(arguments, store)
+            entities::handle_get_entity_source(arguments, store, repository_authority)
         }
-        "get_entity_sources" => entities::handle_get_entity_sources(arguments, store),
-        "get_context_pack" => entities::handle_get_context_pack(arguments, store, sessions),
-        "trace_computation" => entities::handle_trace_computation(arguments, store, sessions),
+        "get_entity_sources" => {
+            entities::handle_get_entity_sources(arguments, store, repository_authority)
+        }
+        "get_context_pack" => {
+            entities::handle_get_context_pack(arguments, store, sessions, repository_authority)
+        }
+        "trace_computation" => {
+            entities::handle_trace_computation(arguments, store, sessions, repository_authority)
+        }
         "trace_data_flow" => entities::handle_trace_data_flow(arguments, store),
-        "find_references" => entities::handle_find_references(arguments, store).await,
+        "find_references" => {
+            entities::handle_find_references(arguments, store, repository_authority).await
+        }
         "bulk_check_references" => entities::handle_bulk_check_references(arguments, store),
-        "explore_codebase" => entities::handle_explore_codebase(arguments, store),
+        "explore_codebase" => {
+            entities::handle_explore_codebase(arguments, store, repository_authority)
+        }
         "dead_code" => entities::handle_dead_code(arguments, store),
         "find_dead_code_seeded" => entities::handle_find_dead_code_seeded(arguments, store),
         "graph_neighborhood" => entities::handle_graph_neighborhood(arguments, store),
@@ -59,7 +76,9 @@ pub async fn handle_tool_call<G: GraphStore>(
         "semantic_diff" => review::handle_semantic_diff(arguments, store),
         "impact_analysis" => review::handle_impact_analysis(arguments, store, sessions).await,
         "semantic_review" => review::handle_semantic_review(arguments, store, sessions),
-        "shadow_gate_report" => review::handle_shadow_gate_report(arguments, store),
+        "shadow_gate_report" => {
+            review::handle_shadow_gate_report(arguments, store, repository_authority)
+        }
         "entity_history" => review::handle_entity_history(arguments, store),
         // Sessions
         "register_session" => sessions::handle_register_session(arguments, sessions),
@@ -114,7 +133,9 @@ pub async fn handle_tool_call<G: GraphStore>(
         "kin_verify_entity" => verification::handle_verify_entity(arguments, store),
         "kin_coverage_summary" => verification::handle_coverage_summary(store),
         "kin_security_scan" => verification::handle_security_scan(arguments, store),
-        "kin_release_check" => verification::handle_release_check(arguments, store),
+        "kin_release_check" => {
+            verification::handle_release_check(arguments, store, repository_authority)
+        }
         "kin_contract_check" => verification::handle_contract_check(arguments, store),
         // Review mutations (Phase 11)
         "kin_review_create" => review::handle_review_create(arguments, store),
@@ -307,6 +328,11 @@ mod tests {
         );
         let kin_dir = root.join(".kin");
         fs::create_dir_all(&kin_dir).unwrap();
+        fs::write(
+            kin_dir.join("VERSION"),
+            kin_core::layout::KIN_LAYOUT_VERSION.to_string(),
+        )
+        .unwrap();
         kin_core::KinConfig::default()
             .save(&kin_dir.join("config.toml"))
             .unwrap();
@@ -407,6 +433,7 @@ mod tests {
                     base_target: workspace.base_target.clone(),
                     base_tree_hash: workspace.base_tree_hash,
                     tree_hash: workspace.tree_hash,
+                    semantic_overlay_hash: workspace.semantic_overlay_hash,
                     admission_policy: workspace.admission_policy,
                 },
                 new_generation: workspace.generation + 1,
@@ -415,6 +442,11 @@ mod tests {
                 new_base_tree_hash: Some(target_tree_hash),
                 tree_deltas: change.tree_deltas.clone(),
                 new_tree_hash: target_tree_hash,
+                semantic_delta: kin_model::WorkspaceSemanticDelta::new(
+                    change.entity_deltas.clone(),
+                    change.relation_deltas.clone(),
+                )
+                .unwrap(),
                 new_shared_admission_policy: shared_policy,
                 new_admission_policy: admission_policy,
             }),
@@ -552,6 +584,15 @@ mod tests {
             build_exact_test_change(store.entities_by_id.values().cloned().collect(), entries);
         store.changes_by_id.insert(change.id, change.clone());
         initialize_test_repository(root, &change);
+    }
+
+    fn test_repository_authority(
+        root: &std::path::Path,
+    ) -> kin_core::LocalRepositoryAuthorityBinding {
+        let layout = kin_core::KinLayout::discover(root)
+            .expect("test repository authority must be discoverable");
+        kin_core::LocalRepositoryAuthorityBinding::from_layout(&layout)
+            .expect("test repository authority must open")
     }
 
     impl kin_model::graph::EntityStore for EmptyStore {
@@ -1402,6 +1443,7 @@ mod tests {
             &store,
             &sessions,
             SessionAuthorityMode::OfflineFallback,
+            None,
         )
         .await;
         assert!(result.is_err());
@@ -1426,6 +1468,7 @@ mod tests {
             &store,
             &sessions,
             SessionAuthorityMode::OfflineFallback,
+            None,
         )
         .await
         .unwrap();
@@ -1447,6 +1490,7 @@ mod tests {
             &store,
             &sessions,
             SessionAuthorityMode::OfflineFallback,
+            None,
         )
         .await
         .unwrap();
@@ -1461,6 +1505,7 @@ mod tests {
             &store,
             &sessions,
             SessionAuthorityMode::OfflineFallback,
+            None,
         )
         .await
         .unwrap();
@@ -1943,8 +1988,9 @@ mod tests {
             .file_hashes
             .insert(entity.file_origin.clone().unwrap(), source.hash);
         install_empty_store_exact_tree(&mut store, source._dir.path());
+        let authority = test_repository_authority(source._dir.path());
 
-        let value = entity_response_json(&store, entity).unwrap();
+        let value = entity_response_json(&store, entity, Some(&authority)).unwrap();
         let object = value.as_object().unwrap();
         let excerpt = object
             .get("source_excerpt")
@@ -1977,8 +2023,9 @@ mod tests {
             .file_hashes
             .insert(entity.file_origin.clone().unwrap(), source.hash);
         install_empty_store_exact_tree(&mut store, source._dir.path());
+        let authority = test_repository_authority(source._dir.path());
 
-        let value = focal_context_json(&store, &entry, entity, false).unwrap();
+        let value = focal_context_json(&store, &entry, entity, false, Some(&authority)).unwrap();
         let object = value.as_object().unwrap();
         let body = object.get("body").and_then(|value| value.as_str()).unwrap();
 
@@ -2011,8 +2058,9 @@ mod tests {
             .file_hashes
             .insert(entity.file_origin.clone().unwrap(), source.hash);
         install_empty_store_exact_tree(&mut store, source._dir.path());
+        let authority = test_repository_authority(source._dir.path());
 
-        let value = focal_context_json(&store, &entry, entity, false).unwrap();
+        let value = focal_context_json(&store, &entry, entity, false, Some(&authority)).unwrap();
         let object = value.as_object().unwrap();
 
         let marker = object.get("source").and_then(|v| v.as_str()).unwrap();
@@ -2047,8 +2095,9 @@ mod tests {
             .file_hashes
             .insert(entity.file_origin.clone().unwrap(), source.hash);
         install_empty_store_exact_tree(&mut store, source._dir.path());
+        let authority = test_repository_authority(source._dir.path());
 
-        let value = focal_context_json(&store, &entry, entity, false).unwrap();
+        let value = focal_context_json(&store, &entry, entity, false, Some(&authority)).unwrap();
         let object = value.as_object().unwrap();
         let body = object.get("body").and_then(|value| value.as_str()).unwrap();
 
@@ -2160,13 +2209,14 @@ mod tests {
         insert_trace_relation(&mut store, &step, &base_step, RelationKind::Calls);
         insert_trace_relation(&mut store, &base_step, &constant, RelationKind::Imports);
         install_empty_store_exact_tree(&mut store, dir.path());
+        let authority = test_repository_authority(dir.path());
 
         let mut args = HashMap::new();
         args.insert("query".into(), serde_json::json!(entry.name));
         args.insert("strategy".into(), serde_json::json!("trace"));
         args.insert("token_budget".into(), serde_json::json!(8000));
 
-        let result = entities::handle_explore_codebase(&args, &store).unwrap();
+        let result = entities::handle_explore_codebase(&args, &store, Some(&authority)).unwrap();
         let text = match &result.content[0] {
             crate::types::ContentBlock::Text { text } => text.clone(),
         };
@@ -2226,13 +2276,14 @@ mod tests {
         store.entities_by_id.insert(step.id, step.clone());
         store.entities_by_id.insert(constant.id, constant.clone());
         install_empty_store_exact_tree(&mut store, dir.path());
+        let authority = test_repository_authority(dir.path());
 
         let mut args = HashMap::new();
         args.insert("query".into(), serde_json::json!(step.name));
         args.insert("strategy".into(), serde_json::json!("trace"));
         args.insert("token_budget".into(), serde_json::json!(8000));
 
-        let result = entities::handle_explore_codebase(&args, &store).unwrap();
+        let result = entities::handle_explore_codebase(&args, &store, Some(&authority)).unwrap();
         let text = match &result.content[0] {
             crate::types::ContentBlock::Text { text } => text.clone(),
         };
@@ -2356,6 +2407,7 @@ mod tests {
         insert_trace_relation(&mut store, &step2, &step1, RelationKind::Calls);
         insert_trace_relation(&mut store, &step1, &constant, RelationKind::Imports);
         install_empty_store_exact_tree(&mut store, dir.path());
+        let authority = test_repository_authority(dir.path());
 
         let mut args = HashMap::new();
         args.insert(
@@ -2365,7 +2417,7 @@ mod tests {
         args.insert("strategy".into(), serde_json::json!("trace"));
         args.insert("token_budget".into(), serde_json::json!(8000));
 
-        let result = entities::handle_explore_codebase(&args, &store).unwrap();
+        let result = entities::handle_explore_codebase(&args, &store, Some(&authority)).unwrap();
         let text = match &result.content[0] {
             crate::types::ContentBlock::Text { text } => text.clone(),
         };
@@ -2621,6 +2673,7 @@ mod tests {
         let entity = &source.entity;
         let store = InMemoryGraph::default();
         source.install(&store);
+        let authority = test_repository_authority(source._dir.path());
 
         // Deposit via the real add handler against the entity scope.
         let mut add_args = HashMap::new();
@@ -2640,7 +2693,8 @@ mod tests {
         let mut args = HashMap::new();
         args.insert("entity_id".into(), serde_json::json!(entity.id.to_string()));
         args.insert("include_traffic".into(), serde_json::json!(false));
-        let result = entities::handle_get_context_pack(&args, &store, &sessions).unwrap();
+        let result =
+            entities::handle_get_context_pack(&args, &store, &sessions, Some(&authority)).unwrap();
         let text = match &result.content[0] {
             crate::types::ContentBlock::Text { text } => text.clone(),
         };
@@ -2672,12 +2726,14 @@ mod tests {
         let entity = &source.entity;
         let store = InMemoryGraph::default();
         source.install(&store);
+        let authority = test_repository_authority(source._dir.path());
 
         let sessions = SessionRegistry::new();
         let mut args = HashMap::new();
         args.insert("entity_id".into(), serde_json::json!(entity.id.to_string()));
 
-        let result = entities::handle_trace_computation(&args, &store, &sessions).unwrap();
+        let result =
+            entities::handle_trace_computation(&args, &store, &sessions, Some(&authority)).unwrap();
         let text = match &result.content[0] {
             crate::types::ContentBlock::Text { text } => text.clone(),
         };
@@ -2708,12 +2764,14 @@ mod tests {
         let entity = &source.entity;
         let store = InMemoryGraph::default();
         source.install(&store);
+        let authority = test_repository_authority(source._dir.path());
 
         let sessions = SessionRegistry::new();
         let mut args = HashMap::new();
         args.insert("query".into(), serde_json::json!(entity.name.clone()));
 
-        let result = entities::handle_trace_computation(&args, &store, &sessions).unwrap();
+        let result =
+            entities::handle_trace_computation(&args, &store, &sessions, Some(&authority)).unwrap();
         let text = match &result.content[0] {
             crate::types::ContentBlock::Text { text } => text.clone(),
         };
@@ -2732,7 +2790,7 @@ mod tests {
         let sessions = SessionRegistry::new();
         let args = HashMap::new();
 
-        let err = entities::handle_trace_computation(&args, &store, &sessions)
+        let err = entities::handle_trace_computation(&args, &store, &sessions, None)
             .expect_err("missing entity_id and query should error");
         assert!(matches!(err, McpError::InvalidParams(_)));
     }
@@ -3041,6 +3099,7 @@ mod tests {
                 .collect(),
         );
         initialize_test_repository(dir.path(), &authority_change);
+        let authority = test_repository_authority(dir.path());
         assert!(
             store
                 .query_entities(&EntityFilter::default())
@@ -3055,6 +3114,7 @@ mod tests {
                 serde_json::json!(change.id.to_string()),
             )]),
             &store,
+            Some(&authority),
         )
         .unwrap();
         let listed = tool_result_json(list);
@@ -3099,6 +3159,7 @@ mod tests {
                     ),
                 ]),
                 &store,
+                Some(&authority),
             )
             .unwrap(),
         );
@@ -3122,6 +3183,7 @@ mod tests {
                     ),
                 ]),
                 &store,
+                Some(&authority),
             )
             .unwrap(),
         );
@@ -3148,6 +3210,7 @@ mod tests {
                     ),
                 ]),
                 &store,
+                Some(&authority),
             )
             .unwrap(),
         );
@@ -3170,6 +3233,7 @@ mod tests {
                     ),
                 ]),
                 &store,
+                Some(&authority),
             )
             .unwrap(),
         );
@@ -3193,6 +3257,7 @@ mod tests {
                     ),
                 ]),
                 &store,
+                Some(&authority),
             )
             .unwrap(),
         );
@@ -3234,6 +3299,7 @@ mod tests {
         let store = InMemoryGraph::default();
         store.create_change(&change).unwrap();
         initialize_test_repository(dir.path(), &change);
+        let authority = test_repository_authority(dir.path());
         fs::remove_file(test_source_blob_path(dir.path(), missing_hash)).unwrap();
         fs::write(
             dir.path().join("missing.bin"),
@@ -3253,6 +3319,7 @@ mod tests {
                 ),
             ]),
             &store,
+            Some(&authority),
         )
         .expect_err("a graph tree entry with no content-addressed blob must fail");
         assert!(missing_blob.to_string().contains("graph authority gap"));
@@ -3276,6 +3343,7 @@ mod tests {
                 ),
             ]),
             &store,
+            Some(&authority),
         )
         .expect_err("an absent exact path must fail");
         assert!(absent_path.to_string().contains("exact path is absent"));
@@ -3287,6 +3355,7 @@ mod tests {
                 serde_json::json!(unknown_change.to_string()),
             )]),
             &store,
+            Some(&authority),
         )
         .expect_err("an unknown graph head must not produce an empty repository");
         assert!(missing_tree.to_string().contains("graph authority gap"));
@@ -3305,6 +3374,7 @@ mod tests {
         let source = make_source_backed_entity(content);
         let store = InMemoryGraph::default();
         let first_head = source.install(&store);
+        let authority = test_repository_authority(source._dir.path());
         let old_path = kin_model::RepoPath::from_utf8("validate.ts").unwrap();
         let renamed_path = kin_model::RepoPath::from_utf8("src/renamed.ts").unwrap();
         let old_entry =
@@ -3334,7 +3404,8 @@ mod tests {
         store.create_change(&rename).unwrap();
         advance_test_repository(source._dir.path(), &rename);
 
-        let renamed_source = entity_response_json(&store, &renamed_entity).unwrap();
+        let renamed_source =
+            entity_response_json(&store, &renamed_entity, Some(&authority)).unwrap();
         assert_eq!(
             renamed_source["artifact_id"],
             serde_json::to_value(source.artifact_id).unwrap()
@@ -3361,6 +3432,7 @@ mod tests {
                     ),
                 ]),
                 &store,
+                Some(&authority),
             )
             .unwrap(),
         );
@@ -3392,7 +3464,7 @@ mod tests {
         store.create_change(&reuse).unwrap();
         advance_test_repository(source._dir.path(), &reuse);
 
-        let error = entity_response_json(&store, &renamed_entity)
+        let error = entity_response_json(&store, &renamed_entity, Some(&authority))
             .expect_err("an old entity revision must not read a replacement artifact");
         assert!(error
             .to_string()
@@ -3408,6 +3480,7 @@ mod tests {
                     ),
                 ]),
                 &store,
+                Some(&authority),
             )
             .unwrap(),
         );
@@ -3474,8 +3547,9 @@ mod tests {
         store.entities_by_id.insert(entity.id, entity.clone());
         store.file_hashes.insert(file_id, hash);
         install_empty_store_exact_tree(&mut store, dir.path());
+        let authority = test_repository_authority(dir.path());
 
-        let value = entity_response_json(&store, &entity).unwrap();
+        let value = entity_response_json(&store, &entity, Some(&authority)).unwrap();
         let object = value.as_object().unwrap();
         let excerpt = object
             .get("source_excerpt")
@@ -3550,11 +3624,12 @@ mod tests {
         store.entities_by_id.insert(entity.id, entity.clone());
         store.file_hashes.insert(file_id, graph_hash);
         install_empty_store_exact_tree(&mut store, dir.path());
+        let authority = test_repository_authority(dir.path());
         fs::remove_file(test_source_blob_path(dir.path(), graph_hash)).unwrap();
 
         let before_misses = GRAPH_MISS_COUNT.load(std::sync::atomic::Ordering::SeqCst);
 
-        let error = entity_response_json(&store, &entity)
+        let error = entity_response_json(&store, &entity, Some(&authority))
             .expect_err("a missing graph blob must fail the MCP read loudly");
         let message = error.to_string();
         assert!(
@@ -3631,6 +3706,7 @@ mod tests {
         store.entities_by_id.insert(entity.id, entity.clone());
         store.file_hashes.insert(file_id, correct_hash);
         install_empty_store_exact_tree(&mut store, dir.path());
+        let authority = test_repository_authority(dir.path());
         fs::write(
             test_source_blob_path(dir.path(), correct_hash),
             b"corrupt content",
@@ -3639,7 +3715,7 @@ mod tests {
 
         let before_misses = GRAPH_MISS_COUNT.load(std::sync::atomic::Ordering::SeqCst);
 
-        let error = entity_response_json(&store, &entity)
+        let error = entity_response_json(&store, &entity, Some(&authority))
             .expect_err("a corrupt graph blob must fail the MCP read loudly");
         let message = error.to_string();
         assert!(
@@ -3756,18 +3832,24 @@ mod tests {
         let dir = tempdir().unwrap();
         initialize_release_test_repository(dir.path(), store);
         let _guard = EnvVarGuard::set("KIN_SOURCE_ROOT", dir.path());
-        verification::handle_release_check(args, store)
+        let layout = kin_core::KinLayout::discover(dir.path()).unwrap();
+        let authority = kin_core::LocalRepositoryAuthorityBinding::from_layout(&layout).unwrap();
+        verification::handle_release_check(args, store, Some(&authority))
     }
 
-    pub(super) fn with_empty_test_repository<T>(call: impl FnOnce() -> T) -> T {
+    pub(super) fn with_empty_test_repository<T>(
+        call: impl FnOnce(&kin_core::LocalRepositoryAuthorityBinding) -> T,
+    ) -> T {
         let _lock = ENV_MUTEX
             .get_or_init(|| Mutex::new(()))
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let dir = tempdir().unwrap();
-        kin_core::init(dir.path()).unwrap();
+        let init = kin_core::init(dir.path()).unwrap();
         let _guard = EnvVarGuard::set("KIN_SOURCE_ROOT", dir.path());
-        call()
+        let authority =
+            kin_core::LocalRepositoryAuthorityBinding::from_layout(&init.layout).unwrap();
+        call(&authority)
     }
 
     async fn call_release_check_with_args(
@@ -4015,6 +4097,7 @@ mod tests {
             &store,
             &sessions,
             SessionAuthorityMode::OfflineFallback,
+            None,
         )
         .await
         .unwrap();
@@ -4045,6 +4128,7 @@ mod tests {
             &store,
             &sessions,
             SessionAuthorityMode::OfflineFallback,
+            None,
         )
         .await
         .unwrap();

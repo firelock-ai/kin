@@ -523,13 +523,18 @@ pub async fn lease(
 pub(crate) async fn load_push_plan(requested_remote: Option<&str>) -> Result<PushPlanContext> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&layout)?;
     let config = KinConfig::load_or_default(&layout.config_path())?;
     let remote = resolve_remote(&config, requested_remote)?;
     let fallback_org_id = std::env::var("KIN_ORG_ID")
         .ok()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| "kin-open-core".to_string());
-    let fallback_repo_id = resolve_repo_id(&layout)?;
+    let fallback_repo_id = std::env::var("KIN_REPO_ID")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| binding.repository_id().as_str().to_string());
     let native_target = if remote.transport == RemoteTransportKind::NativeKin {
         Some(resolve_native_remote_target(
             remote.url.as_deref(),
@@ -552,7 +557,7 @@ pub(crate) async fn load_push_plan(requested_remote: Option<&str>) -> Result<Pus
         crate::backend::open_snapshot_explicit_admin_read_only(&layout, "kin remote").await?;
     let graph = &*snap.graph();
     let authority =
-        crate::commands::repository_authority::ActiveRepositoryAuthority::open(&layout)?;
+        crate::commands::repository_authority::ActiveRepositoryAuthority::open(&binding)?;
     let workspace = authority.workspace()?;
     let branch_name = match &workspace.head {
         kin_model::WorkspaceHead::Symbolic { target } => target.to_string(),

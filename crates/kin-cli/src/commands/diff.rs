@@ -140,11 +140,11 @@ impl EndpointState {
 }
 
 pub fn inspect(
-    layout: &kin_core::KinLayout,
+    binding: &kin_core::LocalRepositoryAuthorityBinding,
     base: Option<&str>,
     head: Option<&str>,
 ) -> Result<DiffReport> {
-    let authority = ActiveRepositoryAuthority::open(layout)?;
+    let authority = ActiveRepositoryAuthority::open(binding)?;
     let lease = authority.manager().read_authority();
     let metadata = lease.metadata();
     let workspace = metadata
@@ -592,7 +592,8 @@ fn summarize(
 pub fn run(base: Option<String>, head: Option<String>, json: bool) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let report = inspect(&layout, base.as_deref(), head.as_deref())?;
+    let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&layout)?;
+    let report = inspect(&binding, base.as_deref(), head.as_deref())?;
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
@@ -604,10 +605,10 @@ pub fn run(base: Option<String>, head: Option<String>, json: bool) -> Result<()>
 }
 
 pub fn build_diff_response(
-    layout: &kin_core::KinLayout,
+    binding: &kin_core::LocalRepositoryAuthorityBinding,
     request: &DiffRequest,
 ) -> Result<DiffResponse> {
-    let report = inspect(layout, request.base.as_deref(), request.head.as_deref())?;
+    let report = inspect(binding, request.base.as_deref(), request.head.as_deref())?;
     Ok(DiffResponse {
         lines: render_lines(&report),
         report: Some(report),

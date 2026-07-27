@@ -36,11 +36,14 @@
     },
     {
       "command": "commit",
-      "status": "ready",
-      "exposure": "enabled",
-      "authority": "repository-v6 transaction and compare-and-swap ref publication",
+      "status": "open_gate",
+      "exposure": "fail_closed",
+      "authority": "sealed exact-workspace observation consumed by repository-v6 transaction and compare-and-swap ref publication",
       "required_for_bounded_dogfood": true,
       "acceptance_spec": [
+        "retain a non-fabricable complete workspace observation and its directory capabilities through final authority publication",
+        "bind the observed path manifest, exact admission policy, source CAS closure, prior tree, roots, and generation into one commit transaction without replanning against newer authority",
+        "reject an unconfirmed mass deletion as a whole observation without publishing simultaneous additions, modifications, policy changes, or graph state",
         "commit exact workspace tree deltas and semantic deltas in one repository transaction",
         "preserve all unsupported-language and non-code artifacts, modes, symlinks, gitlinks, and byte-exact paths",
         "publish the target ref with generation and root-bundle compare-and-swap and no raw-filesystem rebuild"
@@ -52,7 +55,7 @@
         "kin_core::tree::tests::repository_projection_covers_materializable_entries_and_preserves_gitlinks",
         "kin_core::tree::tests::repository_projection_rejects_gitlink_transition_before_namespace_mutation"
       ],
-      "note": "The daemon serializes explicit filesystem admission, complete graph-owned artifact coverage, exact projection verification, semantic change creation, workspace base, and ref publication through repository-v6 authority."
+      "note": "Exact artifact representation and repository transaction publication are implemented, but the ambient scanner currently drops its completion proof before publication, can replan a stale desired tree against newer authority, and can partially publish around the mass-deletion guard."
     },
     {
       "command": "log",
@@ -213,13 +216,23 @@
       "command": "checkout",
       "status": "open_gate",
       "exposure": "fail_closed",
-      "authority": "repository-v6 exact tree and source CAS",
-      "required_for_bounded_dogfood": false,
+      "authority": "daemon-private repository-v6 exact tree, semantic graph, source CAS, and crash-recoverable projection transaction",
+      "required_for_bounded_dogfood": true,
       "acceptance_spec": [
-        "resolve an artifact from an immutable tree and publish a graph-derived projection without .kin/objects"
+        "resolve a selected immutable change through startup-pinned repository and workspace identity without Git or legacy object fallback",
+        "verify complete selected tree, semantic graph, and source CAS closure before one projection and authority transaction",
+        "preserve every unsupported-language and non-code artifact, executable bit, symlink, gitlink, opaque binary, and host-unrepresentable byte path in graph authority while materializing only host-representable entries",
+        "reject every session-scoped request before mutation and preserve independently dirty unselected paths",
+        "replay the exact caller-stable operation across same-daemon and restart crash gaps without advancing authority twice"
       ],
-      "evidence_tests": [],
-      "note": "The old checkout executor still opens the removed legacy blob directory."
+      "evidence_tests": [
+        "kin_daemon::api::tests::command_checkout_projects_universal_selected_tree_and_replays_exactly",
+        "kin_daemon::api::tests::command_checkout_persists_same_tree_semantics_and_replays_after_restart",
+        "kin_daemon::api::tests::command_checkout_rejects_unknown_unscoped_and_expired_sessions_without_mutation",
+        "kin_daemon::api::tests::command_checkout_returns_typed_bad_request_and_conflict_statuses",
+        "kin_daemon::api::tests::command_checkout_projection_only_repairs_universal_bytes_and_replays_after_restart"
+      ],
+      "note": "The daemon-private checkout boundary and its exact replay tests are complete, but exposure remains fail-closed until kin-db retains and revalidates the selected repository authority subtree—not only the top-level storage root—across the daemon process lifetime."
     },
     {
       "command": "push",
@@ -271,11 +284,14 @@
     },
     {
       "command": "reconcile",
-      "status": "ready",
-      "exposure": "enabled",
-      "authority": "repository-v6 explicit ingestion boundary",
+      "status": "open_gate",
+      "exposure": "fail_closed",
+      "authority": "sealed exact-session observation consumed by repository-v6 explicit ingestion boundary",
       "required_for_bounded_dogfood": false,
       "acceptance_spec": [
+        "retain the session root capability and a non-fabricable observation seal through final namespace revalidation and authority commit",
+        "bind exact policy, exclusions, complete source CAS closure, prior roots, and generation into the consumed observation",
+        "reject an unconfirmed mass deletion atomically without admitting simultaneous additions or modifications",
         "admit an explicitly observed projection delta into exact workspace authority with complete artifact identities and source CAS",
         "never answer semantic queries or silently repair authority from raw files"
       ],
@@ -283,7 +299,7 @@
         "api::tests::reconcile_endpoint_admits_complete_exact_session_tree_and_replays",
         "api::tests::reconcile_rejects_control_aliases_special_members_and_stale_bases"
       ],
-      "note": "Full disposable-session membership is admitted through a caller-stable repository-v6 workspace transaction and projection WAL; scoped sessions stay fail-closed pending an external capability seal, and optional parser enrichment is reported separately."
+      "note": "The session scanner already performs retained-root double observation and authority-root CAS, but its public observation DTO drops the retained capability before planning and remains fabricable outside the scanner."
     },
     {
       "command": "conflicts",

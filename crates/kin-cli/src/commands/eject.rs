@@ -32,9 +32,10 @@ pub async fn run(yes: bool) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&cwd)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository"))?;
     ensure_real_directory(layout.root(), "Kin metadata")?;
+    let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&layout)?;
     refuse_live_vfs(&layout)?;
 
-    let authority = ActiveRepositoryAuthority::open(&layout)?;
+    let authority = ActiveRepositoryAuthority::open(&binding)?;
     let captured = capture_export_snapshot(&authority)?;
     let proof = WorkspaceProjectionProof::build(&authority, &captured.workspace.tree)?;
     {
@@ -70,7 +71,7 @@ pub async fn run(yes: bool) -> Result<()> {
     let final_projection_freeze =
         kin_core::ExactProjectionFreeze::acquire_existing(layout.working_dir())
             .context("freeze the existing working projection for eject handoff")?;
-    let reopened = ActiveRepositoryAuthority::open(&layout)
+    let reopened = ActiveRepositoryAuthority::open(&binding)
         .context("reopen repository-v6 authority after daemon shutdown")?;
     let authority_freeze = reopened
         .manager()

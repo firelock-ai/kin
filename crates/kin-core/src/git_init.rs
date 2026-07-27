@@ -17,11 +17,12 @@ use kin_git::{
     GitLocalIgnoreSourceKind, GitMigrationPreflightProof, LosslessGitRepository,
 };
 use kin_model::{
-    compute_resolved_tree_hash, AdmissionCase, AuthorId, EffectiveAdmissionPolicyStamp,
-    ExternalObjectId, ExternalObjectKind, FrozenLocalOverlay, FrozenLocalOverlayDelta,
-    GitExternalAuthorityDelta, GitMaterialHead, Hash256, LocalAdmissionRuleSource,
-    LocalAdmissionRuleSourceKind, LocatedEntry, OperationId, RepositoryId, RepositoryTransaction,
-    TreeDelta, WorkspaceExpectation, WorkspaceMutation,
+    compute_resolved_tree_hash, AdmissionCase, AuthorId, ChangeStore,
+    EffectiveAdmissionPolicyStamp, ExternalObjectId, ExternalObjectKind, FrozenLocalOverlay,
+    FrozenLocalOverlayDelta, GitExternalAuthorityDelta, GitMaterialHead, Hash256,
+    LocalAdmissionRuleSource, LocalAdmissionRuleSourceKind, LocatedEntry, OperationId,
+    RepositoryId, RepositoryTransaction, TreeDelta, WorkspaceExpectation, WorkspaceMutation,
+    WorkspaceSemanticDelta,
 };
 use tracing::info;
 
@@ -404,6 +405,7 @@ fn bind_workspace_authority(
         shared: workspace_policy.stamp(),
         local: local_overlay.stamp(),
     };
+    let semantic_delta = imported_workspace_semantic_delta(transaction, &workspace_seed)?;
     transaction.workspace_mutation = Some(WorkspaceMutation {
         workspace_id,
         expected: WorkspaceExpectation::MustNotExist,
@@ -413,11 +415,58 @@ fn bind_workspace_authority(
         new_base_tree_hash: workspace_seed.base_tree_hash,
         tree_deltas,
         new_tree_hash: tree_hash,
+        semantic_delta,
         new_shared_admission_policy: workspace_policy,
         new_admission_policy: effective_policy,
     });
     transaction.local_overlay_delta = Some(FrozenLocalOverlayDelta::initialize(local_overlay));
     Ok(())
+}
+
+fn imported_workspace_semantic_delta(
+    transaction: &RepositoryTransaction,
+    workspace_seed: &kin_git::GitWorkspaceSeed,
+) -> Result<WorkspaceSemanticDelta> {
+    let Some(base_target) = &workspace_seed.base_target else {
+        return Ok(WorkspaceSemanticDelta::default());
+    };
+    let change_id = match base_target {
+        kin_model::RefTarget::Change { change_id } => *change_id,
+        kin_model::RefTarget::ExternalObject { object } => transaction
+            .aliases
+            .iter()
+            .find(|alias| alias.oid == object.oid)
+            .map(|alias| alias.change_id)
+            .ok_or_else(|| {
+                KinError::Other(format!(
+                    "Git workspace base {} has no semantic change alias in its bootstrap transaction",
+                    object.oid
+                ))
+            })?,
+        kin_model::RefTarget::Symbolic { .. } => {
+            return Err(KinError::Other(
+                "Git workspace bootstrap base must be resolved before semantic admission"
+                    .to_string(),
+            ))
+        }
+    };
+
+    let graph = kin_db::InMemoryGraph::new();
+    for change in &transaction.changes {
+        graph.create_change(change).map_err(|error| {
+            KinError::Other(format!("stage imported semantic history: {error}"))
+        })?;
+    }
+    let target = graph.resolve_graph_at(&change_id).map_err(|error| {
+        KinError::Other(format!("resolve imported workspace semantics: {error}"))
+    })?;
+    crate::diff_workspace_semantics(
+        &Default::default(),
+        &Default::default(),
+        &target.entities,
+        &target.relations,
+    )
+    .map_err(|error| KinError::Other(format!("derive imported workspace semantics: {error}")))
 }
 
 fn frozen_local_overlay(
@@ -1067,6 +1116,10 @@ mod tests {
             .args(args)
             .current_dir(repository)
             .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env(
+                "GIT_CONFIG_GLOBAL",
+                repository.join(".kin-test-global-gitconfig"),
+            )
             .output()
             .unwrap();
         assert!(
@@ -1083,6 +1136,10 @@ mod tests {
             .args(args)
             .current_dir(repository)
             .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env(
+                "GIT_CONFIG_GLOBAL",
+                repository.join(".kin-test-global-gitconfig"),
+            )
             .output()
             .unwrap();
         assert!(

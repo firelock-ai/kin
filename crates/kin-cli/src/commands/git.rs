@@ -104,8 +104,9 @@ pub fn export(output: PathBuf) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let layout = kin_core::KinLayout::discover(&cwd)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&layout)?;
     let output = validate_export_destination(&layout, &cwd, &output)?;
-    let authority = ActiveRepositoryAuthority::open(&layout)?;
+    let authority = ActiveRepositoryAuthority::open(&binding)?;
     let captured = capture_export_snapshot(&authority)?;
     let mut source = RepositorySource::new(&authority);
     let result = kin_git::export_repository_to_git(&captured.plan, &mut source, &output)

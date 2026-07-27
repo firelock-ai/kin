@@ -87,7 +87,7 @@ impl Default for RepositoryTransferLimits {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RepositoryTransferStatus {
     pub schema_version: u32,
@@ -244,7 +244,7 @@ pub enum RepositoryTransferApplyOutcome {
     IdempotentReplay,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RepositoryTransferReceipt {
     pub schema_version: u32,

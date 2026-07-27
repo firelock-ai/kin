@@ -78,10 +78,10 @@ impl SupportJson {
 }
 
 pub fn inspect_support_graph(
-    layout: &kin_core::KinLayout,
+    binding: &kin_core::LocalRepositoryAuthorityBinding,
     graph: &kin_db::InMemoryGraph,
 ) -> Result<SupportJson> {
-    let health = super::graph_health::inspect_graph(layout, graph)?;
+    let health = super::graph_health::inspect_graph(binding, graph)?;
     let stats = graph.graph_stats();
     Ok(SupportJson::from_parts(&stats, health))
 }

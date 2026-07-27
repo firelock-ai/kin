@@ -173,25 +173,25 @@ fn print_graph_response(response: GraphCommandResponse) -> Result<()> {
 }
 
 pub fn execute_graph_command(
-    layout: &kin_core::KinLayout,
+    binding: &kin_core::LocalRepositoryAuthorityBinding,
     graph: &kin_db::InMemoryGraph,
     request: &GraphCommandRequest,
 ) -> Result<GraphCommandResponse> {
     match request {
-        GraphCommandRequest::Status => build_graph_status_response(layout, graph),
-        GraphCommandRequest::Validate => build_graph_validate_response(layout, graph),
+        GraphCommandRequest::Status => build_graph_status_response(binding, graph),
+        GraphCommandRequest::Validate => build_graph_validate_response(binding, graph),
         GraphCommandRequest::Inspect { name } => build_graph_inspect_response(graph, name),
         GraphCommandRequest::Source { entity } => {
-            build_graph_source_response(layout, graph, entity)
+            build_graph_source_response(binding, graph, entity)
         }
     }
 }
 
 fn build_graph_status_response(
-    layout: &kin_core::KinLayout,
+    binding: &kin_core::LocalRepositoryAuthorityBinding,
     graph: &kin_db::InMemoryGraph,
 ) -> Result<GraphCommandResponse> {
-    let health = inspect_graph(layout, graph)?;
+    let health = inspect_graph(binding, graph)?;
 
     let entities = graph.list_all_entities()?;
     let entity_count = entities.len();
@@ -363,10 +363,10 @@ fn build_graph_status_response(
 }
 
 fn build_graph_validate_response(
-    layout: &kin_core::KinLayout,
+    binding: &kin_core::LocalRepositoryAuthorityBinding,
     graph: &kin_db::InMemoryGraph,
 ) -> Result<GraphCommandResponse> {
-    let health = inspect_graph(layout, graph)?;
+    let health = inspect_graph(binding, graph)?;
 
     // Validation needs the complete relation table, including corrupt edges
     // whose source and destination are both absent. Entity-rooted traversal
@@ -622,7 +622,7 @@ fn graph_entity_not_found_lines(name: &str) -> Vec<String> {
 /// daemon MCP path consumes this directly so those cases surface distinctly to
 /// agents instead of collapsing into one opaque message.
 pub fn build_entity_source_outcome(
-    layout: &kin_core::KinLayout,
+    binding: &kin_core::LocalRepositoryAuthorityBinding,
     graph: &kin_db::InMemoryGraph,
     entity_query: &str,
 ) -> Result<EntitySourceOutcome> {
@@ -651,16 +651,16 @@ pub fn build_entity_source_outcome(
         )));
     }
 
-    let record = graph_source_record(layout, graph, &entity)?;
+    let record = graph_source_record(binding, graph, &entity)?;
     Ok(EntitySourceOutcome::Found(record))
 }
 
 pub fn build_graph_source_response(
-    layout: &kin_core::KinLayout,
+    binding: &kin_core::LocalRepositoryAuthorityBinding,
     graph: &kin_db::InMemoryGraph,
     entity_query: &str,
 ) -> Result<GraphCommandResponse> {
-    match build_entity_source_outcome(layout, graph, entity_query)? {
+    match build_entity_source_outcome(binding, graph, entity_query)? {
         EntitySourceOutcome::Found(record) => {
             let mut lines = vec![
                 format!(
@@ -745,7 +745,7 @@ fn resolve_source_entity(
 }
 
 fn graph_source_record(
-    layout: &kin_core::KinLayout,
+    binding: &kin_core::LocalRepositoryAuthorityBinding,
     graph: &kin_db::InMemoryGraph,
     entity: &Entity,
 ) -> Result<GraphSourceRecord> {
@@ -757,7 +757,7 @@ fn graph_source_record(
         .span
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("entity '{}' has no source span", entity.name))?;
-    let bytes = read_entity_file_bytes_from_graph(layout, graph, entity)?;
+    let bytes = read_entity_file_bytes_from_graph(binding, graph, entity)?;
     if span.start_byte >= span.end_byte {
         anyhow::bail!(
             "entity '{}' has an empty or invalid source span ({}..{})",
@@ -801,7 +801,7 @@ fn graph_source_record(
 }
 
 pub(crate) fn read_entity_file_bytes_from_graph(
-    layout: &kin_core::KinLayout,
+    binding: &kin_core::LocalRepositoryAuthorityBinding,
     _graph: &impl GraphStore,
     entity: &Entity,
 ) -> Result<Vec<u8>> {
@@ -815,7 +815,7 @@ pub(crate) fn read_entity_file_bytes_from_graph(
             file_id.0
         )
     })?;
-    let authority = super::repository_authority::ActiveRepositoryAuthority::open(layout)?;
+    let authority = super::repository_authority::ActiveRepositoryAuthority::open(binding)?;
     let workspace = authority.workspace()?;
     let artifact = workspace.tree.artifact_at_path(&path).ok_or_else(|| {
         anyhow::anyhow!(
@@ -954,27 +954,24 @@ mod tests {
 
     fn graph_validation_fixture() -> (
         tempfile::TempDir,
-        kin_core::KinLayout,
+        kin_core::LocalRepositoryAuthorityBinding,
         kin_db::InMemoryGraph,
     ) {
         let temp = tempfile::tempdir().unwrap();
-        let kin_root = temp.path().join(".kin");
-        fs::create_dir_all(&kin_root).unwrap();
-        (
-            temp,
-            kin_core::KinLayout::new(kin_root),
-            kin_db::InMemoryGraph::new(),
-        )
+        let initialized = kin_core::init(temp.path()).unwrap();
+        let binding =
+            kin_core::LocalRepositoryAuthorityBinding::from_layout(&initialized.layout).unwrap();
+        (temp, binding, kin_db::InMemoryGraph::new())
     }
 
     #[test]
     fn graph_validate_accepts_external_import_placeholder_destination() {
-        let (_temp, layout, graph) = graph_validation_fixture();
+        let (_temp, binding, graph) = graph_validation_fixture();
         let (caller, relation) = external_placeholder_relation(RelationKind::Calls);
         graph.upsert_entity(&caller).unwrap();
         graph.upsert_relation(&relation).unwrap();
 
-        let response = build_graph_validate_response(&layout, &graph).unwrap();
+        let response = build_graph_validate_response(&binding, &graph).unwrap();
 
         assert!(response.error.is_none(), "{:?}", response.lines);
         assert!(response
@@ -985,7 +982,7 @@ mod tests {
 
     #[test]
     fn graph_validate_rejects_unmarked_dangling_destination() {
-        let (_temp, layout, graph) = graph_validation_fixture();
+        let (_temp, binding, graph) = graph_validation_fixture();
         let caller = test_entity("run_task");
         graph.upsert_entity(&caller).unwrap();
         graph
@@ -996,7 +993,7 @@ mod tests {
             ))
             .unwrap();
 
-        let response = build_graph_validate_response(&layout, &graph).unwrap();
+        let response = build_graph_validate_response(&binding, &graph).unwrap();
 
         assert!(response.error.is_some(), "{:?}", response.lines);
         assert!(response
@@ -1007,7 +1004,7 @@ mod tests {
 
     #[test]
     fn graph_validate_rejects_relation_with_both_endpoints_absent() {
-        let (_temp, layout, graph) = graph_validation_fixture();
+        let (_temp, binding, graph) = graph_validation_fixture();
         graph
             .upsert_relation(&test_relation(
                 RelationKind::References,
@@ -1016,7 +1013,7 @@ mod tests {
             ))
             .unwrap();
 
-        let response = build_graph_validate_response(&layout, &graph).unwrap();
+        let response = build_graph_validate_response(&binding, &graph).unwrap();
 
         assert!(response.error.is_some(), "{:?}", response.lines);
         assert!(response
@@ -1031,11 +1028,11 @@ mod tests {
 
     #[test]
     fn graph_validate_rejects_missing_source_on_canonical_external_placeholder() {
-        let (_temp, layout, graph) = graph_validation_fixture();
+        let (_temp, binding, graph) = graph_validation_fixture();
         let (_caller, relation) = external_placeholder_relation(RelationKind::References);
         graph.upsert_relation(&relation).unwrap();
 
-        let response = build_graph_validate_response(&layout, &graph).unwrap();
+        let response = build_graph_validate_response(&binding, &graph).unwrap();
 
         assert!(response.error.is_some(), "{:?}", response.lines);
         assert!(response
@@ -1066,6 +1063,7 @@ mod tests {
     struct GraphSourceFixture {
         _temp: tempfile::TempDir,
         layout: kin_core::KinLayout,
+        binding: kin_core::LocalRepositoryAuthorityBinding,
         graph: kin_db::InMemoryGraph,
         file_id: FilePathId,
     }
@@ -1102,8 +1100,9 @@ mod tests {
         git(&["commit", "-m", "seed exact source authority"]);
         let init = kin_core::init_from_git(&repo).unwrap();
         let layout = init.layout;
+        let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&layout).unwrap();
         let authority =
-            crate::commands::repository_authority::ActiveRepositoryAuthority::open(&layout)
+            crate::commands::repository_authority::ActiveRepositoryAuthority::open(&binding)
                 .unwrap();
         let mut resolved_tree = authority.workspace().unwrap().tree;
         if source.is_none() {
@@ -1122,6 +1121,7 @@ mod tests {
         GraphSourceFixture {
             _temp: temp,
             layout,
+            binding,
             graph,
             file_id,
         }
@@ -1160,7 +1160,7 @@ mod tests {
         commit_source_entity(&fixture, &entity);
 
         let response =
-            build_graph_source_response(&fixture.layout, &fixture.graph, &id.to_string()).unwrap();
+            build_graph_source_response(&fixture.binding, &fixture.graph, &id.to_string()).unwrap();
         let source = response.source.unwrap();
 
         assert_eq!(source.body, body);
@@ -1183,7 +1183,7 @@ mod tests {
         )
         .unwrap();
         let response =
-            build_graph_source_response(&fixture.layout, &fixture.graph, &id.to_string()).unwrap();
+            build_graph_source_response(&fixture.binding, &fixture.graph, &id.to_string()).unwrap();
         assert_eq!(response.source.unwrap().body, "fn target() {}");
     }
 
@@ -1196,7 +1196,7 @@ mod tests {
         let id = entity.id;
         commit_source_entity(&fixture, &entity);
 
-        let err = build_graph_source_response(&fixture.layout, &fixture.graph, &id.to_string())
+        let err = build_graph_source_response(&fixture.binding, &fixture.graph, &id.to_string())
             .unwrap_err()
             .to_string();
 
@@ -1214,7 +1214,7 @@ mod tests {
         let id = entity.id;
         commit_source_entity(&fixture, &entity);
 
-        let err = build_graph_source_response(&fixture.layout, &fixture.graph, &id.to_string())
+        let err = build_graph_source_response(&fixture.binding, &fixture.graph, &id.to_string())
             .unwrap_err()
             .to_string();
 
@@ -1236,7 +1236,8 @@ mod tests {
         let id = entity.id;
         commit_source_entity(&fixture, &entity);
 
-        match build_entity_source_outcome(&fixture.layout, &fixture.graph, &id.to_string()).unwrap()
+        match build_entity_source_outcome(&fixture.binding, &fixture.graph, &id.to_string())
+            .unwrap()
         {
             EntitySourceOutcome::Found(record) => assert_eq!(record.body, body),
             other => panic!("expected Found, got {other:?}"),
@@ -1248,7 +1249,7 @@ mod tests {
         let fixture = graph_source_fixture(Some(b"fn x() {}\n"));
         let invented = uuid::Uuid::new_v4();
 
-        match build_entity_source_outcome(&fixture.layout, &fixture.graph, &invented.to_string())
+        match build_entity_source_outcome(&fixture.binding, &fixture.graph, &invented.to_string())
             .unwrap()
         {
             EntitySourceOutcome::NotFound(message) => {
@@ -1270,7 +1271,8 @@ mod tests {
         let id = entity.id;
         fixture.graph.upsert_entity(&entity).unwrap();
 
-        match build_entity_source_outcome(&fixture.layout, &fixture.graph, &id.to_string()).unwrap()
+        match build_entity_source_outcome(&fixture.binding, &fixture.graph, &id.to_string())
+            .unwrap()
         {
             EntitySourceOutcome::NoSource(message) => {
                 assert!(message.contains("target"), "{message}");
@@ -1287,7 +1289,7 @@ mod tests {
 
         let invented = uuid::Uuid::new_v4();
         let not_found =
-            build_entity_source_outcome(&fixture.layout, &fixture.graph, &invented.to_string())
+            build_entity_source_outcome(&fixture.binding, &fixture.graph, &invented.to_string())
                 .unwrap();
 
         let mut spanless = source_entity("target", fixture.file_id.clone(), 0, 8);
@@ -1295,7 +1297,7 @@ mod tests {
         let spanless_id = spanless.id;
         fixture.graph.upsert_entity(&spanless).unwrap();
         let no_source =
-            build_entity_source_outcome(&fixture.layout, &fixture.graph, &spanless_id.to_string())
+            build_entity_source_outcome(&fixture.binding, &fixture.graph, &spanless_id.to_string())
                 .unwrap();
 
         let (nf, ns) = match (not_found, no_source) {
@@ -1314,7 +1316,7 @@ mod tests {
         let invented = uuid::Uuid::new_v4();
 
         let response =
-            build_graph_source_response(&fixture.layout, &fixture.graph, &invented.to_string())
+            build_graph_source_response(&fixture.binding, &fixture.graph, &invented.to_string())
                 .unwrap();
 
         assert!(response.source.is_none());

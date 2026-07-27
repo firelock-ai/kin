@@ -9,12 +9,15 @@ use std::time::{Duration, Instant};
 
 use kin_blobs::{BlobError, BlobStore};
 use kin_core::KinLayout;
-use kin_db::{LocalFileBackend, RepositoryAuthorityManager, StorageBackend};
+use kin_db::{
+    LocalFileBackend, LocalRepositoryAuthorityFreeze, RepositoryAuthorityManager, StorageBackend,
+};
 #[cfg(test)]
 use kin_model::ChangeStore;
 use kin_model::{
-    EntityId, EntityStore, FilePathId, Hash256, RepoPath, RepositoryId, ResolvedTree,
-    SemanticChange, SemanticChangeId, TreeEntry, WorkspaceId,
+    EntityId, EntityStore, FilePathId, Hash256, OperationId, RepoPath, RepositoryCommitReceipt,
+    RepositoryId, ResolvedTree, SemanticChange, SemanticChangeId, TransactionDelta, TreeEntry,
+    WorkspaceId,
 };
 use kin_projection::ProjectionState;
 use kin_reconcile::Reconciler;
@@ -481,6 +484,14 @@ pub enum DaemonEvent {
         old_root_hash: Option<String>,
         new_root_hash: String,
     },
+    /// Repository-v6 authority advanced, even when the derived graph root did
+    /// not (for example, a ref-only create/delete).
+    RepositoryAuthorityChanged {
+        repository_id: String,
+        operation_id: OperationId,
+        previous_generation: u64,
+        new_generation: u64,
+    },
     /// Durable coordination lifecycle event, appended before broadcast.
     Coordination { event: CoordinationEventEnvelope },
 }
@@ -608,6 +619,17 @@ struct SpineGraphCapture {
     relations: Vec<kin_model::Relation>,
 }
 
+/// One local sibling repository capability frozen while the daemon starts.
+///
+/// Lazy spine initialization may load graph bytes later, but it must never
+/// rediscover a mutable registry path, manifest, or storage root from a request
+/// handler. The binding retains the exact backend root identity observed here.
+#[derive(Clone)]
+struct RegisteredLocalRepositoryAuthority {
+    repo_id: String,
+    binding: kin_core::LocalRepositoryAuthorityBinding,
+}
+
 /// Outcome of ingesting one repo's graph into the spine from durable storage.
 ///
 /// Returned by [`DaemonState::ingest_repo_into_spine`] and surfaced by the
@@ -642,21 +664,6 @@ pub struct SpineRefreshOutcome {
     pub repos_refreshed: usize,
     /// Total cross-repo edges in the spine after the refresh pass.
     pub cross_repo_edges: usize,
-}
-
-/// Exact graph identity for a materialized committed VFS tree.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct VfsTreeCacheKey {
-    pub head: Option<SemanticChangeId>,
-    pub version: u64,
-}
-
-/// Graph-derived file tree and timestamps shared by the VFS endpoints.
-#[derive(Debug)]
-pub(crate) struct VfsTreeSnapshot {
-    pub key: VfsTreeCacheKey,
-    pub files: Arc<HashMap<FilePathId, kin_model::TreeEntry>>,
-    pub timestamps: Arc<HashMap<FilePathId, u64>>,
 }
 
 /// One detached graph mutation batch that has not yet been acknowledged by
@@ -697,10 +704,6 @@ impl Drop for GraphPersistenceAttempt<'_> {
 enum SnapshotSaveMode {
     Incremental,
     Full,
-    /// Recover an earlier request whose graph mutation is already visible in
-    /// memory. Persist a full snapshot only when authority is still pending;
-    /// otherwise finish an already-committed generation without advancing it.
-    Retry,
 }
 
 fn exact_source_storage_error(message: impl Into<String>) -> DaemonError {
@@ -753,13 +756,6 @@ fn validate_exact_source_bytes(
     })
 }
 
-#[cfg(test)]
-#[derive(Debug, Clone)]
-pub(crate) struct VfsTreeBuildTestHook {
-    pub materialized: Arc<std::sync::Barrier>,
-    pub resume: Arc<std::sync::Barrier>,
-}
-
 #[derive(Default)]
 struct GraphAuthorityClock {
     /// Serializes writer publication with the one-time spine visibility edge.
@@ -779,6 +775,12 @@ struct GraphAuthorityClock {
 /// fail-closed until the last batch finishes.
 pub(crate) struct GraphAuthorityMutationGuard {
     clock: Arc<GraphAuthorityClock>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LocalRepositoryFinalization {
+    pub graph_changed: bool,
+    pub generation_advanced: bool,
 }
 
 impl Drop for GraphAuthorityMutationGuard {
@@ -831,6 +833,17 @@ pub struct DaemonState {
     /// `None` = local repository-v6 authority.
     /// `Some` = hosted StorageBackend (GCS or an isolated backend fixture).
     pub storage_backend: Option<Arc<dyn StorageBackend>>,
+    /// Startup-opened local storage capability. Reusing this exact backend
+    /// preserves KinDB's device/inode root pin across every local authority
+    /// request; constructing a new backend from the mutable path would bless a
+    /// swapped `.kin/kindb` namespace.
+    local_repository_backend: Option<Arc<LocalFileBackend>>,
+    /// Local sibling capabilities captured from registry configuration at
+    /// startup. The lazy spine loader may open only these retained bindings.
+    registered_local_repository_authorities: Vec<RegisteredLocalRepositoryAuthority>,
+    /// Startup registry/binding gaps prevent a complete local spine claim even
+    /// when every retained sibling that remains can be loaded.
+    registered_local_repository_authority_incomplete: bool,
     /// Frozen startup policy for deployments whose graph backend is the only
     /// write authority. When true, no filesystem/session/VFS compatibility
     /// surface may reconcile bytes back into graph truth.
@@ -841,33 +854,20 @@ pub struct DaemonState {
     /// read index have not both been durably finalized yet. A save with no new
     /// graph mutations still retries this work.
     post_commit_finalization_pending: AtomicBool,
-    /// Subscriber invalidation that must wait for durable authority and its
-    /// local generation/index artifacts to finalize. Multiple mutations before
-    /// recovery coalesce because one root invalidation refreshes subscribers to
-    /// the latest durable graph.
-    pending_persistence_event: Mutex<Option<DaemonEvent>>,
     #[cfg(test)]
     finalization_fail_once: AtomicBool,
-    #[cfg(test)]
-    snapshot_save_fail_once: AtomicBool,
     /// Deterministic crash seam after exact MCP repository authority commits
     /// but before the derived graph and terminal transaction state install.
     #[cfg(test)]
     pub(crate) mcp_fail_after_authority_once: AtomicBool,
+    /// Deterministic crash seam after a branch repository CAS but before the
+    /// daemon installs its derived graph/generation cursor.
+    #[cfg(test)]
+    pub(crate) repository_command_fail_after_authority_once: AtomicBool,
     /// Monotonically increasing version counter for VFS cache invalidation.
     /// Incremented on every graph mutation (reconcile, commit, overlay update).
     /// Unlike entity_count, this never decreases on deletions.
     pub vfs_version: AtomicU64,
-    /// Materialized committed VFS view keyed by exact graph head + monotonic version.
-    /// Endpoint handlers never return this entry unless its key still matches live graph truth.
-    pub(crate) vfs_tree_cache: std::sync::RwLock<Option<Arc<VfsTreeSnapshot>>>,
-    /// Single-flight coordinator for cold VFS materialization. Waiters recheck the cache after
-    /// acquiring this lock, so one exact head/version is replayed at most once.
-    pub(crate) vfs_tree_build_lock: tokio::sync::Mutex<()>,
-    #[cfg(test)]
-    pub(crate) vfs_tree_build_count: AtomicU64,
-    #[cfg(test)]
-    pub(crate) vfs_tree_build_test_hook: std::sync::Mutex<Option<VfsTreeBuildTestHook>>,
     /// Broadcast channel for SSE invalidation events.
     /// Subscribers (VFS daemon, spine, KinLab) receive real-time notifications.
     pub event_tx: tokio::sync::broadcast::Sender<DaemonEvent>,
@@ -1026,6 +1026,46 @@ pub(crate) fn graph_collapse_is_wipe(current: u64, baseline: u64) -> bool {
 }
 
 impl DaemonState {
+    /// Workspace identity pinned when this local daemon opened repository
+    /// authority. Mutation routes must use this instead of reparsing a mutable
+    /// working-copy manifest.
+    pub(crate) fn local_repository_workspace_id(&self) -> Option<WorkspaceId> {
+        self.cached_workspace_id
+    }
+
+    /// Clone the startup-pinned local storage capability.
+    pub(crate) fn local_repository_backend(&self) -> Option<Arc<LocalFileBackend>> {
+        self.local_repository_backend.as_ref().map(Arc::clone)
+    }
+
+    /// Clone the complete repository identity/storage capability pinned when
+    /// this local daemon started. Daemon-owned CLI and MCP helpers must receive
+    /// this binding explicitly instead of rediscovering mutable control files.
+    pub(crate) fn local_repository_authority_binding(
+        &self,
+    ) -> std::result::Result<kin_core::LocalRepositoryAuthorityBinding, DaemonError> {
+        let repository_id = RepositoryId::new(self.cached_repo_id.clone()).map_err(|error| {
+            DaemonError::Graph(kin_db::KinDbError::StorageError(format!(
+                "daemon startup repository identity is invalid: {error}"
+            )))
+        })?;
+        let workspace_id = self.local_repository_workspace_id().ok_or_else(|| {
+            DaemonError::Graph(kin_db::KinDbError::StorageError(
+                "local daemon is missing its startup workspace binding".to_string(),
+            ))
+        })?;
+        let backend = self.local_repository_backend().ok_or_else(|| {
+            DaemonError::Graph(kin_db::KinDbError::StorageError(
+                "local daemon is missing its startup storage capability".to_string(),
+            ))
+        })?;
+        Ok(kin_core::LocalRepositoryAuthorityBinding::from_parts(
+            repository_id,
+            workspace_id,
+            backend,
+        ))
+    }
+
     /// Begin one entity/relation authority mutation batch.
     ///
     /// The first epoch edge is published before callers touch the graph; the
@@ -1267,6 +1307,76 @@ impl DaemonState {
         Ok(hydrated.len())
     }
 
+    /// Freeze local sibling authority capabilities before the daemon becomes
+    /// externally visible.
+    ///
+    /// Registry and manifest reads are startup configuration IO. Request-time
+    /// spine initialization receives only retained identity/storage bindings,
+    /// so a registry edit or storage-root replacement cannot silently change
+    /// the daemon's authority set.
+    fn pin_registered_local_repository_authorities(
+        layout: &KinLayout,
+    ) -> (Vec<RegisteredLocalRepositoryAuthority>, bool) {
+        let registry = match kin_core::registry::KinRegistry::load() {
+            Ok(registry) => registry,
+            Err(error) => {
+                error!(
+                    error = %error,
+                    "registry authority refused at daemon startup; local spine authority will remain incomplete"
+                );
+                return (Vec::new(), true);
+            }
+        };
+        let current_kin_root = layout
+            .root()
+            .canonicalize()
+            .unwrap_or_else(|_| layout.root().to_path_buf());
+        let mut pinned = Vec::new();
+        let mut incomplete = false;
+
+        for repo in registry.repos {
+            let repo_root = repo
+                .path
+                .canonicalize()
+                .unwrap_or_else(|_| repo.path.clone());
+            if repo_root == current_kin_root || current_kin_root.starts_with(&repo_root) {
+                continue;
+            }
+
+            let sibling_layout = KinLayout::new(repo.path.join(".kin"));
+            let binding =
+                match kin_core::LocalRepositoryAuthorityBinding::from_layout(&sibling_layout) {
+                    Ok(binding) => binding,
+                    Err(error) => {
+                        incomplete = true;
+                        warn!(
+                            repo_id = %repo.id,
+                            path = %repo.path.display(),
+                            error = %error,
+                            "sibling repository authority could not be pinned at daemon startup"
+                        );
+                        continue;
+                    }
+                };
+            if binding.repository_id().as_str() != repo.id {
+                incomplete = true;
+                warn!(
+                    repo_id = %repo.id,
+                    path = %repo.path.display(),
+                    manifest_repo_id = %binding.repository_id(),
+                    "registry repository identity does not match startup-pinned manifest authority"
+                );
+                continue;
+            }
+            pinned.push(RegisteredLocalRepositoryAuthority {
+                repo_id: repo.id,
+                binding,
+            });
+        }
+
+        (pinned, incomplete)
+    }
+
     /// Open local daemon state with a repository identity already resolved by
     /// the process entrypoint. Local overrides must name the manifest's exact
     /// authority; they cannot rebind one workspace to another repository.
@@ -1318,9 +1428,14 @@ impl DaemonState {
                 "invalid repository identity in manifest: {error}"
             )))
         })?;
+        let local_repository_backend = Arc::new(LocalFileBackend::new(layout.kindb_dir()));
+        let (
+            registered_local_repository_authorities,
+            registered_local_repository_authority_incomplete,
+        ) = Self::pin_registered_local_repository_authorities(&layout);
         let authority = RepositoryAuthorityManager::open(
             repository_id.clone(),
-            Arc::new(LocalFileBackend::new(layout.kindb_dir())),
+            Arc::clone(&local_repository_backend),
         )
         .map_err(DaemonError::Graph)?;
         let lease = authority.read_authority();
@@ -1413,25 +1528,21 @@ impl DaemonState {
             is_initialized: AtomicBool::new(loaded_snapshot),
             reconciliation_status: AtomicU8::new(RECON_IDLE),
             storage_backend: None,
+            local_repository_backend: Some(local_repository_backend),
+            registered_local_repository_authorities,
+            registered_local_repository_authority_incomplete,
             filesystem_reconcile_disabled: AtomicBool::new(
                 crate::loop_runner::filesystem_reconcile_disabled_at_startup(false),
             ),
             snapshot_generation: AtomicU64::new(generation),
             post_commit_finalization_pending: AtomicBool::new(false),
-            pending_persistence_event: Mutex::new(None),
             #[cfg(test)]
             finalization_fail_once: AtomicBool::new(false),
             #[cfg(test)]
-            snapshot_save_fail_once: AtomicBool::new(false),
-            #[cfg(test)]
             mcp_fail_after_authority_once: AtomicBool::new(false),
+            #[cfg(test)]
+            repository_command_fail_after_authority_once: AtomicBool::new(false),
             vfs_version: AtomicU64::new(persisted_vfs_version),
-            vfs_tree_cache: std::sync::RwLock::new(None),
-            vfs_tree_build_lock: tokio::sync::Mutex::new(()),
-            #[cfg(test)]
-            vfs_tree_build_count: AtomicU64::new(0),
-            #[cfg(test)]
-            vfs_tree_build_test_hook: std::sync::Mutex::new(None),
             event_tx: tokio::sync::broadcast::channel(256).0,
             session_scopes: RwLock::new(HashMap::new()),
             spine: std::sync::OnceLock::new(),
@@ -1578,25 +1689,21 @@ impl DaemonState {
             is_initialized: AtomicBool::new(loaded_snapshot),
             reconciliation_status: AtomicU8::new(RECON_IDLE),
             storage_backend: Some(Arc::from(backend)),
+            local_repository_backend: None,
+            registered_local_repository_authorities: Vec::new(),
+            registered_local_repository_authority_incomplete: false,
             filesystem_reconcile_disabled: AtomicBool::new(
                 crate::loop_runner::filesystem_reconcile_disabled_at_startup(true),
             ),
             snapshot_generation: AtomicU64::new(generation),
             post_commit_finalization_pending: AtomicBool::new(false),
-            pending_persistence_event: Mutex::new(None),
             #[cfg(test)]
             finalization_fail_once: AtomicBool::new(false),
             #[cfg(test)]
-            snapshot_save_fail_once: AtomicBool::new(false),
-            #[cfg(test)]
             mcp_fail_after_authority_once: AtomicBool::new(false),
+            #[cfg(test)]
+            repository_command_fail_after_authority_once: AtomicBool::new(false),
             vfs_version: AtomicU64::new(persisted_vfs_version),
-            vfs_tree_cache: std::sync::RwLock::new(None),
-            vfs_tree_build_lock: tokio::sync::Mutex::new(()),
-            #[cfg(test)]
-            vfs_tree_build_count: AtomicU64::new(0),
-            #[cfg(test)]
-            vfs_tree_build_test_hook: std::sync::Mutex::new(None),
             event_tx: tokio::sync::broadcast::channel(256).0,
             session_scopes: RwLock::new(HashMap::new()),
             spine: std::sync::OnceLock::new(),
@@ -1779,7 +1886,8 @@ impl DaemonState {
         ))
     }
 
-    /// Lazily initialize the spine from the loaded graph and global registry.
+    /// Lazily initialize the spine from the loaded graph and startup-pinned
+    /// sibling authority capabilities.
     /// Called by `ensure_spine()` on first access. Thread-safe via `OnceLock`.
     ///
     /// Backend selection:
@@ -1792,37 +1900,21 @@ impl DaemonState {
     }
 
     fn load_registered_workspace_graph(
-        repository_path: &std::path::Path,
-        expected_repository_id: &str,
+        binding: &kin_core::LocalRepositoryAuthorityBinding,
     ) -> std::result::Result<Arc<kin_db::InMemoryGraph>, String> {
-        let layout = KinLayout::new(repository_path.join(".kin"));
-        layout
-            .check_version()
-            .map_err(|error| format!("validate sibling Kin layout: {error}"))?;
-        let manifest = kin_core::manifest::KinManifest::load(&layout.manifest_path())
-            .map_err(|error| format!("load sibling manifest: {error}"))?;
-        if manifest.repo_id != expected_repository_id {
-            return Err(format!(
-                "registry repository id {expected_repository_id} does not match manifest authority {}",
-                manifest.repo_id
-            ));
-        }
-        let repository_id = RepositoryId::new(manifest.repo_id)
-            .map_err(|error| format!("parse sibling repository identity: {error}"))?;
-        let workspace_uuid = uuid::Uuid::parse_str(&manifest.workspace_id)
-            .map_err(|error| format!("parse sibling workspace identity: {error}"))?;
-        let workspace_id = WorkspaceId::from_uuid(workspace_uuid);
-        let authority = RepositoryAuthorityManager::open(
-            repository_id,
-            Arc::new(LocalFileBackend::new(layout.kindb_dir())),
-        )
-        .map_err(|error| format!("open sibling repository authority: {error}"))?;
+        let authority = binding.open_manager().map_err(|error| {
+            format!("open startup-pinned sibling repository authority: {error}")
+        })?;
         let lease = authority.read_authority();
         let snapshot = lease
-            .workspace_graph_snapshot(&workspace_id)
+            .workspace_graph_snapshot(&binding.workspace_id())
             .map_err(|error| format!("materialize sibling workspace authority: {error}"))?
             .ok_or_else(|| {
-                format!("sibling repository authority has no manifest workspace {workspace_id}")
+                format!(
+                    "sibling repository {} authority has no startup-pinned workspace {}",
+                    binding.repository_id(),
+                    binding.workspace_id()
+                )
             })?;
         kin_db::InMemoryGraph::from_snapshot(snapshot)
             .map(Arc::new)
@@ -1857,78 +1949,47 @@ impl DaemonState {
             }
         };
         let mut captures = vec![primary];
-        let mut authority_incomplete = false;
+        let mut authority_incomplete = self.registered_local_repository_authority_incomplete;
 
-        // Capture sibling repos from the global registry. Each sibling is
-        // materialized from one repository-v6 workspace lease; no raw snapshot
-        // compatibility file participates. The detached graph still goes
-        // through exact live-root validation. A bad sibling is omitted as
-        // advisory data and prevents a completeness claim.
-        match kin_core::registry::KinRegistry::load() {
-            Ok(registry) => {
-                let cwd_canonical = self
-                    .layout
-                    .root()
-                    .canonicalize()
-                    .unwrap_or_else(|_| self.layout.root().to_path_buf());
+        // Capture only sibling capabilities frozen during startup. Lazy
+        // initialization may load graph bytes, but cannot rediscover registry
+        // paths, manifests, or storage roots from a request.
+        for registered in &self.registered_local_repository_authorities {
+            let sibling_id = registered.repo_id.clone();
+            let binding = registered.binding.clone();
+            let loaded = std::thread::Builder::new()
+                .name(format!("spine-load-{sibling_id}"))
+                .spawn(move || Self::load_registered_workspace_graph(&binding))
+                .map_err(|error| format!("spawn sibling authority load: {error}"))
+                .and_then(|handle| {
+                    handle
+                        .join()
+                        .map_err(|_| "sibling authority loader panicked".to_string())
+                })
+                .and_then(|result| result);
 
-                for repo in &registry.repos {
-                    let repo_canonical = repo
-                        .path
-                        .canonicalize()
-                        .unwrap_or_else(|_| repo.path.clone());
-                    if repo_canonical == cwd_canonical || cwd_canonical.starts_with(&repo_canonical)
-                    {
-                        continue;
-                    }
-
-                    let sibling_path = repo.path.clone();
-                    let sibling_id = repo.id.clone();
-                    let loaded = std::thread::Builder::new()
-                        .name(format!("spine-load-{}", repo.id))
-                        .spawn(move || {
-                            Self::load_registered_workspace_graph(&sibling_path, &sibling_id)
-                        })
-                        .map_err(|error| format!("spawn sibling authority load: {error}"))
-                        .and_then(|handle| {
-                            handle
-                                .join()
-                                .map_err(|_| "sibling authority loader panicked".to_string())
-                        })
-                        .and_then(|result| result);
-
-                    let sibling_graph = match loaded {
-                        Ok(graph) => graph,
-                        Err(load_error) => {
-                            authority_incomplete = true;
-                            warn!(
-                                repo_id = %repo.id,
-                                path = %repo.path.display(),
-                                error = %load_error,
-                                "sibling workspace authority could not be loaded; spine authority will remain incomplete"
-                            );
-                            continue;
-                        }
-                    };
-                    match self.capture_spine_repo(&repo.id, sibling_graph) {
-                        Ok(capture) => captures.push(capture),
-                        Err(capture_error) => {
-                            authority_incomplete = true;
-                            warn!(
-                                repo_id = %repo.id,
-                                error = %capture_error,
-                                "sibling graph capture failed; spine authority will remain incomplete"
-                            );
-                        }
-                    }
+            let sibling_graph = match loaded {
+                Ok(graph) => graph,
+                Err(load_error) => {
+                    authority_incomplete = true;
+                    warn!(
+                        repo_id = %registered.repo_id,
+                        error = %load_error,
+                        "startup-pinned sibling workspace authority could not be loaded; spine authority will remain incomplete"
+                    );
+                    continue;
                 }
-            }
-            Err(load_error) => {
-                authority_incomplete = true;
-                error!(
-                    error = %load_error,
-                    "registry authority refused; spine authority will remain incomplete"
-                );
+            };
+            match self.capture_spine_repo(&registered.repo_id, sibling_graph) {
+                Ok(capture) => captures.push(capture),
+                Err(capture_error) => {
+                    authority_incomplete = true;
+                    warn!(
+                        repo_id = %registered.repo_id,
+                        error = %capture_error,
+                        "sibling graph capture failed; spine authority will remain incomplete"
+                    );
+                }
             }
         }
 
@@ -2654,17 +2715,24 @@ impl DaemonState {
     /// daemon restarts and kin-vfs clients don't see a reset to 0.
     /// Also marks the graph as dirty for background persistence.
     pub fn bump_version(&self) {
+        self.advance_vfs_version(true);
+    }
+
+    /// Invalidate projection/VFS readers without claiming graph mutation.
+    ///
+    /// Projection-only checkout repair changes the physical compatibility view
+    /// while repository authority and the derived graph remain byte-for-byte
+    /// identical. It still retires cached VFS materialization, but must not arm
+    /// graph persistence or emit a synthetic graph-root change.
+    pub(crate) fn invalidate_projection(&self) {
+        self.advance_vfs_version(false);
+    }
+
+    fn advance_vfs_version(&self, graph_mutated: bool) {
         let v = self.vfs_version.fetch_add(1, Ordering::SeqCst) + 1;
-        // Retire the old materialization at the same publication boundary. Requests that
-        // already cloned it may finish against the pre-mutation head; every request that
-        // observes the new version must rebuild or reuse a snapshot with the new key.
-        let mut cache = self
-            .vfs_tree_cache
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *cache = None;
-        drop(cache);
-        self.mark_dirty();
+        if graph_mutated {
+            self.mark_dirty();
+        }
         // Persist asynchronously — don't block the mutation path.
         let path = self.layout.root().join("vfs_version");
         let _ = std::fs::write(&path, v.to_string());
@@ -2829,54 +2897,6 @@ impl DaemonState {
         }
     }
 
-    /// Delay an invalidation until the graph authority commit and its local
-    /// derived artifacts have finalized. One pending event is sufficient to
-    /// make subscribers refresh to the latest graph, so concurrent mutations
-    /// coalesce instead of producing stale intermediate notifications.
-    fn queue_persistence_event(&self, event: DaemonEvent) {
-        let mut pending = self
-            .pending_persistence_event
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if pending.is_none() {
-            *pending = Some(event);
-        }
-    }
-
-    fn emit_pending_persistence_event(&self) {
-        let event = self
-            .pending_persistence_event
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        if let Some(event) = event {
-            self.emit_event(event);
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn fail_next_finalization_for_test(&self) {
-        self.finalization_fail_once.store(true, Ordering::SeqCst);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn fail_next_snapshot_save_for_test(&self) {
-        self.snapshot_save_fail_once.store(true, Ordering::SeqCst);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn persistence_event_is_queued_for_test(&self) -> bool {
-        self.pending_persistence_event
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_some()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn emit_pending_persistence_event_for_test(&self) {
-        self.emit_pending_persistence_event();
-    }
-
     /// Save the current graph via the storage backend (CAS write).
     ///
     /// Returns the new generation on success. Fails if another writer
@@ -2886,32 +2906,11 @@ impl DaemonState {
     /// `.kin/kindb/head-generation` so CLI and MCP processes can detect
     /// when their loaded snapshot is stale (P2-2.7).
     pub fn save_snapshot(&self) -> Result<()> {
-        self.save_snapshot_impl(SnapshotSaveMode::Incremental, None)
-    }
-
-    /// Finalize durable authority and publish `event` only after the generation
-    /// containing the caller's mutation has finalized. Local repository-v6
-    /// mutations are already committed; hosted backends commit here. Queueing
-    /// under `persist_lock` keeps older finalization from consuming the event.
-    pub(crate) fn save_snapshot_with_event(&self, event: DaemonEvent) -> Result<()> {
-        self.save_snapshot_impl(SnapshotSaveMode::Incremental, Some(event))
+        self.save_snapshot_impl(SnapshotSaveMode::Incremental)
     }
 
     pub fn save_snapshot_full(&self) -> Result<()> {
-        self.save_snapshot_impl(SnapshotSaveMode::Full, None)
-    }
-
-    pub(crate) fn save_snapshot_full_with_event(&self, event: DaemonEvent) -> Result<()> {
-        self.save_snapshot_impl(SnapshotSaveMode::Full, Some(event))
-    }
-
-    /// Complete persistence for a request whose identical graph change and
-    /// branch head are already visible in memory. A failure before the prior
-    /// authority commit leaves graph deltas pending and therefore requires a
-    /// full snapshot. A failure after the authority commit leaves only local
-    /// finalization pending and must not create a second generation.
-    pub(crate) fn retry_snapshot_authority_with_event(&self, event: DaemonEvent) -> Result<()> {
-        self.save_snapshot_impl(SnapshotSaveMode::Retry, Some(event))
+        self.save_snapshot_impl(SnapshotSaveMode::Full)
     }
 
     /// Whether derived embedding progress may be checkpointed in a local
@@ -3157,6 +3156,135 @@ impl DaemonState {
         Ok(())
     }
 
+    /// Install one already-durable local repository receipt into the daemon's
+    /// derived graph and generation cursor.
+    ///
+    /// Callers must hold `coordination_gate`, `persist_lock`, and one
+    /// `GraphAuthorityMutationGuard` across both the repository CAS and this
+    /// method. The complete delta must have been constructed and preflighted
+    /// before that irreversible CAS. This method revalidates it against the
+    /// still-live graph so a replay heals the authority/daemon crash gap without
+    /// absorbing an unrelated later generation.
+    pub(crate) fn finalize_local_repository_commit(
+        &self,
+        receipt: &RepositoryCommitReceipt,
+        authority_freeze: &LocalRepositoryAuthorityFreeze,
+        delta: &TransactionDelta,
+        expected_previous_tree: &ResolvedTree,
+        desired_tree: &ResolvedTree,
+    ) -> Result<LocalRepositoryFinalization> {
+        receipt.validate().map_err(DaemonError::from)?;
+        if self.storage_backend.is_some() {
+            return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
+                "local repository receipt cannot finalize on hosted graph authority".to_string(),
+            )));
+        }
+        if receipt.repository_id.as_str() != self.cached_repo_id {
+            return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
+                format!(
+                    "repository receipt belongs to {}, not daemon repository {}",
+                    receipt.repository_id, self.cached_repo_id
+                ),
+            )));
+        }
+
+        if authority_freeze.roots() != &receipt.roots_after {
+            return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
+                "repository finalization freeze is not bound to the committed receipt roots"
+                    .to_string(),
+            )));
+        }
+        let workspace_id = self.cached_workspace_id.ok_or_else(|| {
+            DaemonError::Graph(kin_db::KinDbError::StorageError(
+                "local daemon is missing its startup workspace binding".to_string(),
+            ))
+        })?;
+        let authority_snapshot = authority_freeze
+            .authority()
+            .workspace_graph_snapshot(&workspace_id)
+            .map_err(DaemonError::from)?
+            .ok_or_else(|| {
+                DaemonError::Graph(kin_db::KinDbError::StorageError(format!(
+                    "frozen repository authority has no workspace {workspace_id}"
+                )))
+            })?;
+        let authority_graph =
+            kin_db::InMemoryGraph::from_snapshot(authority_snapshot).map_err(DaemonError::from)?;
+        if authority_graph.resolved_tree() != *desired_tree {
+            return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
+                format!(
+                    "repository receipt generation {} does not resolve to the desired tree",
+                    receipt.generation
+                ),
+            )));
+        }
+
+        let live_generation = self.snapshot_generation.load(Ordering::SeqCst);
+        if live_generation != receipt.roots_before.generation
+            && live_generation != receipt.roots_after.generation
+        {
+            return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
+                format!(
+                    "daemon generation {live_generation} matches neither repository receipt base {} nor result {}; reopen from repository authority",
+                    receipt.roots_before.generation, receipt.roots_after.generation
+                ),
+            )));
+        }
+        let live_tree = self.graph.resolved_tree();
+        if live_tree != *expected_previous_tree && live_tree != *desired_tree {
+            return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
+                "daemon query tree matches neither repository receipt base nor result; reopen from repository authority"
+                    .to_string(),
+            )));
+        }
+
+        let authority_snapshot = authority_graph.to_snapshot();
+        let live_snapshot = self.graph.to_snapshot();
+        let already_installed = live_snapshot.resolved_tree == *desired_tree
+            && live_snapshot.entities == authority_snapshot.entities
+            && live_snapshot.relations == authority_snapshot.relations;
+        let graph_changed = !already_installed && delta != &TransactionDelta::default();
+        if graph_changed {
+            let preflight =
+                kin_db::InMemoryGraph::from_snapshot(live_snapshot).map_err(DaemonError::from)?;
+            preflight
+                .apply_transaction_delta(delta)
+                .map_err(DaemonError::from)?;
+            let preflight_snapshot = preflight.to_snapshot();
+            if preflight_snapshot.resolved_tree != *desired_tree
+                || preflight_snapshot.entities != authority_snapshot.entities
+                || preflight_snapshot.relations != authority_snapshot.relations
+            {
+                return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
+                    "preflighted repository delta does not produce the durable workspace graph"
+                        .to_string(),
+                )));
+            }
+            self.graph
+                .apply_transaction_delta(delta)
+                .map_err(DaemonError::from)?;
+        }
+        let live_snapshot = self.graph.to_snapshot();
+        if live_snapshot.resolved_tree != *desired_tree
+            || live_snapshot.entities != authority_snapshot.entities
+            || live_snapshot.relations != authority_snapshot.relations
+        {
+            return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
+                "repository graph finalization did not install the durable workspace graph"
+                    .to_string(),
+            )));
+        }
+
+        let generation_advanced = live_generation == receipt.roots_before.generation;
+        if generation_advanced {
+            self.record_repository_authority_commit(receipt.generation)?;
+        }
+        Ok(LocalRepositoryFinalization {
+            graph_changed,
+            generation_advanced,
+        })
+    }
+
     #[cfg(any(feature = "embeddings", feature = "vector"))]
     fn reject_remote_backend_embed_persistence(&self, operation: &str) -> Result<()> {
         if self.can_persist_embed_progress_locally() {
@@ -3170,7 +3298,7 @@ impl DaemonState {
         )))
     }
 
-    fn save_snapshot_impl(&self, mode: SnapshotSaveMode, event: Option<DaemonEvent>) -> Result<()> {
+    fn save_snapshot_impl(&self, mode: SnapshotSaveMode) -> Result<()> {
         // Serialize the whole kndb + generation-marker + kidx write sequence
         // against any other save (persist loop, idle flush, embed worker).
         // Without this, two concurrent saves race on the shared tmp paths and
@@ -3181,25 +3309,7 @@ impl DaemonState {
             .lock()
             .map_err(|_| DaemonError::Io(std::io::Error::other("persist lock poisoned")))?;
 
-        let has_unpersisted_changes = self.graph.has_unpersisted_changes();
-        let finalization_pending = self.post_commit_finalization_pending.load(Ordering::SeqCst);
-        if mode == SnapshotSaveMode::Retry && !has_unpersisted_changes && !finalization_pending {
-            return Ok(());
-        }
-
-        if let Some(event) = event {
-            self.queue_persistence_event(event);
-        }
-
-        #[cfg(test)]
-        if self.snapshot_save_fail_once.swap(false, Ordering::SeqCst) {
-            return Err(DaemonError::Io(std::io::Error::other(
-                "injected pre-authority snapshot save failure",
-            )));
-        }
-
-        let force_full = mode == SnapshotSaveMode::Full
-            || (mode == SnapshotSaveMode::Retry && has_unpersisted_changes);
+        let force_full = mode == SnapshotSaveMode::Full;
 
         let repo_id = self.cached_repo_id.as_str();
         let expected_gen = self.snapshot_generation.load(Ordering::SeqCst);
@@ -3336,13 +3446,6 @@ impl DaemonState {
         if self.post_commit_finalization_pending.load(Ordering::SeqCst) {
             self.finalize_committed_generation(new_gen)?;
         }
-        // The caller's mutation may have been persisted by a concurrent save
-        // that acquired `persist_lock` after the mutation but before an
-        // event-bearing save reached this critical section. In that case this
-        // save is a no-op (`committed == false`) but the graph is already
-        // durable, so release the queued invalidation now. Committed paths have
-        // already drained it during finalization; this second take is a no-op.
-        self.emit_pending_persistence_event();
 
         info!(
             repo_id,
@@ -3450,7 +3553,6 @@ impl DaemonState {
 
         let authority_graph = self.load_committed_authority_graph(generation)?;
         self.finalize_generation_from_graph(generation, authority_graph.as_ref())?;
-        self.emit_pending_persistence_event();
         Ok(())
     }
 
@@ -3540,22 +3642,8 @@ impl DaemonState {
                 }
             }
         } else {
-            let repository_id =
-                RepositoryId::new(self.cached_repo_id.clone()).map_err(|error| {
-                    DaemonError::Graph(kin_db::KinDbError::StorageError(format!(
-                        "invalid daemon repository identity: {error}"
-                    )))
-                })?;
-            let workspace_id = self.cached_workspace_id.ok_or_else(|| {
-                DaemonError::Graph(kin_db::KinDbError::StorageError(
-                    "local daemon is missing its startup workspace binding".to_string(),
-                ))
-            })?;
-            let authority = RepositoryAuthorityManager::open(
-                repository_id,
-                Arc::new(LocalFileBackend::new(self.layout.kindb_dir())),
-            )
-            .map_err(DaemonError::from)?;
+            let binding = self.local_repository_authority_binding()?;
+            let authority = binding.open_manager().map_err(DaemonError::from)?;
             let lease = authority.read_authority();
             let observed_generation = lease.roots().generation;
             if observed_generation != generation {
@@ -3567,12 +3655,13 @@ impl DaemonState {
                 )));
             }
             let snapshot = lease
-                .workspace_graph_snapshot(&workspace_id)
+                .workspace_graph_snapshot(&binding.workspace_id())
                 .map_err(DaemonError::from)?
                 .ok_or_else(|| {
                     DaemonError::Graph(kin_db::KinDbError::StorageError(format!(
                         "repository {} authority has no manifest workspace {} during read-index finalization",
-                        self.cached_repo_id, workspace_id
+                        self.cached_repo_id,
+                        binding.workspace_id()
                     )))
                 })?;
             Arc::new(kin_db::InMemoryGraph::from_snapshot(snapshot).map_err(DaemonError::from)?)
@@ -4614,13 +4703,6 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn spine_initialization_retries_after_busy_primary_authority() {
-        let repo_dir = tempfile::tempdir().unwrap();
-        let init = kin_core::init(repo_dir.path()).unwrap();
-        let state = test_state(init.layout, repo_dir.path());
-        let primary_repo_id = state.cached_repo_id.clone();
-        let entity = test_entity("stable_after_writer", "src/lib.rs");
-        state.graph.upsert_entity(&entity).unwrap();
-
         let registry_dir = tempfile::tempdir().unwrap();
         let registry_path = registry_dir.path().join("registry.toml");
         kin_core::registry::KinRegistry { repos: Vec::new() }
@@ -4630,6 +4712,13 @@ mod tests {
         let prev_disable = std::env::var_os("KIN_DISABLE_SPINE");
         std::env::set_var("KIN_REGISTRY_PATH", &registry_path);
         std::env::remove_var("KIN_DISABLE_SPINE");
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let state = test_state(init.layout, repo_dir.path());
+        let primary_repo_id = state.cached_repo_id.clone();
+        let entity = test_entity("stable_after_writer", "src/lib.rs");
+        state.graph.upsert_entity(&entity).unwrap();
 
         let writer = state.begin_graph_authority_mutation();
         let deferred = state.ensure_spine().is_none();
@@ -4667,13 +4756,6 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn spine_initialization_revalidates_at_the_publication_edge() {
-        let repo_dir = tempfile::tempdir().unwrap();
-        let init = kin_core::init(repo_dir.path()).unwrap();
-        let state = Arc::new(test_state(init.layout, repo_dir.path()));
-        let primary_repo_id = state.cached_repo_id.clone();
-        let original = test_entity("before_publication", "src/original.rs");
-        state.graph.upsert_entity(&original).unwrap();
-
         let registry_dir = tempfile::tempdir().unwrap();
         let registry_path = registry_dir.path().join("registry.toml");
         kin_core::registry::KinRegistry { repos: Vec::new() }
@@ -4683,6 +4765,13 @@ mod tests {
         let prev_disable = std::env::var_os("KIN_DISABLE_SPINE");
         std::env::set_var("KIN_REGISTRY_PATH", &registry_path);
         std::env::remove_var("KIN_DISABLE_SPINE");
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let state = Arc::new(test_state(init.layout, repo_dir.path()));
+        let primary_repo_id = state.cached_repo_id.clone();
+        let original = test_entity("before_publication", "src/original.rs");
+        state.graph.upsert_entity(&original).unwrap();
 
         let prepared = Arc::new(std::sync::Barrier::new(2));
         let resume = Arc::new(std::sync::Barrier::new(2));
@@ -4761,28 +4850,76 @@ mod tests {
         let sibling_init = kin_core::init(sibling_dir.path()).unwrap();
         let sibling_id = sibling_init.repository_id.as_str().to_string();
         let sibling_graph = InMemoryGraph::new();
+        let sibling_blobs =
+            kin_blobs::BlobStore::new(sibling_init.layout.ingest_cas_dir()).unwrap();
+        let sibling_source = b"pub fn remote_call() {}\n";
+        let sibling_digest = sibling_blobs.write(sibling_source).unwrap();
+        sibling_graph
+            .apply_transaction_delta(&kin_model::TransactionDelta {
+                entity_deltas: Vec::new(),
+                relation_deltas: Vec::new(),
+                tree_deltas: vec![TreeDelta::Added {
+                    artifact_id: ArtifactId::new(),
+                    new: LocatedEntry::new(
+                        RepoPath::from_bytes(b"src/lib.rs".to_vec()).unwrap(),
+                        kin_model::TreeEntry::blob(Hash256::from_bytes(sibling_digest.0), false),
+                    ),
+                }],
+                admission_policy_delta: None,
+            })
+            .unwrap();
         sibling_graph
             .batch_upsert_entities(&[test_entity(imported_symbol, "src/lib.rs")])
             .unwrap();
-        let sibling_blobs =
-            kin_blobs::BlobStore::new(sibling_init.layout.ingest_cas_dir()).unwrap();
         let plan = crate::repository_commit::plan_native_commit(
-            &sibling_init.layout,
             &sibling_graph,
             &sibling_blobs,
+            &crate::local_repository_authority::LocalRepositoryAuthorityContext::from_layout_for_test(
+                &sibling_init.layout,
+            )
+            .unwrap(),
             kin_model::OperationId::new(),
             kin_model::Timestamp::now(),
             kin_model::AuthorId::new("spine-fixture"),
             "publish sibling semantic authority".to_string(),
         )
         .unwrap();
-        crate::repository_commit::commit_native_plan(&sibling_init.layout, &sibling_blobs, plan)
-            .unwrap();
+        crate::repository_commit::commit_native_plan(
+            &sibling_blobs,
+            &crate::local_repository_authority::LocalRepositoryAuthorityContext::from_layout_for_test(
+                &sibling_init.layout,
+            )
+            .unwrap(),
+            plan,
+        )
+        .unwrap();
+        let sibling_binding =
+            kin_core::LocalRepositoryAuthorityBinding::from_layout(&sibling_init.layout).unwrap();
         let expected_sibling_root = hex::encode(
-            DaemonState::load_registered_workspace_graph(sibling_dir.path(), &sibling_id)
+            DaemonState::load_registered_workspace_graph(&sibling_binding)
                 .unwrap()
                 .compute_root_hash(),
         );
+
+        // Pin the sibling through startup registry configuration before the
+        // primary daemon state becomes externally visible.
+        let registry_dir = tempfile::tempdir().unwrap();
+        let registry_path = registry_dir.path().join("registry.toml");
+        kin_core::registry::KinRegistry {
+            repos: vec![kin_core::registry::RegisteredRepo {
+                id: sibling_id.clone(),
+                path: sibling_dir.path().to_path_buf(),
+                entities: 1,
+                last_commit: String::new(),
+                dependencies: vec![],
+            }],
+        }
+        .save_to(&registry_path)
+        .unwrap();
+        let prev_registry = std::env::var_os("KIN_REGISTRY_PATH");
+        let prev_disable = std::env::var_os("KIN_DISABLE_SPINE");
+        std::env::set_var("KIN_REGISTRY_PATH", &registry_path);
+        std::env::remove_var("KIN_DISABLE_SPINE");
 
         // The primary repo: a caller entity plus an unresolved cross-repo call
         // tagged with the sibling repo as its import source.
@@ -4811,27 +4948,6 @@ mod tests {
                 }],
             })
             .unwrap();
-
-        // Point the global registry at a temp file naming only the sibling so
-        // init discovers and indexes it alongside the primary.
-        let registry_dir = tempfile::tempdir().unwrap();
-        let registry_path = registry_dir.path().join("registry.toml");
-        kin_core::registry::KinRegistry {
-            repos: vec![kin_core::registry::RegisteredRepo {
-                id: sibling_id.clone(),
-                path: sibling_dir.path().to_path_buf(),
-                entities: 1,
-                last_commit: String::new(),
-                dependencies: vec![],
-            }],
-        }
-        .save_to(&registry_path)
-        .unwrap();
-
-        let prev_registry = std::env::var_os("KIN_REGISTRY_PATH");
-        let prev_disable = std::env::var_os("KIN_DISABLE_SPINE");
-        std::env::set_var("KIN_REGISTRY_PATH", &registry_path);
-        std::env::remove_var("KIN_DISABLE_SPINE");
 
         let (repo_count, edge_count, sibling_root) = {
             let spine = state.ensure_spine().expect("spine must be enabled");
@@ -5201,8 +5317,11 @@ mod tests {
         }
         let desired = ResolvedTree::from_artifacts(artifacts).unwrap();
         crate::repository_commit::publish_workspace_tree(
-            &init.layout,
             &blobs,
+            &crate::local_repository_authority::LocalRepositoryAuthorityContext::from_layout_for_test(
+                &init.layout,
+            )
+            .unwrap(),
             &desired,
             kin_model::OperationId::new(),
             kin_model::AuthorId::new("authority-open-test"),
@@ -5729,8 +5848,9 @@ mod tests {
         );
         let desired = ResolvedTree::from_artifacts([artifact.clone()]).unwrap();
         let admission = crate::repository_commit::publish_workspace_tree(
-            &layout,
             state.blobs.as_ref(),
+            &crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(&state)
+                .unwrap(),
             &desired,
             kin_model::OperationId::new(),
             kin_model::AuthorId::new("dogfood"),

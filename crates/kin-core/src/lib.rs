@@ -19,10 +19,12 @@ pub mod manifest;
 pub mod ranking;
 pub mod ref_view;
 pub mod registry;
+pub mod repository_authority;
 pub mod resolver;
 pub mod shims;
 pub mod sync_state;
 pub mod tree;
+pub mod workspace_semantics;
 
 pub use assistant::{
     doctor, generate_assistant_prompt, generate_bootstrap_docs, generate_config_snippets,
@@ -62,11 +64,12 @@ pub use tree::{
     reconcile_source_tree_and_commit_repository_transaction, replace_source_tree,
     resolve_change_tree, should_preserve_checkout_path, source_projection_disposition,
     validate_portable_source_paths, validate_portable_source_symlink, validate_source_entry,
-    validate_source_paths, validate_source_tree,
+    validate_source_paths, validate_source_tree, verify_repository_workspace_projection,
     verify_unchanged_source_tree_and_commit_repository_transaction, ExactProjectionDetachTarget,
     ExactProjectionEjectOutcome, ExactProjectionFreeze, ExactProjectionGitStage,
     ExactProjectionVerification, ExactSessionProjection, SourceProjectionDisposition,
 };
+pub use workspace_semantics::diff_workspace_semantics;
 
 pub use diff::{compute_semantic_change_id, content_identity_from_deltas, whoami};
 pub use disambiguation::{fallback_leaf_trace_matches, query_trace_matches};
@@ -74,3 +77,4 @@ pub use ranking::{
     normalize_symbol_hint, normalize_trace_name, qualifier_hint_from_query, select_best_match,
 };
 pub use ref_view::{build_graph_at_ref, collect_changes_at_ref, filter_vector_results_to_scope};
+pub use repository_authority::LocalRepositoryAuthorityBinding;
