@@ -81,6 +81,7 @@ fn init_from_git_with_hooks(
     let semantic_plan = plan_semantic_git_import(&snapshot, &capture_store)
         .map_err(|error| git_boundary_error("derive exact semantic Git history", error))?;
     verify_material_workspace_seed(&semantic_plan.workspace_seed, &git_authority.material_head)?;
+    let semantic_plan = bind_historical_semantics(semantic_plan, &capture_store)?;
     let admitted = admit_semantic_git_import(&semantic_plan, &capture_store)
         .map_err(|error| git_boundary_error("derive branch-versioned admission policy", error))?;
     let source_proof = preflight_git_migration(&source, &snapshot, &semantic_plan, &capture_store)
@@ -514,6 +515,44 @@ fn frozen_local_overlay(
 
 fn git_boundary_error(context: impl std::fmt::Display, error: impl std::fmt::Display) -> KinError {
     KinError::Other(format!("{context}: {error}"))
+}
+
+/// Bind the deterministic entity and relation deltas of every imported change.
+///
+/// The replay reads only graph-owned resolved trees and verified CAS bodies, so
+/// admitted history carries its semantics without consulting the source
+/// repository, its index, or the worktree. Binding recomputes change, parent,
+/// and alias identities, so it must happen before any identity derived from the
+/// plan is published.
+fn bind_historical_semantics(
+    plan: kin_git::SemanticGitImportPlan,
+    capture_store: &BlobStore,
+) -> Result<kin_git::SemanticGitImportPlan> {
+    let mut trees = std::collections::BTreeMap::new();
+    for alias in &plan.aliases {
+        let tree = plan.commit_trees.get(&alias.oid).ok_or_else(|| {
+            git_boundary_error(
+                "bind historical semantics",
+                format!("imported commit {} has no exact resolved tree", alias.oid),
+            )
+        })?;
+        if trees.insert(alias.change_id, tree.clone()).is_some() {
+            return Err(git_boundary_error(
+                "bind historical semantics",
+                format!("imported history repeats change {}", alias.change_id),
+            ));
+        }
+    }
+
+    let bindings =
+        kin_index::derive_historical_semantic_deltas(&plan.changes, &trees, capture_store)
+            .map_err(|error| git_boundary_error("derive historical semantics", error))?
+            .into_iter()
+            .map(|delta| (delta.change_id, delta.entity_deltas, delta.relation_deltas))
+            .collect::<Vec<_>>();
+
+    plan.with_historical_semantics(capture_store, &bindings)
+        .map_err(|error| git_boundary_error("bind historical semantics", error))
 }
 
 #[cfg(test)]
@@ -1111,17 +1150,38 @@ mod tests {
         assert!(leftovers.is_empty(), "staging leftovers: {leftovers:?}");
     }
 
-    fn git<const N: usize>(repository: &Path, args: [&str; N]) {
-        let output = Command::new("git")
-            .args(args)
+    /// A fixture `git` invocation bound to `repository` and nothing else.
+    ///
+    /// Git exports its own repository location to every process it starts, so a
+    /// test run from inside a hook or another Git command inherits `GIT_DIR`,
+    /// `GIT_INDEX_FILE`, and friends. A fixture command that keeps them writes
+    /// into the developer's real repository instead of its temporary one, so
+    /// they are cleared here rather than trusted to be absent.
+    fn fixture_git(repository: &Path) -> Command {
+        let mut command = Command::new("git");
+        command
             .current_dir(repository)
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env(
                 "GIT_CONFIG_GLOBAL",
                 repository.join(".kin-test-global-gitconfig"),
-            )
-            .output()
-            .unwrap();
+            );
+        for inherited in [
+            "GIT_DIR",
+            "GIT_COMMON_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_PREFIX",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        ] {
+            command.env_remove(inherited);
+        }
+        command
+    }
+
+    fn git<const N: usize>(repository: &Path, args: [&str; N]) {
+        let output = fixture_git(repository).args(args).output().unwrap();
         assert!(
             output.status.success(),
             "git {:?} failed\nstdout: {}\nstderr: {}",
@@ -1132,16 +1192,7 @@ mod tests {
     }
 
     fn git_stdout<const N: usize>(repository: &Path, args: [&str; N]) -> String {
-        let output = Command::new("git")
-            .args(args)
-            .current_dir(repository)
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env(
-                "GIT_CONFIG_GLOBAL",
-                repository.join(".kin-test-global-gitconfig"),
-            )
-            .output()
-            .unwrap();
+        let output = fixture_git(repository).args(args).output().unwrap();
         assert!(
             output.status.success(),
             "git {:?} failed\nstdout: {}\nstderr: {}",
