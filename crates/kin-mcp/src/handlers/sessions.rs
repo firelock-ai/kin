@@ -480,6 +480,41 @@ fn intent_scope_to_string(scope: &kin_model::session::IntentScope) -> String {
     }
 }
 
+/// Resolve a target-body update's entity by id or exact name, fail closed.
+///
+/// A uuid target must exist; a name target must match exactly one entity by
+/// exact name (broad substring matches are filtered out). Anything else is an
+/// error, because a mutation that guesses its target is worse than one that
+/// fails.
+pub fn resolve_target_entity<G: GraphStore>(
+    store: &G,
+    target: &str,
+) -> std::result::Result<kin_model::Entity, String> {
+    let target = target.trim();
+    if let Ok(uuid) = uuid::Uuid::parse_str(target) {
+        return match store.get_entity(&kin_model::ids::EntityId(uuid)) {
+            Ok(Some(entity)) => Ok(entity),
+            _ => Err(format!(
+                "target entity id '{target}' not found in the graph"
+            )),
+        };
+    }
+    let mut matches = store
+        .query_entities(&kin_model::EntityFilter {
+            name_pattern: Some(target.to_string()),
+            ..Default::default()
+        })
+        .map_err(|error| format!("target lookup for '{target}' failed: {error}"))?;
+    matches.retain(|entity| entity.name == target);
+    match matches.len() {
+        0 => Err(format!("target entity '{target}' not found in the graph")),
+        1 => Ok(matches.remove(0)),
+        n => Err(format!(
+            "target entity '{target}' is ambiguous ({n} exact-name matches); use the entity id"
+        )),
+    }
+}
+
 pub const TRANSACTION_BEGIN_DESC: &str = "\
 Begin a new semantic graph mutation transaction. Transactions allow you to stage \
 multiple mutations (inserts, updates, deletes) and commit them atomically. Returns \
@@ -522,12 +557,17 @@ pub async fn handle_transaction_begin(
 }
 
 pub const TRANSACTION_STAGE_DESC: &str = "\
-Stage one or more mutation operations onto an active transaction. Each operation is \
-validated at stage time — anything the commit path would silently drop (a missing or \
-unknown verb, a missing payload, a nameless entity, a relation update/modify, or a blob \
-payload) is rejected immediately with an actionable error instead of vanishing at \
-commit. This rejection is identical in daemon and in-process modes. Accepted operations \
-are queued and can be validated or committed together.";
+Stage one or more mutation operations onto an active transaction. The simplest write is \
+a payload-less entity source edit: {verb: \"update\", target: \"<entity name or id>\", \
+body: \"<the entity's full new source text>\", description: \"...\"}. The entity is \
+resolved fail-closed server-side (exact name or id; ambiguity is an error) and on \
+commit the graph-to-file projection writes the body into the entity's working-directory \
+file. Structured payloads (full entity, relation add/remove) are also accepted. Each \
+operation is validated at stage time: anything the commit path would silently drop (a \
+missing or unknown verb, a missing payload, a nameless entity, a relation \
+update/modify, or a blob payload) is rejected immediately with an actionable error \
+instead of vanishing at commit. This rejection is identical in daemon and in-process \
+modes. Accepted operations are queued and can be validated or committed together.";
 
 pub async fn handle_transaction_stage(
     args: &HashMap<String, serde_json::Value>,
@@ -673,10 +713,54 @@ fn transaction_touched_scopes<G: GraphStore>(
                 push_scope_once(&mut scopes, kin_model::IntentScope::Entity(*from));
                 push_scope_once(&mut scopes, kin_model::IntentScope::Entity(*to));
             }
-            Some(McpMutationPayload::Blob(_)) | None => {}
+            Some(McpMutationPayload::Blob(_)) => {}
+            None => {
+                if crate::session::is_target_body_update(operation) {
+                    if let Ok(existing) = resolve_target_entity(store, &operation.target) {
+                        push_scope_once(&mut scopes, kin_model::IntentScope::Entity(existing.id));
+                        if let Some(file) = existing.file_origin {
+                            push_scope_once(&mut scopes, kin_model::IntentScope::Artifact(file));
+                        }
+                    }
+                }
+            }
         }
     }
     scopes
+}
+
+/// Indexed reasons for every staged operation the in-process commit path must
+/// refuse even though staging and the daemon planner accept it.
+///
+/// Today that is exactly the payload-less source update (verb update/modify
+/// with a `target` and a `body`). Turning that shape into a real change means
+/// planning the exact span edit and projecting the new source into the working
+/// file, and both live in the daemon (`kin-daemon`'s `plan_exact_transaction`).
+/// The in-process path has no projection, so committing it here can only
+/// produce a same-entity no-op delta while reporting success, discarding the
+/// agent's body. Refuse instead.
+///
+/// Deliberately private and applied only after the daemon-delegate early
+/// return in [`handle_transaction_commit`]: the daemon commits through
+/// `kin-daemon`'s own entry point and the staging validation it shares with
+/// this crate (`validate_staged_operations`, `uncommittable_operations`) is
+/// untouched, so the daemon keeps accepting the shape.
+fn offline_only_uncommittable_operations(operations: &[McpMutationOperation]) -> Vec<String> {
+    operations
+        .iter()
+        .enumerate()
+        .filter(|(_, op)| crate::session::is_target_body_update(op))
+        .map(|(idx, op)| {
+            format!(
+                "operation #{idx} ('{}'): a payload-less source update (target '{}' plus body) \
+                 requires the daemon commit path, which plans the exact span edit and projects \
+                 the new source into the working file; the in-process commit path has no \
+                 projection and would report success while discarding the body",
+                op.verb,
+                op.target.trim()
+            )
+        })
+        .collect()
 }
 
 pub async fn handle_transaction_commit<G: GraphStore>(
@@ -756,6 +840,22 @@ pub async fn handle_transaction_commit<G: GraphStore>(
         )));
     }
 
+    // Everything from here down is the in-process path: the daemon returned
+    // above. Refuse the operation shapes only the daemon can honor rather than
+    // applying a delta that reports success and changes nothing. Rejected
+    // atomically and before any graph apply, so the transaction stays active.
+    let daemon_only = offline_only_uncommittable_operations(&tx.staged_operations);
+    if !daemon_only.is_empty() {
+        return Ok(ToolCallResult::error(format!(
+            "Cannot commit transaction {}: {} staged operation(s) require the daemon commit \
+             path:\n  - {}\nCommit through a running Kin daemon, or restage the change as an \
+             entity payload. The transaction is left active.",
+            transaction_id,
+            daemon_only.len(),
+            daemon_only.join("\n  - ")
+        )));
+    }
+
     // Load-bearing ordering: run coordination enforcement against the fully
     // staged operation set before constructing or applying any graph delta.
     // A denied transaction remains active and graph truth is unchanged.
@@ -774,6 +874,8 @@ pub async fn handle_transaction_commit<G: GraphStore>(
 
     for op in tx.staged_operations {
         let verb = op.verb.to_lowercase();
+        // Payload-less source updates were refused above, so every operation
+        // reaching here carries a payload this path can turn into a real delta.
         if let Some(payload) = op.payload {
             match payload {
                 McpMutationPayload::Entity(entity) => {

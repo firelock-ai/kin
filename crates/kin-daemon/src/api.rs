@@ -4725,7 +4725,20 @@ fn transaction_coordination_context(
                 push(IntentScope::Entity(*from));
                 push(IntentScope::Entity(*to));
             }
-            Some(kin_mcp::McpMutationPayload::Blob(_)) | None => {}
+            Some(kin_mcp::McpMutationPayload::Blob(_)) => {}
+            None => {
+                if kin_mcp::session::is_target_body_update(operation) {
+                    if let Ok(existing) = kin_mcp::handlers::sessions::resolve_target_entity(
+                        state.graph.as_ref(),
+                        &operation.target,
+                    ) {
+                        push(IntentScope::Entity(existing.id));
+                        if let Some(file) = existing.file_origin {
+                            push(IntentScope::Artifact(file));
+                        }
+                    }
+                }
+            }
         }
     }
     let labels = touched.iter().map(format_scope).collect();
@@ -12168,6 +12181,31 @@ mod tests {
         }
     }
 
+    /// Register a live, write-capable agent session and return its id.
+    ///
+    /// Beginning a transaction requires an existing session so a commit
+    /// attributes to a real actor. Every request rebuilds its registry from the
+    /// coordinator, so the session has to live there rather than on a registry
+    /// this test holds.
+    fn mcp_test_session(state: &Arc<DaemonState>) -> String {
+        state
+            .coordinator
+            .register_session(
+                "codex",
+                "mcp-transaction-test",
+                SessionTransport::Mcp,
+                None,
+                state.layout.working_dir().to_path_buf(),
+                SessionCapabilities {
+                    can_write: true,
+                    can_commit: true,
+                    ..SessionCapabilities::default()
+                },
+            )
+            .unwrap()
+            .to_string()
+    }
+
     #[tokio::test]
     async fn mcp_transaction_persists_across_calls() {
         // Regression: each /mcp/tools/call rebuilds a fresh SessionRegistry, so
@@ -12178,12 +12216,13 @@ mod tests {
         state
             .is_initialized
             .store(true, std::sync::atomic::Ordering::Relaxed);
+        let session_id = mcp_test_session(&state);
 
         // 1. begin
         let begin = mcp_call(
             router(Arc::clone(&state)),
             "kin_transaction_begin",
-            serde_json::json!({ "session_id": "sess-1", "scope": "file:src/lib.rs" }),
+            serde_json::json!({ "session_id": session_id, "scope": "file:src/lib.rs" }),
         )
         .await;
         assert_ne!(begin.is_error, Some(true), "begin failed: {begin:?}");
@@ -12266,11 +12305,12 @@ mod tests {
             .is_initialized
             .store(true, std::sync::atomic::Ordering::Relaxed);
         let before = state.graph.relation_count();
+        let session_id = mcp_test_session(&state);
 
         let begin = mcp_call(
             router(Arc::clone(&state)),
             "kin_transaction_begin",
-            serde_json::json!({ "session_id": "sess-1", "scope": "file:src/lib.rs" }),
+            serde_json::json!({ "session_id": session_id, "scope": "file:src/lib.rs" }),
         )
         .await;
         let begin_json: serde_json::Value = serde_json::from_str(&mcp_result_text(&begin)).unwrap();
@@ -12710,11 +12750,13 @@ mod tests {
 
         // tx1 already durable.
         let registry_b = kin_mcp::SessionRegistry::new();
+        registry_b.register("sess", "kin-daemon-test");
         let tx1 = registry_b.begin_transaction("sess", "file:a.rs").unwrap();
         persist_mcp_transactions(&state, &registry_b);
 
         // Request B begins tx2 on top of the current store and persists.
         let registry_b2 = mcp_session_registry_snapshot(&state).unwrap();
+        registry_b2.register("sess", "kin-daemon-test");
         let tx2 = registry_b2.begin_transaction("sess", "file:b.rs").unwrap();
         persist_mcp_transactions(&state, &registry_b2);
 
@@ -12745,11 +12787,12 @@ mod tests {
         state
             .is_initialized
             .store(true, std::sync::atomic::Ordering::Relaxed);
+        let session_id = mcp_test_session(&state);
 
         let begin = mcp_call(
             router(Arc::clone(&state)),
             "kin_transaction_begin",
-            serde_json::json!({ "session_id": "sess-1", "scope": "file:src/lib.rs" }),
+            serde_json::json!({ "session_id": session_id, "scope": "file:src/lib.rs" }),
         )
         .await;
         let begin_json: serde_json::Value = serde_json::from_str(&mcp_result_text(&begin)).unwrap();
@@ -12808,6 +12851,7 @@ mod tests {
         {
             let state = Arc::new(DaemonState::open(layout.clone()).unwrap());
             let registry = kin_mcp::SessionRegistry::new();
+            registry.register("sess-restart", "kin-daemon-test");
             let tx = registry
                 .begin_transaction("sess-restart", "file:src/lib.rs")
                 .unwrap();

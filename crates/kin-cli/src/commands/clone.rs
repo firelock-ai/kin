@@ -95,17 +95,24 @@ pub async fn run(url: String, path: Option<String>) -> Result<()> {
         }
     };
 
-    println!(
-        "Cloned Git transport and admitted exact Kin repository authority at {}",
-        target.display()
-    );
-    println!("  Repository: {}", result.repository_id);
-    println!("  Workspace: {}", result.workspace_id);
-    println!(
-        "  Authority generation: {}",
-        result.authority.receipt.generation
-    );
-    println!("  Semantic enrichment: not run");
+    // Composed here as plain strings and painted at print time, so a pipe or a
+    // test reads the same bytes the admission reported.
+    let summary = [
+        format!(
+            "Cloned Git transport and admitted exact Kin repository authority at {}",
+            target.display()
+        ),
+        format!("  Repository: {}", result.repository_id),
+        format!("  Workspace: {}", result.workspace_id),
+        format!(
+            "  Authority generation: {}",
+            result.authority.receipt.generation
+        ),
+        "  Semantic enrichment: not run".to_string(),
+    ];
+    for line in &summary {
+        println!("{}", crate::output_style::paint_clone_line(line));
+    }
     Ok(())
 }
 

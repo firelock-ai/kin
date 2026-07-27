@@ -620,13 +620,19 @@ async fn revive_mcp_daemon() -> Result<String, String> {
 /// Core MCP-tool-call dispatch with one-shot daemon revival.
 ///
 /// On a connection-class failure ([`DaemonCallError::ConnectionLost`]) the
-/// seam's `revive` method is called **exactly once**.  If revival succeeds the
-/// original request is retried against the new URL.  Non-connection failures
-/// bypass revival entirely.
+/// call is retried once against the **same** URL before revival is considered:
+/// a transport error is just as often a stale kept-alive socket or a request
+/// landing inside the daemon's post-boot stall as it is a dead daemon, and
+/// revival against a live daemon cannot succeed (the repo lock is held), so
+/// misclassifying costs the whole call. Only when the same-URL retry also
+/// fails is the seam's `revive` method called **exactly once**. If revival
+/// succeeds the original request is retried against the new URL.
+/// Non-connection failures bypass retry and revival entirely.
 ///
 /// Invariants:
 /// - `revive` is called at most once per invocation.
-/// - `call_tool` is called at most twice (first attempt + one retry).
+/// - `call_tool` is called at most three times (attempt, same-URL retry,
+///   post-revival retry).
 /// - Non-connection errors are never silently discarded.
 async fn forward_mcp_with_seam(
     name: &str,
@@ -634,12 +640,20 @@ async fn forward_mcp_with_seam(
     seam: &impl DaemonCallSeam,
     daemon_url: &str,
 ) -> Result<Option<ToolCallResult>, String> {
+    let first_err = match seam.call_tool(daemon_url, name, args).await {
+        Ok(result) => return Ok(result),
+        Err(DaemonCallError::DaemonError(e)) => return Err(e),
+        Err(DaemonCallError::ConnectionLost(e)) => e,
+    };
+    tokio::time::sleep(Duration::from_millis(250)).await;
     match seam.call_tool(daemon_url, name, args).await {
         Ok(result) => Ok(result),
         Err(DaemonCallError::DaemonError(e)) => Err(e),
-        Err(DaemonCallError::ConnectionLost(first_err)) => {
-            // Daemon may have exited (idle timeout or crash).  Single revival
-            // attempt before giving up.
+        Err(DaemonCallError::ConnectionLost(retry_err)) => {
+            // Two transport failures in a row on a fresh connection: now the
+            // dead-daemon read is earned. Single revival attempt before
+            // giving up.
+            let first_err = format!("{first_err}; retry: {retry_err}");
             match seam.revive().await {
                 Err(revive_err) => Err(format!(
                     "tool {name}: daemon at {daemon_url} is not responding \
@@ -897,8 +911,27 @@ pub async fn daemon_client() -> Option<reqwest::Client> {
     }
 
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
+        // Slow is not dead. A daemon fresh off a clone spends its first minute
+        // on enrichment and spine work, and a legitimate tool call inside that
+        // window can take well over five seconds; a 5 s total-request timeout
+        // converted every such call into a transport error, which dispatch
+        // must read as daemon-down, which triggered revival that cannot
+        // succeed while the live daemon holds the repo lock. Dead daemons are
+        // still detected fast by the connect timeout below; busy ones get to
+        // finish. The MCP client above this has its own per-tool deadline and
+        // remains the effective ceiling.
+        .timeout(Duration::from_secs(60))
         .connect_timeout(Duration::from_millis(500))
+        // No pooled keepalive sockets. This client is cached for the process
+        // lifetime while agent loops pause arbitrarily long between calls, and
+        // the daemon closes idle connections on its own schedule. A POST that
+        // reuses a connection the daemon already closed surfaces as a
+        // transport error ("error sending request"), which the dispatch layer
+        // must treat as daemon-down, so one stale pooled socket misdiagnoses a
+        // healthy daemon and triggers doomed revival against its repo lock.
+        // Every call paying a fresh loopback connect costs microseconds;
+        // misdiagnosing the daemon costs the whole session.
+        .pool_max_idle_per_host(0)
         .build()
         .ok()?;
 
@@ -1211,15 +1244,45 @@ mod tests {
 
     #[tokio::test]
     async fn revival_triggered_exactly_once_on_connection_error() {
+        // Attempt and same-URL retry both fail, revival succeeds, post-revival
+        // retry succeeds: three calls, one revival.
         let seam = FakeSeam::new(
-            vec![Err(conn_lost()), ok_tool_result()],
+            vec![Err(conn_lost()), Err(conn_lost()), ok_tool_result()],
             Ok("http://127.0.0.1:9999".to_string()),
         );
         let result =
             forward_mcp_with_seam("tool", &HashMap::new(), &seam, "http://127.0.0.1:4219").await;
         assert!(result.is_ok(), "should succeed after revival: {result:?}");
-        assert_eq!(seam.calls_made(), 2, "call_tool must run exactly twice");
+        assert_eq!(
+            seam.calls_made(),
+            3,
+            "attempt, same-URL retry, post-revival retry"
+        );
         assert_eq!(seam.revives_attempted(), 1, "revive must run exactly once");
+    }
+
+    /// The regression that motivated the same-URL retry: a stale kept-alive
+    /// socket (or a request landing in the daemon's post-boot stall) produces
+    /// one transport error against a perfectly healthy daemon. Revival against
+    /// a healthy daemon cannot succeed, because the live daemon holds the repo
+    /// lock, so treating the first transport error as daemon-down turned one
+    /// stale socket into a failed tool call. The retry must heal it with no
+    /// revival at all.
+    #[tokio::test]
+    async fn stale_socket_heals_on_same_url_retry_without_revival() {
+        let seam = FakeSeam::new(
+            vec![Err(conn_lost()), ok_tool_result()],
+            Err("revival must not run".to_string()),
+        );
+        let result =
+            forward_mcp_with_seam("tool", &HashMap::new(), &seam, "http://127.0.0.1:4219").await;
+        assert!(result.is_ok(), "retry should heal the call: {result:?}");
+        assert_eq!(seam.calls_made(), 2, "attempt plus same-URL retry");
+        assert_eq!(
+            seam.revives_attempted(),
+            0,
+            "a single transport error must not trigger revival"
+        );
     }
 
     #[tokio::test]
@@ -1246,7 +1309,10 @@ mod tests {
 
     #[tokio::test]
     async fn revival_failure_yields_actionable_error() {
-        let seam = FakeSeam::new(vec![Err(conn_lost())], Err("binary not found".to_string()));
+        let seam = FakeSeam::new(
+            vec![Err(conn_lost()), Err(conn_lost())],
+            Err("binary not found".to_string()),
+        );
         let err = forward_mcp_with_seam("tool", &HashMap::new(), &seam, "http://127.0.0.1:4219")
             .await
             .unwrap_err();
@@ -1263,7 +1329,7 @@ mod tests {
     #[tokio::test]
     async fn second_failure_after_revival_surfaces_clear_error() {
         let seam = FakeSeam::new(
-            vec![Err(conn_lost()), Err(conn_lost())],
+            vec![Err(conn_lost()), Err(conn_lost()), Err(conn_lost())],
             Ok("http://127.0.0.1:9999".to_string()),
         );
         let err = forward_mcp_with_seam("tool", &HashMap::new(), &seam, "http://127.0.0.1:4219")

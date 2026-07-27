@@ -94,7 +94,7 @@ pub async fn run(entity: String, kind: String) -> Result<()> {
     let _scope = announce_active_scope(&layout, "refs").await?;
     let response = run_daemon_refs(&layout, &RefsRequest { entity, kind }).await?;
     for line in response.lines {
-        println!("{line}");
+        println!("{}", crate::output_style::paint_refs_line(&line));
     }
     Ok(())
 }
@@ -198,7 +198,7 @@ pub fn build_refs_response(
         return Ok(RefsResponse { lines });
     }
 
-    lines.push(format!("{} upstream files:", refs.len()));
+    lines.push(format!("referenced by {} entities:", refs.len()));
     for entry in refs {
         let file_path = entry
             .file_path
@@ -479,8 +479,12 @@ fn push_relation_kind(kinds: &mut Vec<RelationKind>, kind: RelationKind) {
 }
 
 fn reference_key(file_path: Option<&str>, name: &str) -> String {
+    // Keyed by (file, name), not by file alone: two entities in the same file
+    // that both reference the target are two rows, not one row wearing the
+    // first entity's name. The listing enumerates referencing entities, and
+    // the count line above it says so.
     file_path
-        .map(|path| path.to_string())
+        .map(|path| format!("{path}\u{1f}{name}"))
         .unwrap_or_else(|| format!("name:{name}"))
 }
 
@@ -680,5 +684,93 @@ mod tests {
     fn parse_relation_kinds_accepts_import_alias() {
         let kinds = parse_relation_kinds("import").unwrap();
         assert_eq!(kinds, vec![RelationKind::Imports]);
+    }
+
+    /// Two callers in one file are two rows. The per-file grouping this
+    /// replaces collapsed them into a single row wearing the first caller's
+    /// name, under a count line that then miscounted the referencing entities.
+    #[test]
+    fn refs_lists_every_referencing_entity_not_one_per_file() {
+        use kin_db::InMemoryGraph;
+        use kin_model::relation::{Relation, RelationOrigin};
+        use kin_model::{
+            Entity, EntityId, EntityKind, EntityMetadata, EntityRole, EntityStore, FilePathId,
+            FingerprintAlgorithm, GraphNodeId, Hash256, LanguageId, SemanticFingerprint,
+            Visibility,
+        };
+
+        fn entity(name: &str, rel_path: &str) -> Entity {
+            Entity {
+                id: EntityId::new(),
+                kind: EntityKind::Function,
+                name: name.to_string(),
+                language: LanguageId::Rust,
+                fingerprint: SemanticFingerprint {
+                    algorithm: FingerprintAlgorithm::V1TreeSitter,
+                    ast_hash: Hash256::from_bytes([0; 32]),
+                    signature_hash: Hash256::from_bytes([0; 32]),
+                    behavior_hash: Hash256::from_bytes([0; 32]),
+                    equivalence_hash: kin_model::Hash256::from_bytes([0; 32]),
+                    stability_score: 1.0,
+                },
+                file_origin: Some(FilePathId::new(rel_path)),
+                span: None,
+                signature: name.to_string(),
+                visibility: Visibility::Public,
+                role: EntityRole::Source,
+                doc_summary: None,
+                metadata: EntityMetadata::default(),
+                lineage_parent: None,
+                created_in: None,
+                superseded_by: None,
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
+
+        let target = entity("probe_symbol", "target_mod.rs");
+        let caller_a = entity("caller_a", "callers.rs");
+        let caller_b = entity("caller_b", "callers.rs");
+
+        let graph = InMemoryGraph::new();
+        for e in [&target, &caller_a, &caller_b] {
+            graph.upsert_entity(e).unwrap();
+        }
+        for caller in [&caller_a, &caller_b] {
+            graph
+                .upsert_relation(&Relation {
+                    id: kin_model::ids::RelationId::new(),
+                    kind: RelationKind::References,
+                    src: GraphNodeId::Entity(caller.id),
+                    dst: GraphNodeId::Entity(target.id),
+                    confidence: 1.0,
+                    origin: RelationOrigin::Parsed,
+                    created_in: None,
+                    import_source: None,
+                    evidence: Vec::new(),
+                })
+                .unwrap();
+        }
+
+        let response = build_refs_response(
+            &layout,
+            &graph,
+            &RefsRequest {
+                entity: "probe_symbol".to_string(),
+                kind: "all".to_string(),
+            },
+        )
+        .unwrap();
+        let joined = response.lines.join("\n");
+
+        assert!(
+            joined.contains("referenced by 2 entities:"),
+            "count line must count entities: {joined}"
+        );
+        assert!(
+            joined.contains("caller_a") && joined.contains("caller_b"),
+            "both same-file callers must be listed: {joined}"
+        );
     }
 }

@@ -2915,6 +2915,206 @@ mod tests {
         assert_eq!(sessions.get_transaction(&tx_id).unwrap().state, "validated");
     }
 
+    /// A graph-resident entity with no repository placement, so an in-process
+    /// commit is not gated by kin-db's staged-tree consistency check and the
+    /// assertions stay about commit-shape handling.
+    fn placement_free_entity(name: &str) -> Entity {
+        use kin_model::entity::{FingerprintAlgorithm, SemanticFingerprint};
+        Entity {
+            id: EntityId::new(),
+            kind: EntityKind::Function,
+            name: name.into(),
+            language: LanguageId::Rust,
+            fingerprint: SemanticFingerprint {
+                algorithm: FingerprintAlgorithm::V1TreeSitter,
+                ast_hash: Hash256::from_bytes([0; 32]),
+                signature_hash: Hash256::from_bytes([0; 32]),
+                behavior_hash: Hash256::from_bytes([0; 32]),
+                equivalence_hash: Hash256::from_bytes([0; 32]),
+                stability_score: 1.0,
+            },
+            file_origin: None,
+            span: None,
+            signature: format!("fn {name}()"),
+            visibility: Visibility::Public,
+            role: kin_model::entity::EntityRole::Source,
+            doc_summary: None,
+            metadata: kin_model::entity::EntityMetadata::default(),
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        }
+    }
+
+    /// Begin an offline transaction owned by a write-capable session.
+    async fn begin_offline_transaction(sessions: &SessionRegistry, label: &'static str) -> String {
+        let session = sessions.start_agent_session(
+            "codex",
+            label,
+            SessionTransport::Mcp,
+            None,
+            PathBuf::from("/tmp"),
+            SessionCapabilities {
+                can_write: true,
+                can_commit: true,
+                ..SessionCapabilities::default()
+            },
+        );
+        let mut begin_args = HashMap::new();
+        begin_args.insert(
+            "session_id".into(),
+            serde_json::json!(session.session_id.to_string()),
+        );
+        begin_args.insert("scope".into(), serde_json::json!("src/lib.rs"));
+        let begin_res = sessions::handle_transaction_begin(
+            &begin_args,
+            sessions,
+            SessionAuthorityMode::OfflineFallback,
+        )
+        .await
+        .unwrap();
+        let begin_text = match &begin_res.content[0] {
+            crate::types::ContentBlock::Text { text } => text.clone(),
+        };
+        let begin_val: serde_json::Value = serde_json::from_str(&begin_text).unwrap();
+        begin_val["transaction_id"].as_str().unwrap().to_string()
+    }
+
+    fn tool_result_text(result: &crate::types::ToolCallResult) -> String {
+        match &result.content[0] {
+            crate::types::ContentBlock::Text { text } => text.clone(),
+        }
+    }
+
+    #[tokio::test]
+    async fn offline_commit_refuses_payload_less_source_update() {
+        // A payload-less `update` carrying a target and a body is a real source
+        // edit, but planning the exact span edit and projecting the new source
+        // into the working file lives in the daemon. The in-process path has no
+        // projection, so it must refuse the shape instead of applying a
+        // same-entity no-op delta and reporting "committed", which would
+        // report an agent's edit as durable while discarding the body.
+        use crate::session::{McpMutationOperation, McpMutationPayload};
+
+        let store = InMemoryGraph::default();
+        let entity = placement_free_entity("value");
+        store.upsert_entity(&entity).unwrap();
+        let before = serde_json::to_value(&entity).unwrap();
+
+        let sessions = SessionRegistry::new();
+        sessions.set_coordination_mode(crate::session::CoordinationEnforcementMode::Warn);
+        let session_authority = SessionAuthorityMode::OfflineFallback;
+        let tx_id = begin_offline_transaction(&sessions, "offline-payload-less-refusal").await;
+
+        // Staging still accepts the shape: the daemon commit path can honor it.
+        let op = McpMutationOperation {
+            verb: "update".into(),
+            target: "value".into(),
+            payload: None::<McpMutationPayload>,
+            body: Some("pub fn value() -> u8 { 2 }".into()),
+            description: "payload-less body update".into(),
+        };
+        let mut stage_args = HashMap::new();
+        stage_args.insert("transaction_id".into(), serde_json::json!(tx_id));
+        stage_args.insert("operations".into(), serde_json::json!(vec![op]));
+        let stage_res =
+            sessions::handle_transaction_stage(&stage_args, &sessions, session_authority)
+                .await
+                .unwrap();
+        assert_ne!(
+            stage_res.is_error,
+            Some(true),
+            "staging must keep accepting the daemon-committable shape: {}",
+            tool_result_text(&stage_res)
+        );
+
+        let mut commit_args = HashMap::new();
+        commit_args.insert("transaction_id".into(), serde_json::json!(tx_id));
+        let commit_res =
+            sessions::handle_transaction_commit(&commit_args, &store, &sessions, session_authority)
+                .await
+                .unwrap();
+
+        assert_eq!(
+            commit_res.is_error,
+            Some(true),
+            "in-process commit must refuse a payload-less source update"
+        );
+        let commit_text = tool_result_text(&commit_res);
+        assert!(
+            commit_text.contains("require the daemon commit path"),
+            "message must name the daemon requirement, got: {commit_text}"
+        );
+
+        // Nothing was applied and the transaction is still usable.
+        assert_eq!(sessions.get_transaction(&tx_id).unwrap().state, "active");
+        let after = serde_json::to_value(store.get_entity(&entity.id).unwrap().unwrap()).unwrap();
+        assert_eq!(
+            before, after,
+            "graph truth must be untouched by the refusal"
+        );
+    }
+
+    #[tokio::test]
+    async fn offline_commit_still_applies_entity_payload_operations() {
+        // The refusal is scoped to the payload-less shape. An operation that
+        // carries an entity payload still commits in-process exactly as before.
+        use crate::session::{McpMutationOperation, McpMutationPayload};
+
+        let store = InMemoryGraph::default();
+        let entity = placement_free_entity("documented_value");
+        store.upsert_entity(&entity).unwrap();
+
+        let sessions = SessionRegistry::new();
+        sessions.set_coordination_mode(crate::session::CoordinationEnforcementMode::Warn);
+        let session_authority = SessionAuthorityMode::OfflineFallback;
+        let tx_id = begin_offline_transaction(&sessions, "offline-entity-payload-commit").await;
+
+        let mut updated = entity.clone();
+        updated.doc_summary = Some("returns the configured value".into());
+        let op = McpMutationOperation {
+            verb: "update".into(),
+            target: entity.id.to_string(),
+            payload: Some(McpMutationPayload::Entity(updated)),
+            body: None,
+            description: "entity payload update".into(),
+        };
+        let mut stage_args = HashMap::new();
+        stage_args.insert("transaction_id".into(), serde_json::json!(tx_id));
+        stage_args.insert("operations".into(), serde_json::json!(vec![op]));
+        sessions::handle_transaction_stage(&stage_args, &sessions, session_authority)
+            .await
+            .unwrap();
+
+        let mut commit_args = HashMap::new();
+        commit_args.insert("transaction_id".into(), serde_json::json!(tx_id));
+        let commit_res =
+            sessions::handle_transaction_commit(&commit_args, &store, &sessions, session_authority)
+                .await
+                .unwrap();
+
+        let commit_text = tool_result_text(&commit_res);
+        assert_ne!(
+            commit_res.is_error,
+            Some(true),
+            "entity-payload commit must still succeed: {commit_text}"
+        );
+        let commit_val: serde_json::Value = serde_json::from_str(&commit_text).unwrap();
+        assert_eq!(commit_val["status"].as_str().unwrap(), "committed");
+        assert_eq!(commit_val["ops_applied"].as_u64().unwrap(), 1);
+        assert_eq!(commit_val["empty"].as_bool().unwrap(), false);
+        assert_eq!(
+            store
+                .get_entity(&entity.id)
+                .unwrap()
+                .unwrap()
+                .doc_summary
+                .as_deref(),
+            Some("returns the configured value"),
+            "the payload-ful update must reach graph truth"
+        );
+    }
+
     #[tokio::test]
     async fn handle_transaction_stage_rejects_malformed_op_at_stage_time() {
         // D.7 Track A: a payload-less operation must fail loud at stage time —

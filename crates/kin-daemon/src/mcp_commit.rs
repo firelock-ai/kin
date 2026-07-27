@@ -329,6 +329,32 @@ fn plan_exact_transaction(
 
     for operation in &transaction.staged_operations {
         let verb = operation.verb.trim().to_ascii_lowercase();
+        // A payload-less `update` carrying a target and a body is the minimal
+        // agent write surface: an agent knows a name and the new source text but
+        // not Kin's entity structs. Staging accepts it, so the planner must too,
+        // or the operation is admitted and then refused at commit. The target is
+        // resolved against repository authority (a uuid must exist, a name must
+        // match exactly one entity by exact name) and lands on the same exact
+        // span edit an entity payload produces.
+        if operation.payload.is_none() {
+            if !kin_mcp::session::is_target_body_update(operation) {
+                return Err(format!("operation '{}' has no payload", operation.verb));
+            }
+            let existing =
+                kin_mcp::handlers::sessions::resolve_target_entity(&base.graph, &operation.target)?;
+            let body = operation
+                .body
+                .as_ref()
+                .expect("a target body update always carries a body");
+            record_source_edit(
+                &mut edits,
+                &mut edited_entities,
+                base,
+                existing,
+                body.as_bytes(),
+            )?;
+            continue;
+        }
         let payload = operation
             .payload
             .as_ref()
@@ -353,12 +379,6 @@ fn plan_exact_transaction(
                         payload_entity.id
                     )
                 })?;
-                if !edited_entities.insert(payload_entity.id) {
-                    return Err(format!(
-                        "entity {} is edited more than once in one transaction; overlapping source authority is ambiguous",
-                        payload_entity.id
-                    ));
-                }
                 let existing = base
                     .graph
                     .get_entity(&payload_entity.id)
@@ -399,50 +419,13 @@ fn plan_exact_transaction(
                         existing.id
                     ));
                 }
-                let file_id = existing.file_origin.clone().ok_or_else(|| {
-                    format!(
-                        "entity {} has no exact source origin; graph-only entity mutation is not supported",
-                        existing.id
-                    )
-                })?;
-                let span = existing.span.as_ref().ok_or_else(|| {
-                    format!(
-                        "entity {} has no exact source span; mutation requires a full body and authoritative span",
-                        existing.id
-                    )
-                })?;
-                if span.file != file_id {
-                    return Err(format!(
-                        "entity {} source span file {} disagrees with origin {}",
-                        existing.id, span.file, file_id
-                    ));
-                }
-                if span.start_byte >= span.end_byte {
-                    return Err(format!(
-                        "entity {} has an empty or inverted exact source span {}..{}",
-                        existing.id, span.start_byte, span.end_byte
-                    ));
-                }
-                let path = RepoPath::from_utf8(file_id.0.clone()).map_err(|error| {
-                    format!("invalid entity repository path {file_id}: {error}")
-                })?;
-                let artifact = base.tree.artifact_at_path(&path).ok_or_else(|| {
-                    format!(
-                        "entity {} source {} is absent from exact workspace tree",
-                        existing.id, file_id
-                    )
-                })?;
-                if !matches!(artifact.entry, TreeEntry::Blob { .. }) {
-                    return Err(format!(
-                        "entity {} source {} is not a regular blob entry",
-                        existing.id, file_id
-                    ));
-                }
-                edits
-                    .entry(file_id.0.clone())
-                    .or_insert_with(|| (file_id, Vec::new()))
-                    .1
-                    .push((existing, body.as_bytes().to_vec()));
+                record_source_edit(
+                    &mut edits,
+                    &mut edited_entities,
+                    base,
+                    existing,
+                    body.as_bytes(),
+                )?;
             }
             kin_mcp::McpMutationPayload::Relation { .. } => {
                 relation_operations.push((verb, payload.clone()));
@@ -598,6 +581,71 @@ fn plan_exact_transaction(
     )
     .map_err(|error| format!("plan exact MCP repository commit: {error}"))?;
     Ok(ExactMcpPlan { native, layouts })
+}
+
+/// Record one entity source edit against repository authority.
+///
+/// Shared by the entity-payload form and the payload-less target/body form:
+/// both end in the same place, an authoritative span in an exact blob replaced
+/// by exact new bytes. `existing` is always the authority-side entity, never the
+/// staged payload, so the span is the one repository truth records.
+fn record_source_edit(
+    edits: &mut BTreeMap<String, (FilePathId, Vec<(Entity, Vec<u8>)>)>,
+    edited_entities: &mut HashSet<kin_model::EntityId>,
+    base: &NativeCommitBase,
+    existing: Entity,
+    body: &[u8],
+) -> Result<(), String> {
+    if !edited_entities.insert(existing.id) {
+        return Err(format!(
+            "entity {} is edited more than once in one transaction; overlapping source authority is ambiguous",
+            existing.id
+        ));
+    }
+    let file_id = existing.file_origin.clone().ok_or_else(|| {
+        format!(
+            "entity {} has no exact source origin; graph-only entity mutation is not supported",
+            existing.id
+        )
+    })?;
+    let span = existing.span.as_ref().ok_or_else(|| {
+        format!(
+            "entity {} has no exact source span; mutation requires a full body and authoritative span",
+            existing.id
+        )
+    })?;
+    if span.file != file_id {
+        return Err(format!(
+            "entity {} source span file {} disagrees with origin {}",
+            existing.id, span.file, file_id
+        ));
+    }
+    if span.start_byte >= span.end_byte {
+        return Err(format!(
+            "entity {} has an empty or inverted exact source span {}..{}",
+            existing.id, span.start_byte, span.end_byte
+        ));
+    }
+    let path = RepoPath::from_utf8(file_id.0.clone())
+        .map_err(|error| format!("invalid entity repository path {file_id}: {error}"))?;
+    let artifact = base.tree.artifact_at_path(&path).ok_or_else(|| {
+        format!(
+            "entity {} source {} is absent from exact workspace tree",
+            existing.id, file_id
+        )
+    })?;
+    if !matches!(artifact.entry, TreeEntry::Blob { .. }) {
+        return Err(format!(
+            "entity {} source {} is not a regular blob entry",
+            existing.id, file_id
+        ));
+    }
+    edits
+        .entry(file_id.0.clone())
+        .or_insert_with(|| (file_id, Vec::new()))
+        .1
+        .push((existing, body.to_vec()));
+    Ok(())
 }
 
 fn apply_relation_operations(
@@ -1157,13 +1205,27 @@ mod tests {
         committed
     }
 
+    const TEST_SESSION: &str = "exact-mcp-test";
+
+    /// A registry whose `TEST_SESSION` is already live.
+    ///
+    /// Beginning a transaction requires an existing session so a commit
+    /// attributes to a real actor. These fixtures drive the daemon commit path
+    /// directly instead of through `kin_session_start`, so they register the
+    /// session themselves.
+    fn test_sessions() -> kin_mcp::SessionRegistry {
+        let sessions = kin_mcp::SessionRegistry::new();
+        sessions.register(TEST_SESSION, "kin-daemon-test");
+        sessions
+    }
+
     fn stage_entity_edit(
         sessions: &kin_mcp::SessionRegistry,
         entity: &Entity,
         body: &str,
     ) -> (String, HashMap<String, serde_json::Value>) {
         let transaction = sessions
-            .begin_transaction("exact-mcp-test", "file:src/lib.rs")
+            .begin_transaction(TEST_SESSION, "file:src/lib.rs")
             .unwrap();
         sessions
             .stage_transaction(
@@ -1192,6 +1254,130 @@ mod tests {
         {
             kin_mcp::ContentBlock::Text { text } => text,
         }
+    }
+
+    #[test]
+    fn payload_less_target_body_update_commits_like_an_entity_payload() {
+        // Staging accepts verb `update` with a `target` (entity name or id) and a
+        // `body`, and no entity payload. The planner has to accept the same
+        // shape, or the operation is admitted at stage time and refused at
+        // commit. The target resolves against repository authority, so the span
+        // spliced is the one authority records, not one the caller supplied.
+        let (_dir, state) = test_state();
+        let (entity, _) = install_exact_source(
+            &state,
+            "src/lib.rs",
+            b"pub fn value() -> u8 { 1 }\n",
+            "value",
+        );
+        let sessions = test_sessions();
+        let transaction = sessions
+            .begin_transaction(TEST_SESSION, "file:src/lib.rs")
+            .unwrap();
+        let operation = kin_mcp::McpMutationOperation {
+            verb: "update".to_string(),
+            // The entity's name, not its id: an agent knows the name and the new
+            // source text but not Kin's entity structs.
+            target: "value".to_string(),
+            payload: None,
+            body: Some("pub fn value() -> u8 { 2 }".to_string()),
+            description: "payload-less body update".to_string(),
+        };
+        kin_mcp::session::validate_staged_operations(std::slice::from_ref(&operation))
+            .expect("staging must accept the payload-less target body form");
+        sessions
+            .stage_transaction(&transaction.transaction_id, vec![operation])
+            .unwrap();
+
+        let result = commit_exact_transaction(
+            &state,
+            &sessions,
+            &HashMap::from([(
+                "transaction_id".to_string(),
+                serde_json::json!(transaction.transaction_id),
+            )]),
+            None,
+        );
+        assert_ne!(
+            result.is_error,
+            Some(true),
+            "payload-less target body commit failed: {}",
+            result_text(&result)
+        );
+
+        let expected = b"pub fn value() -> u8 { 2 }\n";
+        assert_eq!(
+            std::fs::read(state.layout.working_dir().join("src/lib.rs")).unwrap(),
+            expected
+        );
+        let after = load_native_commit_base(&state.layout).unwrap();
+        let artifact = after
+            .tree
+            .artifact_at_path(&RepoPath::from_utf8("src/lib.rs").unwrap())
+            .unwrap();
+        assert_eq!(
+            load_native_source_blob(&state.layout, artifact.entry.blob_identity().unwrap())
+                .unwrap(),
+            expected
+        );
+        let reparsed = after.graph.get_entity(&entity.id).unwrap().unwrap();
+        assert_ne!(
+            reparsed.fingerprint, entity.fingerprint,
+            "semantic fingerprint must come from reparsing the exact new bytes"
+        );
+    }
+
+    #[test]
+    fn unresolvable_target_body_update_fails_before_repository_mutation() {
+        let (_dir, state) = test_state();
+        install_exact_source(
+            &state,
+            "src/lib.rs",
+            b"pub fn value() -> u8 { 1 }\n",
+            "value",
+        );
+        let before = load_native_commit_base(&state.layout).unwrap();
+        let sessions = test_sessions();
+        let transaction = sessions
+            .begin_transaction(TEST_SESSION, "file:src/lib.rs")
+            .unwrap();
+        sessions
+            .stage_transaction(
+                &transaction.transaction_id,
+                vec![kin_mcp::McpMutationOperation {
+                    verb: "update".to_string(),
+                    target: "no_such_entity".to_string(),
+                    payload: None,
+                    body: Some("pub fn no_such_entity() {}".to_string()),
+                    description: String::new(),
+                }],
+            )
+            .unwrap();
+
+        let result = commit_exact_transaction(
+            &state,
+            &sessions,
+            &HashMap::from([(
+                "transaction_id".to_string(),
+                serde_json::json!(transaction.transaction_id),
+            )]),
+            None,
+        );
+        assert_eq!(result.is_error, Some(true));
+        assert!(
+            result_text(&result).contains("not found in the graph"),
+            "unresolvable target must say so: {}",
+            result_text(&result)
+        );
+        let after = load_native_commit_base(&state.layout).unwrap();
+        assert_eq!(after.roots.generation, before.roots.generation);
+        assert_eq!(
+            sessions
+                .get_transaction(&transaction.transaction_id)
+                .unwrap()
+                .state,
+            "active"
+        );
     }
 
     #[test]
@@ -1245,7 +1431,7 @@ mod tests {
         let initial = b"pub fn value() -> u8 { 1 }\n";
         let (entity, _) = install_exact_source(&state, "src/lib.rs", initial, "value");
         let before = load_native_commit_base(&state.layout).unwrap();
-        let sessions = kin_mcp::SessionRegistry::new();
+        let sessions = test_sessions();
         let (transaction_id, arguments) =
             stage_entity_edit(&sessions, &entity, "pub fn value() -> u8 { 2 }");
 
@@ -1314,7 +1500,7 @@ mod tests {
         let dirty = b"pub fn value() -> u8 { 99 }\n";
         std::fs::write(state.layout.working_dir().join("src/lib.rs"), dirty).unwrap();
 
-        let sessions = kin_mcp::SessionRegistry::new();
+        let sessions = test_sessions();
         let (transaction_id, arguments) =
             stage_entity_edit(&sessions, &entity, "pub fn value() -> u8 { 2 }");
         let result = commit_exact_transaction(&state, &sessions, &arguments, None);
@@ -1349,9 +1535,9 @@ mod tests {
         );
         let before = load_native_commit_base(&state.layout).unwrap();
 
-        let create_sessions = kin_mcp::SessionRegistry::new();
+        let create_sessions = test_sessions();
         let create = create_sessions
-            .begin_transaction("exact-mcp-test", "file:src/lib.rs")
+            .begin_transaction(TEST_SESSION, "file:src/lib.rs")
             .unwrap();
         let mut inserted = entity.clone();
         inserted.id = kin_model::EntityId::new();
@@ -1387,9 +1573,9 @@ mod tests {
             "active"
         );
 
-        let metadata_sessions = kin_mcp::SessionRegistry::new();
+        let metadata_sessions = test_sessions();
         let metadata = metadata_sessions
-            .begin_transaction("exact-mcp-test", "file:src/lib.rs")
+            .begin_transaction(TEST_SESSION, "file:src/lib.rs")
             .unwrap();
         metadata_sessions
             .stage_transaction(
@@ -1445,9 +1631,9 @@ mod tests {
         commit_live_graph(&state, "install overlapping authority fixture", false);
         let overlap_before = load_native_commit_base(&state.layout).unwrap();
 
-        let overlap_sessions = kin_mcp::SessionRegistry::new();
+        let overlap_sessions = test_sessions();
         let overlap_tx = overlap_sessions
-            .begin_transaction("exact-mcp-test", "file:src/lib.rs")
+            .begin_transaction(TEST_SESSION, "file:src/lib.rs")
             .unwrap();
         overlap_sessions
             .stage_transaction(
@@ -1524,7 +1710,7 @@ mod tests {
         commit_live_graph(&state, "install non-UTF-8 exact source fixture", true);
         let non_utf8_before = load_native_commit_base(&state.layout).unwrap();
 
-        let utf8_sessions = kin_mcp::SessionRegistry::new();
+        let utf8_sessions = test_sessions();
         let (_, utf8_arguments) =
             stage_entity_edit(&utf8_sessions, &entity, "pub fn value() -> u8 { 2 }");
         let utf8_result = commit_exact_transaction(&state, &utf8_sessions, &utf8_arguments, None);
@@ -1647,7 +1833,7 @@ mod tests {
             .join("modules/dependency/local-only.txt");
         std::fs::write(&retained, b"independently managed bytes\n").unwrap();
 
-        let sessions = kin_mcp::SessionRegistry::new();
+        let sessions = test_sessions();
         let (_, arguments) = stage_entity_edit(&sessions, &entity, "pub fn value() -> u8 { 2 }");
         let result = commit_exact_transaction(&state, &sessions, &arguments, None);
         assert_ne!(
@@ -1681,7 +1867,7 @@ mod tests {
             "value",
         );
         let before = load_native_commit_base(&state.layout).unwrap();
-        let sessions = kin_mcp::SessionRegistry::new();
+        let sessions = test_sessions();
         let (transaction_id, arguments) =
             stage_entity_edit(&sessions, &entity, "pub fn value() -> u8 { 2 }");
         let transaction = sessions.get_transaction(&transaction_id).unwrap();
@@ -1715,7 +1901,7 @@ mod tests {
             b"pub fn value() -> u8 { 1 }\n",
             "value",
         );
-        let sessions = kin_mcp::SessionRegistry::new();
+        let sessions = test_sessions();
         let (transaction_id, arguments) =
             stage_entity_edit(&sessions, &entity, "pub fn value() -> u8 { 2 }");
         state
@@ -1748,7 +1934,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(restored.len(), 1);
         assert_eq!(restored[0].state, "committing");
-        let recovered_sessions = kin_mcp::SessionRegistry::new();
+        let recovered_sessions = test_sessions();
         recovered_sessions.replace_transactions(restored);
         let recovered = commit_exact_transaction(&reopened, &recovered_sessions, &arguments, None);
         assert_ne!(
