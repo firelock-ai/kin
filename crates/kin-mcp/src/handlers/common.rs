@@ -1055,9 +1055,10 @@ fn graph_source_gap(message: impl Into<String>) -> McpError {
 /// only the changes reachable from its ref, so resolving an entity revision or a
 /// tree against the workspace head is both the wrong history and a hard
 /// graph-store miss for any ref that is not the head itself.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Deliberately has no `Default`: a caller that has not decided which change it
+/// reads at has not decided whether its answer is history or head.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntitySourceScope {
-    #[default]
     WorkspaceHead,
     At(SemanticChangeId),
 }
@@ -1073,12 +1074,6 @@ impl EntitySourceScope {
             EntitySourceScope::WorkspaceHead => authority.current_source_change_id(),
             EntitySourceScope::At(change_id) => Ok(change_id),
         }
-    }
-}
-
-impl From<SemanticChangeId> for EntitySourceScope {
-    fn from(change_id: SemanticChangeId) -> Self {
-        EntitySourceScope::At(change_id)
     }
 }
 
