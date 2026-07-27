@@ -155,7 +155,7 @@ fn seed_repo(repo: &Path) {
     fs::write(repo.join("src/lib.rs"), LIB_V0).expect("write lib.rs");
     fs::write(repo.join("src/main.rs"), MAIN_RS).expect("write main.rs");
 
-    git(repo, &["init", "-q"]);
+    git(repo, &["init", "-q", "--initial-branch=main"]);
     git(repo, &["config", "user.email", "kin@example.com"]);
     git(repo, &["config", "user.name", "Kin"]);
     git(repo, &["add", "."]);
