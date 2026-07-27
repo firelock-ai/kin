@@ -13,7 +13,10 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
-use kin_db::{LocalFileBackend, RepositoryAuthorityManager};
+use kin_db::{
+    LocalFileBackend, PersistedRepositoryAuthority, RepositoryAuthorityManager,
+    RepositoryAuthorityState,
+};
 use kin_model::{
     ExternalObjectKind, GitObjectId, RefName, RefTarget, RepositoryId, RepositoryRef,
     SemanticChangeId, WorkspaceId, WorkspaceState,
@@ -22,6 +25,27 @@ use kin_model::{
 use crate::error::{McpError, Result};
 
 pub use kin_core::LocalRepositoryAuthorityBinding;
+
+/// Read repository-v6 authority metadata under a name that cannot be mistaken
+/// for filesystem metadata.
+///
+/// `AuthorityReadLease` exposes this state as `metadata()`, which reads at a
+/// call site exactly like `std::fs::Metadata` access and trips the zero
+/// file-search guard's filesystem heuristic. The guard is deliberately blunt,
+/// so the fix is to make authority reads unmistakable rather than to teach the
+/// guard an exception that a real filesystem probe could later hide behind.
+pub(crate) trait RepositoryAuthorityMetadata {
+    fn authority_metadata(&self) -> &PersistedRepositoryAuthority;
+}
+
+impl RepositoryAuthorityMetadata for RepositoryAuthorityState {
+    fn authority_metadata(&self) -> &PersistedRepositoryAuthority {
+        self.snapshot()
+            .repository_authority
+            .as_ref()
+            .expect("repository authority lease always carries authority metadata")
+    }
+}
 
 /// Discover and pin a repository once for the explicit offline stdio loop.
 ///
@@ -64,7 +88,7 @@ impl ActiveRepositoryAuthority {
     pub(crate) fn workspace(&self) -> Result<WorkspaceState> {
         self.manager
             .read_authority()
-            .metadata()
+            .authority_metadata()
             .workspaces
             .iter()
             .find(|workspace| workspace.workspace_id == self.workspace_id)
@@ -80,7 +104,7 @@ impl ActiveRepositoryAuthority {
     pub(crate) fn repository_ref(&self, name: &RefName) -> Option<RepositoryRef> {
         self.manager
             .read_authority()
-            .metadata()
+            .authority_metadata()
             .ref_state
             .refs
             .iter()
@@ -91,7 +115,7 @@ impl ActiveRepositoryAuthority {
     pub(crate) fn repository_refs(&self) -> Vec<RepositoryRef> {
         self.manager
             .read_authority()
-            .metadata()
+            .authority_metadata()
             .ref_state
             .refs
             .clone()
@@ -100,7 +124,7 @@ impl ActiveRepositoryAuthority {
     pub(crate) fn default_ref(&self) -> Option<RefName> {
         self.manager
             .read_authority()
-            .metadata()
+            .authority_metadata()
             .ref_state
             .default_ref
             .clone()
@@ -122,7 +146,7 @@ impl ActiveRepositoryAuthority {
                     return self
                         .manager
                         .read_authority()
-                        .metadata()
+                        .authority_metadata()
                         .aliases
                         .iter()
                         .find(|alias| alias.oid == object.oid)
@@ -174,7 +198,7 @@ impl ActiveRepositoryAuthority {
     pub(crate) fn resolve_git_oid(&self, oid: GitObjectId) -> Result<SemanticChangeId> {
         self.manager
             .read_authority()
-            .metadata()
+            .authority_metadata()
             .aliases
             .iter()
             .find(|alias| alias.oid == oid)

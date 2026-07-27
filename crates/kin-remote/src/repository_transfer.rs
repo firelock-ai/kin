@@ -14,7 +14,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-use kin_db::{KinDbError, RepositoryAuthorityManager, StorageBackend};
+use kin_db::{
+    KinDbError, PersistedRepositoryAuthority, RepositoryAuthorityManager, RepositoryAuthorityState,
+    StorageBackend,
+};
 use kin_model::{
     compute_resolved_tree_hash, validate_semantic_change_id, AuthorId, ChangeOrigin, ChangeStore,
     DefaultRefExpectation, DefaultRefMutation, ExternalChangeAlias, ExternalObjectId,
@@ -26,6 +29,27 @@ use kin_model::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+
+/// Read repository-v6 authority metadata under a name that cannot be mistaken
+/// for filesystem metadata.
+///
+/// `AuthorityReadLease` exposes this state as `metadata()`, which reads at a
+/// call site exactly like `std::fs::Metadata` access and trips the zero
+/// file-search guard's filesystem heuristic. The guard is deliberately blunt,
+/// so the fix is to make authority reads unmistakable rather than to teach the
+/// guard an exception that a real filesystem probe could later hide behind.
+pub(crate) trait RepositoryAuthorityMetadata {
+    fn authority_metadata(&self) -> &PersistedRepositoryAuthority;
+}
+
+impl RepositoryAuthorityMetadata for RepositoryAuthorityState {
+    fn authority_metadata(&self) -> &PersistedRepositoryAuthority {
+        self.snapshot()
+            .repository_authority
+            .as_ref()
+            .expect("repository authority lease always carries authority metadata")
+    }
+}
 
 pub const REPOSITORY_TRANSFER_PROTOCOL: &str = "kin-repository-v6-fast-forward";
 pub const REPOSITORY_TRANSFER_SCHEMA_VERSION: u32 = 1;
@@ -263,15 +287,15 @@ pub fn repository_transfer_status<B: StorageBackend + ?Sized + 'static>(
     destination_ref: &RefName,
 ) -> Result<RepositoryTransferStatus> {
     let lease = authority.read_authority();
-    if &lease.metadata().repository_id != repository_id {
+    if &lease.authority_metadata().repository_id != repository_id {
         return Err(invalid(format!(
             "authority belongs to {}, not requested repository {}",
-            lease.metadata().repository_id,
+            lease.authority_metadata().repository_id,
             repository_id
         )));
     }
     let destination_target = lease
-        .metadata()
+        .authority_metadata()
         .ref_state
         .refs
         .iter()
@@ -290,7 +314,8 @@ pub fn repository_transfer_status<B: StorageBackend + ?Sized + 'static>(
                 .and_then(|tree| compute_resolved_tree_hash(&tree).map_err(model))
         })
         .transpose()?;
-    let git_authority_hash = hash_git_authority(lease.metadata().git_external_authority.as_ref())?;
+    let git_authority_hash =
+        hash_git_authority(lease.authority_metadata().git_external_authority.as_ref())?;
 
     Ok(RepositoryTransferStatus {
         schema_version: REPOSITORY_TRANSFER_SCHEMA_VERSION,
@@ -301,7 +326,7 @@ pub fn repository_transfer_status<B: StorageBackend + ?Sized + 'static>(
         destination_head,
         destination_tree_hash,
         roots: lease.roots().clone(),
-        default_ref: lease.metadata().ref_state.default_ref.clone(),
+        default_ref: lease.authority_metadata().ref_state.default_ref.clone(),
         git_authority_hash,
         supported_features: required_features(),
         limits: RepositoryTransferLimits::default(),
@@ -318,10 +343,10 @@ pub fn build_repository_transfer_pack<B: StorageBackend + ?Sized + 'static>(
 ) -> Result<RepositoryTransferPack> {
     validate_expectation(expectation)?;
     let lease = authority.read_authority();
-    if lease.metadata().repository_id != expectation.repository_id {
+    if lease.authority_metadata().repository_id != expectation.repository_id {
         return Err(invalid(format!(
             "source repository {} does not match destination repository {}",
-            lease.metadata().repository_id,
+            lease.authority_metadata().repository_id,
             expectation.repository_id
         )));
     }
@@ -335,7 +360,7 @@ pub fn build_repository_transfer_pack<B: StorageBackend + ?Sized + 'static>(
         .resolve_target_change_id(&source_target)
         .map_err(storage)?;
     let source_git_authority_hash =
-        hash_git_authority(lease.metadata().git_external_authority.as_ref())?;
+        hash_git_authority(lease.authority_metadata().git_external_authority.as_ref())?;
     if source_git_authority_hash != expectation.git_authority_hash {
         return Err(RepositoryTransferError::Conflict(
             "repository-v6 transfer v1 requires identical imported-Git authority on both replicas; Git-authority bootstrap/divergence is not adapted"
@@ -399,7 +424,7 @@ pub fn build_repository_transfer_pack<B: StorageBackend + ?Sized + 'static>(
     }
 
     let aliases = lease
-        .metadata()
+        .authority_metadata()
         .aliases
         .iter()
         .filter(|alias| {
@@ -408,7 +433,7 @@ pub fn build_repository_transfer_pack<B: StorageBackend + ?Sized + 'static>(
         .cloned()
         .collect::<Vec<_>>();
     let external_objects = lease
-        .metadata()
+        .authority_metadata()
         .external_objects
         .iter()
         .filter(|record| required_git_oids.contains(&record.object.oid))
@@ -511,7 +536,7 @@ pub fn apply_repository_transfer_pack<B: StorageBackend + ?Sized + 'static>(
     let transaction_hash = transaction.transaction_hash().map_err(model)?;
     let lease = authority.read_authority();
     if let Some(receipt) = lease
-        .metadata()
+        .authority_metadata()
         .receipts
         .iter()
         .find(|receipt| receipt.operation_id == pack.operation_id)
@@ -534,13 +559,13 @@ pub fn apply_repository_transfer_pack<B: StorageBackend + ?Sized + 'static>(
             "destination repository roots/generation moved from the pack lease".to_string(),
         ));
     }
-    if lease.metadata().ref_state.default_ref != pack.expected_destination_default_ref {
+    if lease.authority_metadata().ref_state.default_ref != pack.expected_destination_default_ref {
         return Err(RepositoryTransferError::Conflict(
             "destination default ref moved from the pack lease".to_string(),
         ));
     }
     let current_target = lease
-        .metadata()
+        .authority_metadata()
         .ref_state
         .refs
         .iter()
@@ -560,7 +585,8 @@ pub fn apply_repository_transfer_pack<B: StorageBackend + ?Sized + 'static>(
             "destination semantic head moved from the pack lease".to_string(),
         ));
     }
-    let current_git_hash = hash_git_authority(lease.metadata().git_external_authority.as_ref())?;
+    let current_git_hash =
+        hash_git_authority(lease.authority_metadata().git_external_authority.as_ref())?;
     if current_git_hash != pack.expected_destination_git_authority_hash
         || current_git_hash != pack.source_git_authority_hash
     {
@@ -1854,7 +1880,7 @@ mod tests {
 
         let lease = fixture.destination.read_authority();
         let current_target = lease
-            .metadata()
+            .authority_metadata()
             .ref_state
             .refs
             .iter()
