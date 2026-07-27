@@ -85,7 +85,7 @@ pub async fn run(
         }
     } else {
         for line in response.lines {
-            println!("{line}");
+            println!("{}", crate::output_style::paint_impact_line(&line));
         }
     }
     Ok(())

@@ -102,7 +102,7 @@ pub async fn run(entity: String, reference: Option<String>) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
     let response = run_daemon_history(&layout, &HistoryRequest { entity, reference }).await?;
     for line in response.lines {
-        println!("{line}");
+        println!("{}", crate::output_style::paint_history_line(&line));
     }
     Ok(())
 }

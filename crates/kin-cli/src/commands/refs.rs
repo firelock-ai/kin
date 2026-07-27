@@ -94,7 +94,7 @@ pub async fn run(entity: String, kind: String) -> Result<()> {
     let _scope = announce_active_scope(&layout, "refs").await?;
     let response = run_daemon_refs(&layout, &RefsRequest { entity, kind }).await?;
     for line in response.lines {
-        println!("{line}");
+        println!("{}", crate::output_style::paint_refs_line(&line));
     }
     Ok(())
 }

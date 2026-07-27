@@ -220,10 +220,15 @@ pub async fn run(url: String, path: Option<String>) -> Result<()> {
             .map_err(|e| anyhow::anyhow!("failed to configure forge remote: {}", e))?;
     }
 
-    print!("{}", result.summary());
+    for line in result.summary().lines() {
+        println!("{}", crate::output_style::paint_clone_line(line));
+    }
     println!(
-        "Clone complete. Kin repository ready at {}",
-        target.display()
+        "{}",
+        crate::output_style::paint_clone_line(&format!(
+            "Clone complete. Kin repository ready at {}",
+            target.display()
+        ))
     );
 
     Ok(())
