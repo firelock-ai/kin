@@ -115,18 +115,90 @@ pub struct ReconcileSummary {
 /// Source bodies have already been written and read back from the daemon's
 /// non-authoritative ingestion CAS, then released from request memory.
 /// Repository publication reloads them from CAS by identity.
+///
+/// The observation owns the retained no-follow directory capability it was
+/// taken through, so the capability outlives planning and reaches publication
+/// rather than being released when the scanner returns. Every field is
+/// private and every constructor path runs the scanner, so no caller outside
+/// this module can fabricate an observation or hand publication a desired tree
+/// that no retained walk produced.
+///
+/// The seal is a type-level one. Removing the capability, or building this
+/// value by hand, does not compile:
+///
+/// ```compile_fail
+/// # use kin_cli::commands::reconcile::SessionReconcileObservation;
+/// # fn fabricate(base: kin_cli::commands::session_workspace::SessionWorkspaceBase,
+/// #              tree: kin_model::ResolvedTree) -> SessionReconcileObservation {
+/// SessionReconcileObservation {
+///     base,
+///     desired_tree: tree,
+///     deltas: Vec::new(),
+///     observed_materialized_artifacts: 0,
+///     observed_body_bytes: 0,
+///     preserved_graph_only_artifacts: 0,
+/// }
+/// # }
+/// ```
 pub struct SessionReconcileObservation {
-    pub base: SessionWorkspaceBase,
-    pub desired_tree: ResolvedTree,
-    pub deltas: Vec<TreeDelta>,
-    pub observed_materialized_artifacts: usize,
-    pub observed_body_bytes: u64,
-    pub preserved_graph_only_artifacts: usize,
+    #[cfg(unix)]
+    retained: RetainedSession,
+    #[cfg(unix)]
+    base_bytes: Vec<u8>,
+    base: SessionWorkspaceBase,
+    desired_tree: ResolvedTree,
+    deltas: Vec<TreeDelta>,
+    observed_materialized_artifacts: usize,
+    observed_body_bytes: u64,
+    preserved_graph_only_artifacts: usize,
 }
 
 impl SessionReconcileObservation {
+    pub fn base(&self) -> &SessionWorkspaceBase {
+        &self.base
+    }
+
+    pub fn desired_tree(&self) -> &ResolvedTree {
+        &self.desired_tree
+    }
+
+    pub fn deltas(&self) -> &[TreeDelta] {
+        &self.deltas
+    }
+
+    pub const fn observed_materialized_artifacts(&self) -> usize {
+        self.observed_materialized_artifacts
+    }
+
+    pub const fn observed_body_bytes(&self) -> u64 {
+        self.observed_body_bytes
+    }
+
+    pub const fn preserved_graph_only_artifacts(&self) -> usize {
+        self.preserved_graph_only_artifacts
+    }
+
     pub fn changes(&self) -> Vec<ReconcileChange> {
         self.deltas.iter().map(reconcile_change).collect()
+    }
+
+    /// Re-prove the retained capability still names the observed session.
+    ///
+    /// Publication calls this after planning, so the window between the last
+    /// scan and the authority transaction is covered by the same directory
+    /// identities and the same base bytes the plan was derived from.
+    pub fn revalidate_retained_capability(&self, layout: &kin_core::KinLayout) -> Result<()> {
+        #[cfg(unix)]
+        {
+            self.retained
+                .revalidate_visible(layout, &self.base_bytes)
+                .context("revalidate retained session capability before publication")
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = layout;
+            bail!("retained session capability is unavailable on this platform")
+        }
     }
 }
 
@@ -203,6 +275,8 @@ pub fn observe_session_workspace(
         let observed_materialized_artifacts = first.entries.len();
 
         Ok(SessionReconcileObservation {
+            retained,
+            base_bytes,
             base,
             desired_tree,
             deltas,

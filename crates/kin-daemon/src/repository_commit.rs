@@ -79,6 +79,38 @@ pub struct WorkspaceAdmissionResult {
     pub file_count: usize,
 }
 
+/// One exact workspace transition that a complete host scan actually proved.
+///
+/// The constructor requires [`kin_index::CompleteScanToken`], which only a
+/// fully successful repository walk mints, so publication cannot be handed a
+/// tree assembled from a partial walk or from nothing at all. It also binds the
+/// authority roots and the workspace tree the transition was planned against,
+/// which is what lets publication refuse a stale desired tree instead of
+/// silently replanning it against newer authority.
+pub(crate) struct AdmittedWorkspaceTree {
+    previous_tree: kin_model::ResolvedTree,
+    desired_tree: kin_model::ResolvedTree,
+    expected_roots: RootBundle,
+    #[allow(dead_code)]
+    completion: kin_index::CompleteScanToken,
+}
+
+impl AdmittedWorkspaceTree {
+    pub(crate) fn from_complete_observation(
+        completion: kin_index::CompleteScanToken,
+        expected_roots: RootBundle,
+        previous_tree: kin_model::ResolvedTree,
+        desired_tree: kin_model::ResolvedTree,
+    ) -> Self {
+        Self {
+            previous_tree,
+            desired_tree,
+            expected_roots,
+            completion,
+        }
+    }
+}
+
 /// Immutable session-reconcile plan bound to the authority lease captured when
 /// the disposable session was materialized.
 pub struct SessionWorkspaceAdmissionPlan {
@@ -103,16 +135,26 @@ pub struct SessionWorkspaceAdmissionResult {
 /// Build one exact session admission against the session's retained roots and
 /// complete source workspace.
 ///
+/// Planning takes the sealed observation rather than a loose base and tree, so
+/// the retained no-follow directory capability is still held here and can be
+/// re-proved before anything is planned against it. A caller cannot reach this
+/// boundary with a desired tree that no retained walk produced.
+///
 /// Unlike the ambient filesystem synchronizer, this never silently rebases
 /// onto a newer workspace. The only accepted moved-authority state is the
 /// exact durable receipt for this session's caller-stable operation and
 /// transaction hash.
 pub(crate) fn plan_session_workspace_admission(
+    layout: &kin_core::KinLayout,
     blobs: &kin_blobs::BlobStore,
     authority_context: &LocalRepositoryAuthorityContext,
-    base: &kin_cli::commands::session_workspace::SessionWorkspaceBase,
-    desired_tree: &kin_model::ResolvedTree,
+    observation: &kin_cli::commands::reconcile::SessionReconcileObservation,
 ) -> Result<SessionWorkspaceAdmissionPlan> {
+    observation
+        .revalidate_retained_capability(layout)
+        .map_err(|error| invalid(error.to_string()))?;
+    let base = observation.base();
+    let desired_tree = observation.desired_tree();
     let repository_id = authority_context.repository_id().clone();
     let workspace_id = authority_context.workspace_id();
     if base.repository_id != repository_id
@@ -351,22 +393,35 @@ pub(crate) fn commit_session_workspace_admission(
 
 /// Atomically publish one exact graph-owned workspace tree.
 ///
-/// The caller has already performed the explicit filesystem-ingestion scan.
-/// This boundary consumes only its admitted exact tree plus bodies in the
-/// non-authoritative ingestion CAS, copies newly referenced bodies into
-/// repository CAS, and compare-and-swaps the workspace. It never creates a
-/// history node or advances a ref.
+/// The caller has already performed the explicit filesystem-ingestion scan and
+/// carries its completion proof in `admitted`. This boundary consumes only that
+/// admitted exact tree plus bodies in the non-authoritative ingestion CAS,
+/// copies newly referenced bodies into repository CAS, and compare-and-swaps
+/// the workspace. It never creates a history node or advances a ref.
+///
+/// Authority that moved after the observation was planned fails the whole
+/// publication. The desired tree describes one transition out of one observed
+/// prior tree; re-deriving it against a newer workspace would publish a
+/// transition nobody observed, and would silently revert whatever moved
+/// authority in the meantime.
 pub(crate) fn publish_workspace_tree(
     blobs: &kin_blobs::BlobStore,
     authority_context: &LocalRepositoryAuthorityContext,
-    desired_tree: &kin_model::ResolvedTree,
+    admitted: &AdmittedWorkspaceTree,
     operation_id: OperationId,
     actor: AuthorId,
 ) -> Result<Option<WorkspaceAdmissionResult>> {
+    let desired_tree = &admitted.desired_tree;
     let repository_id = authority_context.repository_id().clone();
     let workspace_id = authority_context.workspace_id();
     let authority = authority_context.open().map_err(DaemonError::Graph)?;
     let lease = authority.read_authority();
+    if lease.roots() != &admitted.expected_roots {
+        return Err(invalid(
+            "repository authority moved after the complete workspace observation was planned; \
+             exact admission does not replan a stale desired tree against newer authority",
+        ));
+    }
     let workspace = lease
         .metadata()
         .workspaces
@@ -383,6 +438,13 @@ pub(crate) fn publish_workspace_tree(
             "workspace {} belongs to {}, not {}",
             workspace.workspace_id, workspace.repository_id, repository_id
         )));
+    }
+    if workspace.tree != admitted.previous_tree {
+        return Err(invalid(
+            "the complete workspace observation was planned against a tree that is not this \
+             workspace's authority tree; exact admission does not replan a stale desired tree \
+             against newer authority",
+        ));
     }
     if workspace.tree == *desired_tree {
         return Ok(None);
