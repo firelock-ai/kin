@@ -18,7 +18,7 @@ use kin_model::{
 };
 
 use crate::local_repository_authority::{
-    require_fresh_daemon_workspace, ActiveLocalRepositoryAuthority,
+    require_fresh_daemon_workspace, ActiveLocalRepositoryAuthority, RepositoryAuthorityBindRefusal,
 };
 use crate::state::{DaemonEvent, DaemonState};
 
@@ -89,7 +89,7 @@ pub(crate) fn execute(
 ) -> std::result::Result<BranchResponse, (StatusCode, String)> {
     if matches!(request, BranchRequest::List) {
         let authority =
-            ActiveLocalRepositoryAuthority::open(state).map_err(internal_branch_error)?;
+            ActiveLocalRepositoryAuthority::open_bound(state).map_err(branch_bind_refusal)?;
         return list(&authority).map_err(internal_branch_error);
     }
 
@@ -101,7 +101,8 @@ pub(crate) fn execute(
         )
     })?;
     let previous_graph_root = hex::encode(state.graph.compute_root_hash());
-    let authority = ActiveLocalRepositoryAuthority::open(state).map_err(internal_branch_error)?;
+    let authority =
+        ActiveLocalRepositoryAuthority::open_bound(state).map_err(branch_bind_refusal)?;
     let outcome =
         match request {
             BranchRequest::List => unreachable!("list returned before mutation gates"),
@@ -1093,4 +1094,17 @@ fn repository_finalization_error(error: crate::error::DaemonError) -> (StatusCod
 
 fn internal_branch_error(error: impl std::fmt::Display) -> (StatusCode, String) {
     (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+}
+
+/// Answer a pinned-namespace refusal as a conflict for the same reason checkout
+/// does: the branch request is well formed, but the repository authority this
+/// daemon pinned is no longer the one at that path.
+fn branch_bind_refusal(refusal: RepositoryAuthorityBindRefusal) -> (StatusCode, String) {
+    let identity = refusal.is_identity_refusal();
+    let error = refusal.into_error();
+    if identity {
+        (StatusCode::CONFLICT, format!("{error:#}"))
+    } else {
+        internal_branch_error(format!("{error:#}"))
+    }
 }
