@@ -232,9 +232,7 @@ pub trait ChangeStore: Send + Sync {
         id: &EntityId,
     ) -> std::result::Result<Vec<EntityRevision>, Self::Error> {
         let changes = self.get_entity_history(id)?;
-        Ok(derive_entity_revisions_from_changes(changes)?
-            .remove(id)
-            .unwrap_or_default())
+        Ok(replay_entity_revisions(changes, id)?)
     }
     fn find_merge_bases(
         &self,
@@ -251,6 +249,13 @@ pub trait ChangeStore: Send + Sync {
         base: &SemanticChangeId,
         head: &SemanticChangeId,
     ) -> std::result::Result<Vec<SemanticChange>, Self::Error>;
+    /// The changes reachable from `head` that mention `id`, oldest first.
+    ///
+    /// The result is filtered to one entity, so it is not a history any
+    /// whole-graph replay can validate: the changes it keeps also carry deltas
+    /// for entities whose own introducing changes were filtered out. Derive
+    /// revisions from it with [`replay_entity_revisions`], never with
+    /// [`derive_entity_revisions_from_changes`].
     fn get_entity_history_at(
         &self,
         id: &EntityId,
@@ -267,9 +272,7 @@ pub trait ChangeStore: Send + Sync {
         head: &SemanticChangeId,
     ) -> std::result::Result<Vec<EntityRevision>, Self::Error> {
         let changes = self.get_entity_history_at(id, head)?;
-        Ok(derive_entity_revisions_from_changes(changes)?
-            .remove(id)
-            .unwrap_or_default())
+        Ok(replay_entity_revisions(changes, id)?)
     }
     fn resolve_entity_revision_at(
         &self,
@@ -890,20 +893,14 @@ where
                             entity.id
                         )));
                     }
-                    let previous_revision = mark_matching_entity_revision_ended(
-                        &mut state.entity_revisions,
-                        &entity,
+                    let entries = state.entity_revisions.entry(entity.id).or_default();
+                    let previous_revision =
+                        mark_matching_entity_revision_ended(entries, &entity, change_id);
+                    entries.push(EntityRevision::new(
+                        entity.clone(),
                         change_id,
-                    );
-                    state
-                        .entity_revisions
-                        .entry(entity.id)
-                        .or_default()
-                        .push(EntityRevision::new(
-                            entity.clone(),
-                            change_id,
-                            previous_revision,
-                        ));
+                        previous_revision,
+                    ));
                     state.entity_tombstones.remove(&entity.id);
                     state.entities.insert(entity.id, entity);
                 }
@@ -920,20 +917,14 @@ where
                             old.id
                         )));
                     }
-                    let previous_revision = mark_matching_entity_revision_ended(
-                        &mut state.entity_revisions,
-                        &old,
+                    let entries = state.entity_revisions.entry(new.id).or_default();
+                    let previous_revision =
+                        mark_matching_entity_revision_ended(entries, &old, change_id);
+                    entries.push(EntityRevision::new(
+                        new.clone(),
                         change_id,
-                    );
-                    state
-                        .entity_revisions
-                        .entry(new.id)
-                        .or_default()
-                        .push(EntityRevision::new(
-                            new.clone(),
-                            change_id,
-                            previous_revision,
-                        ));
+                        previous_revision,
+                    ));
                     state.entities.insert(new.id, new);
                 }
                 crate::change::EntityDelta::Removed { old } => {
@@ -1014,6 +1005,12 @@ where
     Ok(state)
 }
 
+/// Replay the revision timelines of every entity in `changes`.
+///
+/// `changes` must be a complete history: replaying validates every delta each
+/// change carries, so a list already filtered to one entity fails on the other
+/// entities that change touches. Use [`replay_entity_revisions`] for a single
+/// entity's timeline.
 pub fn derive_entity_revisions_from_changes<I>(
     changes: I,
 ) -> std::result::Result<HashMap<EntityId, Vec<EntityRevision>>, ModelError>
@@ -1021,6 +1018,91 @@ where
     I: IntoIterator<Item = SemanticChange>,
 {
     Ok(replay_graph_state(changes)?.entity_revisions)
+}
+
+/// Replay one entity's revision timeline, oldest first.
+///
+/// Only `entity_id`'s own deltas are replayed and validated. Every other
+/// entity's deltas are skipped rather than checked, which is what makes this
+/// sound over a change list that has been filtered to one entity: the changes
+/// that introduced the other entities are not in such a list, so validating
+/// their `Modified`/`Removed` preconditions checks them against a state they
+/// were never added to and reports a stale payload for an entity nobody asked
+/// about. A single commit that revised the queried entity while removing a
+/// second one was enough to make `kin history` and `kin blame` fail outright.
+///
+/// The queried entity's own preconditions are still enforced, so a genuinely
+/// inconsistent timeline fails closed.
+pub fn replay_entity_revisions<I>(
+    changes: I,
+    entity_id: &EntityId,
+) -> std::result::Result<Vec<EntityRevision>, ModelError>
+where
+    I: IntoIterator<Item = SemanticChange>,
+{
+    let mut revisions: Vec<EntityRevision> = Vec::new();
+    let mut live: Option<Entity> = None;
+
+    for change in changes {
+        let change_id = change.id;
+        for delta in change.entity_deltas {
+            match delta {
+                crate::change::EntityDelta::Added { new: entity } if entity.id == *entity_id => {
+                    if live.is_some() {
+                        return Err(ModelError::Conflict(format!(
+                            "change {change_id} adds existing entity {entity_id}"
+                        )));
+                    }
+                    let previous_revision =
+                        mark_matching_entity_revision_ended(&mut revisions, &entity, change_id);
+                    revisions.push(EntityRevision::new(
+                        entity.clone(),
+                        change_id,
+                        previous_revision,
+                    ));
+                    live = Some(entity);
+                }
+                crate::change::EntityDelta::Modified { old, new }
+                    if old.id == *entity_id || new.id == *entity_id =>
+                {
+                    if old.id != new.id {
+                        return Err(ModelError::Conflict(format!(
+                            "change {change_id} modifies entity {} into different identity {}",
+                            old.id, new.id
+                        )));
+                    }
+                    if live.as_ref() != Some(&old) {
+                        return Err(ModelError::Conflict(format!(
+                            "change {change_id} has stale old payload for entity {}",
+                            old.id
+                        )));
+                    }
+                    let previous_revision =
+                        mark_matching_entity_revision_ended(&mut revisions, &old, change_id);
+                    revisions.push(EntityRevision::new(
+                        new.clone(),
+                        change_id,
+                        previous_revision,
+                    ));
+                    live = Some(new);
+                }
+                crate::change::EntityDelta::Removed { old } if old.id == *entity_id => {
+                    if live.as_ref() != Some(&old) {
+                        return Err(ModelError::Conflict(format!(
+                            "change {change_id} has stale old payload for removed entity {entity_id}"
+                        )));
+                    }
+                    if let Some(previous) = revisions.last_mut() {
+                        previous.mark_ended(change_id);
+                    }
+                    live = None;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    Ok(revisions)
 }
 
 fn replay_relation_revisions<I>(changes: I, relation_id: &RelationId) -> Vec<RelationRevision>
@@ -1165,23 +1247,26 @@ fn entity_is_touched_by_change(change: &SemanticChange, entity_id: &EntityId) ->
     })
 }
 
+/// Close out the revision of `entity` that a change supersedes, and name it as
+/// the predecessor of the revision that change introduces.
+///
+/// `entries` holds one entity's revisions, oldest first. An empty slice means
+/// nothing to supersede, which is the same answer as an entity with no recorded
+/// history at all.
 fn mark_matching_entity_revision_ended(
-    revisions: &mut HashMap<EntityId, Vec<EntityRevision>>,
+    entries: &mut [EntityRevision],
     entity: &Entity,
     ended_by: SemanticChangeId,
 ) -> Option<EntityRevisionId> {
-    revisions
-        .get_mut(&entity.id)
-        .and_then(|entries| {
-            let match_index = entries
-                .iter()
-                .enumerate()
-                .rev()
-                .find(|(_, revision)| entities_match_for_revision(&revision.entity, entity))
-                .map(|(index, _)| index)
-                .or_else(|| entries.len().checked_sub(1));
-            match_index.and_then(|index| entries.get_mut(index))
-        })
+    let match_index = entries
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, revision)| entities_match_for_revision(&revision.entity, entity))
+        .map(|(index, _)| index)
+        .or_else(|| entries.len().checked_sub(1));
+    match_index
+        .and_then(|index| entries.get_mut(index))
         .map(|revision| {
             revision.mark_ended(ended_by);
             revision.revision_id
@@ -2431,6 +2516,235 @@ mod tests {
                 .artifact_id_at_path(&reused_path),
             Some(new_artifact)
         );
+    }
+
+    /// One version of an entity. `marker` varies the fingerprint so two
+    /// versions of the same entity are distinguishable revisions.
+    fn make_entity_version(id: EntityId, name: &str, marker: u8) -> Entity {
+        let mut entity = make_entity(id, name);
+        entity.fingerprint.ast_hash = Hash256::from_bytes([marker; 32]);
+        entity.signature = format!("fn {name}(v{marker})");
+        entity
+    }
+
+    /// A history whose last change carries a mixed add/remove shape.
+    ///
+    /// `beta` is introduced by a change that never mentions `alpha`, so
+    /// filtering the change list to `alpha` drops the only change that adds
+    /// `beta`, while the change that revises `alpha` still carries `beta`'s
+    /// removal.
+    fn mixed_shape_history(
+        alpha: EntityId,
+        beta: EntityId,
+        gamma: EntityId,
+    ) -> (HistoryStore, [SemanticChangeId; 3]) {
+        let add_alpha_id = make_change_id(60);
+        let add_beta_id = make_change_id(61);
+        let revise_alpha_id = make_change_id(62);
+
+        let add_alpha = make_semantic_change(
+            add_alpha_id,
+            vec![],
+            vec![EntityDelta::Added {
+                new: make_entity_version(alpha, "alpha", 1),
+            }],
+            vec![],
+        );
+        let add_beta = make_semantic_change(
+            add_beta_id,
+            vec![add_alpha_id],
+            vec![EntityDelta::Added {
+                new: make_entity_version(beta, "beta", 1),
+            }],
+            vec![],
+        );
+        let revise_alpha = make_semantic_change(
+            revise_alpha_id,
+            vec![add_beta_id],
+            vec![
+                EntityDelta::Modified {
+                    old: make_entity_version(alpha, "alpha", 1),
+                    new: make_entity_version(alpha, "alpha", 2),
+                },
+                EntityDelta::Removed {
+                    old: make_entity_version(beta, "beta", 1),
+                },
+                EntityDelta::Added {
+                    new: make_entity_version(gamma, "gamma", 1),
+                },
+            ],
+            vec![],
+        );
+
+        (
+            HistoryStore::from_changes([add_alpha, add_beta, revise_alpha]),
+            [add_alpha_id, add_beta_id, revise_alpha_id],
+        )
+    }
+
+    /// Deriving an entity's revisions replays only the changes that mention it,
+    /// so validating the other entities those changes touch checks their
+    /// preconditions against a state their own introducing changes were
+    /// filtered out of. A sound repository then answers a query about `alpha`
+    /// with a stale-payload conflict naming `beta`, which is what made
+    /// `kin history` and `kin blame` fail before printing anything.
+    #[test]
+    fn entity_revisions_at_survive_a_change_that_also_removes_another_entity() {
+        let alpha = EntityId::new();
+        let beta = EntityId::new();
+        let gamma = EntityId::new();
+        let (store, [add_alpha_id, add_beta_id, revise_alpha_id]) =
+            mixed_shape_history(alpha, beta, gamma);
+
+        // The trap this fix closes: the filtered change list is not a history
+        // the whole-graph replay can validate, and routing revisions through it
+        // is what turned a sound repository into a conflict.
+        let filtered = store
+            .get_entity_history_at(&alpha, &revise_alpha_id)
+            .unwrap();
+        let error = derive_entity_revisions_from_changes(filtered)
+            .expect_err("a change list filtered to one entity is not a complete history");
+        assert!(
+            matches!(&error, ModelError::Conflict(message) if message.contains("stale old payload")),
+            "expected the whole-graph replay to reject the filtered list, got {error}"
+        );
+
+        let revisions = store
+            .get_entity_revisions_at(&alpha, &revise_alpha_id)
+            .expect("a sound history must not report a conflict for an unqueried entity");
+
+        assert_eq!(revisions.len(), 2);
+        assert_eq!(revisions[0].introduced_by, add_alpha_id);
+        assert_eq!(revisions[0].ended_by, Some(revise_alpha_id));
+        assert_eq!(revisions[1].introduced_by, revise_alpha_id);
+        assert_eq!(revisions[1].ended_by, None);
+        assert_eq!(
+            revisions[1].previous_revision,
+            Some(revisions[0].revision_id)
+        );
+        assert!(
+            !revisions
+                .iter()
+                .any(|revision| revision.introduced_by == add_beta_id),
+            "a change that never touches alpha is not a revision of alpha"
+        );
+
+        let active = store
+            .resolve_entity_revision_at(&alpha, &revise_alpha_id)
+            .unwrap()
+            .expect("alpha is live at the head");
+        assert_eq!(active.revision_id, revisions[1].revision_id);
+    }
+
+    /// The removed entity's own timeline stays answerable, and ends where the
+    /// change that removed it says it does.
+    #[test]
+    fn entity_revisions_at_close_the_timeline_of_a_removed_entity() {
+        let alpha = EntityId::new();
+        let beta = EntityId::new();
+        let gamma = EntityId::new();
+        let (store, [_, add_beta_id, revise_alpha_id]) = mixed_shape_history(alpha, beta, gamma);
+
+        let revisions = store
+            .get_entity_revisions_at(&beta, &revise_alpha_id)
+            .unwrap();
+
+        assert_eq!(revisions.len(), 1);
+        assert_eq!(revisions[0].introduced_by, add_beta_id);
+        assert_eq!(revisions[0].ended_by, Some(revise_alpha_id));
+        assert!(store
+            .resolve_entity_revision_at(&beta, &revise_alpha_id)
+            .unwrap()
+            .is_none());
+    }
+
+    /// Skipping the other entities' deltas must not weaken the queried
+    /// entity's own preconditions.
+    #[test]
+    fn entity_revisions_at_fail_closed_on_a_stale_payload_for_the_queried_entity() {
+        let alpha = EntityId::new();
+        let add_id = make_change_id(63);
+        let revise_id = make_change_id(64);
+        let add = make_semantic_change(
+            add_id,
+            vec![],
+            vec![EntityDelta::Added {
+                new: make_entity_version(alpha, "alpha", 1),
+            }],
+            vec![],
+        );
+        // `old` is a payload alpha never had at this point in history.
+        let revise = make_semantic_change(
+            revise_id,
+            vec![add_id],
+            vec![EntityDelta::Modified {
+                old: make_entity_version(alpha, "alpha", 9),
+                new: make_entity_version(alpha, "alpha", 2),
+            }],
+            vec![],
+        );
+        let store = HistoryStore::from_changes([add, revise]);
+
+        let error = store
+            .get_entity_revisions_at(&alpha, &revise_id)
+            .expect_err("an inconsistent timeline for the queried entity must fail closed");
+
+        assert!(
+            matches!(&error, ModelError::Conflict(message) if message.contains("stale old payload")),
+            "expected a stale-payload conflict, got {error}"
+        );
+    }
+
+    /// Over a complete history the per-entity replay must agree with the
+    /// whole-graph replay, so routing revisions through it is a soundness fix
+    /// rather than a behavior change.
+    #[test]
+    fn per_entity_replay_matches_the_whole_graph_replay_over_complete_history() {
+        let alpha = EntityId::new();
+        let beta = EntityId::new();
+        let gamma = EntityId::new();
+        let add_both_id = make_change_id(65);
+        let revise_alpha_id = make_change_id(66);
+        let add_both = make_semantic_change(
+            add_both_id,
+            vec![],
+            vec![
+                EntityDelta::Added {
+                    new: make_entity_version(alpha, "alpha", 1),
+                },
+                EntityDelta::Added {
+                    new: make_entity_version(beta, "beta", 1),
+                },
+            ],
+            vec![],
+        );
+        let revise_alpha = make_semantic_change(
+            revise_alpha_id,
+            vec![add_both_id],
+            vec![
+                EntityDelta::Modified {
+                    old: make_entity_version(alpha, "alpha", 1),
+                    new: make_entity_version(alpha, "alpha", 2),
+                },
+                EntityDelta::Removed {
+                    old: make_entity_version(beta, "beta", 1),
+                },
+                EntityDelta::Added {
+                    new: make_entity_version(gamma, "gamma", 1),
+                },
+            ],
+            vec![],
+        );
+        let history = vec![add_both, revise_alpha];
+        let whole_graph = derive_entity_revisions_from_changes(history.clone()).unwrap();
+
+        for entity_id in [alpha, beta, gamma] {
+            assert_eq!(
+                replay_entity_revisions(history.clone(), &entity_id).unwrap(),
+                whole_graph.get(&entity_id).cloned().unwrap_or_default(),
+                "per-entity replay diverged for {entity_id}"
+            );
+        }
     }
 
     #[test]
