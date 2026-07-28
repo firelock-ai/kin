@@ -808,16 +808,22 @@ pub struct RepositoryOperationRecord {
     pub default_ref_mutation: Option<DefaultRefMutation>,
     pub workspace_mutation: Option<WorkspaceMutation>,
     pub local_overlay_delta: Option<FrozenLocalOverlayDelta>,
+    pub roots_before: RootBundle,
+    pub roots_after: RootBundle,
     /// Exact transition of this workspace's durable merge record, when the
     /// operation opened, resolved, or terminated a merge.
     ///
     /// Optional and omitted when absent, so an operation that touches no merge
-    /// serializes to the same bytes it always did and keeps its identity under
-    /// the existing hash domain.
+    /// serializes to the bytes it always did and keeps its identity under the
+    /// existing hash domain.
+    ///
+    /// Deliberately last. Operation records are persisted inside a MessagePack
+    /// snapshot, where a struct is an array and position decides the mapping,
+    /// so an optional field is only additive at the end: an already-written
+    /// record simply runs out of elements and takes the default. Anywhere else
+    /// it would shift every field after it and silently mis-decode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub merge_transaction_delta: Option<MergeTransactionDelta>,
-    pub roots_before: RootBundle,
-    pub roots_after: RootBundle,
 }
 
 #[derive(Serialize)]
@@ -1577,6 +1583,89 @@ mod tests {
             operation.identity_hash().unwrap().to_string(),
             "eae3a8c100dcc231fd552ce1d20c5e258e489e09139076cfa431ebaf6bfa916b",
             "adding an absent merge record must not move operation identity"
+        );
+    }
+
+    /// Operation records live inside a MessagePack snapshot, where a struct is
+    /// an array and position decides the mapping.
+    ///
+    /// An optional field is therefore additive only at the end: a record
+    /// written before it existed runs out of elements and takes the default,
+    /// and a record with nothing to say encodes to the same element count it
+    /// always did. This proves both directions against the real encoder rather
+    /// than trusting the JSON contract to describe the on-disk one, which it
+    /// does not.
+    #[test]
+    fn an_operation_record_round_trips_through_positional_encoding() {
+        let transaction = workspace_transaction();
+        let mut roots_after = roots();
+        roots_after.generation = roots().generation + 1;
+        let operation = RepositoryOperationRecord {
+            operation_id: transaction.operation_id,
+            repository_id: transaction.repository_id.clone(),
+            transaction_hash: transaction.transaction_hash().unwrap(),
+            actor: transaction.actor.clone(),
+            committed_at: crate::Timestamp::from(
+                chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            ),
+            git_authority_delta: None,
+            ref_mutations: Vec::new(),
+            default_ref_mutation: None,
+            workspace_mutation: transaction.workspace_mutation.clone(),
+            local_overlay_delta: transaction.local_overlay_delta.clone(),
+            roots_before: roots(),
+            roots_after,
+            merge_transaction_delta: None,
+        };
+
+        // An absent merge record is not written at all, so the encoded array
+        // has the arity a pre-merge binary produced, and decodes.
+        let bytes = rmp_serde::to_vec(&operation).unwrap();
+        let decoded: RepositoryOperationRecord = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(decoded, operation);
+        assert!(decoded.merge_transaction_delta.is_none());
+
+        let mut with_merge = operation.clone();
+        with_merge.merge_transaction_delta = Some(MergeTransactionDelta::open(
+            crate::merge::tests::sample_record(
+                operation.repository_id.clone(),
+                operation.workspace_mutation.as_ref().unwrap().workspace_id,
+            ),
+        ));
+        let bytes_with_merge = rmp_serde::to_vec(&with_merge).unwrap();
+        assert!(bytes_with_merge.len() > bytes.len());
+        let decoded: RepositoryOperationRecord = rmp_serde::from_slice(&bytes_with_merge).unwrap();
+        assert_eq!(decoded, with_merge);
+    }
+
+    /// The same, for the transaction that carries the delta over the wire.
+    #[test]
+    fn a_transaction_round_trips_through_positional_encoding() {
+        let transaction = workspace_transaction();
+        let bytes = rmp_serde::to_vec(&transaction).unwrap();
+        let decoded: RepositoryTransaction = rmp_serde::from_slice(&bytes).unwrap();
+        assert!(decoded.merge_transaction_delta.is_none());
+        assert_eq!(
+            decoded.transaction_hash().unwrap(),
+            transaction.transaction_hash().unwrap()
+        );
+
+        let mut with_merge = transaction.clone();
+        with_merge.merge_transaction_delta = Some(MergeTransactionDelta::open(
+            crate::merge::tests::sample_record(
+                transaction.repository_id.clone(),
+                transaction
+                    .workspace_mutation
+                    .as_ref()
+                    .unwrap()
+                    .workspace_id,
+            ),
+        ));
+        let decoded: RepositoryTransaction =
+            rmp_serde::from_slice(&rmp_serde::to_vec(&with_merge).unwrap()).unwrap();
+        assert_eq!(
+            decoded.transaction_hash().unwrap(),
+            with_merge.transaction_hash().unwrap()
         );
     }
 
