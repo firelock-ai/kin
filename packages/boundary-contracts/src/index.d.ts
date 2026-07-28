@@ -499,7 +499,7 @@ export interface RepositoryTransferLimits {
 }
 
 export interface RepositoryTransferStatus {
-  schema_version: 1;
+  schema_version: 2;
   protocol: "kin-repository-v6-fast-forward";
   repository_id: string;
   destination_ref: RepositoryTransferRefName;
@@ -511,9 +511,9 @@ export interface RepositoryTransferStatus {
   git_authority_hash: string | null;
   supported_features: string[];
   limits: RepositoryTransferLimits;
-  push_apply_ready: false;
+  push_apply_ready: boolean;
   bounded_envelope_export_ready: boolean;
-  pull_apply_ready: false;
+  pull_apply_ready: boolean;
 }
 
 export interface RepositoryTransferBody {
@@ -523,14 +523,21 @@ export interface RepositoryTransferBody {
 }
 
 export interface RepositoryTransferPack {
-  schema_version: 1;
+  schema_version: 2;
   protocol: "kin-repository-v6-fast-forward";
   transfer_id: string;
   operation_id: string;
   repository_id: string;
   source_ref: RepositoryTransferRefName;
   destination_ref: RepositoryTransferRefName;
+  /** The exact head this one pack publishes. */
   source_head: string;
+  /**
+   * The head the whole transfer is moving toward. Equal to `source_head` on a
+   * single-pack transfer and on the last pack of a continuation; an earlier
+   * exact ancestor of it on every pack before that.
+   */
+  transfer_target_head: string;
   source_tree_hash: string;
   expected_destination_target: RepositoryTransferRefTarget | null;
   expected_destination_head: string | null;
@@ -547,7 +554,7 @@ export interface RepositoryTransferPack {
 }
 
 export interface RepositoryTransferReceipt {
-  schema_version: 1;
+  schema_version: 2;
   protocol: "kin-repository-v6-fast-forward";
   transfer_id: string;
   repository_id: string;

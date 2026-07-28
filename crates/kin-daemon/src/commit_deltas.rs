@@ -439,7 +439,19 @@ fn compute_deltas_from_resolved_state(
                     new: entity.clone(),
                 });
             }
-            Some(committed) if kin_index::entity_semantics_changed(committed, entity) => {
+            // Compare the complete payload, not only the AST/signature/behavior
+            // fingerprint. An entity whose body is unchanged but whose span or
+            // blob provenance advanced is still a different value, and the
+            // workspace semantic overlay is derived by whole-value difference
+            // against the change this delta publishes. Recording only
+            // fingerprint changes therefore leaves the published base holding a
+            // superseded payload, which strands that difference in the overlay:
+            // the workspace reports dirty forever, the next switch or merge
+            // refuses it, and a further commit publishes an empty change
+            // because the fingerprint still has not moved. Publishing the exact
+            // payload is also what keeps history able to reproduce the spans
+            // and source provenance the entity actually had at that change.
+            Some(committed) if committed != entity => {
                 entity_deltas.push(EntityDelta::Modified {
                     old: committed.clone(),
                     new: entity.clone(),
@@ -1826,6 +1838,79 @@ mod tests {
             deltas.relation_deltas.is_empty(),
             "no relation changes: expected 0, got {}",
             deltas.relation_deltas.len()
+        );
+    }
+
+    /// An entity whose body did not change but whose source provenance moved
+    /// must still be published.
+    ///
+    /// The workspace semantic overlay is derived by whole-value difference
+    /// against the change a commit publishes. Recording only fingerprint
+    /// changes leaves the published base holding a superseded payload, so the
+    /// difference is stranded in the overlay: the workspace reports dirty
+    /// permanently, the next switch or merge refuses it, and a further commit
+    /// publishes an empty change because the fingerprint still has not moved.
+    #[test]
+    fn commit_publishes_an_entity_whose_provenance_moved_without_its_fingerprint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let init = kin_core::init(tmp.path()).unwrap();
+        let layout = init.layout;
+        let graph = Arc::new(kin_db::InMemoryGraph::new());
+        let blobs = BlobStore::new(layout.ingest_cas_dir()).unwrap();
+
+        let genesis = genesis_change();
+        graph.create_change(&genesis).unwrap();
+
+        let src_dir = layout.working_dir();
+        std::fs::create_dir_all(src_dir.join("src")).unwrap();
+        let content = b"pub fn stable() {}\n";
+        std::fs::write(src_dir.join("src/lib.rs"), content).unwrap();
+        let digest = blobs.write(content).unwrap();
+        let hash = Hash256::from_bytes(digest.0);
+        let path = RepoPath::from_utf8("src/lib.rs").unwrap();
+
+        let entity = make_entity("stable", "src/lib.rs", [99; 32]);
+        graph.upsert_entity(&entity).unwrap();
+        let head = record_commit(
+            &graph,
+            vec![EntityDelta::Added {
+                new: entity.clone(),
+            }],
+            vec![],
+            vec![TreeDelta::Added {
+                artifact_id: ArtifactId::new(),
+                new: LocatedEntry::new(path, TreeEntry::blob(hash, false)),
+            }],
+            &genesis.id,
+            "main",
+        );
+
+        // Same identity, same body, same fingerprint. Only the blob provenance
+        // the reconciler stamps has advanced, exactly as it does when an edit
+        // elsewhere in the file rewrites the artifact this entity came from.
+        let mut reprovenanced = entity.clone();
+        reprovenanced
+            .metadata
+            .extra
+            .insert("blob_hash".into(), "advanced-source-blob".into());
+        graph.upsert_entity(&reprovenanced).unwrap();
+        assert_eq!(
+            entity.fingerprint, reprovenanced.fingerprint,
+            "the fixture must move provenance without moving the semantic fingerprint"
+        );
+        assert_ne!(
+            entity, reprovenanced,
+            "the fixture must still be a different entity payload"
+        );
+
+        let deltas = compute_deltas_vs_last_commit(&graph, &head).unwrap();
+        assert_eq!(
+            deltas.entity_deltas,
+            vec![EntityDelta::Modified {
+                old: entity,
+                new: reprovenanced,
+            }],
+            "a moved payload must reach the published change, not the workspace overlay"
         );
     }
 }
