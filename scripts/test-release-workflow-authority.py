@@ -174,6 +174,7 @@ def main() -> None:
         "git merge --signoff --no-edit -X ours refs/remotes/origin/main",
         'gh pr merge "$PR"',
         "GH_TOKEN: ${{ steps.app-token.outputs.token }}",
+        "--match-head-commit",
         "--auto",
         "--squash",
         "git commit --allow-empty --signoff",

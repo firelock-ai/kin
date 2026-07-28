@@ -441,10 +441,16 @@ jobs:
           PR: ${{ steps.pr.outputs.number }}
         run: |
           set -euo pipefail
+          head_sha="$(gh pr view "$PR" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json headRefOid \
+            --jq .headRefOid)"
+          [[ "$head_sha" =~ ^[0-9a-f]{40}$ ]]
           gh pr merge "$PR" \
             --repo "$GITHUB_REPOSITORY" \
             --auto \
-            --squash
+            --squash \
+            --match-head-commit "$head_sha"
 
       - name: Summarize
         if: steps.plan.outputs.needed == 'true'
