@@ -12,9 +12,10 @@ use crate::{
     identity::canonical_json_bytes, validate_semantic_change_id, validate_transaction_delta,
     AuthorId, DefaultRefMutation, EffectiveAdmissionPolicyStamp, EntityDelta, ExternalChangeAlias,
     ExternalObjectKind, ExternalObjectRecord, FrozenLocalOverlayDelta, GitExternalAuthorityDelta,
-    GitObjectId, Hash256, ModelError, OperationId, RefMutation, RefName, RefTarget, RelationDelta,
-    RepositoryId, RepositoryRef, ResolvedTree, Result, SemanticChange, SemanticChangeId,
-    SharedAdmissionPolicy, TransactionDelta, TreeDelta, WorkspaceHead, WorkspaceId,
+    GitObjectId, Hash256, MergeTransactionDelta, ModelError, OperationId, RefMutation, RefName,
+    RefTarget, RelationDelta, RepositoryId, RepositoryRef, ResolvedTree, Result, SemanticChange,
+    SemanticChangeId, SharedAdmissionPolicy, TransactionDelta, TreeDelta, WorkspaceHead,
+    WorkspaceId,
 };
 
 /// Clean-slate transaction schema whose persistence authority owns both exact
@@ -807,6 +808,14 @@ pub struct RepositoryOperationRecord {
     pub default_ref_mutation: Option<DefaultRefMutation>,
     pub workspace_mutation: Option<WorkspaceMutation>,
     pub local_overlay_delta: Option<FrozenLocalOverlayDelta>,
+    /// Exact transition of this workspace's durable merge record, when the
+    /// operation opened, resolved, or terminated a merge.
+    ///
+    /// Optional and omitted when absent, so an operation that touches no merge
+    /// serializes to the same bytes it always did and keeps its identity under
+    /// the existing hash domain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_transaction_delta: Option<MergeTransactionDelta>,
     pub roots_before: RootBundle,
     pub roots_after: RootBundle,
 }
@@ -823,6 +832,8 @@ struct RepositoryOperationIdentity<'a> {
     default_ref_mutation: &'a Option<DefaultRefMutation>,
     workspace_mutation: &'a Option<WorkspaceMutation>,
     local_overlay_delta: &'a Option<FrozenLocalOverlayDelta>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    merge_transaction_delta: &'a Option<MergeTransactionDelta>,
 }
 
 impl RepositoryOperationRecord {
@@ -871,6 +882,9 @@ impl RepositoryOperationRecord {
         if let Some(delta) = &self.local_overlay_delta {
             delta.validate()?;
         }
+        if let Some(delta) = &self.merge_transaction_delta {
+            delta.validate()?;
+        }
         Ok(())
     }
 
@@ -902,6 +916,7 @@ impl RepositoryOperationRecord {
                 default_ref_mutation: &canonical.default_ref_mutation,
                 workspace_mutation: &canonical.workspace_mutation,
                 local_overlay_delta: &canonical.local_overlay_delta,
+                merge_transaction_delta: &canonical.merge_transaction_delta,
             },
         )
     }
@@ -928,6 +943,15 @@ pub struct RepositoryTransaction {
     pub default_ref_mutation: Option<DefaultRefMutation>,
     pub workspace_mutation: Option<WorkspaceMutation>,
     pub local_overlay_delta: Option<FrozenLocalOverlayDelta>,
+    /// Exact transition of one workspace's durable merge record.
+    ///
+    /// A merge that composes cleanly publishes without one. This carries the
+    /// merges that did not: opening a conflict set, settling an entry, and
+    /// terminating by publishing the merge change or aborting back to the
+    /// recorded restore point. Optional and omitted when absent, so a
+    /// transaction that touches no merge keeps its existing identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_transaction_delta: Option<MergeTransactionDelta>,
 }
 
 impl RepositoryTransaction {
@@ -956,6 +980,7 @@ impl RepositoryTransaction {
             && self.default_ref_mutation.is_none()
             && self.workspace_mutation.is_none()
             && self.local_overlay_delta.is_none()
+            && self.merge_transaction_delta.is_none()
         {
             return Err(ModelError::InvalidOperation(
                 "repository transaction must contain at least one mutation".to_string(),
@@ -1080,6 +1105,31 @@ impl RepositoryTransaction {
                     "local overlay mutation and workspace state must bind the same workspace and new overlay stamp"
                         .to_string(),
                 ));
+            }
+        }
+
+        if let Some(merge_delta) = &self.merge_transaction_delta {
+            merge_delta.validate()?;
+            for record in [merge_delta.old.as_ref(), merge_delta.new.as_ref()]
+                .into_iter()
+                .flatten()
+            {
+                if record.repository_id != self.repository_id {
+                    return Err(ModelError::InvalidOperation(format!(
+                        "merge transaction record repository {} does not match transaction \
+                         repository {}",
+                        record.repository_id, self.repository_id
+                    )));
+                }
+            }
+            if let Some(workspace) = &self.workspace_mutation {
+                if merge_delta.workspace_id() != Some(workspace.workspace_id) {
+                    return Err(ModelError::InvalidOperation(
+                        "merge transaction record and workspace mutation must bind the same \
+                         workspace"
+                            .to_string(),
+                    ));
+                }
             }
         }
 
@@ -1475,7 +1525,136 @@ mod tests {
             default_ref_mutation: None,
             workspace_mutation: Some(mutation),
             local_overlay_delta: Some(local_overlay_delta),
+            merge_transaction_delta: None,
         }
+    }
+
+    /// A transaction that touches no merge must hash exactly as it did before
+    /// merge records existed.
+    ///
+    /// The two pinned digests were measured on the commit that introduced this
+    /// test, before `merge_transaction_delta` was added. They are what makes
+    /// the field additive in fact rather than in intent: every repository
+    /// already on disk keeps its operation identities and its authority roots,
+    /// so no re-import is owed. A change that moves either digest has broken
+    /// that promise and must carry a schema version instead.
+    #[test]
+    fn a_transaction_without_a_merge_keeps_its_pre_merge_identity() {
+        let transaction = workspace_transaction();
+        assert!(transaction.merge_transaction_delta.is_none());
+        assert_eq!(
+            transaction.transaction_hash().unwrap().to_string(),
+            "3d1a5564f1284d98aeacb1b2c6166bc2ae49586661897933dc0cb45bb7f583df",
+            "adding an absent merge record must not move transaction identity"
+        );
+        assert!(
+            !serde_json::to_string(&transaction)
+                .unwrap()
+                .contains("merge_transaction_delta"),
+            "an absent merge record must not appear on the wire"
+        );
+
+        let mut roots_after = roots();
+        roots_after.generation = roots().generation + 1;
+        let operation = RepositoryOperationRecord {
+            operation_id: transaction.operation_id,
+            repository_id: transaction.repository_id.clone(),
+            transaction_hash: transaction.transaction_hash().unwrap(),
+            actor: transaction.actor.clone(),
+            committed_at: crate::Timestamp::from(
+                chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            ),
+            git_authority_delta: None,
+            ref_mutations: Vec::new(),
+            default_ref_mutation: None,
+            workspace_mutation: transaction.workspace_mutation.clone(),
+            local_overlay_delta: transaction.local_overlay_delta.clone(),
+            merge_transaction_delta: None,
+            roots_before: roots(),
+            roots_after,
+        };
+        assert_eq!(
+            operation.identity_hash().unwrap().to_string(),
+            "eae3a8c100dcc231fd552ce1d20c5e258e489e09139076cfa431ebaf6bfa916b",
+            "adding an absent merge record must not move operation identity"
+        );
+    }
+
+    /// The same transaction carrying a merge record must not be mistakable for
+    /// one that does not, at either identity.
+    #[test]
+    fn a_merge_record_participates_in_transaction_and_operation_identity() {
+        let mut transaction = workspace_transaction();
+        let baseline = transaction.transaction_hash().unwrap();
+        let record = crate::merge::tests::sample_record(
+            transaction.repository_id.clone(),
+            transaction
+                .workspace_mutation
+                .as_ref()
+                .unwrap()
+                .workspace_id,
+        );
+        transaction.merge_transaction_delta = Some(MergeTransactionDelta::open(record.clone()));
+        transaction.validate().unwrap();
+        let with_merge = transaction.transaction_hash().unwrap();
+        assert_ne!(with_merge, baseline);
+
+        let mut roots_after = roots();
+        roots_after.generation = roots().generation + 1;
+        let mut operation = RepositoryOperationRecord {
+            operation_id: transaction.operation_id,
+            repository_id: transaction.repository_id.clone(),
+            transaction_hash: with_merge,
+            actor: transaction.actor.clone(),
+            committed_at: crate::Timestamp::from(
+                chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            ),
+            git_authority_delta: None,
+            ref_mutations: Vec::new(),
+            default_ref_mutation: None,
+            workspace_mutation: transaction.workspace_mutation.clone(),
+            local_overlay_delta: transaction.local_overlay_delta.clone(),
+            merge_transaction_delta: transaction.merge_transaction_delta.clone(),
+            roots_before: roots(),
+            roots_after,
+        };
+        let bound = operation.identity_hash().unwrap();
+        operation.merge_transaction_delta = None;
+        assert_ne!(operation.identity_hash().unwrap(), bound);
+    }
+
+    /// A merge record alone is a real mutation, and an invalid one is refused
+    /// by the transaction that carries it rather than only by the store.
+    #[test]
+    fn a_transaction_carrying_only_a_merge_record_is_a_mutation_and_is_validated() {
+        let mut transaction = workspace_transaction();
+        let workspace_id = transaction
+            .workspace_mutation
+            .as_ref()
+            .unwrap()
+            .workspace_id;
+        transaction.workspace_mutation = None;
+        transaction.local_overlay_delta = None;
+        transaction.merge_transaction_delta = None;
+        assert!(transaction
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("must contain at least one mutation"));
+
+        let record =
+            crate::merge::tests::sample_record(transaction.repository_id.clone(), workspace_id);
+        transaction.merge_transaction_delta = Some(MergeTransactionDelta::open(record.clone()));
+        transaction.validate().unwrap();
+
+        let mut forged = record;
+        forged.hash = Hash256::from_bytes([0x99; 32]);
+        transaction.merge_transaction_delta = Some(MergeTransactionDelta::open(forged));
+        assert!(transaction
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("recomputes to"));
     }
 
     #[test]
@@ -1807,6 +1986,7 @@ mod tests {
             default_ref_mutation: None,
             workspace_mutation: original.workspace_mutation,
             local_overlay_delta: None,
+            merge_transaction_delta: None,
             roots_before: roots(),
             roots_after,
         };
@@ -2094,6 +2274,7 @@ mod tests {
             default_ref_mutation: None,
             workspace_mutation: None,
             local_overlay_delta: None,
+            merge_transaction_delta: None,
             roots_before: roots(),
             roots_after,
         };
@@ -2159,6 +2340,7 @@ mod tests {
             default_ref_mutation: None,
             workspace_mutation: None,
             local_overlay_delta: None,
+            merge_transaction_delta: None,
             roots_before: roots(),
             roots_after,
         };
@@ -2205,6 +2387,7 @@ mod tests {
             default_ref_mutation: None,
             workspace_mutation: None,
             local_overlay_delta: None,
+            merge_transaction_delta: None,
         };
         assert!(transaction.validate().is_err());
     }

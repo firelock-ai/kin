@@ -23,6 +23,7 @@ pub mod graph;
 pub mod identity;
 pub mod ids;
 pub mod layout;
+pub mod merge;
 pub mod preset;
 pub mod projection;
 pub mod provenance;
@@ -98,6 +99,12 @@ pub use ids::{
 pub use layout::{
     ArtifactKind, FileLayout, ImportItem, ImportSection, OpaqueArtifact, ParseCompleteness,
     ShallowTrackedFile, SourceRegion, StructuredArtifact, TrackedFile,
+};
+pub use merge::{
+    MergeConflictEntry, MergeConflictSubject, MergeDivergence, MergeEntryResolution, MergeOpening,
+    MergeParentBinding, MergeResolutionPayload, MergeResolutionProvenance, MergeSide,
+    MergeSideValue, MergeTransactionDelta, MergeTransactionRecord, MergeTransactionState,
+    MergeWorkspaceRestorePoint, MERGE_TRANSACTION_SCHEMA_VERSION,
 };
 pub use preset::{
     BrokenAstBehavior, DirectoryPreset, FormattingPolicy, PolicyOverrides, PresetConfig,
