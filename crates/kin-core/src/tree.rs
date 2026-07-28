@@ -592,6 +592,37 @@ pub fn verify_repository_workspace_projection(
     }
 }
 
+/// One bounded read-only observation of the derived projection against the
+/// exact workspace tree graph authority owns.
+///
+/// `compared_entries` counts the materializable tracked members actually read
+/// back from the working copy, so a caller can report coverage instead of
+/// implying that an empty `drift` list proves every tracked member was
+/// comparable on this host.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorkspaceProjectionDrift {
+    pub compared_entries: usize,
+    pub drift: Vec<String>,
+}
+
+impl WorkspaceProjectionDrift {
+    pub fn is_clean(&self) -> bool {
+        self.drift.is_empty()
+    }
+
+    pub fn first(&self) -> Option<&String> {
+        self.drift.first()
+    }
+
+    pub fn len(&self) -> usize {
+        self.drift.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.drift.is_empty()
+    }
+}
+
 /// Report every tracked path whose working copy no longer matches the exact
 /// workspace tree that graph authority owns.
 ///
@@ -607,7 +638,7 @@ pub fn report_repository_workspace_projection_drift(
     root: &Path,
     tree: &ResolvedTree,
     authority: &RepositoryAuthorityManager<LocalFileBackend>,
-) -> Result<Vec<String>> {
+) -> Result<WorkspaceProjectionDrift> {
     #[cfg(any(unix, windows))]
     {
         let projection =
@@ -628,7 +659,10 @@ pub fn report_repository_workspace_projection_drift(
                 Err(error) => return Err(error),
             }
         }
-        Ok(drift)
+        Ok(WorkspaceProjectionDrift {
+            compared_entries: entries.len(),
+            drift,
+        })
     }
     #[cfg(not(any(unix, windows)))]
     {
