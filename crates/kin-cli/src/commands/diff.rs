@@ -139,11 +139,29 @@ impl EndpointState {
     }
 }
 
+/// The exact entity sets the report's two endpoints resolved to.
+///
+/// A caller that classifies the endpoints themselves must read the same
+/// immutable states the deltas were derived from rather than resolving the
+/// endpoints a second time.
+pub struct DiffEndpointEntities {
+    pub base: HashMap<EntityId, Entity>,
+    pub head: HashMap<EntityId, Entity>,
+}
+
 pub fn inspect(
     binding: &kin_core::LocalRepositoryAuthorityBinding,
     base: Option<&str>,
     head: Option<&str>,
 ) -> Result<DiffReport> {
+    inspect_with_endpoint_entities(binding, base, head).map(|(report, _)| report)
+}
+
+pub fn inspect_with_endpoint_entities(
+    binding: &kin_core::LocalRepositoryAuthorityBinding,
+    base: Option<&str>,
+    head: Option<&str>,
+) -> Result<(DiffReport, DiffEndpointEntities)> {
     let authority = ActiveRepositoryAuthority::open(binding)?;
     let lease = authority.manager().read_authority();
     let metadata = lease.metadata();
@@ -198,7 +216,7 @@ pub fn inspect(
     let relation_deltas = diff_relations(&base_state.relations, &head_state.relations);
     let summary = summarize(&artifact_deltas, &entity_deltas, &relation_deltas);
 
-    Ok(DiffReport {
+    let report = DiffReport {
         schema: DIFF_SCHEMA.to_string(),
         authority: "repository-v6".to_string(),
         repository_id: authority.repository_id.clone(),
@@ -211,7 +229,14 @@ pub fn inspect(
         artifact_deltas,
         entity_deltas,
         relation_deltas,
-    })
+    };
+    Ok((
+        report,
+        DiffEndpointEntities {
+            base: base_state.entities,
+            head: head_state.entities,
+        },
+    ))
 }
 
 fn resolve_endpoint(

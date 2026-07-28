@@ -181,6 +181,33 @@ fn semver_impact_is_derived_from_published_entity_change_classes() {
         changes.keys().collect::<Vec<_>>()
     );
 
+    // The endpoint sizes are the published surface the impact was classified
+    // over. Both endpoints carry a private function and the file container on
+    // top of it, so reporting the endpoint's total entity count here would
+    // describe a different population than the one the changes came from.
+    assert_eq!(
+        report["base_api_entities"], 4,
+        "base endpoint must count only its published API surface: {report}"
+    );
+    assert_eq!(
+        report["head_api_entities"], 4,
+        "head endpoint must count only its published API surface: {report}"
+    );
+    assert!(
+        report["base_api_entities"].as_u64().expect("base count")
+            < report["base"]["entity_count"]
+                .as_u64()
+                .expect("base entity count"),
+        "the published surface must be narrower than every entity at the endpoint: {report}"
+    );
+    assert!(
+        report["head_api_entities"].as_u64().expect("head count")
+            < report["head"]["entity_count"]
+                .as_u64()
+                .expect("head entity count"),
+        "the published surface must be narrower than every entity at the endpoint: {report}"
+    );
+
     assert_eq!(
         report["impact"], "major",
         "the overall bump must be the strongest change class present"

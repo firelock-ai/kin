@@ -9,6 +9,8 @@
 //! the answer is a function of the entities repository authority owns at the
 //! two endpoints and nothing else.
 
+use std::collections::HashMap;
+
 use anyhow::{anyhow, Result};
 use kin_model::{Entity, EntityDelta, EntityId, EntityKind, EntityRole, Visibility};
 use serde::{Deserialize, Serialize};
@@ -130,6 +132,19 @@ fn is_api_surface(entity: &Entity) -> bool {
     )
 }
 
+/// How much published API surface an endpoint carries.
+///
+/// This counts the same surface [`is_api_surface`] classifies changes over, so
+/// the reported endpoint sizes and the reported impact answer for one
+/// population. The endpoint's total entity count is a different number and is
+/// reported separately by diff.
+fn api_surface_count(entities: &HashMap<EntityId, Entity>) -> usize {
+    entities
+        .values()
+        .filter(|entity| is_api_surface(entity))
+        .count()
+}
+
 fn classify(delta: &EntityDelta) -> Option<(ApiChangeClass, ApiChange)> {
     let (class, old, new) = match delta {
         EntityDelta::Added { new } => {
@@ -182,7 +197,8 @@ pub fn inspect(
     base: &str,
     head: &str,
 ) -> Result<SemverReport> {
-    let diff = super::diff::inspect(binding, Some(base), Some(head))?;
+    let (diff, endpoints) =
+        super::diff::inspect_with_endpoint_entities(binding, Some(base), Some(head))?;
     if diff.schema != DIFF_SCHEMA {
         return Err(anyhow!(
             "repository diff returned schema '{}' instead of '{DIFF_SCHEMA}'",
@@ -216,8 +232,8 @@ pub fn inspect(
         schema: SEMVER_SCHEMA.to_string(),
         authority: "repository-v6".to_string(),
         authority_generation: diff.authority_generation,
-        base_api_entities: diff.base.entity_count,
-        head_api_entities: diff.head.entity_count,
+        base_api_entities: api_surface_count(&endpoints.base),
+        head_api_entities: api_surface_count(&endpoints.head),
         base: diff.base,
         head: diff.head,
         impact: impact.as_str().to_string(),
@@ -319,6 +335,27 @@ mod tests {
         assert!(
             classify(&EntityDelta::Added { new: test_entity }).is_none(),
             "test entities are not published API surface"
+        );
+    }
+
+    #[test]
+    fn endpoint_counts_are_the_published_surface_not_every_entity() {
+        let published = entity("api", Visibility::Public, 1, 1);
+        let private = entity("hidden", Visibility::Private, 1, 1);
+        let mut proving = entity("proves", Visibility::Public, 1, 1);
+        proving.role = EntityRole::Test;
+        let mut container = entity("src/lib.rs", Visibility::Public, 1, 1);
+        container.kind = EntityKind::File;
+
+        let endpoint: HashMap<EntityId, Entity> = [published, private, proving, container]
+            .into_iter()
+            .map(|entity| (entity.id, entity))
+            .collect();
+
+        assert_eq!(
+            api_surface_count(&endpoint),
+            1,
+            "the reported endpoint size must count the same surface the impact is classified over"
         );
     }
 
