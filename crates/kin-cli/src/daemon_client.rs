@@ -854,6 +854,55 @@ impl DaemonClient {
             .context("parse daemon command status response")
     }
 
+    pub async fn command_push(
+        &self,
+        request: &crate::commands::transfer::CommandTransferRequest,
+    ) -> Result<crate::commands::transfer::CommandTransferResponse> {
+        self.transfer_command("push", request).await
+    }
+
+    pub async fn command_pull(
+        &self,
+        request: &crate::commands::transfer::CommandTransferRequest,
+    ) -> Result<crate::commands::transfer::CommandTransferResponse> {
+        self.transfer_command("pull", request).await
+    }
+
+    pub async fn command_transfer_plan(
+        &self,
+        request: &crate::commands::transfer::CommandTransferRequest,
+    ) -> Result<crate::commands::transfer::CommandTransferPlanResponse> {
+        self.transfer_command("transfer-plan", request).await
+    }
+
+    /// Drive one repository-v6 transfer command in the daemon.
+    ///
+    /// A refusal body is surfaced verbatim. The daemon has already mapped the
+    /// transfer error class onto a status code, and rewording it here would
+    /// hide which replica refused and why.
+    async fn transfer_command<Resp: serde::de::DeserializeOwned>(
+        &self,
+        leaf: &str,
+        request: &crate::commands::transfer::CommandTransferRequest,
+    ) -> Result<Resp> {
+        let resp = self
+            .send(
+                self.client
+                    .post(format!("{}/commands/{leaf}", self.base_url))
+                    .json(request),
+                "send daemon transfer command",
+            )
+            .await?;
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("kin {leaf} refused (HTTP {status}): {body}");
+        }
+        resp.json()
+            .await
+            .context("parse daemon transfer command response")
+    }
+
     pub async fn command_resources(
         &self,
         request: &crate::commands::resources::CommandResourcesRequest,

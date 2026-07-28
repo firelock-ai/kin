@@ -250,10 +250,17 @@
       "authority": "repository-v6 remote capability and exact transport",
       "required_for_bounded_dogfood": false,
       "acceptance_spec": [
-        "negotiate remote capabilities and transfer missing exact object/change/tree/ref closure with lease-protected publication"
+        "DONE: negotiate the remote destination lease, build the exact closure, publish it, and verify the returned receipt binds the pack that was sent",
+        "DONE: refuse a non-fast-forward gap with both heads named and no force path",
+        "OPEN: carry a closure larger than one negotiated envelope (512 changes, 4096 bodies, 16 MiB decoded); transfer v1 has no continuation packs, so a repository past that bound is refused at pack build",
+        "OPEN: drive the KinLab control-plane transfer envelope route, including its protection rules and durable receipts, rather than a peer daemon transfer seam directly"
       ],
-      "evidence_tests": [],
-      "note": "The previous path depended on the removed legacy Git exporter."
+      "evidence_tests": [
+        "crates/kin-remote/src/repository_transfer_negotiation.rs",
+        "crates/kin-remote/src/repository_transfer_http.rs",
+        "crates/kin-daemon/src/api.rs"
+      ],
+      "note": "The full path runs end to end between two Kin daemons over HTTP with receipts verified, but only within one bounded transfer envelope, and the transfer status this protocol publishes still reports push_apply_ready=false. Exposing it as general `kin push` would promise a capability that a repository past the envelope bound does not have."
     },
     {
       "command": "pull",
@@ -262,10 +269,18 @@
       "authority": "repository-v6 remote capability and exact transport",
       "required_for_bounded_dogfood": false,
       "acceptance_spec": [
-        "fetch and validate exact remote closure before one local authority transaction and graph-derived workspace transition"
+        "DONE: read the remote ref advertisement, adopt its default ref when this replica has none, and fetch the exact exported closure",
+        "DONE: admit the pack in one local authority transaction and refuse a receipt that does not bind it",
+        "DONE: refuse a remote this replica already contains, naming the remote head",
+        "OPEN: carry a closure larger than one negotiated envelope; transfer v1 has no continuation packs",
+        "OPEN: graph-derived workspace transition after admission, so a working tree follows the new head"
       ],
-      "evidence_tests": [],
-      "note": "The previous native sync path materialized file snapshots outside repository-v6 authority."
+      "evidence_tests": [
+        "crates/kin-remote/src/repository_transfer_negotiation.rs",
+        "crates/kin-remote/src/repository_transfer_http.rs",
+        "crates/kin-daemon/src/api.rs"
+      ],
+      "note": "Negotiation, export, and admission run end to end between two Kin daemons over HTTP with receipts verified. It stays closed because the envelope is bounded and because admission does not yet move the workspace to the admitted head."
     },
     {
       "command": "merge",
@@ -352,16 +367,21 @@
     },
     {
       "command": "remote plan-push",
-      "status": "open_gate",
-      "exposure": "fail_closed",
+      "status": "ready",
+      "exposure": "enabled",
       "authority": "repository-v6 workspace/ref state and negotiated remote capability",
       "required_for_bounded_dogfood": false,
       "acceptance_spec": [
         "derive the local publication head from one repository authority generation",
-        "plan exact closure transfer and lease-protected ref publication without legacy branch state"
+        "read the remote destination lease over the repository-v6 transfer seam and classify the gap without moving history",
+        "refuse a remote head this replica has not admitted, naming both heads, with no force path",
+        "report the negotiated envelope bound so an oversized gap is predictable before a push runs"
       ],
-      "evidence_tests": [],
-      "note": "The legacy planner is not an executable repository-v6 transfer proof."
+      "evidence_tests": [
+        "crates/kin-remote/src/repository_transfer_negotiation.rs",
+        "crates/kin-daemon/src/api.rs"
+      ],
+      "note": "Negotiates against a live peer transfer seam and publishes nothing. Reports whether the gap fits one transfer envelope, because transfer v1 has no continuation packs."
     },
     {
       "command": "exec",

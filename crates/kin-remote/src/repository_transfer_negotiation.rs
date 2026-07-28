@@ -88,9 +88,7 @@ pub enum LocalAncestry {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RepositoryTransferPlan {
     /// Both replicas resolve the ref to the same exact change. Nothing moves.
-    UpToDate {
-        head: Option<SemanticChangeId>,
-    },
+    UpToDate { head: Option<SemanticChangeId> },
     /// The receiving head is an ancestor of the sending head. `change_count` is
     /// the exact number of changes the sender will pack, and is `None` when the
     /// sender is the remote, because only the exporting replica can count them.
@@ -266,7 +264,11 @@ pub fn verify_receipt_binds_pack(
     pack: &RepositoryTransferPack,
     receipt: &RepositoryTransferReceipt,
 ) -> Result<()> {
-    require_protocol(receipt.schema_version, &receipt.protocol, "transfer receipt")?;
+    require_protocol(
+        receipt.schema_version,
+        &receipt.protocol,
+        "transfer receipt",
+    )?;
     if receipt.transfer_id != pack.transfer_id {
         return Err(conflict(format!(
             "receipt binds transfer {} but this replica sent transfer {}",
@@ -294,6 +296,162 @@ pub fn verify_receipt_binds_pack(
     Ok(())
 }
 
+/// The ref a replica with no history of its own should adopt from a peer.
+///
+/// A fresh replica cannot name a ref from its own state, and the per-ref
+/// transfer status cannot be asked about a ref nobody has named yet. The
+/// advertisement is the only surface that answers this, which is why an unborn
+/// repository still publishes a default ref.
+pub fn remote_default_ref<T>(transport: &T, repository_id: &RepositoryId) -> Result<RefName>
+where
+    T: RepositoryTransferTransport + ?Sized,
+{
+    let advertisement = transport.advertise_refs(repository_id)?;
+    require_protocol(
+        advertisement.schema_version,
+        &advertisement.protocol,
+        "ref advertisement",
+    )?;
+    require_same_repository(
+        repository_id,
+        &advertisement.repository_id,
+        "ref advertisement",
+    )?;
+    advertisement.default_ref.ok_or_else(|| {
+        invalid(format!(
+            "remote publishes no default ref for {repository_id}; name one explicitly"
+        ))
+    })
+}
+
+/// Read the remote's exact lease for one destination ref, refusing a peer that
+/// answers for a different repository or a different ref than the one asked
+/// about.
+fn negotiated_destination_lease<T>(
+    transport: &T,
+    repository_id: &RepositoryId,
+    destination_ref: &RefName,
+) -> Result<RepositoryTransferExpectation>
+where
+    T: RepositoryTransferTransport + ?Sized,
+{
+    let status = transport.transfer_status(repository_id, destination_ref)?;
+    require_protocol(status.schema_version, &status.protocol, "transfer status")?;
+    require_same_repository(repository_id, &status.repository_id, "transfer status")?;
+    if &status.destination_ref != destination_ref {
+        return Err(invalid(format!(
+            "remote transfer status answers for ref {} but this replica asked about {}",
+            status.destination_ref, destination_ref
+        )));
+    }
+    RepositoryTransferExpectation::try_from(status)
+}
+
+/// Classify the local publication gap against an already-read remote lease.
+fn classify_push<B>(
+    local: &RepositoryAuthorityManager<B>,
+    source_ref: &RefName,
+    destination_ref: &RefName,
+    destination_head: Option<SemanticChangeId>,
+) -> Result<(SemanticChangeId, RepositoryTransferPlan)>
+where
+    B: StorageBackend + ?Sized + 'static,
+{
+    let lease = local.read_authority();
+    let source_target = lease
+        .resolve_ref_target(source_ref)
+        .map_err(storage)?
+        .ok_or_else(|| invalid(format!("local source ref {source_ref} is absent")))?;
+    let source_head = lease
+        .resolve_target_change_id(&source_target)
+        .map_err(storage)?;
+    let Some(head) = destination_head else {
+        return Ok((
+            source_head,
+            RepositoryTransferPlan::FastForward {
+                source_head,
+                destination_head: None,
+                change_count: None,
+            },
+        ));
+    };
+    let plan = match classify_local_ancestry(&lease.snapshot().changes, Some(source_head), head)? {
+        LocalAncestry::Same => RepositoryTransferPlan::UpToDate {
+            head: Some(source_head),
+        },
+        LocalAncestry::Ancestor { distance } => RepositoryTransferPlan::FastForward {
+            source_head,
+            destination_head: Some(head),
+            change_count: Some(distance),
+        },
+        LocalAncestry::Unreachable => {
+            return Err(conflict(format!(
+                "remote head {head} on {destination_ref} is not an ancestor of local head {source_head}; \
+                 the remote holds exact changes this replica has not admitted. Integrate with a pull first. \
+                 This transport publishes fast-forwards only and has no force path"
+            )));
+        }
+    };
+    Ok((source_head, plan))
+}
+
+/// A negotiated publication plan, and whether this protocol version can carry
+/// it in one envelope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepositoryPushPlan {
+    pub plan: RepositoryTransferPlan,
+    /// The most changes one negotiated envelope carries.
+    pub max_changes_per_envelope: u32,
+    /// False when the gap needs more changes than one envelope holds.
+    ///
+    /// Transfer v1 has no continuation packs, so a gap this large is refused at
+    /// pack-build time rather than split. Reporting it from the plan is what
+    /// makes that refusal predictable instead of a surprise mid-publication.
+    pub fits_one_envelope: bool,
+}
+
+/// Negotiate a publication without moving any history.
+///
+/// This is the read-only half of [`push_to_remote`]: it reads the remote lease
+/// and classifies the gap, and refuses exactly what a push would refuse, but it
+/// never builds a pack or contacts the receive seam. A plan that reports a
+/// fast-forward is a statement about the two leases it just read, not a promise
+/// that they will still hold when a push runs.
+pub fn plan_push_to_remote<B, T>(
+    local: &RepositoryAuthorityManager<B>,
+    transport: &T,
+    repository_id: &RepositoryId,
+    source_ref: &RefName,
+    destination_ref: &RefName,
+) -> Result<RepositoryPushPlan>
+where
+    B: StorageBackend + ?Sized + 'static,
+    T: RepositoryTransferTransport + ?Sized,
+{
+    let expectation = negotiated_destination_lease(transport, repository_id, destination_ref)?;
+    let max_changes_per_envelope = expectation.limits.max_changes;
+    let (_, plan) = classify_push(
+        local,
+        source_ref,
+        destination_ref,
+        expectation.destination_head,
+    )?;
+    // An unborn destination has no counted closure yet, because counting it
+    // means walking the whole line. Treat unknown as "not yet known to fit"
+    // rather than asserting it fits.
+    let fits_one_envelope = match &plan {
+        RepositoryTransferPlan::UpToDate { .. } => true,
+        RepositoryTransferPlan::FastForward { change_count, .. } => change_count
+            .map(|count| u32::try_from(count).is_ok_and(|count| count <= max_changes_per_envelope))
+            .unwrap_or(false),
+    };
+    Ok(RepositoryPushPlan {
+        plan,
+        max_changes_per_envelope,
+        fits_one_envelope,
+    })
+}
+
 /// Negotiate and run one exact publication to a remote replica.
 ///
 /// The local replica holds the history, so it classifies the gap itself and
@@ -311,55 +469,14 @@ where
     B: StorageBackend + ?Sized + 'static,
     T: RepositoryTransferTransport + ?Sized,
 {
-    let status = transport.transfer_status(repository_id, destination_ref)?;
-    require_protocol(status.schema_version, &status.protocol, "transfer status")?;
-    require_same_repository(repository_id, &status.repository_id, "transfer status")?;
-    if &status.destination_ref != destination_ref {
-        return Err(invalid(format!(
-            "remote transfer status answers for ref {} but this replica asked about {}",
-            status.destination_ref, destination_ref
-        )));
-    }
-    let destination_head = status.destination_head;
-    let expectation = RepositoryTransferExpectation::try_from(status)?;
-
-    let (source_head, plan) = {
-        let lease = local.read_authority();
-        let source_target = lease
-            .resolve_ref_target(source_ref)
-            .map_err(storage)?
-            .ok_or_else(|| invalid(format!("local source ref {source_ref} is absent")))?;
-        let source_head = lease
-            .resolve_target_change_id(&source_target)
-            .map_err(storage)?;
-        let plan = match destination_head {
-            None => RepositoryTransferPlan::FastForward {
-                source_head,
-                destination_head: None,
-                change_count: None,
-            },
-            Some(head) => {
-                match classify_local_ancestry(&lease.snapshot().changes, Some(source_head), head)? {
-                    LocalAncestry::Same => RepositoryTransferPlan::UpToDate {
-                        head: Some(source_head),
-                    },
-                    LocalAncestry::Ancestor { distance } => RepositoryTransferPlan::FastForward {
-                        source_head,
-                        destination_head: Some(head),
-                        change_count: Some(distance),
-                    },
-                    LocalAncestry::Unreachable => {
-                        return Err(conflict(format!(
-                            "remote head {head} on {destination_ref} is not an ancestor of local head {source_head}; \
-                             the remote holds exact changes this replica has not admitted. Integrate with a pull first. \
-                             This transport publishes fast-forwards only and has no force path"
-                        )));
-                    }
-                }
-            }
-        };
-        (source_head, plan)
-    };
+    let expectation = negotiated_destination_lease(transport, repository_id, destination_ref)?;
+    let destination_head = expectation.destination_head;
+    let (source_head, plan) = classify_push(
+        local,
+        source_ref,
+        destination_ref,
+        expectation.destination_head,
+    )?;
 
     if matches!(plan, RepositoryTransferPlan::UpToDate { .. }) {
         return Ok(RepositoryTransferOutcome {
@@ -397,20 +514,28 @@ where
     })
 }
 
-/// Negotiate and admit one exact publication from a remote replica.
+/// What a pull negotiation produced, before anything is admitted locally.
+#[derive(Debug, Clone)]
+pub enum PullNegotiation {
+    /// Both replicas resolve the ref to the same exact change.
+    UpToDate { head: Option<SemanticChangeId> },
+    /// The exact pack the remote exported to close the gap.
+    Pack(Box<RepositoryTransferPack>),
+}
+
+/// Negotiate a pull and fetch the pack, without admitting it.
 ///
-/// The remote holds the history here, so its export computes the closure and is
-/// the authority on whether the gap is a fast-forward. The local pre-check only
-/// rules out the two cases local history can settle on its own: an identical
-/// head, and a remote head this replica already contains.
-pub fn pull_from_remote<B, T>(
+/// A receiver that owns derived state beyond repository authority needs to
+/// apply the pack itself, so that publication and the refresh of everything
+/// derived from it stay on one path. This is that seam: everything up to and
+/// including the exported pack, and nothing that moves local history.
+pub fn fetch_pull_pack<B, T>(
     local: &RepositoryAuthorityManager<B>,
     transport: &T,
     repository_id: &RepositoryId,
     source_ref: &RefName,
     destination_ref: &RefName,
-    actor: AuthorId,
-) -> Result<RepositoryTransferOutcome>
+) -> Result<PullNegotiation>
 where
     B: StorageBackend + ?Sized + 'static,
     T: RepositoryTransferTransport + ?Sized,
@@ -441,15 +566,8 @@ where
         let lease = local.read_authority();
         match classify_local_ancestry(&lease.snapshot().changes, destination_head, source_head)? {
             LocalAncestry::Same => {
-                return Ok(RepositoryTransferOutcome {
-                    direction: RepositoryTransferDirection::Pull,
-                    repository_id: repository_id.clone(),
-                    source_ref: source_ref.clone(),
-                    destination_ref: destination_ref.clone(),
-                    plan: RepositoryTransferPlan::UpToDate {
-                        head: destination_head,
-                    },
-                    receipt: None,
+                return Ok(PullNegotiation::UpToDate {
+                    head: destination_head,
                 });
             }
             LocalAncestry::Ancestor { distance } => {
@@ -476,6 +594,45 @@ where
             pack.destination_ref
         )));
     }
+    Ok(PullNegotiation::Pack(Box::new(pack)))
+}
+
+/// Negotiate, fetch, and admit one exact publication from a remote replica.
+///
+/// The remote holds the history here, so its export computes the closure and is
+/// the authority on whether the gap is a fast-forward. The local pre-check only
+/// rules out the two cases local history can settle on its own: an identical
+/// head, and a remote head this replica already contains.
+pub fn pull_from_remote<B, T>(
+    local: &RepositoryAuthorityManager<B>,
+    transport: &T,
+    repository_id: &RepositoryId,
+    source_ref: &RefName,
+    destination_ref: &RefName,
+    actor: AuthorId,
+) -> Result<RepositoryTransferOutcome>
+where
+    B: StorageBackend + ?Sized + 'static,
+    T: RepositoryTransferTransport + ?Sized,
+{
+    let negotiation =
+        fetch_pull_pack(local, transport, repository_id, source_ref, destination_ref)?;
+    let pack = match negotiation {
+        PullNegotiation::UpToDate { head } => {
+            return Ok(RepositoryTransferOutcome {
+                direction: RepositoryTransferDirection::Pull,
+                repository_id: repository_id.clone(),
+                source_ref: source_ref.clone(),
+                destination_ref: destination_ref.clone(),
+                plan: RepositoryTransferPlan::UpToDate { head },
+                receipt: None,
+            });
+        }
+        PullNegotiation::Pack(pack) => pack,
+    };
+
+    let destination_head = pack.expected_destination_head;
+    let source_head = pack.source_head;
     let change_count = pack.changes.len();
     let receipt =
         apply_repository_transfer_pack(local, repository_id, destination_ref, actor, &pack)?;
@@ -702,7 +859,14 @@ mod tests {
         let destination = manager(&destination_dir, &repository_id);
         let main = RefName::branch(b"main").unwrap();
 
-        let first = publish(&source, &repository_id, &main, None, 1, "root the exact line");
+        let first = publish(
+            &source,
+            &repository_id,
+            &main,
+            None,
+            1,
+            "root the exact line",
+        );
         let source_head = publish(
             &source,
             &repository_id,

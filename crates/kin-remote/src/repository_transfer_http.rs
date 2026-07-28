@@ -153,9 +153,9 @@ fn peer_error(error: ureq::Error, what: &str) -> RepositoryTransferError {
             404 => RepositoryTransferError::Invalid(format!(
                 "remote does not serve {what} for this repository (HTTP 404)"
             )),
-            other => RepositoryTransferError::Storage(format!(
-                "remote {what} failed with HTTP {other}"
-            )),
+            other => {
+                RepositoryTransferError::Storage(format!("remote {what} failed with HTTP {other}"))
+            }
         },
         other => {
             RepositoryTransferError::Storage(format!("remote {what} transport failed: {other}"))
@@ -165,10 +165,7 @@ fn peer_error(error: ureq::Error, what: &str) -> RepositoryTransferError {
 
 impl RepositoryTransferTransport for HttpRepositoryTransferTransport {
     fn advertise_refs(&self, repository_id: &RepositoryId) -> Result<RepositoryRefAdvertisement> {
-        self.get_json(
-            &self.url(repository_id, "advertise"),
-            "ref advertisement",
-        )
+        self.get_json(&self.url(repository_id, "advertise"), "ref advertisement")
     }
 
     fn transfer_status(

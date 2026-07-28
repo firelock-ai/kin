@@ -526,18 +526,36 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
-    /// [OPEN GATE] Plan or prepare an exact publish to the default remote
+    /// [OPEN GATE] Publish exact repository-v6 history to a native Kin remote
     Push {
-        /// Remote name (defaults to configured default or detected origin)
+        /// Remote name (defaults to the configured default native-kin remote)
         #[arg(long)]
         remote: Option<String>,
+        /// Peer transfer base URL, overriding any configured remote
+        #[arg(long)]
+        url: Option<String>,
+        /// Ref to publish (defaults to the repository default ref)
+        #[arg(long = "ref")]
+        reference: Option<String>,
+        /// Print the negotiated outcome as JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
-    /// [OPEN GATE] Pull exact changes from a remote
+    /// [OPEN GATE] Admit exact repository-v6 history from a native Kin remote
     #[command(visible_alias = "fetch")]
     Pull {
-        /// Remote name (defaults to configured default)
+        /// Remote name (defaults to the configured default native-kin remote)
         #[arg(long)]
         remote: Option<String>,
+        /// Peer transfer base URL, overriding any configured remote
+        #[arg(long)]
+        url: Option<String>,
+        /// Ref to admit (defaults to the repository default ref)
+        #[arg(long = "ref")]
+        reference: Option<String>,
+        /// Print the negotiated outcome as JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
     /// Clone a repository
     Clone {
@@ -1211,11 +1229,20 @@ enum RemoteAction {
         #[arg(long, default_value_t = false)]
         default: bool,
     },
-    /// [OPEN GATE] Show an exact closure and lease-protected push plan
+    /// Negotiate an exact closure and lease-protected push plan, moving nothing
     PlanPush {
-        /// Remote name (defaults to configured default or detected origin)
+        /// Remote name (defaults to the configured default native-kin remote)
         #[arg(long)]
         remote: Option<String>,
+        /// Peer transfer base URL, overriding any configured remote
+        #[arg(long)]
+        url: Option<String>,
+        /// Ref to plan for (defaults to the repository default ref)
+        #[arg(long = "ref")]
+        reference: Option<String>,
+        /// Print the negotiated plan as JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
     /// Acquire a graph-aware session lease for a native Kin remote
     Lease {
@@ -2471,8 +2498,14 @@ fn main() -> Result<()> {
                         )
                         .await
                     }
-                    RemoteAction::PlanPush { .. } => {
-                        commands::capabilities::require_ready("remote plan-push")
+                    RemoteAction::PlanPush {
+                        remote,
+                        url,
+                        reference,
+                        json,
+                    } => {
+                        commands::capabilities::require_ready("remote plan-push")?;
+                        commands::transfer::plan_push(remote, url, reference, json).await
                     }
                     RemoteAction::Lease {
                         remote,
@@ -2492,8 +2525,24 @@ fn main() -> Result<()> {
                     let registry = std::env::var("KIN_REGISTRY_URL").unwrap_or(registry);
                     commands::publish::run(packages, registry, dry_run).await
                 }
-                Command::Push { remote: _ } => commands::capabilities::require_ready("push"),
-                Command::Pull { remote: _ } => commands::capabilities::require_ready("pull"),
+                Command::Push {
+                    remote,
+                    url,
+                    reference,
+                    json,
+                } => {
+                    commands::capabilities::require_ready("push")?;
+                    commands::transfer::push(remote, url, reference, json).await
+                }
+                Command::Pull {
+                    remote,
+                    url,
+                    reference,
+                    json,
+                } => {
+                    commands::capabilities::require_ready("pull")?;
+                    commands::transfer::pull(remote, url, reference, json).await
+                }
                 Command::Clone { url, path } => commands::clone::run(url, path).await,
                 Command::Checkout {
                     path,
