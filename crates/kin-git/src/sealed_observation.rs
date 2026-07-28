@@ -374,7 +374,6 @@ fn append_bytes(buffer: &mut Vec<u8>, bytes: &[u8]) {
 mod tests {
     use std::fs;
     use std::path::Path;
-    use std::process::Command;
 
     use pretty_assertions::assert_eq;
     use tempfile::{tempdir, TempDir};
@@ -383,6 +382,7 @@ mod tests {
     use crate::admission_history::admit_semantic_git_import;
     use crate::lossless::capture_lossless_git_repository;
     use crate::semantic_import::plan_semantic_git_import;
+    use crate::test_support::fixture_git;
 
     /// A content source backed by a real store with selected bodies withheld,
     /// so the fail-closed path is exercised against the production seal rather
@@ -794,12 +794,10 @@ mod tests {
         use std::io::Write as _;
         use std::process::Stdio;
 
-        let mut command = Command::new("git");
+        let mut command = fixture_git();
         command
             .current_dir(repo)
             .args(args)
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_SYSTEM", "/dev/null")
             .stdin(if stdin.is_some() {
                 Stdio::piped()
             } else {

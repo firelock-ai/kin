@@ -1093,6 +1093,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+    use crate::test_support::fixture_git;
     use crate::{
         admit_semantic_git_import, build_git_external_authority, plan_semantic_git_import,
     };
@@ -1466,7 +1467,7 @@ mod tests {
                 .trim(),
             "refs/heads/main"
         );
-        let show_ref = Command::new("git")
+        let show_ref = fixture_git()
             .arg("--git-dir")
             .arg(&exported)
             .arg("show-ref")
@@ -1665,17 +1666,17 @@ mod tests {
     }
 
     fn git(repository: &Path, args: &[&str]) -> Vec<u8> {
-        command(Command::new("git").args(args).current_dir(repository))
+        command(fixture_git().args(args).current_dir(repository))
     }
 
     fn git_bare(repository: &Path, args: &[&str]) -> Vec<u8> {
-        let mut invocation = Command::new("git");
+        let mut invocation = fixture_git();
         invocation.arg("--git-dir").arg(repository).args(args);
         command(&mut invocation)
     }
 
     fn git_with_input(repository: &Path, args: &[&str], input: &[u8]) -> Vec<u8> {
-        let mut child = Command::new("git")
+        let mut child = fixture_git()
             .args(args)
             .current_dir(repository)
             .stdin(Stdio::piped())
@@ -1694,7 +1695,7 @@ mod tests {
     }
 
     fn git_clone_without_checkout(source: &Path, destination: &Path) {
-        let mut invocation = Command::new("git");
+        let mut invocation = fixture_git();
         invocation
             .arg("clone")
             .arg("--no-checkout")

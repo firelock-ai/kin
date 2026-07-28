@@ -2007,6 +2007,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::test_support::fixture_git;
     use crate::{plan_semantic_git_import, GitError};
 
     struct Fixture {
@@ -3016,18 +3017,7 @@ mod tests {
     }
 
     fn clean_git_command() -> Command {
-        let mut command = Command::new("git");
-        for variable in [
-            "GIT_DIR",
-            "GIT_WORK_TREE",
-            "GIT_INDEX_FILE",
-            "GIT_OBJECT_DIRECTORY",
-            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-            "GIT_COMMON_DIR",
-        ] {
-            command.env_remove(variable);
-        }
-        command
+        fixture_git()
     }
 
     fn assert_git_success(args: &[&str], output: &Output) {

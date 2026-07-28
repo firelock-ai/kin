@@ -1198,15 +1198,12 @@ mod tests {
     /// graph authority without reading or mutating the adjacent Git checkout.
     #[test]
     fn shadow_rejects_unimported_git_refs_without_mutating_graph() {
-        use std::process::Command;
-
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path();
 
         let git = |args: &[&str]| {
-            let output = Command::new("git")
+            let output = crate::commands::test_subprocess::fixture_git(repo)
                 .args(args)
-                .current_dir(repo)
                 .output()
                 .expect("run git");
             assert!(
@@ -1221,19 +1218,17 @@ mod tests {
             std::fs::write(repo.join(file), content).unwrap();
             git(&["add", "."]);
             let date = format!("{epoch} +0000");
-            let output = Command::new("git")
+            let output = crate::commands::test_subprocess::fixture_git(repo)
                 .args(["commit", "-m", message])
                 .env("GIT_AUTHOR_DATE", &date)
                 .env("GIT_COMMITTER_DATE", &date)
-                .current_dir(repo)
                 .output()
                 .expect("git commit");
             assert!(output.status.success(), "git commit failed");
         };
         let head_sha = || {
-            let output = Command::new("git")
+            let output = crate::commands::test_subprocess::fixture_git(repo)
                 .args(["rev-parse", "HEAD"])
-                .current_dir(repo)
                 .output()
                 .expect("git rev-parse HEAD");
             String::from_utf8(output.stdout)

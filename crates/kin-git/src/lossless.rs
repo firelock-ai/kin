@@ -1642,12 +1642,13 @@ mod tests {
     use std::ffi::OsStr;
     #[cfg(unix)]
     use std::io::Write as _;
-    use std::process::{Command, Output};
+    use std::process::Output;
 
     use pretty_assertions::assert_eq;
     use tempfile::{tempdir, TempDir};
 
     use super::*;
+    use crate::test_support::fixture_git;
 
     /// Gitlink target recorded by the polyglot fixture, which is never a
     /// capturable object in the source repository.
@@ -2318,7 +2319,7 @@ mod tests {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        Command::new("git")
+        fixture_git()
             .args(args)
             .current_dir(repo)
             .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -2365,7 +2366,7 @@ mod tests {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        let mut child = Command::new("git")
+        let mut child = fixture_git()
             .args(args)
             .current_dir(repo)
             .env("GIT_CONFIG_NOSYSTEM", "1")

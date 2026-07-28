@@ -221,18 +221,49 @@ fn traffic_aware_context_pack_includes_traffic() {
 // -----------------------------------------------------------------------
 
 fn run_git(repo: &Path, args: &[&str]) {
-    let output = std::process::Command::new("git")
+    let mut command = std::process::Command::new("git");
+    command
         .args(args)
         .env("GIT_CONFIG_NOSYSTEM", "1")
-        .current_dir(repo)
-        .output()
-        .expect("run Git");
+        .current_dir(repo);
+    #[cfg(unix)]
+    command.env("GIT_CONFIG_GLOBAL", "/dev/null");
+    #[cfg(windows)]
+    command.env("GIT_CONFIG_GLOBAL", "NUL");
+    for inherited in [
+        "GIT_DIR",
+        "GIT_COMMON_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_PREFIX",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_TEMPLATE_DIR",
+        "GIT_CONFIG",
+        "GIT_CONFIG_PARAMETERS",
+    ] {
+        command.env_remove(inherited);
+    }
+    for key in std::env::vars_os()
+        .map(|(key, _)| key)
+        .filter(|key| is_git_command_config(key))
+    {
+        command.env_remove(key);
+    }
+    let output = command.output().expect("run Git");
     assert!(
         output.status.success(),
         "git {args:?} failed: stdout={} stderr={}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn is_git_command_config(key: &std::ffi::OsStr) -> bool {
+    let label = key.to_string_lossy();
+    label == "GIT_CONFIG_COUNT"
+        || label.starts_with("GIT_CONFIG_KEY_")
+        || label.starts_with("GIT_CONFIG_VALUE_")
 }
 
 fn open_migrated_authority(root: &Path) -> RepositoryAuthorityManager<LocalFileBackend> {

@@ -514,8 +514,24 @@ mod tests {
         vector_index_metadata_version,
     };
     use std::fs;
-    use std::process::Command;
+    use std::path::Path;
     use tempfile::tempdir;
+
+    fn git<const N: usize>(repository: &Path, args: [&str; N]) -> std::process::Command {
+        let mut command = crate::commands::test_subprocess::fixture_git(repository);
+        command.args(args);
+        command
+    }
+
+    fn require_git<const N: usize>(repository: &Path, args: [&str; N]) {
+        let output = git(repository, args).output().unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     #[test]
     fn feature_flags_reflect_compile_configuration() {
@@ -563,33 +579,21 @@ mod tests {
     fn prepared_manifest_tracks_repo_state() {
         let repo = tempdir().unwrap();
         fs::write(repo.path().join("README.md"), "hello\n").unwrap();
-        Command::new("git")
-            .args(["init"])
-            .current_dir(repo.path())
-            .output()
-            .unwrap();
-        Command::new("git")
-            .args(["config", "user.email", "kin@example.com"])
-            .current_dir(repo.path())
-            .output()
-            .unwrap();
-        Command::new("git")
-            .args(["config", "user.name", "Kin"])
-            .current_dir(repo.path())
-            .output()
-            .unwrap();
-        Command::new("git")
-            .args(["add", "README.md"])
-            .current_dir(repo.path())
-            .output()
-            .unwrap();
-        Command::new("git")
-            .args(["commit", "-m", "init"])
+        require_git(repo.path(), ["init"]);
+        require_git(repo.path(), ["config", "user.email", "kin@example.com"]);
+        require_git(repo.path(), ["config", "user.name", "Kin"]);
+        require_git(repo.path(), ["add", "README.md"]);
+        let commit = git(repo.path(), ["commit", "-m", "init"])
             .env("GIT_AUTHOR_DATE", "1000000000 +0000")
             .env("GIT_COMMITTER_DATE", "1000000000 +0000")
-            .current_dir(repo.path())
             .output()
             .unwrap();
+        assert!(
+            commit.status.success(),
+            "git commit failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&commit.stdout),
+            String::from_utf8_lossy(&commit.stderr)
+        );
 
         let meta = build_meta().unwrap();
         let (prepared, repo_base) = build_prepared_manifests(&meta, repo.path()).unwrap();
@@ -612,33 +616,21 @@ mod tests {
     fn prepared_manifest_cache_keys_track_kin_commit_and_dirty() {
         let repo = tempdir().unwrap();
         fs::write(repo.path().join("README.md"), "hello\n").unwrap();
-        Command::new("git")
-            .args(["init"])
-            .current_dir(repo.path())
-            .output()
-            .unwrap();
-        Command::new("git")
-            .args(["config", "user.email", "kin@example.com"])
-            .current_dir(repo.path())
-            .output()
-            .unwrap();
-        Command::new("git")
-            .args(["config", "user.name", "Kin"])
-            .current_dir(repo.path())
-            .output()
-            .unwrap();
-        Command::new("git")
-            .args(["add", "README.md"])
-            .current_dir(repo.path())
-            .output()
-            .unwrap();
-        Command::new("git")
-            .args(["commit", "-m", "init"])
+        require_git(repo.path(), ["init"]);
+        require_git(repo.path(), ["config", "user.email", "kin@example.com"]);
+        require_git(repo.path(), ["config", "user.name", "Kin"]);
+        require_git(repo.path(), ["add", "README.md"]);
+        let commit = git(repo.path(), ["commit", "-m", "init"])
             .env("GIT_AUTHOR_DATE", "1000000100 +0000")
             .env("GIT_COMMITTER_DATE", "1000000100 +0000")
-            .current_dir(repo.path())
             .output()
             .unwrap();
+        assert!(
+            commit.status.success(),
+            "git commit failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&commit.stdout),
+            String::from_utf8_lossy(&commit.stderr)
+        );
 
         let meta = build_meta().unwrap();
         let (prepared_a, repo_base_a) = build_prepared_manifests(&meta, repo.path()).unwrap();

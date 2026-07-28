@@ -851,7 +851,6 @@ mod tests {
         SemanticFingerprint, SourceSpan, TreeEntry, Visibility,
     };
     use std::fs;
-    use std::process::Command;
 
     #[test]
     fn graph_entity_not_found_lines_keep_signal_and_offer_next_steps() {
@@ -1073,10 +1072,8 @@ mod tests {
         let repo = temp.path().join("repo");
         fs::create_dir(&repo).unwrap();
         let git = |args: &[&str]| {
-            let output = Command::new("git")
+            let output = crate::commands::test_subprocess::fixture_git(&repo)
                 .args(args)
-                .current_dir(&repo)
-                .env("GIT_CONFIG_NOSYSTEM", "1")
                 .output()
                 .unwrap();
             assert!(

@@ -15032,16 +15032,13 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
 
     #[test]
     fn workspace_mcp_excludes_are_idempotent_in_linked_worktrees() {
-        use std::process::Command;
-
         let dir = tempfile::tempdir().unwrap();
         let main = dir.path().join("main");
         let linked = dir.path().join("linked");
         fs::create_dir_all(&main).unwrap();
         let git = |args: &[&str], cwd: &Path| {
-            let output = Command::new("git")
+            let output = crate::commands::test_subprocess::fixture_git(cwd)
                 .args(args)
-                .current_dir(cwd)
                 .output()
                 .unwrap();
             assert!(
@@ -15074,9 +15071,8 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
         for pattern in WORKSPACE_MCP_GIT_EXCLUDE_PATTERNS {
             assert_eq!(exclude.lines().filter(|line| *line == pattern).count(), 1);
         }
-        let status = Command::new("git")
+        let status = crate::commands::test_subprocess::fixture_git(&linked)
             .args(["status", "--porcelain", "--untracked-files=all"])
-            .current_dir(&linked)
             .output()
             .unwrap();
         assert!(status.status.success());
@@ -15091,8 +15087,6 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
     #[test]
     #[serial]
     fn antigravity_first_setup_captures_and_repairs_global_and_workspace_bindings() {
-        use std::process::Command;
-
         struct CurrentDirGuard(PathBuf);
         impl Drop for CurrentDirGuard {
             fn drop(&mut self) {
@@ -15107,9 +15101,8 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
         fs::create_dir_all(kin_home.join("bin")).unwrap();
         fs::create_dir_all(repo.join(".kin")).unwrap();
         fs::copy(env::current_exe().unwrap(), kin_home.join("bin/kin")).unwrap();
-        let git = Command::new("git")
+        let git = crate::commands::test_subprocess::fixture_git(&repo)
             .args(["init", "-q"])
-            .current_dir(&repo)
             .output()
             .unwrap();
         assert!(git.status.success());
@@ -15210,14 +15203,12 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
     #[test]
     fn workspace_mcp_excludes_reject_symlink_and_external_gitdir_authority() {
         use std::os::unix::fs::symlink;
-        use std::process::Command;
 
         let dir = tempfile::tempdir().unwrap();
         let trusted = dir.path().join("trusted");
         fs::create_dir_all(&trusted).unwrap();
-        let output = Command::new("git")
+        let output = crate::commands::test_subprocess::fixture_git(&trusted)
             .args(["init", "-q"])
-            .current_dir(&trusted)
             .output()
             .unwrap();
         assert!(output.status.success());
@@ -15246,16 +15237,13 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
 
     #[test]
     fn workspace_mcp_excludes_reject_escaped_commondir_and_wrong_backpointer() {
-        use std::process::Command;
-
         let dir = tempfile::tempdir().unwrap();
         let main = dir.path().join("main");
         let linked = dir.path().join("linked");
         fs::create_dir_all(&main).unwrap();
         let git = |args: &[&str], cwd: &Path| {
-            let output = Command::new("git")
+            let output = crate::commands::test_subprocess::fixture_git(cwd)
                 .args(args)
-                .current_dir(cwd)
                 .output()
                 .unwrap();
             assert!(

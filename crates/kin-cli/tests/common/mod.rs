@@ -57,7 +57,12 @@ pub struct Command(std::process::Command);
 
 impl Command {
     pub fn new<S: AsRef<OsStr>>(program: S) -> Self {
-        Self(std::process::Command::new(program))
+        let program = program.as_ref();
+        let mut command = std::process::Command::new(program);
+        if is_git_program(program) {
+            isolate_fixture_git(&mut command);
+        }
+        Self(command)
     }
 
     pub fn arg<S: AsRef<OsStr>>(&mut self, arg: S) -> &mut Self {
@@ -108,6 +113,61 @@ impl Command {
         let label = self.0.get_program().to_string_lossy().into_owned();
         run_bounded_within(&mut self.0, &label, timeout)
     }
+}
+
+fn is_git_program(program: &OsStr) -> bool {
+    Path::new(program)
+        .file_name()
+        .and_then(OsStr::to_str)
+        .is_some_and(|name| {
+            name.eq_ignore_ascii_case("git") || name.eq_ignore_ascii_case("git.exe")
+        })
+}
+
+/// Keep temporary Git fixtures independent of user hooks and repository state.
+///
+/// The wrapper is test-only. Production Kin subprocesses retain the caller's
+/// Git behavior.
+fn isolate_fixture_git(command: &mut std::process::Command) {
+    command.env("GIT_CONFIG_NOSYSTEM", "1");
+    #[cfg(unix)]
+    command.env("GIT_CONFIG_GLOBAL", "/dev/null");
+    #[cfg(windows)]
+    command.env("GIT_CONFIG_GLOBAL", "NUL");
+
+    for inherited in [
+        "GIT_DIR",
+        "GIT_COMMON_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_PREFIX",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_TEMPLATE_DIR",
+        "GIT_CONFIG",
+        "GIT_CONFIG_PARAMETERS",
+    ] {
+        command.env_remove(inherited);
+    }
+    let explicit_config = command
+        .get_envs()
+        .filter_map(|(key, value)| value.map(|_| key.to_os_string()))
+        .filter(|key| is_git_command_config(key))
+        .collect::<Vec<_>>();
+    for key in std::env::vars_os()
+        .map(|(key, _)| key)
+        .filter(|key| is_git_command_config(key))
+        .chain(explicit_config)
+    {
+        command.env_remove(key);
+    }
+}
+
+fn is_git_command_config(key: &OsStr) -> bool {
+    let label = key.to_string_lossy();
+    label == "GIT_CONFIG_COUNT"
+        || label.starts_with("GIT_CONFIG_KEY_")
+        || label.starts_with("GIT_CONFIG_VALUE_")
 }
 
 fn run_bounded_within(

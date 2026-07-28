@@ -97,13 +97,13 @@ fn raw_target(target: &RefTarget) -> Result<GitRawTarget> {
 #[cfg(test)]
 mod tests {
     use std::path::Path;
-    use std::process::Command;
 
     use kin_model::{GitMaterialHead, RepositoryId};
     use tempfile::tempdir;
 
     use super::*;
     use crate::capture_lossless_git_repository;
+    use crate::test_support::fixture_git;
 
     #[test]
     fn converts_exact_snapshot_into_model_owned_git_authority() {
@@ -148,7 +148,7 @@ mod tests {
     }
 
     fn git<const N: usize>(repository: &Path, args: [&str; N]) {
-        let output = Command::new("git")
+        let output = fixture_git()
             .args(args)
             .current_dir(repository)
             .output()

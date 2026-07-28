@@ -14,6 +14,7 @@
 use anyhow::{Context, Result};
 use std::fs::File;
 use std::io::{Read as _, Seek as _, SeekFrom};
+use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::time::{Duration, Instant};
 
@@ -29,6 +30,67 @@ use std::time::{Duration, Instant};
 pub(crate) const DEFAULT_TEST_SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(300);
 const TEST_SUBPROCESS_REAP_GRACE: Duration = Duration::from_secs(5);
 const TEST_SUBPROCESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Build a Git command for a temporary test repository without inheriting the
+/// developer's Git repository or configuration authority.
+///
+/// In particular, a global `core.hooksPath` must not make fixture commits run
+/// real user hooks. Production Git commands intentionally do not use this
+/// helper.
+pub(crate) fn fixture_git(repository: &Path) -> Command {
+    let mut command = Command::new("git");
+    isolate_fixture_git(&mut command, repository);
+    command
+}
+
+fn isolate_fixture_git(command: &mut Command, repository: &Path) {
+    command
+        .current_dir(repository)
+        .env("GIT_CONFIG_NOSYSTEM", "1");
+    #[cfg(unix)]
+    command.env("GIT_CONFIG_GLOBAL", "/dev/null");
+    #[cfg(windows)]
+    command.env("GIT_CONFIG_GLOBAL", "NUL");
+    #[cfg(not(any(unix, windows)))]
+    command.env(
+        "GIT_CONFIG_GLOBAL",
+        repository.join(".kin-test-global-gitconfig"),
+    );
+
+    for inherited in [
+        "GIT_DIR",
+        "GIT_COMMON_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_PREFIX",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_TEMPLATE_DIR",
+        "GIT_CONFIG",
+        "GIT_CONFIG_PARAMETERS",
+    ] {
+        command.env_remove(inherited);
+    }
+    let explicit_config = command
+        .get_envs()
+        .filter_map(|(key, value)| value.map(|_| key.to_os_string()))
+        .filter(|key| is_git_command_config(key))
+        .collect::<Vec<_>>();
+    for key in std::env::vars_os()
+        .map(|(key, _)| key)
+        .filter(|key| is_git_command_config(key))
+        .chain(explicit_config)
+    {
+        command.env_remove(key);
+    }
+}
+
+fn is_git_command_config(key: &std::ffi::OsStr) -> bool {
+    let label = key.to_string_lossy();
+    label == "GIT_CONFIG_COUNT"
+        || label.starts_with("GIT_CONFIG_KEY_")
+        || label.starts_with("GIT_CONFIG_VALUE_")
+}
 
 #[cfg(unix)]
 struct TestProcessTree {
@@ -520,6 +582,55 @@ mod tests {
     const SLEEP_WORKER: &str = "TEST_BOUNDED_SLEEP_MARKER";
     const DESCENDANT_PARENT: &str = "TEST_BOUNDED_DESCENDANT_PARENT";
     const DESCENDANT_MARKER: &str = "TEST_BOUNDED_DESCENDANT_MARKER";
+
+    #[cfg(unix)]
+    #[test]
+    fn fixture_git_ignores_global_hooks() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let hooks = temp.path().join("hooks");
+        let repository = temp.path().join("repository");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&hooks).unwrap();
+        std::fs::create_dir_all(&repository).unwrap();
+        std::fs::write(
+            home.join(".gitconfig"),
+            format!("[core]\n\thooksPath = {}\n", hooks.display()),
+        )
+        .unwrap();
+        let pre_commit = hooks.join("pre-commit");
+        std::fs::write(&pre_commit, b"#!/bin/sh\nexit 91\n").unwrap();
+        let mut permissions = std::fs::metadata(&pre_commit).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&pre_commit, permissions).unwrap();
+
+        let run = |args: &[&str]| {
+            let mut command = Command::new("git");
+            command
+                .env("HOME", &home)
+                .env("XDG_CONFIG_HOME", home.join(".config"))
+                .env("GIT_CONFIG_COUNT", "1")
+                .env("GIT_CONFIG_KEY_0", "core.hooksPath")
+                .env("GIT_CONFIG_VALUE_0", &hooks)
+                .env("GIT_CONFIG_PARAMETERS", "malformed hostile fixture config");
+            isolate_fixture_git(&mut command, &repository);
+            let output = command.args(args).output().unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run(&["init", "--initial-branch=main"]);
+        run(&["config", "user.email", "kin@example.invalid"]);
+        run(&["config", "user.name", "Kin Test"]);
+        std::fs::write(repository.join("README.md"), b"fixture\n").unwrap();
+        run(&["add", "README.md"]);
+        run(&["commit", "-m", "fixture"]);
+    }
 
     #[test]
     fn sleep_worker() {
