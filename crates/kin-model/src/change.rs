@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::admission::AdmissionPolicyDelta;
 use crate::entity::Entity;
+use crate::external_reference::ExternalReferenceDelta;
 use crate::ids::*;
 use crate::relation::Relation;
 use crate::retrieval::ArtifactId;
@@ -40,6 +41,13 @@ pub struct SemanticChange {
     pub spec_link: Option<SpecId>,
     pub evidence: Vec<EvidenceId>,
     pub risk_summary: Option<RiskSummary>,
+    /// Exact transitions of first-class external-symbol endpoints.
+    ///
+    /// Deliberately last: persisted positional encodings treat an appended,
+    /// omitted-empty field as additive, while inserting one earlier would
+    /// reassign every field after it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub external_reference_deltas: Vec<ExternalReferenceDelta>,
 }
 
 /// Immutable provenance that participates in semantic-change identity.
@@ -57,6 +65,7 @@ impl SemanticChange {
             relation_deltas: self.relation_deltas.clone(),
             tree_deltas: self.tree_deltas.clone(),
             admission_policy_delta: self.admission_policy_delta.clone(),
+            external_reference_deltas: self.external_reference_deltas.clone(),
         }
     }
 }
@@ -156,6 +165,9 @@ pub struct TransactionDelta {
     pub relation_deltas: Vec<RelationDelta>,
     pub tree_deltas: Vec<TreeDelta>,
     pub admission_policy_delta: Option<AdmissionPolicyDelta>,
+    /// Deliberately last for additive positional-wire compatibility.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub external_reference_deltas: Vec<ExternalReferenceDelta>,
 }
 
 impl TransactionDelta {
@@ -176,6 +188,11 @@ impl TransactionDelta {
                 .admission_policy_delta
                 .as_ref()
                 .map(AdmissionPolicyDelta::inverse),
+            external_reference_deltas: self
+                .external_reference_deltas
+                .iter()
+                .map(ExternalReferenceDelta::inverse)
+                .collect(),
         }
     }
 }

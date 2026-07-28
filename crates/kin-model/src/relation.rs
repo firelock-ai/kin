@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 use crate::entity::SourceSpan;
+use crate::external_reference::ExternalReferenceId;
 use crate::ids::{ContractId, EntityId, RelationId, SemanticChangeId};
 use crate::retrieval::ArtifactId;
 use crate::verification::{TestId, VerificationRunId};
@@ -20,6 +21,10 @@ pub enum GraphNodeId {
     Contract(ContractId),
     Work(WorkId),
     VerificationRun(VerificationRunId),
+    /// Symbol owned outside the local repository. Deliberately last so the
+    /// public variant order remains append-only even though the current
+    /// MessagePack encoder tags variants by name.
+    ExternalReference(ExternalReferenceId),
 }
 
 impl GraphNodeId {
@@ -40,6 +45,7 @@ impl fmt::Display for GraphNodeId {
             Self::Contract(id) => write!(f, "contract:{id}"),
             Self::Work(id) => write!(f, "work:{id}"),
             Self::VerificationRun(id) => write!(f, "verification_run:{id}"),
+            Self::ExternalReference(id) => write!(f, "external_reference:{id}"),
         }
     }
 }
@@ -77,6 +83,12 @@ impl From<WorkId> for GraphNodeId {
 impl From<VerificationRunId> for GraphNodeId {
     fn from(value: VerificationRunId) -> Self {
         Self::VerificationRun(value)
+    }
+}
+
+impl From<ExternalReferenceId> for GraphNodeId {
+    fn from(value: ExternalReferenceId) -> Self {
+        Self::ExternalReference(value)
     }
 }
 
@@ -244,6 +256,16 @@ pub enum RelationOrigin {
 mod tests {
     use super::*;
 
+    #[derive(Serialize)]
+    enum LegacyGraphNodeId {
+        Entity(EntityId),
+        Artifact(ArtifactId),
+        Test(TestId),
+        Contract(ContractId),
+        Work(WorkId),
+        VerificationRun(VerificationRunId),
+    }
+
     #[test]
     fn relation_kind_roundtrip() {
         let kinds = vec![
@@ -281,6 +303,63 @@ mod tests {
         let parsed: GraphNodeId = serde_json::from_str(&json).unwrap();
 
         assert_eq!(parsed, node);
+    }
+
+    #[test]
+    fn external_reference_variant_is_appended_and_messagepack_pinned() {
+        let entity_id = EntityId::new();
+        let artifact_id = ArtifactId::new();
+        let test_id = TestId::new();
+        let contract_id = ContractId::new();
+        let work_id = WorkId::new();
+        let verification_id = VerificationRunId::new();
+
+        let fixtures = [
+            (
+                rmp_serde::to_vec(&GraphNodeId::Entity(entity_id)).unwrap(),
+                rmp_serde::to_vec(&LegacyGraphNodeId::Entity(entity_id)).unwrap(),
+            ),
+            (
+                rmp_serde::to_vec(&GraphNodeId::Artifact(artifact_id)).unwrap(),
+                rmp_serde::to_vec(&LegacyGraphNodeId::Artifact(artifact_id)).unwrap(),
+            ),
+            (
+                rmp_serde::to_vec(&GraphNodeId::Test(test_id)).unwrap(),
+                rmp_serde::to_vec(&LegacyGraphNodeId::Test(test_id)).unwrap(),
+            ),
+            (
+                rmp_serde::to_vec(&GraphNodeId::Contract(contract_id)).unwrap(),
+                rmp_serde::to_vec(&LegacyGraphNodeId::Contract(contract_id)).unwrap(),
+            ),
+            (
+                rmp_serde::to_vec(&GraphNodeId::Work(work_id)).unwrap(),
+                rmp_serde::to_vec(&LegacyGraphNodeId::Work(work_id)).unwrap(),
+            ),
+            (
+                rmp_serde::to_vec(&GraphNodeId::VerificationRun(verification_id)).unwrap(),
+                rmp_serde::to_vec(&LegacyGraphNodeId::VerificationRun(verification_id)).unwrap(),
+            ),
+        ];
+        for (current, legacy) in fixtures {
+            assert_eq!(
+                current, legacy,
+                "adding an external-reference node must not change a legacy variant's bytes"
+            );
+        }
+
+        let external = GraphNodeId::ExternalReference(ExternalReferenceId(uuid::Uuid::from_u128(
+            0x0102_0304_0506_0708_090a_0b0c_0d0e_0f10,
+        )));
+        let bytes = rmp_serde::to_vec(&external).unwrap();
+        assert_eq!(
+            hex::encode(&bytes),
+            "81b145787465726e616c5265666572656e6365c4100102030405060708090a0b0c0d0e0f10",
+            "the appended external-reference variant tag is a persisted wire contract"
+        );
+        assert_eq!(
+            rmp_serde::from_slice::<GraphNodeId>(&bytes).unwrap(),
+            external
+        );
     }
 
     #[test]

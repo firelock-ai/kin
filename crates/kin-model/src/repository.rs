@@ -11,11 +11,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::{
     identity::canonical_json_bytes, validate_semantic_change_id, validate_transaction_delta,
     AuthorId, DefaultRefMutation, EffectiveAdmissionPolicyStamp, EntityDelta, ExternalChangeAlias,
-    ExternalObjectKind, ExternalObjectRecord, FrozenLocalOverlayDelta, GitExternalAuthorityDelta,
-    GitObjectId, Hash256, MergeTransactionDelta, ModelError, OperationId, RefMutation, RefName,
-    RefTarget, RelationDelta, RepositoryId, RepositoryRef, ResolvedTree, Result, SemanticChange,
-    SemanticChangeId, SharedAdmissionPolicy, TransactionDelta, TreeDelta, WorkspaceHead,
-    WorkspaceId,
+    ExternalObjectKind, ExternalObjectRecord, ExternalReferenceDelta, FrozenLocalOverlayDelta,
+    GitExternalAuthorityDelta, GitObjectId, Hash256, MergeTransactionDelta, ModelError,
+    OperationId, RefMutation, RefName, RefTarget, RelationDelta, RepositoryId, RepositoryRef,
+    ResolvedTree, Result, SealedObservationBinding, SemanticChange, SemanticChangeId,
+    SharedAdmissionPolicy, TransactionDelta, TreeDelta, WorkspaceHead, WorkspaceId,
 };
 
 /// Clean-slate transaction schema whose persistence authority owns both exact
@@ -43,6 +43,9 @@ pub struct WorkspaceSemanticDelta {
     version: u32,
     entity_deltas: Vec<EntityDelta>,
     relation_deltas: Vec<RelationDelta>,
+    /// Deliberately last for additive positional-wire compatibility.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    external_reference_deltas: Vec<ExternalReferenceDelta>,
 }
 
 #[derive(Deserialize)]
@@ -51,6 +54,8 @@ struct WorkspaceSemanticDeltaWire {
     version: u32,
     entity_deltas: Vec<EntityDelta>,
     relation_deltas: Vec<RelationDelta>,
+    #[serde(default)]
+    external_reference_deltas: Vec<ExternalReferenceDelta>,
 }
 
 impl<'de> Deserialize<'de> for WorkspaceSemanticDelta {
@@ -63,6 +68,7 @@ impl<'de> Deserialize<'de> for WorkspaceSemanticDelta {
             version: wire.version,
             entity_deltas: wire.entity_deltas,
             relation_deltas: wire.relation_deltas,
+            external_reference_deltas: wire.external_reference_deltas,
         };
         delta.validate().map_err(serde::de::Error::custom)?;
         Ok(delta)
@@ -71,15 +77,25 @@ impl<'de> Deserialize<'de> for WorkspaceSemanticDelta {
 
 impl WorkspaceSemanticDelta {
     pub fn new(
+        entity_deltas: Vec<EntityDelta>,
+        relation_deltas: Vec<RelationDelta>,
+    ) -> Result<Self> {
+        Self::new_with_external_references(entity_deltas, relation_deltas, Vec::new())
+    }
+
+    pub fn new_with_external_references(
         mut entity_deltas: Vec<EntityDelta>,
         mut relation_deltas: Vec<RelationDelta>,
+        mut external_reference_deltas: Vec<ExternalReferenceDelta>,
     ) -> Result<Self> {
         entity_deltas.sort_by_key(EntityDelta::target_id);
         relation_deltas.sort_by_key(RelationDelta::target_id);
+        external_reference_deltas.sort_by_key(ExternalReferenceDelta::target_id);
         let delta = Self {
             version: WORKSPACE_SEMANTIC_DELTA_SCHEMA_VERSION,
             entity_deltas,
             relation_deltas,
+            external_reference_deltas,
         };
         delta.validate()?;
         Ok(delta)
@@ -109,6 +125,16 @@ impl WorkspaceSemanticDelta {
         {
             return Err(ModelError::InvalidOperation(
                 "workspace semantic relation deltas are not in canonical unique target order"
+                    .to_string(),
+            ));
+        }
+        if self
+            .external_reference_deltas
+            .windows(2)
+            .any(|pair| pair[0].target_id() >= pair[1].target_id())
+        {
+            return Err(ModelError::InvalidOperation(
+                "workspace semantic external-reference deltas are not in canonical unique target order"
                     .to_string(),
             ));
         }
@@ -144,22 +170,31 @@ impl WorkspaceSemanticDelta {
         &self.relation_deltas
     }
 
+    pub fn external_reference_deltas(&self) -> &[ExternalReferenceDelta] {
+        &self.external_reference_deltas
+    }
+
     pub fn transaction_delta(&self) -> TransactionDelta {
         TransactionDelta {
             entity_deltas: self.entity_deltas.clone(),
             relation_deltas: self.relation_deltas.clone(),
             tree_deltas: Vec::new(),
             admission_policy_delta: None,
+            external_reference_deltas: self.external_reference_deltas.clone(),
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.entity_deltas.is_empty() && self.relation_deltas.is_empty()
+        self.entity_deltas.is_empty()
+            && self.relation_deltas.is_empty()
+            && self.external_reference_deltas.is_empty()
     }
 
     fn sort_canonical(&mut self) {
         self.entity_deltas.sort_by_key(EntityDelta::target_id);
         self.relation_deltas.sort_by_key(RelationDelta::target_id);
+        self.external_reference_deltas
+            .sort_by_key(ExternalReferenceDelta::target_id);
     }
 }
 
@@ -169,6 +204,7 @@ impl Default for WorkspaceSemanticDelta {
             version: WORKSPACE_SEMANTIC_DELTA_SCHEMA_VERSION,
             entity_deltas: Vec::new(),
             relation_deltas: Vec::new(),
+            external_reference_deltas: Vec::new(),
         }
     }
 }
@@ -191,6 +227,18 @@ impl WorkspaceSemanticOverlay {
         Ok(Self(WorkspaceSemanticDelta::new(
             entity_deltas,
             relation_deltas,
+        )?))
+    }
+
+    pub fn new_with_external_references(
+        entity_deltas: Vec<EntityDelta>,
+        relation_deltas: Vec<RelationDelta>,
+        external_reference_deltas: Vec<ExternalReferenceDelta>,
+    ) -> Result<Self> {
+        Ok(Self(WorkspaceSemanticDelta::new_with_external_references(
+            entity_deltas,
+            relation_deltas,
+            external_reference_deltas,
         )?))
     }
 
@@ -231,6 +279,10 @@ impl WorkspaceSemanticOverlay {
 
     pub fn relation_deltas(&self) -> &[RelationDelta] {
         self.0.relation_deltas()
+    }
+
+    pub fn external_reference_deltas(&self) -> &[ExternalReferenceDelta] {
+        self.0.external_reference_deltas()
     }
 
     pub fn transaction_delta(&self) -> TransactionDelta {
@@ -791,6 +843,11 @@ fn validate_head_base(
 }
 
 /// Append-only record of one committed repository operation.
+///
+/// This type is persisted through a positional MessagePack encoding. Any
+/// future optional authority field must be appended after every existing field
+/// and carry a compatibility round-trip proving older, shorter records still
+/// decode. Inserting an optional field earlier shifts all following values.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RepositoryOperationRecord {
@@ -929,7 +986,13 @@ impl RepositoryOperationRecord {
 }
 
 /// One atomic repository-authority transition.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+///
+/// This type is persisted through a positional MessagePack encoding. Any
+/// future optional authority field must be appended after every existing field
+/// and carry compatibility tests for every combination of adjacent optional
+/// tail fields. A later tail value must keep an explicit `nil` placeholder for
+/// any absent earlier value so positions never shift.
+#[derive(Debug, Clone, PartialEq, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RepositoryTransaction {
     pub schema_version: u32,
@@ -956,8 +1019,105 @@ pub struct RepositoryTransaction {
     /// terminating by publishing the merge change or aborting back to the
     /// recorded restore point. Optional and omitted when absent, so a
     /// transaction that touches no merge keeps its existing identity.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub merge_transaction_delta: Option<MergeTransactionDelta>,
+    /// Fingerprint and coverage of the admitted content closure observed by
+    /// the enforcement layer.
+    ///
+    /// Repository storage validates only the binding's internal shape and
+    /// binds it into transaction identity. It cannot re-derive the fingerprint;
+    /// admission remains responsible for verifying it against graph-owned
+    /// content before committing this transaction.
+    ///
+    /// Deliberately last. Positional serialization emits an explicit absent
+    /// merge slot when this field is present without a merge delta.
+    #[serde(default)]
+    pub sealed_observation: Option<SealedObservationBinding>,
+}
+
+#[derive(Serialize)]
+struct RepositoryTransactionHumanReadable<'a> {
+    schema_version: u32,
+    operation_id: OperationId,
+    repository_id: &'a RepositoryId,
+    expected_generation: u64,
+    expected_roots: &'a RootBundle,
+    actor: &'a AuthorId,
+    reason: &'a str,
+    external_objects: &'a [ExternalObjectRecord],
+    git_authority_delta: &'a Option<GitExternalAuthorityDelta>,
+    changes: &'a [SemanticChange],
+    aliases: &'a [ExternalChangeAlias],
+    ref_mutations: &'a [RefMutation],
+    default_ref_mutation: &'a Option<DefaultRefMutation>,
+    workspace_mutation: &'a Option<WorkspaceMutation>,
+    local_overlay_delta: &'a Option<FrozenLocalOverlayDelta>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    merge_transaction_delta: &'a Option<MergeTransactionDelta>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sealed_observation: &'a Option<SealedObservationBinding>,
+}
+
+impl Serialize for RepositoryTransaction {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        if serializer.is_human_readable() {
+            return RepositoryTransactionHumanReadable {
+                schema_version: self.schema_version,
+                operation_id: self.operation_id,
+                repository_id: &self.repository_id,
+                expected_generation: self.expected_generation,
+                expected_roots: &self.expected_roots,
+                actor: &self.actor,
+                reason: &self.reason,
+                external_objects: &self.external_objects,
+                git_authority_delta: &self.git_authority_delta,
+                changes: &self.changes,
+                aliases: &self.aliases,
+                ref_mutations: &self.ref_mutations,
+                default_ref_mutation: &self.default_ref_mutation,
+                workspace_mutation: &self.workspace_mutation,
+                local_overlay_delta: &self.local_overlay_delta,
+                merge_transaction_delta: &self.merge_transaction_delta,
+                sealed_observation: &self.sealed_observation,
+            }
+            .serialize(serializer);
+        }
+
+        use serde::ser::SerializeSeq;
+
+        const LEGACY_FIELD_COUNT: usize = 15;
+        let has_merge_slot =
+            self.merge_transaction_delta.is_some() || self.sealed_observation.is_some();
+        let field_count = LEGACY_FIELD_COUNT
+            + usize::from(has_merge_slot)
+            + usize::from(self.sealed_observation.is_some());
+        let mut sequence = serializer.serialize_seq(Some(field_count))?;
+        sequence.serialize_element(&self.schema_version)?;
+        sequence.serialize_element(&self.operation_id)?;
+        sequence.serialize_element(&self.repository_id)?;
+        sequence.serialize_element(&self.expected_generation)?;
+        sequence.serialize_element(&self.expected_roots)?;
+        sequence.serialize_element(&self.actor)?;
+        sequence.serialize_element(&self.reason)?;
+        sequence.serialize_element(&self.external_objects)?;
+        sequence.serialize_element(&self.git_authority_delta)?;
+        sequence.serialize_element(&self.changes)?;
+        sequence.serialize_element(&self.aliases)?;
+        sequence.serialize_element(&self.ref_mutations)?;
+        sequence.serialize_element(&self.default_ref_mutation)?;
+        sequence.serialize_element(&self.workspace_mutation)?;
+        sequence.serialize_element(&self.local_overlay_delta)?;
+        if has_merge_slot {
+            sequence.serialize_element(&self.merge_transaction_delta)?;
+        }
+        if self.sealed_observation.is_some() {
+            sequence.serialize_element(&self.sealed_observation)?;
+        }
+        sequence.end()
+    }
 }
 
 impl RepositoryTransaction {
@@ -1139,6 +1299,10 @@ impl RepositoryTransaction {
             }
         }
 
+        if let Some(binding) = &self.sealed_observation {
+            binding.validate()?;
+        }
+
         Ok(())
     }
 
@@ -1154,6 +1318,9 @@ impl RepositoryTransaction {
                 .relation_deltas
                 .sort_by_key(crate::RelationDelta::target_id);
             change.tree_deltas.sort_by_key(TreeDelta::artifact_id);
+            change
+                .external_reference_deltas
+                .sort_by_key(ExternalReferenceDelta::target_id);
         }
         canonical
             .external_objects
@@ -1286,10 +1453,10 @@ mod tests {
     use crate::{
         AdmissionCase, AdmissionPolicyStamp, AdmissionRuleSource, AdmissionRuleSourceKind,
         ArtifactId, Entity, EntityId, EntityKind, EntityMetadata, ExternalObjectId,
-        FingerprintAlgorithm, FrozenLocalOverlay, GitExternalAuthority, GitObjectBodyLoader,
-        GitObjectFormat, GitRawRef, GitRawTarget, LanguageId, LocalOverlayHash, LocalOverlayStamp,
-        LocatedEntry, RefExpectation, RefUpdatePolicy, RepoPath, SemanticFingerprint,
-        SharedAdmissionPolicy, TreeEntry, Visibility,
+        ExternalReference, FingerprintAlgorithm, FrozenLocalOverlay, GitExternalAuthority,
+        GitObjectBodyLoader, GitObjectFormat, GitRawRef, GitRawTarget, LanguageId,
+        LocalOverlayHash, LocalOverlayStamp, LocatedEntry, RefExpectation, RefUpdatePolicy,
+        RepoPath, SemanticFingerprint, SharedAdmissionPolicy, TreeEntry, Visibility,
     };
     use uuid::Uuid;
 
@@ -1532,11 +1699,27 @@ mod tests {
             workspace_mutation: Some(mutation),
             local_overlay_delta: Some(local_overlay_delta),
             merge_transaction_delta: None,
+            sealed_observation: None,
         }
     }
 
-    /// A transaction that touches no merge must hash exactly as it did before
-    /// merge records existed.
+    fn sealed_observation() -> SealedObservationBinding {
+        SealedObservationBinding::new(Hash256::from_bytes([0x73; 32]), 3, 21, 7, 98, 1, 1).unwrap()
+    }
+
+    fn messagepack_array_len(bytes: &[u8]) -> usize {
+        match bytes {
+            [tag @ 0x90..=0x9f, ..] => usize::from(*tag & 0x0f),
+            [0xdc, high, low, ..] => usize::from(u16::from_be_bytes([*high, *low])),
+            [0xdd, a, b, c, d, ..] => {
+                usize::try_from(u32::from_be_bytes([*a, *b, *c, *d])).unwrap()
+            }
+            _ => panic!("expected a MessagePack array"),
+        }
+    }
+
+    /// A transaction that touches no merge or seal must hash exactly as it did
+    /// before either binding existed.
     ///
     /// The two pinned digests were measured on the commit that introduced this
     /// test, before `merge_transaction_delta` was added. They are what makes
@@ -1548,6 +1731,7 @@ mod tests {
     fn a_transaction_without_a_merge_keeps_its_pre_merge_identity() {
         let transaction = workspace_transaction();
         assert!(transaction.merge_transaction_delta.is_none());
+        assert!(transaction.sealed_observation.is_none());
         assert_eq!(
             transaction.transaction_hash().unwrap().to_string(),
             "3d1a5564f1284d98aeacb1b2c6166bc2ae49586661897933dc0cb45bb7f583df",
@@ -1558,6 +1742,12 @@ mod tests {
                 .unwrap()
                 .contains("merge_transaction_delta"),
             "an absent merge record must not appear on the wire"
+        );
+        assert!(
+            !serde_json::to_string(&transaction)
+                .unwrap()
+                .contains("sealed_observation"),
+            "an absent sealed observation must not appear on the wire"
         );
 
         let mut roots_after = roots();
@@ -1643,8 +1833,10 @@ mod tests {
     fn a_transaction_round_trips_through_positional_encoding() {
         let transaction = workspace_transaction();
         let bytes = rmp_serde::to_vec(&transaction).unwrap();
+        assert_eq!(messagepack_array_len(&bytes), 15);
         let decoded: RepositoryTransaction = rmp_serde::from_slice(&bytes).unwrap();
         assert!(decoded.merge_transaction_delta.is_none());
+        assert!(decoded.sealed_observation.is_none());
         assert_eq!(
             decoded.transaction_hash().unwrap(),
             transaction.transaction_hash().unwrap()
@@ -1664,8 +1856,159 @@ mod tests {
         let decoded: RepositoryTransaction =
             rmp_serde::from_slice(&rmp_serde::to_vec(&with_merge).unwrap()).unwrap();
         assert_eq!(
+            messagepack_array_len(&rmp_serde::to_vec(&with_merge).unwrap()),
+            16
+        );
+        assert_eq!(
             decoded.transaction_hash().unwrap(),
             with_merge.transaction_hash().unwrap()
+        );
+    }
+
+    #[test]
+    fn positional_transaction_tail_round_trips_all_merge_and_seal_combinations() {
+        let transaction = workspace_transaction();
+        let merge = MergeTransactionDelta::open(crate::merge::tests::sample_record(
+            transaction.repository_id.clone(),
+            transaction
+                .workspace_mutation
+                .as_ref()
+                .unwrap()
+                .workspace_id,
+        ));
+        let seal = sealed_observation();
+        let combinations = [
+            (None, None, 15),
+            (Some(merge.clone()), None, 16),
+            (None, Some(seal), 17),
+            (Some(merge), Some(seal), 17),
+        ];
+
+        for (merge_transaction_delta, sealed_observation, expected_arity) in combinations {
+            let mut candidate = transaction.clone();
+            candidate.merge_transaction_delta = merge_transaction_delta;
+            candidate.sealed_observation = sealed_observation;
+            let encoded = rmp_serde::to_vec(&candidate).unwrap();
+            assert_eq!(messagepack_array_len(&encoded), expected_arity);
+            let decoded: RepositoryTransaction = rmp_serde::from_slice(&encoded).unwrap();
+            assert_eq!(decoded, candidate);
+        }
+
+        let mut seal_only = transaction;
+        seal_only.sealed_observation = Some(seal);
+        let json = serde_json::to_value(&seal_only).unwrap();
+        assert!(json.get("merge_transaction_delta").is_none());
+        assert_eq!(
+            json.get("sealed_observation")
+                .and_then(|value| value.get("fingerprint")),
+            Some(&serde_json::to_value(seal.fingerprint).unwrap())
+        );
+    }
+
+    #[test]
+    fn json_transaction_tail_round_trips_all_merge_and_seal_combinations() {
+        let transaction = workspace_transaction();
+        let merge = MergeTransactionDelta::open(crate::merge::tests::sample_record(
+            transaction.repository_id.clone(),
+            transaction
+                .workspace_mutation
+                .as_ref()
+                .unwrap()
+                .workspace_id,
+        ));
+        let seal = sealed_observation();
+        let combinations = [
+            (None, None),
+            (Some(merge.clone()), None),
+            (None, Some(seal)),
+            (Some(merge), Some(seal)),
+        ];
+
+        for (merge_transaction_delta, sealed_observation) in combinations {
+            let mut candidate = transaction.clone();
+            candidate.merge_transaction_delta = merge_transaction_delta;
+            candidate.sealed_observation = sealed_observation;
+            let encoded = serde_json::to_vec(&candidate).unwrap();
+            let decoded: RepositoryTransaction = serde_json::from_slice(&encoded).unwrap();
+            assert_eq!(decoded, candidate);
+        }
+    }
+
+    #[test]
+    fn legacy_v064_transaction_messagepack_bytes_are_preserved_exactly() {
+        #[derive(Serialize)]
+        struct V064RepositoryTransaction<'a> {
+            schema_version: u32,
+            operation_id: OperationId,
+            repository_id: &'a RepositoryId,
+            expected_generation: u64,
+            expected_roots: &'a RootBundle,
+            actor: &'a AuthorId,
+            reason: &'a str,
+            external_objects: &'a [ExternalObjectRecord],
+            git_authority_delta: &'a Option<GitExternalAuthorityDelta>,
+            changes: &'a [SemanticChange],
+            aliases: &'a [ExternalChangeAlias],
+            ref_mutations: &'a [RefMutation],
+            default_ref_mutation: &'a Option<DefaultRefMutation>,
+            workspace_mutation: &'a Option<WorkspaceMutation>,
+            local_overlay_delta: &'a Option<FrozenLocalOverlayDelta>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            merge_transaction_delta: &'a Option<MergeTransactionDelta>,
+        }
+
+        fn legacy_wire(transaction: &RepositoryTransaction) -> V064RepositoryTransaction<'_> {
+            V064RepositoryTransaction {
+                schema_version: transaction.schema_version,
+                operation_id: transaction.operation_id,
+                repository_id: &transaction.repository_id,
+                expected_generation: transaction.expected_generation,
+                expected_roots: &transaction.expected_roots,
+                actor: &transaction.actor,
+                reason: &transaction.reason,
+                external_objects: &transaction.external_objects,
+                git_authority_delta: &transaction.git_authority_delta,
+                changes: &transaction.changes,
+                aliases: &transaction.aliases,
+                ref_mutations: &transaction.ref_mutations,
+                default_ref_mutation: &transaction.default_ref_mutation,
+                workspace_mutation: &transaction.workspace_mutation,
+                local_overlay_delta: &transaction.local_overlay_delta,
+                merge_transaction_delta: &transaction.merge_transaction_delta,
+            }
+        }
+
+        fn legacy_bytes(transaction: &RepositoryTransaction) -> Vec<u8> {
+            rmp_serde::to_vec(&legacy_wire(transaction)).unwrap()
+        }
+
+        let mut transaction = workspace_transaction();
+        let legacy_json = serde_json::to_value(legacy_wire(&transaction)).unwrap();
+        assert_eq!(serde_json::to_value(&transaction).unwrap(), legacy_json);
+        let legacy = legacy_bytes(&transaction);
+        assert_eq!(rmp_serde::to_vec(&transaction).unwrap(), legacy);
+        assert_eq!(
+            rmp_serde::from_slice::<RepositoryTransaction>(&legacy).unwrap(),
+            transaction
+        );
+
+        transaction.merge_transaction_delta = Some(MergeTransactionDelta::open(
+            crate::merge::tests::sample_record(
+                transaction.repository_id.clone(),
+                transaction
+                    .workspace_mutation
+                    .as_ref()
+                    .unwrap()
+                    .workspace_id,
+            ),
+        ));
+        let legacy_json = serde_json::to_value(legacy_wire(&transaction)).unwrap();
+        assert_eq!(serde_json::to_value(&transaction).unwrap(), legacy_json);
+        let legacy = legacy_bytes(&transaction);
+        assert_eq!(rmp_serde::to_vec(&transaction).unwrap(), legacy);
+        assert_eq!(
+            rmp_serde::from_slice::<RepositoryTransaction>(&legacy).unwrap(),
+            transaction
         );
     }
 
@@ -1687,6 +2030,11 @@ mod tests {
         transaction.validate().unwrap();
         let with_merge = transaction.transaction_hash().unwrap();
         assert_ne!(with_merge, baseline);
+        assert_eq!(
+            with_merge.to_string(),
+            "26fc5b4ecb312a18be0ff24cd07ce7c5b23ac7e040d897eaecfc02b60d098c57",
+            "the v0.6.4 merge-only transaction identity must survive the seal field"
+        );
 
         let mut roots_after = roots();
         roots_after.generation = roots().generation + 1;
@@ -1710,6 +2058,41 @@ mod tests {
         let bound = operation.identity_hash().unwrap();
         operation.merge_transaction_delta = None;
         assert_ne!(operation.identity_hash().unwrap(), bound);
+    }
+
+    #[test]
+    fn a_sealed_observation_is_shape_validated_and_participates_in_identity() {
+        let mut transaction = workspace_transaction();
+        let baseline = transaction.transaction_hash().unwrap();
+        transaction.sealed_observation = Some(sealed_observation());
+        transaction.validate().unwrap();
+        let sealed = transaction.transaction_hash().unwrap();
+        assert_ne!(sealed, baseline);
+
+        let mut changed = transaction.clone();
+        changed.sealed_observation.as_mut().unwrap().fingerprint = Hash256::from_bytes([0x74; 32]);
+        assert_ne!(changed.transaction_hash().unwrap(), sealed);
+
+        let mut malformed = transaction;
+        malformed.sealed_observation.as_mut().unwrap().opaque_bodies = 8;
+        assert!(malformed
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("more opaque bodies"));
+    }
+
+    #[test]
+    fn a_sealed_observation_binds_a_real_mutation_but_is_not_one_by_itself() {
+        let mut transaction = workspace_transaction();
+        transaction.workspace_mutation = None;
+        transaction.local_overlay_delta = None;
+        transaction.sealed_observation = Some(sealed_observation());
+        assert!(transaction
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("must contain at least one mutation"));
     }
 
     /// A merge record alone is a real mutation, and an invalid one is refused
@@ -1857,6 +2240,91 @@ mod tests {
         assert!(
             serde_json::from_value::<WorkspaceSemanticDelta>(encoded).is_err(),
             "noncanonical persisted semantic deltas must fail during decode"
+        );
+    }
+
+    #[test]
+    fn workspace_semantic_delta_persists_external_references_without_moving_legacy_wire() {
+        #[derive(Serialize)]
+        struct LegacyWorkspaceSemanticDelta<'a> {
+            version: u32,
+            entity_deltas: &'a [EntityDelta],
+            relation_deltas: &'a [RelationDelta],
+        }
+
+        let first = ExternalReference::new_resolved("python-module-v1", "requests", "get").unwrap();
+        let second =
+            ExternalReference::new_resolved("npm-package-v1", "@mui/utils", "merge").unwrap();
+        let forward = WorkspaceSemanticDelta::new_with_external_references(
+            Vec::new(),
+            Vec::new(),
+            vec![
+                ExternalReferenceDelta::Added { new: first.clone() },
+                ExternalReferenceDelta::Added {
+                    new: second.clone(),
+                },
+            ],
+        )
+        .unwrap();
+        let reversed = WorkspaceSemanticDelta::new_with_external_references(
+            Vec::new(),
+            Vec::new(),
+            vec![
+                ExternalReferenceDelta::Added {
+                    new: second.clone(),
+                },
+                ExternalReferenceDelta::Added { new: first.clone() },
+            ],
+        )
+        .unwrap();
+        assert_eq!(forward, reversed);
+        assert_eq!(
+            forward.identity_hash().unwrap(),
+            reversed.identity_hash().unwrap()
+        );
+        assert_eq!(
+            forward.transaction_delta().external_reference_deltas,
+            forward.external_reference_deltas()
+        );
+        assert_eq!(
+            WorkspaceSemanticOverlay::new_with_external_references(
+                Vec::new(),
+                Vec::new(),
+                forward.external_reference_deltas().to_vec(),
+            )
+            .unwrap()
+            .external_reference_deltas(),
+            forward.external_reference_deltas()
+        );
+
+        let duplicate = WorkspaceSemanticDelta::new_with_external_references(
+            Vec::new(),
+            Vec::new(),
+            vec![
+                ExternalReferenceDelta::Added { new: first.clone() },
+                ExternalReferenceDelta::Removed { old: first },
+            ],
+        )
+        .unwrap_err();
+        assert!(duplicate
+            .to_string()
+            .contains("canonical unique target order"));
+
+        let legacy = WorkspaceSemanticDelta::default();
+        let legacy_wire = LegacyWorkspaceSemanticDelta {
+            version: legacy.version,
+            entity_deltas: legacy.entity_deltas(),
+            relation_deltas: legacy.relation_deltas(),
+        };
+        assert_eq!(
+            serde_json::to_value(&legacy).unwrap(),
+            serde_json::to_value(&legacy_wire).unwrap()
+        );
+        let legacy_bytes = rmp_serde::to_vec(&legacy_wire).unwrap();
+        assert_eq!(rmp_serde::to_vec(&legacy).unwrap(), legacy_bytes);
+        assert_eq!(
+            rmp_serde::from_slice::<WorkspaceSemanticDelta>(&legacy_bytes).unwrap(),
+            legacy
         );
     }
 
@@ -2477,6 +2945,7 @@ mod tests {
             workspace_mutation: None,
             local_overlay_delta: None,
             merge_transaction_delta: None,
+            sealed_observation: None,
         };
         assert!(transaction.validate().is_err());
     }

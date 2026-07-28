@@ -4,6 +4,7 @@
 use crate::change::{ResolvedTree, SemanticChange, TransactionDelta, TreeEntry};
 use crate::entity::{Entity, EntityKind, EntityRole};
 use crate::error::ModelError;
+use crate::external_reference::{ExternalReference, ExternalReferenceId};
 use crate::ids::*;
 use crate::relation::{GraphNodeId, Relation, RelationKind};
 use crate::review::{
@@ -728,6 +729,8 @@ pub struct SubGraph {
     pub nodes: Vec<GraphNodeId>,
     pub entities: HashMap<EntityId, Entity>,
     pub relations: Vec<Relation>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub external_references: HashMap<ExternalReferenceId, ExternalReference>,
 }
 
 /// Immutable committed graph state resolved at a specific semantic ref.
@@ -744,6 +747,11 @@ pub struct ResolvedGraphState {
     /// because a referenced entity was removed.
     /// Maps relation ID to the removed relation and the change that caused removal.
     pub relation_tombstones: HashMap<RelationId, (Relation, SemanticChangeId)>,
+    /// First-class endpoints for symbols owned outside this repository.
+    ///
+    /// Deliberately last for additive positional-wire compatibility.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub external_references: HashMap<ExternalReferenceId, ExternalReference>,
 }
 
 /// Filter for querying entities.
@@ -961,6 +969,31 @@ where
             }
         }
 
+        for delta in change.external_reference_deltas {
+            match delta {
+                crate::ExternalReferenceDelta::Added { new: reference } => {
+                    reference.validate()?;
+                    if state.external_references.contains_key(&reference.id) {
+                        return Err(ModelError::Conflict(format!(
+                            "change {change_id} adds existing external reference {}",
+                            reference.id
+                        )));
+                    }
+                    state.external_references.insert(reference.id, reference);
+                }
+                crate::ExternalReferenceDelta::Removed { old } => {
+                    old.validate()?;
+                    if state.external_references.get(&old.id) != Some(&old) {
+                        return Err(ModelError::Conflict(format!(
+                            "change {change_id} has stale old payload for removed external reference {}",
+                            old.id
+                        )));
+                    }
+                    state.external_references.remove(&old.id);
+                }
+            }
+        }
+
         for delta in change.relation_deltas {
             match delta {
                 crate::change::RelationDelta::Added { new: relation } => {
@@ -1009,6 +1042,15 @@ where
                     if !state.entities.contains_key(&entity_id) {
                         return Err(ModelError::Conflict(format!(
                             "change {change_id} leaves relation {} dangling from entity {entity_id}; \
+                             relation removal must be explicit",
+                            relation.id
+                        )));
+                    }
+                }
+                if let GraphNodeId::ExternalReference(reference_id) = node {
+                    if !state.external_references.contains_key(&reference_id) {
+                        return Err(ModelError::Conflict(format!(
+                            "change {change_id} leaves relation {} dangling from external reference {reference_id}; \
                              relation removal must be explicit",
                             relation.id
                         )));
@@ -2334,6 +2376,20 @@ mod tests {
         }
     }
 
+    fn make_external_relation(id: RelationId, src: EntityId, dst: ExternalReferenceId) -> Relation {
+        Relation {
+            id,
+            kind: RelationKind::Calls,
+            src: GraphNodeId::Entity(src),
+            dst: GraphNodeId::ExternalReference(dst),
+            confidence: 1.0,
+            origin: RelationOrigin::Inferred,
+            created_in: None,
+            import_source: Some("requests".to_string()),
+            evidence: Vec::new(),
+        }
+    }
+
     fn make_semantic_change(
         id: SemanticChangeId,
         parents: Vec<SemanticChangeId>,
@@ -2355,6 +2411,7 @@ mod tests {
             spec_link: None,
             evidence: vec![],
             risk_summary: None,
+            external_reference_deltas: vec![],
         }
     }
 
@@ -3559,6 +3616,77 @@ mod tests {
     }
 
     #[test]
+    fn external_reference_deltas_replay_into_bindable_graph_authority() {
+        let c1 = make_change_id(31);
+        let c2 = make_change_id(32);
+        let source = make_entity(EntityId::new(), "caller");
+        let external =
+            crate::ExternalReference::new_resolved("python-module-v1", "requests", "get").unwrap();
+        let external_id = external.id;
+        let relation = make_external_relation(RelationId::new(), source.id, external.id);
+
+        let mut introduction = make_semantic_change(
+            c1,
+            Vec::new(),
+            vec![EntityDelta::Added {
+                new: source.clone(),
+            }],
+            vec![RelationDelta::Added {
+                new: relation.clone(),
+            }],
+        );
+        introduction.external_reference_deltas = vec![crate::ExternalReferenceDelta::Added {
+            new: external.clone(),
+        }];
+
+        let state = replay_graph_state(vec![introduction.clone()]).unwrap();
+        assert_eq!(state.external_references.get(&external.id), Some(&external));
+        assert_eq!(state.relations.get(&relation.id), Some(&relation));
+
+        let mut dangling_removal = make_semantic_change(c2, vec![c1], Vec::new(), Vec::new());
+        dangling_removal.external_reference_deltas = vec![crate::ExternalReferenceDelta::Removed {
+            old: external.clone(),
+        }];
+        let error = replay_graph_state(vec![introduction.clone(), dangling_removal]).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("relation removal must be explicit"));
+
+        let mut exact_removal = make_semantic_change(
+            c2,
+            vec![c1],
+            Vec::new(),
+            vec![RelationDelta::Removed {
+                old: relation.clone(),
+            }],
+        );
+        exact_removal.external_reference_deltas =
+            vec![crate::ExternalReferenceDelta::Removed { old: external }];
+        let state = replay_graph_state(vec![introduction, exact_removal]).unwrap();
+        assert!(!state.external_references.contains_key(&external_id));
+        assert!(!state.relations.contains_key(&relation.id));
+    }
+
+    #[test]
+    fn a_relation_cannot_name_an_external_reference_the_change_did_not_persist() {
+        let source = make_entity(EntityId::new(), "caller");
+        let external =
+            crate::ExternalReference::new_resolved("python-module-v1", "requests", "get").unwrap();
+        let relation = make_external_relation(RelationId::new(), source.id, external.id);
+        let change = make_semantic_change(
+            make_change_id(33),
+            Vec::new(),
+            vec![EntityDelta::Added { new: source }],
+            vec![RelationDelta::Added { new: relation }],
+        );
+
+        let error = replay_graph_state(vec![change]).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("dangling from external reference"));
+    }
+
+    #[test]
     fn entity_removal_requires_explicit_relation_removal() {
         let c1 = make_change_id(1);
         let c2 = make_change_id(2);
@@ -3638,6 +3766,7 @@ mod tests {
                 new: new_entry,
             }],
             admission_policy_delta: None,
+            external_reference_deltas: Vec::new(),
         };
 
         crate::validate_transaction_delta(&delta).unwrap();

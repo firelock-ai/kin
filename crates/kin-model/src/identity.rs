@@ -12,8 +12,8 @@ use std::collections::BTreeSet;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    Entity, EntityDelta, Hash256, ModelError, Relation, RelationDelta, Result, SemanticChange,
-    SemanticChangeId, TransactionDelta, TreeDelta,
+    Entity, EntityDelta, ExternalReferenceDelta, Hash256, ModelError, Relation, RelationDelta,
+    Result, SemanticChange, SemanticChangeId, TransactionDelta, TreeDelta,
 };
 
 /// Compute the immutable v6 identity of a complete semantic change.
@@ -36,6 +36,9 @@ pub fn compute_semantic_change_id(change: &SemanticChange) -> Result<SemanticCha
     canonical_change
         .tree_deltas
         .sort_by_key(TreeDelta::artifact_id);
+    canonical_change
+        .external_reference_deltas
+        .sort_by_key(ExternalReferenceDelta::target_id);
 
     let mut payload = serde_json::to_value(&canonical_change).map_err(serialization)?;
     let fields = payload.as_object_mut().ok_or_else(|| {
@@ -144,6 +147,20 @@ pub fn validate_transaction_delta(delta: &TransactionDelta) -> Result<()> {
         }
     }
 
+    let mut external_reference_targets = BTreeSet::new();
+    for reference_delta in &delta.external_reference_deltas {
+        let target = reference_delta.target_id();
+        if !external_reference_targets.insert(target) {
+            return Err(ModelError::InvalidOperation(format!(
+                "transaction contains more than one delta for external reference {target}"
+            )));
+        }
+        match reference_delta {
+            ExternalReferenceDelta::Added { new } => new.validate()?,
+            ExternalReferenceDelta::Removed { old } => old.validate()?,
+        }
+    }
+
     let mut tree_targets = BTreeSet::new();
     for tree_delta in &delta.tree_deltas {
         let target = tree_delta.artifact_id();
@@ -177,6 +194,9 @@ pub fn content_identity_from_deltas(delta: &TransactionDelta) -> Result<[u8; 32]
         .relation_deltas
         .sort_by_key(RelationDelta::target_id);
     canonical.tree_deltas.sort_by_key(TreeDelta::artifact_id);
+    canonical
+        .external_reference_deltas
+        .sort_by_key(ExternalReferenceDelta::target_id);
 
     let encoded = canonical_json_bytes(&canonical)?;
 
@@ -319,6 +339,7 @@ mod tests {
             spec_link: None,
             evidence: Vec::new(),
             risk_summary: None,
+            external_reference_deltas: Vec::new(),
         }
     }
 
@@ -451,5 +472,68 @@ mod tests {
             "f455b244cffbf4eee002e607b19926cefb575e2549fdc21ecbbb956a2eed9fad",
             "changing the kin-semantic-change-v6 domain or canonical fixture is a wire break"
         );
+        assert!(
+            !serde_json::to_string(&fixture)
+                .unwrap()
+                .contains("external_reference_deltas"),
+            "an empty appended delta class must not move the legacy JSON fixture"
+        );
+        let messagepack = rmp_serde::to_vec(&fixture).unwrap();
+        let decoded: SemanticChange = rmp_serde::from_slice(&messagepack).unwrap();
+        assert!(decoded.external_reference_deltas.is_empty());
+        assert_eq!(
+            compute_semantic_change_id(&decoded).unwrap(),
+            compute_semantic_change_id(&fixture).unwrap(),
+            "an older positional change payload must keep its identity"
+        );
+    }
+
+    #[test]
+    fn external_reference_deltas_are_canonical_identity_bearing_and_unique() {
+        let first =
+            crate::ExternalReference::new_resolved("python-module-v1", "requests", "get").unwrap();
+        let second =
+            crate::ExternalReference::new_resolved("npm-package-v1", "@mui/utils", "merge")
+                .unwrap();
+        let left = TransactionDelta {
+            external_reference_deltas: vec![
+                ExternalReferenceDelta::Added { new: first.clone() },
+                ExternalReferenceDelta::Added {
+                    new: second.clone(),
+                },
+            ],
+            ..TransactionDelta::default()
+        };
+        let right = TransactionDelta {
+            external_reference_deltas: vec![
+                ExternalReferenceDelta::Added {
+                    new: second.clone(),
+                },
+                ExternalReferenceDelta::Added { new: first.clone() },
+            ],
+            ..TransactionDelta::default()
+        };
+        assert_eq!(
+            content_identity_from_deltas(&left).unwrap(),
+            content_identity_from_deltas(&right).unwrap()
+        );
+        assert_eq!(left.inverse().inverse(), left);
+
+        let duplicate = TransactionDelta {
+            external_reference_deltas: vec![
+                ExternalReferenceDelta::Added { new: first.clone() },
+                ExternalReferenceDelta::Removed { old: first.clone() },
+            ],
+            ..TransactionDelta::default()
+        };
+        assert!(validate_transaction_delta(&duplicate)
+            .unwrap_err()
+            .to_string()
+            .contains("more than one delta for external reference"));
+
+        let mut change = empty_change();
+        let baseline = compute_semantic_change_id(&change).unwrap();
+        change.external_reference_deltas = vec![ExternalReferenceDelta::Added { new: first }];
+        assert_ne!(compute_semantic_change_id(&change).unwrap(), baseline);
     }
 }

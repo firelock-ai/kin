@@ -17,6 +17,7 @@ pub mod entity;
 pub mod error;
 pub mod evidence;
 pub mod external;
+pub mod external_reference;
 pub mod federation;
 pub mod git_authority;
 pub mod graph;
@@ -32,6 +33,7 @@ pub mod relation;
 pub mod repository;
 pub mod retrieval;
 pub mod review;
+pub mod sealed_observation;
 pub mod session;
 pub mod spec;
 pub mod stats;
@@ -69,6 +71,10 @@ pub use error::{ModelError, Result};
 pub use evidence::{Evidence, TestResult};
 pub use external::{
     ExternalChangeAlias, ExternalObjectId, ExternalObjectKind, ExternalObjectRecord,
+};
+pub use external_reference::{
+    ExternalReference, ExternalReferenceDelta, ExternalReferenceId,
+    EXTERNAL_REFERENCE_ID_NAMESPACE_V1, EXTERNAL_REFERENCE_SCHEMA_VERSION,
 };
 pub use federation::{
     ActorRef, GraphCapabilitySet, GraphLocator, GraphManifest, RemoteRelation, RemoteRelationKind,
@@ -141,6 +147,7 @@ pub use repository::{
     WORKSPACE_SEMANTIC_OVERLAY_SCHEMA_VERSION,
 };
 pub use retrieval::{ArtifactId, RetrievalKey, RetrievalKeyFileResolver};
+pub use sealed_observation::{SealedObservationBinding, SEALED_OBSERVATION_BINDING_SCHEMA_VERSION};
 pub use session::{
     AgentSession, CoordinationEvent, Intent, IntentConflict, IntentScope, IntentSummary, LockType,
     SessionCapabilities, SessionTransport, TrafficReport,
