@@ -1287,13 +1287,18 @@ async fn inject_loopback_host_in_tests(
     next.run(request).await
 }
 
-/// Extract an optional caller session ID from the authoritative
-/// `X-Kin-Session` request header.
-/// Refresh a caller's session heartbeat from its own activity.
+/// Refresh the heartbeat of the session a caller presents.
 ///
 /// Best-effort by construction: an unknown or already-reaped session is not an
 /// error here, it just has no lease to extend, and the caller's own request
 /// still fails closed downstream on whatever it needed the session for.
+///
+/// This refreshes the lease named by `X-Kin-Session`, not the lease the caller
+/// was issued: nothing on the request proves the caller owns that session, and
+/// the session record carries no owner token to check against. Any holder of a
+/// session id can therefore keep that session alive. The daemon binds to
+/// loopback, so the reachable population is local processes, and the effect is
+/// bounded to extending a lease rather than acting under it.
 fn touch_session_liveness(state: &Arc<DaemonState>, session_id: Option<&SessionId>) {
     let Some(session_id) = session_id else {
         return;
@@ -1307,6 +1312,8 @@ fn touch_session_liveness(state: &Arc<DaemonState>, session_id: Option<&SessionI
     }
 }
 
+/// Extract an optional caller session ID from the authoritative
+/// `X-Kin-Session` request header.
 fn extract_session_id_from_headers(
     headers: &axum::http::HeaderMap,
 ) -> Result<Option<SessionId>, (StatusCode, String)> {
@@ -13517,12 +13524,191 @@ mod tests {
         server.abort();
     }
 
+    /// `kin open` retains its projection, and `kin reconcile` collects it.
+    ///
+    /// `open` is the one surface in the cluster that never closes its own
+    /// session: an editor detaches from the launching process, so there is no
+    /// exit to admit on. That makes admission the only collector, and this
+    /// drives the real `open` function to prove both halves. Without the
+    /// collector every `kin open` would leave a full repository materialization
+    /// under `.kin/runs/` forever.
+    ///
+    /// The refusal half matters just as much: a reconcile that cannot admit
+    /// must leave the projection alone, because the only copy of that work is
+    /// the directory it is being asked to take.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn kin_open_retains_its_projection_until_reconcile_collects_it() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        /// Restore the process state `kin open` reads from.
+        ///
+        /// `open` resolves its repository from the working directory and its
+        /// editor from `PATH`, so driving the real function means moving both.
+        /// A guard puts them back even when an assertion unwinds.
+        struct ProcessScope {
+            working_dir: PathBuf,
+            path: Option<std::ffi::OsString>,
+        }
+
+        impl ProcessScope {
+            fn enter(working_dir: &FsPath, editor_dir: &FsPath) -> Self {
+                let scope = Self {
+                    working_dir: std::env::current_dir().unwrap(),
+                    path: std::env::var_os("PATH"),
+                };
+                let mut search = vec![editor_dir.to_path_buf()];
+                if let Some(existing) = scope.path.as_ref() {
+                    search.extend(std::env::split_paths(existing));
+                }
+                std::env::set_var("PATH", std::env::join_paths(search).unwrap());
+                std::env::set_current_dir(working_dir).unwrap();
+                scope
+            }
+        }
+
+        impl Drop for ProcessScope {
+            fn drop(&mut self) {
+                let _ = std::env::set_current_dir(&self.working_dir);
+                match self.path.take() {
+                    Some(path) => std::env::set_var("PATH", path),
+                    None => std::env::remove_var("PATH"),
+                }
+            }
+        }
+
+        // `getcwd` returns a fully resolved path, so a fixture repository
+        // reached through a symlinked temp root would give the CLI a different
+        // layout than the daemon holds, and the reconcile boundary would
+        // correctly refuse it as a foreign session path.
+        install_test_registry_override();
+        let root = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("kin-daemon-open-collect-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let state = Arc::new(DaemonState::open(kin_core::init(&root).unwrap().layout).unwrap());
+        install_repository_file(&state, "src/lib.py", b"graph truth\n");
+        install_working_copy_file(&state, "src/lib.py", b"graph truth\n", false);
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = router(state.clone());
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        std::env::set_var("KIN_DAEMON_URL", format!("http://{addr}"));
+
+        // `kin open` launches an allowlisted editor by name, so the stand-in
+        // has to be reachable exactly the way the real one is.
+        let editor_dir = tempfile::tempdir().unwrap();
+        let editor = editor_dir.path().join("code");
+        std::fs::write(
+            &editor,
+            "#!/bin/sh\nprintf 'editor note\\n' > editor-note.txt\nprintf '%s' \"$1\" > \
+             opened-path.txt\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let scope = ProcessScope::enter(state.layout.working_dir(), editor_dir.path());
+        let opened = kin_cli::commands::session_run::open("code".to_string(), false, false).await;
+        drop(scope);
+        opened.expect("launch an allowlisted editor over a session projection");
+
+        let session_dir = sole_session_projection(&state.layout);
+        assert!(
+            session_dir.join("editor-note.txt").is_file(),
+            "the editor runs with its working directory inside the retained projection"
+        );
+        assert_eq!(
+            std::fs::read_to_string(session_dir.join("opened-path.txt")).unwrap(),
+            session_dir.display().to_string(),
+            "the editor is pointed at the projection, not at the owning working tree"
+        );
+        let note = RepoPath::from_utf8("editor-note.txt").unwrap();
+        assert!(
+            state
+                .graph
+                .resolved_tree()
+                .artifact_at_path(&note)
+                .is_none(),
+            "open must not admit anything on its own"
+        );
+
+        // A reconcile that cannot admit keeps the projection it refused.
+        std::fs::create_dir(session_dir.join(".kin")).unwrap();
+        std::fs::write(session_dir.join(".kin").join("stowaway"), b"reserved\n").unwrap();
+        let refusal = kin_cli::commands::reconcile::run_for_layout(&state.layout, None, false)
+            .await
+            .expect_err("a projection carrying a reserved control path must be refused");
+        assert!(
+            session_dir.join("editor-note.txt").is_file(),
+            "a refused reconcile must keep the projection it could not admit: {refusal:#}"
+        );
+        assert!(
+            state
+                .graph
+                .resolved_tree()
+                .artifact_at_path(&note)
+                .is_none(),
+            "a refused reconcile must not move repository authority"
+        );
+
+        // Once the refusal is cleared, admission is what collects it.
+        std::fs::remove_dir_all(session_dir.join(".kin")).unwrap();
+        kin_cli::commands::reconcile::run_for_layout(&state.layout, None, false)
+            .await
+            .expect("admit the retained projection through repository authority");
+        assert!(
+            !session_dir.exists(),
+            "kin reconcile is the collector for a retained projection"
+        );
+        assert!(
+            state
+                .graph
+                .resolved_tree()
+                .artifact_at_path(&note)
+                .is_some(),
+            "the delta the editor left must reach repository authority"
+        );
+
+        std::env::remove_var("KIN_DAEMON_URL");
+        server.abort();
+    }
+
+    /// The one session projection a fixture repository is holding.
+    ///
+    /// Asserting there is exactly one is part of the proof: a surface that
+    /// materialized twice, or that collected nothing, shows up here.
+    #[cfg(unix)]
+    fn sole_session_projection(layout: &kin_core::KinLayout) -> PathBuf {
+        let mut found = std::fs::read_dir(layout.runs_dir())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("session-"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(found.len(), 1, "expected exactly one session projection");
+        found.pop().unwrap()
+    }
+
     /// A working agent keeps its session by working.
     ///
     /// The session idle window is an idle timeout, so a tool call from a
     /// session refreshes its lease. Without this an agent that never calls
     /// `kin_session_heartbeat` gets reaped mid-task, taking its in-flight
     /// transaction with it, no matter how busy it was.
+    ///
+    /// What is proven here is that presenting a session id extends that
+    /// session. Ownership is not checked and is not claimed: see
+    /// [`touch_session_liveness`].
     #[tokio::test]
     async fn a_tool_call_refreshes_the_calling_session_lease() {
         let state = test_state();
@@ -13574,7 +13760,7 @@ mod tests {
             .last_heartbeat;
         assert!(
             after > before,
-            "a tool call must refresh the lease it was issued under: {before:?} -> {after:?}"
+            "a tool call must refresh the lease whose id it presents: {before:?} -> {after:?}"
         );
     }
 

@@ -159,11 +159,15 @@ fn session_commands_reach_the_session_surface_instead_of_the_capability_gate() {
         );
     }
 
-    // The discontinued native-fork flags still refuse before anything runs.
+    // The discontinued native-fork flags still refuse before anything runs, and
+    // so does `--session`: every launch is a session projection now, so a flag
+    // that used to select one can only mean something it no longer selects.
+    // Accepting and ignoring it would let a caller believe it chose something.
     for args in [
         &["shell", "--restrict-discovery"][..],
         &["open", "code", "--restrict-filesystem"][..],
         &["with", "claude", "--passive-guidance"][..],
+        &["with", "claude", "--session"][..],
     ] {
         let output = kin_command(&home)
             .args(args)

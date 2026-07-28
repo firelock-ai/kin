@@ -3,16 +3,17 @@
 > **Current development status:** repository-v6 exact session materialization is
 > implemented at the daemon boundary, including non-code/binary artifacts,
 > executable bits, symlinks, exact source-CAS reads, scoped artifact selection,
-> and a durable three-way-reconcile base record. The base is not yet sealed
-> against session-local edits, so reconcile consumption remains fail-closed
-> until it revalidates the record against repository authority. The public `kin exec`, `kin shell`,
-> `kin with --session`, `kin open`, and `kin reconcile` commands remain
-> fail-closed open gates. Docker and Compose are therefore represented and
-> materializable, but are **not yet claimed as end-to-end dogfood-ready through
-> these launchers**. Check `kin capabilities --json` for live availability.
+> and a durable three-way-reconcile base record. `kin exec`, `kin shell`,
+> `kin open`, `kin with`, and `kin reconcile` are exposed: the daemon
+> materializes the projection, the process runs inside it, and a clean exit
+> admits the observed delta through the reconcile boundary. Docker and Compose
+> are represented and materializable, but are **not yet claimed as end-to-end
+> dogfood-ready through these launchers**. Check `kin capabilities --json` for
+> live availability.
 >
-> The remainder of this document is the contract those commands must satisfy
-> before their gates are opened, not a claim that every step is released today.
+> Parts of the remainder of this document are still the contract these commands
+> must satisfy rather than a description of shipped behavior. Where the two
+> disagree, `kin capabilities --json` and the code are authoritative.
 
 Two exact-tree cases still fail closed at the physical session boundary:
 byte-exact non-UTF-8 repository paths (retained in repository authority and Git
@@ -34,8 +35,8 @@ Three surfaces share this contract:
 | --- | --- | --- |
 | `kin exec -- <cmd>` | One-shot command in a fresh session workspace | `kin exec -- npm test`, `kin exec -- make build` |
 | `kin shell` | Interactive shell inside a session workspace | exploratory work, multiple commands in one session |
-| `kin with --session <assistant> -- <task>` | AI assistant launched inside a session workspace | agent work that should start Kin-native |
-| `kin open <code\|cursor>` | Supported editor launched with a blocking wait lifecycle | human editing sessions |
+| `kin with <assistant> -- <task>` | AI assistant launched inside a session workspace | agent work that should start Kin-native |
+| `kin open <code\|cursor>` | Supported editor launched over a retained session projection | human editing sessions |
 
 `kin setup` is **not** part of this contract: it is one-time configuration that
 installs Kin's MCP server entry into your AI clients (Claude Code, Cursor,
@@ -43,7 +44,7 @@ Codex, Gemini, Windsurf) and your shell hook. In short:
 
 - **`kin setup`** — configure clients once (MCP install, shell hook).
 - **`kin exec` / `kin shell`** — run ordinary commands through a session workspace.
-- **`kin with`** — launch an assistant; add `--session` to start it inside a
+- **`kin with`** — launch an assistant inside a
   session workspace with session-coherent MCP.
 
 ## The execution contract
@@ -68,10 +69,14 @@ Codex, Gemini, Windsurf) and your shell hook. In short:
    commands:
 
    ```
-   Command failed; session workspace kept at: .kin/runs/session-<id>
-   To reconcile its changes anyway: kin reconcile <id> --cleanup
-   To discard it: rm -rf .kin/runs/session-<id>
+   Process exited <code>; session workspace kept at: .kin/runs/session-<id>
+     admit its changes anyway: kin reconcile <id>
+     discard it: rm -rf .kin/runs/session-<id>
    ```
+
+   `kin reconcile <id>` admits the workspace and then removes it, so a
+   preserved workspace lives exactly until its changes land. A reconcile that
+   is itself refused leaves the workspace alone.
 
 `kin doctor` reports leftover session workspaces and the same recovery
 commands under its **Session runtime** check.
@@ -79,8 +84,8 @@ commands under its **Session runtime** check.
 ### Closeout flags (`kin exec`)
 
 - default — reconcile on success, clean up; preserve on failure.
-- `--keep` — keep the workspace and defer reconcile (`kin reconcile <id>
-  --cleanup` when ready).
+- `--keep` — keep the workspace and defer reconcile (`kin reconcile <id>`
+  when ready, which admits it and then removes it).
 - `--discard` — throw the workspace away without reconciling (pure scratch
   run).
 
@@ -145,7 +150,7 @@ session-workspace realities matter:
 
 ## Agent sessions and MCP session coherence
 
-`kin with --session <assistant> -- <task>` starts the assistant **inside** the
+`kin with <assistant> -- <task>` starts the assistant **inside** the
 session workspace:
 
 - cwd is the session workspace root, so the agent's shell commands and file
@@ -167,7 +172,7 @@ session workspace:
    server forwards every graph tool call to exactly that daemon. No cwd
    guessing, no stale global config.
 2. Otherwise it discovers the repository by walking up from the working
-   directory. Because agents launched with `--session` start inside
+   directory. Because agents launched with `kin with` start inside
    `.kin/runs/session-<id>`, the walk lands on the same repository's `.kin/`.
 3. Each forwarded tool call carries the session id (from `KIN_SESSION_ID`) as
    the `X-Kin-Session` header, so the daemon can serve session-scoped graph
@@ -239,9 +244,9 @@ and the CLI (which compares them), so the two sides cannot drift apart.
 | Situation | What Kin does | Your move |
 | --- | --- | --- |
 | Command/agent succeeded | reconcile + clean up | nothing |
-| Command/agent failed | keep workspace, print recovery | fix and rerun, or `kin reconcile <id> --cleanup`, or `rm -rf` |
+| Command/agent failed | keep workspace, print recovery | fix and rerun, or `kin reconcile <id>`, or `rm -rf` |
 | Reconcile failed | keep workspace, print recovery | `kin reconcile <id>` after resolving, then clean up |
-| Ran with `--keep` | keep workspace, defer reconcile | `kin reconcile <id> --cleanup` when ready |
+| Ran with `--keep` | keep workspace, defer reconcile | `kin reconcile <id>` when ready |
 | Ran with `--discard` | delete workspace, no reconcile | nothing |
 | Not sure what's pending | — | `kin doctor` lists leftover session workspaces |
 

@@ -206,18 +206,41 @@ pub async fn run(session_id: Option<String>, confirm_mass_deletion: bool) -> Res
     let cwd = std::env::current_dir().context("resolve current directory")?;
     let layout = kin_core::KinLayout::discover(&cwd)
         .ok_or_else(|| anyhow!("not inside a Kin repository"))?;
-    let session_dir = resolve_session_directory(&layout, session_id.as_deref())?;
-    let base_url = crate::daemon_client::resolve_daemon_url(&layout)
+    run_for_layout(&layout, session_id.as_deref(), confirm_mass_deletion).await
+}
+
+/// Admit one session projection and collect it.
+///
+/// Admission is what retires a projection, so this is the collector for every
+/// retained session: the surfaces that never close their own projection
+/// (`kin open`, `kin exec --keep`, any run kept by a non-zero exit) all end
+/// here. The removal is strictly after the daemon reports success, so a
+/// refused or failed reconcile leaves the projection on disk for the operator
+/// to inspect and retry.
+pub async fn run_for_layout(
+    layout: &kin_core::KinLayout,
+    session_id: Option<&str>,
+    confirm_mass_deletion: bool,
+) -> Result<()> {
+    let session_dir = resolve_session_directory(layout, session_id)?;
+    let base_url = crate::daemon_client::resolve_daemon_url(layout)
         .await?
         .ok_or_else(|| anyhow!("Kin daemon is required for exact session reconciliation"))?;
-    let client = crate::daemon_client::DaemonClient::from_base_url_for_layout(base_url, &layout)?;
+    let client = crate::daemon_client::DaemonClient::from_base_url_for_layout(base_url, layout)?;
     let summary = client
         .reconcile(&ReconcileRequest {
-            session_dir,
+            session_dir: session_dir.clone(),
             confirm_mass_deletion,
         })
         .await?;
     println!("{}", serde_json::to_string_pretty(&summary)?);
+    crate::commands::session_run::discard(&session_dir).with_context(|| {
+        format!(
+            "remove the admitted session workspace {}; its changes are already in repository \
+             authority, so the reconcile must not be retried",
+            session_dir.display()
+        )
+    })?;
     Ok(())
 }
 

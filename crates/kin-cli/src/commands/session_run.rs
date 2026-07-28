@@ -259,8 +259,9 @@ pub async fn close(
 ///
 /// Only ever called with a path the daemon just materialized under
 /// `.kin/runs/`, and re-checked here so a caller cannot walk this into an
-/// arbitrary removal.
-fn discard(session_dir: &Path) -> Result<()> {
+/// arbitrary removal. This is the one removal path for a projection, whether
+/// the surface closes its own session or `kin reconcile` collects it later.
+pub(crate) fn discard(session_dir: &Path) -> Result<()> {
     let name = session_dir
         .file_name()
         .and_then(|name| name.to_str())
@@ -423,7 +424,9 @@ pub fn editor_program(editor: &str) -> Result<&'static str> {
 ///
 /// The editor is launched over the projection and the projection is retained:
 /// editors detach from the launching process, so there is no exit to key an
-/// automatic admission on. The caller admits the result with `kin reconcile`.
+/// automatic admission on. `kin reconcile <session>` is both the admission and
+/// the collector: it removes the projection once the daemon has taken its
+/// delta, so a retained projection lives exactly until its changes land.
 pub async fn open(
     editor: String,
     restrict_discovery: bool,
@@ -489,10 +492,13 @@ pub async fn with(
              legacy assistant path, so there is no guidance to suppress"
         );
     }
-    // `--session` was the opt-in when a non-session assistant launch existed.
-    // There is no unprojected launch any more, so it is accepted and redundant
-    // rather than silently meaning something different.
-    let _ = session;
+    if session {
+        bail!(
+            "--session is fail-closed: it was the opt-in when an unprojected assistant launch \
+             existed, and every launch is now a session projection, so the flag can only mean \
+             something it no longer selects"
+        );
+    }
 
     let program = assistant_program(&assistant)?;
     let layout = discover_layout()?;

@@ -69,19 +69,40 @@ pub struct TrafficCheck {
 /// keeps its transport alive keeps its session, and a thinking pause between
 /// tool calls cannot strand a transaction. It was two 30-second heartbeat
 /// intervals, which reaped agents mid-task while they were still reading.
+///
+/// The cost is paid by a session that dies without releasing anything, and
+/// only by one registered without a PID. The sweeper reaps a stale session
+/// together with its intents, and a session carrying a PID is judged stale the
+/// moment that process is gone, whatever the idle window says. A PID-less
+/// session has only the window: it holds its hard-lock scopes against every
+/// other session for 30 minutes here where it was one minute before, until the
+/// sweep, an explicit end from a surviving holder of the id, or a daemon
+/// restart. Deployments that run many PID-less sessions against one daemon and
+/// would rather take the mid-task reaping risk can lower the window with
+/// [`SESSION_IDLE_TTL_ENV`].
 pub const DEFAULT_SESSION_IDLE_TTL: Duration = Duration::from_secs(1800);
 
 /// Environment override for [`DEFAULT_SESSION_IDLE_TTL`], in whole seconds.
 pub const SESSION_IDLE_TTL_ENV: &str = "KIN_SESSION_IDLE_TTL_SECS";
 
+/// Longest idle window the override may select.
+///
+/// A ceiling is the same guard as the floor. Without one,
+/// `KIN_SESSION_IDLE_TTL_SECS` set to a large number silently disables
+/// PID-less reaping altogether, and a crashed agent's hard locks become
+/// permanent for the life of the daemon.
+pub const MAX_SESSION_IDLE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// Resolve the session idle TTL from the environment, falling back to
-/// [`DEFAULT_SESSION_IDLE_TTL`]. A malformed or zero value keeps the default:
-/// a typo must not silently reintroduce aggressive reaping.
+/// [`DEFAULT_SESSION_IDLE_TTL`]. A malformed value, zero, or anything past
+/// [`MAX_SESSION_IDLE_TTL`] keeps the default: a typo must not silently
+/// reintroduce aggressive reaping, and it must not silently retire reaping
+/// either.
 pub fn configured_session_idle_ttl() -> Duration {
     std::env::var(SESSION_IDLE_TTL_ENV)
         .ok()
         .and_then(|raw| raw.trim().parse::<u64>().ok())
-        .filter(|secs| *secs > 0)
+        .filter(|secs| *secs > 0 && *secs <= MAX_SESSION_IDLE_TTL.as_secs())
         .map_or(DEFAULT_SESSION_IDLE_TTL, Duration::from_secs)
 }
 
@@ -2161,7 +2182,10 @@ mod tests {
     }
 
     /// The idle window is operator-tunable, and a malformed value keeps the
-    /// safe default rather than silently restoring aggressive reaping.
+    /// safe default rather than silently restoring aggressive reaping. The
+    /// ceiling is the same guard in the other direction: an override large
+    /// enough to retire PID-less reaping is rejected too, because a crashed
+    /// agent's hard locks would then never be released.
     #[test]
     #[serial_test::serial]
     fn session_idle_ttl_is_configurable_and_rejects_nonsense() {
@@ -2176,6 +2200,20 @@ mod tests {
                 configured_session_idle_ttl(),
                 DEFAULT_SESSION_IDLE_TTL,
                 "{nonsense:?} must not shorten the idle window"
+            );
+        }
+
+        std::env::set_var(
+            SESSION_IDLE_TTL_ENV,
+            MAX_SESSION_IDLE_TTL.as_secs().to_string(),
+        );
+        assert_eq!(configured_session_idle_ttl(), MAX_SESSION_IDLE_TTL);
+        for past_ceiling in [MAX_SESSION_IDLE_TTL.as_secs() + 1, 18_000_000, u64::MAX] {
+            std::env::set_var(SESSION_IDLE_TTL_ENV, past_ceiling.to_string());
+            assert_eq!(
+                configured_session_idle_ttl(),
+                DEFAULT_SESSION_IDLE_TTL,
+                "{past_ceiling} must not retire PID-less reaping"
             );
         }
 

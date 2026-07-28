@@ -534,7 +534,9 @@ fn render_kin_first_section(target_path: &str) -> String {
     out.push_str("**Use Kin tools instead of raw file operations whenever possible.**\n\n");
 
     out.push_str("### Agent Coding Workflow\n\n");
-    out.push_str("- Start agent work inside a graph-backed session: `kin with --session codex -- \"task\"`\n");
+    out.push_str(
+        "- Start agent work inside a graph-backed session: `kin with codex -- \"task\"`\n",
+    );
     out.push_str("- For direct commands, prefer `kin exec -- <command>` so execution is tied to the Kin repo context\n");
     out.push_str("- Discover with Kin first: `semantic_locate`, `get_context_pack`, then `trace_data_flow`\n");
     out.push_str("- Record changes with `kin commit -m \"message\"` after verification passes\n");

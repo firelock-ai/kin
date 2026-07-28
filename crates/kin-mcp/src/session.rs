@@ -1084,11 +1084,15 @@ impl SessionRegistry {
     /// carry ("use the entity id") is reachable without also abandoning it.
     /// Clearing here is what makes a failure recoverable, and it is only ever
     /// called before the publication fence, where nothing has been applied.
-    /// Returns how many operations were discarded.
+    ///
+    /// Returns the discarded operations. Clearing takes the whole staged set,
+    /// not just the operation that failed, so the caller loses correct work it
+    /// staged earlier and needs to know exactly what to re-stage. Handing the
+    /// operations back is what lets the refusal name them.
     pub fn clear_staged_operations(
         &self,
         transaction_id: &str,
-    ) -> std::result::Result<usize, String> {
+    ) -> std::result::Result<Vec<McpMutationOperation>, String> {
         let mut map = self
             .transactions
             .lock()
@@ -1102,8 +1106,7 @@ impl SessionRegistry {
                 transaction_id, tx.state
             ));
         }
-        let cleared = tx.staged_operations.len();
-        tx.staged_operations.clear();
+        let cleared = std::mem::take(&mut tx.staged_operations);
         tx.state = "active".to_string();
         tx.commit_payload_hash = None;
         Ok(cleared)

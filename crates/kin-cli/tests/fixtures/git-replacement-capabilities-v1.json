@@ -378,7 +378,7 @@
         "kin_cli::commands::session_run::tests::exec_preserves_argv_boundaries_and_shell_mode_takes_one_script",
         "kin_cli::commands::session_run::tests::discard_refuses_paths_that_are_not_session_projections"
       ],
-      "note": "The daemon materializes repository CAS bodies into a disposable .kin/runs/session-<id> projection, the command runs with its working directory inside it, and a clean exit admits the observed delta through the same reconcile boundary `kin reconcile` uses. A non-zero exit keeps the projection instead of admitting or deleting it, --discard removes it without touching authority, and --keep defers admission. Argument boundaries are preserved unless --shell is given. Scoped sessions stay fail-closed."
+      "note": "The daemon materializes repository CAS bodies into a disposable .kin/runs/session-<id> projection, the command runs with its working directory inside it, and a clean exit admits the observed delta through the same reconcile boundary `kin reconcile` uses. A non-zero exit keeps the projection instead of admitting or deleting it, --discard removes it without touching authority, and --keep defers admission. Any projection kept this way is collected by the `kin reconcile <session>` that admits it, and stays on disk if that reconcile is refused. Argument boundaries are preserved unless --shell is given. Scoped sessions stay fail-closed."
     },
     {
       "command": "open",
@@ -391,11 +391,11 @@
         "retain non-code files, unsupported languages, modes, symlinks, and gitlinks"
       ],
       "evidence_tests": [
+        "api::tests::kin_open_retains_its_projection_until_reconcile_collects_it",
         "api::tests::cli_session_surface_runs_a_process_and_admits_its_delta_through_authority",
-        "api::tests::session_workspace_endpoint_materializes_live_graph",
         "kin_cli::commands::session_run::tests::launcher_allowlists_reject_arbitrary_programs"
       ],
-      "note": "Launches code or cursor over a session projection carrying every host-representable artifact at its repository identity, with executable modes and symlinks intact and gitlinks plus host-unrepresentable members preserved graph-only. Editors detach from the launching process, so the projection is retained and admitted explicitly with `kin reconcile <session>` rather than on an exit that never arrives. The discontinued native-fork restriction flags are fail-closed."
+      "note": "Launches code or cursor over a session projection carrying every host-representable artifact at its repository identity, with executable modes and symlinks intact and gitlinks plus host-unrepresentable members preserved graph-only. Editors detach from the launching process, so the projection is retained and admitted explicitly with `kin reconcile <session>` rather than on an exit that never arrives. Admission is also the collector: a successful `kin reconcile` removes the projection it just took, and a refused one leaves it on disk, so a retained projection lives exactly until its changes land. The discontinued native-fork restriction flags are fail-closed."
     },
     {
       "command": "with",
@@ -412,7 +412,7 @@
         "api::tests::cli_session_surface_runs_a_process_and_admits_its_delta_through_authority",
         "kin_cli::commands::session_run::tests::launcher_allowlists_reject_arbitrary_programs"
       ],
-      "note": "Launches claude, codex, or gemini inside a session projection pinned to the repository generation its base records, under a daemon session lease with declared capabilities that the assistant's MCP calls bind to through KIN_SESSION_ID. A clean exit admits the complete observed delta through reconcile and releases the lease; the assistant never writes through the owning working tree. Prompt-guidance injection and the native-fork restriction flags are fail-closed."
+      "note": "Launches claude, codex, or gemini inside a session projection pinned to the repository generation its base records, under a daemon session lease with declared capabilities that the assistant's MCP calls bind to through KIN_SESSION_ID. A clean exit admits the complete observed delta through reconcile and releases the lease; the assistant never writes through the owning working tree. The lease is registered with the launcher PID, so an assistant that dies is reaped on the PID liveness check rather than waiting out the idle window. The 1800 second idle window is the release path for sessions registered without a PID, which now hold their hard-lock scopes against other sessions for up to that long instead of the previous 60 seconds; the sweeper is their only collector, and KIN_SESSION_IDLE_TTL_SECS lowers the window for deployments that would rather take the mid-task reaping risk. Any local process holding a session id can refresh that lease, which the loopback-only bind is the boundary for. Prompt-guidance injection, --session, and the native-fork restriction flags are fail-closed."
     },
     {
       "command": "shell",

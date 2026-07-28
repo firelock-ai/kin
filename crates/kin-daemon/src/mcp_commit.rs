@@ -273,17 +273,58 @@ fn unstage_failed_attempt(
             )
         }
     };
+    let count = cleared.len();
+    let dropped = describe_cleared_operations(&cleared);
     if let Err(persist_error) = persist_registry_checked(state, sessions) {
         return format!(
-            "{detail}\nthe {cleared} failed operation(s) were cleared but could not be persisted \
-             ({persist_error}); begin a new transaction with kin_transaction_begin"
+            "{detail}\nthe {count} failed operation(s) were cleared but could not be persisted \
+             ({persist_error}); begin a new transaction with kin_transaction_begin\ndropped: \
+             {dropped}"
         );
     }
     format!(
-        "{detail}\nrepository authority did not move, and the {cleared} failed operation(s) have \
+        "{detail}\nrepository authority did not move, and the {count} failed operation(s) have \
          been cleared from transaction {transaction_id}: stage corrected operations on it and \
-         commit again, or begin a new transaction with kin_transaction_begin"
+         commit again, or begin a new transaction with kin_transaction_begin\ndropped: {dropped}"
     )
+}
+
+/// Name every operation the clear discarded.
+///
+/// The clear takes the whole staged set, so an attempt that failed on one bad
+/// target also drops the correct operations staged alongside it, bodies and
+/// all. A count alone leaves the caller guessing at what to re-stage; naming
+/// the targets makes the retry mechanical.
+fn describe_cleared_operations(cleared: &[kin_mcp::McpMutationOperation]) -> String {
+    /// Enough to reconstruct a realistic staged set without letting one
+    /// refusal carry an unbounded operation dump.
+    const MAX_NAMED: usize = 32;
+
+    if cleared.is_empty() {
+        return "(none)".to_string();
+    }
+    let mut named = cleared
+        .iter()
+        .take(MAX_NAMED)
+        .map(describe_cleared_operation)
+        .collect::<Vec<_>>()
+        .join(", ");
+    if let Some(remaining) = cleared.len().checked_sub(MAX_NAMED).filter(|n| *n > 0) {
+        named.push_str(&format!(", and {remaining} more"));
+    }
+    named
+}
+
+fn describe_cleared_operation(operation: &kin_mcp::McpMutationOperation) -> String {
+    let verb = operation.verb.trim();
+    let verb = if verb.is_empty() { "operation" } else { verb };
+    match (operation.target.trim(), &operation.payload) {
+        ("", Some(kin_mcp::McpMutationPayload::Relation { from, to, kind })) => {
+            format!("{verb} relation {kind:?} {from} -> {to}")
+        }
+        ("", _) => format!("{verb} (unnamed target)"),
+        (target, _) => format!("{verb} {target}"),
+    }
 }
 
 fn transaction_payload_hash(transaction: &kin_mcp::McpTransaction) -> Result<String, String> {
@@ -1465,16 +1506,28 @@ mod tests {
             serde_json::json!(transaction.transaction_id),
         )]);
 
+        // One bad target alongside correct work: the clear takes both, so the
+        // refusal has to name both or the caller cannot reconstruct what it
+        // lost.
         sessions
             .stage_transaction(
                 &transaction.transaction_id,
-                vec![kin_mcp::McpMutationOperation {
-                    verb: "update".to_string(),
-                    target: "no_such_entity".to_string(),
-                    payload: None,
-                    body: Some("pub fn no_such_entity() {}".to_string()),
-                    description: String::new(),
-                }],
+                vec![
+                    kin_mcp::McpMutationOperation {
+                        verb: "update".to_string(),
+                        target: entity.id.to_string(),
+                        payload: None,
+                        body: Some("pub fn value() -> u8 { 3 }".to_string()),
+                        description: "correct work staged alongside the failure".to_string(),
+                    },
+                    kin_mcp::McpMutationOperation {
+                        verb: "update".to_string(),
+                        target: "no_such_entity".to_string(),
+                        payload: None,
+                        body: Some("pub fn no_such_entity() {}".to_string()),
+                        description: String::new(),
+                    },
+                ],
             )
             .unwrap();
 
@@ -1488,6 +1541,18 @@ mod tests {
         assert!(
             message.contains("have been cleared from transaction"),
             "the refusal must say the failed operations were dropped: {message}"
+        );
+        let dropped = message
+            .split_once("dropped: ")
+            .expect("the refusal must list what it dropped")
+            .1;
+        assert!(
+            dropped.contains("update no_such_entity"),
+            "the refusal must name the operation that failed: {message}"
+        );
+        assert!(
+            dropped.contains(&format!("update {}", entity.id)),
+            "the refusal must name the correct work it dropped too: {message}"
         );
         assert!(
             sessions
