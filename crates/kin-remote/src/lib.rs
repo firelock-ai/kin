@@ -10,6 +10,9 @@ pub mod http_transport;
 pub mod invalidation;
 pub mod mutation_push;
 pub mod repository_transfer;
+#[cfg(feature = "http")]
+pub mod repository_transfer_http;
+pub mod repository_transfer_negotiation;
 pub mod sync_types;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -250,10 +250,17 @@
       "authority": "repository-v6 remote capability and exact transport",
       "required_for_bounded_dogfood": false,
       "acceptance_spec": [
-        "negotiate remote capabilities and transfer missing exact object/change/tree/ref closure with lease-protected publication"
+        "DONE: negotiate the remote destination lease, build the exact closure, publish it, and verify the returned receipt binds the pack that was sent",
+        "DONE: refuse a non-fast-forward gap with both heads named and no force path",
+        "OPEN: carry a closure larger than one negotiated envelope (512 changes, 4096 bodies, 16 MiB decoded); transfer v1 has no continuation packs, so a repository past that bound is refused at pack build",
+        "OPEN: drive the KinLab control-plane transfer envelope route, including its protection rules and durable receipts, rather than a peer daemon transfer seam directly"
       ],
-      "evidence_tests": [],
-      "note": "The previous path depended on the removed legacy Git exporter."
+      "evidence_tests": [
+        "crates/kin-remote/src/repository_transfer_negotiation.rs",
+        "crates/kin-remote/src/repository_transfer_http.rs",
+        "crates/kin-daemon/src/api.rs"
+      ],
+      "note": "The full path runs end to end between two Kin daemons over HTTP with receipts verified, but only within one bounded transfer envelope, and the transfer status this protocol publishes still reports push_apply_ready=false. Exposing it as general `kin push` would promise a capability that a repository past the envelope bound does not have."
     },
     {
       "command": "pull",
@@ -262,22 +269,37 @@
       "authority": "repository-v6 remote capability and exact transport",
       "required_for_bounded_dogfood": false,
       "acceptance_spec": [
-        "fetch and validate exact remote closure before one local authority transaction and graph-derived workspace transition"
+        "DONE: read the remote ref advertisement, adopt its default ref when this replica has none, and fetch the exact exported closure",
+        "DONE: admit the pack in one local authority transaction and refuse a receipt that does not bind it",
+        "DONE: refuse a remote this replica already contains, naming the remote head",
+        "OPEN: carry a closure larger than one negotiated envelope; transfer v1 has no continuation packs",
+        "OPEN: carry an exported pack past the 24 MiB transfer body bound; the daemon route and the client read declare the same limit, and a pack past it is refused as an oversized envelope rather than split",
+        "OPEN: graph-derived workspace transition after admission, so a working tree follows the new head"
       ],
-      "evidence_tests": [],
-      "note": "The previous native sync path materialized file snapshots outside repository-v6 authority."
+      "evidence_tests": [
+        "crates/kin-remote/src/repository_transfer_negotiation.rs",
+        "crates/kin-remote/src/repository_transfer_http.rs",
+        "crates/kin-daemon/src/api.rs"
+      ],
+      "note": "Negotiation, export, and admission run end to end between two Kin daemons over HTTP with receipts verified. It stays closed because the envelope is bounded and because admission does not yet move the workspace to the admitted head. The envelope is bounded twice: by the negotiated change count, and by the 24 MiB one-body transfer bound. A pack carries base64 CAS bodies for the whole source tree, so on a real repository the byte bound binds first."
     },
     {
       "command": "merge",
-      "status": "open_gate",
-      "exposure": "fail_closed",
-      "authority": "repository-v6 immutable DAG and exact tree merge",
+      "status": "ready",
+      "exposure": "enabled",
+      "authority": "repository-v6 immutable DAG three-way composition published with ref compare-and-swap",
       "required_for_bounded_dogfood": false,
       "acceptance_spec": [
-        "merge semantic and exact tree deltas across all artifact kinds and publish with ref compare-and-swap"
+        "resolve both heads and their merge base by replaying the change DAG, never from raw files",
+        "compose semantic entities, relations, and exact tree artifacts by stable identity against the merge base",
+        "author the merge change against its first parent and record both heads as ordered parents",
+        "publish the merge change, the target ref, and the exact workspace in one repository transaction with compare-and-swap",
+        "refuse a conflicting, unrelated, criss-cross, or admission-policy-changing merge without publishing any part of it"
       ],
-      "evidence_tests": [],
-      "note": "The old merge executor depends on removed legacy branch state and delta shapes."
+      "evidence_tests": [
+        "crates/kin-cli/tests/repository_merge.rs"
+      ],
+      "note": "Merge composes graph truth: both heads and the single merge base are materialized by DAG replay, then entities, relations, and exact tree artifacts are merged by stable identity against that base. Composition decides each identity by whole value, so a side that did not move never overrides a side that did, and both sides moving differently is a conflict rather than a resolution. Granularity is the whole entity or artifact, never the line. Two branches editing disjoint regions of one file therefore conflict, because a semantic-entity model has no textual line merge to fall back on. A move on one branch against an edit on the other conflicts as well, because an artifact's path is part of the value being compared and history that records the move as a removal plus an addition leaves the edited side conflicting against that removal. The merge change carries ordered parents with the active branch first and its deltas are authored against that first parent, which is what history replay validates. Up-to-date and fast-forward merges publish no merge change. Unproven shapes fail closed with nothing published and are named in the refusal: conflicting entities, relations, or artifacts, which covers both branches editing one file and a move against an edit; two artifacts composing onto one path; a relation left with no surviving endpoint; unrelated histories; multiple merge bases (criss-cross); a merge that would change the shared admission policy; a dirty or detached workspace. A conflict refusal states the total conflict count, names the first 25 individually, and reports how many further conflicts it found. There is no mid-merge state, so a conflicting merge is refused rather than parked; `kin conflicts` and `kin resolve` stay fail-closed for that reason. One interaction is inherited, not introduced: a workspace whose semantics were installed from history (branch switch, checkout, or merge) and is then committed retains a semantic overlay, because the commit observation re-derives entities from source bytes while the installed ones came from replayed history. `kin branch switch` followed by `kin commit` reproduces it with no merge involved. Until that is fixed, a second merge in the same session refuses on the resulting dirty workspace."
     },
     {
       "command": "stash",
@@ -322,7 +344,7 @@
         "represent semantic and exact-tree conflicts across every artifact kind"
       ],
       "evidence_tests": [],
-      "note": "The retired command read legacy .kin/merge_state.json state."
+      "note": "Repository-v6 authority has no durable merge-transaction record, so a mid-merge conflict set and its per-entity resolutions cannot be committed with the merge transaction, and the retired sidecar shape (.kin/merge_state.json) is not an acceptable substitute. `kin merge` therefore refuses a conflicting merge atomically instead of parking one, stating the total conflict count and naming the first 25 individually. Flipping this command requires a first-class merge transaction in the kin-model and kin-db substrate."
     },
     {
       "command": "resolve",
@@ -335,7 +357,7 @@
         "publish the resolved workspace and target ref atomically with compare-and-swap"
       ],
       "evidence_tests": [],
-      "note": "The retired resolver mutated legacy branches and sidecar merge state."
+      "note": "Repository-v6 authority has no durable merge-transaction record, so a mid-merge conflict set and its per-entity resolutions cannot be committed with the merge transaction, and the retired sidecar shape (.kin/merge_state.json) is not an acceptable substitute. `kin merge` therefore refuses a conflicting merge atomically instead of parking one, stating the total conflict count and naming the first 25 individually. Flipping this command requires a first-class merge transaction in the kin-model and kin-db substrate."
     },
     {
       "command": "rename",
@@ -352,16 +374,21 @@
     },
     {
       "command": "remote plan-push",
-      "status": "open_gate",
-      "exposure": "fail_closed",
+      "status": "ready",
+      "exposure": "enabled",
       "authority": "repository-v6 workspace/ref state and negotiated remote capability",
       "required_for_bounded_dogfood": false,
       "acceptance_spec": [
         "derive the local publication head from one repository authority generation",
-        "plan exact closure transfer and lease-protected ref publication without legacy branch state"
+        "read the remote destination lease over the repository-v6 transfer seam and classify the gap without moving history",
+        "refuse a remote head this replica has not admitted, naming both heads, with no force path",
+        "report the negotiated envelope bound so an oversized gap is predictable before a push runs"
       ],
-      "evidence_tests": [],
-      "note": "The legacy planner is not an executable repository-v6 transfer proof."
+      "evidence_tests": [
+        "crates/kin-remote/src/repository_transfer_negotiation.rs",
+        "crates/kin-daemon/src/api.rs"
+      ],
+      "note": "Negotiates against a live peer transfer seam and publishes nothing. Reports whether the gap fits one transfer envelope, because transfer v1 has no continuation packs."
     },
     {
       "command": "exec",

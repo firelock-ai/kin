@@ -243,8 +243,8 @@ impl MutationPusher for HttpMutationPusher {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Minimal percent-encoding for URL query parameters.
-fn urlencoded(s: &str) -> String {
+/// Minimal percent-encoding for URL query parameters and path segments.
+pub(crate) fn urlencoded(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {

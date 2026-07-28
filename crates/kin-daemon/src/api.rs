@@ -26,6 +26,9 @@ use kin_model::{
     RepositoryId, SessionCapabilities, SessionId, SessionStore, SessionTransport, TransactionDelta,
     TreeEntry, WorkStore, WorkspaceId, WorkspaceTreeSnapshot,
 };
+// One declared bound governs both directions: what these routes accept is what
+// the transfer client reads.
+use kin_remote::repository_transfer_http::REPOSITORY_TRANSFER_HTTP_BODY_LIMIT;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -35,7 +38,6 @@ use uuid::Uuid;
 
 static BOOTSTRAP_EXPORTS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
 static EXACT_SOURCE_ARCHIVE_EXPORTS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
-const REPOSITORY_TRANSFER_HTTP_BODY_LIMIT: usize = 24 * 1024 * 1024;
 
 fn exact_source_archive_exports() -> Arc<tokio::sync::Semaphore> {
     Arc::clone(
@@ -863,6 +865,7 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route("/commands/approvals", post(command_approvals))
         .route("/commands/security", post(command_security))
         .route("/commands/branch", post(command_branch))
+        .route("/commands/merge", post(command_merge))
         .route("/commands/checkout", post(command_checkout))
         .route("/commands/rename", post(command_rename))
         .route(
@@ -871,6 +874,9 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         )
         .route("/reconcile", post(reconcile_session_workspace))
         .route("/commands/commit", post(command_commit))
+        .route("/commands/push", post(command_push))
+        .route("/commands/pull", post(command_pull))
+        .route("/commands/transfer-plan", post(command_transfer_plan))
         .route("/mcp/tools/call", post(mcp_tools_call))
         // Multi-repo endpoints — list and query lazily-loaded repo graphs
         .route("/repos", get(list_repos))
@@ -879,6 +885,10 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route("/repos/{repo_id}/files", get(repo_files))
         .route("/repos/{repo_id}/refs", get(repo_refs))
         .route("/repos/{repo_id}/history", get(repo_history))
+        .route(
+            "/repos/{repo_id}/transfer/advertise",
+            get(repo_transfer_advertise),
+        )
         .route(
             "/repos/{repo_id}/transfer/status",
             post(repo_transfer_status),
@@ -2584,6 +2594,42 @@ async fn command_branch(
     };
 
     let response = crate::repository_branch::execute(&state, &request)?;
+    Ok(Json(response))
+}
+
+/// POST /commands/merge — publish one exact repository-v6 semantic merge.
+async fn command_merge(
+    headers: axum::http::HeaderMap,
+    State(state): State<Arc<DaemonState>>,
+    Json(request): Json<kin_cli::commands::merge::MergeRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if !state
+        .is_initialized
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon not fully initialized".to_string(),
+        ));
+    }
+    if state.storage_backend.is_some() {
+        return Err((
+            StatusCode::CONFLICT,
+            "local repository merge authority is unavailable for hosted snapshot authority"
+                .to_string(),
+        ));
+    }
+    if extract_session_id_from_headers(&headers)?.is_some() {
+        return Err((
+            StatusCode::CONFLICT,
+            "merge does not accept X-Kin-Session because it mutates the primary repository \
+             workspace and its active branch"
+                .to_string(),
+        ));
+    }
+
+    let _coordination = state.coordination_gate.lock().await;
+    let response = crate::repository_merge::execute(&state, &request)?;
     Ok(Json(response))
 }
 
@@ -6455,6 +6501,23 @@ fn repository_transfer_error(
     (status, error.to_string())
 }
 
+/// GET /repos/{repo_id}/transfer/advertise — every published ref and the
+/// default ref a fresh replica adopts.
+///
+/// This is where a negotiation starts. A replica that has no ref of its own yet
+/// cannot ask the per-ref transfer status about anything, so discovery has to
+/// be answerable without naming a ref first.
+async fn repo_transfer_advertise(
+    Path(repo_id): Path<String>,
+    State(state): State<Arc<DaemonState>>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let (repository_id, authority) = repository_transfer_authority(&state, &repo_id)?;
+    let advertisement =
+        kin_remote::repository_transfer::repository_ref_advertisement(&authority, &repository_id)
+            .map_err(repository_transfer_error)?;
+    Ok(Json(advertisement))
+}
+
 /// POST /repos/{repo_id}/transfer/status — exact destination lease and
 /// negotiated repository-v6 transfer capability.
 async fn repo_transfer_status(
@@ -6541,6 +6604,290 @@ async fn repo_transfer_receive(
         });
     }
     Ok(Json(receipt))
+}
+
+/// Everything a negotiation needs, resolved from one authority lease.
+struct TransferCommandContext {
+    repo_id: String,
+    repository_id: RepositoryId,
+    authority: RepositoryAuthorityManager<dyn StorageBackend>,
+    /// Absent when neither the caller nor this replica names a ref, which is
+    /// the normal state of a replica that has admitted nothing yet.
+    source_ref: Option<kin_model::RefName>,
+    destination_ref: Option<kin_model::RefName>,
+    transport: kin_remote::repository_transfer_http::HttpRepositoryTransferTransport,
+}
+
+impl TransferCommandContext {
+    /// The refs a publication uses.
+    ///
+    /// A replica with no ref of its own has nothing to publish, so a push and a
+    /// plan both fail closed here rather than adopting a remote ref and
+    /// publishing an empty line onto it.
+    fn publication_refs(
+        &self,
+    ) -> Result<(kin_model::RefName, kin_model::RefName), (StatusCode, String)> {
+        let source = self.source_ref.clone().ok_or_else(|| {
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!(
+                    "repository {} publishes no default ref, so there is nothing to send; name a ref explicitly",
+                    self.repository_id
+                ),
+            )
+        })?;
+        let destination = self
+            .destination_ref
+            .clone()
+            .unwrap_or_else(|| source.clone());
+        Ok((source, destination))
+    }
+}
+
+/// Resolve the repository, refs, and peer for one transfer command.
+///
+/// An absent source ref means the repository's own default ref, which is the
+/// only ref a replica can name without the operator choosing one. An absent
+/// destination ref mirrors the source, because a transfer that silently landed
+/// on a different ref than it read would be indistinguishable from one that
+/// landed where it was asked to.
+fn transfer_command_context(
+    state: &DaemonState,
+    request: &kin_cli::commands::transfer::CommandTransferRequest,
+) -> Result<TransferCommandContext, (StatusCode, String)> {
+    let base_url = request.remote_base_url.trim();
+    if base_url.is_empty() {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "transfer requires a remote base URL".to_string(),
+        ));
+    }
+    let repo_id = request
+        .repository_id
+        .clone()
+        .unwrap_or_else(|| state.cached_repo_id.clone());
+    let (repository_id, authority) = repository_transfer_authority(state, &repo_id)?;
+
+    let source_ref = request.source_ref.clone().or_else(|| {
+        authority
+            .read_authority()
+            .snapshot()
+            .repository_authority
+            .as_ref()
+            .and_then(|metadata| metadata.ref_state.default_ref.clone())
+    });
+    let destination_ref = request
+        .destination_ref
+        .clone()
+        .or_else(|| source_ref.clone());
+
+    let mut endpoint =
+        kin_remote::repository_transfer_http::RepositoryTransferEndpoint::new(base_url);
+    if let Some(token) = request
+        .remote_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+    {
+        endpoint = endpoint.with_auth(token);
+    }
+
+    Ok(TransferCommandContext {
+        repo_id,
+        repository_id,
+        authority,
+        source_ref,
+        destination_ref,
+        transport: kin_remote::repository_transfer_http::HttpRepositoryTransferTransport::new(
+            endpoint,
+        ),
+    })
+}
+
+/// POST /commands/push — negotiate and publish this replica's exact history to
+/// a remote replica.
+async fn command_push(
+    State(state): State<Arc<DaemonState>>,
+    Json(request): Json<kin_cli::commands::transfer::CommandTransferRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let context = transfer_command_context(&state, &request)?;
+    let (source_ref, destination_ref) = context.publication_refs()?;
+    // Negotiation blocks on peer HTTP and on authority reads, so it must not run
+    // on the async executor that also serves this daemon's own transfer seam.
+    let outcome = tokio::task::spawn_blocking(move || {
+        kin_remote::repository_transfer_negotiation::push_to_remote(
+            &context.authority,
+            &context.transport,
+            &context.repository_id,
+            &source_ref,
+            &destination_ref,
+        )
+    })
+    .await
+    .map_err(internal_error)?
+    .map_err(repository_transfer_error)?;
+    Ok(Json(kin_cli::commands::transfer::CommandTransferResponse {
+        outcome,
+    }))
+}
+
+/// POST /commands/pull — negotiate, fetch, and admit a remote replica's exact
+/// history into this one.
+///
+/// The pack is applied here rather than inside the negotiation helper so that
+/// publication and the refresh of every daemon-derived view stay on the same
+/// path the inbound receive route already uses.
+async fn command_pull(
+    State(state): State<Arc<DaemonState>>,
+    Json(request): Json<kin_cli::commands::transfer::CommandTransferRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    use kin_remote::repository_transfer_negotiation::{
+        verify_receipt_binds_pack, PullNegotiation, RepositoryTransferDirection,
+        RepositoryTransferOutcome, RepositoryTransferPlan,
+    };
+
+    let context = transfer_command_context(&state, &request)?;
+    let repo_id = context.repo_id.clone();
+    let repository_id = context.repository_id.clone();
+    let requested_source_ref = context.source_ref.clone();
+    let requested_destination_ref = context.destination_ref.clone();
+
+    let TransferCommandContext {
+        authority,
+        transport,
+        ..
+    } = context;
+    let (authority, resolved) = {
+        let repository_id = repository_id.clone();
+        tokio::task::spawn_blocking(move || {
+            // A replica that has admitted nothing cannot name a ref from its own
+            // state. The advertisement is what an unborn replica adopts, so
+            // resolving it here is the same step a clone takes.
+            let resolved = (|| {
+                let source_ref = match requested_source_ref {
+                    Some(name) => name,
+                    None => kin_remote::repository_transfer_negotiation::remote_default_ref(
+                        &transport,
+                        &repository_id,
+                    )?,
+                };
+                let destination_ref =
+                    requested_destination_ref.unwrap_or_else(|| source_ref.clone());
+                let negotiation = kin_remote::repository_transfer_negotiation::fetch_pull_pack(
+                    &authority,
+                    &transport,
+                    &repository_id,
+                    &source_ref,
+                    &destination_ref,
+                )?;
+                Ok((source_ref, destination_ref, negotiation))
+            })();
+            (authority, resolved)
+        })
+        .await
+        .map_err(internal_error)?
+    };
+    let (source_ref, destination_ref, negotiation) = resolved.map_err(repository_transfer_error)?;
+
+    let pack = match negotiation {
+        PullNegotiation::UpToDate { head } => {
+            return Ok(Json(kin_cli::commands::transfer::CommandTransferResponse {
+                outcome: RepositoryTransferOutcome {
+                    direction: RepositoryTransferDirection::Pull,
+                    repository_id,
+                    source_ref,
+                    destination_ref,
+                    plan: RepositoryTransferPlan::UpToDate { head },
+                    receipt: None,
+                },
+            }));
+        }
+        PullNegotiation::Pack(pack) => *pack,
+    };
+
+    let plan = RepositoryTransferPlan::FastForward {
+        source_head: pack.source_head,
+        destination_head: pack.expected_destination_head,
+        change_count: Some(pack.changes.len()),
+    };
+    let receipt = kin_remote::repository_transfer::apply_repository_transfer_pack(
+        &authority,
+        &repository_id,
+        &destination_ref,
+        kin_model::AuthorId::new("kin-daemon:repository-transfer-puller"),
+        &pack,
+    )
+    .map_err(repository_transfer_error)?;
+    verify_receipt_binds_pack(&pack, &receipt).map_err(repository_transfer_error)?;
+
+    // Repository authority is already durable. Refresh only derived daemon
+    // views after that receipt exists; a failure here cannot revoke or fake
+    // the committed transfer.
+    if state.storage_backend.is_some() {
+        state.repo_graphs.write().await.remove(&repo_id);
+    } else if receipt.outcome
+        == kin_remote::repository_transfer::RepositoryTransferApplyOutcome::Committed
+    {
+        state
+            .record_repository_authority_commit(receipt.authority_receipt.generation)
+            .map_err(repository_commit_error)?;
+        for change in &pack.changes {
+            state.graph.create_change(change).map_err(internal_error)?;
+        }
+        state.bump_version();
+        state.emit_event(DaemonEvent::GraphRootChanged {
+            old_root_hash: None,
+            new_root_hash: pack.source_head.to_string(),
+        });
+    }
+
+    Ok(Json(kin_cli::commands::transfer::CommandTransferResponse {
+        outcome: RepositoryTransferOutcome {
+            direction: RepositoryTransferDirection::Pull,
+            repository_id,
+            source_ref,
+            destination_ref,
+            plan,
+            receipt: Some(receipt),
+        },
+    }))
+}
+
+/// POST /commands/transfer-plan — negotiate a publication without moving any
+/// history on either replica.
+async fn command_transfer_plan(
+    State(state): State<Arc<DaemonState>>,
+    Json(request): Json<kin_cli::commands::transfer::CommandTransferRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let context = transfer_command_context(&state, &request)?;
+    let (source_ref, destination_ref) = context.publication_refs()?;
+    let repository_id = context.repository_id.clone();
+    let planned_source_ref = source_ref.clone();
+    let planned_destination_ref = destination_ref.clone();
+    let remote_base_url = context.transport.base_url().to_string();
+
+    let plan = tokio::task::spawn_blocking(move || {
+        kin_remote::repository_transfer_negotiation::plan_push_to_remote(
+            &context.authority,
+            &context.transport,
+            &context.repository_id,
+            &source_ref,
+            &destination_ref,
+        )
+    })
+    .await
+    .map_err(internal_error)?
+    .map_err(repository_transfer_error)?;
+
+    Ok(Json(
+        kin_cli::commands::transfer::CommandTransferPlanResponse {
+            repository_id: repository_id.to_string(),
+            source_ref: planned_source_ref,
+            destination_ref: planned_destination_ref,
+            remote_base_url,
+            plan,
+        },
+    ))
 }
 
 /// GET /repos — list all repos available in storage.
@@ -9921,6 +10268,310 @@ mod tests {
             "pack": {},
         });
         assert!(serde_json::from_value::<RepositoryTransferReceiveRequest>(forged).is_err());
+    }
+
+    /// Serve one daemon on a real ephemeral socket and return its base URL.
+    ///
+    /// A transfer is a claim about two replicas agreeing over a wire. An
+    /// in-process router call would prove the negotiation and skip the only
+    /// part that is new here, so the peer in these tests is a real bound
+    /// listener serving the real router.
+    async fn serve_replica(state: Arc<DaemonState>) -> String {
+        let (listener, port) = bind_api_listener(&state, 0).expect("bind an ephemeral peer port");
+        let app = router(state);
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    /// A daemon backed by its own empty repository-v6 storage under `repo_id`.
+    fn replica_state(repo_id: &str) -> (Arc<DaemonState>, tempfile::TempDir, tempfile::TempDir) {
+        install_test_registry_override();
+        let working = tempfile::tempdir().unwrap();
+        let layout = kin_core::init(working.path()).unwrap().layout;
+        let storage = tempfile::tempdir().unwrap();
+        let state = Arc::new(
+            DaemonState::open_with_backend(
+                layout,
+                Box::new(kin_db::LocalFileBackend::new(storage.path().to_path_buf())),
+                repo_id,
+                None,
+            )
+            .unwrap(),
+        );
+        (state, working, storage)
+    }
+
+    /// Publish one exact native change onto `refs/heads/main` in `storage`.
+    fn seed_replica_change(
+        storage: &tempfile::TempDir,
+        repository_id: &RepositoryId,
+        previous: Option<kin_model::SemanticChangeId>,
+        operation: u128,
+        message: &str,
+    ) -> kin_model::SemanticChangeId {
+        use kin_model::{
+            compute_semantic_change_id, ChangeOrigin, DefaultRefExpectation, DefaultRefMutation,
+            RefExpectation, RefMutation, RefTarget, RefUpdatePolicy, RepositoryTransaction,
+            SemanticChange, REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+        };
+
+        let manager = RepositoryAuthorityManager::open(
+            repository_id.clone(),
+            Arc::new(kin_db::LocalFileBackend::new(storage.path().to_path_buf())),
+        )
+        .unwrap();
+        let main = kin_model::RefName::branch(b"main").unwrap();
+        let mut change = SemanticChange {
+            id: kin_model::SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+            origin: ChangeOrigin::Native,
+            parents: previous.into_iter().collect(),
+            timestamp: kin_model::Timestamp::now(),
+            author: kin_model::AuthorId::new("transfer-e2e"),
+            message: message.to_string(),
+            entity_deltas: Vec::new(),
+            relation_deltas: Vec::new(),
+            tree_deltas: Vec::new(),
+            admission_policy_delta: None,
+            projected_files: Vec::new(),
+            spec_link: None,
+            evidence: Vec::new(),
+            risk_summary: None,
+        };
+        change.id = compute_semantic_change_id(&change).unwrap();
+
+        let lease = manager.read_authority();
+        let transaction = RepositoryTransaction {
+            schema_version: REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+            operation_id: kin_model::OperationId::from_uuid(Uuid::from_u128(operation)),
+            repository_id: repository_id.clone(),
+            expected_generation: lease.roots().generation,
+            expected_roots: lease.roots().clone(),
+            actor: kin_model::AuthorId::new("transfer-e2e"),
+            reason: message.to_string(),
+            external_objects: Vec::new(),
+            git_authority_delta: None,
+            changes: vec![change.clone()],
+            aliases: Vec::new(),
+            ref_mutations: vec![RefMutation {
+                name: main.clone(),
+                expected: match previous {
+                    None => RefExpectation::MustNotExist,
+                    Some(head) => RefExpectation::MustEqual {
+                        target: RefTarget::change(head),
+                    },
+                },
+                new_target: Some(RefTarget::change(change.id)),
+                policy: RefUpdatePolicy::FastForwardOnly,
+            }],
+            default_ref_mutation: previous.is_none().then_some(DefaultRefMutation {
+                expected: DefaultRefExpectation::MustBeUnset,
+                new_default: Some(main),
+            }),
+            workspace_mutation: None,
+            local_overlay_delta: None,
+        };
+        drop(lease);
+        manager.commit_repository_transaction(transaction).unwrap();
+        change.id
+    }
+
+    async fn transfer_command(
+        state: Arc<DaemonState>,
+        leaf: &str,
+        request: &kin_cli::commands::transfer::CommandTransferRequest,
+    ) -> (StatusCode, Vec<u8>) {
+        let response = router(state)
+            .oneshot(
+                Request::post(format!("/commands/{leaf}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(request).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 32 * 1024 * 1024)
+            .await
+            .unwrap();
+        (status, body.to_vec())
+    }
+
+    #[tokio::test]
+    async fn native_push_and_pull_move_exact_history_between_two_daemons_over_http() {
+        use kin_remote::repository_transfer_negotiation::{
+            RepositoryTransferDirection, RepositoryTransferPlan,
+        };
+
+        let repo_id = format!("transfer-e2e-{}", Uuid::new_v4());
+        let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
+
+        let (source_state, _source_working, source_storage) = replica_state(&repo_id);
+        let (destination_state, _destination_working, _destination_storage) =
+            replica_state(&repo_id);
+        let (third_state, _third_working, _third_storage) = replica_state(&repo_id);
+
+        let root = seed_replica_change(&source_storage, &repository_id, None, 1, "root the line");
+        let source_head = seed_replica_change(
+            &source_storage,
+            &repository_id,
+            Some(root),
+            2,
+            "advance the line",
+        );
+
+        let destination_url = serve_replica(Arc::clone(&destination_state)).await;
+        let request = kin_cli::commands::transfer::CommandTransferRequest {
+            remote_base_url: destination_url.clone(),
+            remote_token: None,
+            repository_id: Some(repo_id.clone()),
+            source_ref: None,
+            destination_ref: None,
+        };
+
+        // A plan reads both leases and moves nothing.
+        let (status, body) =
+            transfer_command(Arc::clone(&source_state), "transfer-plan", &request).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let planned: kin_cli::commands::transfer::CommandTransferPlanResponse =
+            serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            planned.plan.plan,
+            RepositoryTransferPlan::FastForward {
+                source_head,
+                destination_head: None,
+                change_count: None,
+            }
+        );
+        assert_eq!(planned.plan.max_changes_per_envelope, 512);
+        assert!(
+            !planned.plan.fits_one_envelope,
+            "an unborn destination has no counted closure, so the plan must not assert it fits"
+        );
+
+        // The push crosses a real socket and returns a receipt bound to it.
+        let (status, body) = transfer_command(Arc::clone(&source_state), "push", &request).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let pushed: kin_cli::commands::transfer::CommandTransferResponse =
+            serde_json::from_slice(&body).unwrap();
+        assert_eq!(pushed.outcome.direction, RepositoryTransferDirection::Push);
+        assert_eq!(
+            pushed.outcome.plan,
+            RepositoryTransferPlan::FastForward {
+                source_head,
+                destination_head: None,
+                change_count: Some(2),
+            }
+        );
+        let receipt = pushed
+            .outcome
+            .receipt
+            .expect("a moved head returns a receipt");
+        assert_eq!(receipt.destination_head, source_head);
+        assert_eq!(
+            receipt.outcome,
+            kin_remote::repository_transfer::RepositoryTransferApplyOutcome::Committed
+        );
+
+        // Re-running the same push finds the remote already there.
+        let (status, body) = transfer_command(Arc::clone(&source_state), "push", &request).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let repeated: kin_cli::commands::transfer::CommandTransferResponse =
+            serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            repeated.outcome.plan,
+            RepositoryTransferPlan::UpToDate {
+                head: Some(source_head),
+            }
+        );
+        assert!(repeated.outcome.receipt.is_none());
+
+        // A third replica pulls the same history back out of the one that was
+        // just published to, so the export seam is exercised on real bytes that
+        // arrived over the wire rather than on locally authored fixtures.
+        let (status, body) = transfer_command(Arc::clone(&third_state), "pull", &request).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let pulled: kin_cli::commands::transfer::CommandTransferResponse =
+            serde_json::from_slice(&body).unwrap();
+        assert_eq!(pulled.outcome.direction, RepositoryTransferDirection::Pull);
+        assert_eq!(
+            pulled.outcome.plan,
+            RepositoryTransferPlan::FastForward {
+                source_head,
+                destination_head: None,
+                change_count: Some(2),
+            }
+        );
+        assert_eq!(
+            pulled
+                .outcome
+                .receipt
+                .expect("a moved head returns a receipt")
+                .destination_head,
+            source_head
+        );
+    }
+
+    #[tokio::test]
+    async fn a_divergent_remote_refuses_the_push_over_http_and_moves_nothing() {
+        let repo_id = format!("transfer-e2e-diverged-{}", Uuid::new_v4());
+        let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
+
+        let (source_state, _source_working, source_storage) = replica_state(&repo_id);
+        let (destination_state, _destination_working, destination_storage) =
+            replica_state(&repo_id);
+
+        let source_head =
+            seed_replica_change(&source_storage, &repository_id, None, 1, "the local line");
+        let remote_head = seed_replica_change(
+            &destination_storage,
+            &repository_id,
+            None,
+            9,
+            "an independent remote line",
+        );
+        assert_ne!(source_head, remote_head);
+
+        let destination_url = serve_replica(Arc::clone(&destination_state)).await;
+        let request = kin_cli::commands::transfer::CommandTransferRequest {
+            remote_base_url: destination_url,
+            remote_token: None,
+            repository_id: Some(repo_id.clone()),
+            source_ref: None,
+            destination_ref: None,
+        };
+
+        let (status, body) = transfer_command(Arc::clone(&source_state), "push", &request).await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "a non-fast-forward publication is a conflict, not a malformed request"
+        );
+        let message = String::from_utf8_lossy(&body);
+        assert!(
+            message.contains(&remote_head.to_string())
+                && message.contains(&source_head.to_string()),
+            "the refusal must name both heads: {message}"
+        );
+
+        // The remote is untouched: its advertisement still resolves to its own head.
+        let advertised = router(Arc::clone(&destination_state))
+            .oneshot(
+                Request::get(format!("/repos/{repo_id}/transfer/advertise"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(advertised.status(), StatusCode::OK);
+        let advertised = axum::body::to_bytes(advertised.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let advertisement: kin_remote::repository_transfer::RepositoryRefAdvertisement =
+            serde_json::from_slice(&advertised).unwrap();
+        assert_eq!(advertisement.refs.len(), 1);
+        assert_eq!(advertisement.refs[0].head, remote_head);
     }
 
     #[tokio::test]
