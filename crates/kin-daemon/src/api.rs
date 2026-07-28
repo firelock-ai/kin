@@ -865,6 +865,7 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route("/commands/approvals", post(command_approvals))
         .route("/commands/security", post(command_security))
         .route("/commands/branch", post(command_branch))
+        .route("/commands/merge", post(command_merge))
         .route("/commands/checkout", post(command_checkout))
         .route("/commands/rename", post(command_rename))
         .route(
@@ -2568,6 +2569,42 @@ async fn command_branch(
     };
 
     let response = crate::repository_branch::execute(&state, &request)?;
+    Ok(Json(response))
+}
+
+/// POST /commands/merge — publish one exact repository-v6 semantic merge.
+async fn command_merge(
+    headers: axum::http::HeaderMap,
+    State(state): State<Arc<DaemonState>>,
+    Json(request): Json<kin_cli::commands::merge::MergeRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if !state
+        .is_initialized
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon not fully initialized".to_string(),
+        ));
+    }
+    if state.storage_backend.is_some() {
+        return Err((
+            StatusCode::CONFLICT,
+            "local repository merge authority is unavailable for hosted snapshot authority"
+                .to_string(),
+        ));
+    }
+    if extract_session_id_from_headers(&headers)?.is_some() {
+        return Err((
+            StatusCode::CONFLICT,
+            "merge does not accept X-Kin-Session because it mutates the primary repository \
+             workspace and its active branch"
+                .to_string(),
+        ));
+    }
+
+    let _coordination = state.coordination_gate.lock().await;
+    let response = crate::repository_merge::execute(&state, &request)?;
     Ok(Json(response))
 }
 

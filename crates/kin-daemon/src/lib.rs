@@ -125,6 +125,7 @@ mod mcp_commit;
 mod repository_branch;
 mod repository_checkout;
 pub mod repository_commit;
+mod repository_merge;
 pub mod session_registry;
 pub mod state;
 pub mod supervisor;

@@ -40,6 +40,7 @@ pub mod locate_sizing;
 pub mod locate_telemetry;
 pub mod log;
 pub mod mcp;
+pub mod merge;
 pub mod migrate;
 pub mod note;
 pub mod notify;
