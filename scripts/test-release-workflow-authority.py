@@ -125,7 +125,8 @@ def main() -> None:
         'DEFAULT_BRANCH" != main',
         'REF" != "refs/heads/$DEFAULT_BRANCH"',
         "environment: release-tag",
-        "node scripts/release-intent.mjs",
+        'git show "${authority_main}:scripts/release-intent.mjs" > "$policy"',
+        '"$node_bin" "$policy"',
         "git merge-base --is-ancestor",
         "break-glass release sha",
         "actions/workflows/release.yml/runs?per_page=100",
@@ -175,6 +176,58 @@ def main() -> None:
             raise AssertionError(
                 f"release-tag workflow contains forbidden standing authority: {forbidden}"
             )
+
+    resolve_start = release_tag.index(
+        "      - name: Resolve exact coherent release commit\n"
+    )
+    resolve_end = release_tag.index(
+        "      - name: Re-verify checked-out SHA is on reviewed origin/main history\n"
+    )
+    resolve_step = release_tag[resolve_start:resolve_end]
+    authority_main = resolve_step.index(
+        'authority_main="$(git rev-parse refs/remotes/origin/main)"'
+    )
+    automatic_authority = resolve_step.index(
+        'git merge-base --is-ancestor "$sha" "$authority_main"'
+    )
+    break_glass_authority = resolve_step.index(
+        'elif [ "$sha" != "$authority_main" ]; then'
+    )
+    trusted_node = resolve_step.index('node_bin="$(command -v node)"')
+    trusted_policy = resolve_step.index(
+        'git show "${authority_main}:scripts/release-intent.mjs" > "$policy"'
+    )
+    target_checkout = resolve_step.index('git checkout --detach "$sha"')
+    intent_execution = resolve_step.index('"$node_bin" "$policy"')
+    runner_state_isolation = tuple(
+        resolve_step.index(marker)
+        for marker in (
+            'GITHUB_ENV="$intent_env"',
+            'GITHUB_PATH="$intent_path"',
+            'GITHUB_STATE="$intent_state"',
+        )
+    )
+    if not (
+        authority_main
+        < automatic_authority
+        < break_glass_authority
+        < trusted_node
+        < trusted_policy
+        < target_checkout
+        < min(runner_state_isolation)
+        <= max(runner_state_isolation)
+        < intent_execution
+    ):
+        raise AssertionError(
+            "release-tag must validate the selected SHA against freshly fetched "
+            "main, copy trusted current-main policy, and isolate runner state "
+            "before checkout or policy execution"
+        )
+    if "node scripts/release-intent.mjs" in resolve_step:
+        raise AssertionError(
+            "release-tag must not execute release policy from the "
+            "payload-selected checkout"
+        )
 
     for policy in (
         'name: Release Train',
@@ -247,6 +300,11 @@ def main() -> None:
     if "Recommended hardening (optional)" in release_bot_doc:
         raise AssertionError(
             "release App Environment isolation must be mandatory, not optional"
+        )
+    if "gh workflow run release-tag.yml" in release_bot_doc:
+        raise AssertionError(
+            "release break glass must use typed repository_dispatch, not "
+            "branch-selectable workflow_dispatch"
         )
     for policy in (
         "last commit on the default branch",

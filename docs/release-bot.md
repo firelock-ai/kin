@@ -138,7 +138,11 @@ Normal releases need no captain command. To recover a refused automatic path,
 an allowlisted actor can dispatch the same admission workflow explicitly:
 
 ```sh
-gh workflow run release-tag.yml -f tag=v0.3.0 -f sha=<40-hex-sha>
+tag=v0.4.0
+sha="$(gh api repos/firelock-ai/kin/git/ref/heads/main --jq .object.sha)"
+jq -n --arg tag "$tag" --arg sha "$sha" \
+  '{event_type:"release_tag",client_payload:{tag:$tag,sha:$sha}}' |
+  gh api --method POST repos/firelock-ai/kin/dispatches --input -
 ```
 
 If a successful historical Actions run has aged out or been deleted, automatic
@@ -154,12 +158,6 @@ the exact source-bound GHCR attestation, plus aggregate release provenance.
 Markerless fallback is retired for v0.4.0 and later. Missing logs therefore
 cannot make the train permanently stale, while a preserved failed attempt can
 never be overridden by public-surface fallback.
-
-Get the SHA to release (current reviewed main tip):
-
-```sh
-gh api repos/firelock-ai/kin/commits/main -q .sha
-```
 
 Watch it:
 

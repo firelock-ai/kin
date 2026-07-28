@@ -174,10 +174,67 @@ jobs:
             sha="$candidate"
           fi
 
+          # Admit the selected commit against the freshly fetched protected-main
+          # authority before checking it out. In particular, a break-glass
+          # repository_dispatch payload cannot select branch-controlled code and
+          # then poison PATH or the runner command files before this decision.
+          authority_main="$(git rev-parse refs/remotes/origin/main)"
+          [[ "$authority_main" =~ ^[0-9a-f]{40}$ ]]
+          resolved_commit="$(git rev-parse "${sha}^{commit}")"
+          if [ "$resolved_commit" != "$sha" ]; then
+            echo "::error::release sha $sha does not name an exact commit"
+            exit 1
+          fi
+          if [ "$automatic" = true ]; then
+            if ! git merge-base --is-ancestor "$sha" "$authority_main"; then
+              echo "::error::automatic release sha $sha is not on reviewed main history"
+              exit 1
+            fi
+          elif [ "$sha" != "$authority_main" ]; then
+            echo "::error::break-glass release sha $sha is not current origin/main HEAD ($authority_main)"
+            exit 1
+          fi
+
+          # Execute the release policy copied from the pinned, reviewed current
+          # main commit, not from the payload-selected checkout. Capture Node
+          # before checkout and give the policy inert runner state files so it
+          # cannot influence later privileged steps through GITHUB_ENV/PATH/STATE.
+          node_bin="$(command -v node)"
+          if [[ "$node_bin" != /* ]]; then
+            echo "::error::could not resolve Node to an absolute trusted runner path"
+            exit 1
+          fi
+          policy="$RUNNER_TEMP/release-intent-policy.mjs"
+          git show "${authority_main}:scripts/release-intent.mjs" > "$policy"
+          test -s "$policy"
+
           git checkout --detach "$sha"
+          if [ "$(git rev-parse HEAD)" != "$sha" ]; then
+            echo "::error::release checkout did not resolve to admitted sha $sha"
+            exit 1
+          fi
           intent="$RUNNER_TEMP/release-intent.outputs"
+          intent_env="$RUNNER_TEMP/release-intent.github-env"
+          intent_path="$RUNNER_TEMP/release-intent.github-path"
+          intent_state="$RUNNER_TEMP/release-intent.github-state"
           : > "$intent"
-          GITHUB_OUTPUT="$intent" node scripts/release-intent.mjs
+          : > "$intent_env"
+          : > "$intent_path"
+          : > "$intent_state"
+          GITHUB_OUTPUT="$intent" \
+          GITHUB_ENV="$intent_env" \
+          GITHUB_PATH="$intent_path" \
+          GITHUB_STATE="$intent_state" \
+            "$node_bin" "$policy"
+          if [ -s "$intent_env" ] || [ -s "$intent_path" ] || [ -s "$intent_state" ]; then
+            echo "::error::release-intent attempted to mutate runner state"
+            exit 1
+          fi
+          if [ "$(git rev-parse HEAD)" != "$sha" ] ||
+             [ -n "$(git status --porcelain --untracked-files=all)" ]; then
+            echo "::error::release-intent mutated the admitted source checkout"
+            exit 1
+          fi
           resolved_tag="$(sed -n 's/^tag=//p' "$intent")"
           should_tag="$(sed -n 's/^should_tag=//p' "$intent")"
           test -n "$resolved_tag"
@@ -211,7 +268,7 @@ jobs:
           echo "SHA=$sha" >> "$GITHUB_ENV"
           echo "resolved coherent release tag=$tag sha=$sha automatic=$automatic"
 
-      - name: Verify SHA is on reviewed origin/main history
+      - name: Re-verify checked-out SHA is on reviewed origin/main history
         if: steps.resolve.outputs.needed == 'true'
         env:
           AUTOMATIC: ${{ steps.resolve.outputs.automatic }}
