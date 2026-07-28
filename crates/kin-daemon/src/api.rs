@@ -866,7 +866,11 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route("/commands/security", post(command_security))
         .route("/commands/branch", post(command_branch))
         .route("/commands/merge", post(command_merge))
+        .route("/commands/drift", post(command_drift))
+        .route("/commands/tag", post(command_tag))
+        .route("/commands/rollback", post(command_rollback))
         .route("/commands/checkout", post(command_checkout))
+        .route("/commands/stash", post(command_stash))
         .route("/commands/rename", post(command_rename))
         .route(
             "/commands/session-workspace",
@@ -2630,6 +2634,165 @@ async fn command_merge(
 
     let _coordination = state.coordination_gate.lock().await;
     let response = crate::repository_merge::execute(&state, &request)?;
+    Ok(Json(response))
+}
+
+/// POST /commands/stash: seal, list, or restore exact workspace state.
+async fn command_stash(
+    headers: axum::http::HeaderMap,
+    State(state): State<Arc<DaemonState>>,
+    Json(request): Json<kin_cli::commands::stash::StashRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if !state
+        .is_initialized
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon not fully initialized".to_string(),
+        ));
+    }
+    if state.storage_backend.is_some() {
+        return Err((
+            StatusCode::CONFLICT,
+            "local repository stash authority is unavailable for hosted snapshot authority"
+                .to_string(),
+        ));
+    }
+    if extract_session_id_from_headers(&headers)?.is_some() {
+        return Err((
+            StatusCode::CONFLICT,
+            "stash commands do not accept X-Kin-Session because they seal and restore the primary \
+             repository workspace"
+                .to_string(),
+        ));
+    }
+
+    if !request.is_mutation() {
+        return Ok(Json(crate::repository_stash::execute(&state, &request)?));
+    }
+    if state.filesystem_reconcile_disabled() {
+        return Err(filesystem_ingest_disabled_response(
+            "/commands/stash",
+            &state.layout.working_dir().display().to_string(),
+        ));
+    }
+
+    // Seal and restore both decide against the exact workspace the host
+    // actually holds, so the complete-scan admission runs first under the same
+    // uninterrupted coordination gate. Without it a stash would seal whatever
+    // authority happened to hold, and a restore would judge "is this workspace
+    // clean" against a stale answer.
+    let _coordination = state.coordination_gate.lock().await;
+    crate::loop_runner::sync_filesystem_with_graph_under_coordination(&state)
+        .await
+        .map_err(internal_error)?;
+    let response = crate::repository_stash::execute(&state, &request)?;
+    Ok(Json(response))
+}
+
+/// POST /commands/drift — report the derived projection against graph truth.
+async fn command_drift(
+    headers: axum::http::HeaderMap,
+    State(state): State<Arc<DaemonState>>,
+    Json(_request): Json<kin_cli::commands::drift::DriftRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if !state
+        .is_initialized
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon not fully initialized".to_string(),
+        ));
+    }
+    if state.storage_backend.is_some() {
+        return Err((
+            StatusCode::CONFLICT,
+            "local repository projection drift is unavailable for hosted snapshot authority"
+                .to_string(),
+        ));
+    }
+    if extract_session_id_from_headers(&headers)?.is_some() {
+        return Err((
+            StatusCode::CONFLICT,
+            "projection drift is reported against primary workspace authority; run it without \
+             ambient session scope"
+                .to_string(),
+        ));
+    }
+
+    let response = crate::repository_drift::execute(&state)?;
+    Ok(Json(response))
+}
+
+/// POST /commands/tag — publish one exact repository-v6 tag ref.
+async fn command_tag(
+    headers: axum::http::HeaderMap,
+    State(state): State<Arc<DaemonState>>,
+    Json(request): Json<kin_cli::commands::tag::TagRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if !state
+        .is_initialized
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon not fully initialized".to_string(),
+        ));
+    }
+    if state.storage_backend.is_some() {
+        return Err((
+            StatusCode::CONFLICT,
+            "local repository tag authority is unavailable for hosted snapshot authority"
+                .to_string(),
+        ));
+    }
+    if extract_session_id_from_headers(&headers)?.is_some() {
+        return Err((
+            StatusCode::CONFLICT,
+            "tags are published against HEAD authority; run them without ambient session scope"
+                .to_string(),
+        ));
+    }
+
+    let _coordination = state.coordination_gate.lock().await;
+    let response = crate::repository_tag::execute(&state, &request)?;
+    Ok(Json(response))
+}
+
+/// POST /commands/rollback — publish one exact repository-v6 rollback change.
+async fn command_rollback(
+    headers: axum::http::HeaderMap,
+    State(state): State<Arc<DaemonState>>,
+    Json(request): Json<kin_cli::commands::rollback::RollbackRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if !state
+        .is_initialized
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon not fully initialized".to_string(),
+        ));
+    }
+    if state.storage_backend.is_some() {
+        return Err((
+            StatusCode::CONFLICT,
+            "local repository rollback authority is unavailable for hosted snapshot authority"
+                .to_string(),
+        ));
+    }
+    if extract_session_id_from_headers(&headers)?.is_some() {
+        return Err((
+            StatusCode::CONFLICT,
+            "rollback publishes against HEAD authority; run it without ambient session scope"
+                .to_string(),
+        ));
+    }
+
+    let _coordination = state.coordination_gate.lock().await;
+    let response = crate::repository_rollback::execute(&state, &request)?;
     Ok(Json(response))
 }
 
@@ -12250,6 +12413,312 @@ mod tests {
     }
 
     #[cfg(unix)]
+    async fn post_stash_request(
+        state: Arc<DaemonState>,
+        request: &kin_cli::commands::stash::StashRequest,
+    ) -> (StatusCode, Vec<u8>) {
+        let response = router(state)
+            .oneshot(
+                Request::post("/commands/stash")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(request).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 256 * 1024)
+            .await
+            .unwrap();
+        (status, body.to_vec())
+    }
+
+    #[cfg(unix)]
+    fn stash_push() -> kin_cli::commands::stash::StashRequest {
+        kin_cli::commands::stash::StashRequest::Push {
+            message: Some("sealed workspace under test".to_string()),
+            operation_id: kin_model::OperationId::new(),
+            timestamp: kin_model::Timestamp::now(),
+            actor: AuthorId::new("stash-route-test"),
+        }
+    }
+
+    #[cfg(unix)]
+    fn stash_pop() -> kin_cli::commands::stash::StashRequest {
+        kin_cli::commands::stash::StashRequest::Pop {
+            operation_id: kin_model::OperationId::new(),
+            actor: AuthorId::new("stash-route-test"),
+        }
+    }
+
+    #[cfg(unix)]
+    async fn stash_entries(
+        state: Arc<DaemonState>,
+    ) -> Vec<kin_cli::commands::stash::StashEntryReport> {
+        let (status, body) =
+            post_stash_request(state, &kin_cli::commands::stash::StashRequest::List).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let response: kin_cli::commands::stash::StashResponse =
+            serde_json::from_slice(&body).unwrap();
+        response
+            .report
+            .expect("stash list carries its report")
+            .entries
+    }
+
+    /// A sealed workspace state must restore byte-exactly onto the base it was
+    /// sealed against, including content no language adapter understands.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_stash_seals_restores_and_round_trips_exact_workspace_state() {
+        let (state, _layout, repository, main_change, _feature) =
+            universal_branch_test_state("stash-round-trip");
+
+        let base_compose = std::fs::read(repository.join("selected/compose.yaml")).unwrap();
+        std::fs::write(
+            repository.join("selected/compose.yaml"),
+            b"services:\n  api:\n    image: dirty\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repository.join("selected/scratch.mystery"),
+            [0x00_u8, 0xfe, 0x7f, 0x41],
+        )
+        .unwrap();
+        let dirty_compose = std::fs::read(repository.join("selected/compose.yaml")).unwrap();
+        let dirty_scratch = std::fs::read(repository.join("selected/scratch.mystery")).unwrap();
+        assert_ne!(dirty_compose, base_compose);
+
+        let (status, body) = post_stash_request(Arc::clone(&state), &stash_push()).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let sealed: kin_cli::commands::stash::StashResponse =
+            serde_json::from_slice(&body).unwrap();
+        let entry = sealed.entry.expect("seal reports the sealed stash");
+        assert_eq!(entry.ordinal, 0);
+        assert_eq!(
+            entry.name,
+            kin_model::RefName::from_utf8("refs/kin/stash/0").unwrap()
+        );
+        assert_eq!(
+            entry.base_target,
+            Some(kin_model::RefTarget::change(main_change)),
+            "a sealed state names the exact authority target it was taken against"
+        );
+
+        assert_eq!(
+            std::fs::read(repository.join("selected/compose.yaml")).unwrap(),
+            base_compose,
+            "sealing with a reset returns tracked bytes to their authority base"
+        );
+        assert!(
+            !repository.join("selected/scratch.mystery").exists(),
+            "sealing with a reset removes members the base tree does not hold"
+        );
+        let authority = ActiveApiRepositoryAuthority::open(&state).unwrap();
+        let lease = authority.manager.read_authority();
+        let workspace = lease
+            .metadata()
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == authority.workspace_id)
+            .unwrap()
+            .clone();
+        assert!(
+            !workspace.is_dirty(),
+            "the workspace is clean in graph-owned authority after a reset seal"
+        );
+        assert!(
+            !lease
+                .metadata()
+                .ref_state
+                .refs
+                .iter()
+                .any(|repository_ref| repository_ref.name.is_branch()
+                    && repository_ref.name == entry.name),
+            "a stash is never published as a branch"
+        );
+        drop(lease);
+        drop(authority);
+
+        let listed = stash_entries(Arc::clone(&state)).await;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].change_id, entry.change_id);
+
+        let (status, body) = post_stash_request(Arc::clone(&state), &stash_pop()).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(
+            std::fs::read(repository.join("selected/compose.yaml")).unwrap(),
+            dirty_compose,
+            "restore reproduces the sealed bytes exactly"
+        );
+        assert_eq!(
+            std::fs::read(repository.join("selected/scratch.mystery")).unwrap(),
+            dirty_scratch,
+            "restore reproduces sealed content no adapter understands"
+        );
+        assert!(
+            stash_entries(Arc::clone(&state)).await.is_empty(),
+            "a restored stash is dropped in the same transaction that restored it"
+        );
+        let authority = ActiveApiRepositoryAuthority::open(&state).unwrap();
+        let lease = authority.manager.read_authority();
+        let workspace = lease
+            .metadata()
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == authority.workspace_id)
+            .unwrap()
+            .clone();
+        assert!(
+            workspace.is_dirty(),
+            "restore returns the workspace to the dirty state that was sealed"
+        );
+        assert_eq!(workspace.tree_hash, entry.tree_hash);
+    }
+
+    /// A seal must leave the daemon and repository authority agreeing, so the
+    /// ready commands still work against the workspace it returned.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_stash_leaves_ready_commands_working_on_the_returned_workspace() {
+        let (state, _layout, repository, _main, _feature) =
+            universal_branch_test_state("stash-then-ready");
+        std::fs::write(
+            repository.join("selected/compose.yaml"),
+            b"services:\n  api:\n    image: dirty\n",
+        )
+        .unwrap();
+        let (status, body) = post_stash_request(Arc::clone(&state), &stash_push()).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let (status, body) = post_stash_request(Arc::clone(&state), &stash_pop()).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let (status, body) = post_stash_request(Arc::clone(&state), &stash_push()).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+
+        let switch = kin_cli::commands::branch::BranchRequest::Switch {
+            name: kin_model::RefName::branch(b"feature").unwrap(),
+            operation_id: kin_model::OperationId::new(),
+            actor: AuthorId::new("stash-then-ready-test"),
+        };
+        let (status, body) = post_branch_request(Arc::clone(&state), &switch, None).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a sealed and returned workspace must still switch branches: {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+
+    /// Restore must refuse a base that moved after the seal instead of
+    /// replanning the sealed state onto it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_stash_refuses_restore_onto_moved_authority() {
+        let (state, _layout, repository, _main, _feature) =
+            universal_branch_test_state("stash-moved-authority");
+        std::fs::write(
+            repository.join("selected/compose.yaml"),
+            b"services:\n  api:\n    image: dirty\n",
+        )
+        .unwrap();
+        let (status, body) = post_stash_request(Arc::clone(&state), &stash_push()).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+
+        std::fs::write(
+            repository.join("selected/Independent.md"),
+            b"authority moved after the seal\n",
+        )
+        .unwrap();
+        let committed = router(Arc::clone(&state))
+            .oneshot(
+                Request::post("/commands/commit")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "operation_id": kin_model::OperationId::new(),
+                            "timestamp": kin_model::Timestamp::now(),
+                            "message": "move authority past the sealed stash"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(committed.status(), StatusCode::OK);
+
+        let (status, body) = post_stash_request(Arc::clone(&state), &stash_pop()).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        let message = String::from_utf8_lossy(&body);
+        assert!(
+            message.contains("does not replan a sealed workspace state onto a base it was never"),
+            "{message}"
+        );
+        assert_eq!(
+            stash_entries(Arc::clone(&state)).await.len(),
+            1,
+            "a refused restore leaves the sealed state exactly where it was"
+        );
+        assert_eq!(
+            std::fs::read(repository.join("selected/compose.yaml")).unwrap(),
+            b"services:\n  api:\n    image: main\n",
+            "a refused restore projects nothing"
+        );
+    }
+
+    /// Both directions fail closed: nothing to seal is a refusal, and a
+    /// workspace holding its own graph-owned changes is never overwritten.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_stash_refuses_sealing_a_clean_workspace_and_restoring_over_a_dirty_one() {
+        let (state, _layout, repository, _main, _feature) =
+            universal_branch_test_state("stash-fail-closed");
+
+        let (status, body) = post_stash_request(Arc::clone(&state), &stash_push()).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(
+            String::from_utf8_lossy(&body).contains("no graph-owned changes to seal"),
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+
+        let (status, body) = post_stash_request(Arc::clone(&state), &stash_pop()).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(
+            String::from_utf8_lossy(&body).contains("no sealed stash to restore"),
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+
+        std::fs::write(
+            repository.join("selected/compose.yaml"),
+            b"services:\n  api:\n    image: first\n",
+        )
+        .unwrap();
+        let (status, body) = post_stash_request(Arc::clone(&state), &stash_push()).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+
+        std::fs::write(
+            repository.join("selected/compose.yaml"),
+            b"services:\n  api:\n    image: second\n",
+        )
+        .unwrap();
+
+        let (status, body) = post_stash_request(Arc::clone(&state), &stash_pop()).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(
+            String::from_utf8_lossy(&body).contains("holds graph-owned changes of its own"),
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(
+            stash_entries(Arc::clone(&state)).await.len(),
+            1,
+            "the refused restore left the sealed state intact"
+        );
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn command_checkout_projection_only_repairs_universal_bytes_and_replays_after_restart() {
         use std::os::unix::fs::{symlink, PermissionsExt as _};
@@ -12846,6 +13315,180 @@ mod tests {
             .changes
             .iter()
             .any(|(_, change)| change.id == change_id));
+    }
+
+    async fn commit_through_api(
+        app: &axum::Router,
+        operation_id: kin_model::OperationId,
+        message: &str,
+    ) -> SemanticChangeId {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/commands/commit")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "operation_id": operation_id,
+                            "timestamp": Timestamp::now(),
+                            "message": message
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 256 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        SemanticChangeId::from_hash(
+            Hash256::from_hex(response["change_id"].as_str().unwrap()).unwrap(),
+        )
+    }
+
+    async fn rollback_through_api(
+        app: &axum::Router,
+        operation_id: kin_model::OperationId,
+        change_id: SemanticChangeId,
+    ) -> (StatusCode, String) {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/commands/rollback")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "change_id": change_id.to_string(),
+                            "operation_id": operation_id,
+                            "actor": AuthorId::new("rollback-acceptance")
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 256 * 1024)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&body).to_string())
+    }
+
+    fn branch_change(state: &DaemonState) -> SemanticChangeId {
+        let authority = ActiveApiRepositoryAuthority::open(state).unwrap();
+        let lease = authority.manager.read_authority();
+        let target = lease
+            .metadata()
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == authority.workspace_id)
+            .unwrap()
+            .base_target
+            .clone()
+            .unwrap();
+        lease.resolve_target_change_id(&target).unwrap()
+    }
+
+    /// An operation id is matched before any history validation runs, and an
+    /// ordinary commit publishes the same receipt shape a rollback does. Only
+    /// the restored content separates them, so reusing a commit's operation id
+    /// must be refused instead of reported as a rollback that never happened.
+    #[tokio::test]
+    async fn command_rollback_refuses_an_operation_id_that_published_a_different_change() {
+        let state = test_state();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let root = state.layout.working_dir().to_path_buf();
+        let app = router(Arc::clone(&state));
+
+        std::fs::write(root.join("service.txt"), b"shipped\n").unwrap();
+        let restored = commit_through_api(
+            &app,
+            kin_model::OperationId::new(),
+            "publish the good state",
+        )
+        .await;
+        std::fs::write(root.join("service.txt"), b"regressed\n").unwrap();
+        let reused = kin_model::OperationId::new();
+        let regression = commit_through_api(&app, reused, "publish the regression").await;
+        assert_eq!(branch_change(&state), regression);
+
+        // The retained receipt for `reused` is an ordinary commit's. It carries
+        // one ref mutation onto a change under a MustEqual expectation and a
+        // workspace mutation, so every shape check passes; only the restored
+        // content refutes it.
+        let (status, body) = rollback_through_api(&app, reused, restored).await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "a commit's receipt was reported as this caller's rollback: {body}"
+        );
+        assert_eq!(
+            branch_change(&state),
+            regression,
+            "a refused rollback moved the branch"
+        );
+        assert_eq!(
+            std::fs::read(root.join("service.txt")).unwrap(),
+            b"regressed\n",
+            "a refused rollback restored the working copy anyway"
+        );
+
+        // The same reuse against a change this repository never materialized is
+        // refused for the same reason: the echoed target is never trusted.
+        let (status, body) = rollback_through_api(
+            &app,
+            reused,
+            SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "a rollback reported a target this repository does not have: {body}"
+        );
+
+        // Honest idempotency still reports success: a genuine rollback retried
+        // with its own operation id reports what it published and commits
+        // nothing further.
+        let rollback_operation = kin_model::OperationId::new();
+        let (status, body) = rollback_through_api(&app, rollback_operation, restored).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let first: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(first["mutated"], true);
+        assert_eq!(first["report"]["target_change_id"], restored.to_string());
+        let published = branch_change(&state);
+        assert_ne!(published, regression, "rollback published no change");
+
+        let (status, body) = rollback_through_api(&app, rollback_operation, restored).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let replay: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            replay["mutated"], false,
+            "an already-published rollback committed a second change"
+        );
+        assert_eq!(replay["report"]["idempotent"], true);
+        assert_eq!(replay["report"]["target_change_id"], restored.to_string());
+        assert_eq!(
+            replay["report"]["inverse_change_id"], first["report"]["inverse_change_id"],
+            "the replay reported a different published change"
+        );
+        assert_eq!(
+            branch_change(&state),
+            published,
+            "an already-published rollback moved the branch again"
+        );
+        assert_eq!(
+            std::fs::read(root.join("service.txt")).unwrap(),
+            b"shipped\n",
+            "the rollback did not leave the restored content in place"
+        );
     }
 
     #[tokio::test]

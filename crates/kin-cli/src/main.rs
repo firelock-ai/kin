@@ -483,7 +483,7 @@ enum Command {
         #[arg(long)]
         abort: bool,
     },
-    /// [OPEN GATE] Stash exact repository-v6 workspace state
+    /// [OPEN GATE] Seal and restore exact graph-owned workspace state
     Stash {
         #[command(subcommand)]
         action: StashAction,
@@ -662,14 +662,24 @@ enum Command {
         #[arg(long)]
         propagate: bool,
     },
-    /// [OPEN GATE] Analyze semver impact from immutable repository-v6 changes
-    Semver,
+    /// Analyze semver impact from immutable repository-v6 changes
+    Semver {
+        /// Explicit base endpoint: a ref, change, HEAD, or WORKSPACE
+        #[arg(long)]
+        base: String,
+        /// Explicit head endpoint (defaults to the committed workspace base)
+        #[arg(long, default_value = "HEAD")]
+        head: String,
+        /// Emit the machine-readable impact report as JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// Cross-repo release orchestration and per-repo release snapshots
     Release {
         #[command(subcommand)]
         action: ReleaseAction,
     },
-    /// [OPEN GATE] Create a repository-v6 release snapshot
+    /// Publish an exact repository-v6 tag ref
     Tag {
         /// Release tag
         tag: String,
@@ -683,7 +693,7 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
-    /// [OPEN GATE] Commit an exact inverse of a previous change
+    /// Publish an exact restoration of a previous change
     #[command(visible_alias = "revert")]
     Rollback {
         /// Change ID to rollback to
@@ -917,10 +927,10 @@ enum Command {
         /// Emit the machine-readable health report as JSON
         #[arg(long, default_value_t = false)]
         json: bool,
-        /// [OPEN GATE] Compare an explicit projection observation with graph truth
+        /// Compare an explicit projection observation with graph truth
         #[arg(long, default_value_t = false)]
         drift: bool,
-        /// [OPEN GATE] Rematerialize a projection from graph truth. Implies --drift
+        /// [OPEN GATE] Rematerialize a projection from graph truth
         #[arg(long, default_value_t = false)]
         heal: bool,
     },
@@ -1472,20 +1482,24 @@ enum AssistantAction {
 
 #[derive(Subcommand)]
 enum StashAction {
-    /// [OPEN GATE] Snapshot exact repository-v6 workspace state.
+    /// [OPEN GATE] Seal exact graph-owned workspace state and return the workspace to its base.
     Push {
-        /// DESTRUCTIVE: delete source files from the working tree after
-        /// snapshotting. Requires typing "remove" to confirm (or --yes).
-        #[arg(long)]
-        remove_from_tree: bool,
-        /// Skip typed confirmation for --remove-from-tree (for non-interactive use).
+        /// Label the sealed state. Defaults to the workspace head it was sealed on.
+        #[arg(long, short = 'm')]
+        message: Option<String>,
+        /// Skip the typed confirmation for discarding the projected working
+        /// files (for non-interactive use).
         #[arg(long)]
         yes: bool,
     },
-    /// [OPEN GATE] Restore the most recent exact stash transaction
+    /// [OPEN GATE] Restore the most recently sealed workspace state and drop its stash
     Pop,
-    /// [OPEN GATE] List repository-v6 stash transactions
-    List,
+    /// [OPEN GATE] List sealed workspace states
+    List {
+        /// Output the machine-readable stash report
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1873,7 +1887,7 @@ enum ReleaseAction {
         /// Repo to gate (e.g. kin, kin-db).
         repo: String,
     },
-    /// [OPEN GATE] Create a release snapshot bound to exact repository roots.
+    /// Publish a release tag and the snapshot bound to its exact repository state.
     Snapshot {
         /// Release tag
         tag: String,
@@ -2463,7 +2477,11 @@ fn main() -> Result<()> {
                 }
                 Command::Conflicts => commands::capabilities::require_ready("conflicts"),
                 Command::Resolve { .. } => commands::capabilities::require_ready("resolve"),
-                Command::Stash { action: _ } => commands::capabilities::require_ready("stash"),
+                Command::Stash { action } => match action {
+                    StashAction::Push { message, yes } => commands::stash::push(message, yes).await,
+                    StashAction::Pop => commands::stash::pop().await,
+                    StashAction::List { json } => commands::stash::list(json).await,
+                },
                 Command::Blame { entity, reference } => {
                     commands::blame::run(entity, reference).await
                 }
@@ -2637,7 +2655,10 @@ fn main() -> Result<()> {
                 Command::Security { propagate } => {
                     commands::security::run_with_options(propagate).await
                 }
-                Command::Semver => commands::capabilities::require_ready("semver"),
+                Command::Semver { base, head, json } => {
+                    commands::capabilities::require_ready("semver")?;
+                    commands::semver::run(base, head, json)
+                }
                 Command::Release { action } => match action {
                     ReleaseAction::Plan { offline } => commands::release_orch::plan(offline).await,
                     ReleaseAction::Apply {
@@ -2647,12 +2668,29 @@ fn main() -> Result<()> {
                         no_lock,
                     } => commands::release_orch::apply(crate_name, version, repos, !no_lock).await,
                     ReleaseAction::Intent { repo } => commands::release_orch::intent(repo).await,
-                    ReleaseAction::Snapshot { .. } => {
-                        commands::capabilities::require_ready("release snapshot")
+                    ReleaseAction::Snapshot {
+                        tag,
+                        require_proof,
+                        require_approval,
+                        force,
+                    } => {
+                        commands::capabilities::require_ready("release snapshot")?;
+                        commands::tag::snapshot(tag, require_proof, require_approval, force).await
                     }
                 },
-                Command::Tag { .. } => commands::capabilities::require_ready("tag"),
-                Command::Rollback { .. } => commands::capabilities::require_ready("rollback"),
+                Command::Tag {
+                    tag,
+                    require_proof,
+                    require_approval,
+                    force,
+                } => {
+                    commands::capabilities::require_ready("tag")?;
+                    commands::tag::run(tag, require_proof, require_approval, force).await
+                }
+                Command::Rollback { change_id, feature } => {
+                    commands::capabilities::require_ready("rollback")?;
+                    commands::rollback::run(change_id, feature).await
+                }
                 Command::Bench { args } => commands::bench::bench_proxy(&args),
                 Command::Migrate { source, target } => commands::migrate::run(source, target).await,
                 Command::Cache { action } => match action {
@@ -2879,10 +2917,14 @@ fn main() -> Result<()> {
                     drift,
                     heal,
                 } => {
-                    // `--drift`/`--heal` run the graph⇄file drift tripwire; bare
-                    // `kin doctor` stays the first-run config health check.
-                    if drift || heal {
-                        commands::capabilities::require_ready("doctor --drift")
+                    // `--drift` reports the derived projection against graph
+                    // truth; `--heal` would rematerialize it. Bare `kin doctor`
+                    // stays the first-run config health check.
+                    if heal {
+                        commands::capabilities::require_ready("doctor --heal")
+                    } else if drift {
+                        commands::capabilities::require_ready("doctor --drift")?;
+                        commands::drift::run(json).await
                     } else {
                         commands::setup::doctor(fix, json).await
                     }
