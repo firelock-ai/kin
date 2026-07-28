@@ -332,9 +332,15 @@ fn plan_and_commit(
         &target_state.relations,
     )
     .context("plan the exact workspace semantic restoration")?;
+    let daemon_semantic_delta = crate::local_repository_authority::plan_daemon_semantic_delta(
+        state,
+        &target_state.entities,
+        &target_state.relations,
+    )
+    .context("plan the exact workspace semantic restoration for the daemon view")?;
     let daemon_delta = TransactionDelta {
-        entity_deltas: workspace_semantic_delta.entity_deltas().to_vec(),
-        relation_deltas: workspace_semantic_delta.relation_deltas().to_vec(),
+        entity_deltas: daemon_semantic_delta.entity_deltas().to_vec(),
+        relation_deltas: daemon_semantic_delta.relation_deltas().to_vec(),
         tree_deltas: workspace_tree_deltas.clone(),
         admission_policy_delta: None,
     };

@@ -439,7 +439,19 @@ fn compute_deltas_from_resolved_state(
                     new: entity.clone(),
                 });
             }
-            Some(committed) if kin_index::entity_semantics_changed(committed, entity) => {
+            // Compare the complete payload, not only the AST/signature/behavior
+            // fingerprint. An entity whose body is unchanged but whose span or
+            // blob provenance advanced is still a different value, and the
+            // workspace semantic overlay is derived by whole-value difference
+            // against the change this delta publishes. Recording only
+            // fingerprint changes therefore leaves the published base holding a
+            // superseded payload, which strands that difference in the overlay:
+            // the workspace reports dirty forever, the next switch or merge
+            // refuses it, and a further commit publishes an empty change
+            // because the fingerprint still has not moved. Publishing the exact
+            // payload is also what keeps history able to reproduce the spans
+            // and source provenance the entity actually had at that change.
+            Some(committed) if committed != entity => {
                 entity_deltas.push(EntityDelta::Modified {
                     old: committed.clone(),
                     new: entity.clone(),

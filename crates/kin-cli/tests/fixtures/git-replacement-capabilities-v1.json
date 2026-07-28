@@ -303,8 +303,8 @@
     },
     {
       "command": "stash",
-      "status": "open_gate",
-      "exposure": "fail_closed",
+      "status": "ready",
+      "exposure": "enabled",
       "authority": "repository-v6 workspace transaction",
       "required_for_bounded_dogfood": false,
       "acceptance_spec": [

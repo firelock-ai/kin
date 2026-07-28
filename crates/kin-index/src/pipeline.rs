@@ -630,6 +630,14 @@ pub const COMMAND_EFFECT_CONTRACT_KEY: &str = "command_effect_contract";
 /// sides carry one (key-absent vs key-present is persist-path coverage skew,
 /// never evidence of change). Every entity-delta producer must use this one
 /// definition so graph truth does not depend on which write path recorded it.
+/// Report whether two revisions of one entity differ in meaning rather than in
+/// payload.
+///
+/// This is a reporting predicate for surfaces that describe intent, such as
+/// review and impact. It must not gate a repository authority delta: a change
+/// that omits an entity because only its span or blob provenance advanced
+/// publishes a base that no longer equals the workspace graph, and the
+/// difference is then stranded in the workspace semantic overlay.
 pub fn entity_semantics_changed(old: &Entity, new: &Entity) -> bool {
     let contract_changed = match (
         old.metadata.extra.get(COMMAND_EFFECT_CONTRACT_KEY),
