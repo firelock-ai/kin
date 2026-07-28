@@ -125,6 +125,7 @@ def main() -> None:
         "release_workflow_run_id",
         "runInvocationURI",
         "runDetails.metadata.invocationId",
+        "ltrimstr($run_uri)",
         "verifiedTimestamps",
         "registry.npmjs.org/@kinlab%2F",
         "ghcr.io/v2/firelock-ai/kin/manifests",

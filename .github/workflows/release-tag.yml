@@ -391,8 +391,16 @@ jobs:
                   '
                     length > 0 and
                     all(.[];
+                      (
+                        .verificationResult.signature.certificate.runInvocationURI ==
+                        .verificationResult.statement.predicate.runDetails.metadata.invocationId
+                      ) and
                       (.verificationResult.signature.certificate.runInvocationURI | startswith($run_uri)) and
-                      (.verificationResult.statement.predicate.runDetails.metadata.invocationId | startswith($run_uri))
+                      (
+                        .verificationResult.signature.certificate.runInvocationURI |
+                        ltrimstr($run_uri) |
+                        test("^[1-9][0-9]*$")
+                      )
                     )
                   ' attestation.json >/dev/null
               )
