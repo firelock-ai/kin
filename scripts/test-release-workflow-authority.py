@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from pathlib import Path
 
 
@@ -21,11 +22,216 @@ UPDATE_TRUST = ROOT / "docs" / "security" / "signing-and-update-trust.md"
 INSTALL_SH = ROOT / "scripts" / "install.sh"
 INSTALL_PS1 = ROOT / "scripts" / "install.ps1"
 HEALTH = ROOT / "crates" / "kin-cli" / "src" / "commands" / "health.rs"
+RUST_CACHE_ACTION = "Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4"
+MAIN_ONLY_CACHE_SAVE = "save-if: ${{ github.ref == 'refs/heads/main' }}"
 
 
 def require(content: str, needle: str, context: str) -> None:
     if needle not in content:
         raise AssertionError(f"{context} is missing required policy: {needle}")
+
+
+def expect_assertion(
+    label: str,
+    expected_error: str,
+    check: Callable[[], None],
+) -> None:
+    try:
+        check()
+    except AssertionError as error:
+        if expected_error not in str(error):
+            raise AssertionError(
+                f"falsification failed for the wrong reason: {label}: {error}"
+            ) from error
+        return
+    raise AssertionError(f"falsification did not fail: {label}")
+
+
+def assert_docs_only_classifier_guard(classifier: str) -> None:
+    lines = classifier.splitlines()
+    guard = 'if [ "$EVENT_NAME" = "pull_request" ]; then'
+    guard_lines = [
+        index
+        for index, line in enumerate(lines)
+        if line.strip().split("#", 1)[0].strip() == guard
+    ]
+    if len(guard_lines) != 1:
+        raise AssertionError(
+            "diff classifier must gate its whole classification on exactly one "
+            "pull_request guard; docs_only has to stay false on every push to main"
+        )
+    guard_line = guard_lines[0]
+
+    default_lines = [
+        index
+        for index, line in enumerate(lines)
+        if line.strip().split("#", 1)[0].strip() == "docs_only=false"
+    ]
+    if len(default_lines) != 1 or default_lines[0] >= guard_line:
+        raise AssertionError(
+            "diff classifier must default docs_only=false exactly once before the "
+            "pull_request guard so any other event fails closed"
+        )
+
+    depth = 0
+    closing_fi = None
+    for index in range(guard_line, len(lines)):
+        code = lines[index].strip().split("#", 1)[0].strip()
+        if re.fullmatch(r"if\b.*;\s*then", code):
+            depth += 1
+        elif code == "fi":
+            depth -= 1
+            if depth == 0:
+                closing_fi = index
+                break
+            if depth < 0:
+                raise AssertionError(
+                    "diff classifier pull_request guard has an unmatched fi"
+                )
+    if closing_fi is None:
+        raise AssertionError(
+            "diff classifier pull_request guard has no structurally matching fi"
+        )
+
+    truthy_assignment = re.compile(r"(?:^|[;\s])docs_only=true(?:$|[;\s])")
+    truthy_lines = []
+    for index, line in enumerate(lines):
+        code = line.strip().split("#", 1)[0].strip()
+        if truthy_assignment.search(code):
+            truthy_lines.append(index)
+    if (
+        len(truthy_lines) != 1
+        or truthy_lines[0] <= guard_line
+        or truthy_lines[0] >= closing_fi
+    ):
+        raise AssertionError(
+            "diff classifier must set docs_only=true exactly once inside the "
+            "structurally matched pull_request guard"
+        )
+
+    output = 'echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"'
+    output_lines = [
+        index
+        for index, line in enumerate(lines)
+        if line.strip().split("#", 1)[0].strip() == output
+    ]
+    if len(output_lines) != 1 or output_lines[0] <= closing_fi:
+        raise AssertionError(
+            "diff classifier must emit its single fail-closed output after the "
+            "pull_request guard"
+        )
+
+
+def rust_cache_step_bounds(lines: list[str], uses_line: int) -> tuple[int, int]:
+    uses = lines[uses_line]
+    inline = re.match(r"^(\s*)-\s+uses:\s*", uses)
+    if inline:
+        step_start = uses_line
+        step_indent = len(inline.group(1))
+    else:
+        uses_indent = len(uses) - len(uses.lstrip())
+        step_indent = uses_indent - 2
+        step_start = -1
+        for index in range(uses_line - 1, -1, -1):
+            line = lines[index]
+            stripped = line.lstrip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            indent = len(line) - len(stripped)
+            if indent < step_indent:
+                break
+            if indent == step_indent and re.match(r"-\s+", stripped):
+                step_start = index
+                break
+        if step_start < 0:
+            raise AssertionError(
+                "rust-cache use is not nested in a structurally identifiable step"
+            )
+
+    step_end = len(lines)
+    for index in range(step_start + 1, len(lines)):
+        line = lines[index]
+        stripped = line.lstrip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        indent = len(line) - len(stripped)
+        if indent < step_indent or (
+            indent == step_indent and re.match(r"-\s+", stripped)
+        ):
+            step_end = index
+            break
+    return step_start, step_end
+
+
+def assert_rust_cache_steps(workflows: dict[Path, str]) -> None:
+    rust_cache_uses = 0
+    for workflow, content in sorted(workflows.items()):
+        lines = content.splitlines()
+        for uses_line, line in enumerate(lines):
+            stripped = line.lstrip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            match = re.match(
+                r"^\s*(?:-\s*)?uses:\s+(Swatinem/rust-cache@\S+)",
+                line,
+            )
+            if not match:
+                continue
+            rust_cache_uses += 1
+            if match.group(1) != RUST_CACHE_ACTION:
+                raise AssertionError(
+                    f"{workflow.name} uses rust-cache at an unpinned ref"
+                )
+
+            step_start, step_end = rust_cache_step_bounds(lines, uses_line)
+            step = lines[step_start:step_end]
+            with_lines = []
+            save_lines = []
+            for relative_index, step_line in enumerate(step):
+                active = step_line.lstrip()
+                if not active or active.startswith("#"):
+                    continue
+                with_match = re.match(r"^(\s*)with:\s*(?:#.*)?$", step_line)
+                if with_match:
+                    with_lines.append((relative_index, len(with_match.group(1))))
+                save_match = re.match(
+                    r"^(\s*)save-if:\s*(.*?)\s*$",
+                    step_line,
+                )
+                if save_match:
+                    value = save_match.group(2).split(" #", 1)[0].rstrip()
+                    save_lines.append((relative_index, len(save_match.group(1)), value))
+
+            if len(with_lines) != 1 or len(save_lines) != 1:
+                raise AssertionError(
+                    f"{workflow.name} rust-cache step must contain exactly one "
+                    "with mapping and one main-only save-if"
+                )
+            with_line, with_indent = with_lines[0]
+            save_line, save_indent, save_value = save_lines[0]
+            with_end = len(step)
+            for relative_index in range(with_line + 1, len(step)):
+                candidate = step[relative_index]
+                active = candidate.lstrip()
+                if not active or active.startswith("#"):
+                    continue
+                indent = len(candidate) - len(active)
+                if indent <= with_indent:
+                    with_end = relative_index
+                    break
+            if (
+                save_line <= with_line
+                or save_line >= with_end
+                or save_indent != with_indent + 2
+                or f"save-if: {save_value}" != MAIN_ONLY_CACHE_SAVE
+            ):
+                raise AssertionError(
+                    f"{workflow.name} rust-cache save-if is not structurally "
+                    "bound to its with mapping or is not main-only"
+                )
+
+    if rust_cache_uses == 0:
+        raise AssertionError("no pinned rust-cache steps found")
 
 
 def main() -> None:
@@ -67,7 +273,9 @@ def main() -> None:
         "honest Windows registry-authority capability report",
     )
     if "KIN_REGISTRY_REPAIR" in install_ps1:
-        raise AssertionError("Windows installer must not imply Unix mode repair support")
+        raise AssertionError(
+            "Windows installer must not imply Unix mode repair support"
+        )
     if "KIN_CI_BOT_TOKEN" in release or "bump_homebrew:" in release:
         raise AssertionError(
             "release.yml must not use a long-lived PAT or wait on cross-repo "
@@ -116,7 +324,7 @@ def main() -> None:
         'case "$PROOF_SHELL" in',
         "export SHELL=/bin/bash",
         "export SHELL=/bin/zsh",
-        "printf 'SHELL=%s\\n' \"$SHELL\" >> \"$GITHUB_ENV\"",
+        'printf \'SHELL=%s\\n\' "$SHELL" >> "$GITHUB_ENV"',
     ):
         require(first_run, policy, "cross-step install-proof shell pin")
     for policy in (
@@ -173,7 +381,7 @@ def main() -> None:
         "negative control did not fail with the expected raw-disk permission error",
         "installed kin-vfs socket remained after shutdown",
         'process_state="$(ps -o stat= -p "$vfs_pid" 2>/dev/null || true)"',
-        'process_state="$(printf \'%s\' "$process_state" | tr -d \'[:space:]\')"',
+        "process_state=\"$(printf '%s' \"$process_state\" | tr -d '[:space:]')\"",
         "trap 'on_vfs_signal 130' INT",
         "trap 'on_vfs_signal 143' TERM",
     ):
@@ -182,7 +390,7 @@ def main() -> None:
     signal_start = install_proof.index("          on_vfs_signal() {", cleanup_start)
     cleanup_vfs = install_proof[cleanup_start:signal_start]
     require(cleanup_vfs, 'vfs_pid=""', "idempotent public VFS cleanup")
-    if "ps -o stat= -p \"$vfs_pid\" 2>/dev/null | tr" in cleanup_vfs:
+    if 'ps -o stat= -p "$vfs_pid" 2>/dev/null | tr' in cleanup_vfs:
         raise AssertionError(
             "public VFS cleanup must treat a disappeared daemon PID as the "
             "expected successful-stop state under set -euo pipefail"
@@ -197,7 +405,9 @@ def main() -> None:
             "public VFS probe must not use a Kin-family basename; the shipped "
             "shim intentionally bypasses basenames beginning with 'kin-'"
         )
-    proof_upload = install_proof[install_proof.index("- name: Preserve proof reports") :]
+    proof_upload = install_proof[
+        install_proof.index("- name: Preserve proof reports") :
+    ]
     for report in (
         "release-provenance.json",
         "release-provenance.json.sha256",
@@ -223,9 +433,7 @@ def main() -> None:
             f"checkouts={vfs_checkout_count}, refs={vfs_checkout_refs}"
         )
     vfs_refs = set(vfs_checkout_refs)
-    vfs_expected = set(
-        re.findall(r"EXPECTED_VFS_COMMIT:\s*([0-9a-f]{40})", release)
-    )
+    vfs_expected = set(re.findall(r"EXPECTED_VFS_COMMIT:\s*([0-9a-f]{40})", release))
     install_proof_vfs_expected = set(
         re.findall(r"expected_vfs_commit:\s*([0-9a-f]{40})", release)
     )
@@ -373,8 +581,7 @@ def main() -> None:
         "docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a",
         "Keep polling the bounded log authority even",
         "cache-from: type=gha",
-        "cache-to: ${{ github.ref == 'refs/heads/main' "
-        "&& 'type=gha,mode=max' || '' }}",
+        "cache-to: ${{ github.ref == 'refs/heads/main' && 'type=gha,mode=max' || '' }}",
     ):
         require(docker_workflow, policy, "Docker CI authority and smoke gate")
 
@@ -457,9 +664,7 @@ def main() -> None:
         raise AssertionError(
             "GHCR latest promotion must be a separate job after release finalization"
         )
-    latest_promotion_job = release[
-        latest_promotion_start:boundary_publish_start
-    ]
+    latest_promotion_job = release[latest_promotion_start:boundary_publish_start]
     for policy in (
         "needs: [config, finalize_release, version_tag_image, build_daemon_image, attest_daemon_image]",
         "always()",
@@ -520,7 +725,7 @@ def main() -> None:
         "prewrite_latest_state=missing",
         'if [ "$prewrite_latest_digest" = "$EXPECTED_SOURCE_DIGEST" ]',
         'action="Verified concurrent"',
-        'changed from ${initial_latest_state}:${initial_latest_digest:-<missing>}',
+        "changed from ${initial_latest_state}:${initial_latest_digest:-<missing>}",
         'prewrite_source_digest="$(resolve_required_digest "$SRC" "pre-write source recheck")"',
         "final_prewrite_latest_state=missing",
         'if [ "$final_prewrite_latest_digest" = "$EXPECTED_SOURCE_DIGEST" ]',
@@ -768,32 +973,25 @@ def main() -> None:
     classifier_start = ci_workflow.index("  changes:")
     classifier_end = ci_workflow.index("\n  check-docs-only:", classifier_start)
     classifier = ci_workflow[classifier_start:classifier_end]
-    pull_request_guard = 'if [ "$EVENT_NAME" = "pull_request" ]; then'
-    if classifier.count(pull_request_guard) != 1:
+    assert_docs_only_classifier_guard(classifier)
+    classifier_falsification_needle = (
+        '          fi\n          echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"'
+    )
+    if classifier.count(classifier_falsification_needle) != 1:
         raise AssertionError(
-            "diff classifier must gate its whole classification on exactly one "
-            "pull_request guard; docs_only has to stay false on every push to main"
+            "diff classifier falsification could not identify the outer guard boundary"
         )
-    guard_at = classifier.index(pull_request_guard)
-    default_at = classifier.index("docs_only=false")
-    if default_at >= guard_at:
-        raise AssertionError(
-            "diff classifier must default docs_only=false before the "
-            "pull_request guard so any other event fails closed"
-        )
-    truthy = classifier.find("docs_only=true")
-    while truthy != -1:
-        if truthy < guard_at:
-            raise AssertionError(
-                "diff classifier sets docs_only=true outside the pull_request "
-                "guard; a main commit could then skip the Windows release build "
-                "while release-tag.yml still accepts the skipped check"
-            )
-        truthy = classifier.find("docs_only=true", truthy + 1)
-    require(
-        classifier,
-        'echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"',
-        "diff classifier single fail-closed output",
+    truthy_after_guard = classifier.replace(
+        classifier_falsification_needle,
+        "          fi\n"
+        "          docs_only=true\n"
+        '          echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"',
+        1,
+    )
+    expect_assertion(
+        "docs_only=true after the matching pull_request fi",
+        "structurally matched pull_request guard",
+        lambda: assert_docs_only_classifier_guard(truthy_after_guard),
     )
 
     release_tag = RELEASE_TAG.read_text(encoding="utf-8")
@@ -821,28 +1019,76 @@ def main() -> None:
     # change as though it did.
     #
     # Scope: this covers Swatinem/rust-cache uses only. Three actions/cache
-    # uses still write pull-request-scoped entries and are deliberately not
-    # constrained here (the windows-installer and coverage jobs in this file,
-    # and the fuzz workflow), so this is not a repository-wide no-PR-writes
+    # uses remain deliberately outside it: the windows-installer and coverage
+    # jobs are admitted only from main, while fuzz may still write a cache on a
+    # qualifying pull request. This is not a repository-wide no-PR-writes
     # invariant.
-    rust_cache_uses = 0
-    trusted_saves = 0
-    for workflow in sorted(WORKFLOWS.glob("*.yml")):
-        content = workflow.read_text(encoding="utf-8")
-        pinned = content.count(
-            "uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4"
-        )
-        if content.count("uses: Swatinem/rust-cache@") != pinned:
-            raise AssertionError(
-                f"{workflow.name} uses rust-cache at an unpinned ref"
-            )
-        rust_cache_uses += pinned
-        trusted_saves += content.count("save-if: ${{ github.ref == 'refs/heads/main' }}")
-    if rust_cache_uses == 0 or rust_cache_uses != trusted_saves:
+    workflow_sources = {
+        workflow: workflow.read_text(encoding="utf-8")
+        for workflow in sorted(WORKFLOWS.glob("*.yml"))
+    }
+    assert_rust_cache_steps(workflow_sources)
+
+    ci_path = WORKFLOWS / "ci.yml"
+    check_start = ci_workflow.index("\n  check:")
+    check_end = ci_workflow.index("\n  coverage:", check_start)
+    check_job = ci_workflow[check_start:check_end]
+    save_line = f"          {MAIN_ONLY_CACHE_SAVE}\n"
+    if check_job.count(save_line) != 1:
         raise AssertionError(
-            "every pinned rust-cache use must save only from main: "
-            f"{rust_cache_uses} pinned uses, {trusted_saves} main-only saves"
+            "cache falsification could not identify the check job's main-only save"
         )
+    check_without_save = check_job.replace(save_line, "", 1)
+    unbound_ci = (
+        ci_workflow[:check_start] + check_without_save + ci_workflow[check_end:]
+    )
+
+    comment_compensation = dict(workflow_sources)
+    comment_compensation[ci_path] = unbound_ci
+    fuzz_path = WORKFLOWS / "fuzz.yml"
+    comment_compensation[fuzz_path] += f"\n# {MAIN_ONLY_CACHE_SAVE}\n"
+    expect_assertion(
+        "missing rust-cache save-if compensated by a comment",
+        "with mapping and one main-only save-if",
+        lambda: assert_rust_cache_steps(comment_compensation),
+    )
+
+    field_compensation = dict(workflow_sources)
+    field_compensation[ci_path] = unbound_ci
+    fuzz_key = (
+        "          key: ${{ runner.os }}-parser-fuzz-"
+        "${{ hashFiles('fuzz/Cargo.toml', 'crates/kin-parser/**') }}\n"
+    )
+    if field_compensation[fuzz_path].count(fuzz_key) != 1:
+        raise AssertionError(
+            "cache falsification could not identify the unrelated fuzz cache step"
+        )
+    field_compensation[fuzz_path] = field_compensation[fuzz_path].replace(
+        fuzz_key,
+        fuzz_key + f"          {MAIN_ONLY_CACHE_SAVE}\n",
+        1,
+    )
+    expect_assertion(
+        "missing rust-cache save-if compensated by an unrelated active field",
+        "with mapping and one main-only save-if",
+        lambda: assert_rust_cache_steps(field_compensation),
+    )
+
+    same_step_field = dict(workflow_sources)
+    same_step_field[ci_path] = (
+        ci_workflow[:check_start]
+        + check_job.replace(
+            save_line,
+            f"        env:\n          {MAIN_ONLY_CACHE_SAVE}\n",
+            1,
+        )
+        + ci_workflow[check_end:]
+    )
+    expect_assertion(
+        "rust-cache save-if moved from with to an env field in the same step",
+        "not structurally bound to its with mapping",
+        lambda: assert_rust_cache_steps(same_step_field),
+    )
 
     for obsolete in (
         ROOT / "scripts" / "promote-npm-release.sh",
@@ -898,9 +1144,7 @@ def main() -> None:
             require(publish_job, policy, f"{job} trusted publishing")
 
     install_proof_start = release.index("  install_proof:")
-    install_proof_end = release.index(
-        "\n  npm_publish_preflight:", install_proof_start
-    )
+    install_proof_end = release.index("\n  npm_publish_preflight:", install_proof_start)
     install_proof_job = release[install_proof_start:install_proof_end]
     for policy in (
         "needs: publish",
@@ -917,9 +1161,7 @@ def main() -> None:
             "needs.publish_npm_compatibility.result == 'success'",
             "needs.version_tag_image.result == 'success'",
         ),
-        "smoke_npm_published": (
-            "needs.verify_npm_published.result == 'success'",
-        ),
+        "smoke_npm_published": ("needs.verify_npm_published.result == 'success'",),
         "finalize_release": (
             "needs.publish.result == 'success'",
             "needs.install_proof.result == 'success'",
