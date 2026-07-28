@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parent.parent
 WORKFLOWS = ROOT / ".github" / "workflows"
 README = ROOT / "README.md"
 RELEASE = WORKFLOWS / "release.yml"
+RELEASE_TAG = WORKFLOWS / "release-tag.yml"
 INSTALL_PROOF = WORKFLOWS / "install-proof.yml"
 INSTALLER_CALLBACK = WORKFLOWS / "publish-release-installers.yml"
 UPDATE_TRUST = ROOT / "docs" / "security" / "signing-and-update-trust.md"
@@ -371,6 +372,9 @@ def main() -> None:
         "docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c",
         "docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a",
         "Keep polling the bounded log authority even",
+        "cache-from: type=gha",
+        "cache-to: ${{ github.ref == 'refs/heads/main' "
+        "&& 'type=gha,mode=max' || '' }}",
     ):
         require(docker_workflow, policy, "Docker CI authority and smoke gate")
 
@@ -731,6 +735,55 @@ def main() -> None:
         "does not match tracked Git bytes",
     ):
         require(windows_job, policy, "Windows exact lockfile provenance regression")
+
+    # The Windows installer leg is off the pull-request path, so the only place
+    # it can still prove anything is a push to main. The only reason that is
+    # safe is that release-tag.yml refuses to mint a tag unless this exact
+    # check is present and green on the release sha. Pin both halves together:
+    # dropping either one silently turns a required release gate into a job that
+    # never runs on the commit being released.
+    installer_start = ci_workflow.index("  windows-installer:")
+    installer_end = ci_workflow.index("\n  changes:", installer_start)
+    installer_job = ci_workflow[installer_start:installer_end]
+    for policy in (
+        "name: Windows installer + vector-free release build",
+        "github.event_name != 'pull_request'",
+        "needs.changes.outputs.docs_only != 'true'",
+    ):
+        require(installer_job, policy, "main-only Windows installer admission")
+    require(
+        ci_workflow,
+        "  push:\n    branches: [main]",
+        "Windows installer proof still reaching every main commit",
+    )
+
+    release_tag = RELEASE_TAG.read_text(encoding="utf-8")
+    for policy in (
+        "REQUIRED_CHECKS: |",
+        "Check & Test (ubuntu-latest)",
+        "Check & Test (macos-latest)",
+        "DCO Sign-off",
+        "cargo-deny",
+        "gitleaks (full history)",
+        "Windows installer + vector-free release build",
+        "missing required check: {name}",
+        "required check not green: {name}",
+    ):
+        require(release_tag, policy, "release tag required-check gate")
+
+    # Cargo caches are restore-anywhere, save-from-main-only. That is what keeps
+    # one reusable warm entry per job alive under the repository cache budget,
+    # and it is also what denies a fork pull request any way to write a cache a
+    # trusted run would later restore.
+    rust_cache_uses = ci_workflow.count(
+        "uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4"
+    )
+    trusted_saves = ci_workflow.count("save-if: ${{ github.ref == 'refs/heads/main' }}")
+    if rust_cache_uses == 0 or rust_cache_uses != trusted_saves:
+        raise AssertionError(
+            "every pinned rust-cache use must save only from main: "
+            f"{rust_cache_uses} pinned uses, {trusted_saves} main-only saves"
+        )
 
     for obsolete in (
         ROOT / "scripts" / "promote-npm-release.sh",

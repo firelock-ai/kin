@@ -107,18 +107,17 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
 
+      # Restore on every event, save only from main. A cache entry written from
+      # a pull request ref is readable by that one pull request and nothing
+      # else, so saving from pull requests bought no warm start while consuming
+      # the shared repository cache budget and evicting main's entry, which is
+      # why no reusable cargo cache existed on refs/heads/main at all. Saving
+      # only from main keeps one warm entry per job that every pull request
+      # restores, and leaves fork pull requests with no path to write one.
       - name: Cache cargo registry and build
-        uses: actions/cache@v6
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          # A key distinct from the installer job: this builds the debug profile,
-          # and one shared key would have the two jobs overwrite each other.
-          key: windows-authority-cargo-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            windows-authority-cargo-
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Compile and run native Windows authority tests
         shell: bash
@@ -146,7 +145,19 @@ jobs:
   windows-installer:
     name: Windows installer + vector-free release build
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
+    # Deliberately off the pull-request path. This leg cold-builds the whole
+    # dependency graph in the release profile for x86_64-pc-windows-msvc and
+    # measured 20 to 25 minutes per round, longer than any other job, so it set
+    # the floor for every land-and-iterate cycle. It now runs on each push to
+    # main, which is exactly the commit release proof reads: release-tag.yml
+    # names this check in REQUIRED_CHECKS and refuses to mint a tag unless it is
+    # present and green on the release sha. On a pull request the job reports
+    # skipped, which satisfies the required context the same way the
+    # documentation-only path already relies on.
+    if: >-
+      ${{ !cancelled()
+      && github.event_name != 'pull_request'
+      && needs.changes.outputs.docs_only != 'true' }}
     runs-on: windows-latest
     timeout-minutes: 60
     steps:
@@ -398,16 +409,13 @@ jobs:
           grep -q '^\[registries\.kin\]' .cargo/config.toml
           if grep -q '^\[patch\.kin\]' .cargo/config.toml; then echo "::error::[patch.kin] git pins must be removed — kin-* resolve from the Kin registry"; exit 1; fi
 
+      # Same trusted-ref scoping as the Windows authority job: restore always,
+      # save only from main. This is the pull-request critical path, so a warm
+      # dependency graph here is what a round actually costs.
       - name: Cache cargo registry and build
-        uses: actions/cache@v6
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Check formatting
         run: cargo fmt -- --check

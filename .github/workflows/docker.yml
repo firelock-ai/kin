@@ -48,7 +48,11 @@ jobs:
             KIN_BUILD_DIRTY=false
             KIN_BUILD_BRANCH=${{ github.ref_name }}
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # Export layers only from main. A pull request's Actions cache scope
+          # is private to that pull request, so exporting mode=max from every
+          # round wrote layers nothing else could read while spending the shared
+          # repository cache budget. Pull requests still import main's layers.
+          cache-to: ${{ github.ref == 'refs/heads/main' && 'type=gha,mode=max' || '' }}
 
       - name: Verify container build provenance
         env:
