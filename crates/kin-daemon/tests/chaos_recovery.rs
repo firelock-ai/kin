@@ -9,6 +9,10 @@ use kin_daemon::api::HealthResponse;
 use tokio::net::TcpStream;
 use tokio::process::{Child, Command};
 
+mod common;
+
+use common::isolate_daemon_test_command;
+
 /// Readiness budget for a daemon to come up. Generous enough that two CI runs
 /// sharing a runner (a push build and a pull_request build on the same commit)
 /// can both bring a daemon up under load without a false timeout. A daemon that
@@ -73,6 +77,7 @@ fn spawn_daemon(repo_root: &Path, port: u16) -> Child {
 fn spawn_daemon_with_env(repo_root: &Path, port: u16, envs: &[(&str, &str)]) -> Child {
     let bin = env!("CARGO_BIN_EXE_kin-daemon");
     let mut cmd = Command::new(bin);
+    isolate_daemon_test_command(&mut cmd);
     cmd.arg("--repo")
         .arg(repo_root)
         .arg("--port")

@@ -89,6 +89,24 @@ fn isolated_runtime_scrubs_ambient_authority_and_reaps_every_process() {
         "KIN_SUPERVISOR_URL",
         std::ffi::OsStr::new("http://127.0.0.1:9"),
     );
+    let _daemon_bind_host =
+        EnvGuard::set("KIN_DAEMON_BIND_HOST", std::ffi::OsStr::new("192.0.2.1"));
+    let _daemon_auth = EnvGuard::set(
+        "KIN_DAEMON_AUTH_TOKEN",
+        std::ffi::OsStr::new("ambient-token"),
+    );
+    let _daemon_require_token =
+        EnvGuard::set("KIN_DAEMON_REQUIRE_TOKEN", std::ffi::OsStr::new("true"));
+    let _supervisor_bind_host = EnvGuard::set(
+        "KIN_SUPERVISOR_BIND_HOST",
+        std::ffi::OsStr::new("192.0.2.1"),
+    );
+    let _supervisor_auth = EnvGuard::set(
+        "KIN_SUPERVISOR_AUTH_TOKEN",
+        std::ffi::OsStr::new("ambient-token"),
+    );
+    let _supervisor_require_token =
+        EnvGuard::set("KIN_SUPERVISOR_REQUIRE_TOKEN", std::ffi::OsStr::new("true"));
     let _vfs_workspace = EnvGuard::set("KIN_VFS_WORKSPACE", sentinel_home.as_os_str());
 
     let repository = root.path().join("repository");

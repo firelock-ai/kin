@@ -74,6 +74,10 @@ impl IsolatedDaemonRuntime {
             "KIN_DAEMON_BIN",
             "KIN_DAEMON_AUTH_TOKEN",
             "KIN_DAEMON_BIND_HOST",
+            "KIN_DAEMON_REQUIRE_TOKEN",
+            "KIN_SUPERVISOR_BIND_HOST",
+            "KIN_SUPERVISOR_AUTH_TOKEN",
+            "KIN_SUPERVISOR_REQUIRE_TOKEN",
             "KIN_VFS_WORKSPACE",
             "KIN_VFS_WORKSPACE_ALIASES",
             "KIN_VFS_SOCK",
@@ -157,20 +161,22 @@ impl Drop for IsolatedDaemonRuntime {
 /// - The wait carries a wall-clock deadline. At the deadline the child is
 ///   killed and the test fails naming the command, instead of leaving a silent,
 ///   idle process the developer has to notice and kill by hand.
-pub struct Command(std::process::Command);
+pub struct Command {
+    inner: std::process::Command,
+    isolate_git: bool,
+}
 
 impl Command {
     pub fn new<S: AsRef<OsStr>>(program: S) -> Self {
         let program = program.as_ref();
-        let mut command = std::process::Command::new(program);
-        if is_git_program(program) {
-            isolate_fixture_git(&mut command);
+        Self {
+            inner: std::process::Command::new(program),
+            isolate_git: is_git_program(program),
         }
-        Self(command)
     }
 
     pub fn arg<S: AsRef<OsStr>>(&mut self, arg: S) -> &mut Self {
-        self.0.arg(arg);
+        self.inner.arg(arg);
         self
     }
 
@@ -179,12 +185,12 @@ impl Command {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        self.0.args(args);
+        self.inner.args(args);
         self
     }
 
     pub fn env<K: AsRef<OsStr>, V: AsRef<OsStr>>(&mut self, key: K, value: V) -> &mut Self {
-        self.0.env(key, value);
+        self.inner.env(key, value);
         self
     }
 
@@ -194,17 +200,17 @@ impl Command {
         K: AsRef<OsStr>,
         V: AsRef<OsStr>,
     {
-        self.0.envs(vars);
+        self.inner.envs(vars);
         self
     }
 
     pub fn env_remove<K: AsRef<OsStr>>(&mut self, key: K) -> &mut Self {
-        self.0.env_remove(key);
+        self.inner.env_remove(key);
         self
     }
 
     pub fn current_dir<P: AsRef<Path>>(&mut self, dir: P) -> &mut Self {
-        self.0.current_dir(dir);
+        self.inner.current_dir(dir);
         self
     }
 
@@ -214,8 +220,11 @@ impl Command {
     }
 
     pub fn output_within(&mut self, timeout: Duration) -> std::io::Result<Output> {
-        let label = self.0.get_program().to_string_lossy().into_owned();
-        run_bounded_within(&mut self.0, &label, timeout)
+        if self.isolate_git {
+            isolate_fixture_git(&mut self.inner);
+        }
+        let label = self.inner.get_program().to_string_lossy().into_owned();
+        run_bounded_within(&mut self.inner, &label, timeout)
     }
 }
 

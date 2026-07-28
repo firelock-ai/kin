@@ -20,6 +20,10 @@ use std::time::{Duration, Instant};
 
 use tokio::process::{Child, Command};
 
+mod common;
+
+use common::isolate_daemon_test_command;
+
 /// Readiness budget for the daemon to bind and serve. Generous so two CI runs
 /// sharing a runner can both come up under load without a false timeout; a
 /// daemon that dies during startup is detected eagerly via its child handle, so
@@ -27,7 +31,9 @@ use tokio::process::{Child, Command};
 const READINESS_TIMEOUT: Duration = Duration::from_secs(180);
 
 fn spawn_daemon_ephemeral(repo_root: &Path) -> Child {
-    Command::new(env!("CARGO_BIN_EXE_kin-daemon"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_kin-daemon"));
+    isolate_daemon_test_command(&mut command);
+    command
         .arg("--repo")
         .arg(repo_root)
         // The feature under test: the daemon, not the launcher, picks the port.
