@@ -98,6 +98,19 @@ pub struct BuildResponse {
     pub built_at: String,
 }
 
+/// Response from `GET /readiness`.
+///
+/// `warming` is the daemon's explicit "alive but still materializing a
+/// cross-repo warm-up" signal. A client must never read a slow readiness as
+/// evidence that the daemon is dead.
+#[derive(Debug, Default, Deserialize)]
+struct ReadinessResponse {
+    #[serde(default)]
+    ready: bool,
+    #[serde(default)]
+    warming: bool,
+}
+
 #[derive(Debug, Deserialize)]
 struct SupervisorHealthResponse {
     status: String,
@@ -2131,54 +2144,117 @@ async fn acquire_supervisor_startup_lock() -> Result<StartupLock> {
     }
 }
 
-async fn validate_daemon_endpoint(
+/// What probing a recorded daemon endpoint established.
+///
+/// The distinction that matters is *why* an endpoint is unusable. A daemon that
+/// simply has not answered yet is alive; a daemon whose recorded process is gone,
+/// or that answered and proved the record wrong, is not. Only the latter may
+/// have its endpoint files cleared: deleting a live daemon's `daemon.pid` and
+/// `daemon.port` strands the repo, because the next start loses the singleton
+/// flock to the daemon still holding it and the lock reclaim has lost the pid it
+/// needed as evidence.
+#[derive(Debug)]
+enum EndpointVerdict {
+    /// The daemon answered readiness and health for this repo.
+    Serving(String),
+    /// Positive evidence the record is wrong: the recorded process is gone, or
+    /// the endpoint answered and named a different repo or a non-serving status.
+    /// Safe to clear and respawn.
+    Invalid(String),
+    /// The recorded owner process is alive but has not reported readiness.
+    /// Never clear: a busy daemon is not a dead one.
+    LiveNotReady {
+        pid: u32,
+        port: u16,
+        detail: String,
+        warming: bool,
+    },
+}
+
+/// Poll a recorded endpoint until it serves, proves itself invalid, or the
+/// budget runs out.
+///
+/// Reaching the deadline is not evidence of anything except that the daemon is
+/// slow, so it yields `LiveNotReady` rather than a verdict the caller could act
+/// on destructively.
+async fn probe_daemon_endpoint(
     kin_root: &Path,
     endpoint: LiveDaemonEndpoint,
     timeout: Duration,
-) -> Result<String> {
-    let working_dir = kin_root
-        .parent()
-        .ok_or_else(|| anyhow!("invalid .kin layout: no parent"))?;
+) -> EndpointVerdict {
+    let Some(working_dir) = kin_root.parent() else {
+        return EndpointVerdict::Invalid("invalid .kin layout: no parent".to_string());
+    };
     let base_url = format!("http://127.0.0.1:{}", endpoint.port);
     let client = daemon_health_client();
     let deadline = Instant::now() + timeout;
+    let mut warming = false;
 
     loop {
         if !is_process_alive(endpoint.pid) {
-            remove_stale_daemon_files(kin_root);
-            bail!("recorded daemon process {} is not alive", endpoint.pid);
+            return EndpointVerdict::Invalid(format!(
+                "recorded daemon process {} is not alive",
+                endpoint.pid
+            ));
         }
 
         let probe_error = match client.get(format!("{base_url}/readiness")).send().await {
             Ok(resp) if resp.status().is_success() => {
-                let health: HealthResponse = client
-                    .get(format!("{base_url}/health"))
-                    .send()
-                    .await
-                    .context("probe daemon health")?
-                    .error_for_status()
-                    .context("daemon health returned an error")?
-                    .json()
-                    .await
-                    .context("parse daemon health response")?;
-                validate_health_repo(&health, working_dir)?;
-                return Ok(base_url);
+                match probe_health_for_repo(&client, &base_url, working_dir).await {
+                    // The daemon answered and identified itself: whatever it
+                    // said is real evidence, so a mismatch is a genuinely stale
+                    // record rather than a slow start.
+                    Ok(()) => return EndpointVerdict::Serving(base_url),
+                    Err(err) => return EndpointVerdict::Invalid(err.to_string()),
+                }
             }
-            Ok(resp) => format!("readiness returned HTTP {}", resp.status()),
+            Ok(resp) => {
+                let status = resp.status();
+                // A 503 body carries the daemon's own readiness detail. It
+                // answered, so it is unambiguously alive; keep the last known
+                // warming signal if this particular body fails to parse.
+                match resp.json::<ReadinessResponse>().await {
+                    Ok(readiness) => {
+                        warming = readiness.warming;
+                        format!(
+                            "readiness returned HTTP {status} (ready={}, warming={})",
+                            readiness.ready, readiness.warming
+                        )
+                    }
+                    Err(_) => format!("readiness returned HTTP {status}"),
+                }
+            }
             Err(err) => err.to_string(),
         };
 
         if Instant::now() >= deadline {
-            bail!(
-                "daemon pid {} on {} failed readiness within {:.1}s: {}",
-                endpoint.pid,
-                base_url,
-                timeout.as_secs_f64(),
-                probe_error
-            );
+            return EndpointVerdict::LiveNotReady {
+                pid: endpoint.pid,
+                port: endpoint.port,
+                detail: probe_error,
+                warming,
+            };
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
+}
+
+async fn probe_health_for_repo(
+    client: &reqwest::Client,
+    base_url: &str,
+    working_dir: &Path,
+) -> Result<()> {
+    let health: HealthResponse = client
+        .get(format!("{base_url}/health"))
+        .send()
+        .await
+        .context("probe daemon health")?
+        .error_for_status()
+        .context("daemon health returned an error")?
+        .json()
+        .await
+        .context("parse daemon health response")?;
+    validate_health_repo(&health, working_dir)
 }
 
 async fn wait_for_daemon_ready(
@@ -2256,34 +2332,121 @@ async fn wait_for_daemon_ready(
     )
 }
 
-async fn wait_for_existing_daemon(kin_root: &Path) -> Option<String> {
-    let existing = live_daemon_endpoint(kin_root)?;
-    match validate_daemon_endpoint(
+/// What the caller should do about the endpoint currently recorded for a repo.
+#[derive(Debug)]
+enum ExistingDaemon {
+    /// Use this daemon.
+    Connected(String),
+    /// No usable record (absent, or proven wrong and now cleared). Start one.
+    None,
+    /// A live daemon owns this repo but is not serving yet. Starting a second
+    /// one would lose the singleton flock, so the caller must report this
+    /// instead.
+    LiveNotReady(String),
+}
+
+/// Resolve the endpoint recorded for this repo, escalating patience — never
+/// destruction — when the recorded owner is alive.
+///
+/// The short budget is the fast path for a healthy daemon. Exhausting it while
+/// the recorded process is still alive says only that the daemon is busy (a
+/// large graph load, a cross-repo warm-up), so this escalates to the same long
+/// budget a freshly spawned daemon gets rather than declaring it dead. Endpoint
+/// files are cleared only against positive evidence.
+async fn wait_for_existing_daemon(kin_root: &Path) -> ExistingDaemon {
+    wait_for_existing_daemon_within(
         kin_root,
-        existing,
         Duration::from_secs(existing_daemon_ready_timeout_secs()),
+        Duration::from_secs(daemon_ready_timeout_secs()),
     )
     .await
+}
+
+async fn wait_for_existing_daemon_within(
+    kin_root: &Path,
+    short: Duration,
+    patience: Duration,
+) -> ExistingDaemon {
+    let Some(existing) = live_daemon_endpoint(kin_root) else {
+        return ExistingDaemon::None;
+    };
+
+    let mut verdict = probe_daemon_endpoint(kin_root, existing, short).await;
+
+    if let EndpointVerdict::LiveNotReady {
+        pid, port, warming, ..
+    } = &verdict
     {
-        Ok(base_url) => {
+        warn!(
+            pid = *pid,
+            port = *port,
+            warming = *warming,
+            patience_secs = patience.as_secs(),
+            "daemon for this repo is alive but not ready yet; waiting rather than \
+             replacing a running daemon"
+        );
+        verdict =
+            probe_daemon_endpoint(kin_root, existing, patience.saturating_sub(short)).await;
+    }
+
+    match verdict {
+        EndpointVerdict::Serving(base_url) => {
             info!(
                 pid = existing.pid,
                 port = existing.port,
                 "connected to existing daemon"
             );
-            Some(base_url)
+            ExistingDaemon::Connected(base_url)
         }
-        Err(err) => {
+        EndpointVerdict::Invalid(reason) => {
             warn!(
                 pid = existing.pid,
                 port = existing.port,
-                error = %err,
-                "invalid daemon endpoint; clearing stale endpoint files"
+                error = %reason,
+                "daemon endpoint proved invalid; clearing stale endpoint files"
             );
             remove_stale_daemon_files(kin_root);
-            None
+            ExistingDaemon::None
         }
+        EndpointVerdict::LiveNotReady {
+            pid,
+            port,
+            detail,
+            warming,
+        } => ExistingDaemon::LiveNotReady(live_daemon_not_ready_message(
+            pid,
+            port,
+            &detail,
+            warming,
+            patience.as_secs(),
+        )),
     }
+}
+
+/// Message for a daemon that owns this repo, is alive, and never reported
+/// readiness inside the full budget.
+///
+/// It names the process so an operator can act on it. The old path silently
+/// deleted this daemon's endpoint files and spawned a replacement, which lost
+/// the singleton flock and left the repo unusable until the first daemon
+/// exited — with nothing in the output pointing at the daemon still running.
+fn live_daemon_not_ready_message(
+    pid: u32,
+    port: u16,
+    detail: &str,
+    warming: bool,
+    waited_secs: u64,
+) -> String {
+    let state = if warming {
+        "is still warming its cross-repo index"
+    } else {
+        "has not reported readiness"
+    };
+    format!(
+        "kin daemon (pid {pid}, port {port}) owns this repo and {state} after {waited_secs}s: \
+         {detail}. It is running, so kin will not replace it. Wait for it to finish, or stop it \
+         with `kin daemon stop`; raise KIN_DAEMON_READY_TIMEOUT_SECS if this repo needs longer."
+    )
 }
 
 async fn validate_supervisor_endpoint(endpoint: LiveDaemonEndpoint) -> Result<String> {
@@ -2499,13 +2662,19 @@ async fn supervisor_route_for_repo(kin_root: &Path, supervisor_url: &str) -> Opt
         pid: read_pid_file(kin_root).unwrap_or(std::process::id()),
         port,
     };
-    validate_daemon_endpoint(
+    // A supervisor route that does not check out just means this path cannot
+    // answer; the repo-local endpoint path decides what is stale. Nothing is
+    // cleared from here.
+    match probe_daemon_endpoint(
         kin_root,
         endpoint,
         Duration::from_secs(existing_daemon_ready_timeout_secs()),
     )
     .await
-    .ok()
+    {
+        EndpointVerdict::Serving(base_url) => Some(base_url),
+        EndpointVerdict::Invalid(_) | EndpointVerdict::LiveNotReady { .. } => None,
+    }
 }
 
 fn supervisor_route_for_repo_if_running(kin_root: &Path) -> Option<String> {
@@ -2689,18 +2858,26 @@ pub async fn ensure_daemon_running_with_idle_timeout(
         return Ok(base_url);
     }
 
-    if let Some(base_url) = wait_for_existing_daemon(kin_root).await {
-        register_repo_daemon_with_supervisor(kin_root, &base_url, &supervisor_url).await?;
-        return Ok(base_url);
+    match wait_for_existing_daemon(kin_root).await {
+        ExistingDaemon::Connected(base_url) => {
+            register_repo_daemon_with_supervisor(kin_root, &base_url, &supervisor_url).await?;
+            return Ok(base_url);
+        }
+        ExistingDaemon::LiveNotReady(message) => bail!(message),
+        ExistingDaemon::None => {}
     }
 
     let _startup_lock = acquire_startup_lock(kin_root).await?;
     if let Some(base_url) = supervisor_route_for_repo(kin_root, &supervisor_url).await {
         return Ok(base_url);
     }
-    if let Some(base_url) = wait_for_existing_daemon(kin_root).await {
-        register_repo_daemon_with_supervisor(kin_root, &base_url, &supervisor_url).await?;
-        return Ok(base_url);
+    match wait_for_existing_daemon(kin_root).await {
+        ExistingDaemon::Connected(base_url) => {
+            register_repo_daemon_with_supervisor(kin_root, &base_url, &supervisor_url).await?;
+            return Ok(base_url);
+        }
+        ExistingDaemon::LiveNotReady(message) => bail!(message),
+        ExistingDaemon::None => {}
     }
 
     let daemon_bin = find_daemon_binary()?;
@@ -3038,6 +3215,132 @@ mod tests {
             !tail.contains("384, got 768"),
             "stale prior-run line must not be surfaced even when fresh output exists: {tail}"
         );
+    }
+
+    // ── FIR-1583: a busy daemon must never be treated as a dead one ───────
+    //
+    // The deadlock chain started here. A daemon that did not answer readiness
+    // inside a short fixed budget had its `daemon.pid` and `daemon.port`
+    // deleted while it was still running and still holding the per-repo
+    // singleton flock. The replacement daemon then lost that flock, and with
+    // `daemon.pid` gone the lock reclaim had no owner evidence left, so every
+    // later command repeated the same failure until the first daemon exited.
+    // A timeout is evidence that a daemon is slow, never that it is dead.
+
+    /// A loopback port with nothing listening: connections are refused
+    /// immediately, so the probe exercises the unreachable-endpoint path
+    /// without waiting on a real timeout.
+    fn closed_loopback_port() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        port
+    }
+
+    fn write_endpoint_files(kin_root: &Path, pid: u32, port: u16) {
+        std::fs::write(kin_root.join("daemon.pid"), pid.to_string()).unwrap();
+        std::fs::write(kin_root.join("daemon.port"), port.to_string()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn unready_endpoint_with_a_live_owner_is_preserved_not_clobbered() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // The recorded owner is this test process, so it is provably alive —
+        // exactly the daemon-still-loading shape.
+        write_endpoint_files(root, std::process::id(), closed_loopback_port());
+
+        let verdict = wait_for_existing_daemon_within(
+            root,
+            Duration::from_millis(50),
+            Duration::from_millis(150),
+        )
+        .await;
+
+        assert!(
+            matches!(verdict, ExistingDaemon::LiveNotReady(_)),
+            "a live owner that has not answered must be reported, not replaced: {verdict:?}"
+        );
+        assert!(
+            root.join("daemon.pid").exists(),
+            "a live daemon's pid file must survive a readiness timeout"
+        );
+        assert!(
+            root.join("daemon.port").exists(),
+            "a live daemon's port file must survive a readiness timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn unready_endpoint_names_the_holder_and_refuses_to_replace_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let pid = std::process::id();
+        write_endpoint_files(root, pid, closed_loopback_port());
+
+        let ExistingDaemon::LiveNotReady(message) = wait_for_existing_daemon_within(
+            root,
+            Duration::from_millis(50),
+            Duration::from_millis(150),
+        )
+        .await
+        else {
+            panic!("a live-but-unready owner must produce a LiveNotReady verdict");
+        };
+
+        assert!(
+            message.contains(&pid.to_string()),
+            "the refusal must name the process that owns the repo: {message}"
+        );
+        assert!(
+            message.contains("kin daemon stop"),
+            "the refusal must tell the operator how to act: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dead_owner_endpoint_is_cleared_so_a_replacement_can_start() {
+        // The other side of the rule: a recorded owner that is provably gone is
+        // positive evidence, so the record is cleared and a start proceeds.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_endpoint_files(root, 999_999_999, closed_loopback_port());
+
+        let verdict = wait_for_existing_daemon_within(
+            root,
+            Duration::from_millis(50),
+            Duration::from_millis(150),
+        )
+        .await;
+
+        assert!(
+            matches!(verdict, ExistingDaemon::None),
+            "a dead owner must not block a fresh start: {verdict:?}"
+        );
+        assert!(!root.join("daemon.pid").exists());
+        assert!(!root.join("daemon.port").exists());
+    }
+
+    #[test]
+    fn not_ready_message_distinguishes_warming_from_silent() {
+        let warming = live_daemon_not_ready_message(4242, 51000, "HTTP 503", true, 300);
+        assert!(
+            warming.contains("warming"),
+            "a daemon that reported warming must be described as warming: {warming}"
+        );
+        let silent = live_daemon_not_ready_message(4242, 51000, "connection refused", false, 300);
+        assert!(
+            silent.contains("has not reported readiness"),
+            "a silent daemon must not be described as warming: {silent}"
+        );
+        for message in [&warming, &silent] {
+            assert!(message.contains("4242"), "must name the pid: {message}");
+            assert!(message.contains("51000"), "must name the port: {message}");
+            assert!(
+                message.contains("will not replace it"),
+                "must state that kin refuses to replace a running daemon: {message}"
+            );
+        }
     }
 
     #[test]

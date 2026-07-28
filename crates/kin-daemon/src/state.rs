@@ -671,6 +671,27 @@ struct SpineGraphCapture {
     relations: Vec<kin_model::Relation>,
 }
 
+use crate::lifecycle::without_blocking_runtime_worker;
+
+/// Holds the "spine is warming" signal up for exactly as long as sibling loads
+/// are in flight, clearing it on every exit path including an unwind.
+struct SpineWarmGuard<'a> {
+    flag: &'a AtomicBool,
+}
+
+impl<'a> SpineWarmGuard<'a> {
+    fn arm(flag: &'a AtomicBool) -> Self {
+        flag.store(true, Ordering::Relaxed);
+        Self { flag }
+    }
+}
+
+impl Drop for SpineWarmGuard<'_> {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::Relaxed);
+    }
+}
+
 /// One local sibling repository capability frozen while the daemon starts.
 ///
 /// Lazy spine initialization may load graph bytes later, but it must never
@@ -940,6 +961,12 @@ pub struct DaemonState {
     /// - `InMemorySpineBackend`: local dev / single daemon (default)
     /// - `FirestoreSpineBackend`: cloud / stateless daemon pool (when GOOGLE_CLOUD_PROJECT is set)
     pub spine: std::sync::OnceLock<Arc<dyn kin_spine::SpineBackend>>,
+    /// True while lazy spine initialization is loading sibling repository
+    /// graphs. This is the daemon's honest "busy warming" signal: the process
+    /// is alive and its own repo is served, but a cross-repo surface is still
+    /// materializing. Clients must treat it as alive-and-waiting, never as a
+    /// dead endpoint.
+    spine_warming: AtomicBool,
     /// Serializes hosted repo registration and all-repo edge refresh passes.
     /// The backend independently keeps a pass-wide incomplete lease; this gate
     /// prevents daemon request paths from racing that lease with a new ingest.
@@ -1500,9 +1527,10 @@ impl DaemonState {
             }
         }
 
-        // Reclaim stale daemon/runtime locks left by a dead process. A no-op
-        // unless the recorded owner PID is present and dead, so a live
-        // daemon's locks are never touched.
+        // Reclaim stale daemon/runtime locks left by a dead process. Acts only
+        // on a recorded owner that is present and dead, so a live daemon's
+        // locks are never touched; every declining outcome is logged by the
+        // reclaim itself rather than silently swallowed here.
         let _ = crate::lifecycle::reclaim_stale_locks(layout.root());
 
         // Resolve repository identity before opening any graph state. The
@@ -1723,6 +1751,7 @@ impl DaemonState {
             event_tx: tokio::sync::broadcast::channel(256).0,
             session_scopes: RwLock::new(HashMap::new()),
             spine: std::sync::OnceLock::new(),
+            spine_warming: AtomicBool::new(false),
             spine_refresh_gate: tokio::sync::Mutex::new(()),
             repo_graphs: RwLock::new(HashMap::new()),
             allowed_repo_ids: None,
@@ -1887,6 +1916,7 @@ impl DaemonState {
             event_tx: tokio::sync::broadcast::channel(256).0,
             session_scopes: RwLock::new(HashMap::new()),
             spine: std::sync::OnceLock::new(),
+            spine_warming: AtomicBool::new(false),
             spine_refresh_gate: tokio::sync::Mutex::new(()),
             repo_graphs: RwLock::new(HashMap::new()), // populated below
             allowed_repo_ids,
@@ -2080,6 +2110,12 @@ impl DaemonState {
         self.initialize_spine_lazy_with_publication_hook(|| {});
     }
 
+    /// Whether lazy spine initialization is currently loading sibling
+    /// repository graphs.
+    pub fn spine_warming(&self) -> bool {
+        self.spine_warming.load(Ordering::Relaxed)
+    }
+
     fn load_registered_workspace_graph(
         binding: &kin_core::LocalRepositoryAuthorityBinding,
     ) -> std::result::Result<Arc<kin_db::InMemoryGraph>, String> {
@@ -2132,6 +2168,11 @@ impl DaemonState {
         let mut captures = vec![primary];
         let mut authority_incomplete = self.registered_local_repository_authority_incomplete;
 
+        // Announce the warm-up before the first sibling load so liveness
+        // surfaces can report "alive and warming" for its whole duration. The
+        // guard clears the flag on every exit path, including a panic.
+        let _warming = SpineWarmGuard::arm(&self.spine_warming);
+
         // Capture only sibling capabilities frozen during startup. Lazy
         // initialization may load graph bytes, but cannot rediscover registry
         // paths, manifests, or storage roots from a request.
@@ -2143,9 +2184,15 @@ impl DaemonState {
                 .spawn(move || Self::load_registered_workspace_graph(&binding))
                 .map_err(|error| format!("spawn sibling authority load: {error}"))
                 .and_then(|handle| {
-                    handle
-                        .join()
-                        .map_err(|_| "sibling authority loader panicked".to_string())
+                    // Wait for the sibling load without holding a runtime
+                    // worker: this join can run for minutes on a large
+                    // registered repo, and readiness must stay answerable
+                    // throughout.
+                    without_blocking_runtime_worker(|| {
+                        handle
+                            .join()
+                            .map_err(|_| "sibling authority loader panicked".to_string())
+                    })
                 })
                 .and_then(|result| result);
 
@@ -4553,6 +4600,52 @@ mod tests {
         assert_eq!(layout.working_dir(), canonical_working_dir.as_path());
         DaemonState::open(layout)
             .expect("daemon test fixtures must open through repository-v6 workspace authority")
+    }
+
+    // ── FIR-1583: the warming signal must be exact ────────────────────────
+    //
+    // "Busy warming" is what lets a client tell a live daemon from a dead one.
+    // A signal that leaks true after a warm-up ends would make every later
+    // command think the daemon is still busy; one that fails to rise makes a
+    // warming daemon indistinguishable from an idle one.
+
+    #[test]
+    fn warm_guard_raises_the_signal_and_clears_it_on_drop() {
+        let flag = AtomicBool::new(false);
+        assert!(!flag.load(Ordering::Relaxed));
+        {
+            let _guard = SpineWarmGuard::arm(&flag);
+            assert!(flag.load(Ordering::Relaxed), "the warm-up must be visible");
+        }
+        assert!(
+            !flag.load(Ordering::Relaxed),
+            "the signal must not outlive the warm-up"
+        );
+    }
+
+    #[test]
+    fn warm_guard_clears_the_signal_on_unwind() {
+        // A sibling load that panics must not leave the daemon permanently
+        // claiming to be warming.
+        let flag = std::sync::Arc::new(AtomicBool::new(false));
+        let panicking = std::sync::Arc::clone(&flag);
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _guard = SpineWarmGuard::arm(&panicking);
+            panic!("sibling authority loader panicked");
+        }));
+        assert!(outcome.is_err(), "the fixture must actually panic");
+        assert!(
+            !flag.load(Ordering::Relaxed),
+            "an unwinding warm-up must still clear its signal"
+        );
+    }
+
+    #[test]
+    fn a_daemon_with_no_warm_up_in_flight_does_not_claim_to_be_warming() {
+        let fixture = tempfile::tempdir().expect("tempdir");
+        let initialized = kin_core::init(fixture.path()).expect("init fixture repository");
+        let state = test_state(initialized.layout, fixture.path());
+        assert!(!state.spine_warming());
     }
 
     fn test_entity(name: &str, file_path: &str) -> Entity {

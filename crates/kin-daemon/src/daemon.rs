@@ -56,6 +56,65 @@ fn should_enable_lsp_enrichment(config_enabled: bool, filesystem_reconcile_disab
     config_enabled && !filesystem_reconcile_disabled
 }
 
+/// Actionable refusal text for a daemon that lost the per-repo singleton lock.
+///
+/// Reads the holder from disk evidence and renders it. Kept split from
+/// [`format_singleton_contention`] so the wording is testable without a repo.
+fn singleton_contention_message(
+    kin_root: &std::path::Path,
+    reclaim: crate::lifecycle::StaleLockReclaim,
+) -> String {
+    format_singleton_contention(
+        &kin_root.display().to_string(),
+        crate::lifecycle::singleton_lock_holder(kin_root),
+        &reclaim,
+    )
+}
+
+/// Render the refusal a contended starter reports.
+///
+/// The old text ("another kin daemon already owns this repo") named nothing an
+/// operator could act on, and the process exited 0 so the message never even
+/// reached the caller as a failure. Every branch here names the evidence that
+/// produced it and what to do next.
+fn format_singleton_contention(
+    repo: &str,
+    holder: Option<crate::lifecycle::SingletonLockHolder>,
+    reclaim: &crate::lifecycle::StaleLockReclaim,
+) -> String {
+    let reclaimed = reclaim.cleared().len();
+    let context = match holder {
+        Some(holder) if holder.alive => format!(
+            "another kin daemon (pid {}) already owns {repo} and is still running",
+            holder.pid
+        ),
+        Some(holder) => format!(
+            "the daemon lock for {repo} is still held after its recorded owner (pid {}) exited, \
+             so a leaked lock fd is keeping it alive",
+            holder.pid
+        ),
+        None => format!(
+            "the daemon lock for {repo} is held but names no owner, so the holding process \
+             cannot be identified from disk"
+        ),
+    };
+    let remedy = match holder {
+        Some(holder) if holder.alive => format!(
+            "wait for pid {} to finish starting, or stop it with `kin daemon stop`",
+            holder.pid
+        ),
+        _ => "stop any remaining kin-daemon process for this repo, then retry".to_string(),
+    };
+    if reclaimed > 0 {
+        format!(
+            "refusing to start a second daemon: {context} (reclaimed {reclaimed} stale lock \
+             file(s) first, and the lock is still contended). To proceed, {remedy}."
+        )
+    } else {
+        format!("refusing to start a second daemon: {context}. To proceed, {remedy}.")
+    }
+}
+
 fn idle_check_interval(idle_timeout: Duration) -> Duration {
     let millis = (idle_timeout.as_millis() / 4).clamp(100, 5_000) as u64;
     Duration::from_millis(millis)
@@ -517,30 +576,35 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
         Ok(None) => {
             // Contended. Either a live daemon already owns this repo, or a
             // forked child leaked the flock fd past its dead parent (os error 35
-            // with no live owner). Reclaim clears only the latter — it is a
-            // no-op unless the recorded owner PID is present and dead — so a
-            // genuine second daemon still refuses to start.
-            let cleared = crate::lifecycle::reclaim_stale_locks(state.layout.root());
-            if cleared.is_empty() {
+            // with no live owner). Reclaim clears only the latter — it acts only
+            // on a recorded owner that is present and dead — so a genuine second
+            // daemon still refuses to start.
+            let reclaim = crate::lifecycle::reclaim_stale_locks(state.layout.root());
+            let cleared = reclaim.cleared().len();
+            if cleared > 0 {
                 warn!(
                     repo = %state.layout.root().display(),
-                    "another kin daemon already owns this repo — refusing to start a second daemon"
+                    cleared,
+                    "reclaimed stale repo locks left by a dead daemon; retrying singleton acquire"
                 );
-                return Ok(());
             }
-            warn!(
-                repo = %state.layout.root().display(),
-                cleared = cleared.len(),
-                "reclaimed stale repo locks left by a dead daemon; retrying singleton acquire"
-            );
-            match crate::lifecycle::acquire_singleton_lock(state.layout.root()) {
+            // Retry for a bounded window either way: an exiting daemon releases
+            // the flock as its process dies, and refusing on the first
+            // EWOULDBLOCK turns that handoff into a user-visible failure.
+            match crate::lifecycle::acquire_singleton_lock_within(
+                state.layout.root(),
+                crate::lifecycle::SINGLETON_LOCK_RETRY_BUDGET,
+            ) {
                 Ok(Some(lock)) => lock,
                 Ok(None) => {
-                    warn!(
-                        repo = %state.layout.root().display(),
-                        "singleton lock still contended after stale-lock reclaim — refusing to start"
-                    );
-                    return Ok(());
+                    // Still held. Name the holder from real process evidence so
+                    // the operator knows exactly which process to wait for or
+                    // stop, and fail loudly instead of exiting 0 — a silent
+                    // clean exit reaches the CLI only as "daemon exited during
+                    // startup", which describes nothing.
+                    return Err(DaemonError::RepoOwnedByAnotherDaemon(
+                        singleton_contention_message(state.layout.root(), reclaim),
+                    ));
                 }
                 Err(error) => return Err(DaemonError::Io(error)),
             }
@@ -2098,10 +2162,10 @@ async fn select_with_signals(
 #[cfg(all(test, unix))]
 mod tests {
     use super::{
-        drain_pending_flush, next_embed_error_backoff, parse_duration_secs, parse_owner_watch_pid,
-        should_enable_lsp_enrichment, should_flush_now, shutdown_signalled,
-        watched_process_is_alive, DaemonConfig, DEFAULT_RUNTIME_SHUTDOWN_GRACE,
-        DEFAULT_SHUTDOWN_ESCALATION_GRACE,
+        drain_pending_flush, format_singleton_contention, next_embed_error_backoff,
+        parse_duration_secs, parse_owner_watch_pid, should_enable_lsp_enrichment, should_flush_now,
+        shutdown_signalled, watched_process_is_alive, DaemonConfig,
+        DEFAULT_RUNTIME_SHUTDOWN_GRACE, DEFAULT_SHUTDOWN_ESCALATION_GRACE,
     };
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -2370,6 +2434,65 @@ mod tests {
         // The deterministic serial persist path is the default; only the
         // throughput profile opts into overlap (wired in the daemon binary).
         assert!(!DaemonConfig::default().embed_pipeline_overlap);
+    }
+
+    // ── FIR-1583: a contended start must name what it lost to ─────────────
+    //
+    // The old refusal said "another kin daemon already owns this repo" and
+    // exited 0, so the CLI reported only "daemon exited during startup" and the
+    // operator had no way to tell a live holder from a leaked lock fd.
+
+    #[test]
+    fn contention_message_names_a_live_holder_and_how_to_clear_it() {
+        let message = format_singleton_contention(
+            "/repo/.kin",
+            Some(crate::lifecycle::SingletonLockHolder {
+                pid: 4242,
+                alive: true,
+            }),
+            &crate::lifecycle::StaleLockReclaim::OwnerAlive(4242),
+        );
+        assert!(message.contains("4242"), "must name the holder: {message}");
+        assert!(
+            message.contains("/repo/.kin"),
+            "must name the repo: {message}"
+        );
+        assert!(
+            message.contains("kin daemon stop"),
+            "must give the operator an action: {message}"
+        );
+    }
+
+    #[test]
+    fn contention_message_distinguishes_a_dead_owner_from_an_unidentified_one() {
+        let leaked = format_singleton_contention(
+            "/repo/.kin",
+            Some(crate::lifecycle::SingletonLockHolder {
+                pid: 4242,
+                alive: false,
+            }),
+            &crate::lifecycle::StaleLockReclaim::Cleared(vec![std::path::PathBuf::from(
+                "/repo/.kin/daemon.lock",
+            )]),
+        );
+        assert!(
+            leaked.contains("leaked lock fd"),
+            "a dead recorded owner is a leaked fd, not a running daemon: {leaked}"
+        );
+        assert!(
+            leaked.contains("reclaimed 1 stale lock"),
+            "the reclaim that already ran must be reported: {leaked}"
+        );
+
+        let unknown = format_singleton_contention(
+            "/repo/.kin",
+            None,
+            &crate::lifecycle::StaleLockReclaim::OwnerUnknown,
+        );
+        assert!(
+            unknown.contains("names no owner"),
+            "an unidentifiable holder must be described as such, not guessed at: {unknown}"
+        );
     }
 
     // The embed worker keeps at most one flush in flight and always awaits it

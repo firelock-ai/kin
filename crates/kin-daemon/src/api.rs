@@ -249,6 +249,11 @@ pub struct HealthResponse {
     /// complete citable measurement source during this daemon lifetime.
     #[serde(default)]
     pub coordination_event_persist_failures: Option<u64>,
+    /// A cross-repo spine warm-up is loading sibling repository graphs right
+    /// now. The daemon is alive and serving its own repo throughout; this is
+    /// the signal that distinguishes "busy" from "dead".
+    #[serde(default)]
+    pub spine_warming: bool,
     pub build: BuildResponse,
 }
 
@@ -264,9 +269,14 @@ pub struct BuildResponse {
 }
 
 /// Readiness response.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, serde::Deserialize)]
 pub struct ReadinessResponse {
     pub ready: bool,
+    /// The daemon is alive and its own repo is served, but a cross-repo spine
+    /// warm-up is still materializing sibling graphs. Clients must read this as
+    /// alive-and-waiting; it is never evidence that the daemon is dead.
+    #[serde(default)]
+    pub warming: bool,
 }
 
 /// JSON-friendly intent payload for CLI and adapter consumers.
@@ -1746,6 +1756,7 @@ async fn health(
             ),
         ),
         coordination_event_persist_failures: Some(coordination_event_persist_failures),
+        spine_warming: state.spine_warming(),
         build: current_build_response(),
     }))
 }
@@ -1753,17 +1764,32 @@ async fn health(
 /// GET /readiness — returns 200 when initialized, 503 otherwise.
 /// An initialized daemon has either loaded a snapshot or completed at least
 /// one reconciliation cycle. An empty but initialized workspace is ready.
+///
+/// Readiness is deliberately independent of cross-repo spine warm-up: this
+/// daemon's own repo is what a client connecting to it needs served, and a
+/// sibling warm-up that gated readiness would report a busy daemon as a dead
+/// one. A warm-up in progress is reported through `warming` instead.
 async fn readiness(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
     let initialized = state
         .is_initialized
         .load(std::sync::atomic::Ordering::Relaxed);
+    let warming = state.spine_warming();
 
     if initialized {
-        (StatusCode::OK, Json(ReadinessResponse { ready: true }))
+        (
+            StatusCode::OK,
+            Json(ReadinessResponse {
+                ready: true,
+                warming,
+            }),
+        )
     } else {
         (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(ReadinessResponse { ready: false }),
+            Json(ReadinessResponse {
+                ready: false,
+                warming,
+            }),
         )
     }
 }
@@ -17168,6 +17194,93 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    // ── FIR-1583: readiness must survive a blocking warm-up ───────────────
+    //
+    // Sibling spine warm-up is a synchronous join that can run for minutes, and
+    // it is reached from async request handlers. Run inline it parks a runtime
+    // worker, and a daemon whose workers are all parked answers nothing — which
+    // is how a live, warming daemon came to look dead to a client and had its
+    // endpoint files clobbered.
+    //
+    // The runtime here has exactly one worker, so a warm-up that fails to release
+    // it starves everything. The assertion is made from the test thread (which is
+    // NOT on that runtime) with a hard wall-clock cap, so the old behavior fails
+    // this test in bounded time instead of hanging.
+    #[test]
+    fn readiness_is_answered_while_a_blocking_warm_up_holds_the_runtime() {
+        use std::sync::mpsc;
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("build single-worker runtime");
+
+        let state = runtime.block_on(async { test_state() });
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let (warm_started_tx, warm_started_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        runtime.spawn(async move {
+            crate::lifecycle::without_blocking_runtime_worker(move || {
+                let _ = warm_started_tx.send(());
+                // Bounded so a failing assertion below still lets the runtime
+                // shut down instead of wedging the test binary.
+                let _ = release_rx.recv_timeout(Duration::from_secs(30));
+            });
+        });
+        warm_started_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the warm-up must start");
+
+        let (answered_tx, answered_rx) = mpsc::channel::<StatusCode>();
+        let probe_state = Arc::clone(&state);
+        runtime.spawn(async move {
+            let response = router(probe_state)
+                .oneshot(Request::get("/readiness").body(Body::empty()).unwrap())
+                .await
+                .expect("readiness request");
+            let _ = answered_tx.send(response.status());
+        });
+
+        let status = answered_rx.recv_timeout(Duration::from_secs(10)).expect(
+            "readiness must be answered while a sibling warm-up blocks; a warm-up that \
+             holds the runtime worker makes a live daemon indistinguishable from a dead one",
+        );
+        assert_eq!(status, StatusCode::OK);
+
+        let _ = release_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn readiness_reports_the_warming_state_it_is_in() {
+        // Readiness is about this daemon's own repo, so it stays 200 during a
+        // cross-repo warm-up. `warming` is how a client learns the daemon is
+        // busy rather than idle — the signal that makes waiting the correct
+        // response instead of respawning.
+        let state = test_state();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let response = router(Arc::clone(&state))
+            .oneshot(Request::get("/readiness").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let readiness: ReadinessResponse = serde_json::from_slice(&body).unwrap();
+        assert!(readiness.ready);
+        assert!(
+            !readiness.warming,
+            "an idle daemon must not claim to be warming"
+        );
     }
 
     // -----------------------------------------------------------------------

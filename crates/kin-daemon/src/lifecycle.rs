@@ -7,6 +7,7 @@
 //! The CLI reads those files to connect. If the daemon isn't running, the
 //! CLI spawns it and waits for the port to open.
 
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -30,7 +31,76 @@ use tracing::info;
 /// while the first still believes it holds the lock.
 #[derive(Debug)]
 pub struct DaemonLock {
-    _file: std::fs::File,
+    file: std::fs::File,
+}
+
+impl Drop for DaemonLock {
+    /// Clear the owner stamp before releasing the lock.
+    ///
+    /// This is what makes the stamp mean something precise: a non-empty
+    /// `daemon.lock` body says a process took the lock and did *not* release it
+    /// cleanly. A clean exit runs this drop; a `SIGKILL` cannot, which is
+    /// exactly the case reclaim needs to identify. Without the clear, every
+    /// ordinary shutdown would leave a dead-owner record and the next startup
+    /// would "reclaim" locks that were never stale.
+    fn drop(&mut self) {
+        let _ = self.file.set_len(0);
+        let _ = self.file.flush();
+    }
+}
+
+/// Stamp the acquiring process's PID into the lock file body.
+///
+/// The flock lives on the open file description, so the file's *contents* are
+/// free real estate. Recording the owner there gives every other process a
+/// piece of evidence about who holds the repo that does not depend on
+/// `daemon.pid` surviving: `daemon.pid` is written by the daemon and can be
+/// removed by any other participant, while this stamp is written under the
+/// lock by the only process that could have taken it.
+fn stamp_lock_owner(file: &mut std::fs::File) {
+    let pid = std::process::id();
+    if file.set_len(0).is_err() {
+        return;
+    }
+    if file.seek(SeekFrom::Start(0)).is_err() {
+        return;
+    }
+    if write!(file, "{pid}").is_err() {
+        return;
+    }
+    let _ = file.flush();
+}
+
+/// Owner PID recorded inside `.kin/daemon.lock` by whichever process last
+/// acquired the lock, if present and parseable.
+///
+/// Unlike [`recorded_daemon_pid`], this record cannot be erased by a client
+/// clearing endpoint files, so it stays available exactly when `daemon.pid` is
+/// missing.
+pub fn lock_owner_pid(kin_root: &Path) -> Option<u32> {
+    std::fs::read_to_string(kin_root.join("daemon.lock"))
+        .ok()
+        .and_then(|content| content.trim().parse::<u32>().ok())
+}
+
+/// Who currently owns this repo's daemon lock, as far as on-disk evidence can
+/// say, and whether that process is still alive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SingletonLockHolder {
+    pub pid: u32,
+    pub alive: bool,
+}
+
+/// Resolve the recorded owner of the repo daemon lock from real process
+/// evidence: the lock file's own owner stamp first (it survives endpoint-file
+/// deletion), then `daemon.pid`. Returns `None` only when neither record
+/// exists.
+pub fn singleton_lock_holder(kin_root: &Path) -> Option<SingletonLockHolder> {
+    let pid = lock_owner_pid(kin_root).or_else(|| recorded_daemon_pid(kin_root))?;
+    Some(SingletonLockHolder {
+        pid,
+        alive: is_process_alive(pid),
+    })
 }
 
 /// Try to acquire the exclusive daemon lock for a repo.
@@ -46,14 +116,19 @@ pub struct DaemonLock {
 /// - `Err(_)` — an unexpected IO error opening the lock file.
 pub fn acquire_singleton_lock(kin_root: &Path) -> std::io::Result<Option<DaemonLock>> {
     let path = kin_root.join("daemon.lock");
-    let file = std::fs::OpenOptions::new()
+    let mut file = std::fs::OpenOptions::new()
         .create(true)
         .read(true)
         .write(true)
         .truncate(false)
         .open(&path)?;
     match file.try_lock_exclusive() {
-        Ok(()) => Ok(Some(DaemonLock { _file: file })),
+        Ok(()) => {
+            // Record ownership while holding the lock, so a contender that
+            // fails to acquire can always name the process it lost to.
+            stamp_lock_owner(&mut file);
+            Ok(Some(DaemonLock { file }))
+        }
         // fs2 reports contention with the platform's "would block" error
         // (EWOULDBLOCK on Unix). Treat that — and only that — as "already
         // held"; surface every other IO error to the caller.
@@ -61,6 +136,65 @@ pub fn acquire_singleton_lock(kin_root: &Path) -> std::io::Result<Option<DaemonL
         Err(err) => Err(err),
     }
 }
+
+/// Acquire the singleton lock, retrying for a bounded window while the lock is
+/// contended.
+///
+/// The handoff window between an exiting daemon and its successor is real but
+/// short: the kernel releases the flock as the old process dies, and a starter
+/// that gives up on the first `EWOULDBLOCK` turns that microsecond race into a
+/// user-visible refusal. Retry briefly, then stop — an unbounded retry would
+/// turn a genuine second daemon into a spinner instead of a loud error.
+///
+/// Returns `Ok(None)` when the lock is still held at the end of the window; the
+/// caller must then report the holder rather than start a second daemon.
+pub fn acquire_singleton_lock_within(
+    kin_root: &Path,
+    budget: Duration,
+) -> std::io::Result<Option<DaemonLock>> {
+    without_blocking_runtime_worker(|| {
+        let deadline = std::time::Instant::now() + budget;
+        loop {
+            if let Some(lock) = acquire_singleton_lock(kin_root)? {
+                return Ok(Some(lock));
+            }
+            if std::time::Instant::now() >= deadline {
+                return Ok(None);
+            }
+            std::thread::sleep(SINGLETON_LOCK_RETRY_INTERVAL);
+        }
+    })
+}
+
+/// Run a blocking step without holding a tokio worker thread hostage.
+///
+/// Daemon lifecycle has two of these: waiting out a contended singleton lock,
+/// and warming sibling repository graphs for the spine. Both are synchronous
+/// and both are reached from async contexts, and blocking the worker inline is
+/// what let a warm-up starve the daemon's own liveness routes — a client
+/// polling `/readiness` saw nothing, concluded the daemon was dead, and
+/// clobbered a live daemon's endpoint files. `block_in_place` hands this
+/// worker's remaining tasks to another thread first, so `/health` and
+/// `/readiness` keep being served throughout.
+///
+/// Outside a multi-thread runtime (a `current_thread` runtime, or no runtime at
+/// all, as in unit tests) there is no worker to hand off and `block_in_place`
+/// would panic, so the work runs directly.
+pub(crate) fn without_blocking_runtime_worker<T>(work: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(work)
+        }
+        _ => work(),
+    }
+}
+
+/// How long a contended starter keeps retrying the singleton lock before it
+/// reports the holder. Long enough to cover an exiting daemon's teardown,
+/// short enough that a genuine second daemon fails fast and loudly.
+pub const SINGLETON_LOCK_RETRY_BUDGET: Duration = Duration::from_secs(5);
+
+const SINGLETON_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 
 // ── Stale-Lock Reclaim ────────────────────────────────────────────────────
 
@@ -90,6 +224,32 @@ fn lock_files(kin_root: &Path) -> Vec<PathBuf> {
     locks
 }
 
+/// What a reclaim attempt concluded, and why.
+///
+/// Every variant is reported: a reclaim that declines must say which evidence
+/// made it decline, because the alternative — returning an empty list — reads
+/// to the caller exactly like "nothing was wrong here".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StaleLockReclaim {
+    /// The recorded owner is dead; these lock files were removed.
+    Cleared(Vec<PathBuf>),
+    /// A recorded owner is alive, so the locks are deliberately preserved.
+    OwnerAlive(u32),
+    /// Neither the lock file's owner stamp nor `daemon.pid` names an owner, so
+    /// liveness cannot be established and reclaiming would be a guess.
+    OwnerUnknown,
+}
+
+impl StaleLockReclaim {
+    /// Lock files actually removed; empty for every non-clearing outcome.
+    pub fn cleared(&self) -> &[PathBuf] {
+        match self {
+            Self::Cleared(paths) => paths,
+            _ => &[],
+        }
+    }
+}
+
 /// Reclaim stale lock files left behind when a daemon died while a forked child
 /// still held an inherited `flock(2)` fd.
 ///
@@ -100,28 +260,39 @@ fn lock_files(kin_root: &Path) -> Vec<PathBuf> {
 /// closes, so a fresh acquire then spuriously fails with `EWOULDBLOCK`
 /// (os error 35) even though no live daemon owns the repo.
 ///
-/// SAFETY: reclaim ONLY when the recorded owner PID is present **and dead**.
+/// SAFETY: reclaim ONLY when a recorded owner PID is present **and dead**.
 ///
 /// - A *live* owner means a real daemon holds the lock; unlinking would let a
 ///   second daemon lock a fresh inode and run concurrently — the very
 ///   singleton-multiplicity hazard `daemon.lock` exists to prevent.
-/// - An *absent* PID is ambiguous (a daemon mid-startup may hold the flock
-///   before stamping its PID), so it is treated conservatively as "do not
-///   reclaim" — refusing to start is always safe; reclaiming a live lock is not.
+/// - No recorded owner at all means liveness is unknowable from disk, so the
+///   locks stay and the gap is reported instead of silently swallowed.
+///
+/// Ownership is read from two independent records: the owner stamp written into
+/// `daemon.lock` under the lock itself, and `daemon.pid`. The stamp is what
+/// keeps this path working when `daemon.pid` is absent — a client that cleared
+/// endpoint files used to erase the only evidence, turning reclaim into a
+/// permanent no-op while the repo stayed wedged. If either record names a live
+/// process, nothing is touched.
 ///
 /// Unlinking a genuinely leaked-fd lock is safe: the next acquire creates a new
 /// inode, while the zombie child's flock stays on the now-orphaned old one.
-///
-/// Returns the lock files actually cleared (each logged loudly); empty when no
-/// reclaim was warranted.
-pub fn reclaim_stale_locks(kin_root: &Path) -> Vec<PathBuf> {
-    match recorded_daemon_pid(kin_root) {
-        // Present and dead → the unambiguous stale-owner record a SIGKILLed
-        // daemon leaves behind. Safe to reclaim.
-        Some(pid) if !is_process_alive(pid) => {}
-        // Present and alive, or absent → do not touch the locks.
-        _ => return Vec::new(),
+pub fn reclaim_stale_locks(kin_root: &Path) -> StaleLockReclaim {
+    let recorded: Vec<u32> = [lock_owner_pid(kin_root), recorded_daemon_pid(kin_root)]
+        .into_iter()
+        .flatten()
+        .collect();
+    if let Some(alive) = recorded.iter().copied().find(|pid| is_process_alive(*pid)) {
+        return StaleLockReclaim::OwnerAlive(alive);
     }
+    let Some(&dead_owner) = recorded.first() else {
+        tracing::warn!(
+            repo = %kin_root.display(),
+            "repo lock is contended but no owner is recorded in daemon.lock or daemon.pid; \
+             refusing to reclaim a lock whose holder cannot be identified"
+        );
+        return StaleLockReclaim::OwnerUnknown;
+    };
 
     let mut cleared = Vec::new();
     for lock in lock_files(kin_root) {
@@ -132,6 +303,7 @@ pub fn reclaim_stale_locks(kin_root: &Path) -> Vec<PathBuf> {
             Ok(()) => {
                 tracing::warn!(
                     lock = %lock.display(),
+                    owner_pid = dead_owner,
                     "reclaimed stale repo lock left by a dead daemon owner"
                 );
                 cleared.push(lock);
@@ -145,7 +317,7 @@ pub fn reclaim_stale_locks(kin_root: &Path) -> Vec<PathBuf> {
             }
         }
     }
-    cleared
+    StaleLockReclaim::Cleared(cleared)
 }
 
 // ── Daemon State Files ──────────────────────────────────────────────────
@@ -710,8 +882,12 @@ mod tests {
         std::fs::write(root.join("daemon.lock"), b"").unwrap();
         std::fs::write(root.join("kindb").join("graph.lock"), b"").unwrap();
 
-        let cleared = reclaim_stale_locks(root);
-        assert_eq!(cleared.len(), 2, "both stale locks should be reclaimed");
+        let reclaim = reclaim_stale_locks(root);
+        assert_eq!(
+            reclaim.cleared().len(),
+            2,
+            "both stale locks should be reclaimed"
+        );
         assert!(!root.join("daemon.lock").exists());
         assert!(!root.join("kindb").join("graph.lock").exists());
 
@@ -736,8 +912,9 @@ mod tests {
         std::fs::write(root.join("daemon.lock"), b"").unwrap();
         std::fs::write(root.join("kindb").join("graph.lock"), b"").unwrap();
 
-        assert!(
-            reclaim_stale_locks(root).is_empty(),
+        assert_eq!(
+            reclaim_stale_locks(root),
+            StaleLockReclaim::OwnerAlive(std::process::id()),
             "live-owner locks must be preserved"
         );
         assert!(root.join("daemon.lock").exists());
@@ -745,19 +922,197 @@ mod tests {
     }
 
     #[test]
-    fn reclaim_is_noop_without_recorded_owner() {
-        // No daemon.pid is ambiguous (a daemon may hold the flock before
-        // stamping its PID), so the conservative choice is to NOT reclaim:
-        // refusing to start is always safe; reclaiming a live lock is not.
+    fn reclaim_is_noop_without_any_recorded_owner() {
+        // Neither record names an owner, so liveness cannot be established and
+        // reclaiming would be a guess. Refusing to start is always safe;
+        // reclaiming a live lock is not. The outcome is reported as
+        // OwnerUnknown rather than an empty list, so the caller can say why.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         std::fs::create_dir_all(root.join("kindb")).unwrap();
         std::fs::write(root.join("daemon.lock"), b"").unwrap();
         std::fs::write(root.join("kindb").join("graph.lock"), b"").unwrap();
 
-        assert!(reclaim_stale_locks(root).is_empty());
+        assert_eq!(reclaim_stale_locks(root), StaleLockReclaim::OwnerUnknown);
         assert!(root.join("daemon.lock").exists());
         assert!(root.join("kindb").join("graph.lock").exists());
+    }
+
+    // ── FIR-1583: reclaim must work without daemon.pid ────────────────────
+    //
+    // The deadlock chain ended here: a client cleared a live daemon's endpoint
+    // files, so when that daemon later died by SIGKILL there was no daemon.pid
+    // left, reclaim had no owner to evaluate, and every subsequent start lost
+    // the leaked flock forever. The lock file's own owner stamp is the evidence
+    // that survives, because only the process holding the lock can write it.
+
+    #[test]
+    fn singleton_lock_stamps_its_owner_pid() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        let lock = acquire_singleton_lock(root)
+            .expect("lock IO should succeed")
+            .expect("first acquire should win");
+        assert_eq!(
+            lock_owner_pid(root),
+            Some(std::process::id()),
+            "the acquiring process must record itself in the lock file"
+        );
+        drop(lock);
+    }
+
+    #[test]
+    fn releasing_the_lock_clears_the_owner_stamp() {
+        // A clean release must leave no dead-owner record: otherwise every
+        // ordinary restart would look like a crashed predecessor and "reclaim"
+        // locks that were never stale.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        let lock = acquire_singleton_lock(root)
+            .expect("lock IO should succeed")
+            .expect("first acquire should win");
+        drop(lock);
+
+        assert_eq!(
+            lock_owner_pid(root),
+            None,
+            "a cleanly released lock must not name an owner"
+        );
+        assert_eq!(reclaim_stale_locks(root), StaleLockReclaim::OwnerUnknown);
+        assert!(
+            root.join("daemon.lock").exists(),
+            "a clean release must not make the next startup reclaim anything"
+        );
+    }
+
+    #[test]
+    fn reclaim_uses_the_lock_owner_stamp_when_daemon_pid_is_missing() {
+        // The exact deadlock state: a dead owner recorded only in the lock
+        // file, because daemon.pid was removed by someone else. Before the
+        // stamp existed this returned "nothing to do" and the repo stayed
+        // wedged until the leaked fd closed.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("kindb")).unwrap();
+        std::fs::write(root.join("daemon.lock"), "999999999").unwrap();
+        std::fs::write(root.join("kindb").join("graph.lock"), b"").unwrap();
+        assert!(
+            !root.join("daemon.pid").exists(),
+            "this is the missing-pid case"
+        );
+
+        let reclaim = reclaim_stale_locks(root);
+        assert_eq!(
+            reclaim.cleared().len(),
+            2,
+            "a dead owner named only by the lock stamp must still be reclaimable"
+        );
+        assert!(!root.join("daemon.lock").exists());
+        assert!(!root.join("kindb").join("graph.lock").exists());
+    }
+
+    #[test]
+    fn reclaim_refuses_when_the_lock_stamp_names_a_live_owner() {
+        // Same missing-pid shape, live owner. Reclaiming here would let a
+        // second daemon lock a fresh inode and run concurrently.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("kindb")).unwrap();
+        std::fs::write(root.join("daemon.lock"), std::process::id().to_string()).unwrap();
+        std::fs::write(root.join("kindb").join("graph.lock"), b"").unwrap();
+
+        assert_eq!(
+            reclaim_stale_locks(root),
+            StaleLockReclaim::OwnerAlive(std::process::id())
+        );
+        assert!(root.join("daemon.lock").exists());
+        assert!(root.join("kindb").join("graph.lock").exists());
+    }
+
+    #[test]
+    fn reclaim_refuses_when_only_the_pid_file_names_a_live_owner() {
+        // Evidence is a union, not a preference: a live owner in either record
+        // must veto the reclaim.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("kindb")).unwrap();
+        std::fs::write(root.join("daemon.lock"), "999999999").unwrap();
+        std::fs::write(root.join("daemon.pid"), std::process::id().to_string()).unwrap();
+
+        assert_eq!(
+            reclaim_stale_locks(root),
+            StaleLockReclaim::OwnerAlive(std::process::id())
+        );
+        assert!(root.join("daemon.lock").exists());
+    }
+
+    #[test]
+    fn lock_holder_is_named_from_the_stamp_without_a_pid_file() {
+        // What the contention error needs: identify the holder so the refusal
+        // can name a process instead of saying "another daemon owns this repo".
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("daemon.lock"), std::process::id().to_string()).unwrap();
+
+        let holder = singleton_lock_holder(root).expect("stamp identifies the holder");
+        assert_eq!(holder.pid, std::process::id());
+        assert!(holder.alive);
+
+        std::fs::write(root.join("daemon.lock"), "999999999").unwrap();
+        let dead = singleton_lock_holder(root).expect("stamp identifies the holder");
+        assert_eq!(dead.pid, 999999999);
+        assert!(!dead.alive);
+    }
+
+    #[test]
+    fn bounded_retry_gives_up_instead_of_spinning_forever() {
+        // The loser retries to cover an exiting daemon's teardown, then stops.
+        // An unbounded retry would replace a loud error with a hang.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let held = acquire_singleton_lock(root)
+            .expect("lock IO should succeed")
+            .expect("first acquire should win");
+
+        let started = std::time::Instant::now();
+        let budget = Duration::from_millis(300);
+        let contended = acquire_singleton_lock_within(root, budget).expect("lock IO should succeed");
+
+        assert!(contended.is_none(), "a held lock must not be handed out");
+        assert!(
+            started.elapsed() >= budget,
+            "the retry must actually cover its budget"
+        );
+        assert!(
+            started.elapsed() < budget * 20,
+            "the retry must be bounded, not a spin"
+        );
+        drop(held);
+    }
+
+    #[test]
+    fn bounded_retry_wins_once_the_holder_releases() {
+        // The handoff case the retry exists for.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let held = acquire_singleton_lock(&root)
+            .expect("lock IO should succeed")
+            .expect("first acquire should win");
+
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            drop(held);
+        });
+
+        let acquired = acquire_singleton_lock_within(&root, Duration::from_secs(10))
+            .expect("lock IO should succeed");
+        assert!(
+            acquired.is_some(),
+            "the successor must take the lock once the holder releases"
+        );
+        releaser.join().expect("releaser thread");
     }
 
     #[test]

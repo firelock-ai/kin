@@ -32,6 +32,12 @@ pub enum DaemonError {
     #[error("Already running")]
     AlreadyRunning,
 
+    /// A second daemon lost the per-repo singleton lock. Carries the actionable
+    /// text naming the holder; a bare "already running" told the operator
+    /// nothing about which process to wait for or stop.
+    #[error("{0}")]
+    RepoOwnedByAnotherDaemon(String),
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 }
