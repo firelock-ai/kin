@@ -961,12 +961,21 @@ pub struct DaemonState {
     /// - `InMemorySpineBackend`: local dev / single daemon (default)
     /// - `FirestoreSpineBackend`: cloud / stateless daemon pool (when GOOGLE_CLOUD_PROJECT is set)
     pub spine: std::sync::OnceLock<Arc<dyn kin_spine::SpineBackend>>,
-    /// True while lazy spine initialization is loading sibling repository
-    /// graphs. This is the daemon's honest "busy warming" signal: the process
-    /// is alive and its own repo is served, but a cross-repo surface is still
-    /// materializing. Clients must treat it as alive-and-waiting, never as a
-    /// dead endpoint.
+    /// Serializes the complete lazy initialization pass. `OnceLock` serializes
+    /// publication only; without this gate, multiple callers can concurrently
+    /// perform the full O(graph) capture/load/build pass and one warm guard can
+    /// clear the shared signal while another initializer is still running.
+    spine_initialization: Mutex<()>,
+    /// True throughout the complete lazy spine initialization pass, including
+    /// primary capture, sibling loading, edge construction, and publication.
+    /// This is the daemon's honest "busy warming" signal: the process is alive
+    /// and its own repo is served, but a cross-repo surface is materializing.
+    /// Clients must treat it as alive-and-waiting, never as a dead endpoint.
     spine_warming: AtomicBool,
+    /// Deterministic blocking seam for concurrency and runtime-starvation
+    /// regression tests. Production initialization has no injected hook.
+    #[cfg(test)]
+    spine_initialization_test_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// Serializes hosted repo registration and all-repo edge refresh passes.
     /// The backend independently keeps a pass-wide incomplete lease; this gate
     /// prevents daemon request paths from racing that lease with a new ingest.
@@ -1751,7 +1760,10 @@ impl DaemonState {
             event_tx: tokio::sync::broadcast::channel(256).0,
             session_scopes: RwLock::new(HashMap::new()),
             spine: std::sync::OnceLock::new(),
+            spine_initialization: Mutex::new(()),
             spine_warming: AtomicBool::new(false),
+            #[cfg(test)]
+            spine_initialization_test_hook: Mutex::new(None),
             spine_refresh_gate: tokio::sync::Mutex::new(()),
             repo_graphs: RwLock::new(HashMap::new()),
             allowed_repo_ids: None,
@@ -1916,7 +1928,10 @@ impl DaemonState {
             event_tx: tokio::sync::broadcast::channel(256).0,
             session_scopes: RwLock::new(HashMap::new()),
             spine: std::sync::OnceLock::new(),
+            spine_initialization: Mutex::new(()),
             spine_warming: AtomicBool::new(false),
+            #[cfg(test)]
+            spine_initialization_test_hook: Mutex::new(None),
             spine_refresh_gate: tokio::sync::Mutex::new(()),
             repo_graphs: RwLock::new(HashMap::new()), // populated below
             allowed_repo_ids,
@@ -2001,7 +2016,19 @@ impl DaemonState {
             return None;
         }
         if self.spine.get().is_none() {
-            self.initialize_spine_lazy();
+            // The entire synchronous O(graph) pass belongs inside the Tokio
+            // blocking handoff, not only the sibling thread join buried within
+            // it. The mutex is acquired there too so a contending initializer
+            // cannot park another async worker.
+            without_blocking_runtime_worker(|| {
+                let _initialization = self
+                    .spine_initialization
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if self.spine.get().is_none() {
+                    self.initialize_spine_lazy();
+                }
+            });
         }
         self.spine.get().map(|s| s.as_ref())
     }
@@ -2099,7 +2126,8 @@ impl DaemonState {
 
     /// Lazily initialize the spine from the loaded graph and startup-pinned
     /// sibling authority capabilities.
-    /// Called by `ensure_spine()` on first access. Thread-safe via `OnceLock`.
+    /// Called by `ensure_spine()` on first access while holding
+    /// `spine_initialization`; `OnceLock` remains the publication edge.
     ///
     /// Backend selection:
     /// - If `GOOGLE_CLOUD_PROJECT` is set AND the `firestore` feature is enabled
@@ -2110,10 +2138,20 @@ impl DaemonState {
         self.initialize_spine_lazy_with_publication_hook(|| {});
     }
 
-    /// Whether lazy spine initialization is currently loading sibling
-    /// repository graphs.
+    /// Whether a complete lazy spine initialization pass is in progress.
     pub fn spine_warming(&self) -> bool {
         self.spine_warming.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_spine_initialization_test_hook(
+        &self,
+        hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) {
+        *self
+            .spine_initialization_test_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = hook;
     }
 
     fn load_registered_workspace_graph(
@@ -2149,6 +2187,21 @@ impl DaemonState {
             return;
         }
 
+        // Announce the warm-up before any O(graph) capture or construction so
+        // liveness surfaces remain honest for the complete blocking pass. The
+        // serialization gate around this method guarantees only one guard can
+        // exist, and Drop clears it on every exit path including a panic.
+        let _warming = SpineWarmGuard::arm(&self.spine_warming);
+        #[cfg(test)]
+        if let Some(hook) = self
+            .spine_initialization_test_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        {
+            hook();
+        }
+
         // Capture the mutable primary before constructing or publishing the
         // OnceLock value. A busy writer therefore leaves the spine uninitialized
         // and the next request retries instead of permanently caching an empty
@@ -2168,11 +2221,6 @@ impl DaemonState {
         let mut captures = vec![primary];
         let mut authority_incomplete = self.registered_local_repository_authority_incomplete;
 
-        // Announce the warm-up before the first sibling load so liveness
-        // surfaces can report "alive and warming" for its whole duration. The
-        // guard clears the flag on every exit path, including a panic.
-        let _warming = SpineWarmGuard::arm(&self.spine_warming);
-
         // Capture only sibling capabilities frozen during startup. Lazy
         // initialization may load graph bytes, but cannot rediscover registry
         // paths, manifests, or storage roots from a request.
@@ -2184,15 +2232,12 @@ impl DaemonState {
                 .spawn(move || Self::load_registered_workspace_graph(&binding))
                 .map_err(|error| format!("spawn sibling authority load: {error}"))
                 .and_then(|handle| {
-                    // Wait for the sibling load without holding a runtime
-                    // worker: this join can run for minutes on a large
-                    // registered repo, and readiness must stay answerable
-                    // throughout.
-                    without_blocking_runtime_worker(|| {
-                        handle
-                            .join()
-                            .map_err(|_| "sibling authority loader panicked".to_string())
-                    })
+                    // `ensure_spine` handed off the complete initialization pass
+                    // before reaching this join, so no nested runtime blocking
+                    // handoff is needed here.
+                    handle
+                        .join()
+                        .map_err(|_| "sibling authority loader panicked".to_string())
                 })
                 .and_then(|result| result);
 
@@ -5101,6 +5146,87 @@ mod tests {
         assert!(retried, "the next request must retry initialization");
         assert_eq!(registered_root.as_deref(), Some(expected_root.as_str()));
         assert!(registered_entity);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn concurrent_spine_callers_share_one_truthful_initialization() {
+        use std::sync::{mpsc, Condvar};
+
+        let registry_dir = tempfile::tempdir().unwrap();
+        let registry_path = registry_dir.path().join("registry.toml");
+        kin_core::registry::KinRegistry { repos: Vec::new() }
+            .save_to(&registry_path)
+            .unwrap();
+        let prev_registry = std::env::var_os("KIN_REGISTRY_PATH");
+        let prev_disable = std::env::var_os("KIN_DISABLE_SPINE");
+        std::env::set_var("KIN_REGISTRY_PATH", &registry_path);
+        std::env::remove_var("KIN_DISABLE_SPINE");
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let state = Arc::new(test_state(init.layout, repo_dir.path()));
+        let hook_calls = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let hook_calls_for_hook = Arc::clone(&hook_calls);
+        let release_for_hook = Arc::clone(&release);
+        state.set_spine_initialization_test_hook(Some(Arc::new(move || {
+            hook_calls_for_hook.fetch_add(1, Ordering::SeqCst);
+            let _ = entered_tx.send(());
+            let (released, wake) = &*release_for_hook;
+            let released = released
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _ = wake
+                .wait_timeout_while(released, Duration::from_secs(120), |released| !*released)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        })));
+
+        let first_state = Arc::clone(&state);
+        let first = std::thread::spawn(move || first_state.ensure_spine().is_some());
+        entered_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("first initializer must enter the blocking seam");
+        assert!(
+            state.spine_warming(),
+            "the daemon must report warming for the blocked initialization"
+        );
+
+        let second_state = Arc::clone(&state);
+        let second = std::thread::spawn(move || second_state.ensure_spine().is_some());
+        std::thread::sleep(Duration::from_millis(250));
+        let calls_while_blocked = hook_calls.load(Ordering::SeqCst);
+
+        let (released, wake) = &*release;
+        *released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        wake.notify_all();
+        assert!(first.join().unwrap(), "first caller must publish the spine");
+        assert!(
+            second.join().unwrap(),
+            "second caller must reuse the published spine"
+        );
+
+        match prev_registry {
+            Some(value) => std::env::set_var("KIN_REGISTRY_PATH", value),
+            None => std::env::remove_var("KIN_REGISTRY_PATH"),
+        }
+        match prev_disable {
+            Some(value) => std::env::set_var("KIN_DISABLE_SPINE", value),
+            None => std::env::remove_var("KIN_DISABLE_SPINE"),
+        }
+
+        assert_eq!(
+            calls_while_blocked, 1,
+            "OnceLock publication alone must not allow duplicate O(graph) initializers"
+        );
+        assert_eq!(hook_calls.load(Ordering::SeqCst), 1);
+        assert!(
+            !state.spine_warming(),
+            "warming must clear only after the sole initializer exits"
+        );
     }
 
     #[test]

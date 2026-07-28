@@ -74,6 +74,11 @@ pub struct HealthResponse {
     pub reconciliation_status: String,
     #[serde(default)]
     pub repo_id: Option<String>,
+    /// Exact local workspace authority served by the daemon. Two clones share
+    /// `repo_id`, so repository identity alone can never authorize routing a
+    /// local command to an endpoint.
+    #[serde(default)]
+    pub workspace_id: Option<String>,
     #[serde(default)]
     pub repo_root: Option<String>,
     #[serde(default)]
@@ -1613,11 +1618,35 @@ pub fn daemon_required() -> bool {
 pub fn is_process_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
-        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+        let Ok(pid) = libc::pid_t::try_from(pid) else {
+            return false;
+        };
+        if unsafe { libc::kill(pid, 0) } == 0 {
+            return true;
+        }
+        std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+
+        let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if process.is_null() {
+            return false;
+        }
+        let mut code = 0;
+        let queried = unsafe { GetExitCodeProcess(process, &mut code) } != 0;
+        let _ = unsafe { CloseHandle(process) };
+        queried && code == STILL_ACTIVE as u32
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = pid;
+        // Unknown targets have no reliable process primitive here. Preserve
+        // ownership rather than guessing "dead" and deleting live authority.
         true
     }
 }
@@ -2068,17 +2097,34 @@ fn strict_canonical_path(path: &Path) -> Option<String> {
     path.canonicalize().ok().map(|p| p.display().to_string())
 }
 
-/// The repository identity recorded in this repo's own manifest.
+/// Repository and workspace identity recorded in this repo's own manifest.
 ///
 /// Startup configuration IO at an explicit boundary, not a semantic answer path:
-/// it reads the local manifest to learn which repository the caller is standing
-/// in, so a daemon's self-reported identity can be compared against something
-/// stronger than a rendered path.
-fn local_repo_identity(kin_root: &Path) -> Option<String> {
+/// it reads the local manifest to learn which exact workspace the caller is
+/// standing in, so a daemon's self-reported identity can be compared against
+/// something stronger than a rendered path.
+struct LocalWorkspaceIdentity {
+    repo_id: String,
+    workspace_id: Option<String>,
+}
+
+fn local_workspace_identity(kin_root: &Path) -> Option<LocalWorkspaceIdentity> {
     kin_core::manifest::KinManifest::load(&kin_root.join("manifest.json"))
         .ok()
-        .map(|manifest| manifest.repo_id)
-        .filter(|repo_id| !repo_id.trim().is_empty())
+        .and_then(|manifest| {
+            let repo_id = manifest.repo_id.trim();
+            if repo_id.is_empty() {
+                return None;
+            }
+            let workspace_id = match manifest.workspace_id.trim() {
+                "" => None,
+                workspace_id => Some(workspace_id.to_string()),
+            };
+            Some(LocalWorkspaceIdentity {
+                repo_id: repo_id.to_string(),
+                workspace_id,
+            })
+        })
 }
 
 /// What a `/health` body establishes about whether this daemon serves this repo.
@@ -2095,13 +2141,14 @@ enum RepoIdentity {
 
 /// Decide whether a health body identifies this repo, with no silent fallback.
 ///
-/// Identity is compared strongest-first. The manifest repository id is exact
-/// (the daemon asserts its own `repo_id` equals its manifest's at open time), so
-/// when both sides carry one the comparison is conclusive in either direction.
-/// Only when an id is unavailable does this fall back to paths, and then both
-/// sides must resolve before a difference counts as evidence — `/tmp` against
+/// Identity is compared strongest-first. A repository id establishes shared
+/// repository truth, but not local authority: two clones deliberately share
+/// `repo_id` and carry distinct `workspace_id` values. When both sides carry
+/// workspace identity, that exact pair is conclusive. Older daemons that do not
+/// report a workspace id fall back to canonical paths, and both sides must
+/// resolve before a difference counts as evidence — `/tmp` against
 /// `/private/tmp` on macOS, or a symlinked worktree, is an aliasing artifact and
-/// not a different repository.
+/// not a different workspace.
 fn classify_health_repo(
     health: &HealthResponse,
     kin_root: &Path,
@@ -2111,17 +2158,49 @@ fn classify_health_repo(
         return RepoIdentity::Rejected(format!("daemon health status is {}", health.status));
     }
 
-    let reported_id = health
+    let reported_repo_id = health
         .repo_id
         .as_deref()
         .map(str::trim)
         .filter(|id| !id.is_empty());
-    if let (Some(reported), Some(expected)) = (reported_id, local_repo_identity(kin_root)) {
-        return if reported == expected {
+    let reported_workspace_id = health
+        .workspace_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty());
+    let local_identity = local_workspace_identity(kin_root);
+
+    if let (Some(reported_repo), Some(expected)) = (reported_repo_id, local_identity.as_ref()) {
+        if reported_repo != expected.repo_id {
+            return RepoIdentity::Rejected(format!(
+                "daemon repo mismatch: endpoint serves repository {reported_repo}, expected {}",
+                expected.repo_id
+            ));
+        }
+        if let (Some(reported_workspace), Some(expected_workspace)) =
+            (reported_workspace_id, expected.workspace_id.as_deref())
+        {
+            return if reported_workspace == expected_workspace {
+                RepoIdentity::Matches
+            } else {
+                RepoIdentity::Rejected(format!(
+                    "daemon workspace mismatch: endpoint serves workspace {reported_workspace}, \
+                     expected {expected_workspace}"
+                ))
+            };
+        }
+    } else if let (Some(reported_workspace), Some(expected_workspace)) = (
+        reported_workspace_id,
+        local_identity
+            .as_ref()
+            .and_then(|identity| identity.workspace_id.as_deref()),
+    ) {
+        return if reported_workspace == expected_workspace {
             RepoIdentity::Matches
         } else {
             RepoIdentity::Rejected(format!(
-                "daemon repo mismatch: endpoint serves repository {reported}, expected {expected}"
+                "daemon workspace mismatch: endpoint serves workspace {reported_workspace}, \
+                 expected {expected_workspace}"
             ))
         };
     }
@@ -2349,6 +2428,13 @@ async fn probe_daemon_endpoint(
 
         let probe_error = match client.get(format!("{base_url}/readiness")).send().await {
             Ok(resp) if resp.status().is_success() => {
+                // Successful readiness carries the warming signal too. Parse it
+                // before the health probe: a daemon can answer readiness and
+                // then be too busy to complete the second request, and that is
+                // exactly when retaining "warming" makes the diagnostic honest.
+                if let Ok(readiness) = resp.json::<ReadinessResponse>().await {
+                    warming = readiness.warming;
+                }
                 match probe_health_for_repo(&client, &base_url, kin_root, working_dir).await {
                     HealthProbe::Matches => return EndpointVerdict::Serving(base_url),
                     // The daemon answered and identified itself as something
@@ -3489,7 +3575,9 @@ mod tests {
     ///
     /// Stands in for a live daemon too busy to complete a second request.
     /// Returns its port and the task serving it.
-    async fn daemon_answering_readiness_but_not_health() -> (u16, tokio::task::JoinHandle<()>) {
+    async fn daemon_answering_readiness_but_not_health(
+        warming: bool,
+    ) -> (u16, tokio::task::JoinHandle<()>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3505,7 +3593,7 @@ mod tests {
                 };
                 let request = String::from_utf8_lossy(&buf[..read]).to_string();
                 if request.contains("/readiness") {
-                    let body = r#"{"ready":true,"warming":false}"#;
+                    let body = format!(r#"{{"ready":true,"warming":{warming}}}"#);
                     let _ = socket
                         .write_all(
                             format!(
@@ -3531,7 +3619,7 @@ mod tests {
         // treating it as proof would clobber the live daemon all over again.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let (port, server) = daemon_answering_readiness_but_not_health().await;
+        let (port, server) = daemon_answering_readiness_but_not_health(false).await;
         write_endpoint_files(root, std::process::id(), port);
 
         let verdict = wait_for_existing_daemon_within(
@@ -3548,6 +3636,35 @@ mod tests {
         assert!(
             root.join("daemon.pid").exists() && root.join("daemon.port").exists(),
             "endpoint files must survive an unanswered health probe"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_successful_readiness_body_retains_warming_when_health_drops() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (port, server) = daemon_answering_readiness_but_not_health(true).await;
+        write_endpoint_files(root, std::process::id(), port);
+
+        let ExistingDaemon::LiveNotReady(message) = wait_for_existing_daemon_within(
+            root,
+            Duration::from_millis(50),
+            Duration::from_millis(400),
+        )
+        .await
+        else {
+            panic!("a live warming daemon must remain LiveNotReady when health drops");
+        };
+
+        assert!(
+            message.contains("warming"),
+            "the successful readiness body's warming signal must survive a failed health probe: \
+             {message}"
+        );
+        assert!(
+            root.join("daemon.pid").exists() && root.join("daemon.port").exists(),
+            "a warming daemon's endpoint files must be preserved"
         );
         server.abort();
     }
@@ -3656,7 +3773,11 @@ mod tests {
     // comparison is not that: two spellings of one directory are an aliasing
     // artifact, and a path that will not resolve is no information at all.
 
-    fn health_naming(repo_id: Option<&str>, repo_root: Option<String>) -> HealthResponse {
+    fn health_naming(
+        repo_id: Option<&str>,
+        workspace_id: Option<&str>,
+        repo_root: Option<String>,
+    ) -> HealthResponse {
         HealthResponse {
             status: "ok".to_string(),
             version: "test".to_string(),
@@ -3665,6 +3786,7 @@ mod tests {
             graph_loaded: false,
             reconciliation_status: "idle".to_string(),
             repo_id: repo_id.map(str::to_string),
+            workspace_id: workspace_id.map(str::to_string),
             repo_root,
             pid: Some(std::process::id()),
             behavior_env: Default::default(),
@@ -3687,7 +3809,7 @@ mod tests {
         std::os::unix::fs::symlink(&real, &alias).unwrap();
 
         // The daemon reports the resolved path; the client holds the alias.
-        let health = health_naming(None, Some(strict_canonical_path(&real).unwrap()));
+        let health = health_naming(None, None, Some(strict_canonical_path(&real).unwrap()));
         assert_eq!(
             classify_health_repo(&health, &alias.join(".kin"), &alias),
             RepoIdentity::Matches,
@@ -3700,7 +3822,7 @@ mod tests {
         // Fail-open was the old behavior: an absent repo_root skipped the check
         // entirely and any daemon passed identity validation.
         let dir = tempfile::tempdir().unwrap();
-        let health = health_naming(None, None);
+        let health = health_naming(None, None, None);
         assert!(
             matches!(
                 classify_health_repo(&health, &dir.path().join(".kin"), dir.path()),
@@ -3713,7 +3835,7 @@ mod tests {
     #[test]
     fn an_unresolvable_repo_root_is_indeterminate_not_a_mismatch() {
         let dir = tempfile::tempdir().unwrap();
-        let health = health_naming(None, Some("/nonexistent/kin/repo/path".to_string()));
+        let health = health_naming(None, None, Some("/nonexistent/kin/repo/path".to_string()));
         assert!(
             matches!(
                 classify_health_repo(&health, &dir.path().join(".kin"), dir.path()),
@@ -3729,7 +3851,11 @@ mod tests {
         // genuinely name different directories.
         let mine = tempfile::tempdir().unwrap();
         let theirs = tempfile::tempdir().unwrap();
-        let health = health_naming(None, Some(strict_canonical_path(theirs.path()).unwrap()));
+        let health = health_naming(
+            None,
+            None,
+            Some(strict_canonical_path(theirs.path()).unwrap()),
+        );
         assert!(
             matches!(
                 classify_health_repo(&health, &mine.path().join(".kin"), mine.path()),
@@ -3740,9 +3866,10 @@ mod tests {
     }
 
     #[test]
-    fn a_manifest_repository_id_decides_before_any_path_does() {
-        // The exact identity both sides already carry. When it is available it
-        // is conclusive in both directions and no path spelling is consulted.
+    fn workspace_identity_decides_local_authority_within_a_repository() {
+        // Repository identity proves shared history, not local endpoint
+        // authority. Two clones carry the same repo id and different workspace
+        // ids, so only the pair can decide before paths.
         let dir = tempfile::tempdir().unwrap();
         let kin_root = dir.path().join(".kin");
         std::fs::create_dir_all(&kin_root).unwrap();
@@ -3758,9 +3885,11 @@ mod tests {
         )
         .unwrap();
 
-        // Same id, and a repo_root that would have failed a path comparison.
+        // Same repo and workspace, even though repo_root would fail a path
+        // comparison.
         let same = health_naming(
             Some("11111111-1111-4111-8111-111111111111"),
+            Some("22222222-2222-4222-8222-222222222222"),
             Some("/some/other/spelling".to_string()),
         );
         assert_eq!(
@@ -3768,21 +3897,49 @@ mod tests {
             RepoIdentity::Matches
         );
 
-        // Different id, and a repo_root that would have passed one.
-        let other = health_naming(
+        // Same repository but a different workspace must be rejected even
+        // when the path would otherwise pass.
+        let other_workspace = health_naming(
+            Some("11111111-1111-4111-8111-111111111111"),
             Some("33333333-3333-4333-8333-333333333333"),
             Some(strict_canonical_path(dir.path()).unwrap()),
         );
         assert!(matches!(
-            classify_health_repo(&other, &kin_root, dir.path()),
-            RepoIdentity::Rejected(_)
+            classify_health_repo(&other_workspace, &kin_root, dir.path()),
+            RepoIdentity::Rejected(ref reason) if reason.contains("workspace mismatch")
+        ));
+
+        // Different repository remains conclusive even if workspace and path
+        // are made to look local.
+        let other_repo = health_naming(
+            Some("33333333-3333-4333-8333-333333333333"),
+            Some("22222222-2222-4222-8222-222222222222"),
+            Some(strict_canonical_path(dir.path()).unwrap()),
+        );
+        assert!(matches!(
+            classify_health_repo(&other_repo, &kin_root, dir.path()),
+            RepoIdentity::Rejected(ref reason) if reason.contains("repo mismatch")
+        ));
+
+        // An old daemon with no workspace id gets only the legacy path
+        // fallback. Matching repo ids do not bypass a proven path mismatch.
+        let other_dir = tempfile::tempdir().unwrap();
+        let old_daemon = health_naming(
+            Some("11111111-1111-4111-8111-111111111111"),
+            None,
+            Some(strict_canonical_path(other_dir.path()).unwrap()),
+        );
+        assert!(matches!(
+            classify_health_repo(&old_daemon, &kin_root, dir.path()),
+            RepoIdentity::Rejected(ref reason) if reason.contains("repo mismatch")
         ));
     }
 
     #[test]
     fn a_non_serving_status_is_still_a_real_answer() {
         let dir = tempfile::tempdir().unwrap();
-        let mut health = health_naming(None, Some(strict_canonical_path(dir.path()).unwrap()));
+        let mut health =
+            health_naming(None, None, Some(strict_canonical_path(dir.path()).unwrap()));
         health.status = "starting".to_string();
         assert!(matches!(
             classify_health_repo(&health, &dir.path().join(".kin"), dir.path()),
@@ -3832,6 +3989,23 @@ mod tests {
     }
 
     #[test]
+    fn process_liveness_recognizes_the_current_process() {
+        assert!(
+            is_process_alive(std::process::id()),
+            "the current process must be observable as alive"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_process_liveness_rejects_a_missing_process() {
+        assert!(
+            !is_process_alive(u32::MAX),
+            "an unopenable Windows process id must not wedge daemon ownership forever"
+        );
+    }
+
+    #[test]
     fn daemon_is_up_returns_listening_port() {
         let dir = tempfile::tempdir().unwrap();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -3869,6 +4043,7 @@ mod tests {
             graph_loaded: false,
             reconciliation_status: "idle".to_string(),
             repo_id: Some("wrong".to_string()),
+            workspace_id: None,
             repo_root: Some(canonical_path_string(other.path())),
             pid: Some(std::process::id()),
             behavior_env: Default::default(),
@@ -3888,6 +4063,7 @@ mod tests {
             graph_loaded: false,
             reconciliation_status: "idle".to_string(),
             repo_id: Some("repo".to_string()),
+            workspace_id: None,
             repo_root: Some(canonical_path_string(repo_root)),
             pid: Some(std::process::id()),
             behavior_env: Default::default(),

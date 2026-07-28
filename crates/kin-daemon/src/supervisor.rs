@@ -269,15 +269,7 @@ fn discover_supervisor_url(failing: Option<&str>) -> Option<String> {
 }
 
 fn is_process_alive(pid: u32) -> bool {
-    #[cfg(unix)]
-    {
-        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = pid;
-        true
-    }
+    kin_cli::daemon_client::is_process_alive(pid)
 }
 
 fn canonical_path_string(path: impl Into<PathBuf>) -> String {

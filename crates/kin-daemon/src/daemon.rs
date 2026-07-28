@@ -394,8 +394,17 @@ fn watched_process_is_alive(pid: i32) -> bool {
     )
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn watched_process_is_alive(pid: i32) -> bool {
+    u32::try_from(pid)
+        .ok()
+        .is_some_and(kin_cli::daemon_client::is_process_alive)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn watched_process_is_alive(_pid: i32) -> bool {
+    // Fail closed on unsupported targets rather than treating an uncheckable
+    // owner as dead.
     true
 }
 

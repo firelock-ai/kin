@@ -190,6 +190,10 @@ pub struct HealthResponse {
     pub graph_loaded: bool,
     pub reconciliation_status: String,
     pub repo_id: String,
+    /// Exact local workspace authority. Hosted snapshot daemons do not carry a
+    /// local workspace and report `null`.
+    #[serde(default)]
+    pub workspace_id: Option<String>,
     pub repo_root: String,
     pub pid: u32,
     #[serde(default)]
@@ -1731,6 +1735,9 @@ async fn health(
         graph_loaded,
         reconciliation_status: state.reconciliation_status_str().to_string(),
         repo_id: primary_repo_id(&state),
+        workspace_id: state
+            .local_repository_workspace_id()
+            .map(|workspace_id| workspace_id.to_string()),
         repo_root: state
             .layout
             .working_dir()
@@ -17164,6 +17171,9 @@ mod tests {
     #[tokio::test]
     async fn health_includes_version_string() {
         let state = test_state();
+        let expected_workspace_id = state
+            .local_repository_workspace_id()
+            .map(|workspace_id| workspace_id.to_string());
         let app = router(state);
         let response = app
             .oneshot(Request::get("/health").body(Body::empty()).unwrap())
@@ -17180,6 +17190,10 @@ mod tests {
         let json: HealthResponse = serde_json::from_slice(&body).unwrap();
         assert!(!json.version.is_empty());
         assert_eq!(json.reconciliation_status, "idle");
+        assert_eq!(
+            json.workspace_id, expected_workspace_id,
+            "health must name the exact local workspace authority"
+        );
     }
 
     #[tokio::test]
@@ -17225,39 +17239,62 @@ mod tests {
 
         let (warm_started_tx, warm_started_rx) = mpsc::channel::<()>();
         let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
+        let hook_release_rx = Arc::clone(&release_rx);
+        state.set_spine_initialization_test_hook(Some(Arc::new(move || {
+            let _ = warm_started_tx.send(());
+            // Bounded so a failing assertion still lets the runtime shut down.
+            let _ = hook_release_rx
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .recv_timeout(Duration::from_secs(120));
+        })));
+
+        let (warm_finished_tx, warm_finished_rx) = mpsc::channel::<bool>();
+        let warm_state = Arc::clone(&state);
         runtime.spawn(async move {
-            crate::lifecycle::without_blocking_runtime_worker(move || {
-                let _ = warm_started_tx.send(());
-                // Bounded so a failing assertion below still lets the runtime
-                // shut down instead of wedging the test binary. Longer than the
-                // assertion cap so the release below is the normal exit.
-                let _ = release_rx.recv_timeout(Duration::from_secs(120));
-            });
+            let _ = warm_finished_tx.send(warm_state.ensure_spine().is_some());
         });
         warm_started_rx
             .recv_timeout(Duration::from_secs(30))
-            .expect("the warm-up must start");
+            .expect("the real ensure_spine warm-up must start");
 
-        let (answered_tx, answered_rx) = mpsc::channel::<StatusCode>();
+        let (answered_tx, answered_rx) = mpsc::channel::<(StatusCode, bool)>();
         let probe_state = Arc::clone(&state);
         runtime.spawn(async move {
             let response = router(probe_state)
                 .oneshot(Request::get("/readiness").body(Body::empty()).unwrap())
                 .await
                 .expect("readiness request");
-            let _ = answered_tx.send(response.status());
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .expect("readiness body");
+            let readiness: ReadinessResponse =
+                serde_json::from_slice(&body).expect("readiness JSON");
+            let _ = answered_tx.send((status, readiness.warming));
         });
 
         // Generous enough that whole-workspace CPU contention cannot trip it,
         // while still bounded: a warm-up that parks the worker never answers at
         // any cap, so this fails rather than hangs.
-        let status = answered_rx.recv_timeout(Duration::from_secs(60)).expect(
+        let answer = answered_rx.recv_timeout(Duration::from_secs(60));
+        let _ = release_tx.send(());
+        let warmed = warm_finished_rx.recv_timeout(Duration::from_secs(60));
+
+        let (status, warming) = answer.expect(
             "readiness must be answered while a sibling warm-up blocks; a warm-up that \
              holds the runtime worker makes a live daemon indistinguishable from a dead one",
         );
         assert_eq!(status, StatusCode::OK);
-
-        let _ = release_tx.send(());
+        assert!(
+            warming,
+            "readiness must identify the actual ensure_spine pass as warming"
+        );
+        assert!(
+            warmed.expect("spine initialization must finish after release"),
+            "spine initialization must publish after release"
+        );
     }
 
     #[tokio::test]
