@@ -420,6 +420,7 @@ fn fast_forward(
             theirs_policy,
         )?),
         local_overlay_delta: None,
+        merge_transaction_delta: None,
     };
     publish(
         state,
@@ -633,6 +634,7 @@ fn three_way(
             shared_policy,
         )?),
         local_overlay_delta: None,
+        merge_transaction_delta: None,
     };
     let mut execution = publish(
         state,

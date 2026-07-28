@@ -10534,6 +10534,7 @@ mod tests {
             }),
             workspace_mutation: None,
             local_overlay_delta: None,
+            merge_transaction_delta: None,
         };
         drop(lease);
         manager.commit_repository_transaction(transaction).unwrap();
@@ -10985,6 +10986,7 @@ mod tests {
             default_ref_mutation: None,
             workspace_mutation: None,
             local_overlay_delta: None,
+            merge_transaction_delta: None,
         };
         drop(lease);
         authority
@@ -11410,6 +11412,7 @@ mod tests {
             default_ref_mutation: None,
             workspace_mutation: None,
             local_overlay_delta: None,
+            merge_transaction_delta: None,
         };
         drop(lease);
         external

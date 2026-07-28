@@ -451,6 +451,7 @@ mod tests {
                 new_admission_policy: admission_policy,
             }),
             local_overlay_delta: None,
+            merge_transaction_delta: None,
         };
         authority
             .commit_repository_transaction(transaction)
@@ -552,6 +553,7 @@ mod tests {
             default_ref_mutation: None,
             workspace_mutation: None,
             local_overlay_delta: None,
+            merge_transaction_delta: None,
         };
         authority
             .commit_repository_transaction(transaction)

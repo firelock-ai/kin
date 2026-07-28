@@ -309,6 +309,7 @@ fn plan_and_commit(
             default_ref_mutation: None,
             workspace_mutation: receipt.operation.workspace_mutation.clone(),
             local_overlay_delta: None,
+            merge_transaction_delta: None,
         };
         let replay_hash = replay_transaction
             .transaction_hash()
@@ -643,6 +644,7 @@ fn plan_and_commit(
             new_admission_policy: workspace.admission_policy,
         }),
         local_overlay_delta: None,
+        merge_transaction_delta: None,
     };
     let (projected_entries, receipt, authority_freeze) =
         kin_core::tree::checkout_repository_workspace_subtree_and_commit_repository_transaction(

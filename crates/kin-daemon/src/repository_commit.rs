@@ -287,6 +287,7 @@ pub(crate) fn plan_session_workspace_admission(
             },
         }),
         local_overlay_delta: None,
+        merge_transaction_delta: None,
     };
     transaction.validate()?;
     let transaction_hash = transaction.transaction_hash()?;
@@ -553,6 +554,7 @@ pub(crate) fn publish_workspace_tree(
             },
         }),
         local_overlay_delta: None,
+        merge_transaction_delta: None,
     };
     transaction.validate()?;
 
@@ -815,6 +817,7 @@ fn plan_native_commit_inner(
         default_ref_mutation: None,
         workspace_mutation: Some(workspace_mutation),
         local_overlay_delta: None,
+        merge_transaction_delta: None,
     };
     transaction.validate()?;
 
