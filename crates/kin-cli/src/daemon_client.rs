@@ -1215,6 +1215,50 @@ impl DaemonClient {
         .await
     }
 
+    pub async fn tag(
+        &self,
+        request: &crate::commands::tag::TagRequest,
+    ) -> Result<crate::commands::tag::TagResponse> {
+        self.post_idempotent_json(
+            "/commands/tag",
+            request,
+            "send daemon-owned repository tag request",
+        )
+        .await
+    }
+
+    pub async fn rollback(
+        &self,
+        request: &crate::commands::rollback::RollbackRequest,
+    ) -> Result<crate::commands::rollback::RollbackResponse> {
+        self.post_idempotent_json(
+            "/commands/rollback",
+            request,
+            "send daemon-owned repository rollback request",
+        )
+        .await
+    }
+
+    pub async fn drift(
+        &self,
+        request: &crate::commands::drift::DriftRequest,
+    ) -> Result<crate::commands::drift::DriftResponse> {
+        let resp = self
+            .send(
+                self.client
+                    .post(format!("{}/commands/drift", self.base_url))
+                    .json(request),
+                "send daemon-owned projection drift request",
+            )
+            .await?;
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("daemon drift error (HTTP {}): {}", status, body);
+        }
+        resp.json().await.context("parse daemon drift response")
+    }
+
     pub async fn checkout(
         &self,
         request: &crate::commands::checkout::CheckoutRequest,

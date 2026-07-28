@@ -866,6 +866,9 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route("/commands/security", post(command_security))
         .route("/commands/branch", post(command_branch))
         .route("/commands/merge", post(command_merge))
+        .route("/commands/drift", post(command_drift))
+        .route("/commands/tag", post(command_tag))
+        .route("/commands/rollback", post(command_rollback))
         .route("/commands/checkout", post(command_checkout))
         .route("/commands/rename", post(command_rename))
         .route(
@@ -2605,6 +2608,111 @@ async fn command_merge(
 
     let _coordination = state.coordination_gate.lock().await;
     let response = crate::repository_merge::execute(&state, &request)?;
+    Ok(Json(response))
+}
+
+/// POST /commands/drift — report the derived projection against graph truth.
+async fn command_drift(
+    headers: axum::http::HeaderMap,
+    State(state): State<Arc<DaemonState>>,
+    Json(_request): Json<kin_cli::commands::drift::DriftRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if !state
+        .is_initialized
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon not fully initialized".to_string(),
+        ));
+    }
+    if state.storage_backend.is_some() {
+        return Err((
+            StatusCode::CONFLICT,
+            "local repository projection drift is unavailable for hosted snapshot authority"
+                .to_string(),
+        ));
+    }
+    if extract_session_id_from_headers(&headers)?.is_some() {
+        return Err((
+            StatusCode::CONFLICT,
+            "projection drift is reported against primary workspace authority; run it without \
+             ambient session scope"
+                .to_string(),
+        ));
+    }
+
+    let response = crate::repository_drift::execute(&state)?;
+    Ok(Json(response))
+}
+
+/// POST /commands/tag — publish one exact repository-v6 tag ref.
+async fn command_tag(
+    headers: axum::http::HeaderMap,
+    State(state): State<Arc<DaemonState>>,
+    Json(request): Json<kin_cli::commands::tag::TagRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if !state
+        .is_initialized
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon not fully initialized".to_string(),
+        ));
+    }
+    if state.storage_backend.is_some() {
+        return Err((
+            StatusCode::CONFLICT,
+            "local repository tag authority is unavailable for hosted snapshot authority"
+                .to_string(),
+        ));
+    }
+    if extract_session_id_from_headers(&headers)?.is_some() {
+        return Err((
+            StatusCode::CONFLICT,
+            "tags are published against HEAD authority; run them without ambient session scope"
+                .to_string(),
+        ));
+    }
+
+    let _coordination = state.coordination_gate.lock().await;
+    let response = crate::repository_tag::execute(&state, &request)?;
+    Ok(Json(response))
+}
+
+/// POST /commands/rollback — publish one exact repository-v6 rollback change.
+async fn command_rollback(
+    headers: axum::http::HeaderMap,
+    State(state): State<Arc<DaemonState>>,
+    Json(request): Json<kin_cli::commands::rollback::RollbackRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if !state
+        .is_initialized
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon not fully initialized".to_string(),
+        ));
+    }
+    if state.storage_backend.is_some() {
+        return Err((
+            StatusCode::CONFLICT,
+            "local repository rollback authority is unavailable for hosted snapshot authority"
+                .to_string(),
+        ));
+    }
+    if extract_session_id_from_headers(&headers)?.is_some() {
+        return Err((
+            StatusCode::CONFLICT,
+            "rollback publishes against HEAD authority; run it without ambient session scope"
+                .to_string(),
+        ));
+    }
+
+    let _coordination = state.coordination_gate.lock().await;
+    let response = crate::repository_rollback::execute(&state, &request)?;
     Ok(Json(response))
 }
 

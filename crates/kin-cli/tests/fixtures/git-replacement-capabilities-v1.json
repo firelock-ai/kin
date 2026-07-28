@@ -444,65 +444,99 @@
     },
     {
       "command": "doctor --drift",
-      "status": "open_gate",
-      "exposure": "fail_closed",
-      "authority": "repository-v6 workspace tree and projection receipt",
+      "status": "ready",
+      "exposure": "enabled",
+      "authority": "repository-v6 exact workspace tree and graph-owned member content",
       "required_for_bounded_dogfood": false,
       "acceptance_spec": [
         "compare a bounded projection observation against one exact workspace generation",
+        "load every compared member's content from repository authority and never from the working copy",
+        "read only paths the exact workspace tree already tracks",
+        "refuse the report when repository authority cannot be opened or moves under the observation"
+      ],
+      "evidence_tests": [
+        "crates/kin-cli/tests/repository_drift.rs"
+      ],
+      "note": "Drift compares the derived projection against the exact workspace tree and the member content repository authority owns. The observation is pinned to one authority generation and workspace generation and is refused rather than reported when either moves, so a drift result always describes one exact workspace state. Untracked host paths are never read and never reported: they are not graph-owned, so they cannot drift. Healing is a separate gate."
+    },
+    {
+      "command": "doctor --heal",
+      "status": "open_gate",
+      "exposure": "fail_closed",
+      "authority": "repository-v6 explicit transaction or graph-derived rematerialization",
+      "required_for_bounded_dogfood": false,
+      "acceptance_spec": [
+        "rematerialize the complete workspace projection under one retained repository authority freeze",
         "heal only through an explicit repository transaction or graph-derived rematerialization"
       ],
       "evidence_tests": [],
-      "note": "The retired drift doctor scanned raw files and read legacy object layout."
+      "note": "Reporting drift is enabled; healing is not. The graph-derived rematerialization primitive (kin_core::tree::repair_repository_workspace_subtree_projection) is scoped to one selected RepoPath through CheckoutProjectionReceipt.selected, and RepoPath cannot name the whole workspace, so there is no exact whole-workspace heal scope to commit against today. The only heal is `kin checkout <path>`, which is already that explicit transaction. Closing this gate needs a whole-workspace checkout scope in kin-core, not a new repair path."
     },
     {
       "command": "semver",
-      "status": "open_gate",
-      "exposure": "fail_closed",
+      "status": "ready",
+      "exposure": "enabled",
       "authority": "repository-v6 immutable change DAG",
       "required_for_bounded_dogfood": false,
       "acceptance_spec": [
-        "derive API impact from repository-v6 changes at explicit refs without legacy branches"
+        "derive API impact from repository-v6 changes at explicit refs without legacy branches",
+        "classify impact from entity visibility, role, and declaration fingerprints alone",
+        "refuse an endpoint repository authority cannot resolve"
       ],
-      "evidence_tests": [],
-      "note": "The retired semantic-release analyzer depended on legacy branch and delta shapes."
+      "evidence_tests": [
+        "crates/kin-cli/tests/repository_semver.rs"
+      ],
+      "note": "Impact is a function of the entities repository authority owns at two explicitly named endpoints, resolved through the same exact endpoint resolver diff uses (ref, change, Git object, HEAD, or WORKSPACE). Both endpoints must be named: there is no branch-shape or commit-message inference and no working-copy scan. The published surface is public, source-role, non-container entities; removal, a changed declaration fingerprint, and unpublishing are breaking, new and newly published surface is additive, and a changed behavior fingerprint behind a stable declaration is a patch."
     },
     {
       "command": "release snapshot",
-      "status": "open_gate",
-      "exposure": "fail_closed",
+      "status": "ready",
+      "exposure": "enabled",
       "authority": "repository-v6 refs, proof state, and immutable tree",
       "required_for_bounded_dogfood": false,
       "acceptance_spec": [
-        "bind the release snapshot to exact repository roots, proof decisions, and immutable artifacts"
+        "bind the release snapshot to exact repository roots, proof decisions, and immutable artifacts",
+        "publish the snapshot through the same tag ref transaction it describes",
+        "seal the binding under a digest that changes with any bound component"
       ],
-      "evidence_tests": [],
-      "note": "The retired snapshot path constructed changes through legacy branch authority."
+      "evidence_tests": [
+        "crates/kin-cli/tests/repository_release_snapshot.rs"
+      ],
+      "note": "A release snapshot is the tag transaction plus the exact state it names: the roots the transaction moved between, the change it points at, the content hash and artifact composition of the complete immutable tree, the entity and relation counts, and the policy decision that admitted it. All of it is sealed under one digest, so a snapshot that reports a different tree, source, or policy outcome is a different snapshot. It is not a separate authority path: the same refs/tags/ compare-and-swap and the same release policy that gate `kin tag` gate this."
     },
     {
       "command": "tag",
-      "status": "open_gate",
-      "exposure": "fail_closed",
+      "status": "ready",
+      "exposure": "enabled",
       "authority": "repository-v6 tag ref transaction",
       "required_for_bounded_dogfood": false,
       "acceptance_spec": [
-        "create an exact refs/tags target with compare-and-swap and proof-policy checks"
+        "create an exact refs/tags target with compare-and-swap and proof-policy checks",
+        "decide release policy over the same authority lease the compare-and-swap carries",
+        "publish nothing when any declared policy check fails",
+        "refuse to move or replace an existing tag ref"
       ],
-      "evidence_tests": [],
-      "note": "The retired tag path wrote semantic tags through legacy branch state."
+      "evidence_tests": [
+        "crates/kin-cli/tests/repository_tag.rs"
+      ],
+      "note": "A tag is a refs/tags/ MustNotExist compare-and-swap in one repository transaction against the exact workspace base target. Release policy is decided over the same authority lease the transaction carries as its expected roots, so the source that was checked and the source that is published are the same immutable state, and an authority move between them refuses the publication instead of tagging an unchecked source. Declared policy is enforced and never downgraded to a warning: --require-proof fails closed for every non-empty source because VerificationRun still carries no immutable source binding, --require-approval fails closed on any unapproved reachable non-root change, and a source below the baseline coverage ratio requires --force to record an explicit acknowledgment in the receipt."
     },
     {
       "command": "rollback",
-      "status": "open_gate",
-      "exposure": "fail_closed",
-      "authority": "repository-v6 inverse semantic and exact-tree transaction",
+      "status": "ready",
+      "exposure": "enabled",
+      "authority": "repository-v6 restoring change and exact-tree transaction",
       "required_for_bounded_dogfood": false,
       "acceptance_spec": [
         "construct and commit an exact inverse change that preserves artifact identity and source CAS",
-        "publish the workspace and ref transition atomically"
+        "publish the workspace and ref transition atomically",
+        "restore only a change this branch already published",
+        "refuse over graph-owned uncommitted state or a diverged projection"
       ],
-      "evidence_tests": [],
-      "note": "The retired rollback path inverted legacy tuple deltas and branch state."
+      "evidence_tests": [
+        "crates/kin-cli/tests/repository_rollback.rs"
+      ],
+      "note": "Rollback moves history forward. It derives the transition by comparing two immutable graph states, then publishes one new change whose content is exactly the restored change's content, so the change being undone stays in history and every restored artifact keeps the identity and source CAS entry it already had. The change, the branch compare-and-swap, and the workspace transition are one repository transaction committed with the projection, so the repository is never observable at a tree no ref names. Restoring a change outside this branch's history, rolling back over graph-owned uncommitted state, or rolling back over a diverged projection are refusals. Rolling back every change linked to a work item (--feature) is not implemented and refuses."
     }
   ]
 }

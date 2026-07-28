@@ -69,6 +69,7 @@ pub use tree::{
     verify_unchanged_source_tree_and_commit_repository_transaction, ExactProjectionDetachTarget,
     ExactProjectionEjectOutcome, ExactProjectionFreeze, ExactProjectionGitStage,
     ExactProjectionVerification, ExactSessionProjection, SourceProjectionDisposition,
+    WorkspaceProjectionDrift,
 };
 pub use workspace_semantics::diff_workspace_semantics;
 
