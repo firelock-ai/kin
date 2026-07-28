@@ -10,11 +10,9 @@
 
 <p><em>Exact context, not more.</em></p>
 
-<p>
-<a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="License: Apache-2.0"></a>
-<a href="https://github.com/firelock-ai/kin/releases/latest"><img src="https://img.shields.io/github/v/release/firelock-ai/kin?color=6E56CF&label=release" alt="Latest release"></a>
-<a href="https://kinlab.ai"><img src="https://img.shields.io/badge/hosted-kinlab.ai-111111.svg" alt="Hosted at kinlab.ai"></a>
-</p>
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Latest release](https://img.shields.io/badge/release-latest-6E56CF.svg)](https://github.com/firelock-ai/kin/releases/latest)
+[![Hosted at kinlab.ai](https://img.shields.io/badge/hosted-kinlab.ai-111111.svg)](https://kinlab.ai)
 
 </div>
 
