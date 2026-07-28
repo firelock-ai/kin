@@ -115,6 +115,31 @@ impl Default for RepositoryTransferLimits {
     }
 }
 
+impl RepositoryTransferLimits {
+    /// Bound peer- or request-supplied ceilings by what this implementation can
+    /// construct and validate locally.
+    ///
+    /// Transfer limits are ceilings rather than quotas, so choosing the
+    /// smaller local value remains compatible with a peer that can accept a
+    /// larger envelope. It also keeps an untrusted advertisement or export
+    /// request from making this process assemble a pack its own receiver would
+    /// reject, or from turning one bounded transfer step into unbounded work.
+    fn bounded_by_local(self) -> Self {
+        let local = Self::default();
+        Self {
+            max_changes: self.max_changes.min(local.max_changes),
+            max_trees: self.max_trees.min(local.max_trees),
+            max_bodies: self.max_bodies.min(local.max_bodies),
+            max_external_objects: self.max_external_objects.min(local.max_external_objects),
+            max_aliases: self.max_aliases.min(local.max_aliases),
+            max_decoded_body_bytes: self
+                .max_decoded_body_bytes
+                .min(local.max_decoded_body_bytes),
+            max_single_body_bytes: self.max_single_body_bytes.min(local.max_single_body_bytes),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RepositoryTransferStatus {
@@ -166,6 +191,7 @@ impl TryFrom<RepositoryTransferStatus> for RepositoryTransferExpectation {
 
     fn try_from(status: RepositoryTransferStatus) -> Result<Self> {
         validate_status(&status)?;
+        let limits = status.limits.bounded_by_local();
         Ok(Self {
             repository_id: status.repository_id,
             destination_ref: status.destination_ref,
@@ -175,7 +201,7 @@ impl TryFrom<RepositoryTransferStatus> for RepositoryTransferExpectation {
             default_ref: status.default_ref,
             git_authority_hash: status.git_authority_hash,
             supported_features: status.supported_features,
-            limits: status.limits,
+            limits,
         })
     }
 }
@@ -491,7 +517,8 @@ pub fn build_repository_transfer_pack<B: StorageBackend + ?Sized + 'static>(
     source_ref: &RefName,
     expectation: &RepositoryTransferExpectation,
 ) -> Result<RepositoryTransferPack> {
-    let context = TransferSourceContext::read(authority, source_ref, expectation)?;
+    let expectation = locally_bounded_expectation(expectation)?;
+    let context = TransferSourceContext::read(authority, source_ref, &expectation)?;
     let ordered = collect_fast_forward_closure(
         &context.all_changes,
         context.source_head,
@@ -503,7 +530,7 @@ pub fn build_repository_transfer_pack<B: StorageBackend + ?Sized + 'static>(
         remaining: 0,
         is_smallest_publishable_step: false,
     };
-    match assemble_segment_pack(authority, &context, expectation, source_ref, &plan)? {
+    match assemble_segment_pack(authority, &context, &expectation, source_ref, &plan)? {
         Assembled::Pack(pack) => Ok(*pack),
         Assembled::OverNegotiatedBound(reason) => Err(invalid(reason)),
     }
@@ -522,7 +549,8 @@ pub fn build_repository_transfer_segment<B: StorageBackend + ?Sized + 'static>(
     source_ref: &RefName,
     expectation: &RepositoryTransferExpectation,
 ) -> Result<RepositoryTransferSegment> {
-    let context = TransferSourceContext::read(authority, source_ref, expectation)?;
+    let expectation = locally_bounded_expectation(expectation)?;
+    let context = TransferSourceContext::read(authority, source_ref, &expectation)?;
     let closure = collect_fast_forward_closure(
         &context.all_changes,
         context.source_head,
@@ -545,7 +573,7 @@ pub fn build_repository_transfer_segment<B: StorageBackend + ?Sized + 'static>(
             budget,
         )?;
         let planned = plan.ordered.len();
-        match assemble_segment_pack(authority, &context, expectation, source_ref, &plan)? {
+        match assemble_segment_pack(authority, &context, &expectation, source_ref, &plan)? {
             Assembled::Pack(pack) => {
                 return Ok(RepositoryTransferSegment {
                     pack: *pack,
@@ -599,7 +627,8 @@ pub fn verify_transfer_source_readiness<B: StorageBackend + ?Sized + 'static>(
     source_ref: &RefName,
     expectation: &RepositoryTransferExpectation,
 ) -> Result<()> {
-    let context = TransferSourceContext::read(authority, source_ref, expectation)?;
+    let expectation = locally_bounded_expectation(expectation)?;
+    let context = TransferSourceContext::read(authority, source_ref, &expectation)?;
     let store = TransferChangeStore::new(context.all_changes.values().cloned());
     let tree = store.resolve_tree_at(&context.source_head).map_err(model)?;
     for hash in resolved_tree_body_identities(&tree)? {
@@ -623,7 +652,8 @@ pub fn count_repository_transfer_packs<B: StorageBackend + ?Sized + 'static>(
     source_ref: &RefName,
     expectation: &RepositoryTransferExpectation,
 ) -> Result<usize> {
-    let context = TransferSourceContext::read(authority, source_ref, expectation)?;
+    let expectation = locally_bounded_expectation(expectation)?;
+    let context = TransferSourceContext::read(authority, source_ref, &expectation)?;
     let mut boundary = expectation.destination_head;
     let mut packs = 0usize;
     loop {
@@ -1298,6 +1328,15 @@ fn validate_expectation(expectation: &RepositoryTransferExpectation) -> Result<(
     require_negotiated_features(&expectation.supported_features)
 }
 
+fn locally_bounded_expectation(
+    expectation: &RepositoryTransferExpectation,
+) -> Result<RepositoryTransferExpectation> {
+    validate_expectation(expectation)?;
+    let mut bounded = expectation.clone();
+    bounded.limits = bounded.limits.bounded_by_local();
+    Ok(bounded)
+}
+
 fn required_features() -> Vec<String> {
     REQUIRED_FEATURES
         .iter()
@@ -1753,6 +1792,19 @@ mod tests {
             Arc::new(LocalFileBackend::new(storage_root)),
         )
         .unwrap()
+    }
+
+    fn limits_above_every_local_ceiling() -> RepositoryTransferLimits {
+        let local = RepositoryTransferLimits::default();
+        RepositoryTransferLimits {
+            max_changes: local.max_changes.checked_add(1).unwrap(),
+            max_trees: local.max_trees.checked_add(1).unwrap(),
+            max_bodies: local.max_bodies.checked_add(1).unwrap(),
+            max_external_objects: local.max_external_objects.checked_add(1).unwrap(),
+            max_aliases: local.max_aliases.checked_add(1).unwrap(),
+            max_decoded_body_bytes: local.max_decoded_body_bytes.checked_add(1).unwrap(),
+            max_single_body_bytes: local.max_single_body_bytes.checked_add(1).unwrap(),
+        }
     }
 
     fn native_change(
@@ -2263,6 +2315,45 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("different exact transaction"));
+    }
+
+    #[test]
+    fn status_advertisement_above_local_caps_is_bounded_before_negotiation() {
+        let fixture = fixture();
+        let mut advertised =
+            repository_transfer_status(&fixture.destination, &fixture.repository_id, &fixture.main)
+                .unwrap();
+        advertised.limits = limits_above_every_local_ceiling();
+
+        let expectation = RepositoryTransferExpectation::try_from(advertised).unwrap();
+
+        assert_eq!(
+            expectation.limits,
+            RepositoryTransferLimits::default(),
+            "a peer's larger ceilings must not enlarge this process's bounded envelope"
+        );
+    }
+
+    #[test]
+    fn export_expectation_above_local_caps_is_bounded_before_assembly() {
+        let fixture = fixture();
+        let status =
+            repository_transfer_status(&fixture.destination, &fixture.repository_id, &fixture.main)
+                .unwrap();
+        let mut expectation = RepositoryTransferExpectation::try_from(status).unwrap();
+        expectation.limits = limits_above_every_local_ceiling();
+
+        let bounded = locally_bounded_expectation(&expectation).unwrap();
+        assert_eq!(
+            bounded.limits,
+            RepositoryTransferLimits::default(),
+            "request-body ceilings must be bounded before an export is planned"
+        );
+
+        let segment =
+            build_repository_transfer_segment(&fixture.source, &fixture.main, &expectation)
+                .unwrap();
+        validate_pack(&segment.pack).expect("the locally bounded exporter must build a valid pack");
     }
 
     #[test]
