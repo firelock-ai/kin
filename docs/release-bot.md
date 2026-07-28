@@ -136,9 +136,10 @@ completion marker and GitHub artifact attestation pinned to the exact release
 workflow, tag, commit, GitHub-hosted runner, and transparency timestamp.
 The one explicit pre-marker migration release, v0.3.6, additionally has to
 prove exact npm latest versions, matching GHCR latest/version/tag digests, and
-aggregate release provenance. Markerless fallback is retired for v0.4.0 and
-later. Missing logs therefore cannot make the train permanently stale, while a
-preserved failed attempt can never be overridden by public-surface fallback.
+the exact source-bound GHCR attestation, plus aggregate release provenance.
+Markerless fallback is retired for v0.4.0 and later. Missing logs therefore
+cannot make the train permanently stale, while a preserved failed attempt can
+never be overridden by public-surface fallback.
 
 Get the SHA to release (current reviewed main tip):
 

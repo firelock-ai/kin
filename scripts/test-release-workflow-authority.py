@@ -124,6 +124,8 @@ def main() -> None:
         "verifiedTimestamps",
         "registry.npmjs.org/@kinlab%2F",
         "ghcr.io/v2/firelock-ai/kin/manifests",
+        "oci://ghcr.io/firelock-ai/kin@${ghcr_latest}",
+        "--bundle-from-oci",
         'latest_tag" != v0.3.6',
         "markerless logless fallback is retired",
         "matching_count",

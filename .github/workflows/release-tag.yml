@@ -462,6 +462,23 @@ jobs:
               [[ "$ghcr_latest" =~ ^sha256:[0-9a-f]{64}$ ]]
               [ "$ghcr_latest" = "$ghcr_version" ]
               [ "$ghcr_latest" = "$ghcr_tag" ]
+              gh attestation verify \
+                "oci://ghcr.io/firelock-ai/kin@${ghcr_latest}" \
+                --repo "$REPO" \
+                --bundle-from-oci \
+                --predicate-type https://slsa.dev/provenance/v1 \
+                --signer-workflow "${REPO}/.github/workflows/release.yml" \
+                --signer-digest "$latest_sha" \
+                --source-ref "refs/tags/${latest_tag}" \
+                --source-digest "$latest_sha" \
+                --deny-self-hosted-runners \
+                --format json > "$proof_dir/ghcr-attestation.json"
+              jq -e '
+                length > 0 and
+                all(.[];
+                  (.verificationResult.verifiedTimestamps | type == "array" and length > 0)
+                )
+              ' "$proof_dir/ghcr-attestation.json" >/dev/null
               echo "prior stable authority recovered from legacy public capstones: ${latest_tag}@${latest_sha} ghcr=${ghcr_latest}"
             fi
 
