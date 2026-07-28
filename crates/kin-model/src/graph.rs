@@ -227,12 +227,22 @@ pub trait ChangeStore: Send + Sync {
         &self,
         id: &EntityId,
     ) -> std::result::Result<Vec<SemanticChange>, Self::Error>;
+    /// Every revision `id` has across the change DAG, oldest first.
+    ///
+    /// [`Self::get_entity_history`] answers with the changes that mention `id`
+    /// alone, which is not a lineage: a change's first declared parent is
+    /// usually absent from it. Replaying that list flat folds divergent
+    /// lineages into a single state, so an entity revised across a merge reads
+    /// as a stale payload. The list is relinked onto first-parent lineage
+    /// before deriving, so each change is read against the state it was
+    /// authored on.
     fn get_entity_revisions(
         &self,
         id: &EntityId,
     ) -> std::result::Result<Vec<EntityRevision>, Self::Error> {
-        let changes = self.get_entity_history(id)?;
-        Ok(replay_entity_revisions(changes, id)?)
+        let history = self.get_entity_history(id)?;
+        let linked = link_history_to_first_parent_lineage(self, history)?;
+        Ok(derive_entity_revisions_along_lineages(linked, id)?)
     }
     fn find_merge_bases(
         &self,
@@ -266,13 +276,19 @@ pub trait ChangeStore: Send + Sync {
             .filter(|change| entity_is_touched_by_change(change, id))
             .collect())
     }
+    /// `id`'s revision timeline on the material lineage reaching `head`.
+    ///
+    /// The derivation reads the complete first-parent history rather than the
+    /// filtered list [`Self::get_entity_history_at`] returns, so every change is
+    /// read against the state its own parent published and the revision it
+    /// supersedes is the one that lineage actually carried.
     fn get_entity_revisions_at(
         &self,
         id: &EntityId,
         head: &SemanticChangeId,
     ) -> std::result::Result<Vec<EntityRevision>, Self::Error> {
-        let changes = self.get_entity_history_at(id, head)?;
-        Ok(replay_entity_revisions(changes, id)?)
+        let changes = collect_changes_first_parent(self, head)?;
+        Ok(derive_entity_revisions_across_history(changes, id)?)
     }
     fn resolve_entity_revision_at(
         &self,
@@ -1237,6 +1253,289 @@ fn replay_artifact_revisions(
     })
 }
 
+/// The state one lineage carries into a change for a single entity.
+///
+/// `live` names the payload that lineage currently publishes and the revision
+/// publishing it. `ended` keeps the revision a removal closed, so a later re-add
+/// in the same lineage names its real predecessor instead of starting a
+/// detached chain.
+#[derive(Clone, Default)]
+struct LineageEntity {
+    live: Option<(Entity, EntityRevisionId)>,
+    ended: Option<EntityRevisionId>,
+}
+
+/// Apply one change's deltas for `entity_id` to the lineage state it was
+/// authored on, appending whatever revision it publishes to `revisions`.
+///
+/// Only `entity_id`'s own deltas are read. Every other entity's deltas are
+/// skipped rather than checked, so a change that revises the queried entity
+/// while touching entities this derivation never tracked stays answerable.
+fn apply_entity_deltas_to_lineage(
+    state: &mut LineageEntity,
+    revisions: &mut Vec<EntityRevision>,
+    change: &SemanticChange,
+    entity_id: &EntityId,
+) -> std::result::Result<(), ModelError> {
+    let change_id = change.id;
+
+    for delta in &change.entity_deltas {
+        match delta {
+            crate::change::EntityDelta::Added { new: entity } if entity.id == *entity_id => {
+                if state.live.is_some() {
+                    return Err(ModelError::Conflict(format!(
+                        "change {change_id} adds existing entity {entity_id}"
+                    )));
+                }
+                let supersedes = state.ended.take();
+                end_entity_revision(revisions, supersedes, change_id);
+                let revision = EntityRevision::new(entity.clone(), change_id, supersedes);
+                state.live = Some((entity.clone(), revision.revision_id));
+                revisions.push(revision);
+            }
+            crate::change::EntityDelta::Modified { old, new }
+                if old.id == *entity_id || new.id == *entity_id =>
+            {
+                if old.id != new.id {
+                    return Err(ModelError::Conflict(format!(
+                        "change {change_id} modifies entity {} into different identity {}",
+                        old.id, new.id
+                    )));
+                }
+                let superseded = match &state.live {
+                    Some((live, revision_id)) if live == old => *revision_id,
+                    _ => {
+                        return Err(ModelError::Conflict(format!(
+                            "change {change_id} has stale old payload for entity {}",
+                            old.id
+                        )))
+                    }
+                };
+                end_entity_revision(revisions, Some(superseded), change_id);
+                let revision = EntityRevision::new(new.clone(), change_id, Some(superseded));
+                state.live = Some((new.clone(), revision.revision_id));
+                revisions.push(revision);
+            }
+            crate::change::EntityDelta::Removed { old } if old.id == *entity_id => {
+                let ended = match &state.live {
+                    Some((live, revision_id)) if live == old => *revision_id,
+                    _ => {
+                        return Err(ModelError::Conflict(format!(
+                            "change {change_id} has stale old payload \
+                             for removed entity {entity_id}"
+                        )))
+                    }
+                };
+                end_entity_revision(revisions, Some(ended), change_id);
+                state.live = None;
+                state.ended = Some(ended);
+            }
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+
+fn end_entity_revision(
+    revisions: &mut [EntityRevision],
+    revision_id: Option<EntityRevisionId>,
+    ended_by: SemanticChangeId,
+) {
+    let Some(revision_id) = revision_id else {
+        return;
+    };
+    if let Some(revision) = revisions
+        .iter_mut()
+        .find(|revision| revision.revision_id == revision_id)
+    {
+        revision.mark_ended(ended_by);
+    }
+}
+
+/// Derive one entity's revisions across `ordered`, reading each change against
+/// the state its first declared parent published.
+///
+/// Replaying a whole change DAG as one flat sequence instead folds divergent
+/// siblings into a single state, so a merge that restates a side-branch
+/// transition looks like a stale payload even though every lineage reaching it
+/// is consistent. Preconditions still run against the state each change was
+/// authored on, so an old payload no parent published still fails closed.
+///
+/// `ordered` must be a complete history listing parents before children. Use
+/// [`derive_entity_revisions_along_lineages`] for a change list that has been
+/// filtered, where a change's first declared parent is usually absent.
+pub fn derive_entity_revisions_across_history<I>(
+    ordered: I,
+    entity_id: &EntityId,
+) -> std::result::Result<Vec<EntityRevision>, ModelError>
+where
+    I: IntoIterator<Item = SemanticChange>,
+{
+    derive_entity_revisions_along_lineages(
+        ordered.into_iter().map(|change| {
+            let lineage_parent = change.parents.first().copied();
+            (change, lineage_parent)
+        }),
+        entity_id,
+    )
+}
+
+/// Derive one entity's revisions along explicit lineage links.
+///
+/// Each entry pairs a change with the change whose published state it was
+/// authored on. Entries must list a lineage parent before every change naming
+/// it; a link to a change absent from `ordered` starts a fresh lineage.
+pub fn derive_entity_revisions_along_lineages<I>(
+    ordered: I,
+    entity_id: &EntityId,
+) -> std::result::Result<Vec<EntityRevision>, ModelError>
+where
+    I: IntoIterator<Item = (SemanticChange, Option<SemanticChangeId>)>,
+{
+    let ordered: Vec<(SemanticChange, Option<SemanticChangeId>)> = ordered.into_iter().collect();
+
+    let mut pending_children: HashMap<SemanticChangeId, usize> = HashMap::new();
+    for (_, lineage_parent) in &ordered {
+        if let Some(parent) = lineage_parent {
+            *pending_children.entry(*parent).or_insert(0) += 1;
+        }
+    }
+
+    let mut states: HashMap<SemanticChangeId, LineageEntity> = HashMap::new();
+    let mut revisions: Vec<EntityRevision> = Vec::new();
+
+    for (change, lineage_parent) in ordered {
+        // The last child to read a parent takes ownership of its state, so a
+        // linear history moves one state forward rather than copying it per
+        // change.
+        let mut state = match lineage_parent {
+            Some(parent) => match pending_children.get_mut(&parent) {
+                Some(remaining) if *remaining <= 1 => {
+                    *remaining = 0;
+                    states.remove(&parent).unwrap_or_default()
+                }
+                Some(remaining) => {
+                    *remaining -= 1;
+                    states.get(&parent).cloned().unwrap_or_default()
+                }
+                None => LineageEntity::default(),
+            },
+            None => LineageEntity::default(),
+        };
+
+        apply_entity_deltas_to_lineage(&mut state, &mut revisions, &change, entity_id)?;
+
+        // A change no other change builds on has no reader left, so its state
+        // is dropped here instead of being retained for the whole derivation.
+        if pending_children
+            .get(&change.id)
+            .is_some_and(|remaining| *remaining > 0)
+        {
+            states.insert(change.id, state);
+        }
+    }
+
+    Ok(revisions)
+}
+
+/// Relink a change list filtered to one entity back onto first-parent lineage.
+///
+/// [`ChangeStore::get_entity_history`] answers with the changes that mention an
+/// entity, so a change's first declared parent is usually absent from the list
+/// and the lineage the derivation needs is the nearest ancestor the list kept.
+/// Walking each first-parent chain back to that ancestor restores it; a chain
+/// that leaves the store reports no lineage parent, which starts a fresh
+/// lineage rather than inventing one.
+///
+/// The result lists every lineage parent before the changes naming it.
+fn link_history_to_first_parent_lineage<G: ChangeStore + ?Sized>(
+    store: &G,
+    history: Vec<SemanticChange>,
+) -> std::result::Result<Vec<(SemanticChange, Option<SemanticChangeId>)>, G::Error> {
+    let kept: HashSet<SemanticChangeId> = history.iter().map(|change| change.id).collect();
+    let mut nearest: HashMap<SemanticChangeId, Option<SemanticChangeId>> = HashMap::new();
+
+    let mut linked = Vec::with_capacity(history.len());
+    for change in history {
+        let lineage_parent = match change.parents.first() {
+            Some(parent) => {
+                nearest_kept_first_parent_ancestor(store, *parent, &kept, &mut nearest)?
+            }
+            None => None,
+        };
+        linked.push((change, lineage_parent));
+    }
+
+    // Each change has at most one lineage parent, so ordering by depth in that
+    // forest lists every parent before the changes naming it.
+    let mut depths: HashMap<SemanticChangeId, usize> = HashMap::new();
+    let by_lineage_parent: HashMap<SemanticChangeId, Option<SemanticChangeId>> = linked
+        .iter()
+        .map(|(change, lineage_parent)| (change.id, *lineage_parent))
+        .collect();
+    for (change, _) in &linked {
+        let mut chain = Vec::new();
+        let mut cursor = Some(change.id);
+        let mut depth = 0;
+        while let Some(id) = cursor {
+            if let Some(known) = depths.get(&id) {
+                depth = *known;
+                break;
+            }
+            chain.push(id);
+            cursor = by_lineage_parent.get(&id).copied().flatten();
+        }
+        for id in chain.into_iter().rev() {
+            depth += 1;
+            depths.insert(id, depth);
+        }
+    }
+    linked.sort_by_key(|(change, _)| depths.get(&change.id).copied().unwrap_or(0));
+
+    Ok(linked)
+}
+
+fn nearest_kept_first_parent_ancestor<G: ChangeStore + ?Sized>(
+    store: &G,
+    from: SemanticChangeId,
+    kept: &HashSet<SemanticChangeId>,
+    nearest: &mut HashMap<SemanticChangeId, Option<SemanticChangeId>>,
+) -> std::result::Result<Option<SemanticChangeId>, G::Error> {
+    let mut walked = Vec::new();
+    let mut seen = HashSet::new();
+    let mut cursor = Some(from);
+
+    let resolved = loop {
+        let Some(id) = cursor else { break None };
+        if let Some(known) = nearest.get(&id) {
+            break *known;
+        }
+        if !seen.insert(id) {
+            return Err(ModelError::Conflict(format!(
+                "cycle in first-parent history at change {id}"
+            ))
+            .into());
+        }
+        if kept.contains(&id) {
+            break Some(id);
+        }
+        walked.push(id);
+        // A first-parent chain that leaves the store ends the walk: the graph
+        // holds no lineage past it, and inventing one would attribute revisions
+        // to a change nobody published.
+        cursor = store
+            .get_change(&id)?
+            .and_then(|change| change.parents.first().copied());
+    };
+
+    for id in walked {
+        nearest.insert(id, resolved);
+    }
+    nearest.insert(from, resolved);
+    Ok(resolved)
+}
+
 fn entity_is_touched_by_change(change: &SemanticChange, entity_id: &EntityId) -> bool {
     change.entity_deltas.iter().any(|delta| match delta {
         crate::change::EntityDelta::Added { new } => new.id == *entity_id,
@@ -2085,11 +2384,24 @@ mod tests {
     impl ChangeStore for HistoryStore {
         type Error = ModelError;
 
+        /// The changes mentioning `id`, in an order that carries no lineage.
+        ///
+        /// A real store answers this from the whole DAG sorted by timestamp, so
+        /// the list interleaves divergent lineages and drops the changes that
+        /// link them. Sorting by change id here keeps that hostile shape
+        /// deterministic.
         fn get_entity_history(
             &self,
-            _id: &EntityId,
+            id: &EntityId,
         ) -> std::result::Result<Vec<SemanticChange>, Self::Error> {
-            Ok(Vec::new())
+            let mut history: Vec<SemanticChange> = self
+                .changes
+                .values()
+                .filter(|change| entity_is_touched_by_change(change, id))
+                .cloned()
+                .collect();
+            history.sort_by_key(|change| change.id.to_string());
+            Ok(history)
         }
 
         fn find_merge_bases(
@@ -2692,6 +3004,268 @@ mod tests {
         assert!(
             matches!(&error, ModelError::Conflict(message) if message.contains("stale old payload")),
             "expected a stale-payload conflict, got {error}"
+        );
+    }
+
+    /// A merge history revising one entity on both sides of the merge.
+    ///
+    /// `left` is the merge's first parent, so the material lineage reaching the
+    /// merge is root -> left -> merge. `right` revises the same entity on the
+    /// other side, and the merge takes its payload, which it states as the
+    /// transition away from what its own first parent published.
+    fn merge_history(entity: EntityId) -> (HistoryStore, [SemanticChangeId; 4]) {
+        let root_id = make_change_id(70);
+        let left_id = make_change_id(71);
+        let right_id = make_change_id(72);
+        let merge_id = make_change_id(73);
+
+        let root = make_semantic_change(
+            root_id,
+            vec![],
+            vec![EntityDelta::Added {
+                new: make_entity_version(entity, "merged", 1),
+            }],
+            vec![],
+        );
+        let left = make_semantic_change(
+            left_id,
+            vec![root_id],
+            vec![EntityDelta::Modified {
+                old: make_entity_version(entity, "merged", 1),
+                new: make_entity_version(entity, "merged", 2),
+            }],
+            vec![],
+        );
+        let right = make_semantic_change(
+            right_id,
+            vec![root_id],
+            vec![EntityDelta::Modified {
+                old: make_entity_version(entity, "merged", 1),
+                new: make_entity_version(entity, "merged", 3),
+            }],
+            vec![],
+        );
+        let merge = make_semantic_change(
+            merge_id,
+            vec![left_id, right_id],
+            vec![EntityDelta::Modified {
+                old: make_entity_version(entity, "merged", 2),
+                new: make_entity_version(entity, "merged", 3),
+            }],
+            vec![],
+        );
+
+        (
+            HistoryStore::from_changes([root, left, right, merge]),
+            [root_id, left_id, right_id, merge_id],
+        )
+    }
+
+    /// The whole-DAG timeline must read each change against its own first
+    /// parent. Replaying the changes that mention an entity as one flat
+    /// sequence folds the two sides of a merge into a single state, so the
+    /// second side's transition reads as a stale payload and a sound repository
+    /// answers a history query with a conflict.
+    #[test]
+    fn entity_revisions_derive_across_a_merge_rather_than_folding_its_sides() {
+        let entity = EntityId::new();
+        let (store, [root_id, left_id, right_id, merge_id]) = merge_history(entity);
+
+        let revisions = store
+            .get_entity_revisions(&entity)
+            .expect("a merge is not a stale payload");
+
+        let introduced: Vec<_> = revisions
+            .iter()
+            .map(|revision| revision.introduced_by)
+            .collect();
+        assert_eq!(introduced, vec![root_id, left_id, right_id, merge_id]);
+        assert_eq!(revisions[3].ended_by, None);
+        // Both sides supersede the root revision, and each names it as the
+        // predecessor its own lineage carried.
+        assert_eq!(
+            revisions[1].previous_revision,
+            Some(revisions[0].revision_id)
+        );
+        assert_eq!(
+            revisions[2].previous_revision,
+            Some(revisions[0].revision_id)
+        );
+        assert_eq!(
+            revisions[3].previous_revision,
+            Some(revisions[1].revision_id)
+        );
+    }
+
+    /// At the merge head the timeline is the merge's own material lineage, so
+    /// the side branch's revision is not part of it.
+    #[test]
+    fn entity_revisions_at_return_the_first_parent_lineage_across_a_merge() {
+        let entity = EntityId::new();
+        let (store, [root_id, left_id, right_id, merge_id]) = merge_history(entity);
+
+        let revisions = store
+            .get_entity_revisions_at(&entity, &merge_id)
+            .expect("the lineage reaching the merge is consistent");
+
+        let introduced: Vec<_> = revisions
+            .iter()
+            .map(|revision| revision.introduced_by)
+            .collect();
+        assert_eq!(introduced, vec![root_id, left_id, merge_id]);
+        assert!(
+            !introduced.contains(&right_id),
+            "a change off the material lineage is not a revision at this head"
+        );
+        assert_eq!(revisions[0].ended_by, Some(left_id));
+        assert_eq!(revisions[1].ended_by, Some(merge_id));
+
+        let active = store
+            .resolve_entity_revision_at(&entity, &merge_id)
+            .unwrap()
+            .expect("the entity is live at the merge");
+        assert_eq!(active.revision_id, revisions[2].revision_id);
+        assert_eq!(
+            active.entity,
+            make_entity_version(entity, "merged", 3),
+            "the merge publishes the payload it resolved to"
+        );
+    }
+
+    /// Reading each change against its first parent must not weaken the
+    /// preconditions: an old payload no parent published is still a conflict.
+    #[test]
+    fn entity_revisions_refuse_a_payload_no_parent_published() {
+        let entity = EntityId::new();
+        let root_id = make_change_id(74);
+        let revise_id = make_change_id(75);
+        let root = make_semantic_change(
+            root_id,
+            vec![],
+            vec![EntityDelta::Added {
+                new: make_entity_version(entity, "drifted", 1),
+            }],
+            vec![],
+        );
+        let revise = make_semantic_change(
+            revise_id,
+            vec![root_id],
+            vec![EntityDelta::Modified {
+                old: make_entity_version(entity, "drifted", 9),
+                new: make_entity_version(entity, "drifted", 2),
+            }],
+            vec![],
+        );
+        let store = HistoryStore::from_changes([root, revise]);
+
+        let error = store
+            .get_entity_revisions(&entity)
+            .expect_err("a payload no parent published must fail closed");
+
+        assert!(
+            matches!(&error, ModelError::Conflict(message) if message.contains("stale old payload")),
+            "expected a stale-payload conflict, got {error}"
+        );
+    }
+
+    /// A merge whose stated transition matches neither parent's published state
+    /// is a genuinely inconsistent history, and stays a refusal.
+    #[test]
+    fn entity_revisions_at_refuse_a_merge_that_restates_a_superseded_transition() {
+        let entity = EntityId::new();
+        let root_id = make_change_id(76);
+        let left_id = make_change_id(77);
+        let right_id = make_change_id(78);
+        let merge_id = make_change_id(79);
+        let version = |marker| make_entity_version(entity, "restated", marker);
+
+        let store = HistoryStore::from_changes([
+            make_semantic_change(
+                root_id,
+                vec![],
+                vec![EntityDelta::Added { new: version(1) }],
+                vec![],
+            ),
+            make_semantic_change(
+                left_id,
+                vec![root_id],
+                vec![EntityDelta::Modified {
+                    old: version(1),
+                    new: version(2),
+                }],
+                vec![],
+            ),
+            make_semantic_change(
+                right_id,
+                vec![root_id],
+                vec![EntityDelta::Modified {
+                    old: version(1),
+                    new: version(3),
+                }],
+                vec![],
+            ),
+            // Authored against the root rather than against `left`, the state
+            // this merge's own first parent published.
+            make_semantic_change(
+                merge_id,
+                vec![left_id, right_id],
+                vec![EntityDelta::Modified {
+                    old: version(1),
+                    new: version(3),
+                }],
+                vec![],
+            ),
+        ]);
+
+        let error = store
+            .get_entity_revisions_at(&entity, &merge_id)
+            .expect_err("a transition its first parent already superseded must fail closed");
+
+        assert!(
+            matches!(&error, ModelError::Conflict(message) if message.contains("stale old payload")),
+            "expected a stale-payload conflict, got {error}"
+        );
+    }
+
+    /// A removal followed by a re-add on the same lineage names the revision
+    /// the removal closed, rather than starting a detached chain.
+    #[test]
+    fn entity_revisions_link_a_re_add_to_the_revision_a_removal_closed() {
+        let entity = EntityId::new();
+        let add_id = make_change_id(80);
+        let remove_id = make_change_id(81);
+        let re_add_id = make_change_id(82);
+        let version = |marker| make_entity_version(entity, "revived", marker);
+
+        let store = HistoryStore::from_changes([
+            make_semantic_change(
+                add_id,
+                vec![],
+                vec![EntityDelta::Added { new: version(1) }],
+                vec![],
+            ),
+            make_semantic_change(
+                remove_id,
+                vec![add_id],
+                vec![EntityDelta::Removed { old: version(1) }],
+                vec![],
+            ),
+            make_semantic_change(
+                re_add_id,
+                vec![remove_id],
+                vec![EntityDelta::Added { new: version(2) }],
+                vec![],
+            ),
+        ]);
+
+        let revisions = store.get_entity_revisions(&entity).unwrap();
+
+        assert_eq!(revisions.len(), 2);
+        assert_eq!(revisions[0].ended_by, Some(remove_id));
+        assert_eq!(revisions[1].introduced_by, re_add_id);
+        assert_eq!(
+            revisions[1].previous_revision,
+            Some(revisions[0].revision_id)
         );
     }
 
