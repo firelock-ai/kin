@@ -1467,6 +1467,16 @@ mod tests {
         // Remove one body from the published store between the two
         // observations, which the staged observation already proved present.
         let opaque = kin_blobs::digest(&std::fs::read(source.join("payload.bin")).unwrap());
+        let external_oid = gix::hash::ObjectId::from_hex(
+            git_stdout(&source, ["hash-object", "payload.bin"])
+                .trim()
+                .as_bytes(),
+        )
+        .unwrap();
+        let external_object = ExternalObjectId::new(
+            ExternalObjectKind::Blob,
+            kin_model::GitObjectId::sha1(external_oid.as_bytes().try_into().unwrap()),
+        );
         let published_kin_dir = source.join(".kin");
         let error = init_from_git_with_hooks(
             &source,
@@ -1483,13 +1493,14 @@ mod tests {
         // corruption. Do not rewrite this to expect the seal; a store defect
         // cannot get past graph-authority verification to reach it.
         let message = error.to_string();
+        let missing_body = format!("body for {external_object:?} is absent");
         assert!(
-            message.contains("is absent from immutable source CAS"),
+            message.contains("Git external authority body validation failed"),
             "graph authority must refuse the absent body, got: {message}"
         );
         assert!(
-            message.contains(&opaque.to_string()),
-            "the refusal must name the lost body, got: {message}"
+            message.contains(&missing_body),
+            "the refusal must name the exact lost external object, got: {message}"
         );
         // The rename already happened, so the contract here is uncertain rather
         // than absent: the operator is told to recover, not to reinitialize.
