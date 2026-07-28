@@ -27,12 +27,33 @@ use crate::repository_transfer::{
 };
 use crate::repository_transfer_negotiation::RepositoryTransferTransport;
 
+/// The most bytes one transfer body carries, in either direction.
+///
+/// The daemon's transfer routes accept this much, so the client reads this
+/// much. Leaving the read side on the HTTP client's implicit 10 MiB default
+/// would cap a pull well below the packs a peer is willing to export, and
+/// would report a body this replica declined to read as a remote failure.
+pub const REPOSITORY_TRANSFER_HTTP_BODY_LIMIT: usize = 24 * 1024 * 1024;
+
 /// Where a peer replica serves its transfer seam.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RepositoryTransferEndpoint {
     pub base_url: String,
     pub auth_token: Option<String>,
     pub timeout_secs: u64,
+}
+
+/// Written by hand so a bearer token cannot reach a log through any derived
+/// `Debug` on this struct or on one that holds it.
+impl std::fmt::Debug for RepositoryTransferEndpoint {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RepositoryTransferEndpoint")
+            .field("base_url", &self.base_url)
+            .field("authenticated", &self.auth_token.is_some())
+            .field("timeout_secs", &self.timeout_secs)
+            .finish()
+    }
 }
 
 impl RepositoryTransferEndpoint {
@@ -122,14 +143,37 @@ fn read_json<R: serde::de::DeserializeOwned>(
     response: ureq::http::Response<ureq::Body>,
     what: &str,
 ) -> Result<R> {
-    let body = response.into_body().read_to_string().map_err(|error| {
-        RepositoryTransferError::Storage(format!("failed to read remote {what} response: {error}"))
-    })?;
+    let body = response
+        .into_body()
+        .into_with_config()
+        // The reader fails at the limit rather than past it, so a body of
+        // exactly the declared bound has to stay readable: the daemon accepts
+        // that body, and both sides must agree on which envelopes are legal.
+        .limit(REPOSITORY_TRANSFER_HTTP_BODY_LIMIT as u64 + 1)
+        .read_to_string()
+        .map_err(|error| body_error(error, what))?;
     serde_json::from_str(&body).map_err(|error| {
         RepositoryTransferError::Invalid(format!(
             "remote {what} response is not a valid repository-v6 envelope: {error}"
         ))
     })
+}
+
+/// Map a body this replica would not read onto the refusal it actually is.
+///
+/// A body past the declared bound is an oversized envelope, not a remote
+/// failure: the peer sent it correctly and the local client declined it.
+/// Reporting `Storage` there would tell an operator the remote broke.
+fn body_error(error: ureq::Error, what: &str) -> RepositoryTransferError {
+    match error {
+        ureq::Error::BodyExceedsLimit(_) => RepositoryTransferError::Invalid(format!(
+            "remote {what} response is larger than the \
+             {REPOSITORY_TRANSFER_HTTP_BODY_LIMIT} byte repository-v6 transfer body limit"
+        )),
+        other => RepositoryTransferError::Storage(format!(
+            "failed to read remote {what} response: {other}"
+        )),
+    }
 }
 
 /// Map a peer failure onto the transfer error it actually represents.
@@ -152,6 +196,13 @@ fn peer_error(error: ureq::Error, what: &str) -> RepositoryTransferError {
             )),
             404 => RepositoryTransferError::Invalid(format!(
                 "remote does not serve {what} for this repository (HTTP 404)"
+            )),
+            // The peer is intact and answered; the envelope is too large for
+            // the bound both sides declare. That is the same refusal the
+            // client raises on an oversized body it reads, not a peer failure.
+            413 => RepositoryTransferError::Invalid(format!(
+                "remote refused {what} as larger than the \
+                 {REPOSITORY_TRANSFER_HTTP_BODY_LIMIT} byte repository-v6 transfer body limit (HTTP 413)"
             )),
             other => {
                 RepositoryTransferError::Storage(format!("remote {what} failed with HTTP {other}"))
@@ -221,6 +272,17 @@ mod tests {
         HttpRepositoryTransferTransport::new(RepositoryTransferEndpoint::new(base_url))
     }
 
+    fn json_response(payload: String) -> ureq::http::Response<ureq::Body> {
+        ureq::http::Response::builder()
+            .status(200)
+            .body(
+                ureq::Body::builder()
+                    .mime_type("application/json")
+                    .data(payload),
+            )
+            .unwrap()
+    }
+
     #[test]
     fn endpoint_urls_percent_encode_the_repository_identity() {
         // A repository id accepts any non-control text, so an id carrying a
@@ -258,9 +320,64 @@ mod tests {
             RepositoryTransferError::Storage(_)
         ));
         assert!(matches!(
+            peer_error(ureq::Error::StatusCode(413), "transfer receive"),
+            RepositoryTransferError::Invalid(_)
+        ));
+        assert!(matches!(
             peer_error(ureq::Error::StatusCode(500), "transfer receive"),
             RepositoryTransferError::Storage(_)
         ));
+    }
+
+    #[test]
+    fn a_pack_larger_than_the_client_default_is_still_read() {
+        // The HTTP client caps a body at 10 MiB unless told otherwise, well
+        // under the bound the daemon's transfer routes accept. A pack carries
+        // base64 CAS bodies for the whole source tree, so any repository past
+        // a toy hits that default long before it hits the change bound.
+        let payload = serde_json::json!({ "value": "a".repeat(11 * 1024 * 1024) }).to_string();
+        assert!(payload.len() > 10 * 1024 * 1024);
+
+        let value: serde_json::Value =
+            read_json(json_response(payload), "transfer export").expect("a body under the bound");
+        assert_eq!(value["value"].as_str().unwrap().len(), 11 * 1024 * 1024);
+    }
+
+    #[test]
+    fn a_body_past_the_declared_bound_is_an_oversized_envelope_not_a_remote_failure() {
+        // The peer sent this body correctly; the local client refused to read
+        // it. Calling that Storage would tell an operator the remote broke.
+        let error = body_error(ureq::Error::BodyExceedsLimit(64), "transfer export");
+        let RepositoryTransferError::Invalid(message) = error else {
+            panic!("a local read bound is not a remote storage failure");
+        };
+        assert!(
+            message.contains("transfer body limit"),
+            "the refusal must name the bound that was exceeded: {message}"
+        );
+        assert!(matches!(
+            body_error(ureq::Error::HostNotFound, "transfer export"),
+            RepositoryTransferError::Storage(_)
+        ));
+    }
+
+    #[test]
+    fn debug_output_never_carries_the_bearer_token() {
+        let endpoint =
+            RepositoryTransferEndpoint::new("http://127.0.0.1:4010").with_auth("test-bearer-token");
+
+        let rendered = format!("{endpoint:?}");
+        assert!(
+            !rendered.contains("test-bearer-token"),
+            "an endpoint must never print its token: {rendered}"
+        );
+        assert!(rendered.contains("authenticated: true"));
+
+        let rendered = format!("{:?}", HttpRepositoryTransferTransport::new(endpoint));
+        assert!(
+            !rendered.contains("test-bearer-token"),
+            "a transport must never print its token: {rendered}"
+        );
     }
 
     #[test]

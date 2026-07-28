@@ -26,6 +26,9 @@ use kin_model::{
     RepositoryId, SessionCapabilities, SessionId, SessionStore, SessionTransport, TransactionDelta,
     TreeEntry, WorkStore, WorkspaceId, WorkspaceTreeSnapshot,
 };
+// One declared bound governs both directions: what these routes accept is what
+// the transfer client reads.
+use kin_remote::repository_transfer_http::REPOSITORY_TRANSFER_HTTP_BODY_LIMIT;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -35,7 +38,6 @@ use uuid::Uuid;
 
 static BOOTSTRAP_EXPORTS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
 static EXACT_SOURCE_ARCHIVE_EXPORTS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
-const REPOSITORY_TRANSFER_HTTP_BODY_LIMIT: usize = 24 * 1024 * 1024;
 
 fn exact_source_archive_exports() -> Arc<tokio::sync::Semaphore> {
     Arc::clone(

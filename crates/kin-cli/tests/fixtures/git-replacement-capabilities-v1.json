@@ -273,6 +273,7 @@
         "DONE: admit the pack in one local authority transaction and refuse a receipt that does not bind it",
         "DONE: refuse a remote this replica already contains, naming the remote head",
         "OPEN: carry a closure larger than one negotiated envelope; transfer v1 has no continuation packs",
+        "OPEN: carry an exported pack past the 24 MiB transfer body bound; the daemon route and the client read declare the same limit, and a pack past it is refused as an oversized envelope rather than split",
         "OPEN: graph-derived workspace transition after admission, so a working tree follows the new head"
       ],
       "evidence_tests": [
@@ -280,7 +281,7 @@
         "crates/kin-remote/src/repository_transfer_http.rs",
         "crates/kin-daemon/src/api.rs"
       ],
-      "note": "Negotiation, export, and admission run end to end between two Kin daemons over HTTP with receipts verified. It stays closed because the envelope is bounded and because admission does not yet move the workspace to the admitted head."
+      "note": "Negotiation, export, and admission run end to end between two Kin daemons over HTTP with receipts verified. It stays closed because the envelope is bounded and because admission does not yet move the workspace to the admitted head. The envelope is bounded twice: by the negotiated change count, and by the 24 MiB one-body transfer bound. A pack carries base64 CAS bodies for the whole source tree, so on a real repository the byte bound binds first."
     },
     {
       "command": "merge",

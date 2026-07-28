@@ -774,6 +774,14 @@ mod tests {
         actor: AuthorId,
         /// Corrupt the receipt on the way back, to prove the caller checks it.
         forge_receipt: bool,
+        /// Rewrite the repository this peer's discovery envelopes claim to
+        /// answer for, to prove the caller checks identity itself rather than
+        /// trusting a peer to refuse on its behalf.
+        claimed_repository: Option<RepositoryId>,
+        /// Rewrite the ref the transfer status answers about, for the same
+        /// reason: a peer that answers a question nobody asked is refused.
+        claimed_destination_ref: Option<RefName>,
+        exported: RefCell<usize>,
         received: RefCell<usize>,
     }
 
@@ -783,6 +791,9 @@ mod tests {
                 authority,
                 actor: AuthorId::new("local-peer"),
                 forge_receipt: false,
+                claimed_repository: None,
+                claimed_destination_ref: None,
+                exported: RefCell::new(0),
                 received: RefCell::new(0),
             }
         }
@@ -793,6 +804,20 @@ mod tests {
                 ..Self::new(authority)
             }
         }
+
+        fn claiming_repository(authority: &'a TestManager, claimed: RepositoryId) -> Self {
+            Self {
+                claimed_repository: Some(claimed),
+                ..Self::new(authority)
+            }
+        }
+
+        fn claiming_destination_ref(authority: &'a TestManager, claimed: RefName) -> Self {
+            Self {
+                claimed_destination_ref: Some(claimed),
+                ..Self::new(authority)
+            }
+        }
     }
 
     impl RepositoryTransferTransport for LocalPeer<'_> {
@@ -800,7 +825,11 @@ mod tests {
             &self,
             repository_id: &RepositoryId,
         ) -> Result<RepositoryRefAdvertisement> {
-            repository_ref_advertisement(self.authority, repository_id)
+            let mut advertisement = repository_ref_advertisement(self.authority, repository_id)?;
+            if let Some(claimed) = &self.claimed_repository {
+                advertisement.repository_id = claimed.clone();
+            }
+            Ok(advertisement)
         }
 
         fn transfer_status(
@@ -808,7 +837,15 @@ mod tests {
             repository_id: &RepositoryId,
             destination_ref: &RefName,
         ) -> Result<RepositoryTransferStatus> {
-            repository_transfer_status(self.authority, repository_id, destination_ref)
+            let mut status =
+                repository_transfer_status(self.authority, repository_id, destination_ref)?;
+            if let Some(claimed) = &self.claimed_repository {
+                status.repository_id = claimed.clone();
+            }
+            if let Some(claimed) = &self.claimed_destination_ref {
+                status.destination_ref = claimed.clone();
+            }
+            Ok(status)
         }
 
         fn export_pack(
@@ -817,6 +854,7 @@ mod tests {
             source_ref: &RefName,
             expectation: &RepositoryTransferExpectation,
         ) -> Result<RepositoryTransferPack> {
+            *self.exported.borrow_mut() += 1;
             build_repository_transfer_pack(self.authority, source_ref, expectation)
         }
 
@@ -1249,7 +1287,11 @@ mod tests {
     }
 
     #[test]
-    fn an_advertisement_for_another_repository_is_refused_before_any_export() {
+    fn a_peer_asked_about_a_repository_it_does_not_serve_refuses_the_advertisement() {
+        // This is the peer-side half. The peer refuses because its authority
+        // does not belong to the requested repository, so the caller never
+        // reaches its own identity check. The caller-side guards are proven
+        // separately against a peer that lies instead of refusing.
         let fixture = fixture();
         let peer = LocalPeer::new(&fixture.source);
         let other = RepositoryId::new("some-other-repository").unwrap();
@@ -1265,6 +1307,138 @@ mod tests {
         .expect_err("a peer serving a different repository must be refused");
 
         assert!(matches!(error, RepositoryTransferError::Invalid(_)));
+        assert_eq!(*peer.exported.borrow(), 0);
+    }
+
+    #[test]
+    fn a_default_ref_from_an_advertisement_naming_another_repository_is_refused() {
+        // A fresh replica adopts this ref before it holds anything of its own,
+        // so the advertisement is the only surface that can be checked at all.
+        let fixture = fixture();
+        let other = RepositoryId::new("some-other-repository").unwrap();
+        let peer = LocalPeer::claiming_repository(&fixture.source, other.clone());
+
+        let error = remote_default_ref(&peer, &fixture.repository_id).expect_err(
+            "an advertisement that names another repository answers a different question",
+        );
+
+        let RepositoryTransferError::Invalid(message) = error else {
+            panic!("a peer answering for another repository is an invalid envelope");
+        };
+        assert!(
+            message.contains(other.as_str()) && message.contains(fixture.repository_id.as_str()),
+            "the refusal must name both repositories so the operator can act on it: {message}"
+        );
+    }
+
+    #[test]
+    fn a_pull_refuses_an_advertisement_naming_another_repository_before_any_export() {
+        // The peer here holds this repository and answers correctly about its
+        // refs, but labels the envelope with another repository. Only the
+        // caller can catch that, and it has to catch it at discovery rather
+        // than leaving it to the admission check after a pack is already here.
+        let fixture = fixture();
+        let other = RepositoryId::new("some-other-repository").unwrap();
+        let peer = LocalPeer::claiming_repository(&fixture.source, other.clone());
+
+        let error = pull_from_remote(
+            &fixture.destination,
+            &peer,
+            &fixture.repository_id,
+            &fixture.main,
+            &fixture.main,
+            AuthorId::new("pulling-replica"),
+        )
+        .expect_err("a peer answering for another repository has not answered for this one");
+
+        let RepositoryTransferError::Invalid(message) = error else {
+            panic!("a peer answering for another repository is an invalid envelope");
+        };
+        assert!(
+            message.contains("remote ref advertisement belongs to repository"),
+            "the caller's own check must be what refuses, not the peer's: {message}"
+        );
+        assert_eq!(
+            *peer.exported.borrow(),
+            0,
+            "a refusal must happen before any pack is exported"
+        );
+        assert_eq!(
+            head_of(&fixture.destination, &fixture.main),
+            None,
+            "a refused pull must admit nothing"
+        );
+    }
+
+    #[test]
+    fn a_push_refuses_a_transfer_status_naming_another_repository() {
+        // The pack builder compares the two repository ids as well, so the
+        // refusal is asserted on the caller's own message: reaching the pack
+        // builder at all means this replica read a lease it should have
+        // refused, and acted on its head and limits.
+        let fixture = fixture();
+        let other = RepositoryId::new("some-other-repository").unwrap();
+        let peer = LocalPeer::claiming_repository(&fixture.destination, other.clone());
+
+        let error = push_to_remote(
+            &fixture.source,
+            &peer,
+            &fixture.repository_id,
+            &fixture.main,
+            &fixture.main,
+        )
+        .expect_err("a lease labelled for another repository is not this repository's lease");
+
+        let RepositoryTransferError::Invalid(message) = error else {
+            panic!("a peer answering for another repository is an invalid envelope");
+        };
+        assert!(
+            message.contains("remote transfer status belongs to repository")
+                && message.contains(other.as_str()),
+            "the caller's own check must be what refuses, not the pack builder's: {message}"
+        );
+        assert_eq!(*peer.received.borrow(), 0);
+        assert_eq!(
+            head_of(&fixture.destination, &fixture.main),
+            None,
+            "a refused push must move nothing"
+        );
+    }
+
+    #[test]
+    fn a_push_refuses_a_transfer_status_answering_for_another_ref() {
+        // A lease read for one ref says nothing about another. Accepting it
+        // would publish against a head and a policy that were never asked for.
+        let fixture = fixture();
+        let elsewhere = RefName::branch(b"elsewhere").unwrap();
+        let peer = LocalPeer::claiming_destination_ref(&fixture.destination, elsewhere);
+
+        let error = push_to_remote(
+            &fixture.source,
+            &peer,
+            &fixture.repository_id,
+            &fixture.main,
+            &fixture.main,
+        )
+        .expect_err("a status for another ref does not answer the question this replica asked");
+
+        let RepositoryTransferError::Invalid(message) = error else {
+            panic!("a status answering for another ref is an invalid envelope");
+        };
+        assert!(
+            message.contains("remote transfer status answers for ref"),
+            "the refusal must say the peer answered a different question: {message}"
+        );
+        assert_eq!(
+            *peer.received.borrow(),
+            0,
+            "a refusal must happen before any pack reaches the remote"
+        );
+        assert_eq!(
+            head_of(&fixture.destination, &fixture.main),
+            None,
+            "a refused push must move nothing"
+        );
     }
 
     #[test]
