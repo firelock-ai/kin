@@ -11,6 +11,13 @@
     },
     {
       "file": "crates/kin-index/src/history.rs",
+      "function": "derive_historical_semantic_deltas_inner",
+      "digest": "sha256:0894a920afdaa466d2469514d51752a963c8a9a9ab5bbbf94ccf821e8967fdc8",
+      "reason": "Owns the parent-first state-retention and eviction loop after the public wrapper delegates into the persistent link engine; omitting it would leave the real replay driver unguarded.",
+      "owner": "kin-index"
+    },
+    {
+      "file": "crates/kin-index/src/history.rs",
       "function": "semantic_state_for_tree",
       "digest": "sha256:5272aa6a3dbc402ebaf0b78e752d7230aaf9af49251b95cffbf3656e6b8ea431",
       "reason": "Turns one exact resolved tree plus CAS bodies into the entity/relation state a change is diffed from and to. Its classification, parse, and cross-file linking order decide what the past is said to contain.",
@@ -68,7 +75,7 @@
     {
       "file": "crates/kin-index/src/history.rs",
       "function": "derive_tree_semantics",
-      "digest": "sha256:7d3ef963c89f32d030c6a1b046fe4a55eeb56a51c1aa859ef05e88a0ef48efa8",
+      "digest": "sha256:f7c9197209a0c1d1fb14447f654954516867b462a307cd70ed482889b4bbeb96",
       "reason": "Derives one tree's semantic state and its first-parent deltas from carried-forward parent state: the incremental replacement for whole-tree recomputation, so its carry/patch rules decide the persisted history.",
       "owner": "kin-index"
     },
@@ -98,6 +105,20 @@
       "function": "analyze_file_era",
       "digest": "sha256:d5ae6a50fee2387dfb5826c16cad9cc655f437423e2892eab4d1c47c0e8d4afe",
       "reason": "Resolves a file's module, pin, and include targets against the tree's path set; module-target invalidation is only as conservative as this resolution.",
+      "owner": "kin-index"
+    },
+    {
+      "file": "crates/kin-index/src/history.rs",
+      "function": "advance_link_era",
+      "digest": "sha256:324729e0cc639e1ead87cbe28a50c51f1474b8c6ce3f928a6a2fc58d0c3f116f",
+      "reason": "Defines exact path-set cache eras for module and include resolution; a stale or colliding era can make replay reuse analysis from the wrong tree.",
+      "owner": "kin-index"
+    },
+    {
+      "file": "crates/kin-index/src/history.rs",
+      "function": "refresh_link_analyses",
+      "digest": "sha256:a136757656771327c0f805f1c9744808f85f6c2adcee52858215a41d06294121",
+      "reason": "Controls exact parse-allocation cache identity, recomputation, and pruning across divergent history; stale reuse here can silently change persisted historical relations.",
       "owner": "kin-index"
     },
     {

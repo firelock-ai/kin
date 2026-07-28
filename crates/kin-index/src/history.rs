@@ -433,6 +433,20 @@ fn derive_tree_semantics(
     first_parent: &SemanticTreeState,
     engine: &mut LinkEngine,
 ) -> Result<(SemanticTreeState, Vec<EntityDelta>, Vec<RelationDelta>)> {
+    // An exact first-parent tree carry is already fully linked. This covers
+    // empty Git commits and merge commits that select the first parent's tree;
+    // returning its immutable state avoids rebuilding every whole-tree index
+    // when no semantic input changed at all.
+    let exact_first_parent_carry = files.len() == first_parent.files.len()
+        && files.iter().zip(first_parent.files.iter()).all(
+            |((current_id, current), (parent_id, parent))| {
+                current_id == parent_id && Arc::ptr_eq(current, parent)
+            },
+        );
+    if exact_first_parent_carry {
+        return Ok((first_parent.clone(), Vec::new(), Vec::new()));
+    }
+
     // Any change to the artifact/path membership of the tree can change module
     // resolution, import targets, and default-export anchoring anywhere in the
     // repository, so those commits relink the whole tree. Content-only commits
@@ -467,8 +481,8 @@ fn derive_tree_semantics(
         .flat_map(|file| file.entities.iter())
         .collect();
     let known_files = known_file_paths(&file_refs, &universe_refs);
-    let era_signature = engine.advance_era(&files);
-    engine.refresh_analyses(&files, era_signature, &known_files);
+    let era_signature = advance_link_era(engine, &files);
+    refresh_link_analyses(engine, &files, era_signature, &known_files);
 
     // Assemble the include graph from the per-file resolved include targets.
     // `resolve_include_targets` is the same function batch include-graph
@@ -858,9 +872,9 @@ fn deltas_from_relation_patch(
 /// Nothing in here is semantic truth: it is memoized analysis of file versions
 /// (probe tokens, resolved module and include targets, hierarchy projections)
 /// used to prove which files a commit's delta cannot have affected. Every
-/// entry is keyed to the exact parse payload (by pointer identity) and the
-/// exact path-set era it was computed under, and is recomputed whenever
-/// either changes.
+/// entry retains and compares the exact parse allocation and the exact
+/// path-set era it was computed under, and is recomputed whenever either
+/// changes.
 struct LinkEngine {
     verify: bool,
     analyses: HashMap<ArtifactId, AnalysisSlot>,
@@ -873,7 +887,11 @@ struct LinkEngine {
 }
 
 struct AnalysisSlot {
-    parse_ptr: usize,
+    /// Retaining the exact parse allocation makes pointer identity safe: an
+    /// allocator cannot recycle its address while this slot exists. A raw
+    /// pointer value alone allowed a dropped leaf-head parse to alias a later
+    /// divergent head's distinct payload.
+    parse: Arc<FileParseData>,
     entity_arcs: Vec<Arc<Entity>>,
     stat: Arc<FileStaticAnalysis>,
     era_signature: u64,
@@ -922,7 +940,7 @@ struct FileEraAnalysis {
 impl LinkEngine {
     fn new() -> Self {
         let verify = std::env::var("KIN_HISTORY_LINK_VERIFY")
-            .map(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"))
+            .map(|value| history_link_verify_enabled(&value))
             .unwrap_or(false);
         Self {
             verify,
@@ -937,62 +955,84 @@ impl LinkEngine {
             .get(artifact_id)
             .expect("analysis slots are refreshed for every file in the tree before use")
     }
+}
 
-    /// Advance to the era of `files`' exact sorted path membership. Module and
-    /// include-target resolution consult the known-file set, so per-file era
-    /// caches are only valid while this membership holds; the comparison is
-    /// over the paths themselves, never a digest of them.
-    fn advance_era(&mut self, files: &BTreeMap<ArtifactId, Arc<SemanticFileState>>) -> u64 {
-        let mut paths: Vec<String> = files.values().map(|file| file.path().to_string()).collect();
-        paths.sort_unstable();
-        if paths != self.era_paths {
-            self.era_counter += 1;
-            self.era_paths = paths;
-        }
-        self.era_counter
+fn history_link_verify_enabled(value: &str) -> bool {
+    let value = value.trim();
+    value == "1"
+        || value.eq_ignore_ascii_case("true")
+        || value.eq_ignore_ascii_case("yes")
+        || value.eq_ignore_ascii_case("on")
+}
+
+/// Advance to `files`' exact sorted path-membership era. Module and include
+/// target resolution consult the known-file set, so per-file era caches are
+/// valid only while this membership holds; compare paths themselves, never a
+/// digest that could collide.
+fn advance_link_era(
+    engine: &mut LinkEngine,
+    files: &BTreeMap<ArtifactId, Arc<SemanticFileState>>,
+) -> u64 {
+    let mut paths: Vec<String> = files.values().map(|file| file.path().to_string()).collect();
+    paths.sort_unstable();
+    if paths != engine.era_paths {
+        engine.era_counter += 1;
+        engine.era_paths = paths;
     }
+    engine.era_counter
+}
 
-    fn refresh_analyses(
-        &mut self,
-        files: &BTreeMap<ArtifactId, Arc<SemanticFileState>>,
-        era_signature: u64,
-        known_files: &HashSet<&str>,
-    ) {
-        for (artifact_id, file) in files {
-            let parse_ptr = Arc::as_ptr(&file.parse) as usize;
-            let stale = match self.analyses.get(artifact_id) {
-                Some(slot) => slot.parse_ptr != parse_ptr,
-                None => true,
-            };
-            if stale {
-                let stat = Arc::new(analyze_file_static(&file.parse));
-                let era = Arc::new(analyze_file_era(&file.parse, known_files));
-                let entity_arcs = file
-                    .parse
-                    .entities
-                    .iter()
-                    .map(|entity| Arc::new(entity.clone()))
-                    .collect();
-                self.analyses.insert(
-                    *artifact_id,
-                    AnalysisSlot {
-                        parse_ptr,
-                        entity_arcs,
-                        stat,
-                        era_signature,
-                        era,
-                    },
-                );
-                continue;
-            }
-            let slot = self
-                .analyses
-                .get_mut(artifact_id)
-                .expect("slot presence checked above");
-            if slot.era_signature != era_signature {
-                slot.era = Arc::new(analyze_file_era(&file.parse, known_files));
-                slot.era_signature = era_signature;
-            }
+/// Refresh exact per-file analysis inputs for one tree and discard analyses no
+/// longer reachable from that tree.
+///
+/// Parent semantic states own every parse allocation a future child can reuse.
+/// Dropping a cache slot therefore never drops semantic truth: revisiting a
+/// live parent or another branch either finds the same retained allocation or
+/// recomputes from that parent's exact parse payload. Retaining only the
+/// current tree bounds cache memory while the `Arc` held by each live slot
+/// prevents address reuse from impersonating a distinct divergent-head input.
+fn refresh_link_analyses(
+    engine: &mut LinkEngine,
+    files: &BTreeMap<ArtifactId, Arc<SemanticFileState>>,
+    era_signature: u64,
+    known_files: &HashSet<&str>,
+) {
+    engine
+        .analyses
+        .retain(|artifact_id, _| files.contains_key(artifact_id));
+    for (artifact_id, file) in files {
+        let stale = match engine.analyses.get(artifact_id) {
+            Some(slot) => !Arc::ptr_eq(&slot.parse, &file.parse),
+            None => true,
+        };
+        if stale {
+            let stat = Arc::new(analyze_file_static(&file.parse));
+            let era = Arc::new(analyze_file_era(&file.parse, known_files));
+            let entity_arcs = file
+                .parse
+                .entities
+                .iter()
+                .map(|entity| Arc::new(entity.clone()))
+                .collect();
+            engine.analyses.insert(
+                *artifact_id,
+                AnalysisSlot {
+                    parse: Arc::clone(&file.parse),
+                    entity_arcs,
+                    stat,
+                    era_signature,
+                    era,
+                },
+            );
+            continue;
+        }
+        let slot = engine
+            .analyses
+            .get_mut(artifact_id)
+            .expect("slot presence checked above");
+        if slot.era_signature != era_signature {
+            slot.era = Arc::new(analyze_file_era(&file.parse, known_files));
+            slot.era_signature = era_signature;
         }
     }
 }
@@ -1907,6 +1947,73 @@ mod tests {
     }
 
     #[test]
+    fn analysis_cache_retains_and_compares_the_exact_parse_allocation() {
+        let artifact_id = ArtifactId::new();
+        let path = "src/shared.rs";
+        let first_parse = Arc::new(FileParseData {
+            file_path: path.to_string(),
+            entities: vec![parsed_function(path, "left_only", 1)],
+            relations: Vec::new(),
+            imports: Vec::new(),
+        });
+        let first_parse_weak = Arc::downgrade(&first_parse);
+        let first_state = Arc::new(SemanticFileState {
+            artifact_id,
+            entry: TreeEntry::blob(kin_model::Hash256::from_bytes([1; 32]), false),
+            completeness: ParseCompleteness::Full,
+            parse: first_parse,
+        });
+        let mut first_files = BTreeMap::new();
+        first_files.insert(artifact_id, first_state);
+        let known_files = HashSet::from([path]);
+        let mut engine = LinkEngine::new();
+        let era = advance_link_era(&mut engine, &first_files);
+        refresh_link_analyses(&mut engine, &first_files, era, &known_files);
+        drop(first_files);
+
+        assert!(
+            first_parse_weak.upgrade().is_some(),
+            "the cache must retain its identity allocation so its address cannot be recycled"
+        );
+
+        let second_state = Arc::new(SemanticFileState {
+            artifact_id,
+            entry: TreeEntry::blob(kin_model::Hash256::from_bytes([2; 32]), false),
+            completeness: ParseCompleteness::Full,
+            parse: Arc::new(FileParseData {
+                file_path: path.to_string(),
+                entities: vec![parsed_function(path, "right_only", 1)],
+                relations: Vec::new(),
+                imports: Vec::new(),
+            }),
+        });
+        let mut second_files = BTreeMap::new();
+        second_files.insert(artifact_id, second_state);
+        let era = advance_link_era(&mut engine, &second_files);
+        refresh_link_analyses(&mut engine, &second_files, era, &known_files);
+
+        assert_eq!(engine.analyses.len(), 1);
+        assert_eq!(
+            engine.analysis(&artifact_id).entity_arcs[0].name,
+            "right_only"
+        );
+        assert!(
+            first_parse_weak.upgrade().is_none(),
+            "replacing the exact input should release the stale cache allocation"
+        );
+    }
+
+    #[test]
+    fn history_link_verification_flag_is_case_insensitive() {
+        for enabled in ["1", "true", "TRUE", "TrUe", "yes", "YES", "on", "ON"] {
+            assert!(history_link_verify_enabled(enabled), "{enabled}");
+        }
+        for disabled in ["", "0", "false", "off", "no", "truthy"] {
+            assert!(!history_link_verify_enabled(disabled), "{disabled}");
+        }
+    }
+
+    #[test]
     fn fails_closed_when_history_is_not_parent_first() {
         let root = tempdir().unwrap();
         let repository = root.path().join("source");
@@ -2025,17 +2132,124 @@ mod tests {
     /// relinks that must still match the batch derivation exactly.
     #[test]
     fn incremental_replay_matches_batch_on_structural_commits() {
-        enrich_verified(&[
-            &[("src/lib.rs", "pub fn one() {}\n")],
-            &[
-                ("src/lib.rs", "pub mod extra;\npub fn one() {}\n"),
-                ("src/extra.rs", "pub fn two() { crate::one() }\n"),
-            ],
-            // Content-only step between the structural ones.
-            &[("src/extra.rs", "pub fn two() { crate::one(); }\n")],
-            // Remove the module again.
-            &[("src/lib.rs", "pub fn one() {}\npub fn three() {}\n")],
-        ]);
+        let root = tempdir().unwrap();
+        let repository = root.path().join("source");
+        fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "--initial-branch=main"]);
+        git(
+            &repository,
+            &["config", "user.email", "kin@example.invalid"],
+        );
+        git(&repository, &["config", "user.name", "Kin Test"]);
+
+        write(&repository, "src/lib.rs", b"pub fn one() {}\n");
+        git(&repository, &["add", "--all"]);
+        git(&repository, &["commit", "-m", "initial"]);
+
+        write(
+            &repository,
+            "src/lib.rs",
+            b"pub mod extra;\npub fn one() {}\n",
+        );
+        write(
+            &repository,
+            "src/extra.rs",
+            b"pub fn two() { crate::one() }\n",
+        );
+        git(&repository, &["add", "--all"]);
+        git(&repository, &["commit", "-m", "add module"]);
+
+        write(
+            &repository,
+            "src/extra.rs",
+            b"pub fn two() { crate::one(); }\n",
+        );
+        git(&repository, &["add", "--all"]);
+        git(&repository, &["commit", "-m", "content edit"]);
+
+        git(&repository, &["mv", "src/extra.rs", "src/renamed.rs"]);
+        write(
+            &repository,
+            "src/lib.rs",
+            b"pub mod renamed;\npub fn one() {}\n",
+        );
+        git(&repository, &["add", "--all"]);
+        git(&repository, &["commit", "-m", "rename module"]);
+
+        fs::remove_file(repository.join("src/renamed.rs")).unwrap();
+        write(
+            &repository,
+            "src/lib.rs",
+            b"pub fn one() {}\npub fn three() {}\n",
+        );
+        git(&repository, &["add", "--all"]);
+        git(&repository, &["commit", "-m", "delete module"]);
+
+        let blob_store = BlobStore::new(root.path().join("cas")).unwrap();
+        let snapshot = capture_lossless_git_repository(
+            &repository,
+            RepositoryId::new("history-structural-equivalence").unwrap(),
+            &blob_store,
+        )
+        .unwrap();
+        let plan = plan_semantic_git_import(&snapshot, &blob_store).unwrap();
+        let trees = trees_by_change(&plan);
+        let deltas =
+            derive_historical_semantic_deltas_verified(&plan.changes, &trees, &blob_store).unwrap();
+        assert_eq!(deltas.len(), 5);
+    }
+
+    /// Two reachable leaf heads can carry different versions of the same
+    /// artifact after their temporary semantic states have been dropped. The
+    /// persistent analysis cache must never confuse one head's parse payload
+    /// for the other through allocator-address reuse.
+    #[test]
+    fn incremental_replay_matches_batch_across_divergent_leaf_heads() {
+        let root = tempdir().unwrap();
+        let repository = root.path().join("source");
+        fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "--initial-branch=main"]);
+        git(
+            &repository,
+            &["config", "user.email", "kin@example.invalid"],
+        );
+        git(&repository, &["config", "user.name", "Kin Test"]);
+        write(&repository, "src/shared.rs", b"pub fn root() {}\n");
+        git(&repository, &["add", "--all"]);
+        git(&repository, &["commit", "-m", "root"]);
+
+        git(&repository, &["switch", "-c", "left"]);
+        write(&repository, "src/shared.rs", b"pub fn left_only() {}\n");
+        git(&repository, &["add", "--all"]);
+        git(&repository, &["commit", "-m", "left leaf"]);
+
+        git(&repository, &["switch", "main"]);
+        git(&repository, &["switch", "-c", "right"]);
+        write(&repository, "src/shared.rs", b"pub fn right_only() {}\n");
+        git(&repository, &["add", "--all"]);
+        git(&repository, &["commit", "-m", "right leaf"]);
+
+        let blob_store = BlobStore::new(root.path().join("cas")).unwrap();
+        let snapshot = capture_lossless_git_repository(
+            &repository,
+            RepositoryId::new("history-divergent-leaf-heads").unwrap(),
+            &blob_store,
+        )
+        .unwrap();
+        let plan = plan_semantic_git_import(&snapshot, &blob_store).unwrap();
+        let trees = trees_by_change(&plan);
+        let deltas =
+            derive_historical_semantic_deltas_verified(&plan.changes, &trees, &blob_store).unwrap();
+
+        assert_eq!(deltas.len(), 3);
+        let names = deltas
+            .iter()
+            .flat_map(|delta| &delta.entity_deltas)
+            .filter_map(EntityDelta::new_state)
+            .map(|entity| entity.name.as_str())
+            .collect::<HashSet<_>>();
+        assert!(names.contains("left_only"));
+        assert!(names.contains("right_only"));
     }
 
     /// Python inheritance: an edit to a base class's hierarchy must relink the
@@ -2183,6 +2397,7 @@ mod tests {
             .args(args)
             .current_dir(repository)
             .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", repository)
             .output()
             .unwrap();
         assert!(

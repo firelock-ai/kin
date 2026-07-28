@@ -22,7 +22,10 @@ use kin_model::{
 
 use crate::error::{GitError, Result};
 use crate::lossless::{GitObjectFormat, LosslessGitRepository};
-use crate::semantic_import::{plan_semantic_git_import, GitWorkspaceSeed, SemanticGitImportPlan};
+use crate::semantic_import::{
+    plan_semantic_git_import, GitWorkspaceSeed, SemanticGitImportPlan,
+    ValidatedSemanticGitImportPlan,
+};
 
 /// A deterministic semantic Git import whose every commit carries the exact
 /// shared admission-policy transition derived from that commit's resolved
@@ -170,6 +173,15 @@ pub fn admit_semantic_git_import(
 ) -> Result<AdmittedSemanticGitImportPlan> {
     plan.validate(blob_store)?;
     build_admitted_semantic_git_import_plan(plan, blob_store)
+}
+
+/// Add shared admission policy to an import plan whose exact raw-object
+/// derivation is already represented by a non-forgeable validation token.
+pub fn admit_validated_semantic_git_import(
+    plan: &ValidatedSemanticGitImportPlan,
+    blob_store: &BlobStore,
+) -> Result<AdmittedSemanticGitImportPlan> {
+    build_admitted_semantic_git_import_plan(plan.as_plan(), blob_store)
 }
 
 fn build_admitted_semantic_git_import_plan(

@@ -151,6 +151,8 @@ mod tests {
         let output = Command::new("git")
             .args(args)
             .current_dir(repository)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", repository)
             .output()
             .unwrap();
         assert!(

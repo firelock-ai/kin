@@ -75,6 +75,45 @@ pub struct SemanticGitImportPlan {
     pub default_ref_mutation: Option<DefaultRefMutation>,
 }
 
+/// A semantic import plan whose complete raw-object derivation has been
+/// validated.
+///
+/// The inner plan is deliberately not publicly mutable and this type has no
+/// public constructor. Callers obtain it either from
+/// [`plan_validated_semantic_git_import`], where validity holds by
+/// construction, or from [`SemanticGitImportPlan::into_validated`], which
+/// performs the full rebuild-and-compare audit. This token lets the admission
+/// pipeline avoid repeating that expensive audit without making an unchecked
+/// plan mutation callable on a plain public [`SemanticGitImportPlan`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValidatedSemanticGitImportPlan {
+    plan: SemanticGitImportPlan,
+}
+
+impl ValidatedSemanticGitImportPlan {
+    /// Borrow the exact validated plan for read-only derivation and proof.
+    pub const fn as_plan(&self) -> &SemanticGitImportPlan {
+        &self.plan
+    }
+
+    /// Consume the validation token and return the ordinary public plan.
+    pub fn into_inner(self) -> SemanticGitImportPlan {
+        self.plan
+    }
+
+    /// Bind deterministic historical semantics to the exact validated base
+    /// plan without rebuilding that base from raw objects again.
+    pub fn with_historical_semantics(
+        self,
+        deltas: &[(SemanticChangeId, Vec<EntityDelta>, Vec<RelationDelta>)],
+    ) -> Result<Self> {
+        require_unenriched_plan(&self.plan)?;
+        Ok(Self {
+            plan: apply_historical_semantic_deltas_unchecked(self.plan, deltas)?,
+        })
+    }
+}
+
 impl SemanticGitImportPlan {
     /// Rebuild the plan from its exact raw-object/ref state and require a
     /// byte-for-byte deterministic semantic result.
@@ -129,36 +168,32 @@ impl SemanticGitImportPlan {
         Ok(())
     }
 
+    /// Consume this plan and return a non-forgeable validated-plan token after
+    /// the full raw-object rebuild-and-compare audit succeeds.
+    pub fn into_validated(self, blob_store: &BlobStore) -> Result<ValidatedSemanticGitImportPlan> {
+        self.validate(blob_store)?;
+        Ok(ValidatedSemanticGitImportPlan { plan: self })
+    }
+
     /// Bind deterministic CAS-native semantic deltas and recompute every
     /// change identity, parent edge, and external alias in parent-first order.
     ///
     /// The plan must be unenriched and must carry the change identities its
     /// own content derives: every change identity is recomputed here and
     /// compared, which pins each change's payload and, transitively through
-    /// parent identities, the whole DAG. This deliberately does not re-derive
-    /// the plan from raw objects; [`admit_semantic_git_import`] performs that
-    /// full rebuild-and-compare audit exactly once on the enriched result, so
-    /// a plan whose content does not match its raw-object derivation still
-    /// fails closed before admission.
-    ///
-    /// [`admit_semantic_git_import`]: crate::admit_semantic_git_import
+    /// parent identities, the whole DAG. Because this method is callable on a
+    /// plain public plan, it first performs the full raw-object
+    /// rebuild-and-compare audit. Pipelines that already hold a
+    /// [`ValidatedSemanticGitImportPlan`] can bind through that token without
+    /// repeating the audit.
     pub fn with_historical_semantics(
         self,
-        _blob_store: &BlobStore,
+        blob_store: &BlobStore,
         deltas: &[(SemanticChangeId, Vec<EntityDelta>, Vec<RelationDelta>)],
     ) -> Result<Self> {
-        for change in &self.changes {
-            if !change.entity_deltas.is_empty()
-                || !change.relation_deltas.is_empty()
-                || validate_semantic_change_id(change).is_err()
-            {
-                return Err(GitError::InvalidSnapshot(
-                    "historical semantics may only be bound to the exact unenriched import plan"
-                        .to_string(),
-                ));
-            }
-        }
-        apply_historical_semantic_deltas_unchecked(self, deltas)
+        self.into_validated(blob_store)?
+            .with_historical_semantics(deltas)
+            .map(ValidatedSemanticGitImportPlan::into_inner)
     }
 }
 
@@ -167,7 +202,34 @@ pub fn plan_semantic_git_import(
     snapshot: &LosslessGitRepository,
     blob_store: &BlobStore,
 ) -> Result<SemanticGitImportPlan> {
-    build_semantic_git_import_plan(snapshot, blob_store)
+    plan_validated_semantic_git_import(snapshot, blob_store)
+        .map(ValidatedSemanticGitImportPlan::into_inner)
+}
+
+/// Build a semantic Git history whose exact raw-object derivation is proven by
+/// construction and retain that fact as a non-forgeable token.
+pub fn plan_validated_semantic_git_import(
+    snapshot: &LosslessGitRepository,
+    blob_store: &BlobStore,
+) -> Result<ValidatedSemanticGitImportPlan> {
+    Ok(ValidatedSemanticGitImportPlan {
+        plan: build_semantic_git_import_plan(snapshot, blob_store)?,
+    })
+}
+
+fn require_unenriched_plan(plan: &SemanticGitImportPlan) -> Result<()> {
+    for change in &plan.changes {
+        if !change.entity_deltas.is_empty()
+            || !change.relation_deltas.is_empty()
+            || validate_semantic_change_id(change).is_err()
+        {
+            return Err(GitError::InvalidSnapshot(
+                "historical semantics may only be bound to the exact unenriched import plan"
+                    .to_string(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn apply_historical_semantic_deltas_unchecked(
@@ -1762,6 +1824,38 @@ mod tests {
         );
         assert_eq!(admitted.workspace_base_change_id(), None);
         admitted.validate(&blob_store).unwrap();
+    }
+
+    #[test]
+    fn public_historical_binding_rejects_a_structurally_tampered_plan() {
+        let root = tempdir().unwrap();
+        let repo = root.path().join("source");
+        fs::create_dir(&repo).unwrap();
+        git_ok(&repo, ["init", "--initial-branch=main"]);
+        configure_git(&repo);
+        write(&repo, "src/lib.rs", b"pub fn exact() {}\n");
+        git_ok(&repo, ["add", "--all"]);
+        git_ok(&repo, ["commit", "-m", "initial"]);
+        let blob_store = BlobStore::new(root.path().join("cas")).unwrap();
+        let snapshot = capture_lossless_git_repository(
+            &repo,
+            RepositoryId::new("public-binding-validation").unwrap(),
+            &blob_store,
+        )
+        .unwrap();
+        let plan = plan_semantic_git_import(&snapshot, &blob_store).unwrap();
+        let bindings = plan
+            .changes
+            .iter()
+            .map(|change| (change.id, Vec::new(), Vec::new()))
+            .collect::<Vec<_>>();
+
+        let mut tampered = plan;
+        tampered.workspace_seed.base_tree = ResolvedTree::default();
+        assert!(matches!(
+            tampered.with_historical_semantics(&blob_store, &bindings),
+            Err(GitError::InvalidSnapshot(_))
+        ));
     }
 
     #[test]

@@ -14,11 +14,12 @@ use std::sync::Arc;
 use kin_blobs::BlobStore;
 use kin_db::{LocalFileBackend, RepositoryAuthorityManager};
 use kin_git::{
-    admit_semantic_git_import, build_git_external_authority, capture_lossless_git_repository,
-    plan_semantic_git_import, preflight_git_migration, preflight_git_migration_after_publication,
-    preflight_git_source_compatibility, seal_all_content_observation, AdmittedContentClosure,
-    GitLocalIgnoreSourceKind, GitMigrationPreflightProof, LosslessGitRepository,
-    SealedContentObservation,
+    admit_validated_semantic_git_import, build_git_external_authority,
+    capture_lossless_git_repository, plan_validated_semantic_git_import,
+    preflight_git_source_compatibility, preflight_validated_git_migration,
+    preflight_validated_git_migration_after_publication, seal_all_content_observation,
+    AdmittedContentClosure, GitLocalIgnoreSourceKind, GitMigrationPreflightProof,
+    LosslessGitRepository, SealedContentObservation, ValidatedSemanticGitImportPlan,
 };
 use kin_model::{
     compute_resolved_tree_hash, AdmissionCase, AuthorId, ChangeStore,
@@ -219,14 +220,18 @@ fn init_from_git_with_hooks(
         .map_err(|error| git_boundary_error("capture exact Git repository", error))?;
     let git_authority = build_git_external_authority(&snapshot, &capture_store)
         .map_err(|error| git_boundary_error("build exact Git authority", error))?;
-    let semantic_plan = plan_semantic_git_import(&snapshot, &capture_store)
+    let semantic_plan = plan_validated_semantic_git_import(&snapshot, &capture_store)
         .map_err(|error| git_boundary_error("derive exact semantic Git history", error))?;
-    verify_material_workspace_seed(&semantic_plan.workspace_seed, &git_authority.material_head)?;
+    verify_material_workspace_seed(
+        &semantic_plan.as_plan().workspace_seed,
+        &git_authority.material_head,
+    )?;
     let semantic_plan = bind_historical_semantics(semantic_plan, &capture_store)?;
-    let admitted = admit_semantic_git_import(&semantic_plan, &capture_store)
+    let admitted = admit_validated_semantic_git_import(&semantic_plan, &capture_store)
         .map_err(|error| git_boundary_error("derive branch-versioned admission policy", error))?;
-    let source_proof = preflight_git_migration(&source, &snapshot, &semantic_plan, &capture_store)
-        .map_err(|error| git_boundary_error("prove mutable Git workspace", error))?;
+    let source_proof =
+        preflight_validated_git_migration(&source, &snapshot, &semantic_plan, &capture_store)
+            .map_err(|error| git_boundary_error("prove mutable Git workspace", error))?;
 
     let final_kin_dir = source.join(".kin");
     let staging_dir = source_parent.join(format!(".kin.init-{}", uuid::Uuid::new_v4()));
@@ -265,7 +270,7 @@ fn init_from_git_with_hooks(
     let mut result = publish_repository_layout_linearized(prepared, |publication| {
         before_final_source_proof();
         let final_proof =
-            preflight_git_migration(&source, &snapshot, &semantic_plan, &capture_store)
+            preflight_validated_git_migration(&source, &snapshot, &semantic_plan, &capture_store)
                 .map_err(|error| git_boundary_error("repeat final Git source proof", error))?;
         if final_proof != source_proof {
             return Err(KinError::Other(
@@ -275,7 +280,7 @@ fn init_from_git_with_hooks(
         }
         let published = publication.publish()?;
         after_repository_publication();
-        let published_proof = preflight_git_migration_after_publication(
+        let published_proof = preflight_validated_git_migration_after_publication(
             &source,
             published.path(),
             &snapshot,
@@ -303,7 +308,7 @@ fn init_from_git_with_hooks(
         // keeps a repository that cannot answer for its content from being
         // published at all. Neither site degrades into a filesystem read.
         let published_observation =
-            seal_published_content_observation(published.path(), &semantic_plan)?;
+            seal_published_content_observation(published.path(), semantic_plan.as_plan())?;
         if published_observation.fingerprint != sealed_observation.fingerprint {
             return Err(KinError::Other(
                 "sealed all-content observation changed across repository publication; published \
@@ -725,12 +730,13 @@ fn git_boundary_error(context: impl std::fmt::Display, error: impl std::fmt::Dis
 /// and alias identities, so it must happen before any identity derived from the
 /// plan is published.
 fn bind_historical_semantics(
-    plan: kin_git::SemanticGitImportPlan,
+    plan: ValidatedSemanticGitImportPlan,
     capture_store: &BlobStore,
-) -> Result<kin_git::SemanticGitImportPlan> {
+) -> Result<ValidatedSemanticGitImportPlan> {
+    let exact = plan.as_plan();
     let mut trees = std::collections::BTreeMap::new();
-    for alias in &plan.aliases {
-        let tree = plan.commit_trees.get(&alias.oid).ok_or_else(|| {
+    for alias in &exact.aliases {
+        let tree = exact.commit_trees.get(&alias.oid).ok_or_else(|| {
             git_boundary_error(
                 "bind historical semantics",
                 format!("imported commit {} has no exact resolved tree", alias.oid),
@@ -745,13 +751,13 @@ fn bind_historical_semantics(
     }
 
     let bindings =
-        kin_index::derive_historical_semantic_deltas(&plan.changes, &trees, capture_store)
+        kin_index::derive_historical_semantic_deltas(&exact.changes, &trees, capture_store)
             .map_err(|error| git_boundary_error("derive historical semantics", error))?
             .into_iter()
             .map(|delta| (delta.change_id, delta.entity_deltas, delta.relation_deltas))
             .collect::<Vec<_>>();
 
-    plan.with_historical_semantics(capture_store, &bindings)
+    plan.with_historical_semantics(&bindings)
         .map_err(|error| git_boundary_error("bind historical semantics", error))
 }
 

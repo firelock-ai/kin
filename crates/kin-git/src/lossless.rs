@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use gix::bstr::ByteSlice;
 use gix::objs::tree::EntryKind;
-use gix::objs::{Find as _, FindHeader as _, Write as _};
+use gix::objs::{Find as _, Write as _};
 use kin_blobs::BlobStore;
 use kin_model::{
     ExternalObjectId, ExternalObjectKind, ExternalObjectRecord, GitObjectId, RefName, RefTarget,
@@ -210,8 +210,7 @@ pub fn capture_lossless_git_repository(
     Ok(snapshot)
 }
 
-/// Prove a source repository still matches a previously captured snapshot
-/// without re-reading blob bodies.
+/// Prove a source repository still matches a previously captured snapshot.
 ///
 /// This is the stability re-observation for a snapshot that was already
 /// captured with full body verification. It re-proves, byte-exactly:
@@ -220,18 +219,14 @@ pub fn capture_lossless_git_repository(
 /// - the object format is unchanged
 /// - every ref and HEAD converts to exactly the captured state
 /// - the reachable closure walked from those refs is exactly the captured
-///   object set: every commit, tree, and tag body is re-read and re-verified
-///   against its Git object ID, Kin body hash, and length, and its
-///   dependencies are re-traversed
-/// - every reachable blob is still present in the object database with the
-///   captured kind and decompressed length
+///   object set: every commit, tree, blob, and tag body is re-read and
+///   re-verified against its Git object ID, Kin body hash, and length, and
+///   structure-object dependencies are re-traversed
 ///
-/// The one observation this does not repeat is re-reading blob payload bytes:
-/// a blob's identity is its OID under Git's content addressing, the original
-/// capture verified those bytes against both the OID and Kin's CAS, and
-/// admission consumes the captured CAS bodies rather than the source object
-/// database. A same-OID, same-length body swap in the source ODB is therefore
-/// outside this proof, exactly as far as it is outside Git's own object model.
+/// Blob payloads are deliberately read again. A header-only probe would accept
+/// an object-database corruption that preserved kind and declared length while
+/// changing the payload behind the captured OID, violating the exact final
+/// source observation this proof represents.
 pub(crate) fn verify_lossless_snapshot_unchanged(
     repo: &gix::Repository,
     expected: &LosslessGitRepository,
@@ -335,30 +330,6 @@ pub(crate) fn verify_lossless_snapshot_unchanged(
             ensure_expected_kind(model_oid, record.object.kind, expected_kind, &next.context)?;
         }
 
-        if record.object.kind == ExternalObjectKind::Blob {
-            let header = match repo.objects.try_header(&next.oid) {
-                Ok(Some(header)) => header,
-                Ok(None) => {
-                    return Err(GitError::MissingObject {
-                        oid: next.oid.to_string(),
-                        context: next.context.clone(),
-                    })
-                }
-                Err(error) => {
-                    return Err(GitError::CorruptObject {
-                        oid: next.oid.to_string(),
-                        reason: error.to_string(),
-                    })
-                }
-            };
-            if external_kind(header.kind) != ExternalObjectKind::Blob
-                || header.size != record.body_len
-            {
-                return Err(changed());
-            }
-            continue;
-        }
-
         let mut body = Vec::new();
         let kind = match repo.objects.try_find(&next.oid, &mut body) {
             Ok(Some(object)) => object.kind,
@@ -385,7 +356,9 @@ pub(crate) fn verify_lossless_snapshot_unchanged(
         if observed != **record {
             return Err(changed());
         }
-        enqueue_dependencies(model_oid, kind, &body, &next.context, &mut pending)?;
+        if kind != ExternalObjectKind::Blob {
+            enqueue_dependencies(model_oid, kind, &body, &next.context, &mut pending)?;
+        }
     }
 
     if visited.len() != expected.objects.len() {
@@ -2335,6 +2308,44 @@ mod tests {
             Err(GitError::Blob(_))
         ));
         assert!(!cas_output.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn final_snapshot_observation_rejects_same_length_blob_payload_corruption() {
+        let fixture = Fixture::simple();
+        let snapshot = capture_lossless_git_repository(
+            &fixture.repo,
+            RepositoryId::new("final-blob-observation").unwrap(),
+            &fixture.blob_store,
+        )
+        .unwrap();
+        let blob = snapshot
+            .objects
+            .iter()
+            .find(|record| record.object.kind == ExternalObjectKind::Blob)
+            .expect("fixture has a reachable blob");
+        let mut replacement = fixture.blob_store.read(&blob.body_hash).unwrap();
+        assert!(!replacement.is_empty());
+        replacement[0] ^= 0xff;
+        let replacement_oid = git_stdin_text(
+            &fixture.repo,
+            ["hash-object", "-w", "--stdin"],
+            &replacement,
+        );
+        assert_ne!(replacement_oid, blob.object.oid.to_string());
+
+        let git_dir = fixture.repo.join(".git");
+        let replacement_path = loose_object_path(&git_dir, &replacement_oid);
+        let captured_path = loose_object_path(&git_dir, &blob.object.oid.to_string());
+        fs::remove_file(&captured_path).expect("remove captured loose blob");
+        fs::copy(replacement_path, captured_path).expect("replace captured loose blob payload");
+
+        let repo = open_repo(&fixture.repo).unwrap();
+        assert!(matches!(
+            verify_lossless_snapshot_unchanged(&repo, &snapshot),
+            Err(GitError::InvalidSnapshot(_)) | Err(GitError::CorruptObject { .. })
+        ));
     }
 
     #[test]

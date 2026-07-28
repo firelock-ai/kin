@@ -21,7 +21,9 @@ pub mod repository_export;
 pub mod sealed_observation;
 pub mod semantic_import;
 
-pub use admission_history::{admit_semantic_git_import, AdmittedSemanticGitImportPlan};
+pub use admission_history::{
+    admit_semantic_git_import, admit_validated_semantic_git_import, AdmittedSemanticGitImportPlan,
+};
 pub use authority::build_git_external_authority;
 pub use error::{
     GitCheckoutFilterFact, GitError, LocalGitHookFact, LocalGitHookKind, RegisteredGitWorktreeFact,
@@ -34,10 +36,12 @@ pub use lossless::{
 };
 pub use preflight::{
     preflight_git_migration, preflight_git_migration_after_publication,
-    preflight_git_source_compatibility, GitBranchTrackingFact, GitIndexPreflightProof,
-    GitLocalIgnoreInputFact, GitLocalIgnoreSourceKind, GitMigrationCompatibilityFacts,
-    GitMigrationPreflightProof, GitRemoteConfigFact, GitRemoteMappingFacts,
-    GitTrackedWorktreeProof, IgnoredLocalEntry, IgnoredLocalEntryKind, IgnoredLocalWorktreeFact,
+    preflight_git_source_compatibility, preflight_validated_git_migration,
+    preflight_validated_git_migration_after_publication, GitBranchTrackingFact,
+    GitIndexPreflightProof, GitLocalIgnoreInputFact, GitLocalIgnoreSourceKind,
+    GitMigrationCompatibilityFacts, GitMigrationPreflightProof, GitRemoteConfigFact,
+    GitRemoteMappingFacts, GitTrackedWorktreeProof, IgnoredLocalEntry, IgnoredLocalEntryKind,
+    IgnoredLocalWorktreeFact,
 };
 pub use repository_export::{
     export_repository_to_git, verify_repository_git_export, RepositoryGitCommitBinding,
@@ -47,4 +51,7 @@ pub use sealed_observation::{
     seal_all_content_observation, AdmittedContentClosure, ContentExclusionReason,
     DeclaredContentExclusion, SealedContentCoverage, SealedContentObservation, SealedContentSource,
 };
-pub use semantic_import::{plan_semantic_git_import, GitWorkspaceSeed, SemanticGitImportPlan};
+pub use semantic_import::{
+    plan_semantic_git_import, plan_validated_semantic_git_import, GitWorkspaceSeed,
+    SemanticGitImportPlan, ValidatedSemanticGitImportPlan,
+};

@@ -30,7 +30,7 @@ use crate::lossless::{
     open_repo, reject_shallow_repository, verify_lossless_snapshot_unchanged, GitObjectFormat,
     LosslessGitRepository,
 };
-use crate::semantic_import::SemanticGitImportPlan;
+use crate::semantic_import::{SemanticGitImportPlan, ValidatedSemanticGitImportPlan};
 
 /// Successful, point-in-time proof that one Git workspace can be admitted
 /// without flattening index or worktree state into repository authority.
@@ -259,6 +259,24 @@ pub fn preflight_git_migration(
     preflight_git_migration_with_hook(repo_path, snapshot, plan, blob_store, None, || {})
 }
 
+/// Prove the mutable Git boundary for a plan whose complete raw-object
+/// derivation is already carried by a non-forgeable validation token.
+pub fn preflight_validated_git_migration(
+    repo_path: &Path,
+    snapshot: &LosslessGitRepository,
+    plan: &ValidatedSemanticGitImportPlan,
+    blob_store: &BlobStore,
+) -> Result<GitMigrationPreflightProof> {
+    preflight_validated_git_migration_with_hook(
+        repo_path,
+        snapshot,
+        plan.as_plan(),
+        blob_store,
+        None,
+        || {},
+    )
+}
+
 /// Repeat an exact Git source proof after Kin has atomically installed `.kin`.
 ///
 /// Only the supplied real `.kin` directory at the canonical worktree root is
@@ -266,6 +284,41 @@ pub fn preflight_git_migration(
 /// leaf, ignored-local fact, and any other untracked path remains subject to
 /// the same two-observation proof as pre-publication migration.
 pub fn preflight_git_migration_after_publication(
+    repo_path: &Path,
+    published_kin_dir: &Path,
+    snapshot: &LosslessGitRepository,
+    plan: &SemanticGitImportPlan,
+    blob_store: &BlobStore,
+) -> Result<GitMigrationPreflightProof> {
+    plan.validate(blob_store)?;
+    preflight_git_migration_after_publication_inner(
+        repo_path,
+        published_kin_dir,
+        snapshot,
+        plan,
+        blob_store,
+    )
+}
+
+/// Repeat the post-publication proof for a plan whose full derivation is
+/// already represented by a validation token.
+pub fn preflight_validated_git_migration_after_publication(
+    repo_path: &Path,
+    published_kin_dir: &Path,
+    snapshot: &LosslessGitRepository,
+    plan: &ValidatedSemanticGitImportPlan,
+    blob_store: &BlobStore,
+) -> Result<GitMigrationPreflightProof> {
+    preflight_git_migration_after_publication_inner(
+        repo_path,
+        published_kin_dir,
+        snapshot,
+        plan.as_plan(),
+        blob_store,
+    )
+}
+
+fn preflight_git_migration_after_publication_inner(
     repo_path: &Path,
     published_kin_dir: &Path,
     snapshot: &LosslessGitRepository,
@@ -291,7 +344,7 @@ pub fn preflight_git_migration_after_publication(
             expected_kin_dir.display()
         )));
     }
-    preflight_git_migration_with_hook(
+    preflight_validated_git_migration_with_hook(
         &source_worktree,
         snapshot,
         plan,
@@ -302,6 +355,25 @@ pub fn preflight_git_migration_after_publication(
 }
 
 fn preflight_git_migration_with_hook(
+    repo_path: &Path,
+    snapshot: &LosslessGitRepository,
+    plan: &SemanticGitImportPlan,
+    blob_store: &BlobStore,
+    published_kin_dir: Option<&Path>,
+    after_first_observation: impl FnOnce(),
+) -> Result<GitMigrationPreflightProof> {
+    plan.validate(blob_store)?;
+    preflight_validated_git_migration_with_hook(
+        repo_path,
+        snapshot,
+        plan,
+        blob_store,
+        published_kin_dir,
+        after_first_observation,
+    )
+}
+
+fn preflight_validated_git_migration_with_hook(
     repo_path: &Path,
     snapshot: &LosslessGitRepository,
     plan: &SemanticGitImportPlan,
@@ -340,11 +412,9 @@ fn validate_plan_binding(
     snapshot: &LosslessGitRepository,
     plan: &SemanticGitImportPlan,
 ) -> Result<()> {
-    // Binding-only check: the plan's full raw-object rebuild audit belongs to
-    // admission (`admit_semantic_git_import` validates the plan exactly once).
-    // The migration proof only needs the plan to be bound to the snapshot it
-    // is proving, so re-running the O(history x tree) self-derivation here
-    // three times per admission bought no additional proof.
+    // This is only the cheap binding half of validation. Public callers reach
+    // it after `SemanticGitImportPlan::validate`; the optimized path can reach
+    // it only through a non-forgeable `ValidatedSemanticGitImportPlan`.
     if plan.repository_id != snapshot.repository_id
         || plan.object_format != snapshot.object_format
         || plan.external_objects != snapshot.objects
@@ -2034,6 +2104,7 @@ mod tests {
     use std::os::unix::fs::{symlink, PermissionsExt};
     use std::process::{Command, Output, Stdio};
 
+    use kin_model::ResolvedTree;
     use tempfile::TempDir;
 
     use super::*;
@@ -2736,6 +2807,18 @@ mod tests {
     }
 
     #[test]
+    fn public_preflight_rejects_plan_tampering_outside_the_snapshot_binding_fields() {
+        let fixture = Fixture::clean();
+        let mut tampered = fixture.plan.clone();
+        tampered.workspace_seed.base_tree = ResolvedTree::default();
+
+        assert!(matches!(
+            preflight_git_migration(&fixture.repo, &fixture.snapshot, &tampered, &fixture.store),
+            Err(GitError::InvalidSnapshot(_))
+        ));
+    }
+
+    #[test]
     fn admits_the_only_linked_worktree_of_a_bare_repository() {
         let temp = tempfile::tempdir().expect("tempdir");
         let seed = temp.path().join("seed");
@@ -3102,7 +3185,10 @@ mod tests {
 
     fn git_command(repo: &Path) -> Command {
         let mut command = clean_git_command();
-        command.current_dir(repo);
+        command
+            .current_dir(repo)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", repo);
         command
     }
 

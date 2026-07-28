@@ -1665,7 +1665,13 @@ mod tests {
     }
 
     fn git(repository: &Path, args: &[&str]) -> Vec<u8> {
-        command(Command::new("git").args(args).current_dir(repository))
+        command(
+            Command::new("git")
+                .args(args)
+                .current_dir(repository)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("HOME", repository),
+        )
     }
 
     fn git_bare(repository: &Path, args: &[&str]) -> Vec<u8> {
@@ -1678,6 +1684,8 @@ mod tests {
         let mut child = Command::new("git")
             .args(args)
             .current_dir(repository)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", repository)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
