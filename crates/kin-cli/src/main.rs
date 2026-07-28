@@ -3027,8 +3027,9 @@ mod tests {
             let mut command = Cli::command();
             let help = command.render_long_help().to_string();
             for supported in [
-                "Run a command in an exact graph-backed session workspace",
-                "Launch an editor in an exact graph-derived session workspace",
+                "Run a command in an exact graph-derived session workspace",
+                "Launch an editor over an exact graph-derived session workspace",
+                "Launch an assistant in an exact graph-derived session workspace",
                 "Open a shell in an exact graph-derived session workspace",
             ] {
                 assert!(
