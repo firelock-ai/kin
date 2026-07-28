@@ -774,11 +774,21 @@ def main() -> None:
     # Cargo caches are restore-anywhere, save-from-main-only. That is what keeps
     # one reusable warm entry per job alive under the repository cache budget,
     # and it is also what denies a fork pull request any way to write a cache a
-    # trusted run would later restore.
-    rust_cache_uses = ci_workflow.count(
-        "uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4"
-    )
-    trusted_saves = ci_workflow.count("save-if: ${{ github.ref == 'refs/heads/main' }}")
+    # trusted run would later restore. Checked across every workflow, so a new
+    # job cannot reintroduce pull-request cache writes in a file nobody pinned.
+    rust_cache_uses = 0
+    trusted_saves = 0
+    for workflow in sorted(WORKFLOWS.glob("*.yml")):
+        content = workflow.read_text(encoding="utf-8")
+        pinned = content.count(
+            "uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4"
+        )
+        if content.count("uses: Swatinem/rust-cache@") != pinned:
+            raise AssertionError(
+                f"{workflow.name} uses rust-cache at an unpinned ref"
+            )
+        rust_cache_uses += pinned
+        trusted_saves += content.count("save-if: ${{ github.ref == 'refs/heads/main' }}")
     if rust_cache_uses == 0 or rust_cache_uses != trusted_saves:
         raise AssertionError(
             "every pinned rust-cache use must save only from main: "
