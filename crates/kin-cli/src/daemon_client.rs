@@ -2919,6 +2919,29 @@ mod urlencoding {
 mod tests {
     use super::*;
 
+    #[test]
+    fn timeout_text_separates_a_loading_daemon_from_one_that_never_came_up() {
+        let budget = Duration::from_secs(300);
+
+        let never_up = LoadingNotice::new(budget);
+        assert_eq!(
+            never_up.timeout_summary(budget),
+            "daemon failed to become ready within 300.0s"
+        );
+
+        let mut loading = LoadingNotice::new(budget);
+        loading.observe(Path::new("/repo/.kin"));
+        let summary = loading.timeout_summary(budget);
+        assert!(
+            summary.contains("alive and still loading"),
+            "a daemon observed loading must not be reported as never ready: {summary}"
+        );
+        assert!(
+            summary.contains("KIN_DAEMON_READY_TIMEOUT_SECS"),
+            "the timeout message must name the bound the user can raise: {summary}"
+        );
+    }
+
     #[tokio::test]
     async fn idempotent_post_retries_exact_body_with_same_session_authority() {
         use axum::{body::Bytes, http::StatusCode, routing::post, Router};
