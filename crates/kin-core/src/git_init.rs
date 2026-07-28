@@ -1467,16 +1467,18 @@ mod tests {
         // Remove one body from the published store between the two
         // observations, which the staged observation already proved present.
         let opaque = kin_blobs::digest(&std::fs::read(source.join("payload.bin")).unwrap());
-        let external_oid = gix::hash::ObjectId::from_hex(
+        let external_oid = match gix::hash::ObjectId::from_hex(
             git_stdout(&source, ["hash-object", "payload.bin"])
                 .trim()
                 .as_bytes(),
         )
-        .unwrap();
-        let external_object = ExternalObjectId::new(
-            ExternalObjectKind::Blob,
-            kin_model::GitObjectId::sha1(external_oid.as_bytes().try_into().unwrap()),
-        );
+        .unwrap()
+        {
+            gix::hash::ObjectId::Sha1(bytes) => kin_model::GitObjectId::sha1(bytes),
+            gix::hash::ObjectId::Sha256(bytes) => kin_model::GitObjectId::sha256(bytes),
+            _ => panic!("fixture Git returned an unsupported object ID algorithm"),
+        };
+        let external_object = ExternalObjectId::new(ExternalObjectKind::Blob, external_oid);
         let published_kin_dir = source.join(".kin");
         let error = init_from_git_with_hooks(
             &source,
