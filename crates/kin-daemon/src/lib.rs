@@ -126,6 +126,7 @@ mod repository_branch;
 mod repository_checkout;
 pub mod repository_commit;
 mod repository_merge;
+mod repository_stash;
 pub mod session_registry;
 pub mod state;
 pub mod supervisor;

@@ -483,7 +483,7 @@ enum Command {
         #[arg(long)]
         abort: bool,
     },
-    /// [OPEN GATE] Stash exact repository-v6 workspace state
+    /// [OPEN GATE] Seal and restore exact graph-owned workspace state
     Stash {
         #[command(subcommand)]
         action: StashAction,
@@ -1472,20 +1472,24 @@ enum AssistantAction {
 
 #[derive(Subcommand)]
 enum StashAction {
-    /// [OPEN GATE] Snapshot exact repository-v6 workspace state.
+    /// [OPEN GATE] Seal exact graph-owned workspace state and return the workspace to its base.
     Push {
-        /// DESTRUCTIVE: delete source files from the working tree after
-        /// snapshotting. Requires typing "remove" to confirm (or --yes).
-        #[arg(long)]
-        remove_from_tree: bool,
-        /// Skip typed confirmation for --remove-from-tree (for non-interactive use).
+        /// Label the sealed state. Defaults to the workspace head it was sealed on.
+        #[arg(long, short = 'm')]
+        message: Option<String>,
+        /// Skip the typed confirmation for discarding the projected working
+        /// files (for non-interactive use).
         #[arg(long)]
         yes: bool,
     },
-    /// [OPEN GATE] Restore the most recent exact stash transaction
+    /// [OPEN GATE] Restore the most recently sealed workspace state and drop its stash
     Pop,
-    /// [OPEN GATE] List repository-v6 stash transactions
-    List,
+    /// [OPEN GATE] List sealed workspace states
+    List {
+        /// Output the machine-readable stash report
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2463,7 +2467,11 @@ fn main() -> Result<()> {
                 }
                 Command::Conflicts => commands::capabilities::require_ready("conflicts"),
                 Command::Resolve { .. } => commands::capabilities::require_ready("resolve"),
-                Command::Stash { action: _ } => commands::capabilities::require_ready("stash"),
+                Command::Stash { action } => match action {
+                    StashAction::Push { message, yes } => commands::stash::push(message, yes).await,
+                    StashAction::Pop => commands::stash::pop().await,
+                    StashAction::List { json } => commands::stash::list(json).await,
+                },
                 Command::Blame { entity, reference } => {
                     commands::blame::run(entity, reference).await
                 }
