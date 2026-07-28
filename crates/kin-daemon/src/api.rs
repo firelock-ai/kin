@@ -17196,7 +17196,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
-    // ── FIR-1583: readiness must survive a blocking warm-up ───────────────
+    // ── Readiness must survive a blocking warm-up ─────────────────────────
     //
     // Sibling spine warm-up is a synchronous join that can run for minutes, and
     // it is reached from async request handlers. Run inline it parks a runtime

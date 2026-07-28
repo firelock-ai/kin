@@ -4602,7 +4602,7 @@ mod tests {
             .expect("daemon test fixtures must open through repository-v6 workspace authority")
     }
 
-    // ── FIR-1583: the warming signal must be exact ────────────────────────
+    // ── The warming signal must be exact ──────────────────────────────────
     //
     // "Busy warming" is what lets a client tell a live daemon from a dead one.
     // A signal that leaks true after a warm-up ends would make every later

@@ -938,7 +938,7 @@ mod tests {
         assert!(root.join("kindb").join("graph.lock").exists());
     }
 
-    // ── FIR-1583: reclaim must work without daemon.pid ────────────────────
+    // ── Reclaim must work without daemon.pid ──────────────────────────────
     //
     // The deadlock chain ended here: a client cleared a live daemon's endpoint
     // files, so when that daemon later died by SIGKILL there was no daemon.pid

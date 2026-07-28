@@ -1654,6 +1654,52 @@ pub fn remove_stale_daemon_files(kin_root: &Path) {
     let _ = std::fs::remove_file(repo_daemon_port_path(kin_root));
 }
 
+/// Remove endpoint files only while they still name the exact endpoint a verdict
+/// was formed about.
+///
+/// Every judgement about a daemon is made from a `(pid, port)` read at some
+/// earlier instant, and the daemon that owns this repo can change between that
+/// read and the delete: the recorded owner exits, a successor takes the flock
+/// and republishes its own pid and port. Deleting unconditionally then acts on a
+/// true statement about the old process by destroying the new one's files —
+/// re-entering the exact failure this path exists to prevent, through the
+/// evidence door rather than the timeout door. The wider the probe window, the
+/// likelier that is, and waiting out a warm-up makes the window long by design.
+///
+/// This is the client-side twin of
+/// `kin_daemon::lifecycle::remove_daemon_files_if_current_process`, which solves
+/// the same race from the daemon's side.
+///
+/// `judged_port` is `None` when the verdict was reached before a port was ever
+/// published, which is the one case where the port file is legitimately absent.
+///
+/// Returns whether the files were removed.
+fn remove_daemon_files_if_unchanged(
+    kin_root: &Path,
+    judged_pid: u32,
+    judged_port: Option<u16>,
+) -> bool {
+    let current_pid = read_pid_file(kin_root);
+    let current_port = read_port_file(kin_root);
+    let same_owner = current_pid == Some(judged_pid);
+    // An unchanged pid that republished its port is still a live daemon whose
+    // endpoint must survive, so a known port has to match too.
+    let same_endpoint = judged_port.is_none_or(|port| current_port == Some(port));
+    if !(same_owner && same_endpoint) {
+        warn!(
+            judged_pid,
+            ?judged_port,
+            ?current_pid,
+            ?current_port,
+            "endpoint files changed while this daemon was being judged; \
+             leaving the successor's endpoint intact"
+        );
+        return false;
+    }
+    remove_stale_daemon_files(kin_root);
+    true
+}
+
 fn supervisor_dir() -> PathBuf {
     kin_core::registry::registry_path()
         .parent()
@@ -1714,7 +1760,11 @@ pub fn supervisor_recorded_endpoint() -> (Option<u32>, Option<u16>) {
 fn live_daemon_endpoint(kin_root: &Path) -> Option<LiveDaemonEndpoint> {
     let pid = read_pid_file(kin_root)?;
     if !is_process_alive(pid) {
-        remove_stale_daemon_files(kin_root);
+        // Compare-and-delete even here, where the window is only as wide as this
+        // function: a successor that republished between the read and the
+        // liveness check would otherwise lose its endpoint to a true statement
+        // about its predecessor.
+        remove_daemon_files_if_unchanged(kin_root, pid, read_port_file(kin_root));
         return None;
     }
     let port = read_port_file(kin_root)?;
@@ -2006,6 +2056,105 @@ fn canonical_path_string(path: &Path) -> String {
         .to_string()
 }
 
+/// Canonical form of a path, or `None` when it cannot be resolved.
+///
+/// Deliberately not [`canonical_path_string`], which falls back to the
+/// unresolved path. That fallback is fine for a log line and wrong for a
+/// comparison: an unresolved path compared against a correctly-resolved peer
+/// differs for a reason that has nothing to do with which repo either side is
+/// serving. Where the answer drives a destructive action, a failure to resolve
+/// must read as "no evidence", never as "different".
+fn strict_canonical_path(path: &Path) -> Option<String> {
+    path.canonicalize().ok().map(|p| p.display().to_string())
+}
+
+/// The repository identity recorded in this repo's own manifest.
+///
+/// Startup configuration IO at an explicit boundary, not a semantic answer path:
+/// it reads the local manifest to learn which repository the caller is standing
+/// in, so a daemon's self-reported identity can be compared against something
+/// stronger than a rendered path.
+fn local_repo_identity(kin_root: &Path) -> Option<String> {
+    kin_core::manifest::KinManifest::load(&kin_root.join("manifest.json"))
+        .ok()
+        .map(|manifest| manifest.repo_id)
+        .filter(|repo_id| !repo_id.trim().is_empty())
+}
+
+/// What a `/health` body establishes about whether this daemon serves this repo.
+#[derive(Debug, PartialEq, Eq)]
+enum RepoIdentity {
+    /// Proven the same repository.
+    Matches,
+    /// Proven a different repository, or a status that is not serving at all.
+    Rejected(String),
+    /// Nothing conclusive: the daemon named no identity this client can compare,
+    /// or a path would not resolve on one side.
+    Indeterminate(String),
+}
+
+/// Decide whether a health body identifies this repo, with no silent fallback.
+///
+/// Identity is compared strongest-first. The manifest repository id is exact
+/// (the daemon asserts its own `repo_id` equals its manifest's at open time), so
+/// when both sides carry one the comparison is conclusive in either direction.
+/// Only when an id is unavailable does this fall back to paths, and then both
+/// sides must resolve before a difference counts as evidence — `/tmp` against
+/// `/private/tmp` on macOS, or a symlinked worktree, is an aliasing artifact and
+/// not a different repository.
+fn classify_health_repo(
+    health: &HealthResponse,
+    kin_root: &Path,
+    working_dir: &Path,
+) -> RepoIdentity {
+    if !health_status_is_serving(&health.status) {
+        return RepoIdentity::Rejected(format!("daemon health status is {}", health.status));
+    }
+
+    let reported_id = health
+        .repo_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty());
+    if let (Some(reported), Some(expected)) = (reported_id, local_repo_identity(kin_root)) {
+        return if reported == expected {
+            RepoIdentity::Matches
+        } else {
+            RepoIdentity::Rejected(format!(
+                "daemon repo mismatch: endpoint serves repository {reported}, expected {expected}"
+            ))
+        };
+    }
+
+    let Some(reported_root) = health.repo_root.as_deref() else {
+        // A daemon that names neither an id nor a root has told us nothing. It
+        // is not proof of a match, which would let an unrelated daemon pass, and
+        // not proof of a mismatch, which would destroy a live endpoint.
+        return RepoIdentity::Indeterminate(
+            "daemon reported neither a repository id nor a repo root".to_string(),
+        );
+    };
+    let Some(expected_root) = strict_canonical_path(working_dir) else {
+        return RepoIdentity::Indeterminate(format!(
+            "cannot resolve {} to compare against the daemon's repo root",
+            working_dir.display()
+        ));
+    };
+    if reported_root == expected_root {
+        return RepoIdentity::Matches;
+    }
+    match strict_canonical_path(Path::new(reported_root)) {
+        Some(resolved) if resolved == expected_root => RepoIdentity::Matches,
+        Some(resolved) => RepoIdentity::Rejected(format!(
+            "daemon repo mismatch: endpoint is for {resolved}, expected {expected_root}"
+        )),
+        None => RepoIdentity::Indeterminate(format!(
+            "daemon reported repo root {reported_root}, which does not resolve; \
+             cannot establish whether it is this repository"
+        )),
+    }
+}
+
 /// Whether a daemon `/health` status string means the daemon is alive and
 /// serving the graph. The daemon reports `"attention"` (not `"ok"`) when it is
 /// up and serving but degraded — a withheld mass-deletion wipe or a permanently
@@ -2018,19 +2167,19 @@ fn health_status_is_serving(status: &str) -> bool {
     matches!(status, "ok" | "attention")
 }
 
+/// Whether this daemon may be used for this repo, for callers that only need a
+/// yes/no and treat every no the same way.
+///
+/// Used by the fresh-spawn path, where an inconclusive identity is still a
+/// reason to keep waiting on a daemon we started ourselves and expect to
+/// identify itself. Callers whose "no" branch destroys state must use
+/// [`classify_health_repo`] instead and distinguish proven-different from
+/// nothing-established.
 pub(crate) fn validate_health_repo(health: &HealthResponse, working_dir: &Path) -> Result<()> {
-    if !health_status_is_serving(&health.status) {
-        bail!("daemon health status is {}", health.status);
-    }
-    if let Some(repo_root) = health.repo_root.as_deref() {
-        let expected = canonical_path_string(working_dir);
-        if repo_root != expected {
-            bail!(
-                "daemon repo mismatch: endpoint is for {}, expected {}",
-                repo_root,
-                expected
-            );
-        }
+    let kin_root = working_dir.join(".kin");
+    match classify_health_repo(health, &kin_root, working_dir) {
+        RepoIdentity::Matches => {}
+        RepoIdentity::Rejected(reason) | RepoIdentity::Indeterminate(reason) => bail!(reason),
     }
     if health.status == "attention" {
         warn!(
@@ -2200,7 +2349,7 @@ async fn probe_daemon_endpoint(
 
         let probe_error = match client.get(format!("{base_url}/readiness")).send().await {
             Ok(resp) if resp.status().is_success() => {
-                match probe_health_for_repo(&client, &base_url, working_dir).await {
+                match probe_health_for_repo(&client, &base_url, kin_root, working_dir).await {
                     HealthProbe::Matches => return EndpointVerdict::Serving(base_url),
                     // The daemon answered and identified itself as something
                     // else. That is real evidence the record is stale, not a
@@ -2262,6 +2411,7 @@ enum HealthProbe {
 async fn probe_health_for_repo(
     client: &reqwest::Client,
     base_url: &str,
+    kin_root: &Path,
     working_dir: &Path,
 ) -> HealthProbe {
     let answered = async {
@@ -2280,9 +2430,13 @@ async fn probe_health_for_repo(
     .await;
 
     match answered {
-        Ok(health) => match validate_health_repo(&health, working_dir) {
-            Ok(()) => HealthProbe::Matches,
-            Err(reason) => HealthProbe::Rejected(reason.to_string()),
+        Ok(health) => match classify_health_repo(&health, kin_root, working_dir) {
+            RepoIdentity::Matches => HealthProbe::Matches,
+            RepoIdentity::Rejected(reason) => HealthProbe::Rejected(reason),
+            // The daemon answered but did not identify itself in terms this
+            // client can compare. That is silence about identity, and silence
+            // must not authorize deleting its endpoint.
+            RepoIdentity::Indeterminate(detail) => HealthProbe::Unanswered(detail),
         },
         Err(error) => HealthProbe::Unanswered(error.to_string()),
     }
@@ -2435,7 +2589,10 @@ async fn wait_for_existing_daemon_within(
                 error = %reason,
                 "daemon endpoint proved invalid; clearing stale endpoint files"
             );
-            remove_stale_daemon_files(kin_root);
+            // The verdict is true about the endpoint that was probed, which may
+            // no longer be the endpoint on disk — the probe deliberately runs
+            // long enough for a successor to take over.
+            remove_daemon_files_if_unchanged(kin_root, existing.pid, Some(existing.port));
             ExistingDaemon::None
         }
         EndpointVerdict::LiveNotReady {
@@ -3247,7 +3404,7 @@ mod tests {
         );
     }
 
-    // ── FIR-1583: a busy daemon must never be treated as a dead one ───────
+    // ── A busy daemon must never be treated as a dead one ─────────────────
     //
     // The deadlock chain started here. A daemon that did not answer readiness
     // inside a short fixed budget had its `daemon.pid` and `daemon.port`
@@ -3395,6 +3552,80 @@ mod tests {
         server.abort();
     }
 
+    // ── A verdict is about an endpoint, not about a path ──────────────────
+    //
+    // Every judgement is formed from a (pid, port) read at some earlier instant,
+    // and the owner of the repo can change in between: the recorded daemon
+    // exits, a successor takes the flock and republishes. Acting on the old
+    // verdict then destroys the new daemon's files — the same failure, entered
+    // through the evidence door instead of the timeout door. Waiting out a
+    // warm-up makes that window long on purpose, so the delete has to re-check.
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_successor_endpoint_survives_a_verdict_about_its_predecessor() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+
+        // A real process, so "the recorded owner is gone" is established the way
+        // production establishes it rather than mocked into place.
+        let mut predecessor = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn predecessor process");
+        write_endpoint_files(&root, predecessor.id(), closed_loopback_port());
+
+        let successor_port = closed_loopback_port();
+        let successor_root = root.clone();
+        let handover = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            // The successor publishes its endpoint first...
+            write_endpoint_files(&successor_root, std::process::id(), successor_port);
+            // ...and only then does the predecessor actually go away. Reap it:
+            // a zombie still answers kill(pid, 0) and would read as alive.
+            let _ = predecessor.kill();
+            let _ = predecessor.wait();
+        });
+
+        let verdict =
+            wait_for_existing_daemon_within(&root, Duration::from_secs(2), Duration::from_secs(3))
+                .await;
+        handover.await.expect("handover task");
+
+        assert_eq!(
+            read_pid_file(&root),
+            Some(std::process::id()),
+            "the successor's pid file must survive a verdict about its predecessor: {verdict:?}"
+        );
+        assert_eq!(
+            read_port_file(&root),
+            Some(successor_port),
+            "the successor's port file must survive a verdict about its predecessor"
+        );
+    }
+
+    #[test]
+    fn compare_and_delete_refuses_once_the_recorded_endpoint_moved() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // Same owner, same port: the judgement still describes what is on disk.
+        write_endpoint_files(root, 4242, 51000);
+        assert!(remove_daemon_files_if_unchanged(root, 4242, Some(51000)));
+        assert!(!root.join("daemon.pid").exists());
+
+        // A different owner republished.
+        write_endpoint_files(root, 4243, 51000);
+        assert!(!remove_daemon_files_if_unchanged(root, 4242, Some(51000)));
+        assert!(root.join("daemon.pid").exists());
+
+        // Same owner, but it rebound to a different port, so the endpoint the
+        // verdict describes no longer exists either.
+        write_endpoint_files(root, 4242, 51001);
+        assert!(!remove_daemon_files_if_unchanged(root, 4242, Some(51000)));
+        assert!(root.join("daemon.port").exists());
+    }
+
     #[tokio::test]
     async fn dead_owner_endpoint_is_cleared_so_a_replacement_can_start() {
         // The other side of the rule: a recorded owner that is provably gone is
@@ -3416,6 +3647,147 @@ mod tests {
         );
         assert!(!root.join("daemon.pid").exists());
         assert!(!root.join("daemon.port").exists());
+    }
+
+    // ── Only a proven different repo is grounds for destruction ───────────
+    //
+    // "The daemon answered and named a different repo" is one of exactly two
+    // affirmative grounds for deleting a live daemon's endpoint. A rendered-path
+    // comparison is not that: two spellings of one directory are an aliasing
+    // artifact, and a path that will not resolve is no information at all.
+
+    fn health_naming(repo_id: Option<&str>, repo_root: Option<String>) -> HealthResponse {
+        HealthResponse {
+            status: "ok".to_string(),
+            version: "test".to_string(),
+            uptime_seconds: 0,
+            graph_entity_count: Some(0),
+            graph_loaded: false,
+            reconciliation_status: "idle".to_string(),
+            repo_id: repo_id.map(str::to_string),
+            repo_root,
+            pid: Some(std::process::id()),
+            behavior_env: Default::default(),
+            build: None,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_aliased_path_to_the_same_directory_is_not_a_different_repo() {
+        // macOS reports /tmp as /private/tmp and this fleet runs lane worktrees
+        // behind symlinks, so the daemon's resolved root and the client's
+        // unresolved one routinely disagree as strings while naming one
+        // directory. Reading that as a different repository deletes the live
+        // daemon serving it.
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("repo");
+        std::fs::create_dir_all(&real).unwrap();
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+
+        // The daemon reports the resolved path; the client holds the alias.
+        let health = health_naming(None, Some(strict_canonical_path(&real).unwrap()));
+        assert_eq!(
+            classify_health_repo(&health, &alias.join(".kin"), &alias),
+            RepoIdentity::Matches,
+            "two spellings of one directory must not read as two repositories"
+        );
+    }
+
+    #[test]
+    fn a_daemon_that_names_no_identity_is_indeterminate_not_a_match() {
+        // Fail-open was the old behavior: an absent repo_root skipped the check
+        // entirely and any daemon passed identity validation.
+        let dir = tempfile::tempdir().unwrap();
+        let health = health_naming(None, None);
+        assert!(
+            matches!(
+                classify_health_repo(&health, &dir.path().join(".kin"), dir.path()),
+                RepoIdentity::Indeterminate(_)
+            ),
+            "silence about identity is not proof of identity"
+        );
+    }
+
+    #[test]
+    fn an_unresolvable_repo_root_is_indeterminate_not_a_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let health = health_naming(None, Some("/nonexistent/kin/repo/path".to_string()));
+        assert!(
+            matches!(
+                classify_health_repo(&health, &dir.path().join(".kin"), dir.path()),
+                RepoIdentity::Indeterminate(_)
+            ),
+            "a path that will not resolve proves nothing about which repo is served"
+        );
+    }
+
+    #[test]
+    fn a_resolvable_different_directory_is_a_real_mismatch() {
+        // The rule must still fire where it should: both sides resolve, and they
+        // genuinely name different directories.
+        let mine = tempfile::tempdir().unwrap();
+        let theirs = tempfile::tempdir().unwrap();
+        let health = health_naming(None, Some(strict_canonical_path(theirs.path()).unwrap()));
+        assert!(
+            matches!(
+                classify_health_repo(&health, &mine.path().join(".kin"), mine.path()),
+                RepoIdentity::Rejected(_)
+            ),
+            "a daemon serving a different directory is real evidence"
+        );
+    }
+
+    #[test]
+    fn a_manifest_repository_id_decides_before_any_path_does() {
+        // The exact identity both sides already carry. When it is available it
+        // is conclusive in both directions and no path spelling is consulted.
+        let dir = tempfile::tempdir().unwrap();
+        let kin_root = dir.path().join(".kin");
+        std::fs::create_dir_all(&kin_root).unwrap();
+        std::fs::write(
+            kin_root.join("manifest.json"),
+            serde_json::json!({
+                "kin_version": "test",
+                "repo_id": "11111111-1111-4111-8111-111111111111",
+                "workspace_id": "22222222-2222-4222-8222-222222222222",
+                "created_at": "2026-01-01T00:00:00Z",
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        // Same id, and a repo_root that would have failed a path comparison.
+        let same = health_naming(
+            Some("11111111-1111-4111-8111-111111111111"),
+            Some("/some/other/spelling".to_string()),
+        );
+        assert_eq!(
+            classify_health_repo(&same, &kin_root, dir.path()),
+            RepoIdentity::Matches
+        );
+
+        // Different id, and a repo_root that would have passed one.
+        let other = health_naming(
+            Some("33333333-3333-4333-8333-333333333333"),
+            Some(strict_canonical_path(dir.path()).unwrap()),
+        );
+        assert!(matches!(
+            classify_health_repo(&other, &kin_root, dir.path()),
+            RepoIdentity::Rejected(_)
+        ));
+    }
+
+    #[test]
+    fn a_non_serving_status_is_still_a_real_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut health = health_naming(None, Some(strict_canonical_path(dir.path()).unwrap()));
+        health.status = "starting".to_string();
+        assert!(matches!(
+            classify_health_repo(&health, &dir.path().join(".kin"), dir.path()),
+            RepoIdentity::Rejected(_)
+        ));
     }
 
     #[test]

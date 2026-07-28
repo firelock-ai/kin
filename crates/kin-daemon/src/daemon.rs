@@ -2436,7 +2436,7 @@ mod tests {
         assert!(!DaemonConfig::default().embed_pipeline_overlap);
     }
 
-    // ── FIR-1583: a contended start must name what it lost to ─────────────
+    // ── A contended start must name what it lost to ───────────────────────
     //
     // The old refusal said "another kin daemon already owns this repo" and
     // exited 0, so the CLI reported only "daemon exited during startup" and the
