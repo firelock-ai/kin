@@ -375,6 +375,8 @@ jobs:
                       ]
                     )
                   ' release-promotion.json >/dev/null
+                marker_run_id="$(jq -er .release_workflow_run_id release-promotion.json)"
+                [[ "$marker_run_id" =~ ^[1-9][0-9]*$ ]]
                 gh attestation verify release-promotion.json \
                   --repo "$REPO" \
                   --signer-workflow "${REPO}/.github/workflows/release.yml" \
@@ -383,6 +385,16 @@ jobs:
                   --source-digest "$latest_sha" \
                   --deny-self-hosted-runners \
                   --format json > attestation.json
+                run_uri="https://github.com/${REPO}/actions/runs/${marker_run_id}/attempts/"
+                jq -e \
+                  --arg run_uri "$run_uri" \
+                  '
+                    length > 0 and
+                    all(.[];
+                      (.verificationResult.signature.certificate.runInvocationURI | startswith($run_uri)) and
+                      (.verificationResult.statement.predicate.runDetails.metadata.invocationId | startswith($run_uri))
+                    )
+                  ' attestation.json >/dev/null
               )
               echo "prior stable authority recovered from terminal completion marker: ${latest_tag}@${latest_sha}"
             else

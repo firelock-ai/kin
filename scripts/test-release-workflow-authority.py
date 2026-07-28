@@ -123,6 +123,8 @@ def main() -> None:
         "gh attestation verify release-provenance.json",
         "gh attestation verify release-promotion.json",
         "release_workflow_run_id",
+        "runInvocationURI",
+        "runDetails.metadata.invocationId",
         "verifiedTimestamps",
         "registry.npmjs.org/@kinlab%2F",
         "ghcr.io/v2/firelock-ai/kin/manifests",
