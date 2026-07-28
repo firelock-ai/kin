@@ -478,8 +478,11 @@ fn merge_of_disjoint_edits_to_one_file_is_refused_atomically() {
     let repo = root.path().join("repo");
     fs::create_dir_all(&home).expect("create home");
     initialize_git_repo(&repo);
-    fs::write(repo.join("src/lib.rs"), b"pub fn alpha() {}\n\npub fn beta() {}\n")
-        .expect("write two functions");
+    fs::write(
+        repo.join("src/lib.rs"),
+        b"pub fn alpha() {}\n\npub fn beta() {}\n",
+    )
+    .expect("write two functions");
     run_git(&repo, &["add", "--all"]);
     run_git(&repo, &["commit", "-m", "two functions"]);
 
