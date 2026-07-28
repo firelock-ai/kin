@@ -269,15 +269,21 @@
     },
     {
       "command": "merge",
-      "status": "open_gate",
-      "exposure": "fail_closed",
-      "authority": "repository-v6 immutable DAG and exact tree merge",
+      "status": "ready",
+      "exposure": "enabled",
+      "authority": "repository-v6 immutable DAG three-way composition published with ref compare-and-swap",
       "required_for_bounded_dogfood": false,
       "acceptance_spec": [
-        "merge semantic and exact tree deltas across all artifact kinds and publish with ref compare-and-swap"
+        "resolve both heads and their merge base by replaying the change DAG, never from raw files",
+        "compose semantic entities, relations, and exact tree artifacts by stable identity against the merge base",
+        "author the merge change against its first parent and record both heads as ordered parents",
+        "publish the merge change, the target ref, and the exact workspace in one repository transaction with compare-and-swap",
+        "refuse a conflicting, unrelated, criss-cross, or admission-policy-changing merge without publishing any part of it"
       ],
-      "evidence_tests": [],
-      "note": "The old merge executor depends on removed legacy branch state and delta shapes."
+      "evidence_tests": [
+        "crates/kin-cli/tests/repository_merge.rs"
+      ],
+      "note": "Merge composes graph truth: both heads and the single merge base are materialized by DAG replay, then entities, relations, and exact tree artifacts are merged by stable identity, so a move on one side and an edit on the other stay the same artifact. The merge change carries ordered parents with the active branch first and its deltas are authored against that first parent, which is what history replay validates. Up-to-date and fast-forward merges publish no merge change. Unproven shapes fail closed with nothing published and are named in the refusal: conflicting entities, relations, or artifacts; two artifacts composing onto one path; unrelated histories; multiple merge bases (criss-cross); a merge that would change the shared admission policy; a dirty or detached workspace. There is no mid-merge state, so a conflicting merge is refused rather than parked; `kin conflicts` and `kin resolve` stay fail-closed for that reason. One interaction is inherited, not introduced: a workspace whose semantics were installed from history (branch switch, checkout, or merge) and is then committed retains a semantic overlay, because the commit observation re-derives entities from source bytes while the installed ones came from replayed history. `kin branch switch` followed by `kin commit` reproduces it with no merge involved. Until that is fixed, a second merge in the same session refuses on the resulting dirty workspace."
     },
     {
       "command": "stash",
@@ -322,7 +328,7 @@
         "represent semantic and exact-tree conflicts across every artifact kind"
       ],
       "evidence_tests": [],
-      "note": "The retired command read legacy .kin/merge_state.json state."
+      "note": "Repository-v6 authority has no durable merge-transaction record, so a mid-merge conflict set and its per-entity resolutions cannot be committed with the merge transaction, and the retired sidecar shape (.kin/merge_state.json) is not an acceptable substitute. `kin merge` therefore refuses a conflicting merge atomically and names every conflict it found instead of parking one. Flipping this command requires a first-class merge transaction in the kin-model and kin-db substrate."
     },
     {
       "command": "resolve",
@@ -335,7 +341,7 @@
         "publish the resolved workspace and target ref atomically with compare-and-swap"
       ],
       "evidence_tests": [],
-      "note": "The retired resolver mutated legacy branches and sidecar merge state."
+      "note": "Repository-v6 authority has no durable merge-transaction record, so a mid-merge conflict set and its per-entity resolutions cannot be committed with the merge transaction, and the retired sidecar shape (.kin/merge_state.json) is not an acceptable substitute. `kin merge` therefore refuses a conflicting merge atomically and names every conflict it found instead of parking one. Flipping this command requires a first-class merge transaction in the kin-model and kin-db substrate."
     },
     {
       "command": "rename",

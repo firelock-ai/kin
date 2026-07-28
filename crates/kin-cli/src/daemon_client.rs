@@ -1154,6 +1154,18 @@ impl DaemonClient {
         .await
     }
 
+    pub async fn merge(
+        &self,
+        request: &crate::commands::merge::MergeRequest,
+    ) -> Result<crate::commands::merge::MergeResponse> {
+        self.post_idempotent_json(
+            "/commands/merge",
+            request,
+            "send daemon-owned repository merge request",
+        )
+        .await
+    }
+
     pub async fn checkout(
         &self,
         request: &crate::commands::checkout::CheckoutRequest,

@@ -452,13 +452,13 @@ enum Command {
         #[command(subcommand)]
         action: SpecAction,
     },
-    /// [OPEN GATE] Merge semantic and exact-tree changes from another branch
+    /// Merge semantic and exact-tree changes from another branch
     Merge {
         /// Branch to merge from
         branch: String,
-        /// Merge strategy: structural or semantic
-        #[arg(short, long, default_value = "structural")]
-        strategy: String,
+        /// Emit the machine-readable merge report
+        #[arg(long)]
+        json: bool,
     },
     /// [OPEN GATE] Show repository-v6 merge conflicts
     Conflicts,
@@ -2430,7 +2430,10 @@ fn main() -> Result<()> {
                     SpecAction::List => commands::spec::list().await,
                     SpecAction::Show { id } => commands::spec::show(id).await,
                 },
-                Command::Merge { .. } => commands::capabilities::require_ready("merge"),
+                Command::Merge { branch, json } => {
+                    commands::capabilities::require_ready("merge")?;
+                    commands::merge::run(branch, json).await
+                }
                 Command::Conflicts => commands::capabilities::require_ready("conflicts"),
                 Command::Resolve { .. } => commands::capabilities::require_ready("resolve"),
                 Command::Stash { action: _ } => commands::capabilities::require_ready("stash"),
