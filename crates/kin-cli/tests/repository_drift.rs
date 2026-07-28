@@ -79,6 +79,18 @@ fn drift_report(repo: &Path, home: &Path) -> Value {
     serde_json::from_slice(&output.stdout).expect("drift report should be JSON")
 }
 
+/// Stop this repository's daemon so a working-copy edit made next is not
+/// observed by a live watcher.
+fn stop_daemon(repo: &Path, home: &Path) {
+    let output = run_kin(repo, home, &["daemon", "stop"]);
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 fn drift_paths(report: &Value) -> Vec<String> {
     report["drift"]
         .as_array()
@@ -173,6 +185,12 @@ fn drift_reports_diverged_tracked_bytes_without_admitting_them() {
         .as_u64()
         .expect("workspace generation");
 
+    // Edit the tracked path with no daemon live to observe it. A running
+    // watcher is entitled to admit a working-copy edit into workspace
+    // authority, which would make the divergence real but transient; this test
+    // is about what drift reports while the divergence still exists, so the
+    // window is made deterministic rather than raced.
+    stop_daemon(&repo, &home);
     fs::write(repo.join("README.md"), b"host edited these bytes\n").expect("edit tracked doc");
     let dirty = drift_report(&repo, &home);
     assert_eq!(dirty["clean"], false);
@@ -205,6 +223,7 @@ fn drift_reports_diverged_tracked_bytes_without_admitting_them() {
     );
 
     // A removed tracked member is drift the report also must not repair.
+    stop_daemon(&repo, &home);
     fs::remove_file(repo.join("src/lib.rs")).expect("remove tracked source");
     let deleted = drift_report(&repo, &home);
     assert!(
