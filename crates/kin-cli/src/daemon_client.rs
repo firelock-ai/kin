@@ -2181,6 +2181,15 @@ async fn validate_daemon_endpoint(
     }
 }
 
+/// How long a still-loading daemon may stay silent before the CLI says so.
+///
+/// A large repository can spend minutes loading. Saying nothing for that whole
+/// time is indistinguishable from a hang, and the eventual failure text used to
+/// be indistinguishable from a dead daemon. Both are the same defect: the CLI
+/// knew the daemon was alive and loading and did not say it.
+const LOADING_NOTICE_AFTER: Duration = Duration::from_secs(10);
+const LOADING_NOTICE_EVERY: Duration = Duration::from_secs(15);
+
 async fn wait_for_daemon_ready(
     kin_root: &Path,
     child: &mut Child,
@@ -2190,6 +2199,7 @@ async fn wait_for_daemon_ready(
     let timeout = deadline.saturating_duration_since(Instant::now());
     let client = daemon_health_client();
     let mut last_error = String::from("daemon did not report its port");
+    let mut loading = LoadingNotice::new(timeout);
 
     while Instant::now() < deadline {
         if let Some(status) = child.try_wait().context("check daemon child status")? {
@@ -2235,6 +2245,13 @@ async fn wait_for_daemon_ready(
                         Err(err) => last_error = err.to_string(),
                     }
                 }
+                Ok(resp) if resp.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE => {
+                    // The daemon is listening and answering: it is alive and
+                    // still loading, which is a different situation from one
+                    // that never came up.
+                    loading.observe(kin_root);
+                    last_error = "daemon is live and still loading its graph".to_string();
+                }
                 Ok(resp) => {
                     last_error = format!("readiness returned HTTP {}", resp.status());
                 }
@@ -2249,11 +2266,74 @@ async fn wait_for_daemon_ready(
     let _ = child.kill();
     let _ = child.wait();
     bail!(
-        "daemon failed to become ready within {:.1}s: {}; recent log:\n{}",
-        timeout.as_secs_f64(),
+        "{}: {}; recent log:\n{}",
+        loading.timeout_summary(timeout),
         last_error,
         daemon_log_tail_since(kin_root, log_offset)
     )
+}
+
+/// Tracks whether the daemon under a readiness wait was ever observed alive and
+/// loading, so the CLI can report progress while it waits and can name the real
+/// situation if patience runs out.
+struct LoadingNotice {
+    started: Instant,
+    last_notice: Option<Instant>,
+    ever_loading: bool,
+    budget: Duration,
+}
+
+impl LoadingNotice {
+    fn new(budget: Duration) -> Self {
+        Self {
+            started: Instant::now(),
+            last_notice: None,
+            ever_loading: false,
+            budget,
+        }
+    }
+
+    fn observe(&mut self, kin_root: &Path) {
+        self.ever_loading = true;
+        let elapsed = self.started.elapsed();
+        if elapsed < LOADING_NOTICE_AFTER {
+            return;
+        }
+        if self
+            .last_notice
+            .is_some_and(|last| last.elapsed() < LOADING_NOTICE_EVERY)
+        {
+            return;
+        }
+        self.last_notice = Some(Instant::now());
+        let repository = kin_root
+            .parent()
+            .and_then(|path| path.file_name())
+            .map_or_else(|| kin_root.display().to_string(), |name| {
+                name.to_string_lossy().into_owned()
+            });
+        eprintln!(
+            "kin: daemon is loading {repository} ({:.0}s elapsed, waiting up to {:.0}s; \
+             raise KIN_DAEMON_READY_TIMEOUT_SECS to wait longer)",
+            elapsed.as_secs_f64(),
+            self.budget.as_secs_f64()
+        );
+    }
+
+    /// Distinguish "never came up" from "came up, answered, and was still
+    /// loading when patience ran out". Only the second one is a timeout the
+    /// user can fix by waiting longer.
+    fn timeout_summary(&self, budget: Duration) -> String {
+        if self.ever_loading {
+            format!(
+                "daemon was alive and still loading after {:.1}s (KIN_DAEMON_READY_TIMEOUT_SECS \
+                 raises this bound)",
+                budget.as_secs_f64()
+            )
+        } else {
+            format!("daemon failed to become ready within {:.1}s", budget.as_secs_f64())
+        }
+    }
 }
 
 async fn wait_for_existing_daemon(kin_root: &Path) -> Option<String> {
