@@ -17229,12 +17229,13 @@ mod tests {
             crate::lifecycle::without_blocking_runtime_worker(move || {
                 let _ = warm_started_tx.send(());
                 // Bounded so a failing assertion below still lets the runtime
-                // shut down instead of wedging the test binary.
-                let _ = release_rx.recv_timeout(Duration::from_secs(30));
+                // shut down instead of wedging the test binary. Longer than the
+                // assertion cap so the release below is the normal exit.
+                let _ = release_rx.recv_timeout(Duration::from_secs(120));
             });
         });
         warm_started_rx
-            .recv_timeout(Duration::from_secs(10))
+            .recv_timeout(Duration::from_secs(30))
             .expect("the warm-up must start");
 
         let (answered_tx, answered_rx) = mpsc::channel::<StatusCode>();
@@ -17247,7 +17248,10 @@ mod tests {
             let _ = answered_tx.send(response.status());
         });
 
-        let status = answered_rx.recv_timeout(Duration::from_secs(10)).expect(
+        // Generous enough that whole-workspace CPU contention cannot trip it,
+        // while still bounded: a warm-up that parks the worker never answers at
+        // any cap, so this fails rather than hangs.
+        let status = answered_rx.recv_timeout(Duration::from_secs(60)).expect(
             "readiness must be answered while a sibling warm-up blocks; a warm-up that \
              holds the runtime worker makes a live daemon indistinguishable from a dead one",
         );
