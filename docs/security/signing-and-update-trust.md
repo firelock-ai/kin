@@ -67,7 +67,9 @@ After GitHub stable/latest, public install proof, both npm packages, and GHCR
 version/latest all succeed, the release publishes deterministic
 `release-promotion.json` plus its checksum and a source-bound GitHub
 attestation. This terminal marker is durable release-completion authority when
-an Actions run record later expires; aggregate archive provenance alone is not.
+an Actions run record later expires. Its attested stable run ID preserves
+downstream audit linkage without making the mutable Actions API authoritative;
+aggregate archive provenance alone is not.
 
 The daemon container is a separate attested subject. The protected tag workflow
 builds one exact commit-tagged image in GHCR, verifies its embedded source and

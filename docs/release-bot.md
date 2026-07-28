@@ -134,6 +134,9 @@ If a successful historical Actions run has aged out or been deleted, automatic
 admission re-establishes the prior stable from its checksum-bound terminal
 completion marker and GitHub artifact attestation pinned to the exact release
 workflow, tag, commit, GitHub-hosted runner, and transparency timestamp.
+The marker also carries the stable numeric Release run ID as an attested audit
+identifier, so downstream provenance can keep its existing linkage without
+requiring GitHub to retain the mutable Actions record forever.
 The one explicit pre-marker migration release, v0.3.6, additionally has to
 prove exact npm latest versions, matching GHCR latest/version/tag digests, and
 the exact source-bound GHCR attestation, plus aggregate release provenance.

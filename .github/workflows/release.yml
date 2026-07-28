@@ -2484,14 +2484,17 @@ jobs:
           commit="$(git rev-parse HEAD)"
           [ "$commit" = "$(git rev-parse "${GITHUB_REF_NAME}^{commit}")" ]
           [[ "$GHCR_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$GITHUB_RUN_ID" =~ ^[1-9][0-9]*$ ]]
           jq -nS \
             --arg tag "$GITHUB_REF_NAME" \
             --arg commit "$commit" \
+            --arg release_workflow_run_id "$GITHUB_RUN_ID" \
             --arg ghcr_digest "$GHCR_DIGEST" \
             '{
               schema_version: 1,
               release_tag: $tag,
               commit: $commit,
+              release_workflow_run_id: $release_workflow_run_id,
               signer_workflow: ".github/workflows/release.yml",
               ghcr_digest: $ghcr_digest,
               completed_capstones: [
