@@ -467,6 +467,13 @@ impl RepositoryTransferSegment {
 struct SegmentPlan {
     ordered: Vec<SemanticChangeId>,
     remaining: usize,
+    /// The plan had to reach past the change budget to end on a change the
+    /// destination ref can fast-forward to.
+    ///
+    /// This is what tells a caller whether a refusal can be answered by trying
+    /// a smaller step. Nothing inside this segment can end one, so replanning
+    /// under any smaller budget rebuilds exactly this segment.
+    is_smallest_publishable_step: bool,
 }
 
 /// A pack that could not be assembled inside the negotiated bounds.
@@ -494,6 +501,7 @@ pub fn build_repository_transfer_pack<B: StorageBackend + ?Sized + 'static>(
     let plan = SegmentPlan {
         ordered,
         remaining: 0,
+        is_smallest_publishable_step: false,
     };
     match assemble_segment_pack(authority, &context, expectation, source_ref, &plan)? {
         Assembled::Pack(pack) => Ok(*pack),
@@ -549,6 +557,24 @@ pub fn build_repository_transfer_segment<B: StorageBackend + ?Sized + 'static>(
                     return Err(invalid(format!(
                         "the next publishable step of this transfer is one exact change and it {reason}; \
                          a single change cannot be split across continuation packs"
+                    )));
+                }
+                // A smaller budget is only worth trying when it can produce a
+                // smaller segment, and here it cannot: the planner already had
+                // to reach past the budget to end on a change this ref can
+                // fast-forward to, so every replan rebuilds this same segment.
+                // Refusing by name is the answer the caller needs; shrinking
+                // the budget again would be a hang standing in for a refusal.
+                //
+                // This is also what bounds the loop. A plan that stayed inside
+                // its budget is never longer than it, so the next budget is
+                // strictly smaller than the segment just refused, and a plan
+                // that reached past its budget stops here.
+                if plan.is_smallest_publishable_step {
+                    return Err(invalid(format!(
+                        "the next publishable step of this transfer is {planned} changes and it \
+                         {reason}; no smaller part of it ends on a change this destination ref can \
+                         fast-forward to, so it cannot be split across continuation packs"
                     )));
                 }
                 // Halve rather than step down one change at a time: the bound
@@ -738,17 +764,20 @@ fn plan_transfer_segment(
     // so refusing here would strand a transfer rather than bound it. Take the
     // smallest publishable step there is and let the pack limits refuse it if
     // it genuinely cannot be built.
-    let end = match last_publishable {
-        Some(end) => end,
-        None => smallest_publishable_step(closure, &descends).ok_or_else(|| {
-            invalid(format!(
-                "no change in this closure descends from destination head {}, so no pack can \
-                 publish a head this ref reaches",
-                destination_head
-                    .map(|head| head.to_string())
-                    .unwrap_or_else(|| "an unborn ref".to_string()),
-            ))
-        })?,
+    let (end, is_smallest_publishable_step) = match last_publishable {
+        Some(end) => (end, false),
+        None => (
+            smallest_publishable_step(closure, &descends).ok_or_else(|| {
+                invalid(format!(
+                    "no change in this closure descends from destination head {}, so no pack can \
+                     publish a head this ref reaches",
+                    destination_head
+                        .map(|head| head.to_string())
+                        .unwrap_or_else(|| "an unborn ref".to_string()),
+                ))
+            })?,
+            true,
+        ),
     };
     // Carry exactly the endpoint's own ancestry rather than the whole scanned
     // prefix. A topological prefix can hold a change that is not an ancestor
@@ -757,7 +786,11 @@ fn plan_transfer_segment(
     // would leave the next segment's closure carrying it a second time.
     let ordered = collect_fast_forward_closure(changes, closure[end], destination_head)?;
     let remaining = closure.len().saturating_sub(ordered.len());
-    Ok(SegmentPlan { ordered, remaining })
+    Ok(SegmentPlan {
+        ordered,
+        remaining,
+        is_smallest_publishable_step,
+    })
 }
 
 fn assemble_segment_pack<B: StorageBackend + ?Sized + 'static>(
@@ -1226,12 +1259,17 @@ fn validate_status(status: &RepositoryTransferStatus) -> Result<()> {
     require_negotiated_features(&status.supported_features)
 }
 
-/// Refuse a peer whose advertised envelope cannot carry anything.
+/// Refuse an envelope that cannot carry anything.
 ///
 /// A continuation loop asks the peer how much it accepts and then sends that
 /// much until the gap closes. A peer advertising a zero-sized envelope would
 /// make every segment empty, so the loop has to refuse it here rather than
 /// discover it as a lack of progress after the first round trip.
+///
+/// The same numbers come back the other way on the export route, where they
+/// arrive in a request body rather than from a status this process built, so
+/// an exporter checks them too rather than trusting the sender to have asked
+/// for something it can answer.
 fn validate_limits(limits: &RepositoryTransferLimits) -> Result<()> {
     for (label, value) in [
         ("max_changes", u64::from(limits.max_changes)),
@@ -1242,7 +1280,7 @@ fn validate_limits(limits: &RepositoryTransferLimits) -> Result<()> {
     ] {
         if value == 0 {
             return Err(invalid(format!(
-                "destination advertises {label} of zero, which can never carry a transfer"
+                "the negotiated {label} is zero, which can never carry a transfer"
             )));
         }
     }
@@ -1251,6 +1289,7 @@ fn validate_limits(limits: &RepositoryTransferLimits) -> Result<()> {
 
 fn validate_expectation(expectation: &RepositoryTransferExpectation) -> Result<()> {
     expectation.roots.validate().map_err(model)?;
+    validate_limits(&expectation.limits)?;
     if expectation.destination_head.is_some() != expectation.destination_target.is_some() {
         return Err(invalid(
             "destination target and resolved head must both be present or absent",

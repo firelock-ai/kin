@@ -936,6 +936,10 @@ mod tests {
         /// The bound a peer publishes is negotiated, not fixed, so a small one
         /// is a legal peer rather than a test-only shortcut.
         advertised_max_changes: Option<u32>,
+        /// Advertise a small bound the sender's change budget cannot reach, so
+        /// a step that is unsplittable on a non-change bound is exercised on a
+        /// history a test can build.
+        advertised_max_trees: Option<u32>,
         exported: RefCell<usize>,
         received: RefCell<usize>,
     }
@@ -949,6 +953,7 @@ mod tests {
                 claimed_repository: None,
                 claimed_destination_ref: None,
                 advertised_max_changes: None,
+                advertised_max_trees: None,
                 exported: RefCell::new(0),
                 received: RefCell::new(0),
             }
@@ -957,6 +962,13 @@ mod tests {
         fn advertising_max_changes(authority: &'a TestManager, max_changes: u32) -> Self {
             Self {
                 advertised_max_changes: Some(max_changes),
+                ..Self::new(authority)
+            }
+        }
+
+        fn advertising_max_trees(authority: &'a TestManager, max_trees: u32) -> Self {
+            Self {
+                advertised_max_trees: Some(max_trees),
                 ..Self::new(authority)
             }
         }
@@ -1011,6 +1023,9 @@ mod tests {
             if let Some(max_changes) = self.advertised_max_changes {
                 status.limits.max_changes = max_changes;
             }
+            if let Some(max_trees) = self.advertised_max_trees {
+                status.limits.max_trees = max_trees;
+            }
             Ok(status)
         }
 
@@ -1026,6 +1041,9 @@ mod tests {
             let mut expectation = expectation.clone();
             if let Some(max_changes) = self.advertised_max_changes {
                 expectation.limits.max_changes = expectation.limits.max_changes.min(max_changes);
+            }
+            if let Some(max_trees) = self.advertised_max_trees {
+                expectation.limits.max_trees = expectation.limits.max_trees.min(max_trees);
             }
             build_repository_transfer_segment(self.authority, source_ref, &expectation)
                 .map(|segment| segment.pack)
@@ -1591,6 +1609,168 @@ mod tests {
                 // conflict.
                 change_count: Some(4),
             }
+        );
+    }
+
+    /// Run `work` on its own thread and fail the test if it does not finish.
+    ///
+    /// What these tests assert is termination, and a test that simply called
+    /// the segment builder would hang the suite instead of failing it. The
+    /// deadline is a liveness bound rather than a performance one: the
+    /// fixtures below finish in milliseconds, so it is set far above any
+    /// plausible slow machine.
+    fn within_deadline<T: Send + 'static>(
+        what: &str,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(work());
+        });
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .unwrap_or_else(|_| panic!("{what} did not terminate"))
+    }
+
+    /// Publish a merge whose smallest publishable step is two changes.
+    ///
+    /// The destination is left holding the mainline change before the merge,
+    /// so the closure is the side line followed by the merge and only the
+    /// merge descends from the head the destination holds.
+    fn merge_past_a_published_head(
+        source: &TestManager,
+        destination: &TestManager,
+        repository_id: &RepositoryId,
+        main: &RefName,
+    ) {
+        let side = RefName::branch(b"side").unwrap();
+        let root = publish(source, repository_id, main, None, 1, "root");
+        let published = publish(source, repository_id, main, Some(root), 2, "mainline");
+        let sibling = publish_with_parents(
+            source,
+            repository_id,
+            &side,
+            vec![root],
+            None,
+            3,
+            "side line",
+        );
+
+        let peer = LocalPeer::new(destination);
+        push_to_remote(source, &peer, repository_id, main, main).unwrap();
+
+        publish_with_parents(
+            source,
+            repository_id,
+            main,
+            vec![published, sibling],
+            Some(published),
+            4,
+            "merge the side line",
+        );
+    }
+
+    #[test]
+    fn a_step_that_cannot_be_split_is_refused_by_name_rather_than_replanned() {
+        // The smallest step that lands a head this ref can reach is bigger
+        // than the envelope on every bound, not only on the change count. The
+        // planner reaches past the change budget to take that step, so a
+        // smaller budget cannot produce a smaller segment: replanning returns
+        // the same one. Refusing and naming the bound is the answer; halving
+        // the budget again is a hang standing in for a refusal.
+        let outcome = within_deadline("a segment over a non-change bound", || {
+            let repository_id =
+                RepositoryId::new(format!("unsplittable-{}", Uuid::new_v4())).unwrap();
+            let source_dir = TempDir::new().unwrap();
+            let destination_dir = TempDir::new().unwrap();
+            let source = manager(&source_dir, &repository_id);
+            let destination = manager(&destination_dir, &repository_id);
+            let main = RefName::branch(b"main").unwrap();
+            merge_past_a_published_head(&source, &destination, &repository_id, &main);
+
+            let status = repository_transfer_status(&destination, &repository_id, &main).unwrap();
+            let mut expectation = RepositoryTransferExpectation::try_from(status).unwrap();
+            // Leave the change bound at the protocol default and clamp only a
+            // bound the change budget cannot reach. This is the shape a merge
+            // step of more than MAX_TRANSFER_CHANGES changes has under
+            // entirely default limits, where max_trees equals max_changes.
+            expectation.limits.max_trees = 1;
+
+            build_repository_transfer_segment(&source, &main, &expectation)
+                .map(|segment| segment.pack.changes.len())
+        });
+
+        let error = outcome.expect_err("a step that cannot be split is refused, not replanned");
+        let RepositoryTransferError::Invalid(message) = error else {
+            panic!("an envelope too small for the smallest step is a refusal: {error:?}");
+        };
+        // Three, not two: the merge reaches its side line by a path that never
+        // passes through the head the destination holds, so the fast-forward
+        // closure collects the root a second time.
+        assert!(
+            message.contains("carries 3 trees, over negotiated limit 1"),
+            "the refusal must name the negotiated bound the step exceeds: {message}"
+        );
+        assert!(
+            message.contains("cannot be split"),
+            "the refusal must say why no smaller step is available: {message}"
+        );
+    }
+
+    #[test]
+    fn a_peer_whose_envelope_cannot_carry_the_smallest_step_is_refused_rather_than_looped_on() {
+        // The same refusal over the negotiation loop a push actually drives.
+        // The bound arrives from the peer's own advertisement, which is where
+        // it comes from on the export route, so this is the shape a remote can
+        // put a sender in rather than one only a direct caller can build.
+        let outcome = within_deadline("a push into an envelope below the smallest step", || {
+            let repository_id =
+                RepositoryId::new(format!("narrow-peer-{}", Uuid::new_v4())).unwrap();
+            let source_dir = TempDir::new().unwrap();
+            let destination_dir = TempDir::new().unwrap();
+            let source = manager(&source_dir, &repository_id);
+            let destination = manager(&destination_dir, &repository_id);
+            let main = RefName::branch(b"main").unwrap();
+            merge_past_a_published_head(&source, &destination, &repository_id, &main);
+
+            let narrow = LocalPeer::advertising_max_trees(&destination, 1);
+            push_to_remote(&source, &narrow, &repository_id, &main, &main)
+                .map(|outcome| outcome.receipts.len())
+        });
+
+        let error = outcome.expect_err("a peer that cannot carry the smallest step is refused");
+        let RepositoryTransferError::Invalid(message) = error else {
+            panic!("an envelope too small for the smallest step is a refusal: {error:?}");
+        };
+        assert!(
+            message.contains("over negotiated limit 1"),
+            "the refusal must name the negotiated bound the step exceeds: {message}"
+        );
+    }
+
+    #[test]
+    fn an_envelope_that_can_carry_nothing_is_refused_before_a_pack_is_built() {
+        // An exporter takes its limits from the request it was handed, not
+        // from a status it built, so the numbers are the caller's word. A
+        // bound of zero is already refused when a peer advertises one; it is
+        // refused on the way in for the same reason, rather than becoming
+        // work that can only end in a refusal.
+        let (fixture, _) = line_of(2);
+        let status =
+            repository_transfer_status(&fixture.destination, &fixture.repository_id, &fixture.main)
+                .unwrap();
+        let mut expectation = RepositoryTransferExpectation::try_from(status).unwrap();
+        expectation.limits.max_trees = 0;
+
+        let error = build_repository_transfer_segment(&fixture.source, &fixture.main, &expectation)
+            .expect_err("an envelope that can carry nothing is refused");
+
+        let RepositoryTransferError::Invalid(message) = error else {
+            panic!("a bound that can carry nothing is a refusal: {error:?}");
+        };
+        assert!(
+            message.contains("the negotiated max_trees is zero"),
+            "the refusal must name the bound that can carry nothing: {message}"
         );
     }
 
