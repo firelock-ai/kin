@@ -128,6 +128,7 @@ pub mod repository_commit;
 mod repository_drift;
 mod repository_merge;
 mod repository_rollback;
+mod repository_stash;
 mod repository_tag;
 pub mod session_registry;
 pub mod state;

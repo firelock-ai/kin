@@ -1,12 +1,18 @@
-# Kin
+<div align="center">
 
-> **Software that remembers itself.**
->
-> Exact context, not more.
+<picture>
+<source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/firelock-ai/kin/main/brand/kin-lockup-dark.svg">
+<source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/firelock-ai/kin/main/brand/kin-lockup-light.svg">
+<img src="https://raw.githubusercontent.com/firelock-ai/kin/main/brand/kin-lockup-light.svg" alt="Kin" width="300">
+</picture>
 
-[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![Latest release](https://img.shields.io/badge/release-latest-6E56CF.svg)](https://github.com/firelock-ai/kin/releases/latest)
-[![kinlab.ai](https://img.shields.io/badge/hosted-kinlab.ai-111111.svg)](https://kinlab.ai)
+<h3>Software that remembers itself.</h3>
+
+<p><em>Exact context, not more.</em></p>
+
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE) [![Latest release](https://img.shields.io/badge/release-latest-6E56CF.svg)](https://github.com/firelock-ai/kin/releases/latest) [![kinlab.ai](https://img.shields.io/badge/hosted-kinlab.ai-111111.svg)](https://kinlab.ai)
+
+</div>
 
 Kin is the system of record for AI-written software. AI agents can write a
 change faster than a team can establish what it touches, whether it reverses
@@ -20,6 +26,19 @@ review surface, and graph-backed filesystem projection. It is pre-1.0, so expect
 rough edges and breaking changes. See the [latest stable release](https://github.com/firelock-ai/kin/releases/latest)
 and the [current limitations](#platform-and-maturity) before adopting it in a
 critical workflow.
+
+## See it on a real repository
+
+A one-line signature change in ripgrep looks harmless in the diff. Asking the
+graph before any build runs:
+
+<div align="center">
+<img src="docs/assets/kin-impact-ripgrep.png" alt="A git diff adding a parameter to resolve_binary, then kin impact listing 13 impacted entities within 3 hops, grouped by hop distance" width="920">
+</div>
+
+The three direct callers stopped compiling the moment that parameter changed.
+`kin impact` named them from graph truth, with the two and three hop blast
+radius behind them, before any compiler ran.
 
 ## The stack
 

@@ -70,6 +70,7 @@ pub mod session_workspace;
 pub mod setup;
 pub mod setup_ledger;
 pub mod spec;
+pub mod stash;
 pub mod status;
 pub mod support;
 pub mod tag;

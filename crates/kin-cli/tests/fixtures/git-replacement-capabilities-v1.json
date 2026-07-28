@@ -310,8 +310,14 @@
       "acceptance_spec": [
         "persist and restore exact graph-owned workspace state without branch sidecars or raw-file inference"
       ],
-      "evidence_tests": [],
-      "note": "The old stash path updates the removed .kin/HEAD branch marker."
+      "evidence_tests": [
+        "kin_daemon::api::tests::command_stash_seals_restores_and_round_trips_exact_workspace_state",
+        "kin_daemon::api::tests::command_stash_refuses_restore_onto_moved_authority",
+        "kin_daemon::api::tests::command_stash_refuses_sealing_a_clean_workspace_and_restoring_over_a_dirty_one",
+        "kin_daemon::api::tests::command_stash_leaves_ready_commands_working_on_the_returned_workspace",
+        "kin_cli::commands::stash::tests::stash_ref_names_round_trip_only_through_canonical_ordinals"
+      ],
+      "note": "The graph-owned path exists and is covered: sealing writes the exact workspace tree and base-relative semantics as one immutable change under refs/kin/stash/, and restore refuses a moved authority base rather than rebasing onto it. It stays fail-closed because against a live daemon a seal can leave the daemon query graph disagreeing with workspace authority, so the next ready command refuses until the daemon reopens. In-process route coverage does not reproduce it; the background daemon loop is the missing variable."
     },
     {
       "command": "reconcile",
@@ -370,7 +376,7 @@
         "apply exact workspace tree and semantic deltas through one repository transaction"
       ],
       "evidence_tests": [],
-      "note": "The old planner read .kin/objects and working-tree files."
+      "note": "kin rename has no planner: the retired one read .kin/objects and working-tree files, and nothing reads bodies from repository-v6 source CAS in its place. There is also no apply path that moves the workspace tree and semantic deltas through one repository transaction."
     },
     {
       "command": "remote plan-push",

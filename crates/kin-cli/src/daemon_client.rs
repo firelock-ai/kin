@@ -1227,6 +1227,18 @@ impl DaemonClient {
         .await
     }
 
+    pub async fn stash(
+        &self,
+        request: &crate::commands::stash::StashRequest,
+    ) -> Result<crate::commands::stash::StashResponse> {
+        self.post_idempotent_json(
+            "/commands/stash",
+            request,
+            "send daemon-owned repository stash request",
+        )
+        .await
+    }
+
     pub async fn rollback(
         &self,
         request: &crate::commands::rollback::RollbackRequest,
