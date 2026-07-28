@@ -35,6 +35,12 @@ fn spawn_daemon_ephemeral(repo_root: &Path) -> Child {
         .arg("0")
         // Keep the test hermetic and light: no LSP discovery on the host.
         .env("KIN_DAEMON_DISABLE_LSP", "1")
+        // Startup pins sibling repository authority from the registry. Keep
+        // that read inside this scratch repository rather than ~/.kin.
+        .env(
+            "KIN_REGISTRY_PATH",
+            repo_root.join(".kin/test-runtime/registry.toml"),
+        )
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()

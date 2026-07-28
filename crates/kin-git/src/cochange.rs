@@ -420,7 +420,8 @@ mod tests {
         Hash256, LanguageId, LocatedEntry, RepoPath, SemanticFingerprint, SourceSpan, TreeDelta,
         TreeEntry, Visibility,
     };
-    use std::process::Command;
+
+    use crate::test_support::fixture_git;
 
     fn modified_regular_delta(
         path: impl Into<String>,
@@ -477,18 +478,18 @@ mod tests {
     }
 
     fn init_git_repo(dir: &std::path::Path) -> bool {
-        let git_init = Command::new("git").args(["init"]).current_dir(dir).output();
+        let git_init = fixture_git().args(["init"]).current_dir(dir).output();
         match git_init {
             Ok(output) if output.status.success() => {
-                let _ = Command::new("git")
+                let _ = fixture_git()
                     .args(["config", "user.email", "test@test.com"])
                     .current_dir(dir)
                     .output();
-                let _ = Command::new("git")
+                let _ = fixture_git()
                     .args(["config", "user.name", "Test"])
                     .current_dir(dir)
                     .output();
-                let _ = Command::new("git")
+                let _ = fixture_git()
                     .args(["config", "core.hooksPath", ".git/no-hooks"])
                     .current_dir(dir)
                     .output();
@@ -787,12 +788,12 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
         std::fs::write(dir.path().join("src/a.rs"), "fn alpha() {}\n").unwrap();
         std::fs::write(dir.path().join("src/b.rs"), "fn beta() {}\n").unwrap();
-        Command::new("git")
+        fixture_git()
             .args(["add", "."])
             .current_dir(dir.path())
             .output()
             .unwrap();
-        Command::new("git")
+        fixture_git()
             .args(["commit", "-m", "initial"])
             .current_dir(dir.path())
             .output()
@@ -804,12 +805,12 @@ mod tests {
         )
         .unwrap();
         std::fs::write(dir.path().join("src/c.rs"), "fn gamma() {}\n").unwrap();
-        Command::new("git")
+        fixture_git()
             .args(["add", "."])
             .current_dir(dir.path())
             .output()
             .unwrap();
-        Command::new("git")
+        fixture_git()
             .args(["commit", "-m", "followup"])
             .current_dir(dir.path())
             .output()
@@ -849,7 +850,7 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
         std::fs::write(dir.path().join("src/a.rs"), "fn alpha() {}\n").unwrap();
         std::fs::write(dir.path().join("src/b.rs"), "fn beta() {}\n").unwrap();
-        Command::new("git")
+        fixture_git()
             .args(["add", "."])
             .current_dir(dir.path())
             .output()
@@ -857,7 +858,7 @@ mod tests {
         // Distinct, increasing commit dates so the recency window is decided by
         // commit time (the realistic case for sequential commits) rather than by
         // the tie-break that only applies to equal-timestamp commits.
-        Command::new("git")
+        fixture_git()
             .args(["commit", "-m", "initial"])
             .env("GIT_AUTHOR_DATE", "2021-01-01T00:00:00 +0000")
             .env("GIT_COMMITTER_DATE", "2021-01-01T00:00:00 +0000")
@@ -866,12 +867,12 @@ mod tests {
             .unwrap();
 
         std::fs::write(dir.path().join("src/c.rs"), "fn gamma() {}\n").unwrap();
-        Command::new("git")
+        fixture_git()
             .args(["add", "."])
             .current_dir(dir.path())
             .output()
             .unwrap();
-        Command::new("git")
+        fixture_git()
             .args(["commit", "-m", "middle"])
             .env("GIT_AUTHOR_DATE", "2021-01-02T00:00:00 +0000")
             .env("GIT_COMMITTER_DATE", "2021-01-02T00:00:00 +0000")
@@ -885,12 +886,12 @@ mod tests {
         )
         .unwrap();
         std::fs::write(dir.path().join("src/d.rs"), "fn delta() {}\n").unwrap();
-        Command::new("git")
+        fixture_git()
             .args(["add", "."])
             .current_dir(dir.path())
             .output()
             .unwrap();
-        Command::new("git")
+        fixture_git()
             .args(["commit", "-m", "latest"])
             .env("GIT_AUTHOR_DATE", "2021-01-03T00:00:00 +0000")
             .env("GIT_COMMITTER_DATE", "2021-01-03T00:00:00 +0000")

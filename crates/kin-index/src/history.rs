@@ -1112,6 +1112,31 @@ mod tests {
             || label.starts_with("GIT_CONFIG_VALUE_")
     }
 
+    #[test]
+    fn git_fixtures_ignore_command_scope_config() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut command = Command::new("git");
+        command
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "core.hooksPath")
+            .env("GIT_CONFIG_VALUE_0", "hostile-command-scope-hooks")
+            .env("GIT_CONFIG_PARAMETERS", "malformed hostile fixture config");
+        isolate_fixture_git(&mut command, temp.path());
+        let output = command
+            .args(["config", "--get", "core.hooksPath"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "isolated Git should report a missing value: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stdout.is_empty());
+        assert!(output.stderr.is_empty());
+    }
+
     #[cfg(unix)]
     #[test]
     fn git_fixtures_ignore_global_and_inherited_config_hooks() {

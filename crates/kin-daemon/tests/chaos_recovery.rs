@@ -77,6 +77,13 @@ fn spawn_daemon_with_env(repo_root: &Path, port: u16, envs: &[(&str, &str)]) -> 
         .arg(repo_root)
         .arg("--port")
         .arg(port.to_string())
+        // Daemon startup inspects the registry to pin sibling repository
+        // authority. A scratch daemon must never enumerate the developer's
+        // real registry while doing so.
+        .env(
+            "KIN_REGISTRY_PATH",
+            repo_root.join(".kin/test-runtime/registry.toml"),
+        )
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
     for (key, value) in envs {

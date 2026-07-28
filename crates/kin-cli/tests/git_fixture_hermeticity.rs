@@ -1,9 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-#![cfg(unix)]
-
-use std::os::unix::fs::PermissionsExt as _;
 use tempfile::tempdir;
 
 mod common;
@@ -11,7 +8,33 @@ mod common;
 use common::Command;
 
 #[test]
+fn integration_git_fixtures_ignore_command_scope_config() {
+    let temp = tempdir().unwrap();
+    let output = Command::new("git")
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "core.hooksPath")
+        .env("GIT_CONFIG_VALUE_0", "hostile-command-scope-hooks")
+        .env("GIT_CONFIG_PARAMETERS", "malformed hostile fixture config")
+        .args(["config", "--get", "core.hooksPath"])
+        .current_dir(temp.path())
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "isolated Git should report a missing value: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+}
+
+#[cfg(unix)]
+#[test]
 fn integration_git_fixtures_ignore_global_hooks() {
+    use std::os::unix::fs::PermissionsExt as _;
+
     let temp = tempdir().unwrap();
     let home = temp.path().join("home");
     let hooks = temp.path().join("hooks");

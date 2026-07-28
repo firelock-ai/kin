@@ -49,34 +49,98 @@ const POLL_INTERVAL: Duration = Duration::from_millis(20);
 pub struct IsolatedDaemonRuntime {
     repository: PathBuf,
     registry_path: PathBuf,
+    home_path: PathBuf,
 }
 
 impl IsolatedDaemonRuntime {
     pub fn new(repository: &Path) -> Self {
+        let runtime_root = repository.join(".kin/test-runtime");
+        let home_path = runtime_root.join("home");
         Self {
             repository: repository.to_path_buf(),
-            registry_path: repository.join(".kin/test-runtime/registry.toml"),
+            registry_path: runtime_root.join("registry.toml"),
+            home_path,
         }
     }
 
     pub fn kin_command(&self) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_kin"));
+        for inherited in [
+            "DYLD_INSERT_LIBRARIES",
+            "LD_PRELOAD",
+            "KIN_DAEMON_URL",
+            "KIN_SUPERVISOR_URL",
+            "KIN_NO_DAEMON",
+            "KIN_DAEMON_BIN",
+            "KIN_DAEMON_AUTH_TOKEN",
+            "KIN_DAEMON_BIND_HOST",
+            "KIN_VFS_WORKSPACE",
+            "KIN_VFS_WORKSPACE_ALIASES",
+            "KIN_VFS_SOCK",
+            "KIN_VFS_PIPE",
+            "KIN_VFS_CANARY",
+            "KIN_VFS_INTERPOSE_ACTIVE",
+            "KIN_VFS_LAST_DIR",
+            "_KIN_VFS_LAST_DIR",
+            "KIN_NO_VFS",
+            "KIN_SESSION",
+            "KIN_SESSION_ID",
+            "KIN_SESSION_DIR",
+            "KIN_REPO_ID",
+            "KIN_REPO_IDS",
+            "KIN_PRIMARY_REPO_ID",
+            "KIN_MCP_REPO",
+            "KIN_SOURCE_ROOT",
+            "KIN_ORIGINAL_PATH",
+            "KIN_DISCOVERY_MODE",
+            "KIN_CONTENT_MODE",
+        ] {
+            command.env_remove(inherited);
+        }
         command
             .env("KIN_REGISTRY_PATH", &self.registry_path)
-            .env("KIN_SUPERVISOR_IDLE_TIMEOUT_SECS", "1");
+            // The explicit registry is authoritative. HOME/USERPROFILE are a
+            // fail-closed fallback for any child boundary that intentionally
+            // rebuilds its environment instead of inheriting the override.
+            .env("HOME", &self.home_path)
+            .env("USERPROFILE", &self.home_path)
+            .env("XDG_CONFIG_HOME", self.home_path.join(".config"))
+            .env("KIN_VFS_DISABLE", "1")
+            .env("KIN_DAEMON_IDLE_TIMEOUT_SECS", "1")
+            .env("KIN_SUPERVISOR_IDLE_TIMEOUT_SECS", "1")
+            // `daemon stop --all` can wait once per worker and once for the
+            // supervisor. Keep both waits below Drop's independent wall cap.
+            .env("KIN_DAEMON_STOP_TIMEOUT_SECS", "5");
         command
     }
 }
 
 impl Drop for IsolatedDaemonRuntime {
     fn drop(&mut self) {
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = self
-                .kin_command()
+        let cleanup = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.kin_command()
                 .args(["daemon", "stop", "--all"])
                 .current_dir(&self.repository)
-                .output_within(Duration::from_secs(15));
+                .output_within(Duration::from_secs(15))
         }));
+        let failure = match cleanup {
+            Ok(Ok(output)) if output.status.success() => None,
+            Ok(Ok(output)) => Some(format!(
+                "isolated daemon cleanup failed with {}: stdout={} stderr={}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )),
+            Ok(Err(error)) => Some(format!("isolated daemon cleanup could not run: {error}")),
+            Err(_) => Some("isolated daemon cleanup exceeded its wall-clock bound".to_string()),
+        };
+        if let Some(failure) = failure {
+            if std::thread::panicking() {
+                eprintln!("{failure}");
+            } else {
+                panic!("{failure}");
+            }
+        }
     }
 }
 
