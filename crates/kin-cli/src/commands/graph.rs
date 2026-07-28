@@ -208,7 +208,11 @@ fn build_graph_status_response(
         *kind_counts.entry(e.kind).or_insert(0) += 1;
     }
 
-    // Relation counts by kind
+    // Relation counts by kind. Entity-rooted traversal only reaches edges whose
+    // src and dst are both entities, so this total is narrower than the whole
+    // relation table, which also carries artifact-, test-, contract-, work-, and
+    // verification-run-anchored edges. Both totals are reported below, each
+    // labeled with the scope it counts.
     let mut relation_counts: HashMap<RelationKind, usize> = HashMap::new();
     let mut seen_relation_ids = HashSet::new();
     let mut total_relations = 0usize;
@@ -237,13 +241,13 @@ fn build_graph_status_response(
     lines.push("=== Graph Health ===".to_string());
     lines.push(String::new());
     lines.push(format!(
-        "Entities: {}  |  Relations: {}  |  Files: {}",
+        "Entities: {}  |  Entity-to-entity relations: {}  |  Files: {}",
         entity_count,
         total_relations,
         unique_files.len()
     ));
     lines.push(format!(
-        "Rels/Entity: {:.2}",
+        "Entity-to-entity rels/entity: {:.2}",
         if entity_count == 0 {
             0.0
         } else {
@@ -274,7 +278,10 @@ fn build_graph_status_response(
         .iter()
         .map(|(kind, count)| format!("{:?}: {}", kind, count))
         .collect();
-    lines.push(format!("Relations: {}", rel_parts.join(", ")));
+    lines.push(format!(
+        "Entity-to-entity relation kinds: {}",
+        rel_parts.join(", ")
+    ));
 
     // Kind distribution
     let mut kind_pairs: Vec<_> = kind_counts.iter().collect();
@@ -302,7 +309,7 @@ fn build_graph_status_response(
         }
     ));
     lines.push(format!(
-        "Semantic rels (excluding CoChanges): {} ({:.2}/entity)",
+        "All graph relations excluding CoChanges: {} ({:.2}/entity)",
         health.semantic_relation_count, health.semantic_relation_density_excluding_cochanges
     ));
     lines.push(format!(
@@ -352,6 +359,11 @@ fn build_graph_status_response(
         for w in &warnings {
             lines.push(format!("⚠ {}", w));
         }
+    }
+    // Notes describe expected absences, so they follow the verdict rather than
+    // suppressing it.
+    for note in &health.notes {
+        lines.push(format!("ℹ {}", note));
     }
 
     Ok(GraphCommandResponse {
@@ -539,55 +551,20 @@ fn build_graph_inspect_response(
         lines.push(format!("  Visibility: {:?}", entity.visibility));
 
         // Show relations
-        let relations = graph.get_all_relations_for_entity(&entity.id)?;
-        if !relations.is_empty() {
-            lines.push(format!("  Relations ({}):", relations.len()));
-            for rel in relations.iter().take(20) {
-                let target_name = match rel.dst {
-                    kin_model::GraphNodeId::Entity(id) => {
-                        if id == entity.id {
-                            // Incoming relation — show source
-                            match rel.src {
-                                kin_model::GraphNodeId::Entity(src_id) => graph
-                                    .get_entity(&src_id)?
-                                    .map(|e| {
-                                        format!(
-                                            "{} ({})",
-                                            e.name,
-                                            e.file_origin
-                                                .as_ref()
-                                                .map(|f| f.0.as_str())
-                                                .unwrap_or("?")
-                                        )
-                                    })
-                                    .unwrap_or_else(|| format!("{}", src_id)),
-                                _ => format!("{:?}", rel.src),
-                            }
-                        } else {
-                            graph
-                                .get_entity(&id)?
-                                .map(|e| {
-                                    format!(
-                                        "{} ({})",
-                                        e.name,
-                                        e.file_origin.as_ref().map(|f| f.0.as_str()).unwrap_or("?")
-                                    )
-                                })
-                                .unwrap_or_else(|| format!("{}", id))
-                        }
-                    }
-                    _ => format!("{:?}", rel.dst),
-                };
-                let direction = if matches!(rel.dst, kin_model::GraphNodeId::Entity(id) if id == entity.id)
-                {
-                    "<-"
-                } else {
-                    "->"
-                };
-                lines.push(format!("    {} {:?} {}", direction, rel.kind, target_name));
+        let rows = inspect_relation_rows(graph, &entity)?;
+        if !rows.is_empty() {
+            lines.push(format!("  Relations ({}):", rows.len()));
+            for row in rows.iter().take(INSPECT_RELATION_LIMIT) {
+                lines.push(format!(
+                    "    {} {:?} {}",
+                    row.direction, row.kind, row.peer_label
+                ));
             }
-            if relations.len() > 20 {
-                lines.push(format!("    ... and {} more", relations.len() - 20));
+            if rows.len() > INSPECT_RELATION_LIMIT {
+                lines.push(format!(
+                    "    ... and {} more",
+                    rows.len() - INSPECT_RELATION_LIMIT
+                ));
             }
         }
         lines.push(String::new());
@@ -598,6 +575,62 @@ fn build_graph_inspect_response(
         error: None,
         source: None,
     })
+}
+
+/// Peer rows rendered past this point are summarized as a remainder count.
+const INSPECT_RELATION_LIMIT: usize = 20;
+
+/// One peer row of a `kin graph inspect` relation list.
+#[derive(Debug)]
+struct InspectRelationRow {
+    direction: &'static str,
+    kind: RelationKind,
+    peer_label: String,
+}
+
+/// Build the deduplicated peer rows for one inspected entity.
+///
+/// Two rows are the same observation when they share direction, kind, and peer
+/// node, so only one is rendered. The peer label carries the peer's kind because
+/// distinct entities can share a name and a file, and a label without the kind
+/// would render them as one row that the reader cannot tell apart.
+fn inspect_relation_rows(
+    graph: &kin_db::InMemoryGraph,
+    entity: &Entity,
+) -> Result<Vec<InspectRelationRow>> {
+    let mut rows = Vec::new();
+    let mut seen = HashSet::new();
+
+    for rel in graph.get_all_relations_for_entity(&entity.id)? {
+        let incoming = matches!(rel.dst, kin_model::GraphNodeId::Entity(id) if id == entity.id);
+        let peer = if incoming { rel.src } else { rel.dst };
+        if !seen.insert((incoming, rel.kind, peer)) {
+            continue;
+        }
+
+        let peer_label = match peer {
+            kin_model::GraphNodeId::Entity(peer_id) => graph
+                .get_entity(&peer_id)?
+                .map(|e| {
+                    format!(
+                        "{} [{:?}] ({})",
+                        e.name,
+                        e.kind,
+                        e.file_origin.as_ref().map(|f| f.0.as_str()).unwrap_or("?")
+                    )
+                })
+                .unwrap_or_else(|| format!("{}", peer_id)),
+            other => format!("{:?}", other),
+        };
+
+        rows.push(InspectRelationRow {
+            direction: if incoming { "<-" } else { "->" },
+            kind: rel.kind,
+            peer_label,
+        });
+    }
+
+    Ok(rows)
 }
 
 /// Actionable lines when a `kin graph inspect|source <name>` lookup misses in
@@ -965,6 +998,47 @@ mod tests {
     }
 
     #[test]
+    fn graph_status_labels_each_relation_total_with_its_scope() {
+        let (_temp, binding, graph) = graph_validation_fixture();
+        let caller = test_entity("run_task");
+        let callee = test_entity("finalize");
+        graph.upsert_entity(&caller).unwrap();
+        graph.upsert_entity(&callee).unwrap();
+        graph
+            .upsert_relation(&test_relation(RelationKind::Calls, caller.id, callee.id))
+            .unwrap();
+
+        let response = build_graph_status_response(&binding, &graph).unwrap();
+
+        // The entity-rooted total and the whole-table total count different
+        // scopes, so neither line may carry a bare "Relations" label.
+        assert!(response
+            .lines
+            .iter()
+            .any(|line| line.contains("Entity-to-entity relations: 1")));
+        assert!(response
+            .lines
+            .iter()
+            .any(|line| line.starts_with("Entity-to-entity rels/entity: ")));
+        assert!(response
+            .lines
+            .iter()
+            .any(|line| line.starts_with("Entity-to-entity relation kinds: ")));
+        assert!(response
+            .lines
+            .iter()
+            .any(|line| line.starts_with("All graph relations excluding CoChanges: ")));
+        assert!(
+            !response
+                .lines
+                .iter()
+                .any(|line| line.starts_with("Relations: ") || line.contains("  |  Relations: ")),
+            "{:?}",
+            response.lines
+        );
+    }
+
+    #[test]
     fn graph_validate_accepts_external_import_placeholder_destination() {
         let (_temp, binding, graph) = graph_validation_fixture();
         let (caller, relation) = external_placeholder_relation(RelationKind::Calls);
@@ -1039,6 +1113,113 @@ mod tests {
             .lines
             .iter()
             .any(|line| line == "✗ 1 relation endpoint references non-existent entities"));
+    }
+
+    #[test]
+    fn graph_inspect_collapses_repeated_peer_edges() {
+        let graph = kin_db::InMemoryGraph::new();
+        let mut container = test_entity("Stats");
+        container.kind = EntityKind::Class;
+        container.file_origin = Some(FilePathId::new("crates/printer/src/stats.rs"));
+        let mut member = test_entity("Stats::elapsed");
+        member.kind = EntityKind::Method;
+        member.file_origin = Some(FilePathId::new("crates/printer/src/stats.rs"));
+        graph.upsert_entity(&container).unwrap();
+        graph.upsert_entity(&member).unwrap();
+
+        // Two rows for one logical edge: distinct relation IDs, identical
+        // (direction, kind, peer).
+        for _ in 0..2 {
+            graph
+                .upsert_relation(&test_relation(
+                    RelationKind::Contains,
+                    container.id,
+                    member.id,
+                ))
+                .unwrap();
+        }
+
+        let response = build_graph_inspect_response(&graph, "Stats::elapsed").unwrap();
+        let peer_rows: Vec<_> = response
+            .lines
+            .iter()
+            .filter(|line| line.starts_with("    <- Contains "))
+            .collect();
+
+        assert_eq!(peer_rows.len(), 1, "{:?}", response.lines);
+        assert_eq!(
+            peer_rows[0],
+            &"    <- Contains Stats [Class] (crates/printer/src/stats.rs)".to_string()
+        );
+        assert!(response.lines.iter().any(|line| line == "  Relations (1):"));
+    }
+
+    #[test]
+    fn graph_inspect_keeps_distinct_peers_that_share_a_name_and_file() {
+        let graph = kin_db::InMemoryGraph::new();
+        let mut member = test_entity("Stats::elapsed");
+        member.kind = EntityKind::Method;
+        graph.upsert_entity(&member).unwrap();
+
+        let file = FilePathId::new("crates/printer/src/stats.rs");
+        let mut declaration = test_entity("Stats");
+        declaration.kind = EntityKind::Class;
+        declaration.file_origin = Some(file.clone());
+        let mut alias = test_entity("Stats");
+        alias.kind = EntityKind::TypeAlias;
+        alias.file_origin = Some(file);
+        graph.upsert_entity(&declaration).unwrap();
+        graph.upsert_entity(&alias).unwrap();
+
+        for peer in [&declaration, &alias] {
+            graph
+                .upsert_relation(&test_relation(RelationKind::Contains, peer.id, member.id))
+                .unwrap();
+        }
+
+        let response = build_graph_inspect_response(&graph, "Stats::elapsed").unwrap();
+        let peer_rows: Vec<_> = response
+            .lines
+            .iter()
+            .filter(|line| line.starts_with("    <- Contains "))
+            .collect();
+
+        assert_eq!(peer_rows.len(), 2, "{:?}", response.lines);
+        assert!(peer_rows
+            .iter()
+            .any(|line| line.contains("Stats [Class] (crates/printer/src/stats.rs)")));
+        assert!(peer_rows
+            .iter()
+            .any(|line| line.contains("Stats [TypeAlias] (crates/printer/src/stats.rs)")));
+    }
+
+    #[test]
+    fn graph_inspect_separates_incoming_and_outgoing_edges_of_one_kind() {
+        let graph = kin_db::InMemoryGraph::new();
+        let subject = test_entity("render");
+        let caller = test_entity("main");
+        let callee = test_entity("format_row");
+        for entity in [&subject, &caller, &callee] {
+            graph.upsert_entity(entity).unwrap();
+        }
+        graph
+            .upsert_relation(&test_relation(RelationKind::Calls, caller.id, subject.id))
+            .unwrap();
+        graph
+            .upsert_relation(&test_relation(RelationKind::Calls, subject.id, callee.id))
+            .unwrap();
+
+        let response = build_graph_inspect_response(&graph, "render").unwrap();
+
+        assert!(response.lines.iter().any(|line| line == "  Relations (2):"));
+        assert!(response
+            .lines
+            .iter()
+            .any(|line| line.starts_with("    <- Calls main ")));
+        assert!(response
+            .lines
+            .iter()
+            .any(|line| line.starts_with("    -> Calls format_row ")));
     }
 
     #[test]

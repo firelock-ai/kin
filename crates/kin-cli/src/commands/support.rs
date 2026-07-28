@@ -363,6 +363,7 @@ mod tests {
             semantic_relation_density_excluding_cochanges: 1.33,
             critical_issues: Vec::new(),
             warnings: vec!["1 files are still shallow-tracked".to_string()],
+            notes: Vec::new(),
         };
 
         let rendered = render_support_report(&stats, &health);
@@ -457,6 +458,7 @@ mod tests {
                 semantic_relation_density_excluding_cochanges: 0.5,
                 critical_issues: Vec::new(),
                 warnings: Vec::new(),
+                notes: Vec::new(),
             },
         );
         assert_eq!(payload.total_entities, 2);

@@ -9,7 +9,7 @@ use tracing::debug;
 use kin_blobs::BlobStore;
 use kin_model::{
     Entity, EntityRole, FileLayout, FilePathId, GraphStore, Hash256, LanguageId, OpaqueArtifact,
-    ParseCompleteness, ParseState, Relation, RelationId, RelationOrigin, StructuredArtifact,
+    ParseCompleteness, ParseState, Relation, RelationOrigin, StructuredArtifact,
 };
 use kin_parser::{attach_file_context_metadata, parse_shallow_file, AdapterRegistry, ShallowFile};
 use kin_projection::build_layout;
@@ -764,11 +764,11 @@ fn resolve_relations(
                     &mut resolved,
                     &mut relation_indices,
                     Relation {
-                        id: RelationId::from_content(
-                            &s.id.0.to_string(),
-                            &d.id.0.to_string(),
-                            &format!("{:?}", rel.kind),
-                        ),
+                        // Same-file edges are re-resolved by the cross-file
+                        // linker over the whole entity universe, so both
+                        // producers must derive the same key or the graph
+                        // stores the edge twice.
+                        id: crate::linker::stable_relation_id(&s.id, &d.id, &rel.kind),
                         kind: rel.kind,
                         src: kin_model::GraphNodeId::Entity(s.id),
                         dst: kin_model::GraphNodeId::Entity(d.id),
@@ -1206,6 +1206,77 @@ pub fn add(a: i32, b: i32) -> i32 { a + b }\n";
 
     fn relation_id_set(indexed: &IndexedFile) -> std::collections::HashSet<kin_model::RelationId> {
         indexed.relations.iter().map(|r| r.id).collect()
+    }
+
+    #[test]
+    fn same_file_relations_share_the_linker_relation_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let blob_store = BlobStore::new(root.join("blobs")).unwrap();
+
+        let abs = write_repo_file(root, "src/geo/point.rs", REL_RUST_SRC);
+        let indexed = IndexPipeline::new()
+            .index_file_relative(&abs, &blob_store, root)
+            .unwrap();
+
+        assert!(
+            !indexed.relations.is_empty(),
+            "fixture must resolve at least one same-file relation"
+        );
+        for relation in &indexed.relations {
+            let (src, dst) = (
+                relation.src.as_entity().unwrap(),
+                relation.dst.as_entity().unwrap(),
+            );
+            assert_eq!(
+                relation.id,
+                crate::linker::stable_relation_id(&src, &dst, &relation.kind),
+                "{:?} edge must carry the single graph-wide relation identity",
+                relation.kind
+            );
+        }
+    }
+
+    #[test]
+    fn pipeline_and_linker_do_not_store_one_edge_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let blob_store = BlobStore::new(root.join("blobs")).unwrap();
+
+        let abs = write_repo_file(root, "src/geo/point.rs", REL_RUST_SRC);
+        let indexed = IndexPipeline::new()
+            .index_file_relative(&abs, &blob_store, root)
+            .unwrap();
+
+        let files = vec![crate::linker::FileParseData {
+            file_path: indexed.file_id.0.clone(),
+            entities: indexed.entities.clone(),
+            relations: indexed.extracted_relations.clone(),
+            imports: indexed.imports.clone(),
+        }];
+        let artifact_ids = files
+            .iter()
+            .map(|file| (file.file_path.clone(), kin_model::ArtifactId::new()))
+            .collect();
+        let linked = crate::linker::link_cross_file(&files, &artifact_ids).unwrap();
+
+        // The graph keys relations by ID, so one logical edge reaching it under
+        // two IDs is stored twice and later rendered twice.
+        let mut by_identity: HashMap<_, std::collections::HashSet<kin_model::RelationId>> =
+            HashMap::new();
+        for relation in indexed.relations.iter().chain(linked.iter()) {
+            by_identity
+                .entry((relation.src, relation.dst, relation.kind))
+                .or_default()
+                .insert(relation.id);
+        }
+
+        let duplicated: Vec<_> = by_identity
+            .iter()
+            .filter(|(_, ids)| ids.len() > 1)
+            .map(|(identity, _)| identity)
+            .collect();
+        assert!(duplicated.is_empty(), "{duplicated:?}");
     }
 
     #[test]
