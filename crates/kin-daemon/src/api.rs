@@ -28,6 +28,7 @@ use kin_model::{
 };
 // One declared bound governs both directions: what these routes accept is what
 // the transfer client reads.
+use kin_cli::commands::transfer::DerivedViewRefresh;
 use kin_remote::repository_transfer_http::REPOSITORY_TRANSFER_HTTP_BODY_LIMIT;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -445,6 +446,11 @@ pub struct RepoHealthResponse {
     pub embed_persistence_unavailable: bool,
     #[serde(default)]
     pub filesystem_reconcile_disabled: bool,
+    /// Why views derived from repository authority are behind it, when they
+    /// are. Set by a transfer whose authority became durable and whose derived
+    /// refresh then failed; absent means they match.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub derived_views_stale: Option<String>,
 }
 
 /// Repo entities search response.
@@ -6715,13 +6721,66 @@ async fn repo_transfer_export(
             ),
         ));
     }
-    let pack = kin_remote::repository_transfer::build_repository_transfer_pack(
+    // Export the largest pack that fits the caller's negotiated envelope rather
+    // than the whole closure. A gap past the envelope is carried by a sequence
+    // of these, each of which the caller admits and receipts on its own.
+    let segment = kin_remote::repository_transfer::build_repository_transfer_segment(
         &authority,
         &request.source_ref,
         &request.expectation,
     )
     .map_err(repository_transfer_error)?;
-    Ok(Json(pack))
+    Ok(Json(segment.pack))
+}
+
+/// Refresh the local views this daemon derives from repository authority, once
+/// an admitted transfer is already durable.
+///
+/// Returns the failure rather than raising it. Authority moved and the receipt
+/// proving it exists; a caller told this failed would believe a transfer that
+/// really happened did not, and would retry against a head that has already
+/// advanced. What is actually true is narrower and is what the caller gets
+/// back: retrieval is serving state that is behind the admitted head.
+fn refresh_local_derived_views(
+    state: &DaemonState,
+    receipt: &kin_remote::repository_transfer::RepositoryTransferReceipt,
+    changes: &[kin_model::SemanticChange],
+    head: kin_model::SemanticChangeId,
+) -> std::result::Result<(), String> {
+    // An idempotent replay already updated these derived local views on the
+    // original request. Reapplying them would make the receipt path spuriously
+    // fail after authority had correctly returned its replay.
+    if receipt.outcome != kin_remote::repository_transfer::RepositoryTransferApplyOutcome::Committed
+    {
+        return Ok(());
+    }
+    state
+        .record_repository_authority_commit(receipt.authority_receipt.generation)
+        .map_err(|error| format!("record repository authority generation: {error}"))?;
+    for change in changes {
+        state.graph.create_change(change).map_err(|error| {
+            format!("admit change {} into the daemon graph: {error}", change.id)
+        })?;
+    }
+    state.bump_version();
+    state.emit_event(DaemonEvent::GraphRootChanged {
+        old_root_hash: None,
+        new_root_hash: head.to_string(),
+    });
+    Ok(())
+}
+
+/// Record that derived views are behind authority, so the gap is a daemon
+/// health signal rather than something an operator has to infer from answers
+/// that quietly went stale.
+async fn record_derived_view_staleness(state: &DaemonState, refresh: &DerivedViewRefresh) {
+    if let DerivedViewRefresh::Stale { detail } = refresh {
+        tracing::error!(
+            detail = %detail,
+            "repository authority moved but daemon-derived views did not follow; retrieval is behind the admitted head"
+        );
+        *state.derived_views_stale.write().await = Some(detail.clone());
+    }
 }
 
 /// POST /repos/{repo_id}/transfer/receive — validate and publish one exact
@@ -6745,27 +6804,23 @@ async fn repo_transfer_receive(
 
     // Repository authority is already durable. Refresh only derived daemon
     // views after that receipt exists; a failure here cannot revoke or fake
-    // the committed transfer.
-    if state.storage_backend.is_some() {
+    // the committed transfer, and must not be answered to the sending peer as
+    // a failed publication.
+    let refresh = if state.storage_backend.is_some() {
         state.repo_graphs.write().await.remove(&repo_id);
-    } else if receipt.outcome
-        == kin_remote::repository_transfer::RepositoryTransferApplyOutcome::Committed
-    {
-        // An idempotent replay already updated these derived local views on
-        // the original request. Reapplying them would make the receipt path
-        // spuriously fail after authority had correctly returned its replay.
-        state
-            .record_repository_authority_commit(receipt.authority_receipt.generation)
-            .map_err(repository_commit_error)?;
-        for change in &request.pack.changes {
-            state.graph.create_change(change).map_err(internal_error)?;
+        DerivedViewRefresh::Current
+    } else {
+        match refresh_local_derived_views(
+            &state,
+            &receipt,
+            &request.pack.changes,
+            request.pack.source_head,
+        ) {
+            Ok(()) => DerivedViewRefresh::Current,
+            Err(detail) => DerivedViewRefresh::Stale { detail },
         }
-        state.bump_version();
-        state.emit_event(DaemonEvent::GraphRootChanged {
-            old_root_hash: None,
-            new_root_hash: request.pack.source_head.to_string(),
-        });
-    }
+    };
+    record_derived_view_staleness(&state, &refresh).await;
     Ok(Json(receipt))
 }
 
@@ -6891,6 +6946,9 @@ async fn command_push(
     .map_err(repository_transfer_error)?;
     Ok(Json(kin_cli::commands::transfer::CommandTransferResponse {
         outcome,
+        // A push moves the remote's authority, not this replica's, so nothing
+        // derived from local authority is behind after it.
+        derived_views: DerivedViewRefresh::Current,
     }))
 }
 
@@ -6904,11 +6962,6 @@ async fn command_pull(
     State(state): State<Arc<DaemonState>>,
     Json(request): Json<kin_cli::commands::transfer::CommandTransferRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    use kin_remote::repository_transfer_negotiation::{
-        verify_receipt_binds_pack, PullNegotiation, RepositoryTransferDirection,
-        RepositoryTransferOutcome, RepositoryTransferPlan,
-    };
-
     let context = transfer_command_context(&state, &request)?;
     let repo_id = context.repo_id.clone();
     let repository_id = context.repository_id.clone();
@@ -6920,99 +6973,73 @@ async fn command_pull(
         transport,
         ..
     } = context;
-    let (authority, resolved) = {
+    let local_derived_views = state.storage_backend.is_none();
+    let blocking_state = Arc::clone(&state);
+    let outcome = {
         let repository_id = repository_id.clone();
         tokio::task::spawn_blocking(move || {
             // A replica that has admitted nothing cannot name a ref from its own
             // state. The advertisement is what an unborn replica adopts, so
             // resolving it here is the same step a clone takes.
-            let resolved = (|| {
-                let source_ref = match requested_source_ref {
-                    Some(name) => name,
-                    None => kin_remote::repository_transfer_negotiation::remote_default_ref(
-                        &transport,
-                        &repository_id,
-                    )?,
-                };
-                let destination_ref =
-                    requested_destination_ref.unwrap_or_else(|| source_ref.clone());
-                let negotiation = kin_remote::repository_transfer_negotiation::fetch_pull_pack(
-                    &authority,
+            let source_ref = match requested_source_ref {
+                Some(name) => name,
+                None => kin_remote::repository_transfer_negotiation::remote_default_ref(
                     &transport,
                     &repository_id,
-                    &source_ref,
-                    &destination_ref,
-                )?;
-                Ok((source_ref, destination_ref, negotiation))
-            })();
-            (authority, resolved)
+                )?,
+            };
+            let destination_ref = requested_destination_ref.unwrap_or_else(|| source_ref.clone());
+            // Admission runs here rather than inside the negotiation helper so
+            // that publication and the refresh of every daemon-derived view stay
+            // on the same path the inbound receive route already uses. A gap
+            // past one envelope arrives as several packs, and each takes that
+            // path in turn.
+            let mut refresh = DerivedViewRefresh::Current;
+            let outcome = kin_remote::repository_transfer_negotiation::pull_from_remote_with(
+                &authority,
+                &transport,
+                &repository_id,
+                &source_ref,
+                &destination_ref,
+                |pack| {
+                    let receipt = kin_remote::repository_transfer::apply_repository_transfer_pack(
+                        &authority,
+                        &repository_id,
+                        &destination_ref,
+                        kin_model::AuthorId::new("kin-daemon:repository-transfer-puller"),
+                        pack,
+                    )?;
+                    if local_derived_views && !refresh.is_stale() {
+                        if let Err(detail) = refresh_local_derived_views(
+                            &blocking_state,
+                            &receipt,
+                            &pack.changes,
+                            pack.source_head,
+                        ) {
+                            refresh = DerivedViewRefresh::Stale { detail };
+                        }
+                    }
+                    Ok(receipt)
+                },
+            )?;
+            Ok::<_, kin_remote::repository_transfer::RepositoryTransferError>((outcome, refresh))
         })
         .await
         .map_err(internal_error)?
     };
-    let (source_ref, destination_ref, negotiation) = resolved.map_err(repository_transfer_error)?;
+    let (outcome, mut derived_views) = outcome.map_err(repository_transfer_error)?;
 
-    let pack = match negotiation {
-        PullNegotiation::UpToDate { head } => {
-            return Ok(Json(kin_cli::commands::transfer::CommandTransferResponse {
-                outcome: RepositoryTransferOutcome {
-                    direction: RepositoryTransferDirection::Pull,
-                    repository_id,
-                    source_ref,
-                    destination_ref,
-                    plan: RepositoryTransferPlan::UpToDate { head },
-                    receipt: None,
-                },
-            }));
-        }
-        PullNegotiation::Pack(pack) => *pack,
-    };
-
-    let plan = RepositoryTransferPlan::FastForward {
-        source_head: pack.source_head,
-        destination_head: pack.expected_destination_head,
-        change_count: Some(pack.changes.len()),
-    };
-    let receipt = kin_remote::repository_transfer::apply_repository_transfer_pack(
-        &authority,
-        &repository_id,
-        &destination_ref,
-        kin_model::AuthorId::new("kin-daemon:repository-transfer-puller"),
-        &pack,
-    )
-    .map_err(repository_transfer_error)?;
-    verify_receipt_binds_pack(&pack, &receipt).map_err(repository_transfer_error)?;
-
-    // Repository authority is already durable. Refresh only derived daemon
-    // views after that receipt exists; a failure here cannot revoke or fake
-    // the committed transfer.
-    if state.storage_backend.is_some() {
+    if !local_derived_views && outcome.moved_history() {
         state.repo_graphs.write().await.remove(&repo_id);
-    } else if receipt.outcome
-        == kin_remote::repository_transfer::RepositoryTransferApplyOutcome::Committed
-    {
-        state
-            .record_repository_authority_commit(receipt.authority_receipt.generation)
-            .map_err(repository_commit_error)?;
-        for change in &pack.changes {
-            state.graph.create_change(change).map_err(internal_error)?;
-        }
-        state.bump_version();
-        state.emit_event(DaemonEvent::GraphRootChanged {
-            old_root_hash: None,
-            new_root_hash: pack.source_head.to_string(),
-        });
     }
+    if !outcome.moved_history() {
+        derived_views = DerivedViewRefresh::Current;
+    }
+    record_derived_view_staleness(&state, &derived_views).await;
 
     Ok(Json(kin_cli::commands::transfer::CommandTransferResponse {
-        outcome: RepositoryTransferOutcome {
-            direction: RepositoryTransferDirection::Pull,
-            repository_id,
-            source_ref,
-            destination_ref,
-            plan,
-            receipt: Some(receipt),
-        },
+        outcome,
+        derived_views,
     }))
 }
 
@@ -7095,6 +7122,7 @@ async fn repo_health(
             .load(std::sync::atomic::Ordering::Relaxed),
         embed_persistence_unavailable: !state.can_persist_embed_progress_locally(),
         filesystem_reconcile_disabled: state.filesystem_reconcile_disabled(),
+        derived_views_stale: state.derived_views_stale.read().await.clone(),
     }))
 }
 
@@ -10393,7 +10421,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repository_transfer_status_preserves_non_utf8_ref_bytes_and_gates_push() {
+    async fn repository_transfer_status_preserves_non_utf8_ref_bytes_and_advertises_apply() {
         let state = test_state();
         let repository_id = state.cached_repo_id.clone();
         let destination_ref =
@@ -10418,9 +10446,9 @@ mod tests {
         let status: kin_remote::repository_transfer::RepositoryTransferStatus =
             serde_json::from_slice(&body).unwrap();
         assert_eq!(status.destination_ref, destination_ref);
-        assert!(!status.push_apply_ready);
+        assert!(status.push_apply_ready);
         assert!(status.bounded_envelope_export_ready);
-        assert!(!status.pull_apply_ready);
+        assert!(status.pull_apply_ready);
     }
 
     #[test]
@@ -10608,9 +10636,10 @@ mod tests {
             }
         );
         assert_eq!(planned.plan.max_changes_per_envelope, 512);
-        assert!(
-            !planned.plan.fits_one_envelope,
-            "an unborn destination has no counted closure, so the plan must not assert it fits"
+        assert_eq!(
+            planned.plan.pack_count,
+            Some(1),
+            "this closure fits one envelope, so it is one pack"
         );
 
         // The push crosses a real socket and returns a receipt bound to it.
@@ -10629,9 +10658,14 @@ mod tests {
         );
         let receipt = pushed
             .outcome
-            .receipt
+            .final_receipt()
             .expect("a moved head returns a receipt");
         assert_eq!(receipt.destination_head, source_head);
+        assert_eq!(pushed.outcome.receipts.len(), 1);
+        assert_eq!(
+            pushed.derived_views,
+            kin_cli::commands::transfer::DerivedViewRefresh::Current
+        );
         assert_eq!(
             receipt.outcome,
             kin_remote::repository_transfer::RepositoryTransferApplyOutcome::Committed
@@ -10648,7 +10682,7 @@ mod tests {
                 head: Some(source_head),
             }
         );
-        assert!(repeated.outcome.receipt.is_none());
+        assert!(repeated.outcome.receipts.is_empty());
 
         // A third replica pulls the same history back out of the one that was
         // just published to, so the export seam is exercised on real bytes that
@@ -10669,10 +10703,295 @@ mod tests {
         assert_eq!(
             pulled
                 .outcome
-                .receipt
+                .final_receipt()
                 .expect("a moved head returns a receipt")
                 .destination_head,
             source_head
+        );
+        assert_eq!(
+            pulled.derived_views,
+            kin_cli::commands::transfer::DerivedViewRefresh::Current
+        );
+    }
+
+    /// The real HTTP transport, standing in for a peer that accepts a smaller
+    /// envelope than the protocol maximum.
+    ///
+    /// The envelope is negotiated, not fixed: a destination publishes what it
+    /// will take in one pack and a sender honours it. Nothing here fakes the
+    /// wire, the routes, or the packs. Clamping the advertised bound is what
+    /// makes continuation reachable on a history a test can seed, because
+    /// seeding past the 512-change default costs minutes of exact repository
+    /// transactions.
+    struct NarrowEnvelopePeer {
+        inner: kin_remote::repository_transfer_http::HttpRepositoryTransferTransport,
+        max_changes: u32,
+    }
+
+    impl kin_remote::repository_transfer_negotiation::RepositoryTransferTransport
+        for NarrowEnvelopePeer
+    {
+        fn advertise_refs(
+            &self,
+            repository_id: &RepositoryId,
+        ) -> kin_remote::repository_transfer::Result<
+            kin_remote::repository_transfer::RepositoryRefAdvertisement,
+        > {
+            self.inner.advertise_refs(repository_id)
+        }
+
+        fn transfer_status(
+            &self,
+            repository_id: &RepositoryId,
+            destination_ref: &kin_model::RefName,
+        ) -> kin_remote::repository_transfer::Result<
+            kin_remote::repository_transfer::RepositoryTransferStatus,
+        > {
+            let mut status = self.inner.transfer_status(repository_id, destination_ref)?;
+            status.limits.max_changes = self.max_changes;
+            Ok(status)
+        }
+
+        fn export_pack(
+            &self,
+            repository_id: &RepositoryId,
+            source_ref: &kin_model::RefName,
+            expectation: &kin_remote::repository_transfer::RepositoryTransferExpectation,
+        ) -> kin_remote::repository_transfer::Result<
+            kin_remote::repository_transfer::RepositoryTransferPack,
+        > {
+            self.inner
+                .export_pack(repository_id, source_ref, expectation)
+        }
+
+        fn receive_pack(
+            &self,
+            repository_id: &RepositoryId,
+            destination_ref: &kin_model::RefName,
+            pack: &kin_remote::repository_transfer::RepositoryTransferPack,
+        ) -> kin_remote::repository_transfer::Result<
+            kin_remote::repository_transfer::RepositoryTransferReceipt,
+        > {
+            self.inner
+                .receive_pack(repository_id, destination_ref, pack)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_push_past_the_negotiated_envelope_crosses_real_http_as_continuation_packs() {
+        use kin_remote::repository_transfer_negotiation::RepositoryTransferPlan;
+
+        let repo_id = format!("transfer-e2e-continuation-{}", Uuid::new_v4());
+        let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
+        let main = kin_model::RefName::branch(b"main").unwrap();
+
+        let (_source_state, _source_working, source_storage) = replica_state(&repo_id);
+        let (destination_state, _destination_working, _destination_storage) =
+            replica_state(&repo_id);
+
+        let mut heads = Vec::new();
+        let mut previous = None;
+        for step in 0..5u128 {
+            previous = Some(seed_replica_change(
+                &source_storage,
+                &repository_id,
+                previous,
+                step + 1,
+                "extend the exact line",
+            ));
+            heads.push(previous.unwrap());
+        }
+        let source_head = previous.unwrap();
+
+        let destination_url = serve_replica(Arc::clone(&destination_state)).await;
+        let peer = NarrowEnvelopePeer {
+            inner: kin_remote::repository_transfer_http::HttpRepositoryTransferTransport::new(
+                kin_remote::repository_transfer_http::RepositoryTransferEndpoint::new(
+                    destination_url.clone(),
+                ),
+            ),
+            max_changes: 2,
+        };
+        let source_authority = RepositoryAuthorityManager::open(
+            repository_id.clone(),
+            Arc::new(kin_db::LocalFileBackend::new(
+                source_storage.path().to_path_buf(),
+            )) as Arc<dyn StorageBackend>,
+        )
+        .unwrap();
+
+        let pushed_repository_id = repository_id.clone();
+        let outcome = tokio::task::spawn_blocking(move || {
+            kin_remote::repository_transfer_negotiation::push_to_remote(
+                &source_authority,
+                &peer,
+                &pushed_repository_id,
+                &main,
+                &main,
+            )
+        })
+        .await
+        .unwrap()
+        .expect("a gap past the negotiated envelope publishes as continuation packs");
+
+        assert_eq!(
+            outcome.plan,
+            RepositoryTransferPlan::FastForward {
+                source_head,
+                destination_head: None,
+                change_count: Some(5),
+            },
+            "the reported move is the whole publication, not its last pack"
+        );
+        assert_eq!(
+            outcome.receipts.len(),
+            3,
+            "five changes across a two-change envelope cross the wire as three packs"
+        );
+        // Every pack was published on its own, and each landed an exact change
+        // of the line rather than some synthesized intermediate state.
+        for receipt in &outcome.receipts {
+            assert_eq!(
+                receipt.outcome,
+                kin_remote::repository_transfer::RepositoryTransferApplyOutcome::Committed
+            );
+            assert!(
+                heads.contains(&receipt.destination_head),
+                "every receipted head is an exact change on the source line"
+            );
+        }
+        assert_eq!(
+            outcome.final_receipt().unwrap().destination_head,
+            source_head
+        );
+
+        // The remote resolves the ref to the head the transfer was moving
+        // toward, read back through its own advertisement route.
+        let advertised = router(Arc::clone(&destination_state))
+            .oneshot(
+                Request::get(format!("/repos/{repo_id}/transfer/advertise"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(advertised.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(advertised.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let advertised: kin_remote::repository_transfer::RepositoryRefAdvertisement =
+            serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            advertised.refs.first().map(|entry| entry.head),
+            Some(source_head)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pull_whose_derived_refresh_fails_reports_partial_success_not_a_server_error() {
+        // Repository authority moves first and is durable before anything
+        // derived from it is touched. A refresh that fails after that point
+        // used to surface as HTTP 500, which tells the caller a transfer that
+        // really happened did not. What is true is narrower and typed: the
+        // history is admitted, and retrieval is behind it.
+        let destination_state = test_state();
+        let repo_id = destination_state.cached_repo_id.clone();
+        let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
+
+        let (source_state, _source_working, source_storage) = replica_state(&repo_id);
+        let root = seed_replica_change(&source_storage, &repository_id, None, 1, "root the line");
+        let source_head = seed_replica_change(
+            &source_storage,
+            &repository_id,
+            Some(root),
+            2,
+            "advance the line",
+        );
+        let source_url = serve_replica(Arc::clone(&source_state)).await;
+
+        // Put the daemon's derived generation cursor ahead of anything the
+        // transfer can produce, so installing the admitted generation is
+        // refused after authority has already committed.
+        destination_state
+            .snapshot_generation
+            .store(u64::MAX, std::sync::atomic::Ordering::SeqCst);
+
+        let request = kin_cli::commands::transfer::CommandTransferRequest {
+            remote_base_url: source_url,
+            remote_token: None,
+            repository_id: Some(repo_id.clone()),
+            source_ref: None,
+            destination_ref: None,
+        };
+        let (status, body) =
+            transfer_command(Arc::clone(&destination_state), "pull", &request).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a durable admission with a stale derived view is not a server error: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let pulled: kin_cli::commands::transfer::CommandTransferResponse =
+            serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            pulled
+                .outcome
+                .final_receipt()
+                .expect("authority moved, so a receipt exists")
+                .destination_head,
+            source_head
+        );
+        let kin_cli::commands::transfer::DerivedViewRefresh::Stale { detail } =
+            &pulled.derived_views
+        else {
+            panic!(
+                "a failed derived refresh must be named, not flattened into success: {:?}",
+                pulled.derived_views
+            );
+        };
+        assert!(
+            detail.contains("generation"),
+            "the partial success must say what did not follow: {detail}"
+        );
+
+        // Authority really moved: the destination advertises the admitted head.
+        let advertised = router(Arc::clone(&destination_state))
+            .oneshot(
+                Request::get(format!("/repos/{repo_id}/transfer/advertise"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(advertised.status(), StatusCode::OK);
+        let advertised_body = axum::body::to_bytes(advertised.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let advertised: kin_remote::repository_transfer::RepositoryRefAdvertisement =
+            serde_json::from_slice(&advertised_body).unwrap();
+        assert_eq!(
+            advertised.refs.first().map(|entry| entry.head),
+            Some(source_head),
+            "the admitted head is durable regardless of what the derived refresh did"
+        );
+
+        // And the gap is a health signal rather than something an operator has
+        // to infer from answers that quietly went stale.
+        let health = router(Arc::clone(&destination_state))
+            .oneshot(
+                Request::get(format!("/repos/{repo_id}/health"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let health_body = axum::body::to_bytes(health.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let health: RepoHealthResponse = serde_json::from_slice(&health_body).unwrap();
+        assert!(
+            health.derived_views_stale.is_some(),
+            "a daemon serving behind authority must say so on its health surface"
         );
     }
 

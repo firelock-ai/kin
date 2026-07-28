@@ -344,6 +344,29 @@ mod tests {
     }
 
     #[test]
+    fn a_body_of_exactly_the_declared_bound_is_read_and_one_byte_more_is_refused() {
+        // Both replicas declare the same number, so the boundary itself has to
+        // land on the same side of the refusal on both. A client that stopped
+        // one byte early would refuse envelopes the daemon route accepts, and
+        // would blame the peer for a bound this side chose.
+        let filler = REPOSITORY_TRANSFER_HTTP_BODY_LIMIT - r#"{"value":""}"#.len();
+        let payload = format!(r#"{{"value":"{}"}}"#, "a".repeat(filler));
+        assert_eq!(payload.len(), REPOSITORY_TRANSFER_HTTP_BODY_LIMIT);
+        let value: serde_json::Value =
+            read_json(json_response(payload), "transfer export").expect("a body at the bound");
+        assert_eq!(value["value"].as_str().unwrap().len(), filler);
+
+        let payload = format!(r#"{{"value":"{}"}}"#, "a".repeat(filler + 1));
+        assert_eq!(payload.len(), REPOSITORY_TRANSFER_HTTP_BODY_LIMIT + 1);
+        let error = read_json::<serde_json::Value>(json_response(payload), "transfer export")
+            .expect_err("a body one byte past the bound is refused");
+        let RepositoryTransferError::Invalid(message) = error else {
+            panic!("a local read bound is not a remote storage failure");
+        };
+        assert!(message.contains("transfer body limit"));
+    }
+
+    #[test]
     fn a_body_past_the_declared_bound_is_an_oversized_envelope_not_a_remote_failure() {
         // The peer sent this body correctly; the local client refused to read
         // it. Calling that Storage would tell an operator the remote broke.

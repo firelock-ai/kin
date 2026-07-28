@@ -40,7 +40,7 @@ fn capability_json_keeps_the_bounded_dogfood_bar_explicit() {
     assert_eq!(report["bounded_dogfood_required_ready"], 12);
     assert_eq!(report["bounded_dogfood_required_total"], 12);
     assert_eq!(report["full_git_replacement_ready"], false);
-    assert_eq!(report["ready_commands"], 26);
+    assert_eq!(report["ready_commands"], 27);
     assert_eq!(report["command_total"], 33);
 
     let commands = report["commands"]
@@ -119,6 +119,55 @@ fn remaining_open_gate_commands_fail_before_repository_discovery() {
         "checkout must no longer answer from the capability gate: {stderr}"
     );
     assert!(stderr.contains("not a Kin repository"), "{stderr}");
+}
+
+/// Push is wired to the transfer surface, not to the gate.
+///
+/// The flip that exposed it is a fixture edit, so nothing in the fixture can
+/// prove the dispatch arm reaches anything. Driving the real binary is what
+/// proves it: the gate message must be absent and the transfer surface's own
+/// discovery failure must be present. Pull is still gated and is asserted in
+/// the same pass, so a gate that stopped refusing anything at all cannot pass
+/// this as a connected command.
+#[test]
+fn push_reaches_the_transfer_surface_instead_of_the_capability_gate() {
+    let root = tempdir().expect("temp root");
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&home).expect("create home");
+
+    let output = kin_command(&home)
+        .args(["push"])
+        .current_dir(root.path())
+        .output()
+        .expect("run exposed push outside a repository");
+    assert!(
+        !output.status.success(),
+        "push must fail outside a repository"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("is fail-closed on repository-v6"),
+        "push must no longer answer from the capability gate: {stderr}"
+    );
+    assert!(
+        stderr.contains("not a Kin repository"),
+        "push must reach the transfer surface and fail on discovery: {stderr}"
+    );
+
+    let output = kin_command(&home)
+        .args(["pull"])
+        .current_dir(root.path())
+        .output()
+        .expect("run gated pull outside a repository");
+    assert!(
+        !output.status.success(),
+        "pull must fail outside a repository"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("is fail-closed on repository-v6"),
+        "pull is still gated and must answer from the capability gate: {stderr}"
+    );
 }
 
 /// The session cluster is wired to the session surface, not to the gate.

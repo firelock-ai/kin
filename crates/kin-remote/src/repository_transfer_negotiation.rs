@@ -28,7 +28,8 @@ use kin_model::{AuthorId, RefName, RepositoryId, SemanticChange, SemanticChangeI
 use serde::{Deserialize, Serialize};
 
 use crate::repository_transfer::{
-    apply_repository_transfer_pack, build_repository_transfer_pack, repository_transfer_status,
+    apply_repository_transfer_pack, build_repository_transfer_segment,
+    count_repository_transfer_packs, repository_transfer_status, verify_transfer_source_readiness,
     RepositoryRefAdvertisement, RepositoryTransferError, RepositoryTransferExpectation,
     RepositoryTransferPack, RepositoryTransferReceipt, RepositoryTransferStatus, Result,
     REPOSITORY_TRANSFER_PROTOCOL, REPOSITORY_TRANSFER_SCHEMA_VERSION,
@@ -90,7 +91,16 @@ pub enum RepositoryTransferPlan {
     },
 }
 
-/// One completed negotiation, including the receipt when history moved.
+/// One completed negotiation, including a receipt per published pack.
+///
+/// Atomicity contract for a transfer that needed more than one pack: each pack
+/// is published in one repository transaction and proven by its own receipt,
+/// and the packs are ordered. There is no transaction spanning them, and this
+/// protocol does not claim one. A transfer interrupted between packs leaves
+/// the destination ref on the last head that was receipted, which is always an
+/// exact ancestor of the head the transfer was moving toward, so re-running it
+/// resumes from there rather than restarting or rewinding. `receipts` is the
+/// complete evidence of what actually moved.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RepositoryTransferOutcome {
     pub direction: RepositoryTransferDirection,
@@ -98,14 +108,21 @@ pub struct RepositoryTransferOutcome {
     pub source_ref: RefName,
     pub destination_ref: RefName,
     pub plan: RepositoryTransferPlan,
-    /// Absent exactly when the plan was [`RepositoryTransferPlan::UpToDate`].
-    pub receipt: Option<RepositoryTransferReceipt>,
+    /// One receipt per published pack, in publication order. Empty exactly
+    /// when the plan was [`RepositoryTransferPlan::UpToDate`].
+    pub receipts: Vec<RepositoryTransferReceipt>,
 }
 
 impl RepositoryTransferOutcome {
-    /// True when this negotiation published a repository transaction.
+    /// True when this negotiation published at least one repository
+    /// transaction.
     pub fn moved_history(&self) -> bool {
-        self.receipt.is_some()
+        !self.receipts.is_empty()
+    }
+
+    /// The receipt for the pack that landed the transfer's final head.
+    pub fn final_receipt(&self) -> Option<&RepositoryTransferReceipt> {
+        self.receipts.last()
     }
 }
 
@@ -365,28 +382,35 @@ where
     Ok((source_head, plan))
 }
 
-/// A negotiated publication plan, and whether this protocol version can carry
-/// it in one envelope.
+/// A negotiated publication plan, and how many packs carrying it will take.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepositoryPushPlan {
     pub plan: RepositoryTransferPlan,
     /// The most changes one negotiated envelope carries.
     pub max_changes_per_envelope: u32,
-    /// False when the gap needs more changes than one envelope holds.
+    /// How many packs this publication needs, each published atomically.
     ///
-    /// Transfer v1 has no continuation packs, so a gap this large is refused at
-    /// pack-build time rather than split. Reporting it from the plan is what
-    /// makes that refusal predictable instead of a surprise mid-publication.
-    pub fits_one_envelope: bool,
+    /// `None` when the count is not knowable from the local lease alone, which
+    /// is the case for an unborn destination: counting its closure means
+    /// walking the whole line.
+    pub pack_count: Option<usize>,
 }
 
 /// Negotiate a publication without moving any history.
 ///
 /// This is the read-only half of [`push_to_remote`]: it reads the remote lease
-/// and classifies the gap, and refuses exactly what a push would refuse, but it
-/// never builds a pack or contacts the receive seam. A plan that reports a
-/// fast-forward is a statement about the two leases it just read, not a promise
-/// that they will still hold when a push runs.
+/// and classifies the gap, and refuses what a push would refuse, but it never
+/// publishes anything and never contacts the receive seam. A plan that reports
+/// a fast-forward is a statement about the two leases it just read, not a
+/// promise that they will still hold when a push runs.
+///
+/// Parity with a push is checked, not assumed. Everything a push decides
+/// before it ships bytes is decided here too: the destination lease, the
+/// fast-forward classification, the imported-Git authority baseline, and the
+/// presence and identity of every immutable source body the publication head's
+/// tree depends on. What is left to the push itself is the per-pack byte
+/// arithmetic, which is only knowable once the packs are assembled; the plan
+/// reports the pack count and the negotiated bound instead of predicting it.
 pub fn plan_push_to_remote<B, T>(
     local: &RepositoryAuthorityManager<B>,
     transport: &T,
@@ -400,25 +424,30 @@ where
 {
     let expectation = negotiated_destination_lease(transport, repository_id, destination_ref)?;
     let max_changes_per_envelope = expectation.limits.max_changes;
-    let (_, plan) = classify_push(
+    let (source_head, plan) = classify_push(
         local,
         source_ref,
         destination_ref,
         expectation.destination_head,
     )?;
-    // An unborn destination has no counted closure yet, because counting it
-    // means walking the whole line. Treat unknown as "not yet known to fit"
-    // rather than asserting it fits.
-    let fits_one_envelope = match &plan {
-        RepositoryTransferPlan::UpToDate { .. } => true,
-        RepositoryTransferPlan::FastForward { change_count, .. } => change_count
-            .map(|count| u32::try_from(count).is_ok_and(|count| count <= max_changes_per_envelope))
-            .unwrap_or(false),
+    let _ = source_head;
+    verify_transfer_source_readiness(local, source_ref, &expectation)?;
+    // Counted even when the destination is unborn and `change_count` is not.
+    // Walking the whole line is what the push is about to do anyway, and an
+    // operator deciding whether to start it needs the number most in exactly
+    // that case.
+    let pack_count = match &plan {
+        RepositoryTransferPlan::UpToDate { .. } => Some(0),
+        RepositoryTransferPlan::FastForward { .. } => Some(count_repository_transfer_packs(
+            local,
+            source_ref,
+            &expectation,
+        )?),
     };
     Ok(RepositoryPushPlan {
         plan,
         max_changes_per_envelope,
-        fits_one_envelope,
+        pack_count,
     })
 }
 
@@ -428,6 +457,13 @@ where
 /// refuses a non-fast-forward before building anything. There is no force
 /// path: a remote head this replica has not admitted is reported with both
 /// heads named so the operator integrates instead of overwriting.
+///
+/// A gap larger than one negotiated envelope is published as an ordered
+/// sequence of packs rather than refused. Each round re-reads the remote lease,
+/// so every pack is built against the head the remote actually holds at that
+/// moment, and each is published in its own repository transaction with its own
+/// receipt. See [`RepositoryTransferOutcome`] for what that does and does not
+/// promise across packs.
 pub fn push_to_remote<B, T>(
     local: &RepositoryAuthorityManager<B>,
     transport: &T,
@@ -439,48 +475,84 @@ where
     B: StorageBackend + ?Sized + 'static,
     T: RepositoryTransferTransport + ?Sized,
 {
-    let expectation = negotiated_destination_lease(transport, repository_id, destination_ref)?;
-    let destination_head = expectation.destination_head;
-    let (source_head, plan) = classify_push(
-        local,
-        source_ref,
-        destination_ref,
-        expectation.destination_head,
-    )?;
+    let mut receipts = Vec::new();
+    let mut originally_at = None;
+    let mut published_changes = 0usize;
+    let mut previous_head: Option<Option<SemanticChangeId>> = None;
 
-    if matches!(plan, RepositoryTransferPlan::UpToDate { .. }) {
-        return Ok(RepositoryTransferOutcome {
-            direction: RepositoryTransferDirection::Push,
-            repository_id: repository_id.clone(),
-            source_ref: source_ref.clone(),
-            destination_ref: destination_ref.clone(),
-            plan,
-            receipt: None,
-        });
-    }
+    let (source_head, plan) = loop {
+        let expectation = negotiated_destination_lease(transport, repository_id, destination_ref)?;
+        if receipts.is_empty() {
+            originally_at = expectation.destination_head;
+        }
+        // Every round must find the remote further along than the last one
+        // left it. Without this a peer that receipts a pack and then keeps
+        // reporting its old head would have this loop republish the same
+        // segment forever, which is a hang standing in for a refusal.
+        if let Some(previous) = previous_head {
+            if expectation.destination_head == previous {
+                return Err(conflict(format!(
+                    "remote reported the same head on {destination_ref} after publishing a \
+                     continuation pack, so the transfer toward {} made no progress",
+                    previous
+                        .map(|head| head.to_string())
+                        .unwrap_or_else(|| "an unborn ref".to_string())
+                )));
+            }
+        }
+        previous_head = Some(expectation.destination_head);
+        let (source_head, plan) = classify_push(
+            local,
+            source_ref,
+            destination_ref,
+            expectation.destination_head,
+        )?;
+        if matches!(plan, RepositoryTransferPlan::UpToDate { .. }) {
+            break (source_head, plan);
+        }
 
-    let pack = build_repository_transfer_pack(local, source_ref, &expectation)?;
-    if pack.source_head != source_head {
-        return Err(conflict(format!(
-            "local authority moved during negotiation: planned head {source_head}, packed head {}",
-            pack.source_head
-        )));
-    }
-    let plan = RepositoryTransferPlan::FastForward {
-        source_head,
-        destination_head,
-        change_count: Some(pack.changes.len()),
+        let segment = build_repository_transfer_segment(local, source_ref, &expectation)?;
+        if segment.pack.transfer_target_head != source_head {
+            return Err(conflict(format!(
+                "local authority moved during negotiation: planned head {source_head}, packed transfer toward {}",
+                segment.pack.transfer_target_head
+            )));
+        }
+        published_changes += segment.pack.changes.len();
+
+        let receipt = transport.receive_pack(repository_id, destination_ref, &segment.pack)?;
+        verify_receipt_binds_pack(&segment.pack, &receipt)?;
+        receipts.push(receipt);
+
+        if segment.is_final() {
+            break (
+                source_head,
+                RepositoryTransferPlan::FastForward {
+                    source_head,
+                    destination_head: originally_at,
+                    change_count: Some(published_changes),
+                },
+            );
+        }
     };
-    let receipt = transport.receive_pack(repository_id, destination_ref, &pack)?;
-    verify_receipt_binds_pack(&pack, &receipt)?;
 
+    let plan = match (receipts.is_empty(), plan) {
+        // A publication that took several packs reports the whole move, not
+        // the last one: the operator asked to publish a head, not a segment.
+        (false, RepositoryTransferPlan::UpToDate { .. }) => RepositoryTransferPlan::FastForward {
+            source_head,
+            destination_head: originally_at,
+            change_count: Some(published_changes),
+        },
+        (_, plan) => plan,
+    };
     Ok(RepositoryTransferOutcome {
         direction: RepositoryTransferDirection::Push,
         repository_id: repository_id.clone(),
         source_ref: source_ref.clone(),
         destination_ref: destination_ref.clone(),
         plan,
-        receipt: Some(receipt),
+        receipts,
     })
 }
 
@@ -552,16 +624,30 @@ where
     }
 
     let pack = transport.export_pack(repository_id, source_ref, &expectation)?;
-    if pack.source_head != source_head {
+    // A pack that publishes something other than the advertised head is either
+    // one segment of a continuation toward it, or a remote whose authority
+    // moved under the negotiation. The declared target is what separates them,
+    // and it has to be the head this replica negotiated for.
+    if pack.transfer_target_head != source_head {
         return Err(conflict(format!(
-            "remote authority moved during negotiation: advertised head {source_head}, exported head {}",
-            pack.source_head
+            "remote authority moved during negotiation: advertised head {source_head}, exported transfer toward {}",
+            pack.transfer_target_head
         )));
     }
     if &pack.destination_ref != destination_ref {
         return Err(invalid(format!(
             "remote exported a pack for destination ref {} but this replica asked for {destination_ref}",
             pack.destination_ref
+        )));
+    }
+    // A segment that publishes the head this replica already holds moves
+    // nothing, so admitting it would let a remote keep a continuation loop
+    // running without ever closing the gap.
+    if Some(pack.source_head) == destination_head {
+        return Err(conflict(format!(
+            "remote exported a pack publishing {}, which this replica already holds; \
+             the transfer toward {source_head} made no progress",
+            pack.source_head
         )));
     }
     Ok(PullNegotiation::Pack(Box::new(pack)))
@@ -585,29 +671,93 @@ where
     B: StorageBackend + ?Sized + 'static,
     T: RepositoryTransferTransport + ?Sized,
 {
-    let negotiation =
-        fetch_pull_pack(local, transport, repository_id, source_ref, destination_ref)?;
-    let pack = match negotiation {
-        PullNegotiation::UpToDate { head } => {
-            return Ok(RepositoryTransferOutcome {
-                direction: RepositoryTransferDirection::Pull,
-                repository_id: repository_id.clone(),
-                source_ref: source_ref.clone(),
-                destination_ref: destination_ref.clone(),
-                plan: RepositoryTransferPlan::UpToDate { head },
-                receipt: None,
-            });
+    pull_from_remote_with(
+        local,
+        transport,
+        repository_id,
+        source_ref,
+        destination_ref,
+        |pack| {
+            apply_repository_transfer_pack(
+                local,
+                repository_id,
+                destination_ref,
+                actor.clone(),
+                pack,
+            )
+        },
+    )
+}
+
+/// Run a pull, admitting each pack through a caller-supplied publication step.
+///
+/// A receiver that owns derived state beyond repository authority has to admit
+/// packs itself, so that publication and the refresh of everything derived from
+/// it stay on one path. `admit` is that step. It is called once per pack, in
+/// order, and this function verifies each returned receipt binds the pack it
+/// was given before asking for the next one.
+///
+/// A remote gap larger than one negotiated envelope arrives as several packs.
+/// Each is admitted and receipted on its own; see [`RepositoryTransferOutcome`]
+/// for the contract that spans them.
+pub fn pull_from_remote_with<B, T, A>(
+    local: &RepositoryAuthorityManager<B>,
+    transport: &T,
+    repository_id: &RepositoryId,
+    source_ref: &RefName,
+    destination_ref: &RefName,
+    mut admit: A,
+) -> Result<RepositoryTransferOutcome>
+where
+    B: StorageBackend + ?Sized + 'static,
+    T: RepositoryTransferTransport + ?Sized,
+    A: FnMut(&RepositoryTransferPack) -> Result<RepositoryTransferReceipt>,
+{
+    let mut receipts = Vec::new();
+    let mut originally_at = None;
+    let mut admitted_changes = 0usize;
+
+    loop {
+        let negotiation =
+            fetch_pull_pack(local, transport, repository_id, source_ref, destination_ref)?;
+        let pack = match negotiation {
+            PullNegotiation::UpToDate { head: current } => {
+                if receipts.is_empty() {
+                    return Ok(RepositoryTransferOutcome {
+                        direction: RepositoryTransferDirection::Pull,
+                        repository_id: repository_id.clone(),
+                        source_ref: source_ref.clone(),
+                        destination_ref: destination_ref.clone(),
+                        plan: RepositoryTransferPlan::UpToDate { head: current },
+                        receipts,
+                    });
+                }
+                break;
+            }
+            PullNegotiation::Pack(pack) => pack,
+        };
+
+        if receipts.is_empty() {
+            originally_at = pack.expected_destination_head;
         }
-        PullNegotiation::Pack(pack) => pack,
-    };
+        let is_final = pack.source_head == pack.transfer_target_head;
+        admitted_changes += pack.changes.len();
 
-    let destination_head = pack.expected_destination_head;
-    let source_head = pack.source_head;
-    let change_count = pack.changes.len();
-    let receipt =
-        apply_repository_transfer_pack(local, repository_id, destination_ref, actor, &pack)?;
-    verify_receipt_binds_pack(&pack, &receipt)?;
+        let receipt = admit(&pack)?;
+        verify_receipt_binds_pack(&pack, &receipt)?;
+        receipts.push(receipt);
 
+        if is_final {
+            break;
+        }
+    }
+
+    // The head this pull admitted is the one the last receipt was verified to
+    // bind, not a head tracked alongside it.
+    let source_head = receipts
+        .last()
+        .map(|receipt| receipt.destination_head)
+        .ok_or_else(|| invalid("a pull that moved history produces at least one receipt"))?;
     Ok(RepositoryTransferOutcome {
         direction: RepositoryTransferDirection::Pull,
         repository_id: repository_id.clone(),
@@ -615,10 +765,10 @@ where
         destination_ref: destination_ref.clone(),
         plan: RepositoryTransferPlan::FastForward {
             source_head,
-            destination_head,
-            change_count: Some(change_count),
+            destination_head: originally_at,
+            change_count: Some(admitted_changes),
         },
-        receipt: Some(receipt),
+        receipts,
     })
 }
 
@@ -781,6 +931,15 @@ mod tests {
         /// Rewrite the ref the transfer status answers about, for the same
         /// reason: a peer that answers a question nobody asked is refused.
         claimed_destination_ref: Option<RefName>,
+        /// Advertise a smaller envelope than the protocol maximum, so
+        /// continuation behaviour is exercised on histories a test can build.
+        /// The bound a peer publishes is negotiated, not fixed, so a small one
+        /// is a legal peer rather than a test-only shortcut.
+        advertised_max_changes: Option<u32>,
+        /// Advertise a small bound the sender's change budget cannot reach, so
+        /// a step that is unsplittable on a non-change bound is exercised on a
+        /// history a test can build.
+        advertised_max_trees: Option<u32>,
         exported: RefCell<usize>,
         received: RefCell<usize>,
     }
@@ -793,8 +952,24 @@ mod tests {
                 forge_receipt: false,
                 claimed_repository: None,
                 claimed_destination_ref: None,
+                advertised_max_changes: None,
+                advertised_max_trees: None,
                 exported: RefCell::new(0),
                 received: RefCell::new(0),
+            }
+        }
+
+        fn advertising_max_changes(authority: &'a TestManager, max_changes: u32) -> Self {
+            Self {
+                advertised_max_changes: Some(max_changes),
+                ..Self::new(authority)
+            }
+        }
+
+        fn advertising_max_trees(authority: &'a TestManager, max_trees: u32) -> Self {
+            Self {
+                advertised_max_trees: Some(max_trees),
+                ..Self::new(authority)
             }
         }
 
@@ -845,6 +1020,12 @@ mod tests {
             if let Some(claimed) = &self.claimed_destination_ref {
                 status.destination_ref = claimed.clone();
             }
+            if let Some(max_changes) = self.advertised_max_changes {
+                status.limits.max_changes = max_changes;
+            }
+            if let Some(max_trees) = self.advertised_max_trees {
+                status.limits.max_trees = max_trees;
+            }
             Ok(status)
         }
 
@@ -855,7 +1036,17 @@ mod tests {
             expectation: &RepositoryTransferExpectation,
         ) -> Result<RepositoryTransferPack> {
             *self.exported.borrow_mut() += 1;
-            build_repository_transfer_pack(self.authority, source_ref, expectation)
+            // A sender may segment more finely than the receiver's bound
+            // requires; the receiver's limits are ceilings, not quotas.
+            let mut expectation = expectation.clone();
+            if let Some(max_changes) = self.advertised_max_changes {
+                expectation.limits.max_changes = expectation.limits.max_changes.min(max_changes);
+            }
+            if let Some(max_trees) = self.advertised_max_trees {
+                expectation.limits.max_trees = expectation.limits.max_trees.min(max_trees);
+            }
+            build_repository_transfer_segment(self.authority, source_ref, &expectation)
+                .map(|segment| segment.pack)
         }
 
         fn receive_pack(
@@ -955,9 +1146,16 @@ mod tests {
                 change_count: Some(2),
             }
         );
-        let receipt = outcome.receipt.expect("a moved head produces a receipt");
+        let receipt = outcome
+            .final_receipt()
+            .expect("a moved head produces a receipt");
         assert_eq!(receipt.outcome, RepositoryTransferApplyOutcome::Committed);
         assert_eq!(receipt.destination_head, fixture.source_head);
+        assert_eq!(
+            outcome.receipts.len(),
+            1,
+            "a gap inside one envelope is published as one pack"
+        );
         assert_eq!(
             head_of(&fixture.destination, &fixture.main),
             Some(fixture.source_head),
@@ -1045,7 +1243,7 @@ mod tests {
             }
         );
         assert_eq!(planned.max_changes_per_envelope, 512);
-        assert!(planned.fits_one_envelope);
+        assert_eq!(planned.pack_count, Some(1));
 
         let outcome = push_to_remote(
             &fixture.source,
@@ -1158,8 +1356,555 @@ mod tests {
             head_of(&fixture.destination, &fixture.main),
             Some(fixture.source_head)
         );
-        let receipt = outcome.receipt.expect("a moved head produces a receipt");
+        let receipt = outcome
+            .final_receipt()
+            .expect("a moved head produces a receipt");
         assert_eq!(receipt.outcome, RepositoryTransferApplyOutcome::Committed);
+    }
+
+    /// A line `count` changes longer than the base fixture, and every exact
+    /// head on it in order.
+    fn line_of(count: u128) -> (Fixture, Vec<SemanticChangeId>) {
+        let mut fixture = fixture();
+        let lease = fixture.source.read_authority();
+        let root = lease
+            .snapshot()
+            .changes
+            .values()
+            .find(|change| change.parents.is_empty())
+            .expect("the fixture roots one change")
+            .id;
+        drop(lease);
+        let mut heads = vec![root, fixture.source_head];
+        let mut previous = Some(fixture.source_head);
+        for step in 0..count {
+            let head = publish(
+                &fixture.source,
+                &fixture.repository_id,
+                &fixture.main,
+                previous,
+                100 + step,
+                &format!("extend the exact line {step}"),
+            );
+            heads.push(head);
+            previous = Some(head);
+        }
+        fixture.source_head = previous.expect("the line has a head");
+        (fixture, heads)
+    }
+
+    #[test]
+    fn a_push_past_the_negotiated_envelope_lands_the_whole_gap_across_continuation_packs() {
+        // The bound is the envelope, not the history. Six exact changes across
+        // an envelope that carries two must arrive whole, and the remote must
+        // end on the same head the local replica publishes.
+        let (fixture, _) = line_of(4);
+        let peer = LocalPeer::advertising_max_changes(&fixture.destination, 2);
+
+        let outcome = push_to_remote(
+            &fixture.source,
+            &peer,
+            &fixture.repository_id,
+            &fixture.main,
+            &fixture.main,
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome.plan,
+            RepositoryTransferPlan::FastForward {
+                source_head: fixture.source_head,
+                destination_head: None,
+                change_count: Some(6),
+            },
+            "the reported move is the whole publication, not its last segment"
+        );
+        assert_eq!(
+            outcome.receipts.len(),
+            3,
+            "six changes across a two-change envelope take three packs"
+        );
+        assert_eq!(*peer.received.borrow(), 3);
+        assert_eq!(
+            head_of(&fixture.destination, &fixture.main),
+            Some(fixture.source_head),
+            "the remote resolves the ref to the exact head the local replica holds"
+        );
+        for receipt in &outcome.receipts {
+            assert_eq!(receipt.outcome, RepositoryTransferApplyOutcome::Committed);
+        }
+        assert_eq!(
+            outcome.final_receipt().unwrap().destination_head,
+            fixture.source_head,
+            "the last receipt binds the head the transfer was moving toward"
+        );
+    }
+
+    #[test]
+    fn an_interrupted_multi_pack_push_resumes_from_the_pack_that_landed() {
+        // This is the whole per-pack contract. Nothing spans the packs, so an
+        // interruption has to leave the remote on a real ancestor of the target
+        // and a re-run has to carry only what is left.
+        let (fixture, heads) = line_of(4);
+        let peer = LocalPeer::advertising_max_changes(&fixture.destination, 2);
+
+        // Publish the first pack alone, exactly as the loop would.
+        let expectation =
+            negotiated_destination_lease(&peer, &fixture.repository_id, &fixture.main)
+                .expect("the remote lease is readable");
+        let segment =
+            build_repository_transfer_segment(&fixture.source, &fixture.main, &expectation)
+                .unwrap();
+        assert!(!segment.is_final());
+        let receipt = peer
+            .receive_pack(&fixture.repository_id, &fixture.main, &segment.pack)
+            .unwrap();
+        verify_receipt_binds_pack(&segment.pack, &receipt).unwrap();
+        let landed = head_of(&fixture.destination, &fixture.main).expect("one pack landed");
+        assert_eq!(landed, segment.pack.source_head);
+        assert!(
+            heads.contains(&landed),
+            "an interrupted transfer leaves the remote on an exact change of the line"
+        );
+        assert_ne!(
+            landed, fixture.source_head,
+            "the interruption is before the target head"
+        );
+
+        // A re-run resumes rather than restarting or rewinding.
+        let outcome = push_to_remote(
+            &fixture.source,
+            &peer,
+            &fixture.repository_id,
+            &fixture.main,
+            &fixture.main,
+        )
+        .unwrap();
+        assert_eq!(
+            outcome.plan,
+            RepositoryTransferPlan::FastForward {
+                source_head: fixture.source_head,
+                destination_head: Some(landed),
+                change_count: Some(4),
+            },
+            "the resumed push carries only what the interrupted one did not"
+        );
+        assert_eq!(
+            head_of(&fixture.destination, &fixture.main),
+            Some(fixture.source_head)
+        );
+    }
+
+    #[test]
+    fn a_pull_past_the_negotiated_envelope_admits_the_whole_gap_across_continuation_packs() {
+        let (fixture, _) = line_of(4);
+        let peer = LocalPeer::advertising_max_changes(&fixture.source, 2);
+
+        let outcome = pull_from_remote(
+            &fixture.destination,
+            &peer,
+            &fixture.repository_id,
+            &fixture.main,
+            &fixture.main,
+            AuthorId::new("pulling-replica"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome.plan,
+            RepositoryTransferPlan::FastForward {
+                source_head: fixture.source_head,
+                destination_head: None,
+                change_count: Some(6),
+            }
+        );
+        assert_eq!(outcome.receipts.len(), 3);
+        assert_eq!(*peer.exported.borrow(), 3);
+        assert_eq!(
+            head_of(&fixture.destination, &fixture.main),
+            Some(fixture.source_head)
+        );
+    }
+
+    #[test]
+    fn a_continuation_segment_publishes_a_head_the_destination_ref_can_reach() {
+        // A topological prefix is not a valid segment boundary on its own.
+        // Merging a side line puts that line's changes ahead of the merge in
+        // the closure, and neither of them descends from the head the
+        // destination holds. Ending a segment there would ask the destination
+        // ref to move sideways onto an unrelated change, so the smallest step
+        // that lands a reachable head is the merge itself even though it is
+        // bigger than the envelope asked for. Refusing instead would strand a
+        // publication partway through.
+        let repository_id = RepositoryId::new(format!("segment-merge-{}", Uuid::new_v4())).unwrap();
+        let source_dir = TempDir::new().unwrap();
+        let destination_dir = TempDir::new().unwrap();
+        let source = manager(&source_dir, &repository_id);
+        let destination = manager(&destination_dir, &repository_id);
+        let main = RefName::branch(b"main").unwrap();
+        let side = RefName::branch(b"side").unwrap();
+
+        let root = publish(&source, &repository_id, &main, None, 1, "root");
+        let published = publish(&source, &repository_id, &main, Some(root), 2, "mainline");
+        let sibling = publish_with_parents(
+            &source,
+            &repository_id,
+            &side,
+            vec![root],
+            None,
+            3,
+            "side line",
+        );
+
+        let peer = LocalPeer::new(&destination);
+        push_to_remote(&source, &peer, &repository_id, &main, &main).unwrap();
+        assert_eq!(head_of(&destination, &main), Some(published));
+
+        let merged = publish_with_parents(
+            &source,
+            &repository_id,
+            &main,
+            vec![published, sibling],
+            Some(published),
+            4,
+            "merge the side line",
+        );
+        let after_merge = publish(
+            &source,
+            &repository_id,
+            &main,
+            Some(merged),
+            5,
+            "advance past the merge",
+        );
+
+        // One change per envelope. Nothing before the merge can end a segment,
+        // so the first pack is the merge closure and the second is the single
+        // change after it.
+        let narrow = LocalPeer::advertising_max_changes(&destination, 1);
+        let outcome = push_to_remote(&source, &narrow, &repository_id, &main, &main)
+            .expect("an unsplittable step is taken whole, not refused");
+
+        assert_eq!(
+            outcome.receipts.len(),
+            2,
+            "the merge closure is one step and the change after it is another"
+        );
+        assert_eq!(
+            outcome.receipts[0].destination_head, merged,
+            "the first pack lands the merge, the earliest head this ref can reach"
+        );
+        assert_eq!(outcome.receipts[1].destination_head, after_merge);
+        assert_eq!(head_of(&destination, &main), Some(after_merge));
+        assert_eq!(
+            outcome.plan,
+            RepositoryTransferPlan::FastForward {
+                source_head: after_merge,
+                destination_head: Some(published),
+                // The merge closure carries the root a second time: it reaches
+                // the merge by a path that never passes through the head the
+                // destination held, so the fast-forward closure collects it.
+                // The receiver accepts a change it already has when the bytes
+                // are identical, which is why this is redundancy rather than a
+                // conflict.
+                change_count: Some(4),
+            }
+        );
+    }
+
+    /// Run `work` on its own thread and fail the test if it does not finish.
+    ///
+    /// What these tests assert is termination, and a test that simply called
+    /// the segment builder would hang the suite instead of failing it. The
+    /// deadline is a liveness bound rather than a performance one: the
+    /// fixtures below finish in milliseconds, so it is set far above any
+    /// plausible slow machine.
+    fn within_deadline<T: Send + 'static>(
+        what: &str,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(work());
+        });
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .unwrap_or_else(|_| panic!("{what} did not terminate"))
+    }
+
+    /// Publish a merge whose smallest publishable step is two changes.
+    ///
+    /// The destination is left holding the mainline change before the merge,
+    /// so the closure is the side line followed by the merge and only the
+    /// merge descends from the head the destination holds.
+    fn merge_past_a_published_head(
+        source: &TestManager,
+        destination: &TestManager,
+        repository_id: &RepositoryId,
+        main: &RefName,
+    ) {
+        let side = RefName::branch(b"side").unwrap();
+        let root = publish(source, repository_id, main, None, 1, "root");
+        let published = publish(source, repository_id, main, Some(root), 2, "mainline");
+        let sibling = publish_with_parents(
+            source,
+            repository_id,
+            &side,
+            vec![root],
+            None,
+            3,
+            "side line",
+        );
+
+        let peer = LocalPeer::new(destination);
+        push_to_remote(source, &peer, repository_id, main, main).unwrap();
+
+        publish_with_parents(
+            source,
+            repository_id,
+            main,
+            vec![published, sibling],
+            Some(published),
+            4,
+            "merge the side line",
+        );
+    }
+
+    #[test]
+    fn a_step_that_cannot_be_split_is_refused_by_name_rather_than_replanned() {
+        // The smallest step that lands a head this ref can reach is bigger
+        // than the envelope on every bound, not only on the change count. The
+        // planner reaches past the change budget to take that step, so a
+        // smaller budget cannot produce a smaller segment: replanning returns
+        // the same one. Refusing and naming the bound is the answer; halving
+        // the budget again is a hang standing in for a refusal.
+        let outcome = within_deadline("a segment over a non-change bound", || {
+            let repository_id =
+                RepositoryId::new(format!("unsplittable-{}", Uuid::new_v4())).unwrap();
+            let source_dir = TempDir::new().unwrap();
+            let destination_dir = TempDir::new().unwrap();
+            let source = manager(&source_dir, &repository_id);
+            let destination = manager(&destination_dir, &repository_id);
+            let main = RefName::branch(b"main").unwrap();
+            merge_past_a_published_head(&source, &destination, &repository_id, &main);
+
+            let status = repository_transfer_status(&destination, &repository_id, &main).unwrap();
+            let mut expectation = RepositoryTransferExpectation::try_from(status).unwrap();
+            // Leave the change bound at the protocol default and clamp only a
+            // bound the change budget cannot reach. This is the shape a merge
+            // step of more than MAX_TRANSFER_CHANGES changes has under
+            // entirely default limits, where max_trees equals max_changes.
+            expectation.limits.max_trees = 1;
+
+            build_repository_transfer_segment(&source, &main, &expectation)
+                .map(|segment| segment.pack.changes.len())
+        });
+
+        let error = outcome.expect_err("a step that cannot be split is refused, not replanned");
+        let RepositoryTransferError::Invalid(message) = error else {
+            panic!("an envelope too small for the smallest step is a refusal: {error:?}");
+        };
+        // Three, not two: the merge reaches its side line by a path that never
+        // passes through the head the destination holds, so the fast-forward
+        // closure collects the root a second time.
+        assert!(
+            message.contains("carries 3 trees, over negotiated limit 1"),
+            "the refusal must name the negotiated bound the step exceeds: {message}"
+        );
+        assert!(
+            message.contains("cannot be split"),
+            "the refusal must say why no smaller step is available: {message}"
+        );
+    }
+
+    #[test]
+    fn a_peer_whose_envelope_cannot_carry_the_smallest_step_is_refused_rather_than_looped_on() {
+        // The same refusal over the negotiation loop a push actually drives.
+        // The bound arrives from the peer's own advertisement, which is where
+        // it comes from on the export route, so this is the shape a remote can
+        // put a sender in rather than one only a direct caller can build.
+        let outcome = within_deadline("a push into an envelope below the smallest step", || {
+            let repository_id =
+                RepositoryId::new(format!("narrow-peer-{}", Uuid::new_v4())).unwrap();
+            let source_dir = TempDir::new().unwrap();
+            let destination_dir = TempDir::new().unwrap();
+            let source = manager(&source_dir, &repository_id);
+            let destination = manager(&destination_dir, &repository_id);
+            let main = RefName::branch(b"main").unwrap();
+            merge_past_a_published_head(&source, &destination, &repository_id, &main);
+
+            let narrow = LocalPeer::advertising_max_trees(&destination, 1);
+            push_to_remote(&source, &narrow, &repository_id, &main, &main)
+                .map(|outcome| outcome.receipts.len())
+        });
+
+        let error = outcome.expect_err("a peer that cannot carry the smallest step is refused");
+        let RepositoryTransferError::Invalid(message) = error else {
+            panic!("an envelope too small for the smallest step is a refusal: {error:?}");
+        };
+        assert!(
+            message.contains("over negotiated limit 1"),
+            "the refusal must name the negotiated bound the step exceeds: {message}"
+        );
+    }
+
+    #[test]
+    fn an_envelope_that_can_carry_nothing_is_refused_before_a_pack_is_built() {
+        // An exporter takes its limits from the request it was handed, not
+        // from a status it built, so the numbers are the caller's word. A
+        // bound of zero is already refused when a peer advertises one; it is
+        // refused on the way in for the same reason, rather than becoming
+        // work that can only end in a refusal.
+        let (fixture, _) = line_of(2);
+        let status =
+            repository_transfer_status(&fixture.destination, &fixture.repository_id, &fixture.main)
+                .unwrap();
+        let mut expectation = RepositoryTransferExpectation::try_from(status).unwrap();
+        expectation.limits.max_trees = 0;
+
+        let error = build_repository_transfer_segment(&fixture.source, &fixture.main, &expectation)
+            .expect_err("an envelope that can carry nothing is refused");
+
+        let RepositoryTransferError::Invalid(message) = error else {
+            panic!("a bound that can carry nothing is a refusal: {error:?}");
+        };
+        assert!(
+            message.contains("the negotiated max_trees is zero"),
+            "the refusal must name the bound that can carry nothing: {message}"
+        );
+    }
+
+    #[test]
+    fn a_peer_that_never_advances_is_refused_rather_than_looped_on() {
+        // The continuation loop asks the remote where it is, publishes the next
+        // step, and asks again. A peer that receipts a pack and then reports the
+        // same head has not moved, and there is no number of retries that fixes
+        // it. Reporting that as a refusal is the difference between an error and
+        // a hang.
+        let (fixture, _) = line_of(4);
+        let peer = FrozenPeer {
+            inner: LocalPeer::advertising_max_changes(&fixture.destination, 2),
+        };
+
+        let error = push_to_remote(
+            &fixture.source,
+            &peer,
+            &fixture.repository_id,
+            &fixture.main,
+            &fixture.main,
+        )
+        .expect_err("a remote that never advances is refused");
+
+        let RepositoryTransferError::Conflict(message) = error else {
+            panic!("a peer that will not advance is a conflict: {error:?}");
+        };
+        assert!(
+            message.contains("made no progress"),
+            "the refusal must say the remote did not move: {message}"
+        );
+    }
+
+    /// A peer whose transfer status keeps reporting the head it had before any
+    /// pack was published.
+    struct FrozenPeer<'a> {
+        inner: LocalPeer<'a>,
+    }
+
+    impl RepositoryTransferTransport for FrozenPeer<'_> {
+        fn advertise_refs(
+            &self,
+            repository_id: &RepositoryId,
+        ) -> Result<RepositoryRefAdvertisement> {
+            self.inner.advertise_refs(repository_id)
+        }
+
+        fn transfer_status(
+            &self,
+            repository_id: &RepositoryId,
+            destination_ref: &RefName,
+        ) -> Result<RepositoryTransferStatus> {
+            let mut status = self.inner.transfer_status(repository_id, destination_ref)?;
+            status.destination_target = None;
+            status.destination_head = None;
+            Ok(status)
+        }
+
+        fn export_pack(
+            &self,
+            repository_id: &RepositoryId,
+            source_ref: &RefName,
+            expectation: &RepositoryTransferExpectation,
+        ) -> Result<RepositoryTransferPack> {
+            self.inner
+                .export_pack(repository_id, source_ref, expectation)
+        }
+
+        fn receive_pack(
+            &self,
+            repository_id: &RepositoryId,
+            destination_ref: &RefName,
+            pack: &RepositoryTransferPack,
+        ) -> Result<RepositoryTransferReceipt> {
+            self.inner
+                .receive_pack(repository_id, destination_ref, pack)
+        }
+    }
+
+    #[test]
+    fn a_plan_counts_the_packs_a_push_will_take() {
+        let (fixture, _) = line_of(4);
+        let peer = LocalPeer::advertising_max_changes(&fixture.destination, 2);
+
+        let planned = plan_push_to_remote(
+            &fixture.source,
+            &peer,
+            &fixture.repository_id,
+            &fixture.main,
+            &fixture.main,
+        )
+        .unwrap();
+
+        assert_eq!(planned.max_changes_per_envelope, 2);
+        assert_eq!(
+            planned.pack_count,
+            Some(3),
+            "the plan must say how many packs the operator is about to publish"
+        );
+
+        let outcome = push_to_remote(
+            &fixture.source,
+            &peer,
+            &fixture.repository_id,
+            &fixture.main,
+            &fixture.main,
+        )
+        .unwrap();
+        assert_eq!(
+            outcome.receipts.len(),
+            planned.pack_count.unwrap(),
+            "the executed push must take exactly the packs the plan counted"
+        );
+    }
+
+    #[test]
+    fn a_plan_refuses_a_divergent_imported_git_baseline_the_way_a_push_would() {
+        // Parity is the point of the plan. A push refuses a Git-authority
+        // baseline the two replicas do not share, so a plan that reported a
+        // clean fast-forward there would be telling the operator a push will
+        // work when it cannot.
+        let fixture = fixture();
+        let peer = LocalPeer::new(&fixture.destination);
+        let mut expectation =
+            negotiated_destination_lease(&peer, &fixture.repository_id, &fixture.main).unwrap();
+        expectation.git_authority_hash = Some(Hash256::from_bytes([0x71; 32]));
+
+        let error = verify_transfer_source_readiness(&fixture.source, &fixture.main, &expectation)
+            .expect_err("a Git-authority baseline mismatch is refused before any pack is built");
+
+        assert!(
+            matches!(error, RepositoryTransferError::Conflict(_)),
+            "a divergent imported-Git baseline is a conflict: {error:?}"
+        );
     }
 
     #[test]

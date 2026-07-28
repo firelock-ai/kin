@@ -245,22 +245,30 @@
     },
     {
       "command": "push",
-      "status": "open_gate",
-      "exposure": "fail_closed",
+      "status": "ready",
+      "exposure": "enabled",
       "authority": "repository-v6 remote capability and exact transport",
       "required_for_bounded_dogfood": false,
       "acceptance_spec": [
-        "DONE: negotiate the remote destination lease, build the exact closure, publish it, and verify the returned receipt binds the pack that was sent",
-        "DONE: refuse a non-fast-forward gap with both heads named and no force path",
-        "OPEN: carry a closure larger than one negotiated envelope (512 changes, 4096 bodies, 16 MiB decoded); transfer v1 has no continuation packs, so a repository past that bound is refused at pack build",
-        "OPEN: drive the KinLab control-plane transfer envelope route, including its protection rules and durable receipts, rather than a peer daemon transfer seam directly"
+        "negotiate the remote destination lease, build the exact closure, publish it, and verify the returned receipt binds the pack that was sent",
+        "refuse a non-fast-forward gap with both heads named and no force path",
+        "carry a closure larger than one negotiated envelope as an ordered sequence of packs, each published in its own repository transaction and proven by its own receipt",
+        "leave an interrupted multi-pack publication on the last head that was receipted, which is an exact ancestor of the target, and resume from there on a re-run",
+        "refuse a step that cannot be split, naming the negotiated bound it exceeds, whether that step is one change or the smallest one a merge leaves reachable"
       ],
       "evidence_tests": [
-        "crates/kin-remote/src/repository_transfer_negotiation.rs",
-        "crates/kin-remote/src/repository_transfer_http.rs",
-        "crates/kin-daemon/src/api.rs"
+        "kin_remote::repository_transfer_negotiation::tests::a_push_past_the_negotiated_envelope_lands_the_whole_gap_across_continuation_packs",
+        "kin_remote::repository_transfer_negotiation::tests::an_interrupted_multi_pack_push_resumes_from_the_pack_that_landed",
+        "kin_remote::repository_transfer_negotiation::tests::a_continuation_segment_publishes_a_head_the_destination_ref_can_reach",
+        "kin_remote::repository_transfer_negotiation::tests::push_refuses_a_remote_head_this_replica_has_not_admitted",
+        "kin_daemon::api::tests::a_push_past_the_negotiated_envelope_crosses_real_http_as_continuation_packs",
+        "kin_daemon::api::tests::native_push_and_pull_move_exact_history_between_two_daemons_over_http",
+        "kin_daemon::api::tests::a_divergent_remote_refuses_the_push_over_http_and_moves_nothing",
+        "kin_remote::repository_transfer_negotiation::tests::a_step_that_cannot_be_split_is_refused_by_name_rather_than_replanned",
+        "kin_remote::repository_transfer_negotiation::tests::a_peer_whose_envelope_cannot_carry_the_smallest_step_is_refused_rather_than_looped_on",
+        "crates/kin-cli/tests/command_capabilities.rs::push_reaches_the_transfer_surface_instead_of_the_capability_gate"
       ],
-      "note": "The full path runs end to end between two Kin daemons over HTTP with receipts verified, but only within one bounded transfer envelope, and the transfer status this protocol publishes still reports push_apply_ready=false. Exposing it as general `kin push` would promise a capability that a repository past the envelope bound does not have."
+      "note": "Runs end to end between two Kin daemons over HTTP, including a gap larger than one negotiated envelope, which is published as an ordered sequence of packs rather than refused. Nothing spans those packs and this protocol does not claim it does: each is atomic on its own, and an interruption leaves the remote on the last receipted head. The remaining bound is a step that cannot be split, either one change whose new bodies exceed the negotiated byte limit or the smallest step a merge leaves reachable when that step exceeds a negotiated bound, which is refused by name rather than replanned. The peer is a Kin daemon transfer seam; the KinLab control-plane wrapper and its protection rules are not driven by this command."
     },
     {
       "command": "pull",
@@ -270,18 +278,20 @@
       "required_for_bounded_dogfood": false,
       "acceptance_spec": [
         "DONE: read the remote ref advertisement, adopt its default ref when this replica has none, and fetch the exact exported closure",
-        "DONE: admit the pack in one local authority transaction and refuse a receipt that does not bind it",
+        "DONE: admit each pack in one local authority transaction and refuse a receipt that does not bind it",
         "DONE: refuse a remote this replica already contains, naming the remote head",
-        "OPEN: carry a closure larger than one negotiated envelope; transfer v1 has no continuation packs",
-        "OPEN: carry an exported pack past the 24 MiB transfer body bound; the daemon route and the client read declare the same limit, and a pack past it is refused as an oversized envelope rather than split",
+        "DONE: carry a closure larger than one negotiated envelope as an ordered sequence of packs, resuming from the last one admitted",
+        "DONE: report a derived-view refresh that fails after authority is durable as a typed partial success rather than a server error",
         "OPEN: graph-derived workspace transition after admission, so a working tree follows the new head"
       ],
       "evidence_tests": [
-        "crates/kin-remote/src/repository_transfer_negotiation.rs",
-        "crates/kin-remote/src/repository_transfer_http.rs",
-        "crates/kin-daemon/src/api.rs"
+        "kin_remote::repository_transfer_negotiation::tests::a_pull_past_the_negotiated_envelope_admits_the_whole_gap_across_continuation_packs",
+        "kin_remote::repository_transfer_negotiation::tests::pull_admits_the_same_gap_from_the_other_side",
+        "kin_remote::repository_transfer_negotiation::tests::pull_refuses_a_remote_this_replica_already_contains",
+        "kin_daemon::api::tests::a_pull_whose_derived_refresh_fails_reports_partial_success_not_a_server_error",
+        "kin_daemon::api::tests::native_push_and_pull_move_exact_history_between_two_daemons_over_http"
       ],
-      "note": "Negotiation, export, and admission run end to end between two Kin daemons over HTTP with receipts verified. It stays closed because the envelope is bounded and because admission does not yet move the workspace to the admitted head. The envelope is bounded twice: by the negotiated change count, and by the 24 MiB one-body transfer bound. A pack carries base64 CAS bodies for the whole source tree, so on a real repository the byte bound binds first."
+      "note": "Negotiation, export, and admission run end to end between two Kin daemons over HTTP with receipts verified, including a gap past one envelope. It stays closed for one reason only: admitting history does not move the workspace to the admitted head, so a working tree after `kin pull` still shows the old one. That is what a caller expects this command to do, and until it does, exposing it would promise a transition that does not happen."
     },
     {
       "command": "merge",
@@ -388,13 +398,16 @@
         "derive the local publication head from one repository authority generation",
         "read the remote destination lease over the repository-v6 transfer seam and classify the gap without moving history",
         "refuse a remote head this replica has not admitted, naming both heads, with no force path",
-        "report the negotiated envelope bound so an oversized gap is predictable before a push runs"
+        "refuse the imported-Git baseline and the missing or mismatched source bodies a push would refuse, before anything is published",
+        "report how many packs the publication will take at the negotiated envelope"
       ],
       "evidence_tests": [
-        "crates/kin-remote/src/repository_transfer_negotiation.rs",
-        "crates/kin-daemon/src/api.rs"
+        "kin_remote::repository_transfer_negotiation::tests::a_plan_counts_the_packs_a_push_will_take",
+        "kin_remote::repository_transfer_negotiation::tests::a_plan_refuses_a_divergent_imported_git_baseline_the_way_a_push_would",
+        "kin_remote::repository_transfer_negotiation::tests::the_planned_distance_is_exactly_what_the_pack_carries",
+        "kin_daemon::api::tests::native_push_and_pull_move_exact_history_between_two_daemons_over_http"
       ],
-      "note": "Negotiates against a live peer transfer seam and publishes nothing. Reports whether the gap fits one transfer envelope, because transfer v1 has no continuation packs."
+      "note": "Negotiates against a live peer transfer seam and publishes nothing. Everything a push decides before it ships bytes is decided here too: the lease, the fast-forward classification, the imported-Git baseline, and the presence and identity of every immutable body the publication head's tree depends on. The per-pack byte arithmetic is only knowable once packs are assembled, so the plan reports the pack count and the negotiated bound rather than predicting that refusal."
     },
     {
       "command": "exec",

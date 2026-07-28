@@ -40,9 +40,41 @@ pub struct CommandTransferRequest {
     pub destination_ref: Option<RefName>,
 }
 
+/// What happened to the views a daemon derives from repository authority once
+/// a transfer's authority had already moved.
+///
+/// Repository authority is the truth, and it is durable before anything
+/// derived from it is touched. A refresh that fails after that point has not
+/// failed the transfer and must not be reported as one, but it does leave
+/// retrieval answering from state that is behind the admitted head. This is
+/// how that partial success is named instead of being flattened into either a
+/// clean success or a server error.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum DerivedViewRefresh {
+    /// Everything derived from authority matches the admitted head.
+    Current,
+    /// Authority moved and is durable; these views did not follow it.
+    Stale { detail: String },
+}
+
+impl DerivedViewRefresh {
+    pub fn is_stale(&self) -> bool {
+        matches!(self, Self::Stale { .. })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommandTransferResponse {
     pub outcome: RepositoryTransferOutcome,
+    /// Defaulted so a response from a daemon that predates this field reads as
+    /// the state it in fact reported: a refresh it never surfaced.
+    #[serde(default = "derived_views_current")]
+    pub derived_views: DerivedViewRefresh,
+}
+
+fn derived_views_current() -> DerivedViewRefresh {
+    DerivedViewRefresh::Current
 }
 
 /// A negotiated plan that moved nothing.
@@ -186,7 +218,7 @@ pub async fn push(
     let peer = resolve_peer(&layout, remote.as_deref(), url.as_deref())?;
     let request = build_request(peer, reference.as_deref(), None)?;
     let response = daemon().await?.command_push(&request).await?;
-    render_outcome(&response.outcome, json)
+    render_outcome(&response, json)
 }
 
 pub async fn pull(
@@ -199,7 +231,7 @@ pub async fn pull(
     let peer = resolve_peer(&layout, remote.as_deref(), url.as_deref())?;
     let request = build_request(peer, reference.as_deref(), None)?;
     let response = daemon().await?.command_pull(&request).await?;
-    render_outcome(&response.outcome, json)
+    render_outcome(&response, json)
 }
 
 pub async fn plan_push(
@@ -222,11 +254,12 @@ pub async fn plan_push(
     println!("Source ref:  {}", plan.source_ref);
     println!("Destination: {}", plan.destination_ref);
     println!("{}", render_plan(&plan.plan.plan));
-    if !plan.plan.fits_one_envelope {
-        println!(
-            "This gap does not fit one transfer envelope (limit {} changes). Transfer v1 has no continuation packs, so a push would be refused at pack build.",
+    match plan.plan.pack_count {
+        Some(0) | Some(1) | None => {}
+        Some(packs) => println!(
+            "This gap needs {packs} transfer packs at the negotiated bound of {} changes each. Each pack is published on its own, so an interruption leaves the remote on the last one that landed and a re-run resumes from there.",
             plan.plan.max_changes_per_envelope
-        );
+        ),
     }
     println!(
         "Nothing was published. This plan describes the two leases as they were read, not a reservation of them."
@@ -256,23 +289,30 @@ fn render_plan(plan: &RepositoryTransferPlan) -> String {
     }
 }
 
-fn render_outcome(outcome: &RepositoryTransferOutcome, json: bool) -> Result<()> {
+fn render_outcome(response: &CommandTransferResponse, json: bool) -> Result<()> {
     if json {
-        println!("{}", serde_json::to_string_pretty(outcome)?);
+        println!("{}", serde_json::to_string_pretty(response)?);
         return Ok(());
     }
+    let outcome = &response.outcome;
     let verb = match outcome.direction {
         RepositoryTransferDirection::Push => "Pushed",
         RepositoryTransferDirection::Pull => "Pulled",
     };
     println!("{}", render_plan(&outcome.plan));
-    match &outcome.receipt {
+    match outcome.final_receipt() {
         None => println!("{verb} nothing: no repository transaction was published."),
         Some(receipt) => {
             println!(
                 "{verb} {} onto {} at {}.",
                 outcome.repository_id, outcome.destination_ref, receipt.destination_head
             );
+            if outcome.receipts.len() > 1 {
+                println!(
+                    "Packs:     {} continuation packs, each published on its own",
+                    outcome.receipts.len()
+                );
+            }
             println!("Transfer:  {}", receipt.transfer_id);
             println!("Outcome:   {:?}", receipt.outcome);
             println!(
@@ -280,6 +320,14 @@ fn render_outcome(outcome: &RepositoryTransferOutcome, json: bool) -> Result<()>
                 receipt.authority_receipt.generation
             );
         }
+    }
+    if let DerivedViewRefresh::Stale { detail } = &response.derived_views {
+        println!(
+            "Repository authority moved and is durable, but the views derived from it did not follow: {detail}"
+        );
+        println!(
+            "Search and retrieval answer from behind the admitted head until those views are rebuilt. Restart the daemon to rebuild them."
+        );
     }
     Ok(())
 }
