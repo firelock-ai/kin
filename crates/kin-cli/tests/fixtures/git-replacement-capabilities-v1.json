@@ -254,7 +254,7 @@
         "refuse a non-fast-forward gap with both heads named and no force path",
         "carry a closure larger than one negotiated envelope as an ordered sequence of packs, each published in its own repository transaction and proven by its own receipt",
         "leave an interrupted multi-pack publication on the last head that was receipted, which is an exact ancestor of the target, and resume from there on a re-run",
-        "refuse a step that cannot be split, naming the negotiated byte bound the single change exceeds"
+        "refuse a step that cannot be split, naming the negotiated bound it exceeds, whether that step is one change or the smallest one a merge leaves reachable"
       ],
       "evidence_tests": [
         "kin_remote::repository_transfer_negotiation::tests::a_push_past_the_negotiated_envelope_lands_the_whole_gap_across_continuation_packs",
@@ -263,9 +263,12 @@
         "kin_remote::repository_transfer_negotiation::tests::push_refuses_a_remote_head_this_replica_has_not_admitted",
         "kin_daemon::api::tests::a_push_past_the_negotiated_envelope_crosses_real_http_as_continuation_packs",
         "kin_daemon::api::tests::native_push_and_pull_move_exact_history_between_two_daemons_over_http",
-        "kin_daemon::api::tests::a_divergent_remote_refuses_the_push_over_http_and_moves_nothing"
+        "kin_daemon::api::tests::a_divergent_remote_refuses_the_push_over_http_and_moves_nothing",
+        "kin_remote::repository_transfer_negotiation::tests::a_step_that_cannot_be_split_is_refused_by_name_rather_than_replanned",
+        "kin_remote::repository_transfer_negotiation::tests::a_peer_whose_envelope_cannot_carry_the_smallest_step_is_refused_rather_than_looped_on",
+        "crates/kin-cli/tests/command_capabilities.rs::push_reaches_the_transfer_surface_instead_of_the_capability_gate"
       ],
-      "note": "Runs end to end between two Kin daemons over HTTP, including a gap larger than one negotiated envelope, which is published as an ordered sequence of packs rather than refused. Nothing spans those packs and this protocol does not claim it does: each is atomic on its own, and an interruption leaves the remote on the last receipted head. The remaining bound is one indivisible change whose new bodies exceed the negotiated byte limit, which is refused by name rather than split. The peer is a Kin daemon transfer seam; the KinLab control-plane wrapper and its protection rules are not driven by this command."
+      "note": "Runs end to end between two Kin daemons over HTTP, including a gap larger than one negotiated envelope, which is published as an ordered sequence of packs rather than refused. Nothing spans those packs and this protocol does not claim it does: each is atomic on its own, and an interruption leaves the remote on the last receipted head. The remaining bound is a step that cannot be split, either one change whose new bodies exceed the negotiated byte limit or the smallest step a merge leaves reachable when that step exceeds a negotiated bound, which is refused by name rather than replanned. The peer is a Kin daemon transfer seam; the KinLab control-plane wrapper and its protection rules are not driven by this command."
     },
     {
       "command": "pull",
