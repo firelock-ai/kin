@@ -13023,6 +13023,61 @@ mod tests {
         );
     }
 
+    /// The daemon-side transition is planned before the authority transaction
+    /// commits, and the enrichment worker writes into the live graph without
+    /// taking the coordination gate or the persistence lock. An enrichment tick
+    /// that lands in that window must not leave authority at the new generation
+    /// with the daemon cursor still on the old one, which is the same wedge one
+    /// step later: finalization therefore plans against the graph it is
+    /// installing into rather than against the plan-time snapshot.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn switch_survives_enrichment_that_lands_after_the_authority_commit() {
+        let (state, _layout, _repository, _main, _feature) =
+            universal_branch_test_state("switch-enrichment-window");
+        let generation_before = state
+            .snapshot_generation
+            .load(std::sync::atomic::Ordering::SeqCst);
+        state
+            .repository_command_enrich_after_authority_once
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let switch = kin_cli::commands::branch::BranchRequest::Switch {
+            name: kin_model::RefName::branch(b"feature").unwrap(),
+            operation_id: kin_model::OperationId::new(),
+            actor: AuthorId::new("enrichment-window-test"),
+        };
+        let (status, body) = post_branch_request(Arc::clone(&state), &switch, None).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "enrichment landing after the authority commit must not fail the switch: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(
+            state
+                .snapshot_generation
+                .load(std::sync::atomic::Ordering::SeqCst),
+            generation_before + 1,
+            "the daemon cursor must follow the authority commit the switch just made"
+        );
+
+        // The wedge is the next command, not this one: a daemon cursor left
+        // behind authority refuses every freshness-gated command after it.
+        let back = kin_cli::commands::branch::BranchRequest::Switch {
+            name: kin_model::RefName::branch(b"main").unwrap(),
+            operation_id: kin_model::OperationId::new(),
+            actor: AuthorId::new("enrichment-window-test"),
+        };
+        let (status, body) = post_branch_request(Arc::clone(&state), &back, None).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the command after the enrichment window must not be wedged: {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+
     /// A seal must leave the daemon and repository authority agreeing, so the
     /// ready commands still work against the workspace it returned.
     #[cfg(unix)]

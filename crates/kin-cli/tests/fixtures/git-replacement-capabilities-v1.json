@@ -321,12 +321,14 @@
         "persist and restore exact graph-owned workspace state without branch sidecars or raw-file inference"
       ],
       "evidence_tests": [
+        "crates/kin-cli/tests/repository_stash.rs",
         "kin_cli::commands::stash::tests::stash_ref_names_round_trip_only_through_canonical_ordinals",
         "kin_daemon::api::tests::command_stash_leaves_ready_commands_working_on_the_returned_workspace",
         "kin_daemon::api::tests::command_stash_refuses_restore_onto_moved_authority",
         "kin_daemon::api::tests::command_stash_refuses_sealing_a_clean_workspace_and_restoring_over_a_dirty_one",
         "kin_daemon::api::tests::command_stash_seals_restores_and_round_trips_exact_workspace_state",
         "kin_daemon::api::tests::switch_refuses_a_daemon_that_lost_authority_owned_semantics",
+        "kin_daemon::api::tests::switch_survives_enrichment_that_lands_after_the_authority_commit",
         "kin_daemon::api::tests::switch_tolerates_derived_semantics_the_workspace_has_not_published",
         "kin_daemon::commit_deltas::tests::commit_publishes_an_entity_whose_provenance_moved_without_its_fingerprint"
       ],

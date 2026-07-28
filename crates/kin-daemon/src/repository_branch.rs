@@ -145,6 +145,14 @@ pub(crate) fn execute(
         ));
     }
 
+    #[cfg(test)]
+    if state
+        .repository_command_enrich_after_authority_once
+        .swap(false, std::sync::atomic::Ordering::SeqCst)
+    {
+        state.install_derived_enrichment();
+    }
+
     let finalization = state
         .finalize_local_repository_commit(
             &execution.receipt,

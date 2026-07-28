@@ -259,22 +259,28 @@ fn plan_and_commit(
         .iter()
         .find(|receipt| receipt.operation_id == request.operation_id)
         .cloned();
-    let workspace_graph = lease
-        .workspace_graph_snapshot(&workspace.workspace_id)
-        .map_err(|error| {
-            classify_graph_checkout_error(error, "materialize checkout workspace authority")
-        })?
-        .ok_or_else(|| {
-            CheckoutCommandError::internal(anyhow::anyhow!(
-                "repository {} has no graph snapshot for workspace {}",
-                authority.repository_id,
-                workspace.workspace_id
-            ))
-        })?;
-    if existing_receipt.is_none() {
+    // Materialized only on the planning path. A replay returns before the
+    // authority transition is planned, so demanding a workspace authority
+    // graph there would fail a recovery that can otherwise complete.
+    let workspace_graph = if existing_receipt.is_none() {
+        let workspace_graph = lease
+            .workspace_graph_snapshot(&workspace.workspace_id)
+            .map_err(|error| {
+                classify_graph_checkout_error(error, "materialize checkout workspace authority")
+            })?
+            .ok_or_else(|| {
+                CheckoutCommandError::internal(anyhow::anyhow!(
+                    "repository {} has no graph snapshot for workspace {}",
+                    authority.repository_id,
+                    workspace.workspace_id
+                ))
+            })?;
         require_fresh_daemon_workspace(state, &roots, &workspace_graph, "checking out a path")
             .map_err(CheckoutCommandError::conflict)?;
-    }
+        Some(workspace_graph)
+    } else {
+        None
+    };
     let mut snapshot = lease.snapshot().clone();
     snapshot.repository_authority = None;
     drop(lease);
@@ -506,6 +512,11 @@ fn plan_and_commit(
     // from the daemon delta above. The daemon graph carries derived enrichment
     // that has not crossed the compare-and-swap, so reusing its delta here
     // would ask authority to publish or retract semantics it never owned.
+    let workspace_graph = workspace_graph.ok_or_else(|| {
+        CheckoutCommandError::internal(anyhow::anyhow!(
+            "checkout planning reached the authority transition without a workspace authority graph"
+        ))
+    })?;
     let authority_graph = kin_db::InMemoryGraph::from_snapshot(workspace_graph)
         .context("prepare exact checkout workspace authority graph")?;
     let authority_delta = crate::commit_deltas::compute_selected_checkout_delta(

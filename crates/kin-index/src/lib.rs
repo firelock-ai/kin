@@ -51,8 +51,8 @@ pub use linker::{
 pub use linker::{is_external_import_placeholder, EXTERNAL_IMPORT_REFERENCE_RULE};
 pub use overlay::{apply_file_removal, apply_to_graph, ApplyResult};
 pub use pipeline::{
-    classify_file_role, entity_semantics_changed, normalize_file_path_id, IndexPipeline,
-    IndexedAny, IndexedFile, COMMAND_EFFECT_CONTRACT_KEY,
+    classify_file_role, normalize_file_path_id, IndexPipeline, IndexedAny, IndexedFile,
+    COMMAND_EFFECT_CONTRACT_KEY,
 };
 pub use repository::{
     host_path_from_repo_path, is_repository_control_path, read_verified_scanned_entry,

@@ -1894,9 +1894,13 @@ mod tests {
             .extra
             .insert("blob_hash".into(), "advanced-source-blob".into());
         graph.upsert_entity(&reprovenanced).unwrap();
-        assert!(
-            !kin_index::entity_semantics_changed(&entity, &reprovenanced),
-            "the fixture must move provenance without moving meaning"
+        assert_eq!(
+            entity.fingerprint, reprovenanced.fingerprint,
+            "the fixture must move provenance without moving the semantic fingerprint"
+        );
+        assert_ne!(
+            entity, reprovenanced,
+            "the fixture must still be a different entity payload"
         );
 
         let deltas = compute_deltas_vs_last_commit(&graph, &head).unwrap();
