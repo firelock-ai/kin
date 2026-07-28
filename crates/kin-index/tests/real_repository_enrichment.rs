@@ -35,13 +35,17 @@ fn a_real_repository_enriches_into_replayable_history() {
     let root = tempfile::tempdir().unwrap();
     let blob_store = BlobStore::new(root.path().join("cas")).unwrap();
 
+    let phase = std::time::Instant::now();
     let snapshot = capture_lossless_git_repository(
         Path::new(&repository),
         RepositoryId::new("real-repository-enrichment").unwrap(),
         &blob_store,
     )
     .unwrap();
+    eprintln!("phase capture: {:.2}s", phase.elapsed().as_secs_f64());
+    let phase = std::time::Instant::now();
     let plan = plan_semantic_git_import(&snapshot, &blob_store).unwrap();
+    eprintln!("phase plan: {:.2}s", phase.elapsed().as_secs_f64());
     let trees = plan
         .aliases
         .iter()
@@ -56,19 +60,24 @@ fn a_real_repository_enriches_into_replayable_history() {
         })
         .collect::<BTreeMap<_, _>>();
 
+    let phase = std::time::Instant::now();
     let deltas = derive_historical_semantic_deltas(&plan.changes, &trees, &blob_store).unwrap();
+    eprintln!("phase derive: {:.2}s", phase.elapsed().as_secs_f64());
     let bindings = deltas
         .into_iter()
         .map(|delta| (delta.change_id, delta.entity_deltas, delta.relation_deltas))
         .collect::<Vec<_>>();
-    let admitted = admit_semantic_git_import(
-        &plan
-            .with_historical_semantics(&blob_store, &bindings)
-            .unwrap(),
-        &blob_store,
-    )
-    .unwrap();
+    let phase = std::time::Instant::now();
+    let enriched = plan
+        .with_historical_semantics(&blob_store, &bindings)
+        .unwrap();
+    eprintln!("phase bind: {:.2}s", phase.elapsed().as_secs_f64());
+    let phase = std::time::Instant::now();
+    let admitted = admit_semantic_git_import(&enriched, &blob_store).unwrap();
+    eprintln!("phase admit: {:.2}s", phase.elapsed().as_secs_f64());
+    let phase = std::time::Instant::now();
     admitted.validate(&blob_store).unwrap();
+    eprintln!("phase validate: {:.2}s", phase.elapsed().as_secs_f64());
 
     // The graph must never publish a change its own replay rejects, so every
     // head is resolved rather than only the tip of the default branch.
