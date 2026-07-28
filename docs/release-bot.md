@@ -1,10 +1,25 @@
 # Release tag bot
 
-`.github/workflows/release-tag.yml` lets the release captain create a `vX.Y.Z`
-release tag **without holding the founder credential**, while keeping every
-guarantee the manual tag push had. It is the front door to the existing
-fail-closed release pipeline (`.github/workflows/release.yml`), which still
-triggers on the tag push exactly as before.
+Kin's release front door is automatic and fail closed:
+
+1. `.github/workflows/release-train.yml` coalesces reviewed `main` drift into
+   one `automation/release-next` PR.
+2. The PR moves Cargo, npm, the explicit `kin-spine` path pin, `Cargo.lock`,
+   and `CHANGELOG.md` together, then uses normal protected-main checks and
+   GitHub auto-merge.
+3. `.github/workflows/release-tag.yml` finds the exact reviewed commit where
+   the coherent untagged version first appeared and creates `vX.Y.Z` with the
+   scoped release App.
+4. The existing tag-only `.github/workflows/release.yml` publishes and proves
+   the release. `.github/workflows/release-recovery.yml` retries only failed or
+   timed-out jobs, at most twice, while preserving the same immutable tag. Its
+   final job publishes and attests deterministic `release-promotion.json`
+   only after every stable-release capstone succeeds.
+5. Installer and hosted reconcilers take over afterward.
+
+The manual dispatch remains a break-glass recovery path. It lets the release
+captain create a tag **without holding the founder credential**, while keeping
+every guarantee the manual tag push had.
 
 ## Why it exists
 
@@ -15,7 +30,8 @@ that is allowlisted in the ruleset. The captain dispatches the workflow; the
 workflow verifies the release is safe and then mints a short-lived App
 installation token to create the tag ref.
 
-The tag ref is created with the **App installation token, never the workflow's
+The release branch and tag ref are pushed with the **App installation token,
+never the workflow's
 `GITHUB_TOKEN`**. This matters for two reasons:
 
 1. The ruleset admits the App, so the `v*` tag creation is allowed.
@@ -23,21 +39,37 @@ The tag ref is created with the **App installation token, never the workflow's
    workflows (GitHub's recursion guard). A ref created by an App token **does**,
    so `release.yml` fires normally.
 
-## What it does (fail-closed checks, in order)
+## Automatic release PR
+
+The release train runs after successful `main` CI and on a staggered 15-minute
+reconcile. If `main` is ahead of its already-tagged workspace version, it opens
+or updates one automation-owned PR. Patch is the default; merged PR labels
+`release:minor` and `release:major` raise the bump to the highest declared
+intent.
+
+The release App has repository Contents permission but no `main` bypass. It can
+only update `automation/release-next`; the repository `GITHUB_TOKEN` opens the
+PR and arms auto-merge. A final App-authored synchronize event starts ordinary
+PR checks without a standing PAT. Main must require up-to-date checks so new
+merges cause the train to coalesce and re-test rather than release an older
+changelog against newer code.
+
+## Tag admission (fail-closed checks, in order)
 
 The single job refuses — before any tag is created — unless **all** hold:
 
-1. **Authorized actor + ref.** `github.actor` must be in the allowlist
+1. **Trusted trigger or authorized manual actor.** Scheduled and `workflow_run`
+   events use the workflow from protected default-branch history. A manual
+   dispatch still requires `github.actor` in the allowlist
    (`troyjr4103`, `kin-release-bot[bot]`) and the dispatch ref must be
    `refs/heads/main`. A branch dispatch of the workflow is refused loudly.
 2. **Well-formed inputs.** `tag` must match `^v[0-9]+\.[0-9]+\.[0-9]+$`; `sha`
    must be a 40-character lowercase hex commit SHA. (`workflow_dispatch` cannot
    enforce a regex, so it is validated in-job. Both are handled only through the
    environment, never interpolated into a shell.)
-3. **SHA is current `origin/main` HEAD.** The workflow checks out the SHA, fetches
-   `origin/main`, and refuses unless the checked-out HEAD equals both the
-   requested SHA and current `origin/main`. You can only tag the reviewed tip of
-   main.
+3. **SHA is reviewed `origin/main` history.** The automatic path tags the exact
+   coherent release-PR merge commit even if unrelated reviewed work has since
+   advanced `main`; a manual request remains restricted to current `main`.
 4. **Tag matches the workspace version.** `[workspace.package].version` in the
    root `Cargo.toml` **at that SHA** must equal the tag minus its `v`. This is
    the same version `release.yml` later asserts against the built packages.
@@ -66,19 +98,45 @@ The single job refuses — before any tag is created — unless **all** hold:
    second guard already refuses any present check that is failing, this list need
    not mirror every CI context — extend it only to force *presence* of a
    release-critical check (add branch-protection additions here too).
-6. **Tag does not already exist.** Refuses if `refs/tags/<tag>` is present.
+6. **The prior release lane is settled.** No Release run may be queued or
+   active, and the prior stable must retain a successful exact tag/SHA Release
+   run. This prevents GitHub concurrency from replacing a pending version.
+7. **Tag does not already exist.** Refuses if `refs/tags/<tag>` is present.
 
 Only then does it mint the App token, create `refs/tags/<tag>` at the SHA, and
 **post-verify** that the new ref points at the SHA. A run summary records the
 tag, SHA, and actor.
 
-## Captain usage
+## Automatic recovery
 
-One command, from a machine authenticated as an allowlisted actor:
+The release controller immediately and periodically reconciles failed,
+timed-out, or runner-startup-failed `Release` runs. It re-fetches the run
+through the Actions API, checks
+the exact workflow path, repository, stable SemVer tag, peeled tag commit,
+default-branch ancestry, absence of any successful attempt, and absence of an
+active release before requesting `rerun-failed-jobs`. The initial attempt plus
+two retries is the hard cap. Cancellation is treated as an operator stop and is
+never retried. If all three attempts fail, the controller opens one
+`Release blocked after automatic retries` issue and stops.
+
+## Captain break-glass usage
+
+Normal releases need no captain command. To recover a refused automatic path,
+an allowlisted actor can dispatch the same admission workflow explicitly:
 
 ```sh
 gh workflow run release-tag.yml -f tag=v0.3.0 -f sha=<40-hex-sha>
 ```
+
+If a successful historical Actions run has aged out or been deleted, automatic
+admission re-establishes the prior stable from its checksum-bound terminal
+completion marker and GitHub artifact attestation pinned to the exact release
+workflow, tag, commit, GitHub-hosted runner, and transparency timestamp.
+The one explicit pre-marker migration release, v0.3.6, additionally has to
+prove exact npm latest versions, matching GHCR latest/version/tag digests, and
+aggregate release provenance. Markerless fallback is retired for v0.4.0 and
+later. Missing logs therefore cannot make the train permanently stale, while a
+preserved failed attempt can never be overridden by public-surface fallback.
 
 Get the SHA to release (current reviewed main tip):
 
@@ -126,6 +184,12 @@ These steps require the founder / org owner and gate the bot going live.
    `permissions: contents: read` + `checks: read`. Ensure repo/org Actions
    settings permit those read scopes on `GITHUB_TOKEN` (default). The App token,
    not `GITHUB_TOKEN`, carries the write.
+6. **Admit protected release PR automation.** Keep the repository default
+   workflow token permission at **read**, enable **Allow GitHub Actions to create
+   and approve pull requests**, and keep the main required-status rule in strict
+   up-to-date mode. `release-train.yml` explicitly elevates only Issues and Pull
+   requests for its PR metadata; its branch bytes still come from the
+   repository-scoped App, and neither identity bypasses protected `main`.
 
 ### Install scope and token narrowing
 

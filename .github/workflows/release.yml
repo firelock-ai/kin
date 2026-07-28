@@ -2439,3 +2439,162 @@ jobs:
             echo "- source: \`${SRC}\`"
             echo "- digest: \`${source_digest}\`"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  seal_release_completion:
+    name: Seal completed stable release
+    needs:
+      - config
+      - build_daemon_image
+      - finalize_release
+      - promote_ghcr_latest
+      - publish_boundary_contracts
+      - version_tag_image
+    if: >-
+      ${{
+        always() &&
+        needs.config.result == 'success' &&
+        needs.build_daemon_image.result == 'success' &&
+        needs.finalize_release.result == 'success' &&
+        needs.promote_ghcr_latest.result == 'success' &&
+        needs.publish_boundary_contracts.result == 'success' &&
+        needs.version_tag_image.result == 'success' &&
+        needs.config.outputs.release_channel == 'latest' &&
+        startsWith(github.ref, 'refs/tags/v') &&
+        !contains(github.ref_name, '-')
+      }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: release
+    permissions:
+      contents: write
+      attestations: write
+      id-token: write
+    steps:
+      - name: Checkout exact completed release
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Generate deterministic completion marker
+        env:
+          GHCR_DIGEST: ${{ needs.build_daemon_image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          commit="$(git rev-parse HEAD)"
+          [ "$commit" = "$(git rev-parse "${GITHUB_REF_NAME}^{commit}")" ]
+          [[ "$GHCR_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          jq -nS \
+            --arg tag "$GITHUB_REF_NAME" \
+            --arg commit "$commit" \
+            --arg ghcr_digest "$GHCR_DIGEST" \
+            '{
+              schema_version: 1,
+              release_tag: $tag,
+              commit: $commit,
+              signer_workflow: ".github/workflows/release.yml",
+              ghcr_digest: $ghcr_digest,
+              completed_capstones: [
+                "github_stable_latest",
+                "install_proof",
+                "npm_public_provenance_and_smoke",
+                "ghcr_version_and_latest",
+                "post_release_boundary_contracts_settled"
+              ]
+            }' > release-promotion.json
+          sha256sum release-promotion.json > release-promotion.json.sha256
+          sha256sum -c release-promotion.json.sha256
+
+      - name: Refuse mismatched existing completion assets
+        id: existing
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          release="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}")"
+          marker_id="$(jq -r '[.assets[] | select(.name == "release-promotion.json")] | if length > 1 then error("duplicate marker assets") else .[0].id // empty end' <<< "$release")"
+          sidecar_id="$(jq -r '[.assets[] | select(.name == "release-promotion.json.sha256")] | if length > 1 then error("duplicate marker sidecars") else .[0].id // empty end' <<< "$release")"
+          marker_present=false
+          sidecar_present=false
+          if [ -n "$marker_id" ]; then
+            gh api \
+              -H "Accept: application/octet-stream" \
+              "repos/${GITHUB_REPOSITORY}/releases/assets/${marker_id}" \
+              > existing-release-promotion.json
+            cmp release-promotion.json existing-release-promotion.json
+            marker_present=true
+          fi
+          if [ -n "$sidecar_id" ]; then
+            gh api \
+              -H "Accept: application/octet-stream" \
+              "repos/${GITHUB_REPOSITORY}/releases/assets/${sidecar_id}" \
+              > existing-release-promotion.json.sha256
+            cmp release-promotion.json.sha256 existing-release-promotion.json.sha256
+            sidecar_present=true
+          fi
+          {
+            echo "marker_present=$marker_present"
+            echo "sidecar_present=$sidecar_present"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Attest terminal completion marker
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        with:
+          subject-path: release-promotion.json
+
+      - name: Publish missing completion assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MARKER_PRESENT: ${{ steps.existing.outputs.marker_present }}
+          SIDECAR_PRESENT: ${{ steps.existing.outputs.sidecar_present }}
+        run: |
+          set -euo pipefail
+          assets=()
+          [ "$MARKER_PRESENT" = true ] || assets+=(release-promotion.json)
+          [ "$SIDECAR_PRESENT" = true ] || assets+=(release-promotion.json.sha256)
+          if [ "${#assets[@]}" -gt 0 ]; then
+            gh release upload "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
+              "${assets[@]}"
+          fi
+
+      - name: Verify public terminal completion proof
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          proof_dir="$RUNNER_TEMP/release-completion-proof"
+          mkdir -p "$proof_dir"
+          gh release download "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern release-promotion.json \
+            --pattern release-promotion.json.sha256 \
+            --dir "$proof_dir"
+          (
+            cd "$proof_dir"
+            sha256sum -c release-promotion.json.sha256
+            cmp release-promotion.json "$GITHUB_WORKSPACE/release-promotion.json"
+          )
+
+          verified=false
+          for attempt in $(seq 1 18); do
+            if gh attestation verify "$proof_dir/release-promotion.json" \
+              --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/release.yml" \
+              --signer-digest "$GITHUB_SHA" \
+              --source-ref "$GITHUB_REF" \
+              --source-digest "$GITHUB_SHA" \
+              --deny-self-hosted-runners \
+              --format json > "$proof_dir/attestation.json"; then
+              verified=true
+              break
+            fi
+            [ "$attempt" -eq 18 ] || sleep 10
+          done
+          [ "$verified" = true ]
+          jq -e '
+            length > 0 and
+            all(.[];
+              (.verificationResult.verifiedTimestamps | type == "array" and length > 0)
+            )
+          ' "$proof_dir/attestation.json" >/dev/null

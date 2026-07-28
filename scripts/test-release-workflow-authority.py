@@ -14,6 +14,9 @@ ROOT = Path(__file__).resolve().parent.parent
 WORKFLOWS = ROOT / ".github" / "workflows"
 README = ROOT / "README.md"
 RELEASE = WORKFLOWS / "release.yml"
+RELEASE_RECOVERY = WORKFLOWS / "release-recovery.yml"
+RELEASE_TAG = WORKFLOWS / "release-tag.yml"
+RELEASE_TRAIN = WORKFLOWS / "release-train.yml"
 INSTALL_PROOF = WORKFLOWS / "install-proof.yml"
 INSTALLER_CALLBACK = WORKFLOWS / "publish-release-installers.yml"
 UPDATE_TRUST = ROOT / "docs" / "security" / "signing-and-update-trust.md"
@@ -41,6 +44,9 @@ def main() -> None:
             )
 
     release = RELEASE.read_text(encoding="utf-8")
+    release_recovery = RELEASE_RECOVERY.read_text(encoding="utf-8")
+    release_tag = RELEASE_TAG.read_text(encoding="utf-8")
+    release_train = RELEASE_TRAIN.read_text(encoding="utf-8")
     install_proof = INSTALL_PROOF.read_text(encoding="utf-8")
     readme = README.read_text(encoding="utf-8")
     ci_workflow = (WORKFLOWS / "ci.yml").read_text(encoding="utf-8")
@@ -79,6 +85,141 @@ def main() -> None:
     require(release, 'tags:\n      - "v*.*.*"', "release trigger")
     require(release, "  build_daemon_image:", "release daemon image job")
     require(release, "  attest_daemon_image:", "release daemon attestation job")
+    for policy in (
+        "  seal_release_completion:",
+        "name: Seal completed stable release",
+        "needs.promote_ghcr_latest.result == 'success'",
+        "needs.publish_boundary_contracts.result == 'success'",
+        "release-promotion.json.sha256",
+        "completed_capstones",
+        "Attest terminal completion marker",
+        "actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6",
+        "Refuse mismatched existing completion assets",
+        "Verify public terminal completion proof",
+    ):
+        require(release, policy, "terminal stable-release completion seal")
+
+    for policy in (
+        'workflows: ["CI"]',
+        "types: [completed]",
+        'cron: "11,26,41,56 * * * *"',
+        "actions: read",
+        "attestations: read",
+        "contents: read",
+        "checks: read",
+        "github.event.workflow_run.event == 'push'",
+        "github.event.workflow_run.head_branch == 'main'",
+        "github.event.workflow_run.conclusion == 'success'",
+        "node scripts/release-intent.mjs",
+        "git merge-base --is-ancestor",
+        "manual release sha",
+        "actions/workflows/release.yml/runs?per_page=100",
+        '.status == "requested"',
+        ".status == \"queued\"",
+        ".conclusion == \"success\"",
+        "release-provenance.json.sha256",
+        "release-promotion.json.sha256",
+        "gh attestation verify release-provenance.json",
+        "gh attestation verify release-promotion.json",
+        "verifiedTimestamps",
+        "registry.npmjs.org/@kinlab%2F",
+        "ghcr.io/v2/firelock-ai/kin/manifests",
+        'latest_tag" != v0.3.6',
+        "markerless logless fallback is retired",
+        "matching_count",
+        "highest_tag",
+        "REQUIRED_CHECKS:",
+        "did not settle within 20 minutes",
+        "actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1",
+        "repositories: kin",
+        'ref="refs/tags/$TAG"',
+    ):
+        require(release_tag, policy, "automatic App-mediated release tag admission")
+    for forbidden in (
+        "contents: write",
+        "packages: write",
+        "id-token: write",
+        "KIN_CI_BOT_TOKEN",
+    ):
+        if forbidden in release_tag:
+            raise AssertionError(
+                f"release-tag workflow contains forbidden standing authority: {forbidden}"
+            )
+
+    for policy in (
+        'name: Release Train',
+        'workflows: ["CI"]',
+        'cron: "7,22,37,52 * * * *"',
+        "types: [release-reconcile]",
+        "contents: read",
+        "issues: write",
+        "pull-requests: write",
+        "github.event.workflow_run.event == 'push'",
+        "github.event.workflow_run.head_branch == 'main'",
+        "github.event.workflow_run.conclusion == 'success'",
+        "actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1",
+        "repositories: kin",
+        "BRANCH: automation/release-next",
+        'git show "refs/remotes/origin/main:${policy}"',
+        'node "$policy_dir/prepare-release.mjs"',
+        'node "$policy_dir/check-release-version.mjs"',
+        'node "$policy_dir/release-intent.mjs"',
+        "release branch contains non-generated paths",
+        "git restore --source refs/remotes/origin/main",
+        '.headRepositoryOwner.login == "firelock-ai"',
+        '.headRepository.nameWithOwner == "firelock-ai/kin"',
+        "highest_tag",
+        "git merge --signoff --no-edit -X ours refs/remotes/origin/main",
+        'gh pr merge "$PR"',
+        "--auto",
+        "--squash",
+        "git commit --allow-empty --signoff",
+        "Activate protected checks for the automated release PR",
+    ):
+        require(release_train, policy, "coalescing protected release train")
+    for forbidden in (
+        "workflow_dispatch:",
+        "contents: write",
+        "packages: write",
+        "id-token: write",
+        "git push --force",
+        "git push -f",
+    ):
+        if forbidden in release_train:
+            raise AssertionError(
+                f"release train contains forbidden authority or history rewrite: {forbidden}"
+            )
+
+    for policy in (
+        "name: Release Recovery",
+        'workflows: ["Release"]',
+        'cron: "3,18,33,48 * * * *"',
+        "actions: write",
+        "contents: read",
+        "issues: write",
+        "github.event.workflow_run.conclusion == 'failure'",
+        "github.event.workflow_run.conclusion == 'timed_out'",
+        "github.event.workflow_run.conclusion == 'startup_failure'",
+        "actions/workflows/release.yml/runs?per_page=100",
+        '.status == "requested"',
+        '.path == ".github/workflows/release.yml"',
+        '.head_repository.full_name == $repo',
+        "rerun-failed-jobs",
+        '[ "$attempt" -ge 3 ]',
+        "Release blocked after automatic retries",
+    ):
+        require(release_recovery, policy, "bounded automatic release recovery")
+    for forbidden in (
+        "workflow_dispatch:",
+        "contents: write",
+        "packages: write",
+        "id-token: write",
+        "conclusion == 'cancelled'",
+    ):
+        if forbidden in release_recovery:
+            raise AssertionError(
+                f"release recovery contains forbidden authority or retry state: {forbidden}"
+            )
 
     pinned_readme_version = re.search(r"\bv?\d+\.\d+\.\d+\b", readme)
     if pinned_readme_version:
@@ -998,9 +1139,9 @@ def main() -> None:
             )
 
     print(
-        "release workflow authority is tag-only, protected, pinned, GCP-free, "
-        "cross-platform byte-canonical, and npm automatic through short-lived "
-        "OIDC with post-public proof"
+        "release workflow authority is reviewed-PR to App-tag automatic, "
+        "protected, pinned, GCP-free, cross-platform byte-canonical, and npm "
+        "automatic through short-lived OIDC with post-public proof"
     )
 
 

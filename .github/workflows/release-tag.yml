@@ -12,11 +12,17 @@ name: Release Tag (bot-mediated)
 # never the default GITHUB_TOKEN — is what lets the existing tag-triggered
 # `release.yml` DAG fire.
 #
-# Every step below is fail-closed: any unmet precondition aborts before the tag
-# is created. See docs/release-bot.md for the operator runbook and the one-time
-# founder setup.
+# Automatic reconciliation uses only trusted default-branch workflow code. It
+# finds the exact reviewed commit where an untagged coherent version first
+# appeared, waits for release-critical checks and the prior release lane, then
+# uses the same App-mediated tag write as the manual break-glass path.
 
 on:
+  schedule:
+    - cron: "11,26,41,56 * * * *"
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
   workflow_dispatch:
     inputs:
       tag:
@@ -32,6 +38,8 @@ on:
 # tag ref). The workflow's own GITHUB_TOKEN stays read-only: contents:read for
 # checkout and ref reads, checks:read to inspect the commit's check-runs.
 permissions:
+  actions: read
+  attestations: read
   contents: read
   checks: read
 
@@ -43,14 +51,19 @@ concurrency:
 jobs:
   mint-release-tag:
     name: Mint release tag
+    if: >-
+      github.event_name != 'workflow_run' ||
+      (
+        github.event.workflow_run.event == 'push' &&
+        github.event.workflow_run.head_branch == 'main' &&
+        github.event.workflow_run.conclusion == 'success'
+      )
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 45
     steps:
-      - name: Guard — authorized actor and ref
-        # Only the release captain or the bot may dispatch, and only against the
-        # trusted workflow file on main. A branch dispatch of this file is
-        # refused loudly rather than silently skipped.
+      - name: Guard manual authority
         env:
+          EVENT_NAME: ${{ github.event_name }}
           ACTOR: ${{ github.actor }}
           REF: ${{ github.ref }}
           ALLOWED_ACTORS: |
@@ -58,6 +71,10 @@ jobs:
             kin-release-bot[bot]
         run: |
           set -euo pipefail
+          if [ "$EVENT_NAME" != workflow_dispatch ]; then
+            echo "trusted automatic trigger: $EVENT_NAME"
+            exit 0
+          fi
           if [ "$REF" != "refs/heads/main" ]; then
             echo "::error::release-tag must be dispatched from main (got '$REF')"
             exit 1
@@ -73,37 +90,117 @@ jobs:
           fi
           echo "authorized actor=$ACTOR ref=$REF"
 
-      - name: Validate inputs
-        # workflow_dispatch inputs cannot enforce a regex, so validate here and
-        # normalize the SHA to lowercase. Both are routed through the job
-        # environment (never interpolated into a shell) to stay injection-safe.
+      - name: Checkout trusted release policy
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve exact coherent release commit
+        id: resolve
         env:
+          EVENT_NAME: ${{ github.event_name }}
           RAW_TAG: ${{ inputs.tag }}
           RAW_SHA: ${{ inputs.sha }}
+          WORKFLOW_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
           set -euo pipefail
-          tag="$RAW_TAG"
-          sha="$(printf '%s' "$RAW_SHA" | tr '[:upper:]' '[:lower:]')"
+          git fetch origin \
+            "+refs/heads/main:refs/remotes/origin/main" \
+            "+refs/tags/*:refs/tags/*"
+
+          automatic=true
+          tag=""
+          case "$EVENT_NAME" in
+            workflow_dispatch)
+              automatic=false
+              tag="$RAW_TAG"
+              sha="$(printf '%s' "$RAW_SHA" | tr '[:upper:]' '[:lower:]')"
+              ;;
+            workflow_run)
+              sha="$WORKFLOW_SHA"
+              ;;
+            schedule)
+              sha="$(git rev-parse refs/remotes/origin/main)"
+              ;;
+            *)
+              echo "::error::unsupported release-tag event: $EVENT_NAME"
+              exit 1
+              ;;
+          esac
+
           if ! printf '%s' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
-            echo "::error::tag '$tag' must match ^v[0-9]+\.[0-9]+\.[0-9]+\$"
-            exit 1
+            if [ "$automatic" != true ]; then
+              echo "::error::tag '$tag' must match ^v[0-9]+\.[0-9]+\.[0-9]+\$"
+              exit 1
+            fi
           fi
           if ! printf '%s' "$sha" | grep -Eq '^[0-9a-f]{40}$'; then
             echo "::error::sha '$sha' must be a 40-character lowercase hex commit SHA"
             exit 1
           fi
+          if [ "$automatic" = true ]; then
+            current_version="$(git show "$sha:Cargo.toml" | python3 -c '
+          import sys, tomllib
+          print(tomllib.loads(sys.stdin.read())["workspace"]["package"]["version"])
+          ')"
+            # Both scheduled reconciliation and workflow_run retries normalize
+            # to the first reviewed main commit carrying this version. A later
+            # green commit must never be swept into an already-prepared release.
+            candidate="$sha"
+            while IFS= read -r commit; do
+              version="$(git show "$commit:Cargo.toml" | python3 -c '
+          import sys, tomllib
+          print(tomllib.loads(sys.stdin.read())["workspace"]["package"]["version"])
+          ')"
+              [ "$version" = "$current_version" ] || break
+              candidate="$commit"
+            done < <(git log --first-parent --format=%H "$sha" -- Cargo.toml)
+            sha="$candidate"
+          fi
+
+          git checkout --detach "$sha"
+          intent="$RUNNER_TEMP/release-intent.outputs"
+          : > "$intent"
+          GITHUB_OUTPUT="$intent" node scripts/release-intent.mjs
+          resolved_tag="$(sed -n 's/^tag=//p' "$intent")"
+          should_tag="$(sed -n 's/^should_tag=//p' "$intent")"
+          test -n "$resolved_tag"
+          test -n "$should_tag"
+
+          if [ "$automatic" = true ]; then
+            tag="$resolved_tag"
+            if [ "$should_tag" != true ]; then
+              echo "::notice::${tag} already exists; release tag reconciliation is a no-op."
+              echo "needed=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          else
+            if [ "$resolved_tag" != "$tag" ]; then
+              echo "::error::requested tag $tag does not match coherent intent $resolved_tag"
+              exit 1
+            fi
+            if [ "$should_tag" != true ]; then
+              echo "::error::requested tag $tag already exists"
+              exit 1
+            fi
+          fi
+
+          {
+            echo "needed=true"
+            echo "automatic=$automatic"
+            echo "tag=$tag"
+            echo "sha=$sha"
+          } >> "$GITHUB_OUTPUT"
           echo "TAG=$tag" >> "$GITHUB_ENV"
           echo "SHA=$sha" >> "$GITHUB_ENV"
-          echo "validated tag=$tag sha=$sha"
+          echo "resolved coherent release tag=$tag sha=$sha automatic=$automatic"
 
-      - name: Checkout requested SHA
-        uses: actions/checkout@v7
-        with:
-          ref: ${{ env.SHA }}
-          fetch-depth: 0
-          persist-credentials: false
-
-      - name: Verify SHA is current origin/main HEAD
+      - name: Verify SHA is on reviewed origin/main history
+        if: steps.resolve.outputs.needed == 'true'
+        env:
+          AUTOMATIC: ${{ steps.resolve.outputs.automatic }}
         run: |
           set -euo pipefail
           git fetch --no-tags origin main
@@ -114,13 +211,19 @@ jobs:
             echo "::error::checked-out HEAD ($head_sha) != requested sha ($SHA)"
             exit 1
           fi
-          if [ "$head_sha" != "$main_sha" ]; then
-            echo "::error::sha $SHA is not current origin/main HEAD ($main_sha) — refusing"
+          if [ "$AUTOMATIC" = true ]; then
+            if ! git merge-base --is-ancestor "$head_sha" "$main_sha"; then
+              echo "::error::automatic release sha $SHA is not on reviewed main history"
+              exit 1
+            fi
+          elif [ "$head_sha" != "$main_sha" ]; then
+            echo "::error::manual release sha $SHA is not current origin/main HEAD ($main_sha)"
             exit 1
           fi
-          echo "sha confirmed at origin/main HEAD"
+          echo "sha confirmed on reviewed origin/main history"
 
       - name: Verify tag version matches workspace version
+        if: steps.resolve.outputs.needed == 'true'
         # The version of record is [workspace.package].version in the root
         # Cargo.toml at the requested SHA. The tag must be exactly that, v-prefixed.
         run: |
@@ -140,7 +243,243 @@ jobs:
           fi
           echo "tag matches workspace version"
 
+      - name: Admit the serialized release lane
+        id: prior
+        if: steps.resolve.outputs.needed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          AUTOMATIC: ${{ steps.resolve.outputs.automatic }}
+        run: |
+          set -euo pipefail
+          runs="$(gh api "repos/${REPO}/actions/workflows/release.yml/runs?per_page=100")"
+          active="$(jq '[.workflow_runs[] | select(
+            .status == "requested" or .status == "queued" or .status == "in_progress" or
+            .status == "waiting" or .status == "pending"
+          )] | length' <<< "$runs")"
+          if [ "$active" -ne 0 ]; then
+            if [ "$AUTOMATIC" = true ]; then
+              echo "::notice::${active} Release run(s) are active; a scheduled reconcile will retry."
+              echo "ready=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "::error::${active} Release run(s) are active"
+            exit 1
+          fi
+
+          latest="$(gh api "repos/${REPO}/releases/latest")"
+          latest_tag="$(jq -er .tag_name <<< "$latest")"
+          highest_tag=""
+          while IFS= read -r candidate_tag; do
+            if [[ "$candidate_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              highest_tag="$candidate_tag"
+              break
+            fi
+          done < <(git tag --list --sort=-v:refname)
+          if [ -z "$highest_tag" ] || [ "$highest_tag" != "$latest_tag" ]; then
+            if [ "$AUTOMATIC" = true ]; then
+              echo "::notice::highest tag ${highest_tag:-<none>} is not finalized GitHub Latest ${latest_tag}; release recovery will reconcile it."
+              echo "ready=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "::error::highest tag ${highest_tag:-<none>} is not finalized GitHub Latest ${latest_tag}"
+            exit 1
+          fi
+          ref="$(gh api "repos/${REPO}/git/ref/tags/${latest_tag}")"
+          object_type="$(jq -r .object.type <<< "$ref")"
+          latest_sha="$(jq -r .object.sha <<< "$ref")"
+          for _ in 1 2 3 4; do
+            [ "$object_type" = tag ] || break
+            tag_object="$(gh api "repos/${REPO}/git/tags/${latest_sha}")"
+            object_type="$(jq -r .object.type <<< "$tag_object")"
+            latest_sha="$(jq -r .object.sha <<< "$tag_object")"
+          done
+          [ "$object_type" = commit ]
+          successful="$(jq -r \
+            --arg tag "$latest_tag" \
+            --arg sha "$latest_sha" \
+            '[.workflow_runs[] | select(
+              .event == "push" and
+              .status == "completed" and
+              .conclusion == "success" and
+              .head_branch == $tag and
+              .head_sha == $sha and
+              .path == ".github/workflows/release.yml"
+            )] | sort_by(.created_at) | last | .id // empty' \
+            <<< "$runs")"
+          if [ -z "$successful" ]; then
+            matching_count="$(jq \
+              --arg tag "$latest_tag" \
+              --arg sha "$latest_sha" \
+              '[.workflow_runs[] | select(
+                .event == "push" and
+                .head_branch == $tag and
+                .head_sha == $sha and
+                .path == ".github/workflows/release.yml"
+              )] | length' \
+              <<< "$runs")"
+            if [ "$matching_count" -ne 0 ]; then
+              if [ "$AUTOMATIC" = true ]; then
+                echo "::notice::latest stable ${latest_tag}@${latest_sha} has preserved Release attempts but none succeeded; recovery owns this state."
+                echo "ready=false" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              echo "::error::latest stable ${latest_tag}@${latest_sha} has preserved Release attempts but none succeeded"
+              exit 1
+            fi
+
+            # Actions logs are operational records, not durable release
+            # authority. Prefer the terminal marker produced only after every
+            # stable release capstone. Releases predating that marker must prove
+            # their exact npm and GHCR final surfaces in addition to aggregate
+            # provenance; this is intentionally a legacy-only fallback.
+            proof_dir="$RUNNER_TEMP/prior-release-proof"
+            mkdir -p "$proof_dir"
+            marker_count="$(jq '[.assets[] | select(.name == "release-promotion.json")] | length' <<< "$latest")"
+            sidecar_count="$(jq '[.assets[] | select(.name == "release-promotion.json.sha256")] | length' <<< "$latest")"
+            if [ "$marker_count" -gt 1 ] || [ "$sidecar_count" -gt 1 ]; then
+              echo "::error::prior stable has duplicate terminal completion assets"
+              exit 1
+            fi
+
+            if [ "$marker_count" -eq 1 ] || [ "$sidecar_count" -eq 1 ]; then
+              if [ "$marker_count" -ne 1 ] || [ "$sidecar_count" -ne 1 ]; then
+                echo "::error::prior stable has a partial terminal completion marker"
+                exit 1
+              fi
+              gh release download "$latest_tag" \
+                --repo "$REPO" \
+                --pattern release-promotion.json \
+                --pattern release-promotion.json.sha256 \
+                --dir "$proof_dir"
+              (
+                cd "$proof_dir"
+                sha256sum -c release-promotion.json.sha256
+                jq -e \
+                  --arg tag "$latest_tag" \
+                  --arg sha "$latest_sha" \
+                  '
+                    .schema_version == 1 and
+                    .release_tag == $tag and
+                    .commit == $sha and
+                    .signer_workflow == ".github/workflows/release.yml" and
+                    (.ghcr_digest | test("^sha256:[0-9a-f]{64}$")) and
+                    (
+                      .completed_capstones == [
+                        "github_stable_latest",
+                        "install_proof",
+                        "npm_public_provenance_and_smoke",
+                        "ghcr_version_and_latest",
+                        "post_release_boundary_contracts_settled"
+                      ]
+                    )
+                  ' release-promotion.json >/dev/null
+                gh attestation verify release-promotion.json \
+                  --repo "$REPO" \
+                  --signer-workflow "${REPO}/.github/workflows/release.yml" \
+                  --signer-digest "$latest_sha" \
+                  --source-ref "refs/tags/${latest_tag}" \
+                  --source-digest "$latest_sha" \
+                  --deny-self-hosted-runners \
+                  --format json > attestation.json
+              )
+              echo "prior stable authority recovered from terminal completion marker: ${latest_tag}@${latest_sha}"
+            else
+              if [ "$latest_tag" != v0.3.6 ]; then
+                echo "::error::markerless logless fallback is retired after the explicit v0.3.6 migration boundary"
+                exit 1
+              fi
+              gh release download "$latest_tag" \
+                --repo "$REPO" \
+                --pattern release-provenance.json \
+                --pattern release-provenance.json.sha256 \
+                --dir "$proof_dir"
+              (
+                cd "$proof_dir"
+                sha256sum -c release-provenance.json.sha256
+                jq -e \
+                  --arg tag "$latest_tag" \
+                  --arg sha "$latest_sha" \
+                  '
+                    .schema_version == 2 and
+                    .release_tag == $tag and
+                    .kin.commit == $sha and
+                    (.artifacts | type == "array" and length == 5) and
+                    all(.artifacts[];
+                      .release_tag == $tag and
+                      .kin.commit == $sha and
+                      (.archive.sha256 | test("^[0-9a-f]{64}$"))
+                    )
+                  ' release-provenance.json >/dev/null
+                gh attestation verify release-provenance.json \
+                  --repo "$REPO" \
+                  --signer-workflow "${REPO}/.github/workflows/release.yml" \
+                  --signer-digest "$latest_sha" \
+                  --source-ref "refs/tags/${latest_tag}" \
+                  --source-digest "$latest_sha" \
+                  --deny-self-hosted-runners \
+                  --format json > attestation.json
+              )
+
+              version="${latest_tag#v}"
+              for package in kin kin-mcp; do
+                npm_version="$(curl -fsSL \
+                  --retry 5 \
+                  --retry-all-errors \
+                  --retry-delay 2 \
+                  "https://registry.npmjs.org/@kinlab%2F${package}/latest" \
+                  | jq -er .version)"
+                if [ "$npm_version" != "$version" ]; then
+                  echo "::error::legacy prior stable npm @kinlab/${package}@latest is ${npm_version}, expected ${version}"
+                  exit 1
+                fi
+              done
+
+              registry_token="$(curl -fsSL \
+                --retry 5 \
+                --retry-all-errors \
+                --retry-delay 2 \
+                'https://ghcr.io/token?scope=repository%3Afirelock-ai%2Fkin%3Apull' \
+                | jq -er .token)"
+              manifest_digest() {
+                local image_tag="$1"
+                local headers
+                headers="$(curl -fsSI \
+                  --retry 5 \
+                  --retry-all-errors \
+                  --retry-delay 2 \
+                  -H "Authorization: Bearer ${registry_token}" \
+                  -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json' \
+                  "https://ghcr.io/v2/firelock-ai/kin/manifests/${image_tag}" \
+                  | tr -d '\r')"
+                awk -F': ' \
+                  'tolower($1) == "docker-content-digest" {print $2}' \
+                  <<< "$headers"
+              }
+              ghcr_latest="$(manifest_digest latest)"
+              ghcr_version="$(manifest_digest "$version")"
+              ghcr_tag="$(manifest_digest "$latest_tag")"
+              [[ "$ghcr_latest" =~ ^sha256:[0-9a-f]{64}$ ]]
+              [ "$ghcr_latest" = "$ghcr_version" ]
+              [ "$ghcr_latest" = "$ghcr_tag" ]
+              echo "prior stable authority recovered from legacy public capstones: ${latest_tag}@${latest_sha} ghcr=${ghcr_latest}"
+            fi
+
+            jq -e '
+              length > 0 and
+              all(.[];
+                (.verificationResult.verifiedTimestamps | type == "array" and length > 0)
+              )
+            ' "$proof_dir/attestation.json" >/dev/null
+          else
+            echo "prior stable authority: ${latest_tag}@${latest_sha} run=${successful}"
+          fi
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+
       - name: Verify required checks are green
+        if: >-
+          steps.resolve.outputs.needed == 'true' &&
+          steps.prior.outputs.ready == 'true'
         # Fail closed on the commit's check-runs. REQUIRED_CHECKS is the
         # presence-required release-critical set — a sha missing any of these is
         # refused even if nothing failed. Each must be present and green
@@ -161,10 +500,15 @@ jobs:
             Windows installer + vector-free release build
         run: |
           set -euo pipefail
-          gh api "repos/$REPO/commits/$SHA/check-runs?per_page=100" --paginate \
-            -q '.check_runs[] | {name: .name, status: .status, conclusion: .conclusion, id: .id}' \
-            > check_runs.ndjson || { echo "::error::failed to fetch check-runs for $SHA"; exit 1; }
-          python3 - <<'PY'
+          for attempt in $(seq 1 40); do
+            gh api "repos/$REPO/commits/$SHA/check-runs?per_page=100" --paginate \
+              -q '.check_runs[] | {name: .name, status: .status, conclusion: .conclusion, id: .id}' \
+              > check_runs.ndjson || {
+                echo "::error::failed to fetch check-runs for $SHA"
+                exit 1
+              }
+            set +e
+            python3 - <<'PY'
           import json, os, sys
 
           runs = {}
@@ -181,40 +525,63 @@ jobs:
 
           required = [c.strip() for c in os.environ["REQUIRED_CHECKS"].splitlines() if c.strip()]
           acceptable = {"success", "skipped", "neutral"}
-          errors = []
+          failures = []
+          pending = []
 
           if not runs:
-              errors.append("no check-runs found on sha")
+              pending.append("no check-runs found on sha")
 
           for name in required:
               run = runs.get(name)
               if run is None:
-                  errors.append(f"missing required check: {name}")
+                  pending.append(f"missing required check: {name}")
               elif run["status"] != "completed":
-                  errors.append(f"required check not completed: {name} (status={run['status']})")
+                  pending.append(f"required check not completed: {name} (status={run['status']})")
               elif run["conclusion"] not in acceptable:
-                  errors.append(f"required check not green: {name} (conclusion={run['conclusion']})")
+                  failures.append(f"required check not green: {name} (conclusion={run['conclusion']})")
 
           for name, run in runs.items():
               # Self-exclude this workflow's own job ("Mint release tag") — a gate must not read its own refusals as evidence.
               if name == "Mint release tag":
                   continue
               if run["status"] != "completed":
-                  errors.append(f"check still in progress: {name} (status={run['status']})")
+                  pending.append(f"check still in progress: {name} (status={run['status']})")
               elif run["conclusion"] not in acceptable:
-                  errors.append(f"check not green: {name} (conclusion={run['conclusion']})")
+                  failures.append(f"check not green: {name} (conclusion={run['conclusion']})")
 
-          if errors:
+          if failures:
               print("::error::refusing — check verification failed:")
-              for err in errors:
+              for err in failures:
                   print(f"  - {err}")
               sys.exit(1)
+          if pending:
+              print("release-critical checks are not complete yet:")
+              for item in pending:
+                  print(f"  - {item}")
+              sys.exit(2)
 
           print(f"verified {len(required)} required checks green; "
                 f"{len(runs)} total checks, none failing or in progress")
           PY
+            status=$?
+            set -e
+            if [ "$status" -eq 0 ]; then
+              break
+            fi
+            if [ "$status" -ne 2 ]; then
+              exit "$status"
+            fi
+            if [ "$attempt" -eq 40 ]; then
+              echo "::error::release-critical checks did not settle within 20 minutes"
+              exit 1
+            fi
+            sleep 30
+          done
 
       - name: Verify tag does not already exist
+        if: >-
+          steps.resolve.outputs.needed == 'true' &&
+          steps.prior.outputs.ready == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -228,7 +595,10 @@ jobs:
 
       - name: Mint kin-release-bot installation token
         id: app-token
-        uses: actions/create-github-app-token@v2
+        if: >-
+          steps.resolve.outputs.needed == 'true' &&
+          steps.prior.outputs.ready == 'true'
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v2.2.1
         with:
           app-id: ${{ secrets.KIN_RELEASE_BOT_APP_ID }}
           private-key: ${{ secrets.KIN_RELEASE_BOT_PRIVATE_KEY }}
@@ -240,6 +610,9 @@ jobs:
           repositories: kin
 
       - name: Create release tag ref
+        if: >-
+          steps.resolve.outputs.needed == 'true' &&
+          steps.prior.outputs.ready == 'true'
         # Created with the App token (not GITHUB_TOKEN) so the ruleset admits it
         # AND so the tag push triggers release.yml.
         env:
@@ -254,6 +627,9 @@ jobs:
           echo "created refs/tags/$TAG"
 
       - name: Verify tag ref and summarize
+        if: >-
+          steps.resolve.outputs.needed == 'true' &&
+          steps.prior.outputs.ready == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}

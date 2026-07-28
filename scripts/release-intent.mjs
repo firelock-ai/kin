@@ -176,6 +176,44 @@ async function main() {
   }
   const npmVersion = npmVersions.map((n) => `${n.manifest.split('/').slice(-2, -1)[0] ?? n.manifest}@${n.version ?? '<missing>'}`).join(', ');
 
+  // 1b. Cargo's explicit internal path-version pin and every local Kin
+  // workspace entry in Cargo.lock must move with the workspace version. A
+  // global text replacement is forbidden: third-party packages such as
+  // async-stream can legitimately have the same numeric version.
+  const cliManifestPath = 'crates/kin-cli/Cargo.toml';
+  const cliManifest = await readFileOrNull(cliManifestPath);
+  const spinePin = cliManifest?.match(
+    /^kin-spine\s*=\s*\{[^\n]*version\s*=\s*"([^"]+)"[^\n]*\}$/m,
+  )?.[1] ?? null;
+  if (spinePin !== version) {
+    failures.push(
+      `${cliManifestPath} kin-spine path-version pin is ${spinePin ?? '<missing>'}, workspace is ${version}`,
+    );
+  }
+
+  const cargoLockPath = 'Cargo.lock';
+  const cargoLock = await readFileOrNull(cargoLockPath);
+  const localLockVersions = [];
+  if (cargoLock === null) {
+    failures.push(`${cargoLockPath} not found`);
+  } else {
+    for (const block of cargoLock.split('[[package]]').slice(1)) {
+      if (/^source\s*=/m.test(block)) continue;
+      const name = block.match(/^name = "([^"]+)"/m)?.[1] ?? null;
+      const locked = block.match(/^version = "([^"]+)"/m)?.[1] ?? null;
+      if (!name?.startsWith('kin-')) continue;
+      localLockVersions.push({ name, version: locked });
+      if (locked !== version) {
+        failures.push(
+          `${cargoLockPath} local package ${name} is ${locked ?? '<missing>'}, workspace is ${version}`,
+        );
+      }
+    }
+    if (localLockVersions.length === 0) {
+      failures.push(`${cargoLockPath} has no local Kin workspace packages`);
+    }
+  }
+
   // 2. CHANGELOG section: required for a stable release, advisory for prereleases.
   const changelogText = await readFileOrNull(opts.changelog);
   const hasChangelog = changelogText !== null && changelogHasSection(changelogText, version);
@@ -216,6 +254,8 @@ async function main() {
     console.log('Kin release-intent gate');
     console.log(`  workspace version : ${version}`);
     console.log(`  npm packages      : ${npmVersion || '<missing>'}`);
+    console.log(`  kin-spine pin     : ${spinePin ?? '<missing>'}`);
+    console.log(`  local lock entries: ${localLockVersions.length}`);
     console.log(`  changelog section : ${hasChangelog ? 'present' : 'absent'}`);
     console.log(`  newest tag        : ${newest ?? '<none>'}`);
     console.log(`  tag ${tag}${' '.repeat(Math.max(0, 13 - tag.length))}: ${tagExists ? 'exists' : 'absent'}`);

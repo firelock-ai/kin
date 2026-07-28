@@ -1,0 +1,201 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+
+name: Release Recovery
+
+# The primary release is tag-only. This trusted default-branch controller makes
+# transient runner, registry, and notarization failures self-healing without
+# making release.yml branch-dispatchable.
+on:
+  schedule:
+    - cron: "3,18,33,48 * * * *"
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
+
+permissions:
+  actions: write
+  contents: read
+  issues: write
+
+concurrency:
+  group: kin-release-recovery
+  cancel-in-progress: false
+
+jobs:
+  reconcile:
+    name: Reconcile failed release
+    if: >-
+      github.event_name == 'schedule' ||
+      (
+        github.event.workflow_run.event == 'push' &&
+        github.event.workflow_run.status == 'completed' &&
+        (
+          github.event.workflow_run.conclusion == 'failure' ||
+          github.event.workflow_run.conclusion == 'timed_out' ||
+          github.event.workflow_run.conclusion == 'startup_failure'
+        ) &&
+        startsWith(github.event.workflow_run.head_branch, 'v')
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Resolve exact retry candidate
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PREFERRED_RUN: ${{ github.event.workflow_run.id }}
+        run: |
+          set -euo pipefail
+          runs="$(gh api "repos/${REPO}/actions/workflows/release.yml/runs?per_page=100")"
+
+          active="$(jq '[.workflow_runs[] | select(
+            .status == "requested" or .status == "queued" or .status == "in_progress" or
+            .status == "waiting" or .status == "pending"
+          )] | length' <<< "$runs")"
+          if [ "$active" -ne 0 ]; then
+            echo "::notice::${active} Release run(s) are active; recovery will reconcile later."
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          candidate="$(jq -c \
+            --arg repo "$REPO" \
+            --arg preferred "${PREFERRED_RUN:-}" \
+            '
+              .workflow_runs as $runs |
+              [
+                $runs[] |
+                select(
+                  ($preferred == "" or (.id | tostring) == $preferred) and
+                  .event == "push" and
+                  .status == "completed" and
+                  (
+                    .conclusion == "failure" or
+                    .conclusion == "timed_out" or
+                    .conclusion == "startup_failure"
+                  ) and
+                  .path == ".github/workflows/release.yml" and
+                  .repository.full_name == $repo and
+                  .head_repository.full_name == $repo and
+                  (.head_branch | test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))
+                ) |
+                . as $failed |
+                select(
+                  any(
+                    $runs[];
+                    .head_branch == $failed.head_branch and
+                    .head_sha == $failed.head_sha and
+                    .event == "push" and
+                    .status == "completed" and
+                    .conclusion == "success" and
+                    .path == ".github/workflows/release.yml"
+                  ) | not
+                )
+              ] |
+              sort_by(.created_at) |
+              last // empty
+            ' <<< "$runs")"
+          if [ -z "$candidate" ]; then
+            echo "::notice::no failed, timed-out, or startup-failed Release run needs recovery."
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          run_id="$(jq -er '.id | tostring' <<< "$candidate")"
+          tag="$(jq -er .head_branch <<< "$candidate")"
+          sha="$(jq -er .head_sha <<< "$candidate")"
+          attempt="$(jq -er .run_attempt <<< "$candidate")"
+          url="$(jq -er .html_url <<< "$candidate")"
+          [[ "$run_id" =~ ^[0-9]+$ ]]
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$attempt" =~ ^[0-9]+$ ]]
+
+          latest_tag="$(gh api "repos/${REPO}/releases/latest" --jq .tag_name)"
+          [[ "$latest_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          highest="$(printf '%s\n%s\n' "${latest_tag#v}" "${tag#v}" | sort -V | tail -1)"
+          if [ "$highest" != "${tag#v}" ]; then
+            echo "::notice::ignoring historical failed ${tag}; current stable is ${latest_tag}."
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          ref="$(gh api "repos/${REPO}/git/ref/tags/${tag}")"
+          object_type="$(jq -r .object.type <<< "$ref")"
+          peeled="$(jq -r .object.sha <<< "$ref")"
+          for _ in 1 2 3 4; do
+            [ "$object_type" = tag ] || break
+            tag_object="$(gh api "repos/${REPO}/git/tags/${peeled}")"
+            object_type="$(jq -r .object.type <<< "$tag_object")"
+            peeled="$(jq -r .object.sha <<< "$tag_object")"
+          done
+          [ "$object_type" = commit ]
+          [ "$peeled" = "$sha" ]
+
+          ancestry="$(gh api "repos/${REPO}/compare/${sha}...main" --jq .status)"
+          [ "$ancestry" = ahead ] || [ "$ancestry" = identical ]
+
+          {
+            echo "needed=true"
+            echo "run_id=$run_id"
+            echo "tag=$tag"
+            echo "sha=$sha"
+            echo "attempt=$attempt"
+            echo "url=$url"
+          } >> "$GITHUB_OUTPUT"
+          if [ "$attempt" -ge 3 ]; then
+            echo "retry=false" >> "$GITHUB_OUTPUT"
+            echo "exhausted=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "retry=true" >> "$GITHUB_OUTPUT"
+            echo "exhausted=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Re-run failed jobs
+        if: >-
+          steps.resolve.outputs.needed == 'true' &&
+          steps.resolve.outputs.retry == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ steps.resolve.outputs.run_id }}
+        run: |
+          set -euo pipefail
+          gh api \
+            --method POST \
+            "repos/${REPO}/actions/runs/${RUN_ID}/rerun-failed-jobs" \
+            >/dev/null
+          echo "Requested bounded automatic retry for Release run ${RUN_ID}."
+
+      - name: Alert after automatic retries are exhausted
+        if: >-
+          steps.resolve.outputs.needed == 'true' &&
+          steps.resolve.outputs.exhausted == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ steps.resolve.outputs.tag }}
+          SHA: ${{ steps.resolve.outputs.sha }}
+          RUN_ID: ${{ steps.resolve.outputs.run_id }}
+          RUN_URL: ${{ steps.resolve.outputs.url }}
+        run: |
+          set -euo pipefail
+          title="Release blocked after automatic retries: ${TAG}"
+          existing="$(gh issue list \
+            --repo "$REPO" \
+            --state open \
+            --search "\"${title}\" in:title" \
+            --json number,title \
+            --jq ".[] | select(.title == \"${title}\") | .number" \
+            | head -1)"
+          if [ -z "$existing" ]; then
+            gh issue create \
+              --repo "$REPO" \
+              --title "$title" \
+              --body "The automatic release controller exhausted two retries for \`${TAG}\` at \`${SHA}\`. Release run: ${RUN_URL} (id ${RUN_ID}). The tag and any immutable public artifacts remain in place; diagnose and rerun the same release rather than cutting a newer version." \
+              >/dev/null
+          fi
+          echo "::error::${TAG} exhausted its two automatic retries: ${RUN_URL}"
+          exit 1
