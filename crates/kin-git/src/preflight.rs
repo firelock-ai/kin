@@ -27,7 +27,7 @@ use crate::error::{
     RegisteredGitWorktreeKind, Result,
 };
 use crate::lossless::{
-    capture_lossless_git_repository, open_repo, reject_shallow_repository, GitObjectFormat,
+    open_repo, reject_shallow_repository, verify_lossless_snapshot_unchanged, GitObjectFormat,
     LosslessGitRepository,
 };
 use crate::semantic_import::SemanticGitImportPlan;
@@ -230,7 +230,6 @@ impl fmt::Debug for GitBranchTrackingFact {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PreflightObservation {
-    snapshot: LosslessGitRepository,
     proof: GitMigrationPreflightProof,
 }
 
@@ -310,7 +309,7 @@ fn preflight_git_migration_with_hook(
     published_kin_dir: Option<&Path>,
     after_first_observation: impl FnOnce(),
 ) -> Result<GitMigrationPreflightProof> {
-    validate_plan_binding(snapshot, plan, blob_store)?;
+    validate_plan_binding(snapshot, plan)?;
     let expected = expected_index_entries(snapshot, plan)?;
     let first = observe(
         repo_path,
@@ -340,9 +339,12 @@ fn preflight_git_migration_with_hook(
 fn validate_plan_binding(
     snapshot: &LosslessGitRepository,
     plan: &SemanticGitImportPlan,
-    blob_store: &BlobStore,
 ) -> Result<()> {
-    plan.validate(blob_store)?;
+    // Binding-only check: the plan's full raw-object rebuild audit belongs to
+    // admission (`admit_semantic_git_import` validates the plan exactly once).
+    // The migration proof only needs the plan to be bound to the snapshot it
+    // is proving, so re-running the O(history x tree) self-derivation here
+    // three times per admission bought no additional proof.
     if plan.repository_id != snapshot.repository_id
         || plan.object_format != snapshot.object_format
         || plan.external_objects != snapshot.objects
@@ -366,51 +368,16 @@ fn observe(
 ) -> Result<PreflightObservation> {
     let source_worktree =
         fs::canonicalize(repo_path).map_err(|error| GitError::io(repo_path, error))?;
-    let snapshot = capture_lossless_git_repository(
-        &source_worktree,
-        expected_snapshot.repository_id.clone(),
-        blob_store,
-    )?;
-    if snapshot != *expected_snapshot {
-        return Err(preflight_error(
-            "source HEAD, refs, or reachable object closure no longer matches the supplied snapshot",
-        ));
-    }
-
     let repo = open_repo(&source_worktree)?;
-    reject_shallow_repository(&repo)?;
-    reject_in_progress_operations(&repo)?;
-    let source_git_dir = stable_path(repo.git_dir());
-    let workdir = repo.workdir().ok_or_else(|| {
-        preflight_error("migration preflight requires a materialized Git worktree")
-    })?;
-    if stable_path(workdir) != source_worktree {
-        return Err(preflight_error(format!(
-            "opened Git worktree {} does not match requested source {}",
-            workdir.display(),
-            source_worktree.display()
-        )));
-    }
-
-    let other_worktrees = other_registered_worktrees(&repo, &source_worktree)?;
-    if !other_worktrees.is_empty() {
-        return Err(GitError::AdditionalWorktrees {
-            count: other_worktrees.len(),
-            worktrees: other_worktrees,
-        });
-    }
-
-    let (configured_custom_hooks_path, hooks) = local_hook_facts(&repo)?;
-    let filters = checkout_filter_facts(&repo);
-    if configured_custom_hooks_path || !hooks.is_empty() || !filters.is_empty() {
-        return Err(GitError::LocalCompatibilityBlockers {
-            hook_count: hooks.len(),
-            custom_hooks_path: configured_custom_hooks_path,
-            filter_count: filters.len(),
-            hooks,
-            filters,
-        });
-    }
+    // Stability re-observation of the already-captured snapshot: refs, HEAD,
+    // and the reachable closure are re-proven byte-exactly (structure objects
+    // re-verified in full, blob bodies by presence, kind, and length) without
+    // re-reading every blob payload the initial capture already verified
+    // against both its OID and the CAS.
+    verify_lossless_snapshot_unchanged(&repo, expected_snapshot)?;
+    let snapshot = expected_snapshot;
+    let (source_git_dir, workdir) = assert_source_compatibility(&repo, &source_worktree)?;
+    let workdir = workdir.as_path();
 
     let remote_mapping = remote_mapping_facts(&repo)?;
     let absent_index_allowed = matches!(snapshot.head, WorkspaceHead::Symbolic { .. })
@@ -439,7 +406,7 @@ fn observe(
         blob_store,
         published_kin_dir,
     )?;
-    let snapshot_fingerprint = fingerprint_snapshot(&snapshot);
+    let snapshot_fingerprint = fingerprint_snapshot(snapshot);
     let semantic_plan_fingerprint = fingerprint_plan(plan)?;
     let compatibility = GitMigrationCompatibilityFacts {
         other_registered_worktrees: Vec::new(),
@@ -467,7 +434,7 @@ fn observe(
         observation_fingerprint: digest(b"kin.git.preflight.unset"),
     };
     proof.observation_fingerprint = fingerprint_proof(&proof);
-    Ok(PreflightObservation { snapshot, proof })
+    Ok(PreflightObservation { proof })
 }
 
 fn expected_index_entries(
@@ -969,6 +936,69 @@ fn prove_tracked_entry(
             // graph-owned pointer. Any nested state above fails closed.
         }
     }
+    Ok(())
+}
+
+/// Fail-closed source-compatibility refusals that need no captured snapshot.
+///
+/// Shared by [`preflight_git_source_compatibility`] and the two-observation
+/// migration proof so the cheap refusal set and the admission-time proof can
+/// never drift apart. Returns the stable Git dir and materialized worktree.
+fn assert_source_compatibility(
+    repo: &gix::Repository,
+    source_worktree: &Path,
+) -> Result<(PathBuf, PathBuf)> {
+    reject_shallow_repository(repo)?;
+    reject_in_progress_operations(repo)?;
+    let source_git_dir = stable_path(repo.git_dir());
+    let workdir = repo.workdir().ok_or_else(|| {
+        preflight_error("migration preflight requires a materialized Git worktree")
+    })?;
+    if stable_path(workdir) != source_worktree {
+        return Err(preflight_error(format!(
+            "opened Git worktree {} does not match requested source {}",
+            workdir.display(),
+            source_worktree.display()
+        )));
+    }
+    let workdir = workdir.to_path_buf();
+
+    let other_worktrees = other_registered_worktrees(repo, source_worktree)?;
+    if !other_worktrees.is_empty() {
+        return Err(GitError::AdditionalWorktrees {
+            count: other_worktrees.len(),
+            worktrees: other_worktrees,
+        });
+    }
+
+    let (configured_custom_hooks_path, hooks) = local_hook_facts(repo)?;
+    let filters = checkout_filter_facts(repo);
+    if configured_custom_hooks_path || !hooks.is_empty() || !filters.is_empty() {
+        return Err(GitError::LocalCompatibilityBlockers {
+            hook_count: hooks.len(),
+            custom_hooks_path: configured_custom_hooks_path,
+            filter_count: filters.len(),
+            hooks,
+            filters,
+        });
+    }
+    Ok((source_git_dir, workdir))
+}
+
+/// Prove in milliseconds that a Git source is even a candidate for exact
+/// admission, before any capture, plan, or enrichment cost is paid.
+///
+/// This is exactly the snapshot-free refusal subset of the migration proof:
+/// shallow boundary, in-progress operations, materialized worktree identity,
+/// sibling registered worktrees, and local hook/filter blockers. It proves
+/// nothing about content: the full two-observation migration proof still runs
+/// at admission time. Hoisting only the refusals means a source that can never
+/// be admitted fails before a capture is attempted rather than after it.
+pub fn preflight_git_source_compatibility(repo_path: &Path) -> Result<()> {
+    let source_worktree =
+        fs::canonicalize(repo_path).map_err(|error| GitError::io(repo_path, error))?;
+    let repo = open_repo(&source_worktree)?;
+    assert_source_compatibility(&repo, &source_worktree)?;
     Ok(())
 }
 
@@ -2007,6 +2037,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::lossless::capture_lossless_git_repository;
     use crate::{plan_semantic_git_import, GitError};
 
     struct Fixture {
@@ -2642,6 +2673,66 @@ mod tests {
             }
             error => panic!("unexpected error: {error:?}"),
         }
+    }
+
+    /// The snapshot-free preflight must reproduce every refusal the full
+    /// migration proof would raise, without any capture cost, and must accept
+    /// a clean source.
+    #[test]
+    fn source_compatibility_preflight_fronts_the_refusals() {
+        let clean = Fixture::clean();
+        preflight_git_source_compatibility(&clean.repo).expect("clean source is a candidate");
+
+        let started = std::time::Instant::now();
+        let worktrees = Fixture::clean();
+        let other = worktrees.temp.path().join("other-worktree");
+        git(
+            &worktrees.repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "other",
+                other.to_str().expect("utf8 test path"),
+            ],
+        );
+        match preflight_git_source_compatibility(&worktrees.repo)
+            .expect_err("sibling worktree refusal")
+        {
+            GitError::AdditionalWorktrees { count, .. } => assert_eq!(count, 1),
+            error => panic!("unexpected error: {error:?}"),
+        }
+
+        let shallow = Fixture::clean();
+        let head = git_stdout(&shallow.repo, &["rev-parse", "HEAD"]);
+        fs::write(shallow.repo.join(".git/shallow"), format!("{head}\n")).expect("shallow");
+        assert!(matches!(
+            preflight_git_source_compatibility(&shallow.repo).expect_err("shallow refusal"),
+            GitError::ShallowRepository
+        ));
+
+        let hook = Fixture::clean();
+        let hook_path = hook.repo.join(".git/hooks/pre-commit");
+        fs::write(&hook_path, b"#!/bin/sh\nexit 0\n").expect("hook");
+        let mut permissions = fs::metadata(&hook_path)
+            .expect("hook metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&hook_path, permissions).expect("hook chmod");
+        assert!(matches!(
+            preflight_git_source_compatibility(&hook.repo).expect_err("hook refusal"),
+            GitError::LocalCompatibilityBlockers { .. }
+        ));
+
+        // Refusals must not cost anything like a capture: the three refusal
+        // probes above, fixtures included, stay far under a second of work
+        // each. The bound is deliberately loose for slow CI machines while
+        // still proving the check cannot be doing per-object history work.
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "snapshot-free preflight took {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

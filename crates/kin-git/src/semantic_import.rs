@@ -131,24 +131,32 @@ impl SemanticGitImportPlan {
 
     /// Bind deterministic CAS-native semantic deltas and recompute every
     /// change identity, parent edge, and external alias in parent-first order.
+    ///
+    /// The plan must be unenriched and must carry the change identities its
+    /// own content derives: every change identity is recomputed here and
+    /// compared, which pins each change's payload and, transitively through
+    /// parent identities, the whole DAG. This deliberately does not re-derive
+    /// the plan from raw objects; [`admit_semantic_git_import`] performs that
+    /// full rebuild-and-compare audit exactly once on the enriched result, so
+    /// a plan whose content does not match its raw-object derivation still
+    /// fails closed before admission.
+    ///
+    /// [`admit_semantic_git_import`]: crate::admit_semantic_git_import
     pub fn with_historical_semantics(
         self,
-        blob_store: &BlobStore,
+        _blob_store: &BlobStore,
         deltas: &[(SemanticChangeId, Vec<EntityDelta>, Vec<RelationDelta>)],
     ) -> Result<Self> {
-        let snapshot = LosslessGitRepository {
-            repository_id: self.repository_id.clone(),
-            object_format: self.object_format,
-            objects: self.external_objects.clone(),
-            refs: self.refs.clone(),
-            head: self.head.clone(),
-        };
-        let exact = build_semantic_git_import_plan(&snapshot, blob_store)?;
-        if exact != self {
-            return Err(GitError::InvalidSnapshot(
-                "historical semantics may only be bound to the exact unenriched import plan"
-                    .to_string(),
-            ));
+        for change in &self.changes {
+            if !change.entity_deltas.is_empty()
+                || !change.relation_deltas.is_empty()
+                || validate_semantic_change_id(change).is_err()
+            {
+                return Err(GitError::InvalidSnapshot(
+                    "historical semantics may only be bound to the exact unenriched import plan"
+                        .to_string(),
+                ));
+            }
         }
         apply_historical_semantic_deltas_unchecked(self, deltas)
     }

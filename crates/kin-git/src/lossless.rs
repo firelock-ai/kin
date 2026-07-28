@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use gix::bstr::ByteSlice;
 use gix::objs::tree::EntryKind;
-use gix::objs::{Find as _, Write as _};
+use gix::objs::{Find as _, FindHeader as _, Write as _};
 use kin_blobs::BlobStore;
 use kin_model::{
     ExternalObjectId, ExternalObjectKind, ExternalObjectRecord, GitObjectId, RefName, RefTarget,
@@ -208,6 +208,190 @@ pub fn capture_lossless_git_repository(
     };
     validate_snapshot(&snapshot, blob_store)?;
     Ok(snapshot)
+}
+
+/// Prove a source repository still matches a previously captured snapshot
+/// without re-reading blob bodies.
+///
+/// This is the stability re-observation for a snapshot that was already
+/// captured with full body verification. It re-proves, byte-exactly:
+///
+/// - the shallow boundary is still absent
+/// - the object format is unchanged
+/// - every ref and HEAD converts to exactly the captured state
+/// - the reachable closure walked from those refs is exactly the captured
+///   object set: every commit, tree, and tag body is re-read and re-verified
+///   against its Git object ID, Kin body hash, and length, and its
+///   dependencies are re-traversed
+/// - every reachable blob is still present in the object database with the
+///   captured kind and decompressed length
+///
+/// The one observation this does not repeat is re-reading blob payload bytes:
+/// a blob's identity is its OID under Git's content addressing, the original
+/// capture verified those bytes against both the OID and Kin's CAS, and
+/// admission consumes the captured CAS bodies rather than the source object
+/// database. A same-OID, same-length body swap in the source ODB is therefore
+/// outside this proof, exactly as far as it is outside Git's own object model.
+pub(crate) fn verify_lossless_snapshot_unchanged(
+    repo: &gix::Repository,
+    expected: &LosslessGitRepository,
+) -> Result<()> {
+    let changed = || {
+        GitError::InvalidSnapshot(
+            "source HEAD, refs, or reachable object closure no longer matches the supplied \
+             snapshot"
+                .to_string(),
+        )
+    };
+    reject_shallow_repository(repo)?;
+    if object_format(repo)? != expected.object_format {
+        return Err(changed());
+    }
+
+    let expected_records: BTreeMap<GitObjectId, &ExternalObjectRecord> = expected
+        .objects
+        .iter()
+        .map(|record| (record.object.oid, record))
+        .collect();
+    if expected_records.len() != expected.objects.len() {
+        return Err(GitError::InvalidSnapshot(
+            "captured snapshot repeats an object identity".to_string(),
+        ));
+    }
+    let object_kinds: BTreeMap<GitObjectId, ExternalObjectKind> = expected
+        .objects
+        .iter()
+        .map(|record| (record.object.oid, record.object.kind))
+        .collect();
+
+    let mut raw_refs = collect_refs(repo)?;
+    raw_refs.sort_by(|left, right| left.name.cmp(&right.name));
+    ensure_unique_ref_names(&raw_refs)?;
+    let raw_head = collect_head(repo)?;
+
+    let mut pending = VecDeque::new();
+    for repository_ref in &raw_refs {
+        if let RawTarget::Direct(oid) = repository_ref.target {
+            pending.push_back(PendingObject {
+                oid,
+                expected_kind: None,
+                context: format!("ref {}", display_bytes(&repository_ref.name)),
+            });
+        }
+    }
+    if let RawTarget::Direct(oid) = raw_head {
+        pending.push_back(PendingObject {
+            oid,
+            expected_kind: None,
+            context: "detached HEAD".to_string(),
+        });
+    }
+
+    let refs = RepositoryRefState {
+        refs: raw_refs
+            .into_iter()
+            .map(|repository_ref| {
+                let name = ref_name(repository_ref.name)?;
+                let target = exact_ref_target(repository_ref.target, &object_kinds)
+                    .map_err(|_| changed())?;
+                Ok(RepositoryRef {
+                    repository_id: expected.repository_id.clone(),
+                    name,
+                    target,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?,
+        default_ref: match &raw_head {
+            RawTarget::Symbolic(target) => Some(ref_name(target.clone())?),
+            RawTarget::Direct(_) => None,
+        },
+    };
+    let head = match raw_head {
+        RawTarget::Symbolic(target) => WorkspaceHead::Symbolic {
+            target: ref_name(target)?,
+        },
+        RawTarget::Direct(oid) => WorkspaceHead::Detached {
+            target: exact_ref_target(RawTarget::Direct(oid), &object_kinds)
+                .map_err(|_| changed())?,
+        },
+    };
+    if refs != expected.refs || head != expected.head {
+        return Err(changed());
+    }
+
+    let mut visited = BTreeSet::new();
+    while let Some(next) = pending.pop_front() {
+        let model_oid = git_object_id(next.oid)?;
+        let Some(record) = expected_records.get(&model_oid) else {
+            return Err(changed());
+        };
+        if !visited.insert(model_oid) {
+            if let Some(expected_kind) = next.expected_kind {
+                ensure_expected_kind(model_oid, record.object.kind, expected_kind, &next.context)?;
+            }
+            continue;
+        }
+        if let Some(expected_kind) = next.expected_kind {
+            ensure_expected_kind(model_oid, record.object.kind, expected_kind, &next.context)?;
+        }
+
+        if record.object.kind == ExternalObjectKind::Blob {
+            let header = match repo.objects.try_header(&next.oid) {
+                Ok(Some(header)) => header,
+                Ok(None) => {
+                    return Err(GitError::MissingObject {
+                        oid: next.oid.to_string(),
+                        context: next.context.clone(),
+                    })
+                }
+                Err(error) => {
+                    return Err(GitError::CorruptObject {
+                        oid: next.oid.to_string(),
+                        reason: error.to_string(),
+                    })
+                }
+            };
+            if external_kind(header.kind) != ExternalObjectKind::Blob
+                || header.size != record.body_len
+            {
+                return Err(changed());
+            }
+            continue;
+        }
+
+        let mut body = Vec::new();
+        let kind = match repo.objects.try_find(&next.oid, &mut body) {
+            Ok(Some(object)) => object.kind,
+            Ok(None) => {
+                return Err(GitError::MissingObject {
+                    oid: next.oid.to_string(),
+                    context: next.context.clone(),
+                })
+            }
+            Err(error) => {
+                return Err(GitError::CorruptObject {
+                    oid: next.oid.to_string(),
+                    reason: error.to_string(),
+                })
+            }
+        };
+        let kind = external_kind(kind);
+        let observed = ExternalObjectRecord::from_raw(kind, model_oid, &body).map_err(|error| {
+            GitError::CorruptObject {
+                oid: model_oid.to_string(),
+                reason: error.to_string(),
+            }
+        })?;
+        if observed != **record {
+            return Err(changed());
+        }
+        enqueue_dependencies(model_oid, kind, &body, &next.context, &mut pending)?;
+    }
+
+    if visited.len() != expected.objects.len() {
+        return Err(changed());
+    }
+    Ok(())
 }
 
 /// Rehydrate an exact SHA-1 Git repository from a lossless snapshot.

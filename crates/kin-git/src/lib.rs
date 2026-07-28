@@ -33,11 +33,11 @@ pub use lossless::{
     LosslessGitRepository,
 };
 pub use preflight::{
-    preflight_git_migration, preflight_git_migration_after_publication, GitBranchTrackingFact,
-    GitIndexPreflightProof, GitLocalIgnoreInputFact, GitLocalIgnoreSourceKind,
-    GitMigrationCompatibilityFacts, GitMigrationPreflightProof, GitRemoteConfigFact,
-    GitRemoteMappingFacts, GitTrackedWorktreeProof, IgnoredLocalEntry, IgnoredLocalEntryKind,
-    IgnoredLocalWorktreeFact,
+    preflight_git_migration, preflight_git_migration_after_publication,
+    preflight_git_source_compatibility, GitBranchTrackingFact, GitIndexPreflightProof,
+    GitLocalIgnoreInputFact, GitLocalIgnoreSourceKind, GitMigrationCompatibilityFacts,
+    GitMigrationPreflightProof, GitRemoteConfigFact, GitRemoteMappingFacts,
+    GitTrackedWorktreeProof, IgnoredLocalEntry, IgnoredLocalEntryKind, IgnoredLocalWorktreeFact,
 };
 pub use repository_export::{
     export_repository_to_git, verify_repository_git_export, RepositoryGitCommitBinding,

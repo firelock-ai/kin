@@ -119,7 +119,7 @@ pub struct UnresolvedRelation {
 }
 
 /// Data for a single parsed file, used for cross-file linking.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FileParseData {
     /// Relative file path (e.g., "src/app/api/chat/route.ts").
     pub file_path: String,
@@ -199,11 +199,11 @@ fn link_cross_file_internal(
     completeness: Option<&FileParseCompletenessMap>,
 ) -> IndexResult<Vec<Relation>> {
     let _span = tracing::info_span!("kin.index.link_cross_file", files = files.len()).entered();
-    let universe_entities: Vec<Entity> = files
-        .iter()
-        .flat_map(|file| file.entities.iter().cloned())
-        .collect();
-    link_cross_file_against_entities_internal(files, &universe_entities, artifact_ids, completeness)
+    let file_refs: Vec<&FileParseData> = files.iter().collect();
+    let universe_refs: Vec<&Entity> = files.iter().flat_map(|file| file.entities.iter()).collect();
+    let include_graph = build_include_graph(files, &known_file_paths(&file_refs, &universe_refs));
+    let ctx = build_link_context_from_refs(&file_refs, &universe_refs, include_graph);
+    resolve_and_merge(files, &ctx, artifact_ids, completeness)
 }
 
 /// Resolve cross-file relations while carrying parser-emitted tests alongside the input.
@@ -265,7 +265,7 @@ fn entity_link_order(a: &Entity, b: &Entity) -> std::cmp::Ordering {
 /// [`IncrementalLinker`] bare-name index so both derive receiver-method leaf
 /// names identically — a divergence here would resolve the same call to
 /// different entities across the two linkers.
-fn bare_entity_name(name: &str) -> &str {
+pub(crate) fn bare_entity_name(name: &str) -> &str {
     match name.rfind("::") {
         Some(idx) => &name[idx + 2..],
         None => match name.rfind('.') {
@@ -319,7 +319,22 @@ fn link_cross_file_against_entities_internal(
     )
     .entered();
 
-    let ctx = build_link_context(files, universe_entities);
+    let file_refs: Vec<&FileParseData> = files.iter().collect();
+    let universe_refs: Vec<&Entity> = universe_entities.iter().collect();
+    let include_graph = build_include_graph(files, &known_file_paths(&file_refs, &universe_refs));
+    let ctx = build_link_context_from_refs(&file_refs, &universe_refs, include_graph);
+    resolve_and_merge(files, &ctx, artifact_ids, completeness)
+}
+
+/// Resolve every file against a prepared context and merge, exactly as the
+/// single-pass entry points do. Factored so the historical replay engine can
+/// drive the same resolution code against an incrementally assembled context.
+fn resolve_and_merge(
+    files: &[FileParseData],
+    ctx: &LinkContext<'_>,
+    artifact_ids: &ArtifactIdentityMap,
+    completeness: Option<&FileParseCompletenessMap>,
+) -> IndexResult<Vec<Relation>> {
     require_artifact_identities(ctx.known_files.iter().copied(), artifact_ids)?;
 
     let total_files = files.len();
@@ -343,7 +358,7 @@ fn link_cross_file_against_entities_internal(
         files
             .par_iter()
             .map(|file| {
-                let relations = resolve_one_file(file, &ctx, completeness);
+                let relations = resolve_one_file(file, ctx, completeness);
                 if total_files > 50 {
                     let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
                     let total =
@@ -364,7 +379,7 @@ fn link_cross_file_against_entities_internal(
             .collect()
     };
 
-    let resolved = merge_resolved(per_file_relations, files, &ctx, artifact_ids, completeness);
+    let resolved = merge_resolved(per_file_relations, files, ctx, artifact_ids, completeness);
 
     if total_files > 0 {
         eprintln!(); // newline after \r progress
@@ -374,7 +389,7 @@ fn link_cross_file_against_entities_internal(
 }
 
 /// Read-only indices shared across per-file relation resolution.
-struct LinkContext<'a> {
+pub(crate) struct LinkContext<'a> {
     sorted_universe: Vec<&'a Entity>,
     entity_by_file_name: HashMap<(&'a str, &'a str), EntityId>,
     entity_by_name: HashMap<&'a str, Vec<(&'a str, EntityId)>>,
@@ -462,13 +477,34 @@ fn blind_inference_target_allowed(
         .unwrap_or(false)
 }
 
-fn build_link_context<'a>(
-    files: &'a [FileParseData],
-    universe_entities: &'a [Entity],
+/// The set of file paths module resolution may target: every parsed file plus
+/// every file an entity in the universe originates from. Shared by context
+/// construction and the historical replay engine so both resolve module paths
+/// against the identical set.
+pub(crate) fn known_file_paths<'a>(
+    files: &[&'a FileParseData],
+    universe_entities: &[&'a Entity],
+) -> HashSet<&'a str> {
+    let mut known: HashSet<&str> = HashSet::new();
+    for entity in universe_entities {
+        if let Some(file_path) = entity.file_origin.as_ref() {
+            known.insert(file_path.0.as_str());
+        }
+    }
+    for file in files {
+        known.insert(&file.file_path);
+    }
+    known
+}
+
+pub(crate) fn build_link_context_from_refs<'a>(
+    files: &[&'a FileParseData],
+    universe_entities: &[&'a Entity],
+    include_graph: HashMap<String, Vec<String>>,
 ) -> LinkContext<'a> {
     // Sort for deterministic relation materialization.
     let sorted_universe: Vec<&Entity> = {
-        let mut sorted: Vec<&Entity> = universe_entities.iter().collect();
+        let mut sorted: Vec<&Entity> = universe_entities.to_vec();
         sorted.sort_by(|a, b| entity_link_order(a, b));
         sorted
     };
@@ -565,8 +601,6 @@ fn build_link_context<'a>(
         import_map
     };
 
-    let include_graph = build_include_graph(files, &known_files);
-
     // Step 3: class hierarchy from parser-emitted Extends relations, keyed per
     // (file, class). Bases are sorted lexicographically — NOT declaration
     // order — because the reopen path rehydrates this index from committed
@@ -611,7 +645,7 @@ fn build_link_context<'a>(
 /// All reads are against the shared read-only [`LinkContext`]; the only mutable
 /// state is a file-local relation accumulator, so this is pure with respect to
 /// other files.
-fn resolve_one_file(
+pub(crate) fn resolve_one_file(
     file: &FileParseData,
     ctx: &LinkContext<'_>,
     completeness: Option<&FileParseCompletenessMap>,
@@ -1142,7 +1176,11 @@ fn link_cross_file_against_entities_serial(
     universe_entities: &[Entity],
     artifact_ids: &ArtifactIdentityMap,
 ) -> Vec<Relation> {
-    let ctx = build_link_context(files, universe_entities);
+    let file_refs: Vec<&FileParseData> = files.iter().collect();
+    let universe_refs: Vec<&Entity> = universe_entities.iter().collect();
+    let include_graph =
+        build_include_graph_serial(files, &known_file_paths(&file_refs, &universe_refs));
+    let ctx = build_link_context_from_refs(&file_refs, &universe_refs, include_graph);
     let per_file_relations: Vec<Vec<Relation>> = files
         .iter()
         .map(|file| resolve_one_file(file, &ctx, None))
@@ -1219,7 +1257,7 @@ fn merge_resolved_serial(
 ///
 /// Shared by batch include-graph construction and the incremental linker's
 /// persistent per-file include state so both record identical edges.
-fn resolve_include_targets<S>(
+pub(crate) fn resolve_include_targets<S>(
     file_path: &str,
     imports: &[FileImport],
     known_files: &HashSet<S>,
@@ -1578,7 +1616,7 @@ const INHERITED_METHOD_CONFIDENCE: f32 = 0.85;
 /// undotted names, `::` paths (those belong to the qualified-suffix resolver),
 /// and empty halves, so only receiver-qualified method keys reach the
 /// inheritance walk.
-fn split_owner_method(name: &str) -> Option<(&str, &str)> {
+pub(crate) fn split_owner_method(name: &str) -> Option<(&str, &str)> {
     if name.contains("::") {
         return None;
     }
@@ -1601,7 +1639,7 @@ fn receiver_method_keys(class: &str, method: &str) -> [String; 2] {
 /// operators), or with an empty half — so only a genuine receiver-scoped method
 /// key reaches the Extends-chain walk. The owner is validated as a class at the
 /// call site, so a namespace-qualified free function (`Catch::Main`) never binds.
-fn split_scoped_receiver_method(name: &str) -> Option<(&str, &str)> {
+pub(crate) fn split_scoped_receiver_method(name: &str) -> Option<(&str, &str)> {
     let (owner_path, method) = name.rsplit_once("::")?;
     let owner = owner_path.rsplit("::").next()?;
     if owner.is_empty()
@@ -2100,7 +2138,7 @@ fn resolve_qualified_suffix_incremental(
 }
 
 /// Whether an entity id names a type that can anchor an inheritance walk.
-fn is_class_like(kind: Option<&EntityKind>) -> bool {
+pub(crate) fn is_class_like(kind: Option<&EntityKind>) -> bool {
     matches!(
         kind,
         Some(
@@ -2807,7 +2845,7 @@ where
     })
 }
 
-fn make_artifact_import_relation<S>(
+pub(crate) fn make_artifact_import_relation<S>(
     importer_file: &str,
     import: &FileImport,
     known_files: &HashSet<S>,
@@ -2853,7 +2891,7 @@ where
 /// Build the graph-owned file-level call-coverage certificate used by
 /// ref-scoped review. Coverage state lives in relation evidence; history paths
 /// compare the complete relation payload and replace changed evidence.
-fn make_parse_coverage_relation(
+pub(crate) fn make_parse_coverage_relation(
     file_path: &str,
     artifact_id: ArtifactId,
     completeness: Option<&ParseCompleteness>,
@@ -3124,7 +3162,7 @@ fn stable_relation_node_id(
 ///
 /// For non-relative (package) imports like `@vue/shared` or `@mui/utils/foo`,
 /// uses monorepo heuristics to locate workspace packages under `packages/`.
-fn resolve_module_path<S>(
+pub(crate) fn resolve_module_path<S>(
     importer_path: &str,
     module_path: &str,
     known_files: &HashSet<S>,
@@ -5783,7 +5821,11 @@ mod tests {
             .iter()
             .flat_map(|f| f.entities.iter().cloned())
             .collect();
-        let ctx = build_link_context(&files, &universe);
+        let file_refs: Vec<&FileParseData> = files.iter().collect();
+        let universe_refs: Vec<&Entity> = universe.iter().collect();
+        let include_graph =
+            build_include_graph(&files, &known_file_paths(&file_refs, &universe_refs));
+        let ctx = build_link_context_from_refs(&file_refs, &universe_refs, include_graph);
         let artifact_ids = artifact_ids_for(&files, &universe);
 
         // resolve_one_file is deterministic, so building the per-file relations

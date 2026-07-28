@@ -5,14 +5,14 @@
     {
       "file": "crates/kin-index/src/history.rs",
       "function": "derive_historical_semantic_deltas",
-      "digest": "sha256:defd5579325f7b159b1aff73498622a72156c64579319d31ceec0b35f85fa2cf",
+      "digest": "sha256:f9b6eb1b0271bff9945b4d84d069633eaee32183c7ea368a560b3136a224d6f1",
       "reason": "Drives the whole parent-first replay: it decides the per-change baseline, which trees are enriched, and the exact EntityDelta/RelationDelta payload persisted for every historical change.",
       "owner": "kin-index"
     },
     {
       "file": "crates/kin-index/src/history.rs",
       "function": "semantic_state_for_tree",
-      "digest": "sha256:883a0ba2ac406e67a7efb59d59cae37c0d33aa6829938d20f986d19833d75cab",
+      "digest": "sha256:5272aa6a3dbc402ebaf0b78e752d7230aaf9af49251b95cffbf3656e6b8ea431",
       "reason": "Turns one exact resolved tree plus CAS bodies into the entity/relation state a change is diffed from and to. Its classification, parse, and cross-file linking order decide what the past is said to contain.",
       "owner": "kin-index"
     },
@@ -64,6 +64,69 @@
       "digest": "sha256:9665b558bbd0b395f455a9db301c7d1769ceb17ccbe99f7bd92ec62440cb50e3",
       "reason": "Assigns the stable artifact identities trees and entities are keyed by across the imported history. Reassignment here silently repoints every historical file.",
       "owner": "kin-git"
+    },
+    {
+      "file": "crates/kin-index/src/history.rs",
+      "function": "derive_tree_semantics",
+      "digest": "sha256:67acebf4f2c2a17cb6ff1a9f8f7868a9ed64cb50377607ec5594106ca52bbf86",
+      "reason": "Derives one tree's semantic state and its first-parent deltas from carried-forward parent state: the incremental replacement for whole-tree recomputation, so its carry/patch rules decide the persisted history.",
+      "owner": "kin-index"
+    },
+    {
+      "file": "crates/kin-index/src/history.rs",
+      "function": "link_single_file",
+      "digest": "sha256:0791c66b3ca5c74d14a6f4a8e5e9edac33b89e19ac337a9688da666347f04ed1",
+      "reason": "Produces one file's complete share of a tree's linked relations (resolved edges, artifact import/include edges, parse-coverage certificate) and validates endpoints; its per-file decomposition must match the batch linker exactly.",
+      "owner": "kin-index"
+    },
+    {
+      "file": "crates/kin-index/src/history.rs",
+      "function": "invalidated_files",
+      "digest": "sha256:8917877cec217126e1e1c3c265c7fcc4221b618974f0e2abcf11021db65f3567",
+      "reason": "Decides which files a content-only commit may carry forward without relinking. An under-conservative rule here silently changes what history claims; every rule must remain provably conservative.",
+      "owner": "kin-index"
+    },
+    {
+      "file": "crates/kin-index/src/history.rs",
+      "function": "analyze_file_static",
+      "digest": "sha256:3ae2dad2bd2ff1422923c33804b0f0226ceb2fe45ab95197d9f79a2d75b3c6e4",
+      "reason": "Enumerates the name-index keys a file's resolution can probe and the hierarchy shape other files can traverse through it; the invalidation rules are only as conservative as this enumeration.",
+      "owner": "kin-index"
+    },
+    {
+      "file": "crates/kin-index/src/history.rs",
+      "function": "analyze_file_era",
+      "digest": "sha256:d5ae6a50fee2387dfb5826c16cad9cc655f437423e2892eab4d1c47c0e8d4afe",
+      "reason": "Resolves a file's module, pin, and include targets against the tree's path set; module-target invalidation is only as conservative as this resolution.",
+      "owner": "kin-index"
+    },
+    {
+      "file": "crates/kin-index/src/history.rs",
+      "function": "add_name_tokens",
+      "digest": "sha256:abe245a1a1100d476a38358b5cf8e372a7ff26f13fc1041c18304bf9674f2d37",
+      "reason": "Derives every probe-key form of one name (bare leaf, segments, type-qualified suffix); token invalidation soundness depends on this closure.",
+      "owner": "kin-index"
+    },
+    {
+      "file": "crates/kin-index/src/history.rs",
+      "function": "deltas_from_entity_patch",
+      "digest": "sha256:daebf51288359fc5234bbb1d75065ceb7d7b8088aa2b2c22754e50b8766d631f",
+      "reason": "Emits the persisted first-parent entity deltas from the incremental patch; must stay identical to a full map diff.",
+      "owner": "kin-index"
+    },
+    {
+      "file": "crates/kin-index/src/history.rs",
+      "function": "deltas_from_relation_patch",
+      "digest": "sha256:8289842104dfb735ff461b5f99235a042816e56a5f989b248c342342e27f270f",
+      "reason": "Emits the persisted first-parent relation deltas from the incremental patch; must stay identical to a full map diff.",
+      "owner": "kin-index"
+    },
+    {
+      "file": "crates/kin-index/src/history.rs",
+      "function": "audit_carried_link_outputs",
+      "digest": "sha256:09d4d901f474e2a6c781f54045056c54a386f1c08f768d1e356c84f823b0a7ec",
+      "reason": "Fail-closed audit that a carried-forward link output could not have changed; weakening it converts invalidation bugs into silently wrong history instead of refusals.",
+      "owner": "kin-index"
     }
   ]
 }

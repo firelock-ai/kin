@@ -8,21 +8,26 @@
 //! CAS bodies. Every other artifact remains represented by the exact tree even
 //! when it has no language adapter.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
 
 use kin_blobs::BlobStore;
 use kin_model::{
     ArtifactId, ChangeOrigin, Entity, EntityDelta, EntityId, FilePathId, ParseCompleteness,
     Relation, RelationDelta, RelationId, ResolvedTree, SemanticChange, SemanticChangeId, TreeEntry,
 };
+use kin_parser::is_call_extraction_incomplete_marker;
 use sha2::{Digest, Sha256};
 
 use crate::classifier::{FileClassification, FileClassifier};
 use crate::error::{IndexError, Result};
 use crate::linker::{
-    is_external_import_placeholder, link_cross_file_with_completeness, ArtifactIdentityMap,
-    FileParseCompletenessMap, FileParseData,
+    bare_entity_name, build_link_context_from_refs, is_class_like, is_external_import_placeholder,
+    known_file_paths, link_cross_file_with_completeness, make_artifact_import_relation,
+    make_parse_coverage_relation, resolve_include_targets, resolve_module_path, resolve_one_file,
+    split_owner_method, split_scoped_receiver_method, ArtifactIdentityMap,
+    FileParseCompletenessMap, FileParseData, LinkContext,
 };
 use crate::pipeline::IndexPipeline;
 
@@ -56,22 +61,44 @@ struct ParsedFile {
     imports: Vec<kin_parser::FileImport>,
 }
 
-#[derive(Clone)]
+/// One semantic file at one exact content identity.
+///
+/// The parse payload is shared by `Arc` so that carrying an unchanged file
+/// from a parent tree to a child tree is a pointer clone, never a deep copy of
+/// its entities, relations, and imports.
 struct SemanticFileState {
     artifact_id: ArtifactId,
-    path: String,
     entry: TreeEntry,
     completeness: ParseCompleteness,
-    entities: Vec<Entity>,
-    relations: Vec<kin_parser::ExtractedRelation>,
-    imports: Vec<kin_parser::FileImport>,
+    parse: Arc<FileParseData>,
+}
+
+impl SemanticFileState {
+    fn path(&self) -> &str {
+        &self.parse.file_path
+    }
+}
+
+/// The cross-file link output of one file under one tree's link context.
+///
+/// `relations` is the complete per-file share of the tree's linked relation
+/// set: resolved entity relations, artifact-level import/include edges, and
+/// the file's parse-coverage certificate, already validated against the
+/// tree's entity set. `referenced_entities` and `dropped_placeholder_dsts`
+/// back the fail-closed audit that proves a carried-forward output could not
+/// have changed.
+struct LinkedFile {
+    relations: Vec<Relation>,
+    referenced_entities: BTreeSet<EntityId>,
+    dropped_placeholder_dsts: BTreeSet<EntityId>,
 }
 
 #[derive(Clone, Default)]
 struct SemanticTreeState {
-    files: BTreeMap<ArtifactId, SemanticFileState>,
-    entities: BTreeMap<EntityId, Entity>,
-    relations: BTreeMap<RelationId, Relation>,
+    files: BTreeMap<ArtifactId, Arc<SemanticFileState>>,
+    linked: BTreeMap<ArtifactId, Arc<LinkedFile>>,
+    entities: BTreeMap<EntityId, Arc<Entity>>,
+    relations: BTreeMap<RelationId, Arc<Relation>>,
 }
 
 /// Derive semantic deltas for parent-first exact history.
@@ -83,6 +110,29 @@ pub fn derive_historical_semantic_deltas(
     changes: &[SemanticChange],
     trees: &BTreeMap<SemanticChangeId, ResolvedTree>,
     blob_store: &BlobStore,
+) -> Result<Vec<HistoricalSemanticDelta>> {
+    derive_historical_semantic_deltas_inner(changes, trees, blob_store, LinkEngine::new())
+}
+
+/// Derivation with the batch cross-check forced on for every commit,
+/// regardless of `KIN_HISTORY_LINK_VERIFY`. Test-only: fixtures use the batch
+/// path itself as the oracle for the incremental path.
+#[cfg(test)]
+fn derive_historical_semantic_deltas_verified(
+    changes: &[SemanticChange],
+    trees: &BTreeMap<SemanticChangeId, ResolvedTree>,
+    blob_store: &BlobStore,
+) -> Result<Vec<HistoricalSemanticDelta>> {
+    let mut engine = LinkEngine::new();
+    engine.verify = true;
+    derive_historical_semantic_deltas_inner(changes, trees, blob_store, engine)
+}
+
+fn derive_historical_semantic_deltas_inner(
+    changes: &[SemanticChange],
+    trees: &BTreeMap<SemanticChangeId, ResolvedTree>,
+    blob_store: &BlobStore,
+    mut engine: LinkEngine,
 ) -> Result<Vec<HistoricalSemanticDelta>> {
     let pipeline = IndexPipeline::new();
     let mut states = BTreeMap::<SemanticChangeId, SemanticTreeState>::new();
@@ -134,17 +184,14 @@ pub fn derive_historical_semantic_deltas(
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let empty_parent = SemanticTreeState::default();
-        let first_parent = parent_states.first().copied().unwrap_or(&empty_parent);
         let tree = trees.get(&change.id).ok_or_else(|| {
             invalid(format!(
                 "change {} has no exact resolved tree for semantic enrichment",
                 change.id
             ))
         })?;
-        let current = semantic_state_for_tree(tree, &parent_states, blob_store, &pipeline)?;
-        let entity_deltas = diff_entities(&first_parent.entities, &current.entities);
-        let relation_deltas = diff_relations(&first_parent.relations, &current.relations);
+        let (current, entity_deltas, relation_deltas) =
+            semantic_state_for_tree(tree, &parent_states, blob_store, &pipeline, &mut engine)?;
 
         output.push(HistoricalSemanticDelta {
             change_id: change.id,
@@ -188,7 +235,10 @@ fn semantic_state_for_tree(
     parents: &[&SemanticTreeState],
     blob_store: &BlobStore,
     pipeline: &IndexPipeline,
-) -> Result<SemanticTreeState> {
+    engine: &mut LinkEngine,
+) -> Result<(SemanticTreeState, Vec<EntityDelta>, Vec<RelationDelta>)> {
+    let empty_parent = SemanticTreeState::default();
+    let first_parent = parents.first().copied().unwrap_or(&empty_parent);
     let mut files = BTreeMap::new();
 
     for artifact in tree.artifacts() {
@@ -209,10 +259,10 @@ fn semantic_state_for_tree(
             parent
                 .files
                 .get(&artifact.artifact_id)
-                .filter(|file| file.path == path && file.entry == artifact.entry)
+                .filter(|file| file.path() == path && file.entry == artifact.entry)
         }) {
             if files
-                .insert(artifact.artifact_id, existing.clone())
+                .insert(artifact.artifact_id, Arc::clone(existing))
                 .is_some()
             {
                 return Err(invalid(format!(
@@ -248,20 +298,25 @@ fn semantic_state_for_tree(
         let old_entities = parents
             .iter()
             .filter_map(|parent| parent.files.get(&artifact.artifact_id))
-            .flat_map(|file| file.entities.iter())
+            .flat_map(|file| file.parse.entities.iter())
             .collect::<Vec<_>>();
         let entities =
             stabilize_historical_entities(artifact.artifact_id, old_entities, &parsed.entities);
         let state = SemanticFileState {
             artifact_id: artifact.artifact_id,
-            path: path.to_string(),
             entry: artifact.entry,
             completeness: parsed.completeness,
-            entities,
-            relations: parsed.relations,
-            imports: parsed.imports,
+            parse: Arc::new(FileParseData {
+                file_path: path.to_string(),
+                entities,
+                relations: parsed.relations,
+                imports: parsed.imports,
+            }),
         };
-        if files.insert(artifact.artifact_id, state).is_some() {
+        if files
+            .insert(artifact.artifact_id, Arc::new(state))
+            .is_some()
+        {
             return Err(invalid(format!(
                 "tree assigns artifact {:?} to multiple semantic files",
                 artifact.artifact_id
@@ -269,23 +324,205 @@ fn semantic_state_for_tree(
         }
     }
 
-    let mut parse_data = Vec::with_capacity(files.len());
+    let (state, entity_deltas, relation_deltas) =
+        derive_tree_semantics(files, first_parent, engine)?;
+
+    if engine.verify {
+        verify_against_reference(&state, first_parent, &entity_deltas, &relation_deltas)?;
+    }
+    Ok((state, entity_deltas, relation_deltas))
+}
+
+/// Recompute this tree's complete semantic state through the single-pass batch
+/// path and require the incremental result to be identical, including the
+/// emitted first-parent deltas. This is the `KIN_HISTORY_LINK_VERIFY` audit:
+/// it proves on real histories that incremental replay authors byte-identical
+/// truth, at full batch cost.
+fn verify_against_reference(
+    current: &SemanticTreeState,
+    first_parent: &SemanticTreeState,
+    entity_deltas: &[EntityDelta],
+    relation_deltas: &[RelationDelta],
+) -> Result<()> {
+    let mut parse_data = Vec::with_capacity(current.files.len());
     let mut completeness = FileParseCompletenessMap::new();
     let mut artifact_ids = ArtifactIdentityMap::new();
     let mut entities = BTreeMap::new();
+    for file in current.files.values() {
+        artifact_ids.insert(file.path().to_string(), file.artifact_id);
+        completeness.insert(file.path().to_string(), file.completeness.clone());
+        for entity in &file.parse.entities {
+            if entities.insert(entity.id, entity.clone()).is_some() {
+                return Err(invalid(
+                    "verification found a duplicated entity identity the incremental path admitted",
+                ));
+            }
+        }
+        parse_data.push((*file.parse).clone());
+    }
+    parse_data.sort_by(|left, right| left.file_path.cmp(&right.file_path));
+    let linked = link_cross_file_with_completeness(&parse_data, &artifact_ids, &completeness)?;
+    let mut relations = BTreeMap::new();
+    for relation in linked {
+        if let Some(absent) = absent_local_endpoint(&relation, &entities) {
+            if absent.is_destination && is_external_import_placeholder(&relation) {
+                continue;
+            }
+            return Err(invalid(format!(
+                "verification relation {} names absent entity {}",
+                relation.id, absent.entity_id
+            )));
+        }
+        if relations.insert(relation.id, relation).is_some() {
+            return Err(invalid(
+                "verification found a duplicate relation identity the incremental path admitted",
+            ));
+        }
+    }
+
+    let entities_match = entities.len() == current.entities.len()
+        && entities.iter().all(|(id, entity)| {
+            current
+                .entities
+                .get(id)
+                .is_some_and(|held| **held == *entity)
+        });
+    if !entities_match {
+        return Err(invalid(
+            "incremental enrichment diverged from the batch derivation in the tree entity set",
+        ));
+    }
+    let relations_match = relations.len() == current.relations.len()
+        && relations.iter().all(|(id, relation)| {
+            current
+                .relations
+                .get(id)
+                .is_some_and(|held| **held == *relation)
+        });
+    if !relations_match {
+        return Err(invalid(
+            "incremental enrichment diverged from the batch derivation in the tree relation set",
+        ));
+    }
+
+    let parent_entities: BTreeMap<EntityId, Entity> = first_parent
+        .entities
+        .iter()
+        .map(|(id, entity)| (*id, (**entity).clone()))
+        .collect();
+    let parent_relations: BTreeMap<RelationId, Relation> = first_parent
+        .relations
+        .iter()
+        .map(|(id, relation)| (*id, (**relation).clone()))
+        .collect();
+    if diff_entities(&parent_entities, &entities).as_slice() != entity_deltas
+        || diff_relations(&parent_relations, &relations).as_slice() != relation_deltas
+    {
+        return Err(invalid(
+            "incremental enrichment diverged from the batch derivation in the emitted deltas",
+        ));
+    }
+    Ok(())
+}
+
+/// Derive one tree's semantic state and its first-parent deltas, reusing every
+/// carried-forward per-file link output the invalidation analysis proves
+/// unchanged.
+fn derive_tree_semantics(
+    files: BTreeMap<ArtifactId, Arc<SemanticFileState>>,
+    first_parent: &SemanticTreeState,
+    engine: &mut LinkEngine,
+) -> Result<(SemanticTreeState, Vec<EntityDelta>, Vec<RelationDelta>)> {
+    // Any change to the artifact/path membership of the tree can change module
+    // resolution, import targets, and default-export anchoring anywhere in the
+    // repository, so those commits relink the whole tree. Content-only commits
+    // take the incremental path below.
+    let structural = files.len() != first_parent.files.len()
+        || files.iter().zip(first_parent.files.iter()).any(
+            |((current_id, current), (parent_id, parent))| {
+                current_id != parent_id || current.path() != parent.path()
+            },
+        );
+
+    // Duplicate-path refusal, artifact identities, and parse completeness are
+    // per-tree inputs to linking and validation.
+    let mut completeness = FileParseCompletenessMap::new();
+    let mut artifact_ids = ArtifactIdentityMap::new();
     for file in files.values() {
         if artifact_ids
-            .insert(file.path.clone(), file.artifact_id)
+            .insert(file.path().to_string(), file.artifact_id)
             .is_some()
         {
             return Err(invalid(format!(
                 "tree contains more than one semantic artifact at {}",
-                file.path
+                file.path()
             )));
         }
-        completeness.insert(file.path.clone(), file.completeness.clone());
-        for entity in &file.entities {
-            if let Some(previous) = entities.insert(entity.id, entity.clone()) {
+        completeness.insert(file.path().to_string(), file.completeness.clone());
+    }
+
+    let file_refs: Vec<&FileParseData> = files.values().map(|file| file.parse.as_ref()).collect();
+    let universe_refs: Vec<&Entity> = file_refs
+        .iter()
+        .flat_map(|file| file.entities.iter())
+        .collect();
+    let known_files = known_file_paths(&file_refs, &universe_refs);
+    let era_signature = era_signature_of(&files);
+    engine.refresh_analyses(&files, era_signature, &known_files);
+
+    // Assemble the include graph from the per-file resolved include targets.
+    // `resolve_include_targets` is the same function batch include-graph
+    // construction folds per file, and paths are unique per tree, so this is
+    // the identical graph without re-resolving unchanged files' imports.
+    let mut include_graph: HashMap<String, Vec<String>> = HashMap::new();
+    for (artifact_id, file) in &files {
+        let targets = &engine.analysis(artifact_id).era.include_targets;
+        if !targets.is_empty() {
+            include_graph.insert(file.path().to_string(), targets.clone());
+        }
+    }
+    let ctx = build_link_context_from_refs(&file_refs, &universe_refs, include_graph);
+
+    // The set of files whose link output must be recomputed under this tree.
+    let relink: Vec<ArtifactId> = if structural {
+        files.keys().copied().collect()
+    } else {
+        invalidated_files(engine, &files, first_parent, &known_files)?
+    };
+
+    // Entity map: carry the first parent's map and apply the changed files'
+    // entity deltas, preserving the whole-tree duplicate-identity refusal.
+    let mut entities = first_parent.entities.clone();
+    let mut removed_entities = BTreeMap::<EntityId, Arc<Entity>>::new();
+    let mut inserted_entities = BTreeMap::<EntityId, Arc<Entity>>::new();
+    for (artifact_id, parent_file) in &first_parent.files {
+        let changed = match files.get(artifact_id) {
+            Some(current) => !Arc::ptr_eq(current, parent_file),
+            None => true,
+        };
+        if changed {
+            for entity in &parent_file.parse.entities {
+                let Some(previous) = entities.remove(&entity.id) else {
+                    return Err(invalid(format!(
+                        "parent tree state lost entity {} during incremental carry-forward",
+                        entity.id
+                    )));
+                };
+                removed_entities.insert(entity.id, previous);
+            }
+        }
+    }
+    for (artifact_id, file) in &files {
+        let changed = match first_parent.files.get(artifact_id) {
+            Some(parent_file) => !Arc::ptr_eq(file, parent_file),
+            None => true,
+        };
+        if !changed {
+            continue;
+        }
+        let arcs = &engine.analysis(artifact_id).entity_arcs;
+        for entity in arcs {
+            if let Some(previous) = entities.insert(entity.id, Arc::clone(entity)) {
                 return Err(invalid(format!(
                     "semantic entity identity {} is duplicated in one tree: {} {:?} from {:?} and {} {:?} from {}",
                     entity.id,
@@ -294,23 +531,157 @@ fn semantic_state_for_tree(
                     previous.file_origin,
                     entity.name,
                     entity.kind,
-                    file.path
+                    file.path()
                 )));
             }
+            inserted_entities.insert(entity.id, Arc::clone(entity));
         }
-        parse_data.push(FileParseData {
-            file_path: file.path.clone(),
-            entities: file.entities.clone(),
-            relations: file.relations.clone(),
-            imports: file.imports.clone(),
-        });
     }
-    parse_data.sort_by(|left, right| left.file_path.cmp(&right.file_path));
 
-    let linked = link_cross_file_with_completeness(&parse_data, &artifact_ids, &completeness)?;
-    let mut relations = BTreeMap::new();
-    for relation in linked {
-        if let Some(absent) = absent_local_endpoint(&relation, &entities) {
+    // Link the invalidated files under the exact context of this tree.
+    let mut linked = BTreeMap::new();
+    let mut removed_relations = BTreeMap::<RelationId, Arc<Relation>>::new();
+    let mut inserted_relations = BTreeMap::<RelationId, Arc<Relation>>::new();
+    let mut relations = if structural {
+        // Every file relinks, so every parent relation leaves the map and
+        // every current relation re-enters it; the patch diff then compares
+        // per identity exactly as a full first-parent diff would.
+        removed_relations = first_parent.relations.clone();
+        BTreeMap::new()
+    } else {
+        first_parent.relations.clone()
+    };
+    if !structural {
+        // Remove every relinked or removed file's previous share first, so a
+        // relation that survives a relink re-inserts cleanly.
+        let mut drop_share = |artifact_id: &ArtifactId| -> Result<()> {
+            if let Some(previous) = first_parent.linked.get(artifact_id) {
+                for relation in &previous.relations {
+                    let Some(removed) = relations.remove(&relation.id) else {
+                        return Err(invalid(format!(
+                            "parent tree state lost relation {} during incremental carry-forward",
+                            relation.id
+                        )));
+                    };
+                    removed_relations.insert(relation.id, removed);
+                }
+            }
+            Ok(())
+        };
+        for artifact_id in &relink {
+            drop_share(artifact_id)?;
+        }
+        for artifact_id in first_parent.files.keys() {
+            if !files.contains_key(artifact_id) {
+                drop_share(artifact_id)?;
+            }
+        }
+    }
+    for artifact_id in &relink {
+        let file = files
+            .get(artifact_id)
+            .ok_or_else(|| invalid("relink set names an artifact absent from the tree"))?;
+        let linked_file = link_single_file(
+            file,
+            &ctx,
+            &known_files,
+            &artifact_ids,
+            &completeness,
+            &entities,
+        )?;
+        for relation in &linked_file.relations {
+            let value = Arc::new(relation.clone());
+            if relations.insert(relation.id, Arc::clone(&value)).is_some() {
+                return Err(invalid(
+                    "cross-file linker returned a duplicate relation identity",
+                ));
+            }
+            inserted_relations.insert(relation.id, value);
+        }
+        linked.insert(*artifact_id, Arc::new(linked_file));
+    }
+    for (artifact_id, file) in &files {
+        if linked.contains_key(artifact_id) {
+            continue;
+        }
+        let carried = first_parent.linked.get(artifact_id).ok_or_else(|| {
+            invalid(format!(
+                "carried-forward file {} has no parent link output",
+                file.path()
+            ))
+        })?;
+        linked.insert(*artifact_id, Arc::clone(carried));
+    }
+
+    if !structural {
+        audit_carried_link_outputs(
+            &files,
+            &linked,
+            &relink,
+            &removed_entities,
+            &inserted_entities,
+        )?;
+    }
+
+    let entity_deltas = deltas_from_entity_patch(&removed_entities, &inserted_entities);
+    let relation_deltas = deltas_from_relation_patch(&removed_relations, &inserted_relations);
+
+    Ok((
+        SemanticTreeState {
+            files,
+            linked,
+            entities,
+            relations,
+        },
+        entity_deltas,
+        relation_deltas,
+    ))
+}
+
+/// Resolve, decorate, and validate one file's complete share of the tree's
+/// linked relation set: its resolved entity relations, its artifact-level
+/// import/include edges, and its parse-coverage certificate.
+///
+/// This is exactly the per-file share the batch entry point produces: per-file
+/// resolution is pure, artifact edges depend only on this file's imports and
+/// the tree's path set, and cross-file merge deduplication can never fire
+/// because every relation's source node is owned by its emitting file.
+fn link_single_file(
+    file: &SemanticFileState,
+    ctx: &LinkContext<'_>,
+    known_files: &HashSet<&str>,
+    artifact_ids: &ArtifactIdentityMap,
+    completeness: &FileParseCompletenessMap,
+    entities: &BTreeMap<EntityId, Arc<Entity>>,
+) -> Result<LinkedFile> {
+    let mut produced = resolve_one_file(&file.parse, ctx, Some(completeness));
+    let mut seen_artifact = HashSet::new();
+    for import in &file.parse.imports {
+        if let Some(relation) =
+            make_artifact_import_relation(file.path(), import, known_files, artifact_ids)
+        {
+            if seen_artifact.insert((relation.src, relation.dst, relation.kind)) {
+                produced.push(relation);
+            }
+        }
+    }
+    let call_extraction_complete = !file
+        .parse
+        .relations
+        .iter()
+        .any(is_call_extraction_incomplete_marker);
+    produced.push(make_parse_coverage_relation(
+        file.path(),
+        file.artifact_id,
+        completeness.get(file.path()),
+        call_extraction_complete,
+    ));
+
+    let mut relations = Vec::with_capacity(produced.len());
+    let mut referenced_entities = BTreeSet::new();
+    let mut dropped_placeholder_dsts = BTreeSet::new();
+    for relation in produced {
+        if let Some(absent) = absent_local_endpoint(&relation, entities) {
             // A change carries the entity set of its own tree, so replaying it
             // can only bind an edge whose endpoints that tree defines. The
             // linker's cross-repo placeholder destination is absent by
@@ -318,6 +689,7 @@ fn semantic_state_for_tree(
             // history; every other absent endpoint is inconsistent state and
             // fails closed here instead of being admitted.
             if absent.is_destination && is_external_import_placeholder(&relation) {
+                dropped_placeholder_dsts.insert(absent.entity_id);
                 continue;
             }
             return Err(invalid(format!(
@@ -331,18 +703,537 @@ fn semantic_state_for_tree(
                 absent.entity_id
             )));
         }
-        if relations.insert(relation.id, relation).is_some() {
-            return Err(invalid(
-                "cross-file linker returned a duplicate relation identity",
-            ));
+        for node in [relation.src, relation.dst] {
+            if let Some(entity_id) = node.as_entity() {
+                referenced_entities.insert(entity_id);
+            }
+        }
+        relations.push(relation);
+    }
+    Ok(LinkedFile {
+        relations,
+        referenced_entities,
+        dropped_placeholder_dsts,
+    })
+}
+
+/// Fail-closed audit that a carried-forward link output could not have
+/// changed: it must not reference any entity this commit removed, and no
+/// placeholder destination it dropped may have become a real entity. Either
+/// condition would mean the invalidation analysis was not conservative, so
+/// enrichment refuses loudly instead of admitting silently wrong history.
+fn audit_carried_link_outputs(
+    files: &BTreeMap<ArtifactId, Arc<SemanticFileState>>,
+    linked: &BTreeMap<ArtifactId, Arc<LinkedFile>>,
+    relink: &[ArtifactId],
+    removed_entities: &BTreeMap<EntityId, Arc<Entity>>,
+    inserted_entities: &BTreeMap<EntityId, Arc<Entity>>,
+) -> Result<()> {
+    let net_removed: Vec<&EntityId> = removed_entities
+        .keys()
+        .filter(|id| !inserted_entities.contains_key(id))
+        .collect();
+    let net_added: Vec<&EntityId> = inserted_entities
+        .keys()
+        .filter(|id| !removed_entities.contains_key(id))
+        .collect();
+    if net_removed.is_empty() && net_added.is_empty() {
+        return Ok(());
+    }
+    let relinked: HashSet<&ArtifactId> = relink.iter().collect();
+    for (artifact_id, output) in linked {
+        if relinked.contains(artifact_id) {
+            continue;
+        }
+        for removed in &net_removed {
+            if output.referenced_entities.contains(removed) {
+                return Err(invalid(format!(
+                    "carried-forward link output for {} references removed entity {}; \
+                     relink invalidation was not conservative",
+                    files
+                        .get(artifact_id)
+                        .map(|file| file.path())
+                        .unwrap_or("<unknown>"),
+                    removed
+                )));
+            }
+        }
+        for added in &net_added {
+            if output.dropped_placeholder_dsts.contains(added) {
+                return Err(invalid(format!(
+                    "carried-forward link output for {} dropped a placeholder that now \
+                     names real entity {}; relink invalidation was not conservative",
+                    files
+                        .get(artifact_id)
+                        .map(|file| file.path())
+                        .unwrap_or("<unknown>"),
+                    added
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// First-parent entity deltas from the incremental patch, identical to a full
+/// map diff: an identity untouched by the patch carries the same shared value
+/// on both sides, and a patched identity compares old against new exactly as
+/// the full diff would.
+fn deltas_from_entity_patch(
+    removed: &BTreeMap<EntityId, Arc<Entity>>,
+    inserted: &BTreeMap<EntityId, Arc<Entity>>,
+) -> Vec<EntityDelta> {
+    let mut deltas = Vec::new();
+    for (id, old) in removed {
+        match inserted.get(id) {
+            Some(new) if **old == **new => {}
+            Some(new) => deltas.push(EntityDelta::Modified {
+                old: (**old).clone(),
+                new: (**new).clone(),
+            }),
+            None => deltas.push(EntityDelta::Removed {
+                old: (**old).clone(),
+            }),
+        }
+    }
+    for (id, new) in inserted {
+        if !removed.contains_key(id) {
+            deltas.push(EntityDelta::Added {
+                new: (**new).clone(),
+            });
+        }
+    }
+    deltas.sort_by_key(EntityDelta::target_id);
+    deltas
+}
+
+fn deltas_from_relation_patch(
+    removed: &BTreeMap<RelationId, Arc<Relation>>,
+    inserted: &BTreeMap<RelationId, Arc<Relation>>,
+) -> Vec<RelationDelta> {
+    let mut deltas = Vec::new();
+    for (id, old) in removed {
+        match inserted.get(id) {
+            Some(new) if **old == **new => {}
+            Some(new) => deltas.push(RelationDelta::Modified {
+                old: (**old).clone(),
+                new: (**new).clone(),
+            }),
+            None => deltas.push(RelationDelta::Removed {
+                old: (**old).clone(),
+            }),
+        }
+    }
+    for (id, new) in inserted {
+        if !removed.contains_key(id) {
+            deltas.push(RelationDelta::Added {
+                new: (**new).clone(),
+            });
+        }
+    }
+    deltas.sort_by_key(RelationDelta::target_id);
+    deltas
+}
+
+/// Persistent cross-commit linking state.
+///
+/// Nothing in here is semantic truth: it is memoized analysis of file versions
+/// (probe tokens, resolved module and include targets, hierarchy projections)
+/// used to prove which files a commit's delta cannot have affected. Every
+/// entry is keyed to the exact parse payload (by pointer identity) and the
+/// exact path-set era it was computed under, and is recomputed whenever
+/// either changes.
+struct LinkEngine {
+    verify: bool,
+    analyses: HashMap<ArtifactId, AnalysisSlot>,
+}
+
+struct AnalysisSlot {
+    parse_ptr: usize,
+    entity_arcs: Vec<Arc<Entity>>,
+    stat: Arc<FileStaticAnalysis>,
+    era_signature: u64,
+    era: Arc<FileEraAnalysis>,
+}
+
+/// Analysis of one file version that depends only on its own parse payload.
+struct FileStaticAnalysis {
+    /// Every name-shaped key this file's resolution can probe in the global
+    /// entity indices: relation destinations plus their bare leaves, `::` and
+    /// `.` segments, and adjacent type-qualified suffix pairs.
+    tokens: BTreeSet<String>,
+    /// Full and bare names this file contributes to the global entity indices.
+    contributed_names: BTreeSet<String>,
+    /// Class hierarchy shape other files' inheritance walks can traverse
+    /// through this file.
+    hierarchy: FileHierarchyProjection,
+    /// Bare leaves of this file's declared Extends bases.
+    base_leaves: BTreeSet<String>,
+    /// Whether any call in this file can enter an inheritance walk at all.
+    walk_capable: bool,
+}
+
+#[derive(PartialEq, Eq)]
+struct FileHierarchyProjection {
+    /// Sorted (class, base) pairs from parser-emitted Extends relations.
+    extends: Vec<(String, String)>,
+    /// Sorted class-like entity (name, kind) pairs: the anchors and waypoints
+    /// an inheritance walk can locate in this file.
+    class_like: Vec<(String, String)>,
+    /// Sorted import specifiers, tracked only when the file declares Extends
+    /// bases: a mid-walk `locate_base_class` resolves that file's bases
+    /// through its own imports.
+    imports: Vec<(String, String, String)>,
+}
+
+/// Analysis of one file version that also depends on the tree's path set.
+struct FileEraAnalysis {
+    /// Files this file's imports and parser-pinned import sources resolve to.
+    module_targets: BTreeSet<String>,
+    /// Include-like resolved targets, exactly as batch include-graph
+    /// construction records them.
+    include_targets: Vec<String>,
+}
+
+impl LinkEngine {
+    fn new() -> Self {
+        let verify = std::env::var("KIN_HISTORY_LINK_VERIFY")
+            .map(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false);
+        Self {
+            verify,
+            analyses: HashMap::new(),
         }
     }
 
-    Ok(SemanticTreeState {
-        files,
-        entities,
-        relations,
-    })
+    fn analysis(&self, artifact_id: &ArtifactId) -> &AnalysisSlot {
+        self.analyses
+            .get(artifact_id)
+            .expect("analysis slots are refreshed for every file in the tree before use")
+    }
+
+    fn refresh_analyses(
+        &mut self,
+        files: &BTreeMap<ArtifactId, Arc<SemanticFileState>>,
+        era_signature: u64,
+        known_files: &HashSet<&str>,
+    ) {
+        for (artifact_id, file) in files {
+            let parse_ptr = Arc::as_ptr(&file.parse) as usize;
+            let stale = match self.analyses.get(artifact_id) {
+                Some(slot) => slot.parse_ptr != parse_ptr,
+                None => true,
+            };
+            if stale {
+                let stat = Arc::new(analyze_file_static(&file.parse));
+                let era = Arc::new(analyze_file_era(&file.parse, known_files));
+                let entity_arcs = file
+                    .parse
+                    .entities
+                    .iter()
+                    .map(|entity| Arc::new(entity.clone()))
+                    .collect();
+                self.analyses.insert(
+                    *artifact_id,
+                    AnalysisSlot {
+                        parse_ptr,
+                        entity_arcs,
+                        stat,
+                        era_signature,
+                        era,
+                    },
+                );
+                continue;
+            }
+            let slot = self
+                .analyses
+                .get_mut(artifact_id)
+                .expect("slot presence checked above");
+            if slot.era_signature != era_signature {
+                slot.era = Arc::new(analyze_file_era(&file.parse, known_files));
+                slot.era_signature = era_signature;
+            }
+        }
+    }
+}
+
+/// The conservative set of files whose link output must be recomputed for
+/// a content-only commit. Everything a file's resolution can observe from
+/// the rest of the tree is covered by one of the four rules below; the
+/// per-rule reasoning lives with each block.
+fn invalidated_files(
+    engine: &LinkEngine,
+    files: &BTreeMap<ArtifactId, Arc<SemanticFileState>>,
+    first_parent: &SemanticTreeState,
+    known_files: &HashSet<&str>,
+) -> Result<Vec<ArtifactId>> {
+    let mut relink = BTreeSet::new();
+    let mut changed = Vec::new();
+    for (artifact_id, file) in files {
+        let Some(parent_file) = first_parent.files.get(artifact_id) else {
+            return Err(invalid(
+                "content-only commit gained an artifact; structural mode was required",
+            ));
+        };
+        if !Arc::ptr_eq(file, parent_file) {
+            changed.push((*artifact_id, Arc::clone(parent_file), Arc::clone(file)));
+            relink.insert(*artifact_id);
+        }
+    }
+
+    // Rule 1: names. A kept file's resolution reads the global indices only
+    // at keys derivable from its own parse payload; the indices change only
+    // at keys named by the changed files' old and new entity sets. Any
+    // intersection forces a relink.
+    let mut changed_names = BTreeSet::new();
+    // Rule 2: module targets. Import, pin, namespace-member, and
+    // default-export resolution reach other files through resolved module
+    // paths; path resolution is stable while the path set is stable, so a
+    // kept file is affected only when a changed file is one of its targets.
+    let mut changed_paths = BTreeSet::new();
+    // Rule 3: include topology. Macro reachability and include-closure
+    // disambiguation read the transitive include graph, so a changed
+    // include-target list invalidates every file that can reach the
+    // changed file through either the old or the new graph.
+    let mut include_seeds = BTreeSet::new();
+    // Rule 4: hierarchy. Inheritance walks discover class names mid-walk
+    // that no static token set can enumerate, so any change to a hierarchy
+    // projection, or to any entity sharing a name with a declared base,
+    // invalidates every file whose calls can enter a walk.
+    let mut hierarchy_fire = false;
+    let mut base_leaves: BTreeSet<String> = BTreeSet::new();
+    for slot in files.keys().map(|id| engine.analysis(id)) {
+        base_leaves.extend(slot.stat.base_leaves.iter().cloned());
+    }
+
+    for (artifact_id, old_file, new_file) in &changed {
+        let new_slot = engine.analysis(artifact_id);
+        let old_stat = analyze_file_static(&old_file.parse);
+        let old_era = analyze_file_era(&old_file.parse, known_files);
+        changed_names.extend(old_stat.contributed_names.iter().cloned());
+        changed_names.extend(new_slot.stat.contributed_names.iter().cloned());
+        changed_paths.insert(new_file.path().to_string());
+        if old_era.include_targets != new_slot.era.include_targets {
+            include_seeds.insert(new_file.path().to_string());
+        }
+        base_leaves.extend(old_stat.base_leaves.iter().cloned());
+        if old_stat.hierarchy != new_slot.stat.hierarchy {
+            hierarchy_fire = true;
+        }
+        if !hierarchy_fire {
+            for name in old_stat
+                .contributed_names
+                .iter()
+                .chain(new_slot.stat.contributed_names.iter())
+            {
+                if base_leaves.contains(name) {
+                    hierarchy_fire = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    let include_invalidated = if include_seeds.is_empty() {
+        HashSet::new()
+    } else {
+        // Reverse reachability over the union of the old and new include
+        // graphs, unbounded by the forward walk's depth cap: a superset of
+        // every file whose bounded closure could contain a seed.
+        let mut reverse: HashMap<String, Vec<String>> = HashMap::new();
+        for (artifact_id, file) in files {
+            for target in &engine.analysis(artifact_id).era.include_targets {
+                reverse
+                    .entry(target.clone())
+                    .or_default()
+                    .push(file.path().to_string());
+            }
+        }
+        for (_, old_file, _) in &changed {
+            let old_era = analyze_file_era(&old_file.parse, known_files);
+            for target in &old_era.include_targets {
+                reverse
+                    .entry(target.clone())
+                    .or_default()
+                    .push(old_file.path().to_string());
+            }
+        }
+        let mut reached: HashSet<String> = HashSet::new();
+        let mut stack: Vec<String> = include_seeds.iter().cloned().collect();
+        while let Some(path) = stack.pop() {
+            if !reached.insert(path.clone()) {
+                continue;
+            }
+            if let Some(importers) = reverse.get(&path) {
+                stack.extend(importers.iter().cloned());
+            }
+        }
+        reached
+    };
+
+    for (artifact_id, file) in files {
+        if relink.contains(artifact_id) {
+            continue;
+        }
+        let slot = engine.analysis(artifact_id);
+        let token_hit = intersects(&slot.stat.tokens, &changed_names);
+        let module_hit = slot
+            .era
+            .module_targets
+            .iter()
+            .any(|target| changed_paths.contains(target));
+        let include_hit = include_invalidated.contains(file.path());
+        let hierarchy_hit = hierarchy_fire && slot.stat.walk_capable;
+        if token_hit || module_hit || include_hit || hierarchy_hit {
+            relink.insert(*artifact_id);
+        }
+    }
+    Ok(relink.into_iter().collect())
+}
+
+fn intersects(a: &BTreeSet<String>, b: &BTreeSet<String>) -> bool {
+    let (small, large) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+    small.iter().any(|item| large.contains(item))
+}
+
+/// Insert every index key `name` can be probed under, on both the probing and
+/// the contributing side: the full name, its bare leaf, each `::` and `.`
+/// segment, and the type-qualified adjacent suffix pair.
+fn add_name_tokens(tokens: &mut BTreeSet<String>, name: &str) {
+    if name.is_empty() {
+        return;
+    }
+    tokens.insert(name.to_string());
+    tokens.insert(bare_entity_name(name).to_string());
+    let segments: Vec<&str> = name.split("::").collect();
+    if segments.len() >= 2 {
+        for segment in &segments {
+            tokens.insert((*segment).to_string());
+        }
+        tokens.insert(format!(
+            "{}::{}",
+            segments[segments.len() - 2],
+            segments[segments.len() - 1]
+        ));
+    }
+    if name.contains('.') {
+        for segment in name.split('.') {
+            tokens.insert(segment.to_string());
+        }
+    }
+}
+
+fn analyze_file_static(parse: &FileParseData) -> FileStaticAnalysis {
+    let mut tokens = BTreeSet::new();
+    let mut walk_capable = false;
+    for relation in &parse.relations {
+        if is_call_extraction_incomplete_marker(relation) {
+            continue;
+        }
+        add_name_tokens(&mut tokens, &relation.dst_name);
+        if relation.kind == kin_model::RelationKind::Calls
+            && (split_owner_method(&relation.dst_name).is_some()
+                || split_scoped_receiver_method(&relation.dst_name).is_some())
+        {
+            walk_capable = true;
+        }
+    }
+
+    let mut contributed_names = BTreeSet::new();
+    for entity in &parse.entities {
+        contributed_names.insert(entity.name.clone());
+        contributed_names.insert(bare_entity_name(&entity.name).to_string());
+    }
+
+    let mut extends = Vec::new();
+    let mut base_leaves = BTreeSet::new();
+    for relation in &parse.relations {
+        if relation.kind != kin_model::RelationKind::Extends {
+            continue;
+        }
+        let pair = (relation.src_name.clone(), relation.dst_name.clone());
+        if !extends.contains(&pair) {
+            extends.push(pair);
+        }
+        base_leaves.insert(bare_entity_name(&relation.dst_name).to_string());
+    }
+    extends.sort();
+    let mut class_like: Vec<(String, String)> = parse
+        .entities
+        .iter()
+        .filter(|entity| is_class_like(Some(&entity.kind)))
+        .map(|entity| (entity.name.clone(), format!("{:?}", entity.kind)))
+        .collect();
+    class_like.sort();
+    class_like.dedup();
+    let mut imports = Vec::new();
+    if !extends.is_empty() {
+        for import in &parse.imports {
+            for spec in &import.specifiers {
+                imports.push((
+                    import.module_path.clone(),
+                    spec.local_name.clone(),
+                    spec.original_name.clone().unwrap_or_default(),
+                ));
+            }
+        }
+        imports.sort();
+    }
+
+    FileStaticAnalysis {
+        tokens,
+        contributed_names,
+        hierarchy: FileHierarchyProjection {
+            extends,
+            class_like,
+            imports,
+        },
+        base_leaves,
+        walk_capable,
+    }
+}
+
+fn analyze_file_era(parse: &FileParseData, known_files: &HashSet<&str>) -> FileEraAnalysis {
+    let mut module_targets = BTreeSet::new();
+    for import in &parse.imports {
+        if let Some(target) =
+            resolve_module_path(&parse.file_path, &import.module_path, known_files)
+        {
+            module_targets.insert(target);
+        }
+    }
+    for relation in &parse.relations {
+        if let Some(source) = relation
+            .import_source
+            .as_deref()
+            .map(str::trim)
+            .filter(|source| !source.is_empty())
+        {
+            if let Some(target) = resolve_module_path(&parse.file_path, source, known_files) {
+                module_targets.insert(target);
+            }
+        }
+    }
+    let include_targets = resolve_include_targets(&parse.file_path, &parse.imports, known_files);
+    FileEraAnalysis {
+        module_targets,
+        include_targets,
+    }
+}
+
+/// Stable signature of the tree's path membership. Module and include-target
+/// resolution consult the known-file set, so their per-file caches are only
+/// valid while this signature holds.
+fn era_signature_of(files: &BTreeMap<ArtifactId, Arc<SemanticFileState>>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut paths: Vec<&str> = files.values().map(|file| file.path()).collect();
+    paths.sort_unstable();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for path in paths {
+        path.hash(&mut hasher);
+        0xffu8.hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 /// An entity endpoint of a linked relation that the tree does not define.
@@ -354,9 +1245,9 @@ struct AbsentEndpoint {
 /// Report the first entity endpoint of `relation` that `entities` does not
 /// define, source before destination. Non-entity endpoints are not part of the
 /// entity state a change replays, so they are never reported.
-fn absent_local_endpoint(
+fn absent_local_endpoint<V>(
     relation: &Relation,
-    entities: &BTreeMap<EntityId, Entity>,
+    entities: &BTreeMap<EntityId, V>,
 ) -> Option<AbsentEndpoint> {
     [(relation.src, false), (relation.dst, true)]
         .into_iter()
@@ -1014,6 +1905,216 @@ mod tests {
             error.to_string().contains("was not enriched first"),
             "{error}"
         );
+    }
+
+    /// Build a Git fixture from parent-first (path, body) steps, where each
+    /// step is one commit writing the given files, then enrich it with the
+    /// batch cross-check forced on for every commit. The batch derivation is
+    /// the oracle: any divergence in the incremental tree states or emitted
+    /// deltas fails the derivation itself.
+    fn enrich_verified(steps: &[&[(&str, &str)]]) -> Vec<HistoricalSemanticDelta> {
+        let root = tempdir().unwrap();
+        let repository = root.path().join("source");
+        fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "--initial-branch=main"]);
+        git(
+            &repository,
+            &["config", "user.email", "kin@example.invalid"],
+        );
+        git(&repository, &["config", "user.name", "Kin Test"]);
+        for (index, step) in steps.iter().enumerate() {
+            for (path, body) in *step {
+                write(&repository, path, body.as_bytes());
+            }
+            git(&repository, &["add", "--all"]);
+            git(&repository, &["commit", "-m", &format!("step {index}")]);
+        }
+        let blob_store = BlobStore::new(root.path().join("cas")).unwrap();
+        let snapshot = capture_lossless_git_repository(
+            &repository,
+            RepositoryId::new("history-incremental-equivalence").unwrap(),
+            &blob_store,
+        )
+        .unwrap();
+        let plan = plan_semantic_git_import(&snapshot, &blob_store).unwrap();
+        let trees = trees_by_change(&plan);
+        derive_historical_semantic_deltas_verified(&plan.changes, &trees, &blob_store).unwrap()
+    }
+
+    /// Content-only commits: bodies change, cross-file callers must relink
+    /// when their callee's name set changes, and untouched files carry
+    /// forward. Every commit is cross-checked against the batch derivation.
+    #[test]
+    fn incremental_replay_matches_batch_on_content_edits() {
+        let deltas = enrich_verified(&[
+            &[
+                ("src/a.rs", "pub fn alpha() -> u8 { 1 }\n"),
+                ("src/b.rs", "pub fn beta() -> u8 { crate::a::alpha() }\n"),
+                ("src/c.rs", "pub fn gamma() -> u8 { 3 }\n"),
+            ],
+            // Body-only edit: callers of alpha unaffected structurally.
+            &[("src/a.rs", "pub fn alpha() -> u8 { 2 }\n")],
+            // Rename alpha -> alpha_two: b's cross-file call must relink away.
+            &[("src/a.rs", "pub fn alpha_two() -> u8 { 2 }\n")],
+            // b now calls the new name; c stays untouched throughout.
+            &[(
+                "src/b.rs",
+                "pub fn beta() -> u8 { crate::a::alpha_two() }\n",
+            )],
+        ]);
+        assert_eq!(deltas.len(), 4);
+    }
+
+    /// A same-name definition appearing in another file changes ambiguity for
+    /// an untouched caller; removing it changes it back.
+    #[test]
+    fn incremental_replay_matches_batch_on_ambiguity_shifts() {
+        enrich_verified(&[
+            &[
+                ("src/caller.rs", "pub fn go() { helper(); }\n"),
+                ("src/one.rs", "pub fn helper() {}\n"),
+            ],
+            // A second helper appears: the untouched caller's candidate set
+            // widens and must relink.
+            &[("src/two.rs", "pub fn helper() {}\npub fn other() {}\n")],
+            // The second helper disappears again (content-only edit).
+            &[("src/two.rs", "pub fn other() {}\n")],
+        ]);
+    }
+
+    /// Structural commits: files added, removed, and renamed force whole-tree
+    /// relinks that must still match the batch derivation exactly.
+    #[test]
+    fn incremental_replay_matches_batch_on_structural_commits() {
+        enrich_verified(&[
+            &[("src/lib.rs", "pub fn one() {}\n")],
+            &[
+                ("src/lib.rs", "pub mod extra;\npub fn one() {}\n"),
+                ("src/extra.rs", "pub fn two() { crate::one() }\n"),
+            ],
+            // Content-only step between the structural ones.
+            &[("src/extra.rs", "pub fn two() { crate::one(); }\n")],
+            // Remove the module again.
+            &[("src/lib.rs", "pub fn one() {}\npub fn three() {}\n")],
+        ]);
+    }
+
+    /// Python inheritance: an edit to a base class's hierarchy must relink the
+    /// walk-capable caller even though the caller's own file never changed.
+    #[test]
+    fn incremental_replay_matches_batch_on_hierarchy_edits() {
+        enrich_verified(&[
+            &[
+                (
+                    "pkg/base.py",
+                    "class Base:\n    def greet(self):\n        return 1\n",
+                ),
+                (
+                    "pkg/mid.py",
+                    "from base import Base\n\nclass Mid(Base):\n    pass\n",
+                ),
+                (
+                    "pkg/use.py",
+                    "from mid import Mid\n\nclass App(Mid):\n    def run(self):\n        return App.greet(self)\n",
+                ),
+            ],
+            // Move greet out of Base: the walk from App must stop resolving.
+            &[(
+                "pkg/base.py",
+                "class Base:\n    def farewell(self):\n        return 2\n",
+            )],
+            // Reintroduce greet.
+            &[(
+                "pkg/base.py",
+                "class Base:\n    def greet(self):\n        return 3\n",
+            )],
+        ]);
+    }
+
+    /// Import rewiring: a caller's own import moves between modules, and a
+    /// target module's exports change underneath an untouched importer.
+    #[test]
+    fn incremental_replay_matches_batch_on_import_rewiring() {
+        enrich_verified(&[
+            &[
+                ("src/util.ts", "export function finalize() {}\n"),
+                ("src/alt.ts", "export function finalize() {}\n"),
+                (
+                    "src/app.ts",
+                    "import { finalize } from './util';\nexport function main() { finalize(); }\n",
+                ),
+            ],
+            // The untouched importer's target module changes its exports.
+            &[(
+                "src/util.ts",
+                "export function finalize() {}\nexport function extra() {}\n",
+            )],
+            // The importer itself rewires to the other module.
+            &[(
+                "src/app.ts",
+                "import { finalize } from './alt';\nexport function main() { finalize(); }\n",
+            )],
+        ]);
+    }
+
+    /// Merge shape: two branches, both sides carrying semantic files, with the
+    /// merge adopting each side's version. Parent-first replay must stay
+    /// batch-identical through the merge commit.
+    #[test]
+    fn incremental_replay_matches_batch_across_merges() {
+        let root = tempdir().unwrap();
+        let repository = root.path().join("source");
+        fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "--initial-branch=main"]);
+        git(
+            &repository,
+            &["config", "user.email", "kin@example.invalid"],
+        );
+        git(&repository, &["config", "user.name", "Kin Test"]);
+        write(&repository, "src/shared.rs", b"pub fn shared() {}\n");
+        write(&repository, "src/main_side.rs", b"pub fn main_side() {}\n");
+        git(&repository, &["add", "--all"]);
+        git(&repository, &["commit", "-m", "root"]);
+
+        git(&repository, &["checkout", "-b", "feature"]);
+        write(
+            &repository,
+            "src/feature.rs",
+            b"pub fn feature() { crate::shared() }\n",
+        );
+        git(&repository, &["add", "--all"]);
+        git(&repository, &["commit", "-m", "feature"]);
+
+        git(&repository, &["checkout", "main"]);
+        write(
+            &repository,
+            "src/main_side.rs",
+            b"pub fn main_side() { crate::shared() }\n",
+        );
+        git(&repository, &["add", "--all"]);
+        git(&repository, &["commit", "-m", "main work"]);
+        git(
+            &repository,
+            &["merge", "--no-ff", "feature", "-m", "merge feature"],
+        );
+        write(
+            &repository,
+            "src/shared.rs",
+            b"pub fn shared() -> u8 { 1 }\n",
+        );
+        git(&repository, &["add", "--all"]);
+        git(&repository, &["commit", "-m", "post-merge edit"]);
+
+        let blob_store = BlobStore::new(root.path().join("cas")).unwrap();
+        let snapshot = capture_lossless_git_repository(
+            &repository,
+            RepositoryId::new("history-incremental-merge").unwrap(),
+            &blob_store,
+        )
+        .unwrap();
+        let plan = plan_semantic_git_import(&snapshot, &blob_store).unwrap();
+        let trees = trees_by_change(&plan);
+        derive_historical_semantic_deltas_verified(&plan.changes, &trees, &blob_store).unwrap();
     }
 
     fn trees_by_change(

@@ -3,7 +3,7 @@
 
 # Kin environment variables
 
-This is the authoritative list of supported `KIN_*` environment variables (410 total, 310 correctness-relevant), generated from the central registry in `kin-core`.
+This is the authoritative list of supported `KIN_*` environment variables (411 total, 310 correctness-relevant), generated from the central registry in `kin-core`.
 
 At CLI and daemon startup Kin validates this surface (`KIN_ENV_VALIDATION`, default `warn`):
 
@@ -41,6 +41,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_CLAUDE_DISALLOWED_TOOLS` | string | *(unset)* | operational | comma-separated tool names disallowed in a with-session |
 | `KIN_DIR` | path | *(unset)* | operational | compatibility alias for the managed Kin install root; KIN_HOME wins when both are set |
 | `KIN_DISABLE_SPINE` | bool | false | correctness | disable the spine federation layer, narrowing retrieval scope |
+| `KIN_HISTORY_LINK_VERIFY` | bool | false | operational | cross-check incremental historical enrichment against the full batch derivation at every commit during Git admission (self-audit; much slower, output unchanged) |
 | `KIN_HOME` | path | ~/.kin | operational | preferred root for the managed Kin install used by the launcher, setup, and shell hooks |
 | `KIN_MCP_CACHE_DIR` | path | *(unset)* | operational | cache directory override for the npm MCP wrapper's managed Kin binary |
 | `KIN_MCP_REPO` | path | *(unset)* | operational | bind `kin mcp start` to this repository instead of the launch directory |

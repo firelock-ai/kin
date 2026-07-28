@@ -162,6 +162,7 @@ pub const OPERATIONAL: &[EnvVarSpec] = &[
     EnvVarSpec { name: "KIN_WRITE_VETO", kind: Kind::OneOf(&["warn", "enforce", "off"]), default: "warn", sensitivity: Sensitivity::Correctness, summary: "write-veto mode: 'warn' (default) annotates would-be vetoes into foreign-held scopes, 'enforce' rejects them with a 409, 'off' disables" },
     EnvVarSpec { name: "KIN_DAEMON_LOCATE_ONLY", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Correctness, summary: "daemon serves locate-only from a snapshot, changing what it answers" },
     EnvVarSpec { name: "KIN_DAEMON_DISABLE_LSP", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Correctness, summary: "disable LSP enrichment in the daemon, reducing relation coverage" },
+    EnvVarSpec { name: "KIN_HISTORY_LINK_VERIFY", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Operational, summary: "cross-check incremental historical enrichment against the full batch derivation at every commit during Git admission (self-audit; much slower, output unchanged)" },
     EnvVarSpec { name: "KIN_COCHANGE_MAX_FAN_OUT", kind: Kind::Usize, default: "15", sensitivity: Sensitivity::Correctness, summary: "cap on co-change fan-out per entity (co-change ranking signal)" },
     EnvVarSpec { name: "KIN_COCHANGE_MAX_FILES_PER_COMMIT", kind: Kind::Usize, default: "20", sensitivity: Sensitivity::Correctness, summary: "cap on files per commit considered for the co-change signal" },
 
@@ -590,6 +591,18 @@ impl AuditReport {
 /// invocation inside a kin-vfs projection would emit a spurious typo warning.
 const EXTERNAL_PREFIXES: &[&str] = &["KIN_VFS_"];
 
+/// `KIN_*` variables that existed in an earlier kin and were deliberately
+/// removed. Setting one is not a possible typo: the caller is pinning a
+/// guarantee this binary no longer implements, and silently ignoring the pin
+/// would let a protocol fail-safe rot into a no-op. These fail startup loudly
+/// in every validation mode so the caller learns the pin is dead.
+const REMOVED: &[(&str, &str)] = &[(
+    "KIN_INIT_WARM_CACHE",
+    "this variable was removed with the exact Git admission cutover: init derives all \
+     semantic truth from the captured object closure and consults no warm cache, so the \
+     contamination this pin guarded against cannot occur. Unset it",
+)];
+
 /// Audit an environment (any iterator of name/value pairs). Pure: it never reads
 /// or mutates the process environment, so it is deterministic and testable.
 ///
@@ -608,6 +621,14 @@ where
         }
         if EXTERNAL_PREFIXES.iter().any(|p| name.starts_with(p)) {
             continue; // owned by a sibling component (e.g. kin-vfs); not our surface
+        }
+        if let Some((_, reason)) = REMOVED.iter().find(|(removed, _)| *removed == name) {
+            report.invalid.push(Finding {
+                var: name.clone(),
+                severity: Severity::Error,
+                message: (*reason).to_string(),
+            });
+            continue;
         }
         match spec(&name) {
             None => report.unknown.push(name),
@@ -981,6 +1002,27 @@ mod tests {
             spec("KIN_LOCATE_PHASE_MULTIHOP_SECS").unwrap().kind,
             Kind::SecsBound
         ));
+    }
+
+    #[test]
+    fn removed_var_hard_fails_in_every_mode() {
+        // A removed variable is a dead protocol pin, not a typo: it must abort
+        // startup loudly even in the default warn mode, naming itself and why.
+        for strict in [false, true] {
+            let report = audit_env(
+                [("KIN_INIT_WARM_CACHE".to_string(), "0".to_string())],
+                strict,
+            );
+            assert!(report.unknown.is_empty(), "removed vars are not unknowns");
+            assert!(report.has_hard_errors());
+            let finding = report
+                .invalid
+                .iter()
+                .find(|f| f.var == "KIN_INIT_WARM_CACHE")
+                .expect("removed var must be reported by name");
+            assert_eq!(finding.severity, Severity::Error);
+            assert!(finding.message.contains("removed"));
+        }
     }
 
     #[test]
