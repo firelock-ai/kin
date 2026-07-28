@@ -56,15 +56,6 @@ pub enum RepositoryTransferDirection {
     Pull,
 }
 
-impl RepositoryTransferDirection {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Push => "push",
-            Self::Pull => "pull",
-        }
-    }
-}
-
 /// How an advertised head sits against exact local history.
 ///
 /// This is deliberately the only question local history can answer on its own.
