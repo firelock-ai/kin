@@ -2309,9 +2309,10 @@ impl LoadingNotice {
         let repository = kin_root
             .parent()
             .and_then(|path| path.file_name())
-            .map_or_else(|| kin_root.display().to_string(), |name| {
-                name.to_string_lossy().into_owned()
-            });
+            .map_or_else(
+                || kin_root.display().to_string(),
+                |name| name.to_string_lossy().into_owned(),
+            );
         eprintln!(
             "kin: daemon is loading {repository} ({:.0}s elapsed, waiting up to {:.0}s; \
              raise KIN_DAEMON_READY_TIMEOUT_SECS to wait longer)",
@@ -2331,7 +2332,10 @@ impl LoadingNotice {
                 budget.as_secs_f64()
             )
         } else {
-            format!("daemon failed to become ready within {:.1}s", budget.as_secs_f64())
+            format!(
+                "daemon failed to become ready within {:.1}s",
+                budget.as_secs_f64()
+            )
         }
     }
 }
