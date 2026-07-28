@@ -6263,6 +6263,13 @@ mod tests {
         (snapshot, vec![genesis, branch, merge])
     }
 
+    /// A merge restates the edit its second parent published. Entity revisions
+    /// derived along first-parent lineage alone never saw that payload, so
+    /// replay read the merge's old payload as stale and refused the history.
+    ///
+    /// Upstream trigger: fd 10ea476e3174350860ef3a32c61c4c8d6e74ab55, its 91st
+    /// commit, the first merge in fd whose second parent carries a source edit
+    /// (src/main.rs) that the first-parent lineage never published.
     #[test]
     fn history_replay_admits_a_merge_that_carries_its_second_parent_edits() {
         let original = semantic_test_entity("src/lib.rs", "kin", LanguageId::Rust, 0x61);

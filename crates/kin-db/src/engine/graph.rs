@@ -12611,6 +12611,14 @@ mod tests {
         );
     }
 
+    /// Reloading a snapshot must rebuild the same revisions the live graph
+    /// held, including the payload a merge inherited from its second parent.
+    /// Backfilling along first-parent lineage alone loses it and the reload
+    /// refuses its own history as stale.
+    ///
+    /// Upstream trigger: fd 10ea476e3174350860ef3a32c61c4c8d6e74ab55, its 91st
+    /// commit, the first merge in fd whose second parent carries a source edit
+    /// (src/main.rs) that the first-parent lineage never published.
     #[test]
     fn from_snapshot_backfills_entity_revisions_across_merge_history() {
         let graph = InMemoryGraph::new();
