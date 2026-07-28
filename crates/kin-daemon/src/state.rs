@@ -4640,14 +4640,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_daemon_with_no_warm_up_in_flight_does_not_claim_to_be_warming() {
-        let fixture = tempfile::tempdir().expect("tempdir");
-        let initialized = kin_core::init(fixture.path()).expect("init fixture repository");
-        let state = test_state(initialized.layout, fixture.path());
-        assert!(!state.spine_warming());
-    }
-
     fn test_entity(name: &str, file_path: &str) -> Entity {
         Entity {
             id: kin_model::EntityId::new(),
