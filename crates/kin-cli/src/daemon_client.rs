@@ -1325,6 +1325,68 @@ impl DaemonClient {
             .context("parse daemon session workspace response")
     }
 
+    /// Register a capability-scoped agent session bound to a session workspace.
+    ///
+    /// `pid` is the launching CLI process, which outlives the child it is about
+    /// to run, so the daemon's liveness check tracks a process that is really
+    /// there instead of reaping the lease out from under a working agent.
+    pub async fn start_session(
+        &self,
+        vendor: &str,
+        client_name: &str,
+        cwd: &std::path::Path,
+        pid: u32,
+        capabilities: kin_model::session::SessionCapabilities,
+    ) -> Result<String> {
+        let body = serde_json::json!({
+            "vendor": vendor,
+            "client_name": client_name,
+            "transport": "cli",
+            "pid": pid,
+            "cwd": cwd.display().to_string(),
+            "capabilities": capabilities,
+        });
+        let resp = self
+            .send(
+                self.client
+                    .post(format!("{}/session", self.base_url))
+                    .json(&body),
+                "send daemon session registration",
+            )
+            .await?;
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("daemon session registration error (HTTP {status}): {body}");
+        }
+        let value: serde_json::Value = resp
+            .json()
+            .await
+            .context("parse daemon session registration response")?;
+        value
+            .get("session_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| anyhow::anyhow!("daemon session registration returned no session_id"))
+    }
+
+    /// Release a session lease registered by [`Self::start_session`].
+    pub async fn end_session(&self, session_id: &str) -> Result<()> {
+        let resp = self
+            .send(
+                self.client
+                    .delete(format!("{}/session/{}", self.base_url, session_id)),
+                "send daemon session end",
+            )
+            .await?;
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("daemon session end error (HTTP {status}): {body}");
+        }
+        Ok(())
+    }
+
     pub async fn work(
         &self,
         request: &crate::commands::work::WorkRequest,

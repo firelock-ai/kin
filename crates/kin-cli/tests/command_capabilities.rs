@@ -40,7 +40,7 @@ fn capability_json_keeps_the_bounded_dogfood_bar_explicit() {
     assert_eq!(report["bounded_dogfood_required_ready"], 12);
     assert_eq!(report["bounded_dogfood_required_total"], 12);
     assert_eq!(report["full_git_replacement_ready"], false);
-    assert_eq!(report["ready_commands"], 22);
+    assert_eq!(report["ready_commands"], 26);
     assert_eq!(report["command_total"], 33);
 
     let commands = report["commands"]
@@ -119,6 +119,77 @@ fn remaining_open_gate_commands_fail_before_repository_discovery() {
         "checkout must no longer answer from the capability gate: {stderr}"
     );
     assert!(stderr.contains("not a Kin repository"), "{stderr}");
+}
+
+/// The session cluster is wired to the session surface, not to the gate.
+///
+/// Each command is driven through the real binary and must fail on repository
+/// discovery. Asserting the gate message is absent is what catches a silent
+/// re-seal, and asserting the discovery message is present is what catches a
+/// dispatch arm that was flipped ready without being connected to anything.
+#[test]
+fn session_commands_reach_the_session_surface_instead_of_the_capability_gate() {
+    let root = tempdir().expect("temp root");
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&home).expect("create home");
+
+    for args in [
+        &["exec", "--", "true"][..],
+        &["shell"][..],
+        &["open", "code"][..],
+        &["with", "claude"][..],
+    ] {
+        let output = kin_command(&home)
+            .args(args)
+            .current_dir(root.path())
+            .output()
+            .unwrap_or_else(|error| panic!("run kin {args:?}: {error}"));
+        assert!(
+            !output.status.success(),
+            "kin {args:?} must fail outside a repository"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains("is fail-closed on repository-v6"),
+            "kin {args:?} must no longer answer from the capability gate: {stderr}"
+        );
+        assert!(
+            stderr.contains("not inside a Kin repository"),
+            "kin {args:?} must reach the session surface and fail on discovery: {stderr}"
+        );
+    }
+
+    // The discontinued native-fork flags still refuse before anything runs, and
+    // so does `--session`: every launch is a session projection now, so a flag
+    // that used to select one can only mean something it no longer selects.
+    // Accepting and ignoring it would let a caller believe it chose something.
+    for args in [
+        &["shell", "--restrict-discovery"][..],
+        &["open", "code", "--restrict-filesystem"][..],
+        &["with", "claude", "--passive-guidance"][..],
+        &["with", "claude", "--session"][..],
+    ] {
+        let output = kin_command(&home)
+            .args(args)
+            .current_dir(root.path())
+            .output()
+            .unwrap_or_else(|error| panic!("run kin {args:?}: {error}"));
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("fail-closed"),
+            "kin {args:?} must stay fail-closed: {stderr}"
+        );
+    }
+
+    // An unknown launcher target is refused rather than executed.
+    let output = kin_command(&home)
+        .args(["open", "rm"])
+        .current_dir(root.path())
+        .output()
+        .expect("run kin open rm");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unknown editor"));
 }
 
 #[test]

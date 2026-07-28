@@ -1038,6 +1038,7 @@ pub fn agent_default_tool_names() -> &'static [&'static str] {
         "find_references",
         "graph_neighborhood",
         "kin_session_start",
+        "kin_session_heartbeat",
         "kin_session_end",
         "kin_transaction_begin",
         "kin_transaction_stage",
@@ -1130,7 +1131,7 @@ mod tests {
         let profile = agent_default_tool_names();
 
         assert!(
-            profile.len() >= 10 && profile.len() <= 16,
+            profile.len() >= 10 && profile.len() <= 17,
             "agent-default should be small but cover the wedge; got {}",
             profile.len()
         );
@@ -1151,12 +1152,29 @@ mod tests {
             "get_context_pack",
             "kin_transaction_commit",
             "kin_provenance_query",
+            // kin_session_start tells the agent to keep the session alive with
+            // this tool. A profile that carries the advice without the tool
+            // strands any agent whose read phase outlasts the idle TTL.
+            "kin_session_heartbeat",
         ] {
             assert!(
                 profile.contains(&required),
                 "agent-default must include {required}"
             );
         }
+
+        // An agent restricted to this profile cannot call get_entity_source, so
+        // the read tool it does have must say where the source text arrives.
+        // Without that it hunts for a tool it cannot see.
+        let context_pack = list
+            .tools
+            .iter()
+            .find(|tool| tool.name == "get_context_pack")
+            .expect("get_context_pack is in the profile");
+        assert!(
+            context_pack.description.contains("focal_entity.body"),
+            "get_context_pack must name the field carrying the source text"
+        );
 
         let allowed: std::collections::HashSet<&str> = profile.iter().copied().collect();
         let visible = list

@@ -634,6 +634,39 @@ fn stage_owner_name(stage_id: uuid::Uuid) -> String {
     format!("{INIT_STAGE_PREFIX}{stage_id}{INIT_STAGE_OWNER_SUFFIX}")
 }
 
+/// Longest a concurrent recovery scan may hold the owner file this init just
+/// created before the init gives up on it.
+const OWN_STAGE_OWNER_LOCK_ATTEMPTS: u32 = 100;
+const OWN_STAGE_OWNER_LOCK_RETRY: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// Take the exclusive lock on an owner file this call just created with
+/// `create_new`, tolerating a concurrent recovery scan.
+///
+/// Every init recovers orphaned stages first, and that scan locks each sibling
+/// owner file to decide whether it is abandoned. A scan that lands in the
+/// window between this init creating its owner file and locking it holds the
+/// lock for as long as it takes to read one record, and the init used to fail
+/// outright on that. Contention on a file nobody else can name is transient by
+/// construction, so it is retried; anything else, and contention that outlasts
+/// the bound, still fails closed.
+fn lock_own_stage_owner(owner_file: &File) -> std::io::Result<()> {
+    let mut last = match owner_file.try_lock_exclusive() {
+        Ok(()) => return Ok(()),
+        Err(error) => error,
+    };
+    for _ in 1..OWN_STAGE_OWNER_LOCK_ATTEMPTS {
+        if last.kind() != std::io::ErrorKind::WouldBlock {
+            return Err(last);
+        }
+        std::thread::sleep(OWN_STAGE_OWNER_LOCK_RETRY);
+        match owner_file.try_lock_exclusive() {
+            Ok(()) => return Ok(()),
+            Err(error) => last = error,
+        }
+    }
+    Err(last)
+}
+
 fn create_repository_init_stage_lease(
     stage_root: &Path,
     final_kin_dir: &Path,
@@ -687,7 +720,7 @@ fn create_repository_init_stage_lease(
     let mut owner_file = options
         .open(&owner_path)
         .map_err(|error| KinError::io(&owner_path, error))?;
-    if let Err(error) = owner_file.try_lock_exclusive() {
+    if let Err(error) = lock_own_stage_owner(&owner_file) {
         let _ = std::fs::remove_file(&owner_path);
         return Err(KinError::io(&owner_path, error));
     }
@@ -2058,6 +2091,69 @@ mod tests {
         GitObjectBodyLoader, GitObjectFormat, Hash256, RefTarget, Timestamp, WorkspaceHead,
     };
     use sha2::{Digest, Sha256};
+
+    /// A concurrent recovery scan holding this init's own owner file must not
+    /// fail the init.
+    ///
+    /// Every init scans sibling stages and locks each owner file to judge it,
+    /// so a scan can land between this init creating its owner file and
+    /// locking it. That contention is transient and cannot mean anything else,
+    /// because the file was created with `create_new` under a fresh UUID.
+    #[test]
+    fn a_concurrent_scan_holding_the_new_owner_file_does_not_fail_the_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner_path = dir.path().join("stage.owner");
+        let owner_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&owner_path)
+            .unwrap();
+
+        let scanner = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&owner_path)
+            .unwrap();
+        scanner.try_lock_exclusive().unwrap();
+        assert_eq!(
+            owner_file.try_lock_exclusive().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "the scan must really be holding the lock"
+        );
+
+        let released = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            fs2::FileExt::unlock(&scanner).unwrap();
+        });
+        lock_own_stage_owner(&owner_file).expect("a transient scan must not fail the lease");
+        released.join().unwrap();
+    }
+
+    /// Contention that never clears still fails closed rather than hanging or
+    /// proceeding without the lock.
+    #[test]
+    fn an_unyielding_holder_still_fails_the_lease_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner_path = dir.path().join("stage.owner");
+        let owner_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&owner_path)
+            .unwrap();
+        let holder = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&owner_path)
+            .unwrap();
+        holder.try_lock_exclusive().unwrap();
+
+        assert_eq!(
+            lock_own_stage_owner(&owner_file).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
 
     fn prepare_unborn(
         working_dir: &Path,

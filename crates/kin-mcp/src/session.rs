@@ -314,6 +314,50 @@ pub fn uncommittable_reason(op: &McpMutationOperation) -> Option<String> {
     }
 }
 
+/// The accepted `operations` element shapes, spelled out for a caller that has
+/// to construct them without reading Kin's Rust types.
+pub const ACCEPTED_OPERATION_SHAPES: &str = "each element of `operations` is one of:\n  \
+     - an entity source edit: {\"verb\": \"update\", \"target\": \"<entity uuid or exact name>\", \
+     \"body\": \"<the entity's full new source text>\", \"description\": \"<why>\"}\n  \
+     - an entity payload edit: {\"verb\": \"update\", \"target\": \"<entity uuid>\", \
+     \"payload\": {\"Entity\": {<the entity object>}}, \"body\": \"<full new source text>\", \
+     \"description\": \"<why>\"}\n  \
+     - a relation edit: {\"verb\": \"create\"|\"delete\", \"target\": \"\", \
+     \"payload\": {\"Relation\": {\"from\": \"<uuid>\", \"to\": \"<uuid>\", \"kind\": \"<relation kind>\"}}, \
+     \"description\": \"<why>\"}\n\
+     Prefer the first shape: it needs only a target and the new source text";
+
+/// Decode an `operations` argument into staged operations.
+///
+/// A raw serde failure here names an internal field of whichever payload
+/// variant it got furthest into (`missing field 'kind'`), which tells a caller
+/// improvising the shape nothing it can act on. Every decode failure is
+/// rewritten to name the accepted shapes, so a caller that guessed wrong learns
+/// the contract from the refusal instead of looping on retries.
+pub fn parse_staged_operations(
+    operations: &serde_json::Value,
+) -> std::result::Result<Vec<McpMutationOperation>, String> {
+    if !operations.is_array() {
+        return Err(format!(
+            "invalid operations: expected a JSON array, got {}; {ACCEPTED_OPERATION_SHAPES}",
+            json_type_name(operations)
+        ));
+    }
+    serde_json::from_value(operations.clone())
+        .map_err(|error| format!("invalid operations array: {error}; {ACCEPTED_OPERATION_SHAPES}"))
+}
+
+fn json_type_name(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::Object(_) => "an object",
+    }
+}
+
 /// Indexed, human-readable reasons for every staged operation that cannot be
 /// committed. Empty when the whole batch is committable. The commit and
 /// validate handlers use this to fail loud instead of silently dropping
@@ -1028,6 +1072,44 @@ impl SessionRegistry {
         } else {
             Err(format!("Transaction not found: {}", transaction_id))
         }
+    }
+
+    /// Return an editable transaction to an empty staged set after an attempt
+    /// that provably did not move repository authority.
+    ///
+    /// A commit that fails while planning leaves the operations that failed
+    /// staged. Staging a corrected operation then appends to the same set, so
+    /// the next commit re-plans the original failure and returns the identical
+    /// error forever: the transaction is wedged, and no advice the error can
+    /// carry ("use the entity id") is reachable without also abandoning it.
+    /// Clearing here is what makes a failure recoverable, and it is only ever
+    /// called before the publication fence, where nothing has been applied.
+    ///
+    /// Returns the discarded operations. Clearing takes the whole staged set,
+    /// not just the operation that failed, so the caller loses correct work it
+    /// staged earlier and needs to know exactly what to re-stage. Handing the
+    /// operations back is what lets the refusal name them.
+    pub fn clear_staged_operations(
+        &self,
+        transaction_id: &str,
+    ) -> std::result::Result<Vec<McpMutationOperation>, String> {
+        let mut map = self
+            .transactions
+            .lock()
+            .expect("transactions lock poisoned");
+        let tx = map
+            .get_mut(transaction_id)
+            .ok_or_else(|| format!("Transaction not found: {transaction_id}"))?;
+        if !matches!(tx.state.as_str(), "active" | "validated") {
+            return Err(format!(
+                "Cannot clear staged operations on transaction {} in state: {}",
+                transaction_id, tx.state
+            ));
+        }
+        let cleared = std::mem::take(&mut tx.staged_operations);
+        tx.state = "active".to_string();
+        tx.commit_payload_hash = None;
+        Ok(cleared)
     }
 
     pub fn abort_transaction(

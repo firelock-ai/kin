@@ -1854,6 +1854,47 @@ mod tests {
         }
     }
 
+    /// A bare name that matches several entities is unrecoverable unless the
+    /// refusal carries the candidates: the caller cannot re-target what it
+    /// cannot see. "use the entity id" alone is advice with no way to act on it.
+    #[test]
+    fn an_ambiguous_name_target_enumerates_its_candidates() {
+        let store = kin_db::InMemoryGraph::new();
+        let first = make_dead_code_entity("src/net/host.ts", "hostname", 12);
+        let second = make_dead_code_entity("src/cli/host.ts", "hostname", 40);
+        let third = make_dead_code_entity("src/util/host.ts", "hostname", 7);
+        let unrelated = make_dead_code_entity("src/net/port.ts", "portname", 3);
+        for entity in [&first, &second, &third, &unrelated] {
+            store.upsert_entity(entity).unwrap();
+        }
+
+        let error = sessions::resolve_target_entity(&store, "hostname")
+            .expect_err("three exact-name matches cannot resolve");
+        assert!(error.contains("3 exact-name matches"), "{error}");
+        for entity in [&first, &second, &third] {
+            assert!(
+                error.contains(&entity.id.to_string()),
+                "every candidate id must be re-targetable: {error}"
+            );
+        }
+        assert!(error.contains("src/cli/host.ts:40"), "{error}");
+        assert!(
+            !error.contains(&unrelated.id.to_string()),
+            "only exact-name matches are candidates: {error}"
+        );
+
+        // The unambiguous paths are unchanged.
+        assert_eq!(
+            sessions::resolve_target_entity(&store, "portname")
+                .unwrap()
+                .id,
+            unrelated.id
+        );
+        assert!(sessions::resolve_target_entity(&store, "absent")
+            .unwrap_err()
+            .contains("not found in the graph"));
+    }
+
     fn make_dead_code_entity(file_path: &str, name: &str, start_line: u32) -> Entity {
         let file_id = kin_model::ids::FilePathId::new(file_path);
         Entity {

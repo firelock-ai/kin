@@ -66,6 +66,7 @@ pub mod search;
 pub mod secret;
 pub mod security;
 pub mod semver;
+pub mod session_run;
 pub mod session_workspace;
 pub mod setup;
 pub mod setup_ledger;

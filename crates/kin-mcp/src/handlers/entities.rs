@@ -556,9 +556,11 @@ response with the token accounting included. Reach for it when a question is abo
 unit of code in context (\"what does X do and what does it touch?\") rather than a single \
 isolated body. Its value is that it replaces an open-ended chain of \
 get_entity_source / find_references calls — which burns round-trips and easily blows \
-your context window — with one budgeted call that stays within the limit you set. If \
-you only need the focal entity's raw body, get_entity_source is cheaper; if you need to \
-follow an actual call chain step by step, use trace_data_flow.";
+your context window — with one budgeted call that stays within the limit you set. \
+`focal_entity.body` in the response IS the focal entity's exact source text, so this one \
+call already answers \"show me the code\": no follow-up read is needed, and it is the body \
+to edit and stage back. If get_entity_source is available to you it is cheaper for a raw \
+body alone; if you need to follow an actual call chain step by step, use trace_data_flow.";
 
 pub fn handle_get_context_pack<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,

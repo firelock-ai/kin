@@ -586,9 +586,9 @@ fn check_repo_init() -> HealthCheck {
 /// Teach the session runtime path and surface leftover session workspaces.
 ///
 /// Ordinary project tools run through graph-backed session workspaces
-/// (`kin exec`, `kin shell`, `kin with --session`); a workspace left under
-/// `.kin/runs/` is either an active session or a failed run waiting for
-/// `kin reconcile`.
+/// (`kin exec`, `kin shell`, `kin with`); a workspace left under `.kin/runs/`
+/// is either an active session or a run waiting for `kin reconcile`, which
+/// admits it and then removes it.
 fn check_session_runtime() -> HealthCheck {
     let cwd = env::current_dir().unwrap_or_default();
     session_runtime_check_for(kin_core::KinLayout::discover(&cwd).as_ref())
@@ -620,7 +620,7 @@ fn session_runtime_check_for(layout: Option<&kin_core::KinLayout>) -> HealthChec
             HealthStatus::Healthy,
             "run project tools with `kin exec -- <cmd>`, \
              open an interactive env with `kin shell`, \
-             launch agents with `kin with --session <assistant>`",
+             launch agents with `kin with <assistant>`",
         )
     } else {
         HealthCheck::new(
@@ -634,8 +634,8 @@ fn session_runtime_check_for(layout: Option<&kin_core::KinLayout>) -> HealthChec
             ),
         )
         .with_manual_fix(
-            "reconcile a finished session with `kin reconcile <session-id>`; capability-safe \
-             session cleanup is not exposed yet",
+            "reconcile a finished session with `kin reconcile <session-id>`, which admits it and \
+             then removes it; a workspace you do not want to admit has no exposed discard yet",
         )
     }
 }
@@ -1874,7 +1874,12 @@ mod tests {
         assert!(matches!(check.status, HealthStatus::Healthy));
         assert!(check.detail.contains("kin exec"));
         assert!(check.detail.contains("kin shell"));
-        assert!(check.detail.contains("kin with --session"));
+        assert!(check.detail.contains("kin with <assistant>"));
+        assert!(
+            !check.detail.contains("--session"),
+            "doctor must not teach a flag the session surface refuses: {}",
+            check.detail
+        );
     }
 
     #[test]

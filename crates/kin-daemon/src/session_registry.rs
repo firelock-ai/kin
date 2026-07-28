@@ -60,6 +60,52 @@ pub struct TrafficCheck {
 /// All operations go through `kin_db::InMemoryGraph`, which is the authoritative
 /// source for transient session/intent state. This struct provides the
 /// higher-level lifecycle operations described in PLAN_P2.md Section 4.7.
+/// How long a session with no live PID may go without a heartbeat before the
+/// sweeper reaps it.
+///
+/// This is an idle timeout, not a lifetime: every session-bound daemon call
+/// refreshes the heartbeat, so it only elapses when an agent is genuinely
+/// silent. The default matches the daemon's MCP idle default so an agent that
+/// keeps its transport alive keeps its session, and a thinking pause between
+/// tool calls cannot strand a transaction. It was two 30-second heartbeat
+/// intervals, which reaped agents mid-task while they were still reading.
+///
+/// The cost is paid by a session that dies without releasing anything, and
+/// only by one registered without a PID. The sweeper reaps a stale session
+/// together with its intents, and a session carrying a PID is judged stale the
+/// moment that process is gone, whatever the idle window says. A PID-less
+/// session has only the window: it holds its hard-lock scopes against every
+/// other session for 30 minutes here where it was one minute before, until the
+/// sweep, an explicit end from a surviving holder of the id, or a daemon
+/// restart. Deployments that run many PID-less sessions against one daemon and
+/// would rather take the mid-task reaping risk can lower the window with
+/// [`SESSION_IDLE_TTL_ENV`].
+pub const DEFAULT_SESSION_IDLE_TTL: Duration = Duration::from_secs(1800);
+
+/// Environment override for [`DEFAULT_SESSION_IDLE_TTL`], in whole seconds.
+pub const SESSION_IDLE_TTL_ENV: &str = "KIN_SESSION_IDLE_TTL_SECS";
+
+/// Longest idle window the override may select.
+///
+/// A ceiling is the same guard as the floor. Without one,
+/// `KIN_SESSION_IDLE_TTL_SECS` set to a large number silently disables
+/// PID-less reaping altogether, and a crashed agent's hard locks become
+/// permanent for the life of the daemon.
+pub const MAX_SESSION_IDLE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Resolve the session idle TTL from the environment, falling back to
+/// [`DEFAULT_SESSION_IDLE_TTL`]. A malformed value, zero, or anything past
+/// [`MAX_SESSION_IDLE_TTL`] keeps the default: a typo must not silently
+/// reintroduce aggressive reaping, and it must not silently retire reaping
+/// either.
+pub fn configured_session_idle_ttl() -> Duration {
+    std::env::var(SESSION_IDLE_TTL_ENV)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0 && *secs <= MAX_SESSION_IDLE_TTL.as_secs())
+        .map_or(DEFAULT_SESSION_IDLE_TTL, Duration::from_secs)
+}
+
 pub struct SessionCoordinator {
     graph: Arc<kin_db::InMemoryGraph>,
     /// Linearization point for session/intent lifecycle mutations. `kin-db`'s
@@ -68,27 +114,36 @@ pub struct SessionCoordinator {
     /// at the owning coordinator boundary rather than performed as racy reads
     /// followed by a later write.
     arbitration: Mutex<()>,
-    /// Heartbeat interval used for stale-session detection.
-    heartbeat_interval: Duration,
+    /// How long a heartbeat stays valid before a PID-less session is stale.
+    session_idle_ttl: Duration,
 }
 
 impl SessionCoordinator {
     /// Create a new coordinator backed by the given graph store.
     pub fn new(graph: Arc<kin_db::InMemoryGraph>) -> Self {
-        Self {
-            graph,
-            arbitration: Mutex::new(()),
-            heartbeat_interval: Duration::from_secs(30),
-        }
+        Self::with_session_idle_ttl(graph, configured_session_idle_ttl())
     }
 
     /// Create a coordinator with a custom heartbeat interval (useful for testing).
+    ///
+    /// Preserved as the interval-shaped constructor: a session is stale after
+    /// two missed intervals.
     pub fn with_heartbeat_interval(graph: Arc<kin_db::InMemoryGraph>, interval: Duration) -> Self {
+        Self::with_session_idle_ttl(graph, interval * 2)
+    }
+
+    /// Create a coordinator with an explicit session idle TTL.
+    pub fn with_session_idle_ttl(graph: Arc<kin_db::InMemoryGraph>, ttl: Duration) -> Self {
         Self {
             graph,
             arbitration: Mutex::new(()),
-            heartbeat_interval: interval,
+            session_idle_ttl: ttl,
         }
+    }
+
+    /// The idle TTL this coordinator reaps PID-less sessions against.
+    pub fn session_idle_ttl(&self) -> Duration {
+        self.session_idle_ttl
     }
 
     // -----------------------------------------------------------------------
@@ -832,8 +887,8 @@ impl SessionCoordinator {
     ///
     /// A session is stale if:
     /// - Its PID is set and the process is no longer alive, OR
-    /// - It has missed two heartbeat intervals and no live PID can prove the
-    ///   owning process is still active.
+    /// - Its last heartbeat is older than the session idle TTL and no live PID
+    ///   can prove the owning process is still active.
     ///
     /// Returns the number of sessions reaped.
     pub fn sweep_stale_sessions(&self) -> Result<usize> {
@@ -860,7 +915,7 @@ impl SessionCoordinator {
         let mut sessions = self.graph.list_sessions().map_err(DaemonError::from)?;
         sessions.sort_by_key(|session| session.session_id.to_string());
         let now = Timestamp::now();
-        let stale_threshold = self.heartbeat_interval * 2;
+        let stale_threshold = self.session_idle_ttl;
         let mut reaped = Vec::new();
 
         for session in &sessions {
@@ -2094,6 +2149,116 @@ mod tests {
         let reaped = coord.sweep_stale_sessions().unwrap();
         assert_eq!(reaped, 0);
         assert!(coord.get_session(&sid).unwrap().is_some());
+    }
+
+    /// A silent agent must not be reaped inside a thinking pause.
+    ///
+    /// The default was two 30-second heartbeat intervals, so a read phase
+    /// longer than a minute stranded the agent and its transaction. The
+    /// default idle window is now the same one the MCP transport uses.
+    #[test]
+    fn pid_less_sessions_survive_a_thinking_pause_by_default() {
+        assert_eq!(DEFAULT_SESSION_IDLE_TTL, Duration::from_secs(1800));
+
+        let coord = SessionCoordinator::new(Arc::new(kin_db::InMemoryGraph::new()));
+        assert_eq!(coord.session_idle_ttl(), DEFAULT_SESSION_IDLE_TTL);
+        assert!(
+            coord.session_idle_ttl() >= Duration::from_secs(600),
+            "an agent that pauses to think must not lose its session"
+        );
+
+        let sid = coord
+            .register_session(
+                "claude-code",
+                "thinking-agent",
+                SessionTransport::Mcp,
+                None,
+                PathBuf::from("/"),
+                write_capabilities(),
+            )
+            .unwrap();
+        assert_eq!(coord.sweep_stale_sessions().unwrap(), 0);
+        assert!(coord.get_session(&sid).unwrap().is_some());
+    }
+
+    /// The idle window is operator-tunable, and a malformed value keeps the
+    /// safe default rather than silently restoring aggressive reaping. The
+    /// ceiling is the same guard in the other direction: an override large
+    /// enough to retire PID-less reaping is rejected too, because a crashed
+    /// agent's hard locks would then never be released.
+    #[test]
+    #[serial_test::serial]
+    fn session_idle_ttl_is_configurable_and_rejects_nonsense() {
+        let restore = std::env::var(SESSION_IDLE_TTL_ENV).ok();
+
+        std::env::set_var(SESSION_IDLE_TTL_ENV, "60");
+        assert_eq!(configured_session_idle_ttl(), Duration::from_secs(60));
+
+        for nonsense in ["0", "", "  ", "later", "-5"] {
+            std::env::set_var(SESSION_IDLE_TTL_ENV, nonsense);
+            assert_eq!(
+                configured_session_idle_ttl(),
+                DEFAULT_SESSION_IDLE_TTL,
+                "{nonsense:?} must not shorten the idle window"
+            );
+        }
+
+        std::env::set_var(
+            SESSION_IDLE_TTL_ENV,
+            MAX_SESSION_IDLE_TTL.as_secs().to_string(),
+        );
+        assert_eq!(configured_session_idle_ttl(), MAX_SESSION_IDLE_TTL);
+        for past_ceiling in [MAX_SESSION_IDLE_TTL.as_secs() + 1, 18_000_000, u64::MAX] {
+            std::env::set_var(SESSION_IDLE_TTL_ENV, past_ceiling.to_string());
+            assert_eq!(
+                configured_session_idle_ttl(),
+                DEFAULT_SESSION_IDLE_TTL,
+                "{past_ceiling} must not retire PID-less reaping"
+            );
+        }
+
+        std::env::remove_var(SESSION_IDLE_TTL_ENV);
+        assert_eq!(configured_session_idle_ttl(), DEFAULT_SESSION_IDLE_TTL);
+        if let Some(restore) = restore {
+            std::env::set_var(SESSION_IDLE_TTL_ENV, restore);
+        }
+    }
+
+    /// A heartbeat extends the lease: the sweeper measures from the last
+    /// heartbeat, not from session start.
+    #[test]
+    fn a_heartbeat_extends_a_session_past_its_idle_window() {
+        let coord = SessionCoordinator::with_session_idle_ttl(
+            Arc::new(kin_db::InMemoryGraph::new()),
+            Duration::from_millis(20),
+        );
+        let sid = coord
+            .register_session(
+                "claude-code",
+                "long-reader",
+                SessionTransport::Mcp,
+                None,
+                PathBuf::from("/"),
+                write_capabilities(),
+            )
+            .unwrap();
+
+        std::thread::sleep(Duration::from_millis(40));
+        coord.heartbeat(&sid).unwrap();
+        assert_eq!(
+            coord.sweep_stale_sessions().unwrap(),
+            0,
+            "a heartbeat inside the window keeps the session"
+        );
+        assert!(coord.get_session(&sid).unwrap().is_some());
+
+        std::thread::sleep(Duration::from_millis(40));
+        assert_eq!(
+            coord.sweep_stale_sessions().unwrap(),
+            1,
+            "a session that goes silent past its window is still reaped"
+        );
+        assert!(coord.get_session(&sid).unwrap().is_none());
     }
 
     #[test]

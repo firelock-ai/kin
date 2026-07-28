@@ -580,7 +580,7 @@ enum Command {
         #[command(subcommand)]
         action: VerifyAction,
     },
-    /// [OPEN GATE] Run a command in an exact graph-backed session workspace
+    /// Run a command in an exact graph-derived session workspace
     Exec {
         /// Command to run (put kin flags before it: `kin exec --keep -- npm test`)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
@@ -769,7 +769,7 @@ enum Command {
         #[command(subcommand)]
         action: TodoAction,
     },
-    /// [OPEN GATE] Launch an editor in an exact graph-derived session workspace
+    /// Launch an editor over an exact graph-derived session workspace
     Open {
         /// Editor to launch: code or cursor
         editor: String,
@@ -780,7 +780,7 @@ enum Command {
         #[arg(long, conflicts_with = "restrict_discovery")]
         restrict_filesystem: bool,
     },
-    /// [OPEN GATE] Launch an assistant in a graph-derived session
+    /// Launch an assistant in an exact graph-derived session workspace
     With {
         /// Assistant to launch: claude, codex, gemini
         assistant: String,
@@ -810,7 +810,7 @@ enum Command {
         #[arg(long)]
         confirm_mass_deletion: bool,
     },
-    /// [OPEN GATE] Open a shell in an exact graph-derived session workspace
+    /// Open a shell in an exact graph-derived session workspace
     Shell {
         /// Materialization strategy
         #[arg(long)]
@@ -2589,7 +2589,18 @@ fn main() -> Result<()> {
                         depth,
                     } => commands::verify::run_verification(entity, runner, depth).await,
                 },
-                Command::Exec { .. } => commands::capabilities::require_ready("exec"),
+                Command::Exec {
+                    command,
+                    shell,
+                    keep,
+                    discard,
+                    strategy,
+                    scope,
+                } => {
+                    commands::capabilities::require_ready("exec")?;
+                    commands::session_run::exec(command, shell, keep, discard, strategy, scope)
+                        .await
+                }
                 Command::Telemetry { action } => match action {
                     TelemetryAction::Status => commands::telemetry::run_status().await,
                     TelemetryAction::Consent => commands::telemetry::run_consent().await,
@@ -2794,7 +2805,15 @@ fn main() -> Result<()> {
                 Command::Todo { action } => match action {
                     TodoAction::Import { path } => commands::note::todo_import(path).await,
                 },
-                Command::Open { .. } => commands::capabilities::require_ready("open"),
+                Command::Open {
+                    editor,
+                    restrict_discovery,
+                    restrict_filesystem,
+                } => {
+                    commands::capabilities::require_ready("open")?;
+                    commands::session_run::open(editor, restrict_discovery, restrict_filesystem)
+                        .await
+                }
                 Command::Reconcile {
                     session,
                     confirm_mass_deletion,
@@ -2802,8 +2821,40 @@ fn main() -> Result<()> {
                     commands::capabilities::require_ready("reconcile")?;
                     commands::reconcile::run(session, confirm_mass_deletion).await
                 }
-                Command::With { .. } => commands::capabilities::require_ready("with"),
-                Command::Shell { .. } => commands::capabilities::require_ready("shell"),
+                Command::With {
+                    assistant,
+                    session,
+                    passive_guidance,
+                    restrict_discovery,
+                    restrict_filesystem,
+                    task,
+                } => {
+                    commands::capabilities::require_ready("with")?;
+                    commands::session_run::with(
+                        assistant,
+                        session,
+                        passive_guidance,
+                        restrict_discovery,
+                        restrict_filesystem,
+                        task,
+                    )
+                    .await
+                }
+                Command::Shell {
+                    strategy,
+                    restrict_discovery,
+                    restrict_filesystem,
+                } => {
+                    commands::capabilities::require_ready("shell")?;
+                    if restrict_discovery || restrict_filesystem {
+                        anyhow::bail!(
+                            "--restrict-discovery and --restrict-filesystem belonged to the \
+                             discontinued native editor fork and are fail-closed; the session \
+                             projection is the boundary now"
+                        );
+                    }
+                    commands::session_run::shell(strategy).await
+                }
                 Command::Overview { compact, json } => {
                     if json {
                         commands::overview::run_json().await
@@ -3070,8 +3121,9 @@ mod tests {
             let mut command = Cli::command();
             let help = command.render_long_help().to_string();
             for supported in [
-                "Run a command in an exact graph-backed session workspace",
-                "Launch an editor in an exact graph-derived session workspace",
+                "Run a command in an exact graph-derived session workspace",
+                "Launch an editor over an exact graph-derived session workspace",
+                "Launch an assistant in an exact graph-derived session workspace",
                 "Open a shell in an exact graph-derived session workspace",
             ] {
                 assert!(
