@@ -1163,6 +1163,19 @@ mod tests {
             );
         }
 
+        // An agent restricted to this profile cannot call get_entity_source, so
+        // the read tool it does have must say where the source text arrives.
+        // Without that it hunts for a tool it cannot see.
+        let context_pack = list
+            .tools
+            .iter()
+            .find(|tool| tool.name == "get_context_pack")
+            .expect("get_context_pack is in the profile");
+        assert!(
+            context_pack.description.contains("focal_entity.body"),
+            "get_context_pack must name the field carrying the source text"
+        );
+
         let allowed: std::collections::HashSet<&str> = profile.iter().copied().collect();
         let visible = list
             .tools
