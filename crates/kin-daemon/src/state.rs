@@ -1019,6 +1019,16 @@ pub struct DaemonState {
     /// daemon-health signal so this degraded state is LOUD, never silent (the
     /// worker dying must NOT take the whole daemon down).
     pub embed_worker_failed: AtomicBool,
+    /// Why the views this daemon derives from repository authority stopped
+    /// matching it, or `None` when they match.
+    ///
+    /// Set when an admitted repository transfer became durable and the refresh
+    /// of everything derived from it then failed. Authority is the truth and it
+    /// moved, so that is not a failed transfer and must not be reported as one.
+    /// It is also not nothing: retrieval served from these views is behind
+    /// authority until they are rebuilt. Surfaced as a daemon-health signal so
+    /// the gap is loud rather than inferred from stale answers.
+    pub derived_views_stale: RwLock<Option<String>>,
     /// Durable store for in-flight MCP transactions, keyed by transaction id.
     ///
     /// Each `/mcp/tools/call` rebuilds a fresh `SessionRegistry` for the request,
@@ -1649,6 +1659,7 @@ impl DaemonState {
             persisted_entity_count: AtomicU64::new(loaded_entity_count as u64),
             mass_deletion_blocked: AtomicBool::new(false),
             embed_worker_failed: AtomicBool::new(false),
+            derived_views_stale: RwLock::new(None),
             mcp_transactions: Mutex::new(HashMap::new()),
             locate_rankings: Mutex::new(HashMap::new()),
             semantic_locate_pages: Mutex::new(HashMap::new()),
@@ -1810,6 +1821,7 @@ impl DaemonState {
             persisted_entity_count: AtomicU64::new(loaded_entity_count as u64),
             mass_deletion_blocked: AtomicBool::new(false),
             embed_worker_failed: AtomicBool::new(false),
+            derived_views_stale: RwLock::new(None),
             mcp_transactions: Mutex::new(HashMap::new()),
             locate_rankings: Mutex::new(HashMap::new()),
             semantic_locate_pages: Mutex::new(HashMap::new()),
