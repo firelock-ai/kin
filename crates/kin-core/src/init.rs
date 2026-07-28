@@ -1215,6 +1215,7 @@ fn build_repository_bootstrap_transaction(
         }),
         workspace_mutation: Some(workspace_mutation),
         local_overlay_delta: Some(FrozenLocalOverlayDelta::initialize(local_overlay)),
+        merge_transaction_delta: None,
     };
 
     if let Some(change_id) = initial_change_id {

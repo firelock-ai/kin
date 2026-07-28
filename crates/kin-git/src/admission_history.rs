@@ -156,6 +156,7 @@ impl AdmittedSemanticGitImportPlan {
             default_ref_mutation: self.default_ref_mutation,
             workspace_mutation: None,
             local_overlay_delta: None,
+            merge_transaction_delta: None,
         };
         transaction.validate()?;
         Ok(transaction)

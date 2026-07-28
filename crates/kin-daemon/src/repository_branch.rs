@@ -700,6 +700,7 @@ fn switch(
             },
         }),
         local_overlay_delta: None,
+        merge_transaction_delta: None,
     };
     // Validate the derived view before materializing anything over it. This
     // reads the working copy only at paths the workspace tree already tracks
@@ -810,6 +811,7 @@ fn replay_switch(
         default_ref_mutation: None,
         workspace_mutation: Some(mutation.clone()),
         local_overlay_delta: None,
+        merge_transaction_delta: None,
     };
     if transaction.transaction_hash()? != receipt.transaction_hash {
         return Err(branch_conflict(format!(
@@ -947,6 +949,7 @@ fn ref_transaction(
         default_ref_mutation: None,
         workspace_mutation: None,
         local_overlay_delta: None,
+        merge_transaction_delta: None,
     }
 }
 

@@ -15969,6 +15969,7 @@ mod tests {
                 }),
                 local_overlay_delta: (index == 0)
                     .then(|| FrozenLocalOverlayDelta::initialize(overlay.clone())),
+                merge_transaction_delta: None,
             };
             drop(lease);
             manager.commit_repository_transaction(transaction).unwrap();

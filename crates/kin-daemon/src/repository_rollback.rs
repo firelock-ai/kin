@@ -396,6 +396,7 @@ fn plan_and_commit(
             },
         }),
         local_overlay_delta: None,
+        merge_transaction_delta: None,
     };
     transaction
         .validate()

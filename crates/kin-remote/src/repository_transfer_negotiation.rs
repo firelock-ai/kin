@@ -907,6 +907,7 @@ mod tests {
             }),
             workspace_mutation: None,
             local_overlay_delta: None,
+            merge_transaction_delta: None,
         };
         drop(lease);
         manager.commit_repository_transaction(transaction).unwrap();

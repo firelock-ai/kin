@@ -1588,6 +1588,7 @@ fn transfer_transaction(
         default_ref_mutation,
         workspace_mutation: None,
         local_overlay_delta: None,
+        merge_transaction_delta: None,
     };
     transaction.validate().map_err(model)?;
     Ok(transaction)
@@ -1941,6 +1942,7 @@ mod tests {
             }),
             workspace_mutation: None,
             local_overlay_delta: None,
+            merge_transaction_delta: None,
         };
         drop(lease);
         manager.commit_repository_transaction(transaction).unwrap();
@@ -2203,6 +2205,7 @@ mod tests {
             default_ref_mutation: None,
             workspace_mutation: None,
             local_overlay_delta: None,
+            merge_transaction_delta: None,
         };
         drop(source_lease);
         source
@@ -2452,6 +2455,7 @@ mod tests {
             default_ref_mutation: None,
             workspace_mutation: None,
             local_overlay_delta: None,
+            merge_transaction_delta: None,
         };
         drop(lease);
         fixture
@@ -2511,6 +2515,7 @@ mod tests {
             }),
             workspace_mutation: None,
             local_overlay_delta: None,
+            merge_transaction_delta: None,
         };
         drop(lease);
         authority
@@ -2722,6 +2727,7 @@ mod tests {
             default_ref_mutation: None,
             workspace_mutation: None,
             local_overlay_delta: None,
+            merge_transaction_delta: None,
         };
         drop(lease);
         fixture
