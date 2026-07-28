@@ -330,22 +330,25 @@ fn build_graph_status_response(
     // Warnings
     let mut warnings = health.warnings.clone();
     let criticals = health.critical_issues.clone();
-    if entity_count > 0 && total_relations == 0 {
+    let all_relation_count = health
+        .semantic_relation_count
+        .saturating_add(health.cochange_relation_count);
+    if entity_count > 0 && all_relation_count == 0 {
         warnings.push("no relations in graph — cross-file linking may have failed".to_string());
     }
     if entity_count > 0 && role_counts.len() == 1 && role_counts.contains_key(&EntityRole::Source) {
         warnings
             .push("all entities are Source — role classification may not be working".to_string());
     }
-    let rels_per_ent = if entity_count == 0 {
+    let entity_rels_per_ent = if entity_count == 0 {
         0.0
     } else {
         total_relations as f64 / entity_count as f64
     };
-    if rels_per_ent < 0.1 && entity_count > 100 {
+    if entity_rels_per_ent < 0.1 && entity_count > 100 {
         warnings.push(format!(
-            "very low relation density ({:.2} rels/entity) — linker may be failing",
-            rels_per_ent
+            "very low entity-to-entity relation density ({:.2} rels/entity) — entity linker may be failing",
+            entity_rels_per_ent
         ));
     }
     if warnings.is_empty() && criticals.is_empty() {
@@ -552,18 +555,18 @@ fn build_graph_inspect_response(
 
         // Show relations
         let rows = inspect_relation_rows(graph, &entity)?;
-        if !rows.is_empty() {
-            lines.push(format!("  Relations ({}):", rows.len()));
-            for row in rows.iter().take(INSPECT_RELATION_LIMIT) {
+        if rows.total > 0 {
+            lines.push(format!("  Relations ({}):", rows.total));
+            for row in &rows.displayed {
                 lines.push(format!(
                     "    {} {:?} {}",
                     row.direction, row.kind, row.peer_label
                 ));
             }
-            if rows.len() > INSPECT_RELATION_LIMIT {
+            if rows.total > rows.displayed.len() {
                 lines.push(format!(
                     "    ... and {} more",
-                    rows.len() - INSPECT_RELATION_LIMIT
+                    rows.total - rows.displayed.len()
                 ));
             }
         }
@@ -588,21 +591,31 @@ struct InspectRelationRow {
     peer_label: String,
 }
 
+/// Bounded rendered rows plus the full number of unique peer observations.
+#[derive(Debug)]
+struct InspectRelationRows {
+    total: usize,
+    displayed: Vec<InspectRelationRow>,
+}
+
 /// Build the deduplicated peer rows for one inspected entity.
 ///
 /// Two rows are the same observation when they share direction marker, kind,
-/// and peer node, so only one is rendered. The peer label carries the peer's
-/// kind because distinct entities can share a name and a file, and a label
-/// without the kind would render them as one row that the reader cannot tell
-/// apart.
+/// and peer node, so only one is rendered. Mixed-domain relations are included,
+/// and entity labels carry their stable identity because overloads can share a
+/// name, kind, and file. Relation identities determine display order, and peer
+/// labels are resolved only for the bounded displayed prefix.
 fn inspect_relation_rows(
     graph: &kin_db::InMemoryGraph,
     entity: &Entity,
-) -> Result<Vec<InspectRelationRow>> {
+) -> Result<InspectRelationRows> {
     let mut rows = Vec::new();
     let mut seen = HashSet::new();
+    let self_node = kin_model::GraphNodeId::Entity(entity.id);
+    let mut relations = graph.get_all_relations_for_node(&self_node)?;
+    relations.sort_unstable_by_key(|rel| rel.id.0);
 
-    for rel in graph.get_all_relations_for_entity(&entity.id)? {
+    for rel in relations {
         let src_is_self = matches!(rel.src, kin_model::GraphNodeId::Entity(id) if id == entity.id);
         let dst_is_self = matches!(rel.dst, kin_model::GraphNodeId::Entity(id) if id == entity.id);
         let (direction, peer) = match (src_is_self, dst_is_self) {
@@ -614,20 +627,24 @@ fn inspect_relation_rows(
         if !seen.insert((direction, rel.kind, peer)) {
             continue;
         }
+        if rows.len() >= INSPECT_RELATION_LIMIT {
+            continue;
+        }
 
         let peer_label = match peer {
             kin_model::GraphNodeId::Entity(peer_id) => graph
                 .get_entity(&peer_id)?
                 .map(|e| {
                     format!(
-                        "{} [{:?}] ({})",
+                        "{} [{:?}] ({}; entity:{})",
                         e.name,
                         e.kind,
-                        e.file_origin.as_ref().map(|f| f.0.as_str()).unwrap_or("?")
+                        e.file_origin.as_ref().map(|f| f.0.as_str()).unwrap_or("?"),
+                        e.id
                     )
                 })
                 .unwrap_or_else(|| format!("{}", peer_id)),
-            other => format!("{:?}", other),
+            other => other.to_string(),
         };
 
         rows.push(InspectRelationRow {
@@ -637,7 +654,10 @@ fn inspect_relation_rows(
         });
     }
 
-    Ok(rows)
+    Ok(InspectRelationRows {
+        total: seen.len(),
+        displayed: rows,
+    })
 }
 
 /// Actionable lines when a `kin graph inspect|source <name>` lookup misses in
@@ -939,11 +959,15 @@ mod tests {
     }
 
     fn test_relation(kind: RelationKind, src: EntityId, dst: EntityId) -> Relation {
+        graph_relation(kind, GraphNodeId::Entity(src), GraphNodeId::Entity(dst))
+    }
+
+    fn graph_relation(kind: RelationKind, src: GraphNodeId, dst: GraphNodeId) -> Relation {
         Relation {
             id: RelationId::new(),
             kind,
-            src: GraphNodeId::Entity(src),
-            dst: GraphNodeId::Entity(dst),
+            src,
+            dst,
             confidence: 1.0,
             origin: RelationOrigin::Parsed,
             created_in: None,
@@ -1040,6 +1064,39 @@ mod tests {
                 .lines
                 .iter()
                 .any(|line| line.starts_with("Relations: ") || line.contains("  |  Relations: ")),
+            "{:?}",
+            response.lines
+        );
+    }
+
+    #[test]
+    fn graph_status_does_not_call_a_mixed_relation_graph_relationless() {
+        let (_temp, binding, graph) = graph_validation_fixture();
+        let entity = test_entity("run_task");
+        graph.upsert_entity(&entity).unwrap();
+        graph
+            .upsert_relation(&graph_relation(
+                RelationKind::Covers,
+                GraphNodeId::Test(kin_model::TestId::new()),
+                GraphNodeId::Entity(entity.id),
+            ))
+            .unwrap();
+
+        let response = build_graph_status_response(&binding, &graph).unwrap();
+
+        assert!(response
+            .lines
+            .iter()
+            .any(|line| line.contains("Entity-to-entity relations: 0")));
+        assert!(response
+            .lines
+            .iter()
+            .any(|line| line == "All graph relations excluding CoChanges: 1 (1.00/entity)"));
+        assert!(
+            !response
+                .lines
+                .iter()
+                .any(|line| line.contains("no relations in graph")),
             "{:?}",
             response.lines
         );
@@ -1156,7 +1213,10 @@ mod tests {
         assert_eq!(peer_rows.len(), 1, "{:?}", response.lines);
         assert_eq!(
             peer_rows[0],
-            &"    <- Contains Stats [Class] (crates/printer/src/stats.rs)".to_string()
+            &format!(
+                "    <- Contains Stats [Class] (crates/printer/src/stats.rs; entity:{})",
+                container.id
+            )
         );
         assert!(response.lines.iter().any(|line| line == "  Relations (1):"));
     }
@@ -1194,10 +1254,136 @@ mod tests {
         assert_eq!(peer_rows.len(), 2, "{:?}", response.lines);
         assert!(peer_rows
             .iter()
-            .any(|line| line.contains("Stats [Class] (crates/printer/src/stats.rs)")));
+            .any(|line| line.contains("Stats [Class] (crates/printer/src/stats.rs; entity:")));
         assert!(peer_rows
             .iter()
-            .any(|line| line.contains("Stats [TypeAlias] (crates/printer/src/stats.rs)")));
+            .any(|line| line.contains("Stats [TypeAlias] (crates/printer/src/stats.rs; entity:")));
+    }
+
+    #[test]
+    fn graph_inspect_disambiguates_overloads_with_the_same_name_kind_and_file() {
+        let graph = kin_db::InMemoryGraph::new();
+        let mut subject = test_entity("dispatch");
+        subject.kind = EntityKind::Method;
+        graph.upsert_entity(&subject).unwrap();
+
+        let file = FilePathId::new("src/handlers.rs");
+        let mut first = test_entity("Handler::run");
+        first.kind = EntityKind::Method;
+        first.file_origin = Some(file.clone());
+        first.span = Some(SourceSpan {
+            file: file.clone(),
+            start_byte: 10,
+            end_byte: 20,
+            start_line: 2,
+            start_col: 0,
+            end_line: 4,
+            end_col: 1,
+        });
+        let mut second = test_entity("Handler::run");
+        second.kind = EntityKind::Method;
+        second.file_origin = Some(file.clone());
+        second.span = Some(SourceSpan {
+            file,
+            start_byte: 30,
+            end_byte: 40,
+            start_line: 6,
+            start_col: 0,
+            end_line: 8,
+            end_col: 1,
+        });
+        graph.upsert_entity(&first).unwrap();
+        graph.upsert_entity(&second).unwrap();
+
+        for peer in [&first, &second] {
+            graph
+                .upsert_relation(&test_relation(RelationKind::Calls, subject.id, peer.id))
+                .unwrap();
+        }
+
+        let response = build_graph_inspect_response(&graph, "dispatch").unwrap();
+        let peer_rows: Vec<_> = response
+            .lines
+            .iter()
+            .filter(|line| line.starts_with("    -> Calls Handler::run "))
+            .collect();
+
+        assert_eq!(peer_rows.len(), 2, "{:?}", response.lines);
+        assert_ne!(peer_rows[0], peer_rows[1], "{:?}", response.lines);
+        assert!(peer_rows
+            .iter()
+            .any(|line| line.contains(&format!("entity:{}", first.id))));
+        assert!(peer_rows
+            .iter()
+            .any(|line| line.contains(&format!("entity:{}", second.id))));
+    }
+
+    #[test]
+    fn graph_inspect_includes_mixed_domain_relations() {
+        let graph = kin_db::InMemoryGraph::new();
+        let subject = test_entity("dispatch");
+        graph.upsert_entity(&subject).unwrap();
+
+        let test_id = kin_model::TestId::new();
+        let artifact_id = ArtifactId::new();
+        graph
+            .upsert_relation(&graph_relation(
+                RelationKind::Covers,
+                GraphNodeId::Test(test_id),
+                GraphNodeId::Entity(subject.id),
+            ))
+            .unwrap();
+        graph
+            .upsert_relation(&graph_relation(
+                RelationKind::OwnedByFile,
+                GraphNodeId::Entity(subject.id),
+                GraphNodeId::Artifact(artifact_id),
+            ))
+            .unwrap();
+
+        let response = build_graph_inspect_response(&graph, "dispatch").unwrap();
+
+        assert!(response.lines.iter().any(|line| line == "  Relations (2):"));
+        assert!(response
+            .lines
+            .iter()
+            .any(|line| line == &format!("    <- Covers test:{test_id}")));
+        assert!(response
+            .lines
+            .iter()
+            .any(|line| line == &format!("    -> OwnedByFile artifact:{}", artifact_id.0)));
+    }
+
+    #[test]
+    fn graph_inspect_bounds_rendered_rows_but_reports_the_full_unique_count() {
+        let graph = kin_db::InMemoryGraph::new();
+        let subject = test_entity("dispatch");
+        graph.upsert_entity(&subject).unwrap();
+
+        for index in 0..=INSPECT_RELATION_LIMIT {
+            let peer = test_entity(&format!("peer_{index}"));
+            graph.upsert_entity(&peer).unwrap();
+            graph
+                .upsert_relation(&test_relation(RelationKind::Calls, subject.id, peer.id))
+                .unwrap();
+        }
+
+        let response = build_graph_inspect_response(&graph, "dispatch").unwrap();
+        let peer_rows = response
+            .lines
+            .iter()
+            .filter(|line| line.starts_with("    -> Calls peer_"))
+            .count();
+
+        assert_eq!(peer_rows, INSPECT_RELATION_LIMIT, "{:?}", response.lines);
+        assert!(response
+            .lines
+            .iter()
+            .any(|line| line == &format!("  Relations ({}):", INSPECT_RELATION_LIMIT + 1)));
+        assert!(response
+            .lines
+            .iter()
+            .any(|line| line == "    ... and 1 more"));
     }
 
     #[test]
