@@ -673,6 +673,16 @@ impl TransferSourceContext {
     }
 }
 
+/// The earliest change in `closure` the destination ref can fast-forward to.
+fn smallest_publishable_step(
+    closure: &[SemanticChangeId],
+    descends: &BTreeMap<SemanticChangeId, bool>,
+) -> Option<usize> {
+    closure
+        .iter()
+        .position(|id| descends.get(id) == Some(&true))
+}
+
 /// Choose the longest parent-closed prefix of `closure` that stays inside the
 /// negotiated bounds and ends on a change the destination ref can fast-forward
 /// to.
@@ -714,26 +724,32 @@ fn plan_transfer_segment(
             }
         }
         let count = u32::try_from(index + 1).unwrap_or(u32::MAX);
-        if count > change_budget
-            || u32::try_from(bodies.len()).unwrap_or(u32::MAX) > limits.max_bodies
-        {
-            break;
-        }
-        if descends.get(id) == Some(&true) {
+        let within_budget = count <= change_budget
+            && u32::try_from(bodies.len()).unwrap_or(u32::MAX) <= limits.max_bodies;
+        if within_budget && descends.get(id) == Some(&true) {
             last_publishable = Some(index);
         }
     }
 
-    let end = last_publishable.ok_or_else(|| {
-        invalid(format!(
-            "no change in this closure both fits the negotiated envelope ({change_budget} changes, \
-             {} bodies) and descends from destination head {}; the transfer cannot be split here",
-            limits.max_bodies,
-            destination_head
-                .map(|head| head.to_string())
-                .unwrap_or_else(|| "an unborn ref".to_string()),
-        ))
-    })?;
+    // No boundary fits the budget. That does not mean the transfer is stuck:
+    // it means the smallest step that lands a head this ref can reach is
+    // bigger than the envelope asked for. Merging a side line does this, and
+    // it does it partway through a publication that has already moved history,
+    // so refusing here would strand a transfer rather than bound it. Take the
+    // smallest publishable step there is and let the pack limits refuse it if
+    // it genuinely cannot be built.
+    let end = match last_publishable {
+        Some(end) => end,
+        None => smallest_publishable_step(closure, &descends).ok_or_else(|| {
+            invalid(format!(
+                "no change in this closure descends from destination head {}, so no pack can \
+                 publish a head this ref reaches",
+                destination_head
+                    .map(|head| head.to_string())
+                    .unwrap_or_else(|| "an unborn ref".to_string()),
+            ))
+        })?,
+    };
     // Carry exactly the endpoint's own ancestry rather than the whole scanned
     // prefix. A topological prefix can hold a change that is not an ancestor
     // of the change it ends on: order a merge's two lines the other way and
@@ -890,9 +906,7 @@ fn assemble_segment_pack<B: StorageBackend + ?Sized + 'static>(
 }
 
 /// Every immutable CAS body one resolved tree depends on.
-fn resolved_tree_body_identities(
-    tree: &kin_model::ResolvedTree,
-) -> Result<BTreeSet<Hash256>> {
+fn resolved_tree_body_identities(tree: &kin_model::ResolvedTree) -> Result<BTreeSet<Hash256>> {
     let mut identities = BTreeSet::new();
     for artifact in tree.artifacts() {
         if let Some(hash) = artifact.entry.blob_identity() {

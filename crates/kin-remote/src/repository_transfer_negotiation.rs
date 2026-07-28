@@ -478,13 +478,29 @@ where
     let mut receipts = Vec::new();
     let mut originally_at = None;
     let mut published_changes = 0usize;
-    let mut previous_remaining: Option<usize> = None;
+    let mut previous_head: Option<Option<SemanticChangeId>> = None;
 
     let (source_head, plan) = loop {
         let expectation = negotiated_destination_lease(transport, repository_id, destination_ref)?;
         if receipts.is_empty() {
             originally_at = expectation.destination_head;
         }
+        // Every round must find the remote further along than the last one
+        // left it. Without this a peer that receipts a pack and then keeps
+        // reporting its old head would have this loop republish the same
+        // segment forever, which is a hang standing in for a refusal.
+        if let Some(previous) = previous_head {
+            if expectation.destination_head == previous {
+                return Err(conflict(format!(
+                    "remote reported the same head on {destination_ref} after publishing a \
+                     continuation pack, so the transfer toward {} made no progress",
+                    previous
+                        .map(|head| head.to_string())
+                        .unwrap_or_else(|| "an unborn ref".to_string())
+                )));
+            }
+        }
+        previous_head = Some(expectation.destination_head);
         let (source_head, plan) = classify_push(
             local,
             source_ref,
@@ -502,20 +518,6 @@ where
                 segment.pack.transfer_target_head
             )));
         }
-        // Every round must leave strictly less to move. Without this a peer
-        // that accepts a pack and then keeps reporting its old head would keep
-        // this loop republishing the same segment forever, which is a hang
-        // rather than the refusal it actually is.
-        if let Some(previous) = previous_remaining {
-            if segment.remaining_changes >= previous {
-                return Err(conflict(format!(
-                    "remote made no progress across continuation packs: {} exact changes remained \
-                     before this pack and {} remain after it",
-                    previous, segment.remaining_changes
-                )));
-            }
-        }
-        previous_remaining = Some(segment.remaining_changes);
         published_changes += segment.pack.changes.len();
 
         let receipt = transport.receive_pack(repository_id, destination_ref, &segment.pack)?;
@@ -1429,10 +1431,12 @@ mod tests {
         let peer = LocalPeer::advertising_max_changes(&fixture.destination, 2);
 
         // Publish the first pack alone, exactly as the loop would.
-        let expectation = negotiated_destination_lease(&peer, &fixture.repository_id, &fixture.main)
-            .expect("the remote lease is readable");
+        let expectation =
+            negotiated_destination_lease(&peer, &fixture.repository_id, &fixture.main)
+                .expect("the remote lease is readable");
         let segment =
-            build_repository_transfer_segment(&fixture.source, &fixture.main, &expectation).unwrap();
+            build_repository_transfer_segment(&fixture.source, &fixture.main, &expectation)
+                .unwrap();
         assert!(!segment.is_final());
         let receipt = peer
             .receive_pack(&fixture.repository_id, &fixture.main, &segment.pack)
@@ -1506,10 +1510,14 @@ mod tests {
 
     #[test]
     fn a_continuation_segment_publishes_a_head_the_destination_ref_can_reach() {
-        // A topological prefix is not enough on its own. Merging a side line
-        // puts that line ahead of the merge in the closure, and ending a
-        // segment there would move the destination ref sideways onto a change
-        // that is not descended from the head it holds.
+        // A topological prefix is not a valid segment boundary on its own.
+        // Merging a side line puts that line's changes ahead of the merge in
+        // the closure, and neither of them descends from the head the
+        // destination holds. Ending a segment there would ask the destination
+        // ref to move sideways onto an unrelated change, so the smallest step
+        // that lands a reachable head is the merge itself even though it is
+        // bigger than the envelope asked for. Refusing instead would strand a
+        // publication partway through.
         let repository_id = RepositoryId::new(format!("segment-merge-{}", Uuid::new_v4())).unwrap();
         let source_dir = TempDir::new().unwrap();
         let destination_dir = TempDir::new().unwrap();
@@ -1532,6 +1540,8 @@ mod tests {
 
         let peer = LocalPeer::new(&destination);
         push_to_remote(&source, &peer, &repository_id, &main, &main).unwrap();
+        assert_eq!(head_of(&destination, &main), Some(published));
+
         let merged = publish_with_parents(
             &source,
             &repository_id,
@@ -1541,31 +1551,123 @@ mod tests {
             4,
             "merge the side line",
         );
+        let after_merge = publish(
+            &source,
+            &repository_id,
+            &main,
+            Some(merged),
+            5,
+            "advance past the merge",
+        );
 
-        // One change per envelope. The side change and the root are both in
-        // the closure and neither can end a segment, so the only publishable
-        // step is the merge itself, and it does not fit. The refusal has to
-        // say so rather than publish a sideways head.
+        // One change per envelope. Nothing before the merge can end a segment,
+        // so the first pack is the merge closure and the second is the single
+        // change after it.
         let narrow = LocalPeer::advertising_max_changes(&destination, 1);
-        let error = push_to_remote(&source, &narrow, &repository_id, &main, &main)
-            .expect_err("no single-change segment can end on a reachable head here");
-        let RepositoryTransferError::Invalid(message) = error else {
-            panic!("an unsplittable closure is an invalid transfer, not a conflict: {error:?}");
-        };
-        assert!(
-            message.contains("descends from destination head"),
-            "the refusal must say why no segment boundary exists: {message}"
+        let outcome = push_to_remote(&source, &narrow, &repository_id, &main, &main)
+            .expect("an unsplittable step is taken whole, not refused");
+
+        assert_eq!(
+            outcome.receipts.len(),
+            2,
+            "the merge closure is one step and the change after it is another"
         );
         assert_eq!(
-            head_of(&destination, &main),
-            Some(published),
-            "a refused segmentation must move nothing"
+            outcome.receipts[0].destination_head, merged,
+            "the first pack lands the merge, the earliest head this ref can reach"
         );
+        assert_eq!(outcome.receipts[1].destination_head, after_merge);
+        assert_eq!(head_of(&destination, &main), Some(after_merge));
+        assert_eq!(
+            outcome.plan,
+            RepositoryTransferPlan::FastForward {
+                source_head: after_merge,
+                destination_head: Some(published),
+                // The merge closure carries the root a second time: it reaches
+                // the merge by a path that never passes through the head the
+                // destination held, so the fast-forward closure collects it.
+                // The receiver accepts a change it already has when the bytes
+                // are identical, which is why this is redundancy rather than a
+                // conflict.
+                change_count: Some(4),
+            }
+        );
+    }
 
-        // With room for the whole closure the same push lands normally.
-        let outcome = push_to_remote(&source, &peer, &repository_id, &main, &main).unwrap();
-        assert_eq!(outcome.receipts.len(), 1);
-        assert_eq!(head_of(&destination, &main), Some(merged));
+    #[test]
+    fn a_peer_that_never_advances_is_refused_rather_than_looped_on() {
+        // The continuation loop asks the remote where it is, publishes the next
+        // step, and asks again. A peer that receipts a pack and then reports the
+        // same head has not moved, and there is no number of retries that fixes
+        // it. Reporting that as a refusal is the difference between an error and
+        // a hang.
+        let (fixture, _) = line_of(4);
+        let peer = FrozenPeer {
+            inner: LocalPeer::advertising_max_changes(&fixture.destination, 2),
+        };
+
+        let error = push_to_remote(
+            &fixture.source,
+            &peer,
+            &fixture.repository_id,
+            &fixture.main,
+            &fixture.main,
+        )
+        .expect_err("a remote that never advances is refused");
+
+        let RepositoryTransferError::Conflict(message) = error else {
+            panic!("a peer that will not advance is a conflict: {error:?}");
+        };
+        assert!(
+            message.contains("made no progress"),
+            "the refusal must say the remote did not move: {message}"
+        );
+    }
+
+    /// A peer whose transfer status keeps reporting the head it had before any
+    /// pack was published.
+    struct FrozenPeer<'a> {
+        inner: LocalPeer<'a>,
+    }
+
+    impl RepositoryTransferTransport for FrozenPeer<'_> {
+        fn advertise_refs(
+            &self,
+            repository_id: &RepositoryId,
+        ) -> Result<RepositoryRefAdvertisement> {
+            self.inner.advertise_refs(repository_id)
+        }
+
+        fn transfer_status(
+            &self,
+            repository_id: &RepositoryId,
+            destination_ref: &RefName,
+        ) -> Result<RepositoryTransferStatus> {
+            let mut status = self.inner.transfer_status(repository_id, destination_ref)?;
+            status.destination_target = None;
+            status.destination_head = None;
+            Ok(status)
+        }
+
+        fn export_pack(
+            &self,
+            repository_id: &RepositoryId,
+            source_ref: &RefName,
+            expectation: &RepositoryTransferExpectation,
+        ) -> Result<RepositoryTransferPack> {
+            self.inner
+                .export_pack(repository_id, source_ref, expectation)
+        }
+
+        fn receive_pack(
+            &self,
+            repository_id: &RepositoryId,
+            destination_ref: &RefName,
+            pack: &RepositoryTransferPack,
+        ) -> Result<RepositoryTransferReceipt> {
+            self.inner
+                .receive_pack(repository_id, destination_ref, pack)
+        }
     }
 
     #[test]
@@ -1612,12 +1714,8 @@ mod tests {
         // work when it cannot.
         let fixture = fixture();
         let peer = LocalPeer::new(&fixture.destination);
-        let mut expectation = negotiated_destination_lease(
-            &peer,
-            &fixture.repository_id,
-            &fixture.main,
-        )
-        .unwrap();
+        let mut expectation =
+            negotiated_destination_lease(&peer, &fixture.repository_id, &fixture.main).unwrap();
         expectation.git_authority_hash = Some(Hash256::from_bytes([0x71; 32]));
 
         let error = verify_transfer_source_readiness(&fixture.source, &fixture.main, &expectation)

@@ -6758,10 +6758,9 @@ fn refresh_local_derived_views(
         .record_repository_authority_commit(receipt.authority_receipt.generation)
         .map_err(|error| format!("record repository authority generation: {error}"))?;
     for change in changes {
-        state
-            .graph
-            .create_change(change)
-            .map_err(|error| format!("admit change {} into the daemon graph: {error}", change.id))?;
+        state.graph.create_change(change).map_err(|error| {
+            format!("admit change {} into the daemon graph: {error}", change.id)
+        })?;
     }
     state.bump_version();
     state.emit_event(DaemonEvent::GraphRootChanged {
