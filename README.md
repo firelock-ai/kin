@@ -1,10 +1,10 @@
 <div align="center">
 
-<a href="https://kinlab.ai"><picture>
-  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/firelock-ai/kin/main/brand/kin-lockup-dark.svg">
-  <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/firelock-ai/kin/main/brand/kin-lockup-light.svg">
-  <img src="https://raw.githubusercontent.com/firelock-ai/kin/main/brand/kin-lockup-light.svg" alt="Kin" width="300">
-</picture></a>
+<picture>
+<source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/firelock-ai/kin/main/brand/kin-lockup-dark.svg">
+<source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/firelock-ai/kin/main/brand/kin-lockup-light.svg">
+<img src="https://raw.githubusercontent.com/firelock-ai/kin/main/brand/kin-lockup-light.svg" alt="Kin" width="300">
+</picture>
 
 <h3>Software that remembers itself.</h3>
 
