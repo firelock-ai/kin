@@ -38,8 +38,8 @@ pub use storage::{
 pub use storage::{
     load_recovered_snapshot, Generation, LocalFileBackend, LocalNamespaceIdentityFault,
     LocalNamespaceProbe, PersistedDelta, RecoveredSnapshot, SnapshotAuthority, SnapshotCursor,
-    SnapshotRecoveryState, SnapshotSaveOutcome, StorageBackend, GENERATION_INIT,
-    MAX_SOURCE_BLOB_BYTES,
+    SnapshotRecoveryState, SnapshotSaveOutcome, SourceBlobValidationRequest, StorageBackend,
+    VerifiedSourceBlob, VerifiedSourceBlobBatch, GENERATION_INIT, MAX_SOURCE_BLOB_BYTES,
 };
 pub use storage::{
     AuthorityCommitDecision, AuthorityPublication, AuthorityReadLease, DurableAuthorityPersistence,

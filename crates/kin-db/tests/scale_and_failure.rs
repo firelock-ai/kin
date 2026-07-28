@@ -148,7 +148,12 @@ fn generate_snapshot(n: usize, rels_per_entity: usize) -> (GraphSnapshot, Vec<En
 }
 
 /// Scale test: 100K entities with basic operations in bounded time.
+///
+/// This timed guard is deliberately excluded from the parallel default suite.
+/// CI runs it as an exact, single-threaded test so another scale test cannot
+/// consume the runner while the wall-clock assertion is measuring hydration.
 #[test]
+#[ignore = "timed guard; run exactly with one test thread"]
 fn scale_100k_entities() {
     let (snapshot, entity_ids) = generate_snapshot(100_000, 2);
     let start = Instant::now();

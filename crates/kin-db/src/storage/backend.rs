@@ -76,6 +76,58 @@ pub enum SnapshotSaveOutcome {
 /// object is allowed to force an allocation larger than this boundary.
 pub const MAX_SOURCE_BLOB_BYTES: u64 = 1024 * 1024 * 1024;
 
+/// One distinct immutable source body requested for a validated batch read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceBlobValidationRequest {
+    pub digest: [u8; 32],
+    pub max_bytes: u64,
+}
+
+/// Immutable source bytes whose storage backend verified their SHA-256
+/// content identity while loading them.
+///
+/// The only constructor re-verifies the content identity, so an optimized
+/// backend implementation cannot promote arbitrary bytes to a verified body.
+/// Higher-level validators may still apply domain-specific checks such as
+/// exact Git object identity.
+#[derive(Debug)]
+pub struct VerifiedSourceBlob {
+    digest: [u8; 32],
+    bytes: Vec<u8>,
+}
+
+/// One integrity-checking immutable-body read session.
+///
+/// A backend may retain a repository capability or remote read context for
+/// the lifetime of this value. Every returned body still passes through
+/// [`VerifiedSourceBlob::from_verified_bytes`].
+pub trait VerifiedSourceBlobBatch {
+    fn load_verified(
+        &self,
+        request: SourceBlobValidationRequest,
+    ) -> Result<Option<VerifiedSourceBlob>, KinDbError>;
+}
+
+impl VerifiedSourceBlob {
+    /// Bind bytes to `digest` after recomputing their SHA-256 identity.
+    pub fn from_verified_bytes(digest: [u8; 32], bytes: Vec<u8>) -> Result<Self, KinDbError> {
+        verify_source_blob_digest(digest, &bytes, "verified source blob batch")?;
+        Ok(Self { digest, bytes })
+    }
+
+    pub const fn digest(&self) -> [u8; 32] {
+        self.digest
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
 #[cfg(all(test, unix))]
 std::thread_local! {
     static SOURCE_FILE_AFTER_METADATA_HOOK:
@@ -1307,6 +1359,10 @@ pub struct SnapshotAuthority {
     /// Last acknowledged generation. Every generation in
     /// `(snapshot_generation, head_generation]` must have one exact delta.
     pub head_generation: Generation,
+    /// Durable claim that `snapshot_bytes` already passed complete open-time
+    /// validation. Backends with no durable place to bind such a claim leave
+    /// this `None`, and their repositories revalidate in full on every open.
+    pub history_validation: Option<HistoryValidationProof>,
 }
 
 impl SnapshotAuthority {
@@ -1327,6 +1383,18 @@ pub struct RecoveredSnapshot {
     pub generation: Generation,
     pub deltas_applied: usize,
     pub deltas_seen: usize,
+    /// SHA-256 recomputed here over the exact base snapshot bytes that were
+    /// deserialized, never copied from a backend's own claim about them.
+    pub snapshot_sha256: String,
+    /// Backend claim that the base snapshot already passed complete open-time
+    /// validation. Cleared once any delta is applied, because the recovered
+    /// state is then no longer the bytes the claim names.
+    pub history_validation: Option<HistoryValidationProof>,
+}
+
+pub(crate) struct RecoveredRepositoryAuthority {
+    pub recovered: RecoveredSnapshot,
+    pub reused_complete_validation: bool,
 }
 
 /// Load a backend snapshot and replay its complete authoritative delta chain.
@@ -1340,6 +1408,30 @@ pub fn load_recovered_snapshot<B: StorageBackend + ?Sized>(
     backend: &B,
     repo_id: &str,
 ) -> Result<Option<RecoveredSnapshot>, KinDbError> {
+    load_recovered_snapshot_inner(backend, repo_id, None)
+        .map(|recovered| recovered.map(|recovered| recovered.recovered))
+}
+
+/// Load repository authority while permitting an exact, durable
+/// complete-validation proof to skip deterministic semantic revalidation.
+///
+/// General snapshot consumers continue to use [`load_recovered_snapshot`] and
+/// always perform full storage admission. This narrower entrypoint is reserved
+/// for [`RepositoryAuthorityManager`](crate::storage::RepositoryAuthorityManager),
+/// which still revalidates every referenced immutable body after recovery.
+pub(crate) fn load_recovered_repository_authority<B: StorageBackend + ?Sized>(
+    backend: &B,
+    repo_id: &str,
+    expected_validator_version: u32,
+) -> Result<Option<RecoveredRepositoryAuthority>, KinDbError> {
+    load_recovered_snapshot_inner(backend, repo_id, Some(expected_validator_version))
+}
+
+fn load_recovered_snapshot_inner<B: StorageBackend + ?Sized>(
+    backend: &B,
+    repo_id: &str,
+    expected_validator_version: Option<u32>,
+) -> Result<Option<RecoveredRepositoryAuthority>, KinDbError> {
     let (loaded, raw_deltas) = backend.load_recovery_state(repo_id)?;
 
     let Some(authority) = loaded else {
@@ -1359,14 +1451,35 @@ pub fn load_recovered_snapshot<B: StorageBackend + ?Sized>(
         )));
     }
 
-    let mut snapshot = GraphSnapshot::from_bytes(&authority.snapshot_bytes)?;
+    let snapshot_sha256 = hex::encode(Sha256::digest(&authority.snapshot_bytes));
     let deltas_seen = raw_deltas.len();
+    let reused_complete_validation = expected_validator_version.is_some_and(|expected| {
+        authority.snapshot_generation == authority.head_generation
+            && raw_deltas.is_empty()
+            && authority.history_validation.as_ref().is_some_and(|proof| {
+                proof.validator_version == expected
+                    && proof.repository_id == repo_id
+                    && proof.generation == authority.head_generation
+                    && proof.snapshot_sha256 == snapshot_sha256
+            })
+    });
+    let mut snapshot = if reused_complete_validation {
+        let _span = tracing::info_span!("kindb.snapshot.reuse_exact_complete_validation").entered();
+        GraphSnapshot::from_bytes_reusing_exact_validation(&authority.snapshot_bytes)?
+    } else {
+        GraphSnapshot::from_bytes(&authority.snapshot_bytes)?
+    };
     if authority.snapshot_generation == authority.head_generation {
-        return Ok(Some(RecoveredSnapshot {
-            snapshot,
-            generation: authority.head_generation,
-            deltas_applied: 0,
-            deltas_seen,
+        return Ok(Some(RecoveredRepositoryAuthority {
+            recovered: RecoveredSnapshot {
+                snapshot,
+                generation: authority.head_generation,
+                deltas_applied: 0,
+                deltas_seen,
+                snapshot_sha256,
+                history_validation: authority.history_validation,
+            },
+            reused_complete_validation,
         }));
     }
     let mut expected_generation = checked_next_generation(
@@ -1425,11 +1538,18 @@ pub fn load_recovered_snapshot<B: StorageBackend + ?Sized>(
         )));
     }
 
-    Ok(Some(RecoveredSnapshot {
-        snapshot,
-        generation: authority.head_generation,
-        deltas_applied: applied,
-        deltas_seen,
+    Ok(Some(RecoveredRepositoryAuthority {
+        recovered: RecoveredSnapshot {
+            snapshot,
+            generation: authority.head_generation,
+            deltas_applied: applied,
+            deltas_seen,
+            snapshot_sha256,
+            // The recovered state is the base snapshot plus a delta chain, so no
+            // claim about the base bytes describes it any more.
+            history_validation: None,
+        },
+        reused_complete_validation: false,
     }))
 }
 
@@ -1458,7 +1578,46 @@ pub trait StorageBackend: Send + Sync {
                 snapshot_bytes,
                 snapshot_generation: generation,
                 head_generation: generation,
+                history_validation: None,
             }))
+    }
+
+    /// Persist a full snapshot, optionally binding a durable record that these
+    /// exact bytes already passed complete open-time validation.
+    ///
+    /// `history_validator_version` is `Some` only when the caller has just
+    /// validated the very bytes it is handing over. Backends with nowhere to
+    /// bind that record ignore it, which costs correctness nothing: their
+    /// repositories simply revalidate in full on every open.
+    fn save_snapshot_validated(
+        &self,
+        repo_id: &str,
+        data: &[u8],
+        expected: SnapshotCursor,
+        history_validator_version: Option<u32>,
+    ) -> SnapshotSaveOutcome {
+        let _ = history_validator_version;
+        self.save_snapshot_classified(repo_id, data, expected)
+    }
+
+    /// Bind a validation record to the snapshot a repository already holds,
+    /// without rewriting it.
+    ///
+    /// This is how the first full validation after an upgrade, an import, or a
+    /// store written by an older build pays for itself. The backend must
+    /// verify that the durable snapshot still is exactly `snapshot_sha256` at
+    /// exactly `generation` before binding anything, and refuse otherwise.
+    ///
+    /// `Ok(false)` means the backend has no durable place for the record.
+    fn record_history_validation(
+        &self,
+        repo_id: &str,
+        generation: Generation,
+        snapshot_sha256: &str,
+        validator_version: u32,
+    ) -> Result<bool, KinDbError> {
+        let _ = (repo_id, generation, snapshot_sha256, validator_version);
+        Ok(false)
     }
 
     /// Read snapshot authority and its journal from one coherent backend view.
@@ -1540,6 +1699,31 @@ pub trait StorageBackend: Send + Sync {
         Err(KinDbError::StorageError(
             "bounded immutable source blob reads are not supported by this backend".to_string(),
         ))
+    }
+
+    /// Execute integrity-checked immutable-body reads in one backend batch.
+    ///
+    /// The safe default preserves backend compatibility by delegating each read
+    /// to [`load_source_blob_bounded`](Self::load_source_blob_bounded). Local
+    /// storage overrides this to retain one repository lock across the complete
+    /// operation instead of reacquiring it for every content address.
+    ///
+    /// The callback shape lets callers stream globally de-duplicated bodies
+    /// instead of materializing their aggregate bytes in memory.
+    ///
+    /// Implementations must invoke `operation` exactly once. If it returns an
+    /// error, the backend must propagate that failure and must not return
+    /// success. Repository authority callers enforce both rules fail closed.
+    fn with_verified_source_blob_batch(
+        &self,
+        repo_id: &str,
+        operation: &mut dyn FnMut(&dyn VerifiedSourceBlobBatch) -> Result<(), KinDbError>,
+    ) -> Result<(), KinDbError> {
+        let batch = DefaultVerifiedSourceBlobBatch {
+            backend: self,
+            repo_id,
+        };
+        operation(&batch)
     }
 
     /// Load the exact byte length of an immutable source blob.
@@ -1693,6 +1877,23 @@ pub trait StorageBackend: Send + Sync {
     /// For local: list subdirectories in the base path that contain `authority.json`.
     /// For GCS: list top-level prefixes in the bucket under the configured prefix.
     fn list_repos(&self) -> Result<Vec<String>, KinDbError>;
+}
+
+struct DefaultVerifiedSourceBlobBatch<'a, B: StorageBackend + ?Sized> {
+    backend: &'a B,
+    repo_id: &'a str,
+}
+
+impl<B: StorageBackend + ?Sized> VerifiedSourceBlobBatch for DefaultVerifiedSourceBlobBatch<'_, B> {
+    fn load_verified(
+        &self,
+        request: SourceBlobValidationRequest,
+    ) -> Result<Option<VerifiedSourceBlob>, KinDbError> {
+        self.backend
+            .load_source_blob_bounded(self.repo_id, request.digest, request.max_bytes)?
+            .map(|bytes| VerifiedSourceBlob::from_verified_bytes(request.digest, bytes))
+            .transpose()
+    }
 }
 
 /// Local filesystem storage backend for developer machines.
@@ -1860,6 +2061,30 @@ struct LocalRepositoryCapability {
         parking_lot::Mutex<std::collections::HashMap<String, LocalStorageRootIdentity>>,
     lock_identity: parking_lot::Mutex<Option<LocalRepositoryLockIdentity>>,
     lock_publication_sync_pending: std::sync::atomic::AtomicBool,
+}
+
+struct LocalVerifiedSourceBlobBatch<'a> {
+    backend: &'a LocalFileBackend,
+    namespace: &'a LocalRepositoryCapability,
+}
+
+impl VerifiedSourceBlobBatch for LocalVerifiedSourceBlobBatch<'_> {
+    fn load_verified(
+        &self,
+        request: SourceBlobValidationRequest,
+    ) -> Result<Option<VerifiedSourceBlob>, KinDbError> {
+        self.backend
+            .load_source_blob_bounded_from_namespace(
+                self.namespace,
+                request.digest,
+                request.max_bytes,
+                false,
+                false,
+                false,
+            )?
+            .map(|bytes| VerifiedSourceBlob::from_verified_bytes(request.digest, bytes))
+            .transpose()
+    }
 }
 
 struct LocalSurfaceCapability {
@@ -2222,6 +2447,26 @@ impl LocalAuthorityFreezeLock {
 
 const LOCAL_AUTHORITY_VERSION: u32 = 3;
 
+/// Durable record that one exact snapshot already passed complete open-time
+/// validation.
+///
+/// The record is content-bound: it names the SHA-256 of the exact snapshot
+/// bytes it stands for, so it can never be transplanted onto different bytes,
+/// a different generation, or a different repository. A reader that recomputes
+/// a different digest holds no proof at all and must revalidate in full.
+///
+/// `validator_version` is supplied by the validator that minted the record,
+/// not by storage. Any change to what open-time validation checks bumps it,
+/// which refuses every previously minted record and re-establishes the proof
+/// with one full validation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HistoryValidationProof {
+    pub validator_version: u32,
+    pub repository_id: String,
+    pub generation: Generation,
+    pub snapshot_sha256: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct LocalDeltaIdentity {
     generation: Generation,
@@ -2241,6 +2486,11 @@ struct LocalAuthorityRecord {
     /// Exact journal bytes already represented by the promoted full snapshot
     /// but not necessarily removed yet. Cleanup may act only on these bytes.
     retired_deltas: Vec<LocalDeltaIdentity>,
+    /// Content-bound record that the authoritative snapshot already passed
+    /// complete open-time validation. Absent on records written before this
+    /// field existed and on every authority that advanced through a delta.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    history_validation: Option<HistoryValidationProof>,
 }
 
 impl LocalFileBackend {
@@ -3875,9 +4125,64 @@ impl LocalFileBackend {
     ) -> Result<Option<Vec<u8>>, KinDbError> {
         freeze.require_repository(repo_id)?;
         validate_source_blob_repo_id(repo_id)?;
+        self.load_source_blob_bounded_from_namespace(
+            freeze.namespace(),
+            digest,
+            max_bytes,
+            false,
+            true,
+            true,
+        )
+    }
+
+    pub(crate) fn with_verified_source_blob_batch_while_frozen(
+        &self,
+        freeze: &LocalAuthorityFreezeLock,
+        repo_id: &str,
+        operation: &mut dyn FnMut(&dyn VerifiedSourceBlobBatch) -> Result<(), KinDbError>,
+    ) -> Result<(), KinDbError> {
+        freeze.require_repository(repo_id)?;
+        validate_source_blob_repo_id(repo_id)?;
+        self.with_verified_source_blob_batch_from_namespace(freeze.namespace(), operation)
+    }
+
+    fn with_verified_source_blob_batch_from_namespace(
+        &self,
+        namespace: &LocalRepositoryCapability,
+        operation: &mut dyn FnMut(&dyn VerifiedSourceBlobBatch) -> Result<(), KinDbError>,
+    ) -> Result<(), KinDbError> {
+        self.confirm_existing_lock_visible(namespace)?;
+        let batch = LocalVerifiedSourceBlobBatch {
+            backend: self,
+            namespace,
+        };
+        let operation_result = operation(&batch);
+        let identity_result = self.confirm_existing_lock_visible(namespace);
+        match identity_result {
+            Ok(()) => operation_result,
+            Err(error) => Err(error),
+        }
+    }
+
+    fn load_source_blob_bounded_from_namespace(
+        &self,
+        namespace: &LocalRepositoryCapability,
+        digest: [u8; 32],
+        max_bytes: u64,
+        create_missing_ancestors: bool,
+        confirm_repository_each_read: bool,
+        verify_digest_in_reader: bool,
+    ) -> Result<Option<Vec<u8>>, KinDbError> {
         #[cfg(not(any(unix, windows)))]
         {
-            let _ = (digest, max_bytes);
+            let _ = (
+                namespace,
+                digest,
+                max_bytes,
+                create_missing_ancestors,
+                confirm_repository_each_read,
+                verify_digest_in_reader,
+            );
             return Err(KinDbError::StorageError(
                 "secure local immutable source storage is unavailable on this platform; use the GCS backend"
                     .to_string(),
@@ -3885,13 +4190,14 @@ impl LocalFileBackend {
         }
         #[cfg(windows)]
         {
-            let namespace = freeze.namespace();
-            self.confirm_repository_visible(namespace)?;
+            if confirm_repository_each_read {
+                self.confirm_repository_visible(namespace)?;
+            }
             let capability = open_windows_source_blob_capability_from_repository(
                 &namespace.directory,
                 &namespace.display_path,
                 digest,
-                false,
+                create_missing_ancestors,
             )?;
             confirm_windows_source_blob_namespace_from_repository(
                 &namespace.directory,
@@ -3907,32 +4213,39 @@ impl LocalFileBackend {
                 false,
             )?
             else {
-                self.confirm_repository_visible(namespace)?;
+                if confirm_repository_each_read {
+                    self.confirm_repository_visible(namespace)?;
+                }
                 return Ok(None);
             };
-            verify_source_blob_digest(
-                digest,
-                &data.data,
-                &capability.leaf_path.display().to_string(),
-            )?;
+            if verify_digest_in_reader {
+                verify_source_blob_digest(
+                    digest,
+                    &data.data,
+                    &capability.leaf_path.display().to_string(),
+                )?;
+            }
             confirm_windows_source_blob_namespace_from_repository(
                 &namespace.directory,
                 &namespace.display_path,
                 digest,
                 &capability,
             )?;
-            self.confirm_repository_visible(namespace)?;
+            if confirm_repository_each_read {
+                self.confirm_repository_visible(namespace)?;
+            }
             return Ok(Some(data.data));
         }
         #[cfg(unix)]
         {
-            let namespace = freeze.namespace();
-            self.confirm_repository_visible(namespace)?;
+            if confirm_repository_each_read {
+                self.confirm_repository_visible(namespace)?;
+            }
             let capability = open_source_blob_capability_from_repository(
                 &namespace.directory,
                 &namespace.display_path,
                 digest,
-                false,
+                create_missing_ancestors,
                 false,
             )?;
             confirm_source_blob_namespace_from_repository(
@@ -3944,21 +4257,27 @@ impl LocalFileBackend {
             let digest_hex = hex::encode(digest);
             let Some(data) = read_source_file_at(&capability.leaf_dir, &digest_hex, max_bytes)?
             else {
-                self.confirm_repository_visible(namespace)?;
+                if confirm_repository_each_read {
+                    self.confirm_repository_visible(namespace)?;
+                }
                 return Ok(None);
             };
-            verify_source_blob_digest(
-                digest,
-                &data.data,
-                &capability.leaf_path.display().to_string(),
-            )?;
+            if verify_digest_in_reader {
+                verify_source_blob_digest(
+                    digest,
+                    &data.data,
+                    &capability.leaf_path.display().to_string(),
+                )?;
+            }
             confirm_source_blob_namespace_from_repository(
                 &namespace.directory,
                 &namespace.display_path,
                 digest,
                 &capability,
             )?;
-            self.confirm_repository_visible(namespace)?;
+            if confirm_repository_each_read {
+                self.confirm_repository_visible(namespace)?;
+            }
             Ok(Some(data.data))
         }
     }
@@ -4540,11 +4859,11 @@ impl LocalFileBackend {
                 record.snapshot_sha256
             )));
         }
-        GraphSnapshot::from_bytes(&snapshot_bytes).map_err(|error| {
-            KinDbError::StorageError(format!(
-                "authoritative snapshot payload for repo {repo_id} is invalid: {error}"
-            ))
-        })?;
+        // Payload decoding and structural admission belong to
+        // `load_recovered_snapshot`, which is the shared recovery boundary for
+        // every backend. Decoding here would throw the validated value away
+        // and make local recovery deserialize and validate the same exact
+        // content-addressed bytes twice before repository open can use them.
         namespace.confirm_surface_visible(&snapshots)?;
         Ok(snapshot_bytes)
     }
@@ -4660,6 +4979,7 @@ impl LocalFileBackend {
             snapshot_bytes,
             snapshot_generation: record.snapshot_generation,
             head_generation: record.head_generation,
+            history_validation: record.history_validation,
         }))
     }
 
@@ -4778,6 +5098,7 @@ impl LocalFileBackend {
         namespace: &LocalRepositoryCapability,
         data: &[u8],
         expected_gen: Generation,
+        history_validator_version: Option<u32>,
     ) -> Result<Generation, KinDbError> {
         let repo_id = &namespace.repo_id;
         let current = self.load_authority_unlocked(namespace)?;
@@ -4905,9 +5226,17 @@ impl LocalFileBackend {
             snapshot_generation: new_gen,
             head_generation: new_gen,
             snapshot_file: Self::snapshot_file_name(new_gen),
-            snapshot_sha256: requested_digest,
+            snapshot_sha256: requested_digest.clone(),
             acknowledged_deltas: Vec::new(),
             retired_deltas: Self::delta_identities(&captured_for_cleanup),
+            history_validation: history_validator_version.map(|validator_version| {
+                HistoryValidationProof {
+                    validator_version,
+                    repository_id: repo_id.clone(),
+                    generation: new_gen,
+                    snapshot_sha256: requested_digest,
+                }
+            }),
         };
         self.write_authority_unlocked(namespace, &record)?;
         #[cfg(test)]
@@ -4928,6 +5257,26 @@ impl LocalFileBackend {
         Ok(new_gen)
     }
 
+    fn save_snapshot_locked(
+        &self,
+        repo_id: &str,
+        data: &[u8],
+        expected_gen: Generation,
+        history_validator_version: Option<u32>,
+    ) -> Result<Generation, KinDbError> {
+        let lock = if expected_gen == GENERATION_INIT {
+            self.acquire_lock_for_initialization(repo_id)?
+        } else {
+            self.acquire_existing_lock(repo_id)?
+        };
+        self.save_snapshot_unlocked(
+            &lock.namespace,
+            data,
+            expected_gen,
+            history_validator_version,
+        )
+    }
+
     /// Persist a local full-snapshot CAS and return the same still-held
     /// repository lock that protected its commit point.
     pub(crate) fn save_snapshot_and_freeze(
@@ -4935,6 +5284,7 @@ impl LocalFileBackend {
         repo_id: &str,
         data: &[u8],
         expected_cursor: SnapshotCursor,
+        history_validator_version: Option<u32>,
     ) -> Result<(SnapshotCursor, LocalAuthorityFreezeLock), KinDbError> {
         let expected_gen = expected_cursor.backend_generation();
         let lock = if expected_gen == GENERATION_INIT {
@@ -4942,12 +5292,25 @@ impl LocalFileBackend {
         } else {
             self.acquire_existing_lock(repo_id)?
         };
-        let generation = self.save_snapshot_unlocked(&lock.namespace, data, expected_gen)?;
+        let generation = self.save_snapshot_unlocked(
+            &lock.namespace,
+            data,
+            expected_gen,
+            history_validator_version,
+        )?;
         let cursor = SnapshotCursor::from_backend_generation(generation);
         let authority = SnapshotAuthority {
             snapshot_bytes: data.to_vec(),
             snapshot_generation: generation,
             head_generation: generation,
+            history_validation: history_validator_version.map(|validator_version| {
+                HistoryValidationProof {
+                    validator_version,
+                    repository_id: repo_id.to_string(),
+                    generation,
+                    snapshot_sha256: hex::encode(Sha256::digest(data)),
+                }
+            }),
         };
         Ok((
             cursor,
@@ -5382,6 +5745,34 @@ impl StorageBackend for LocalFileBackend {
         }
     }
 
+    fn with_verified_source_blob_batch(
+        &self,
+        repo_id: &str,
+        operation: &mut dyn FnMut(&dyn VerifiedSourceBlobBatch) -> Result<(), KinDbError>,
+    ) -> Result<(), KinDbError> {
+        validate_source_blob_repo_id(repo_id)?;
+        if self.existing_repository_path(repo_id)?.is_none() {
+            return Err(KinDbError::StorageError(format!(
+                "local repository {repo_id} is absent during immutable source batch access"
+            )));
+        }
+        #[cfg(any(unix, windows))]
+        let authority_lock = self.acquire_existing_lock(repo_id)?;
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = operation;
+            return Err(KinDbError::StorageError(
+                "secure local immutable source storage is unavailable on this platform; use the GCS backend"
+                    .to_string(),
+            ));
+        }
+        #[cfg(any(unix, windows))]
+        {
+            let namespace = &authority_lock.namespace;
+            self.with_verified_source_blob_batch_from_namespace(namespace, operation)
+        }
+    }
+
     fn source_blob_len(&self, repo_id: &str, digest: [u8; 32]) -> Result<Option<u64>, KinDbError> {
         validate_source_blob_repo_id(repo_id)?;
         if self.existing_repository_path(repo_id)?.is_none() {
@@ -5516,12 +5907,7 @@ impl StorageBackend for LocalFileBackend {
         data: &[u8],
         expected_gen: Generation,
     ) -> Result<Generation, KinDbError> {
-        let lock = if expected_gen == GENERATION_INIT {
-            self.acquire_lock_for_initialization(repo_id)?
-        } else {
-            self.acquire_existing_lock(repo_id)?
-        };
-        self.save_snapshot_unlocked(&lock.namespace, data, expected_gen)
+        self.save_snapshot_locked(repo_id, data, expected_gen, None)
     }
 
     fn save_snapshot_classified(
@@ -5530,7 +5916,22 @@ impl StorageBackend for LocalFileBackend {
         data: &[u8],
         expected_cursor: SnapshotCursor,
     ) -> SnapshotSaveOutcome {
-        match self.save_snapshot(repo_id, data, expected_cursor.backend_generation()) {
+        self.save_snapshot_validated(repo_id, data, expected_cursor, None)
+    }
+
+    fn save_snapshot_validated(
+        &self,
+        repo_id: &str,
+        data: &[u8],
+        expected_cursor: SnapshotCursor,
+        history_validator_version: Option<u32>,
+    ) -> SnapshotSaveOutcome {
+        match self.save_snapshot_locked(
+            repo_id,
+            data,
+            expected_cursor.backend_generation(),
+            history_validator_version,
+        ) {
             Ok(generation) => SnapshotSaveOutcome::Committed {
                 cursor: SnapshotCursor::from_backend_generation(generation),
             },
@@ -5539,6 +5940,47 @@ impl StorageBackend for LocalFileBackend {
             }
             Err(error) => SnapshotSaveOutcome::NotCommitted(error),
         }
+    }
+
+    fn record_history_validation(
+        &self,
+        repo_id: &str,
+        generation: Generation,
+        snapshot_sha256: &str,
+        validator_version: u32,
+    ) -> Result<bool, KinDbError> {
+        let lock = self.acquire_existing_lock(repo_id)?;
+        let namespace = &lock.namespace;
+        let Some(mut record) = self.read_authority_record_raw_unlocked(namespace)? else {
+            return Err(KinDbError::StorageError(format!(
+                "repo {repo_id} has no authority record to bind a history validation to"
+            )));
+        };
+        // Bind only to the exact durable state that was validated. Anything
+        // else means the repository moved underneath the validator and the
+        // record would vouch for bytes nobody checked.
+        if record.snapshot_generation != generation
+            || record.head_generation != generation
+            || record.snapshot_sha256 != snapshot_sha256
+        {
+            return Err(KinDbError::StorageError(format!(
+                "repo {repo_id} authority moved to generation {} while binding a history validation for generation {generation}",
+                record.head_generation
+            )));
+        }
+        let proof = HistoryValidationProof {
+            validator_version,
+            repository_id: repo_id.to_string(),
+            generation,
+            snapshot_sha256: snapshot_sha256.to_string(),
+        };
+        if record.history_validation.as_ref() == Some(&proof) {
+            return Ok(true);
+        }
+        record.history_validation = Some(proof);
+        self.write_authority_unlocked(namespace, &record)?;
+        self.confirm_repository_visible(namespace)?;
+        Ok(true)
     }
 
     fn save_delta(
@@ -5631,6 +6073,9 @@ impl StorageBackend for LocalFileBackend {
             hook();
         }
         record.version = LOCAL_AUTHORITY_VERSION;
+        // Authority now advances past the snapshot the validation record was
+        // bound to, so that record no longer describes this repository.
+        record.history_validation = None;
         record
             .retired_deltas
             .retain(|identity| identity.generation != new_gen);
@@ -6318,6 +6763,47 @@ mod tests {
             .expect_err("growth beyond the pinned descriptor length must fail closed");
         assert!(error.to_string().contains("changed length while reading"));
         assert!(error.to_string().contains("allocation safety limit"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_verified_batch_refuses_repository_displacement_at_final_boundary() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+        let data = b"batch-pinned immutable source";
+        let digest = source_digest(data);
+        backend.save_source_blob("repo-a", digest, data).unwrap();
+
+        let repo = dir.path().join("repo-a");
+        let displaced_repo = dir.path().join("repo-a-displaced");
+        let outside_path = outside.path().to_path_buf();
+        set_source_file_after_metadata_hook(move || {
+            std::fs::rename(&repo, &displaced_repo).unwrap();
+            symlink(outside_path, repo).unwrap();
+        });
+
+        let mut operation = |batch: &dyn VerifiedSourceBlobBatch| {
+            let body = batch
+                .load_verified(SourceBlobValidationRequest {
+                    digest,
+                    max_bytes: data.len() as u64,
+                })?
+                .expect("the retained capability still reaches the exact body");
+            assert_eq!(body.bytes(), data);
+            Ok(())
+        };
+        let error = backend
+            .with_verified_source_blob_batch("repo-a", &mut operation)
+            .expect_err("batch success must wait for final repository identity confirmation");
+        assert!(
+            error.to_string().contains("not a real directory")
+                || error.to_string().contains("changed")
+                || error.to_string().contains("detached"),
+            "unexpected batch displacement error: {error}"
+        );
     }
 
     #[test]
@@ -7160,6 +7646,7 @@ mod tests {
                 "repo-a",
                 &snapshot,
                 SnapshotCursor::from_backend_generation(GENERATION_INIT),
+                None,
             )
             .expect_err("an exact retry must not return a freeze for a detached surface epoch");
         assert!(

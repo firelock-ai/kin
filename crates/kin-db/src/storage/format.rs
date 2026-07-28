@@ -403,18 +403,36 @@ impl GraphSnapshot {
     pub(crate) fn from_bytes_with_persisted_root_hash(
         data: &[u8],
     ) -> Result<(Self, Option<[u8; 32]>), crate::error::KinDbError> {
-        Self::from_bytes_with_persisted_root_hash_inner(data, true)
+        Self::from_bytes_with_persisted_root_hash_inner(data, true, true)
     }
 
     pub(crate) fn from_bytes_with_persisted_root_hash_unverified(
         data: &[u8],
     ) -> Result<(Self, Option<[u8; 32]>), crate::error::KinDbError> {
-        Self::from_bytes_with_persisted_root_hash_inner(data, false)
+        Self::from_bytes_with_persisted_root_hash_inner(data, false, true)
+    }
+
+    /// Decode exact snapshot bytes that already carry a matching durable
+    /// complete-validation proof.
+    ///
+    /// This remains a checksum-verifying decoder. It skips only the semantic
+    /// storage-admission pass whose result is already bound to these exact
+    /// bytes by
+    /// [`HistoryValidationProof`](crate::storage::backend::HistoryValidationProof).
+    /// Callers must establish that proof against a freshly recomputed digest,
+    /// repository identity, generation, validator version, and a journal-free
+    /// authority before entering this boundary.
+    pub(crate) fn from_bytes_reusing_exact_validation(
+        data: &[u8],
+    ) -> Result<Self, crate::error::KinDbError> {
+        Self::from_bytes_with_persisted_root_hash_inner(data, true, false)
+            .map(|(snapshot, _)| snapshot)
     }
 
     fn from_bytes_with_persisted_root_hash_inner(
         data: &[u8],
         verify_checksum: bool,
+        validate_storage_admission: bool,
     ) -> Result<(Self, Option<[u8; 32]>), crate::error::KinDbError> {
         let frame = {
             let _span = tracing::info_span!("kindb.snapshot.decode_frame").entered();
@@ -424,7 +442,9 @@ impl GraphSnapshot {
             Self::CURRENT_VERSION => Self::decode_current_snapshot(frame.body)?,
             _ => unreachable!("decode_frame validates supported versions"),
         };
-        snapshot.validate_storage_admission()?;
+        if validate_storage_admission {
+            snapshot.validate_storage_admission()?;
+        }
         let persisted_root_hash = if verify_checksum {
             Self::decode_root_hash_trailer(data, &frame)?
         } else {

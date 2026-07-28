@@ -235,6 +235,9 @@ impl SqliteBackend {
             snapshot_bytes,
             snapshot_generation,
             head_generation,
+            // No durable place to bind a history validation here, so every
+            // open of a SQLite-backed repository validates in full.
+            history_validation: None,
         }))
     }
 

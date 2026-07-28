@@ -207,6 +207,9 @@ impl GcsBackend {
             snapshot_bytes,
             snapshot_generation: generation,
             head_generation: generation,
+            // No durable place to bind a history validation here, so every
+            // open of a GCS-backed repository validates in full.
+            history_validation: None,
         }))
     }
 
