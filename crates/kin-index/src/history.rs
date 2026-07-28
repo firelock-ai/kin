@@ -1046,17 +1046,32 @@ fn invalidated_files(
         base_leaves.extend(slot.stat.base_leaves.iter().cloned());
     }
 
-    for (artifact_id, old_file, new_file) in &changed {
+    // The changed files' old versions are analyzed once; the tree's path set
+    // is identical to the parent's on this path, so the current known-file
+    // set resolves the old imports exactly as the parent tree did.
+    let old_analyses: Vec<(FileStaticAnalysis, FileEraAnalysis)> = changed
+        .iter()
+        .map(|(_, old_file, _)| {
+            (
+                analyze_file_static(&old_file.parse),
+                analyze_file_era(&old_file.parse, known_files),
+            )
+        })
+        .collect();
+    // Base leaves must be complete (current tree plus every changed file's
+    // old declarations) before any name is tested against them.
+    for (old_stat, _) in &old_analyses {
+        base_leaves.extend(old_stat.base_leaves.iter().cloned());
+    }
+
+    for ((artifact_id, _, new_file), (old_stat, old_era)) in changed.iter().zip(&old_analyses) {
         let new_slot = engine.analysis(artifact_id);
-        let old_stat = analyze_file_static(&old_file.parse);
-        let old_era = analyze_file_era(&old_file.parse, known_files);
         changed_names.extend(old_stat.contributed_names.iter().cloned());
         changed_names.extend(new_slot.stat.contributed_names.iter().cloned());
         changed_paths.insert(new_file.path().to_string());
         if old_era.include_targets != new_slot.era.include_targets {
             include_seeds.insert(new_file.path().to_string());
         }
-        base_leaves.extend(old_stat.base_leaves.iter().cloned());
         if old_stat.hierarchy != new_slot.stat.hierarchy {
             hierarchy_fire = true;
         }
@@ -1089,8 +1104,7 @@ fn invalidated_files(
                     .push(file.path().to_string());
             }
         }
-        for (_, old_file, _) in &changed {
-            let old_era = analyze_file_era(&old_file.parse, known_files);
+        for ((_, old_file, _), (_, old_era)) in changed.iter().zip(&old_analyses) {
             for target in &old_era.include_targets {
                 reverse
                     .entry(target.clone())

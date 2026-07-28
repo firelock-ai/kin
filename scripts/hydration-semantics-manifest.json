@@ -82,7 +82,7 @@
     {
       "file": "crates/kin-index/src/history.rs",
       "function": "invalidated_files",
-      "digest": "sha256:8917877cec217126e1e1c3c265c7fcc4221b618974f0e2abcf11021db65f3567",
+      "digest": "sha256:f3ab9daeeaedb72cd1c6281b268915b002174c2b59eaa1a5366be3b171e527e2",
       "reason": "Decides which files a content-only commit may carry forward without relinking. An under-conservative rule here silently changes what history claims; every rule must remain provably conservative.",
       "owner": "kin-index"
     },
