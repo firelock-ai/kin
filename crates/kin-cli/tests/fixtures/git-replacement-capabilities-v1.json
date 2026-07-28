@@ -365,55 +365,71 @@
     },
     {
       "command": "exec",
-      "status": "open_gate",
-      "exposure": "fail_closed",
-      "authority": "repository-v6 workspace snapshot and graph-derived session projection",
+      "status": "ready",
+      "exposure": "enabled",
+      "authority": "repository-v6 CAS session projection admitted through the explicit reconcile boundary",
       "required_for_bounded_dogfood": false,
       "acceptance_spec": [
         "materialize a bounded exact workspace snapshot from repository CAS",
         "capture session deltas back through explicit repository transactions or discard them"
       ],
-      "evidence_tests": [],
-      "note": "The legacy session materializer has been removed pending exact workspace projection."
+      "evidence_tests": [
+        "api::tests::cli_session_surface_runs_a_process_and_admits_its_delta_through_authority",
+        "kin_cli::commands::session_run::tests::exec_preserves_argv_boundaries_and_shell_mode_takes_one_script",
+        "kin_cli::commands::session_run::tests::discard_refuses_paths_that_are_not_session_projections"
+      ],
+      "note": "The daemon materializes repository CAS bodies into a disposable .kin/runs/session-<id> projection, the command runs with its working directory inside it, and a clean exit admits the observed delta through the same reconcile boundary `kin reconcile` uses. A non-zero exit keeps the projection instead of admitting or deleting it, --discard removes it without touching authority, and --keep defers admission. Argument boundaries are preserved unless --shell is given. Scoped sessions stay fail-closed."
     },
     {
       "command": "open",
-      "status": "open_gate",
-      "exposure": "fail_closed",
-      "authority": "repository-v6 workspace snapshot and graph-derived session projection",
+      "status": "ready",
+      "exposure": "enabled",
+      "authority": "repository-v6 CAS session projection admitted through the explicit reconcile boundary",
       "required_for_bounded_dogfood": false,
       "acceptance_spec": [
         "open an editor over an exact graph-derived workspace with stable artifact identity",
         "retain non-code files, unsupported languages, modes, symlinks, and gitlinks"
       ],
-      "evidence_tests": [],
-      "note": "The legacy session materializer has been removed pending exact workspace projection."
+      "evidence_tests": [
+        "api::tests::cli_session_surface_runs_a_process_and_admits_its_delta_through_authority",
+        "api::tests::session_workspace_endpoint_materializes_live_graph",
+        "kin_cli::commands::session_run::tests::launcher_allowlists_reject_arbitrary_programs"
+      ],
+      "note": "Launches code or cursor over a session projection carrying every host-representable artifact at its repository identity, with executable modes and symlinks intact and gitlinks plus host-unrepresentable members preserved graph-only. Editors detach from the launching process, so the projection is retained and admitted explicitly with `kin reconcile <session>` rather than on an exit that never arrives. The discontinued native-fork restriction flags are fail-closed."
     },
     {
       "command": "with",
-      "status": "open_gate",
-      "exposure": "fail_closed",
-      "authority": "repository-v6 workspace snapshot and graph-derived agent session",
+      "status": "ready",
+      "exposure": "enabled",
+      "authority": "repository-v6 CAS session projection plus a capability-scoped daemon session lease",
       "required_for_bounded_dogfood": false,
       "acceptance_spec": [
         "bind the assistant to an exact repository generation and capability-scoped session",
         "capture or discard complete exact deltas without hidden working-tree authority"
       ],
-      "evidence_tests": [],
-      "note": "The legacy assistant session path depended on removed projection shims."
+      "evidence_tests": [
+        "api::tests::cli_session_lease_is_capability_scoped_and_released",
+        "api::tests::cli_session_surface_runs_a_process_and_admits_its_delta_through_authority",
+        "kin_cli::commands::session_run::tests::launcher_allowlists_reject_arbitrary_programs"
+      ],
+      "note": "Launches claude, codex, or gemini inside a session projection pinned to the repository generation its base records, under a daemon session lease with declared capabilities that the assistant's MCP calls bind to through KIN_SESSION_ID. A clean exit admits the complete observed delta through reconcile and releases the lease; the assistant never writes through the owning working tree. Prompt-guidance injection and the native-fork restriction flags are fail-closed."
     },
     {
       "command": "shell",
-      "status": "open_gate",
-      "exposure": "fail_closed",
-      "authority": "repository-v6 workspace snapshot and graph-derived session projection",
+      "status": "ready",
+      "exposure": "enabled",
+      "authority": "repository-v6 CAS session projection admitted through the explicit reconcile boundary",
       "required_for_bounded_dogfood": false,
       "acceptance_spec": [
         "start a shell in an exact graph-derived workspace",
         "capture or discard complete exact deltas through repository authority"
       ],
-      "evidence_tests": [],
-      "note": "The legacy session materializer has been removed pending exact workspace projection."
+      "evidence_tests": [
+        "api::tests::cli_session_surface_runs_a_process_and_admits_its_delta_through_authority",
+        "api::tests::session_workspace_endpoint_materializes_live_graph",
+        "kin_cli::commands::session_run::tests::closeout_precedence_puts_discard_first"
+      ],
+      "note": "Starts $SHELL with its working directory inside a session projection materialized from repository CAS. Exiting the shell admits the observed delta through the reconcile boundary and removes the projection; a non-zero exit keeps it for `kin reconcile <session>`. The discontinued native-fork restriction flags are fail-closed."
     },
     {
       "command": "doctor --drift",

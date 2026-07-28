@@ -1289,6 +1289,24 @@ async fn inject_loopback_host_in_tests(
 
 /// Extract an optional caller session ID from the authoritative
 /// `X-Kin-Session` request header.
+/// Refresh a caller's session heartbeat from its own activity.
+///
+/// Best-effort by construction: an unknown or already-reaped session is not an
+/// error here, it just has no lease to extend, and the caller's own request
+/// still fails closed downstream on whatever it needed the session for.
+fn touch_session_liveness(state: &Arc<DaemonState>, session_id: Option<&SessionId>) {
+    let Some(session_id) = session_id else {
+        return;
+    };
+    if let Err(error) = state.coordinator.heartbeat(session_id) {
+        tracing::debug!(
+            session_id = %session_id,
+            %error,
+            "tool call carried a session with no live lease to refresh"
+        );
+    }
+}
+
 fn extract_session_id_from_headers(
     headers: &axum::http::HeaderMap,
 ) -> Result<Option<SessionId>, (StatusCode, String)> {
@@ -5661,6 +5679,11 @@ async fn mcp_tools_call(
     }
 
     let session_id = extract_session_id_from_headers(&headers)?;
+    // Any tool call from a session is proof that session is alive, so it
+    // refreshes the lease. Without this the idle TTL behaves as a lifetime cap:
+    // an agent working continuously through tools that do not heartbeat gets
+    // reaped mid-task, and its in-flight transaction dies with it.
+    touch_session_liveness(&state, session_id.as_ref());
     let mutates = mcp_tool_mutates_graph(&request.name);
     let (graph, graph_authority) = if mutates {
         (Arc::clone(&state.graph), RequestGraphAuthority::Head)
@@ -9982,6 +10005,32 @@ mod tests {
         })
     }
 
+    /// Mirror an installed repository artifact into the owning working copy.
+    ///
+    /// Session reconciliation moves repository authority and the owning
+    /// projection together, so a fixture whose working copy never held the
+    /// artifact fails the projection preflight rather than the behavior a test
+    /// is actually asserting.
+    fn install_working_copy_file(
+        state: &Arc<DaemonState>,
+        rel_path: &str,
+        content: &[u8],
+        executable: bool,
+    ) {
+        let path = state.layout.working_dir().join(rel_path);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&path, content).unwrap();
+        #[cfg(unix)]
+        if executable {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        #[cfg(not(unix))]
+        let _ = executable;
+    }
+
     fn install_repository_entry(
         state: &Arc<DaemonState>,
         rel_path: &str,
@@ -13295,6 +13344,325 @@ mod tests {
             .lines
             .iter()
             .any(|line| line.contains("Repository Coverage:")));
+    }
+
+    /// End-to-end proof for the `exec`/`shell`/`open`/`with` cluster: the CLI
+    /// session surface materializes from repository CAS over the real daemon
+    /// HTTP path, a real process runs inside the projection, and the delta it
+    /// leaves is admitted through repository authority.
+    ///
+    /// Every step is the product path. If the CLI stopped going through the
+    /// daemon, or stopped admitting through reconcile, or started deleting a
+    /// projection without admitting it, this fails.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cli_session_surface_runs_a_process_and_admits_its_delta_through_authority() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let state = test_state();
+        install_repository_file(&state, "src/lib.py", b"graph truth\n");
+        install_repository_entry(&state, "bin/verify", b"#!/bin/sh\nexit 0\n", |hash| {
+            TreeEntry::blob(hash, true)
+        });
+        install_working_copy_file(&state, "src/lib.py", b"graph truth\n", false);
+        install_working_copy_file(&state, "bin/verify", b"#!/bin/sh\nexit 0\n", true);
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = router(state.clone());
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        std::env::set_var("KIN_DAEMON_URL", format!("http://{addr}"));
+
+        let projection =
+            kin_cli::commands::session_run::materialize(state.layout.clone(), None, None)
+                .await
+                .expect("materialize an exact session projection through the daemon");
+
+        // The projection is repository CAS truth, including the mode bit.
+        assert_eq!(
+            std::fs::read_to_string(projection.root().join("src/lib.py")).unwrap(),
+            "graph truth\n"
+        );
+        assert_ne!(
+            std::fs::metadata(projection.root().join("bin/verify"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o111,
+            0,
+            "an exact projection retains the executable mode"
+        );
+
+        // A real process, run with its working directory inside the projection.
+        let invocation = kin_cli::commands::session_run::ExecInvocation::parse(
+            vec![
+                "printf 'session note\\n' > notes.txt && printf '%s' \"$KIN_SESSION_DIR\" > \
+                 seen-session-dir.txt"
+                    .to_string(),
+            ],
+            true,
+        )
+        .unwrap();
+        let exit =
+            kin_cli::commands::session_run::run_in_session(&projection, invocation.command())
+                .expect("run a process in the session projection");
+        assert_eq!(exit.code, 0);
+        assert_eq!(
+            std::fs::read_to_string(projection.root().join("seen-session-dir.txt")).unwrap(),
+            projection.root().display().to_string(),
+            "the child is told which projection it is running in"
+        );
+
+        let session_dir = state.layout.runs_dir().join(projection.name());
+        kin_cli::commands::session_run::close(
+            &projection,
+            exit,
+            kin_cli::commands::session_run::SessionCloseout::Reconcile,
+        )
+        .await
+        .expect("admit the session observation through repository authority");
+
+        assert!(
+            !session_dir.exists(),
+            "an admitted session projection is disposable and must not be left behind"
+        );
+        let notes = RepoPath::from_utf8("notes.txt").unwrap();
+        assert!(
+            state
+                .graph
+                .resolved_tree()
+                .artifact_at_path(&notes)
+                .is_some(),
+            "the delta the process left must reach repository authority"
+        );
+
+        // A discarded session leaves authority untouched.
+        let discarded =
+            kin_cli::commands::session_run::materialize(state.layout.clone(), None, None)
+                .await
+                .unwrap();
+        let discarded_dir = state.layout.runs_dir().join(discarded.name());
+        let discard_exit = kin_cli::commands::session_run::run_in_session(
+            &discarded,
+            kin_cli::commands::session_run::ExecInvocation::parse(
+                vec!["printf 'never admitted\\n' > dropped.txt".to_string()],
+                true,
+            )
+            .unwrap()
+            .command(),
+        )
+        .unwrap();
+        assert_eq!(discard_exit.code, 0);
+        let generation_before_discard = state.graph.resolved_tree().len();
+        kin_cli::commands::session_run::close(
+            &discarded,
+            discard_exit,
+            kin_cli::commands::session_run::SessionCloseout::Discard,
+        )
+        .await
+        .unwrap();
+        assert!(!discarded_dir.exists());
+        assert_eq!(
+            state.graph.resolved_tree().len(),
+            generation_before_discard,
+            "a discarded session must not move repository authority"
+        );
+        assert!(state
+            .graph
+            .resolved_tree()
+            .artifact_at_path(&RepoPath::from_utf8("dropped.txt").unwrap())
+            .is_none());
+
+        // A failed process keeps its projection for inspection rather than
+        // admitting or deleting it.
+        let failed = kin_cli::commands::session_run::materialize(state.layout.clone(), None, None)
+            .await
+            .unwrap();
+        let failed_dir = state.layout.runs_dir().join(failed.name());
+        let failed_exit = kin_cli::commands::session_run::run_in_session(
+            &failed,
+            kin_cli::commands::session_run::ExecInvocation::parse(
+                vec!["printf 'partial\\n' > partial.txt; exit 3".to_string()],
+                true,
+            )
+            .unwrap()
+            .command(),
+        )
+        .unwrap();
+        assert_eq!(failed_exit.code, 3);
+        kin_cli::commands::session_run::close(
+            &failed,
+            failed_exit,
+            kin_cli::commands::session_run::SessionCloseout::Reconcile,
+        )
+        .await
+        .unwrap();
+        assert!(
+            failed_dir.join("partial.txt").is_file(),
+            "a failed run keeps its projection instead of admitting or deleting it"
+        );
+        assert!(state
+            .graph
+            .resolved_tree()
+            .artifact_at_path(&RepoPath::from_utf8("partial.txt").unwrap())
+            .is_none());
+
+        std::env::remove_var("KIN_DAEMON_URL");
+        server.abort();
+    }
+
+    /// A working agent keeps its session by working.
+    ///
+    /// The session idle window is an idle timeout, so a tool call from a
+    /// session refreshes its lease. Without this an agent that never calls
+    /// `kin_session_heartbeat` gets reaped mid-task, taking its in-flight
+    /// transaction with it, no matter how busy it was.
+    #[tokio::test]
+    async fn a_tool_call_refreshes_the_calling_session_lease() {
+        let state = test_state();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let session_id = state
+            .coordinator
+            .register_session(
+                "claude-code",
+                "busy-agent",
+                kin_model::session::SessionTransport::Mcp,
+                None,
+                PathBuf::from("/"),
+                kin_model::session::SessionCapabilities::default(),
+            )
+            .unwrap();
+        let before = state
+            .coordinator
+            .get_session(&session_id)
+            .unwrap()
+            .unwrap()
+            .last_heartbeat;
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let response = router(state.clone())
+            .oneshot(
+                Request::post("/mcp/tools/call")
+                    .header("content-type", "application/json")
+                    .header("X-Kin-Session", session_id.to_string())
+                    .body(Body::from(
+                        serde_json::json!({
+                            "name": "kin_graph_status",
+                            "arguments": {},
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let after = state
+            .coordinator
+            .get_session(&session_id)
+            .unwrap()
+            .expect("a working session is still live")
+            .last_heartbeat;
+        assert!(
+            after > before,
+            "a tool call must refresh the lease it was issued under: {before:?} -> {after:?}"
+        );
+    }
+
+    /// A capability-scoped session lease is registered for `kin with`, exported
+    /// to the child, and released on closeout.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cli_session_lease_is_capability_scoped_and_released() {
+        let state = test_state();
+        install_repository_file(&state, "src/lib.py", b"graph truth\n");
+        install_working_copy_file(&state, "src/lib.py", b"graph truth\n", false);
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = router(state.clone());
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        std::env::set_var("KIN_DAEMON_URL", format!("http://{addr}"));
+
+        let mut projection =
+            kin_cli::commands::session_run::materialize(state.layout.clone(), None, None)
+                .await
+                .unwrap();
+        let session_id = kin_cli::commands::session_run::register_lease(
+            &mut projection,
+            "claude",
+            "kin with",
+            kin_model::session::SessionCapabilities {
+                can_read: true,
+                can_write: true,
+                can_execute: true,
+                can_branch: false,
+                can_commit: true,
+                max_concurrent_intents: 8,
+            },
+        )
+        .await
+        .expect("register a capability-scoped session lease");
+
+        let registered = state
+            .coordinator
+            .get_session(&SessionId(Uuid::parse_str(&session_id).unwrap()))
+            .unwrap()
+            .expect("the lease is live in the coordinator");
+        assert!(registered.capabilities.can_write);
+        assert!(!registered.capabilities.can_branch);
+        assert_eq!(registered.cwd, projection.root());
+
+        let exit = kin_cli::commands::session_run::run_in_session(
+            &projection,
+            kin_cli::commands::session_run::ExecInvocation::parse(
+                vec!["printf '%s' \"$KIN_SESSION_ID\" > seen-session.txt".to_string()],
+                true,
+            )
+            .unwrap()
+            .command(),
+        )
+        .unwrap();
+        assert_eq!(exit.code, 0);
+        assert_eq!(
+            std::fs::read_to_string(projection.root().join("seen-session.txt")).unwrap(),
+            session_id,
+            "the child inherits the lease it is coordinating under"
+        );
+
+        kin_cli::commands::session_run::close(
+            &projection,
+            exit,
+            kin_cli::commands::session_run::SessionCloseout::Reconcile,
+        )
+        .await
+        .unwrap();
+        assert!(
+            state
+                .coordinator
+                .get_session(&SessionId(Uuid::parse_str(&session_id).unwrap()))
+                .unwrap()
+                .is_none(),
+            "closing a session releases its lease"
+        );
+
+        std::env::remove_var("KIN_DAEMON_URL");
+        server.abort();
     }
 
     #[tokio::test]

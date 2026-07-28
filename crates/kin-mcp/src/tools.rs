@@ -1038,6 +1038,7 @@ pub fn agent_default_tool_names() -> &'static [&'static str] {
         "find_references",
         "graph_neighborhood",
         "kin_session_start",
+        "kin_session_heartbeat",
         "kin_session_end",
         "kin_transaction_begin",
         "kin_transaction_stage",
@@ -1130,7 +1131,7 @@ mod tests {
         let profile = agent_default_tool_names();
 
         assert!(
-            profile.len() >= 10 && profile.len() <= 16,
+            profile.len() >= 10 && profile.len() <= 17,
             "agent-default should be small but cover the wedge; got {}",
             profile.len()
         );
@@ -1151,6 +1152,10 @@ mod tests {
             "get_context_pack",
             "kin_transaction_commit",
             "kin_provenance_query",
+            // kin_session_start tells the agent to keep the session alive with
+            // this tool. A profile that carries the advice without the tool
+            // strands any agent whose read phase outlasts the idle TTL.
+            "kin_session_heartbeat",
         ] {
             assert!(
                 profile.contains(&required),

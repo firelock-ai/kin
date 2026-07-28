@@ -189,6 +189,57 @@ mod tests {
         }
     }
 
+    /// A command is only ready if the inventory names the tests that prove it.
+    /// Flipping a gate without evidence is the failure this bars.
+    #[test]
+    fn every_ready_capability_names_the_evidence_that_proves_it() {
+        for capability in inventory().unwrap().commands {
+            if capability.status != CapabilityStatus::Ready {
+                continue;
+            }
+            assert!(
+                !capability.evidence_tests.is_empty(),
+                "ready capability '{}' names no evidence test",
+                capability.command
+            );
+            assert!(
+                !capability.acceptance_spec.is_empty(),
+                "ready capability '{}' states no acceptance spec",
+                capability.command
+            );
+        }
+    }
+
+    /// The session cluster runs one process inside one exact projection, so it
+    /// stands or falls together. If any of these regresses to a gate, the
+    /// others are reporting a contract the surface no longer has.
+    #[test]
+    fn the_session_cluster_is_ready_on_the_session_projection_surface() {
+        let inventory = inventory().unwrap();
+        for command in ["exec", "open", "with", "shell"] {
+            let capability = inventory
+                .commands
+                .iter()
+                .find(|capability| capability.command == command)
+                .unwrap_or_else(|| panic!("missing session capability {command}"));
+            assert_eq!(
+                capability.status,
+                CapabilityStatus::Ready,
+                "{command} must stay ready"
+            );
+            assert_eq!(capability.exposure, CapabilityExposure::Enabled);
+            assert!(
+                capability.authority.contains("session projection"),
+                "{command} must declare the session projection as its authority: {}",
+                capability.authority
+            );
+            assert!(
+                require_ready(command).is_ok(),
+                "{command} must no longer refuse at the CLI boundary"
+            );
+        }
+    }
+
     #[test]
     fn bounded_dogfood_bar_cannot_disappear_from_inventory() {
         let inventory = inventory().unwrap();

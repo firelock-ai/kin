@@ -74,8 +74,7 @@ fn commit_exact_transaction_inner(
         .to_string();
 
     if let Some(inline) = arguments.get("operations") {
-        let operations: Vec<kin_mcp::McpMutationOperation> = serde_json::from_value(inline.clone())
-            .map_err(|error| format!("invalid operations array: {error}"))?;
+        let operations = kin_mcp::session::parse_staged_operations(inline)?;
         kin_mcp::session::validate_staged_operations(&operations)?;
         sessions
             .stage_transaction(&transaction_id, operations)
@@ -96,11 +95,17 @@ fn commit_exact_transaction_inner(
     }
     let rejected = kin_mcp::session::uncommittable_operations(&transaction.staged_operations);
     if !rejected.is_empty() {
-        return Err(format!(
+        let detail = format!(
             "Cannot commit transaction {}: {} staged operation(s) are not committable:\n  - {}",
             transaction_id,
             rejected.len(),
             rejected.join("\n  - ")
+        );
+        return Err(unstage_failed_attempt(
+            state,
+            sessions,
+            &transaction_id,
+            detail,
         ));
     }
     if transaction.staged_operations.is_empty() {
@@ -158,8 +163,23 @@ fn commit_exact_transaction_inner(
     let base = load_native_commit_base(&authority_context)
         .map_err(|error| format!("load exact MCP commit base: {error}"))?;
     require_live_graph_matches_authority(state.graph.as_ref(), &base.graph)?;
-    let plan =
-        plan_exact_transaction(state, &authority_context, &transaction, operation_id, &base)?;
+    let plan = match plan_exact_transaction(
+        state,
+        &authority_context,
+        &transaction,
+        operation_id,
+        &base,
+    ) {
+        Ok(plan) => plan,
+        Err(error) => {
+            return Err(unstage_failed_attempt(
+                state,
+                sessions,
+                &transaction_id,
+                error,
+            ))
+        }
+    };
 
     // Publication fence: from this point until receipt recovery or an explicit
     // reset, the staged operation set is immutable and durable.
@@ -224,6 +244,45 @@ fn commit_exact_transaction_inner(
         committed,
         plan.layouts,
         coordination,
+    )
+}
+
+/// Discard the operations of a commit attempt that failed before the
+/// publication fence, and say so in the refusal.
+///
+/// Every caller sits strictly before `prepare_transaction_commit`, so no
+/// repository authority has moved and no CAS body has been published: the
+/// staged set is the only state to undo. Leaving it staged is what wedges the
+/// transaction, because a later `kin_transaction_stage` appends to it and the
+/// next commit re-plans the same failing operation and returns the identical
+/// error. Clearing it returns the transaction to a clean, editable state, so
+/// the corrective action the error describes is actually reachable on the
+/// transaction the caller already has.
+fn unstage_failed_attempt(
+    state: &Arc<DaemonState>,
+    sessions: &kin_mcp::SessionRegistry,
+    transaction_id: &str,
+    detail: String,
+) -> String {
+    let cleared = match sessions.clear_staged_operations(transaction_id) {
+        Ok(cleared) => cleared,
+        Err(clear_error) => {
+            return format!(
+                "{detail}\nthe staged operations could not be cleared ({clear_error}); \
+                 begin a new transaction with kin_transaction_begin"
+            )
+        }
+    };
+    if let Err(persist_error) = persist_registry_checked(state, sessions) {
+        return format!(
+            "{detail}\nthe {cleared} failed operation(s) were cleared but could not be persisted \
+             ({persist_error}); begin a new transaction with kin_transaction_begin"
+        );
+    }
+    format!(
+        "{detail}\nrepository authority did not move, and the {cleared} failed operation(s) have \
+         been cleared from transaction {transaction_id}: stage corrected operations on it and \
+         commit again, or begin a new transaction with kin_transaction_begin"
     )
 }
 
@@ -1377,6 +1436,147 @@ mod tests {
                 .unwrap()
                 .state,
             "active"
+        );
+    }
+
+    /// A commit that fails while planning must leave the transaction usable.
+    ///
+    /// The failure mode this closes: the failed operations stayed staged, so
+    /// staging a corrected operation appended to them and the next commit
+    /// re-planned the original failure and returned the identical error
+    /// forever. The transaction was wedged with no way out that any error
+    /// message described.
+    #[test]
+    fn a_failed_commit_unstages_its_operations_so_a_corrected_retry_works() {
+        let (_dir, state) = test_state();
+        let (entity, _) = install_exact_source(
+            &state,
+            "src/lib.rs",
+            b"pub fn value() -> u8 { 1 }\n",
+            "value",
+        );
+        let before = load_native_commit_base(&state.layout).unwrap();
+        let sessions = test_sessions();
+        let transaction = sessions
+            .begin_transaction(TEST_SESSION, "file:src/lib.rs")
+            .unwrap();
+        let arguments = HashMap::from([(
+            "transaction_id".to_string(),
+            serde_json::json!(transaction.transaction_id),
+        )]);
+
+        sessions
+            .stage_transaction(
+                &transaction.transaction_id,
+                vec![kin_mcp::McpMutationOperation {
+                    verb: "update".to_string(),
+                    target: "no_such_entity".to_string(),
+                    payload: None,
+                    body: Some("pub fn no_such_entity() {}".to_string()),
+                    description: String::new(),
+                }],
+            )
+            .unwrap();
+
+        let failed = commit_exact_transaction(&state, &sessions, &arguments, None);
+        assert_eq!(failed.is_error, Some(true));
+        let message = result_text(&failed);
+        assert!(
+            message.contains("not found in the graph"),
+            "the refusal keeps naming the real problem: {message}"
+        );
+        assert!(
+            message.contains("have been cleared from transaction"),
+            "the refusal must say the failed operations were dropped: {message}"
+        );
+        assert!(
+            sessions
+                .get_transaction(&transaction.transaction_id)
+                .unwrap()
+                .staged_operations
+                .is_empty(),
+            "a pre-authority failure must not leave its operations staged"
+        );
+
+        // The corrected operation, staged on the SAME transaction, commits.
+        sessions
+            .stage_transaction(
+                &transaction.transaction_id,
+                vec![kin_mcp::McpMutationOperation {
+                    verb: "update".to_string(),
+                    target: entity.id.to_string(),
+                    payload: None,
+                    body: Some("pub fn value() -> u8 { 2 }".to_string()),
+                    description: "corrected retry".to_string(),
+                }],
+            )
+            .unwrap();
+        let committed = commit_exact_transaction(&state, &sessions, &arguments, None);
+        assert_ne!(
+            committed.is_error,
+            Some(true),
+            "the corrected retry must commit: {}",
+            result_text(&committed)
+        );
+
+        let after = load_native_commit_base(&state.layout).unwrap();
+        assert!(after.roots.generation > before.roots.generation);
+        let artifact = after
+            .tree
+            .artifact_at_path(&RepoPath::from_utf8("src/lib.rs").unwrap())
+            .unwrap();
+        assert_eq!(
+            load_native_source_blob(&state.layout, artifact.entry.blob_identity().unwrap())
+                .unwrap(),
+            b"pub fn value() -> u8 { 2 }\n"
+        );
+    }
+
+    /// A caller that guesses the operations shape gets the accepted shapes
+    /// back, not a serde field name from inside a payload variant.
+    #[test]
+    fn improvised_operation_shapes_are_refused_with_the_accepted_shapes() {
+        let (_dir, state) = test_state();
+        install_exact_source(
+            &state,
+            "src/lib.rs",
+            b"pub fn value() -> u8 { 1 }\n",
+            "value",
+        );
+        let sessions = test_sessions();
+        let transaction = sessions
+            .begin_transaction(TEST_SESSION, "file:src/lib.rs")
+            .unwrap();
+
+        let result = commit_exact_transaction(
+            &state,
+            &sessions,
+            &HashMap::from([
+                (
+                    "transaction_id".to_string(),
+                    serde_json::json!(transaction.transaction_id),
+                ),
+                (
+                    "operations".to_string(),
+                    serde_json::json!([{
+                        "verb": "update",
+                        "target": "value",
+                        "payload": {"name": "value", "body": "pub fn value() -> u8 { 2 }"},
+                        "description": "improvised payload shape",
+                    }]),
+                ),
+            ]),
+            None,
+        );
+        assert_eq!(result.is_error, Some(true));
+        let message = result_text(&result);
+        assert!(
+            message.contains("each element of `operations` is one of"),
+            "the refusal must spell out the accepted shapes: {message}"
+        );
+        assert!(
+            message.contains("\"body\""),
+            "the minimal target-body shape must be named: {message}"
         );
     }
 

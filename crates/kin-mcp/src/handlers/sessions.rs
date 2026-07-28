@@ -509,9 +509,43 @@ pub fn resolve_target_entity<G: GraphStore>(
     match matches.len() {
         0 => Err(format!("target entity '{target}' not found in the graph")),
         1 => Ok(matches.remove(0)),
-        n => Err(format!(
-            "target entity '{target}' is ambiguous ({n} exact-name matches); use the entity id"
-        )),
+        n => {
+            // An unqualified name that matches several entities is structurally
+            // unrecoverable unless the refusal carries the candidates: the
+            // caller cannot re-target what it cannot see, and it has no other
+            // way to learn which entity it meant.
+            matches.sort_by(|left, right| {
+                candidate_location(left)
+                    .cmp(&candidate_location(right))
+                    .then_with(|| left.id.to_string().cmp(&right.id.to_string()))
+            });
+            let candidates = matches
+                .iter()
+                .map(|entity| {
+                    format!(
+                        "{} ({:?} at {})",
+                        entity.id,
+                        entity.kind,
+                        candidate_location(entity)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n  - ");
+            Err(format!(
+                "target entity '{target}' is ambiguous ({n} exact-name matches); re-target one of \
+                 these entity ids:\n  - {candidates}"
+            ))
+        }
+    }
+}
+
+/// `file:line` for an ambiguity candidate, or a stable placeholder when the
+/// entity carries no source origin.
+fn candidate_location(entity: &kin_model::Entity) -> String {
+    match (entity.file_origin.as_ref(), entity.span.as_ref()) {
+        (Some(file), Some(span)) => format!("{}:{}", file.0, span.start_line),
+        (Some(file), None) => file.0.clone(),
+        (None, _) => "<no source origin>".to_string(),
     }
 }
 
@@ -579,10 +613,9 @@ pub async fn handle_transaction_stage(
         crate::error::McpError::InvalidParams("missing required parameter: operations".into())
     })?;
 
-    let operations: Vec<McpMutationOperation> = serde_json::from_value(operations_val.clone())
-        .map_err(|e| {
-            crate::error::McpError::InvalidParams(format!("invalid operations array: {e}"))
-        })?;
+    let operations: Vec<McpMutationOperation> =
+        crate::session::parse_staged_operations(operations_val)
+            .map_err(crate::error::McpError::InvalidParams)?;
 
     // Stage-time validation: reject intrinsically-malformed operations now, with
     // an actionable message, rather than letting the commit path silently drop
