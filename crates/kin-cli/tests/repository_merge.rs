@@ -467,6 +467,75 @@ fn conflicting_merge_is_refused_atomically_and_names_what_conflicted() {
     );
 }
 
+/// Both branches edit one file, in regions that do not overlap. Git merges
+/// this cleanly by line. Composition granularity here is the whole artifact,
+/// so it conflicts, and the note says so rather than letting a reader infer
+/// sub-file composition from "stable identity".
+#[test]
+fn merge_of_disjoint_edits_to_one_file_is_refused_atomically() {
+    let root = tempdir().expect("temp root");
+    let home = root.path().join("home");
+    let repo = root.path().join("repo");
+    fs::create_dir_all(&home).expect("create home");
+    initialize_git_repo(&repo);
+    fs::write(repo.join("src/lib.rs"), b"pub fn alpha() {}\n\npub fn beta() {}\n")
+        .expect("write two functions");
+    run_git(&repo, &["add", "--all"]);
+    run_git(&repo, &["commit", "-m", "two functions"]);
+
+    run_git(&repo, &["switch", "-c", "feature"]);
+    fs::write(
+        repo.join("src/lib.rs"),
+        b"pub fn alpha() {}\n\npub fn beta(value: i32) {}\n",
+    )
+    .expect("edit the second function on feature");
+    run_git(&repo, &["add", "--all"]);
+    run_git(&repo, &["commit", "-m", "feature work"]);
+
+    run_git(&repo, &["switch", "main"]);
+    fs::write(
+        repo.join("src/lib.rs"),
+        b"pub fn alpha(value: u64) {}\n\npub fn beta() {}\n",
+    )
+    .expect("edit the first function on main");
+    run_git(&repo, &["add", "--all"]);
+    run_git(&repo, &["commit", "-m", "main work"]);
+
+    let layout = initialize_kin_repo(&repo, &home);
+    let main_before = branch_change(&layout, "main");
+    let feature_before = branch_change(&layout, "feature");
+    let generation_before = authority_generation(&layout);
+
+    let merged = run_kin(&repo, &home, &["merge", "feature"]);
+    assert!(
+        !merged.status.success(),
+        "disjoint edits to one file must fail closed: stdout={}",
+        String::from_utf8_lossy(&merged.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&merged.stderr);
+    assert!(
+        stderr.contains("unresolved conflict"),
+        "the refusal names the conflict set: {stderr}"
+    );
+    assert!(
+        stderr.contains("artifact src/lib.rs"),
+        "the whole artifact is what conflicted, not a line range: {stderr}"
+    );
+
+    // Nothing moved: refs, authority generation, and the working copy.
+    assert_eq!(branch_change(&layout, "main"), main_before);
+    assert_eq!(branch_change(&layout, "feature"), feature_before);
+    assert_eq!(authority_generation(&layout), generation_before);
+    assert_eq!(
+        fs::read(repo.join("src/lib.rs")).unwrap(),
+        b"pub fn alpha(value: u64) {}\n\npub fn beta() {}\n"
+    );
+    assert!(
+        !workspace_is_dirty(&layout),
+        "a refused merge leaves no partial workspace state"
+    );
+}
+
 /// One branch moves an artifact while the other edits it. Composition decides
 /// each identity by whole value and an artifact's path is part of that value,
 /// so this is a conflict rather than a move carrying an edit along with it.
