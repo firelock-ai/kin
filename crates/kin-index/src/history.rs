@@ -765,6 +765,14 @@ mod tests {
     /// entity set by contract, so a change carrying that edge cannot be
     /// replayed. Admission must still bind the commit and the local call graph
     /// around it.
+    ///
+    /// Upstream trigger: fd b4a252a3916ab342b289331fbf49aa2db73df579, its 26th
+    /// commit, which adds `extern crate isatty` and calls `stdout_isatty` from
+    /// `main`. ripgrep reaches the same shape at its 25th,
+    /// 5450aed9a891254a3cfe26ce0da3a56fed0d957a, by editing
+    /// `start_of_previous_lines` around its existing `memrchr` call: the call
+    /// site need not be new, because the change re-derives the enclosing
+    /// entity's relations.
     #[test]
     fn calling_an_imported_external_symbol_stays_replayable() {
         let root = tempdir().unwrap();
@@ -877,6 +885,11 @@ mod tests {
     /// takes over the position an inherited entity was first parsed at derives
     /// that entity's identity, and two definitions of one name in one file must
     /// never collapse into a single entity because of it.
+    ///
+    /// Upstream trigger: fd 6c9e743d43ff2daff39aeab0796ae713bb544263, which
+    /// renames `print_entry_uncolorized` to `print_entry_uncolorized_base` and
+    /// gives the original name a `#[cfg(not(unix))]` / `#[cfg(unix)]` pair in
+    /// `src/output.rs`. The names and the path here are that commit's.
     #[test]
     fn a_definition_taking_an_inherited_position_keeps_its_own_identity() {
         let artifact_id = ArtifactId::new();
@@ -903,7 +916,9 @@ mod tests {
     }
 
     /// The whole-history form of the same defect: one conditionally compiled
-    /// pair is enough to make a tree claim one entity twice.
+    /// pair is enough to make a tree claim one entity twice. The two commits
+    /// below replay fd 6c9e743d43ff2daff39aeab0796ae713bb544263 in miniature,
+    /// down to the symbol name and the file it lives in.
     #[test]
     fn conditionally_compiled_duplicates_of_one_name_enrich() {
         let root = tempdir().unwrap();
