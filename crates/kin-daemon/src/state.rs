@@ -1550,6 +1550,15 @@ impl DaemonState {
             Arc::clone(&local_repository_backend),
         )
         .map_err(DaemonError::Graph)?;
+        // Startup latency on a large repository is dominated by whether this
+        // open replayed the whole history or trusted a durable validation of
+        // the exact bytes it loaded. Record which path ran so an operator can
+        // diagnose a slow reopen from persisted logs.
+        info!(
+            repository = %repository_id,
+            by_history_validation = authority.opened_by_history_validation(),
+            "opened repository authority"
+        );
         // Opening authority above is what retains the per-repository storage
         // capability on this backend. Prove the pin took before serving any
         // request from it: a daemon that cannot revalidate its own namespace
