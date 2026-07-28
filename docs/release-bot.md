@@ -101,8 +101,10 @@ The single job refuses — before any tag is created — unless **all** hold:
    not mirror every CI context — extend it only to force *presence* of a
    release-critical check (add branch-protection additions here too).
 6. **The prior release lane is settled.** No Release run may be queued or
-   active, and the prior stable must retain a successful exact tag/SHA Release
-   run. This prevents GitHub concurrency from replacing a pending version.
+   active, and the prior stable must have either a successful exact tag/SHA
+   Release run or its attested terminal completion marker. This prevents GitHub
+   concurrency from replacing a pending version without making Actions log
+   retention part of durable release authority.
 7. **Tag does not already exist.** Refuses if `refs/tags/<tag>` is present.
 
 Only then does it mint the App token, create `refs/tags/<tag>` at the SHA, and
