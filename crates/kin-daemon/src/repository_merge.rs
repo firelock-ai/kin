@@ -505,6 +505,14 @@ fn three_way(
             });
         }
     }
+    collect_dangling_endpoints(
+        &merged_relations,
+        &merged_entities,
+        &merged_artifacts,
+        &ours_state,
+        &theirs_state,
+        &mut conflicts,
+    );
     if !conflicts.is_empty() {
         return Err(conflict_refusal(request, &plan, &conflicts));
     }
@@ -696,6 +704,70 @@ where
         }
     }
     merged
+}
+
+/// Refuse a composition where one side removed a node the other side still
+/// points at.
+///
+/// Each dimension composes independently, so "remove an entity" and "add an
+/// edge to that entity" are both non-conflicting on their own and compose into
+/// an edge with no endpoint. Replay would silently prune it, which is a quiet
+/// way to drop work the source branch published. An endpoint that was already
+/// absent from both sides is pre-existing and not this merge's doing.
+fn collect_dangling_endpoints(
+    relations: &std::collections::HashMap<kin_model::RelationId, kin_model::Relation>,
+    entities: &std::collections::HashMap<kin_model::EntityId, kin_model::Entity>,
+    artifacts: &std::collections::HashMap<kin_model::ArtifactId, ResolvedArtifact>,
+    ours: &kin_model::graph::ResolvedGraphState,
+    theirs: &kin_model::graph::ResolvedGraphState,
+    conflicts: &mut Vec<MergeConflict>,
+) {
+    let mut dangling: BTreeMap<kin_model::RelationId, String> = BTreeMap::new();
+    for (id, relation) in relations {
+        for endpoint in [&relation.src, &relation.dst] {
+            if let Some(entity) = endpoint.as_entity() {
+                let survives = entities.contains_key(&entity);
+                let existed =
+                    ours.entities.contains_key(&entity) || theirs.entities.contains_key(&entity);
+                if !survives && existed {
+                    dangling.entry(*id).or_insert_with(|| {
+                        let name = describe_entity(&ours.entities, &theirs.entities, &entity);
+                        format!(
+                            "one branch removed {}, which the other branch still relates to",
+                            name.unwrap_or_else(|| entity.to_string())
+                        )
+                    });
+                }
+            }
+            if let kin_model::GraphNodeId::Artifact(artifact) = endpoint {
+                let artifact = *artifact;
+                let survives = artifacts.contains_key(&artifact);
+                let existed =
+                    ours.tree.get(&artifact).is_some() || theirs.tree.get(&artifact).is_some();
+                if !survives && existed {
+                    dangling.entry(*id).or_insert_with(|| {
+                        let path = ours
+                            .tree
+                            .get(&artifact)
+                            .or_else(|| theirs.tree.get(&artifact))
+                            .map(|resolved| resolved.path.to_string())
+                            .unwrap_or_else(|| format!("{artifact:?}"));
+                        format!(
+                            "one branch removed {path}, which the other branch still relates to"
+                        )
+                    });
+                }
+            }
+        }
+    }
+    conflicts.extend(
+        dangling
+            .into_iter()
+            .map(|(relation, detail)| MergeConflict {
+                scope: MergeConflictScope::Relation { relation },
+                detail,
+            }),
+    );
 }
 
 fn describe_divergence(in_base: bool, in_ours: bool, in_theirs: bool) -> String {
