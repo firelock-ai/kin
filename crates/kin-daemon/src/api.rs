@@ -12900,6 +12900,180 @@ mod tests {
             .any(|(_, change)| change.id == change_id));
     }
 
+    async fn commit_through_api(
+        app: &axum::Router,
+        operation_id: kin_model::OperationId,
+        message: &str,
+    ) -> SemanticChangeId {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/commands/commit")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "operation_id": operation_id,
+                            "timestamp": Timestamp::now(),
+                            "message": message
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 256 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        SemanticChangeId::from_hash(
+            Hash256::from_hex(response["change_id"].as_str().unwrap()).unwrap(),
+        )
+    }
+
+    async fn rollback_through_api(
+        app: &axum::Router,
+        operation_id: kin_model::OperationId,
+        change_id: SemanticChangeId,
+    ) -> (StatusCode, String) {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/commands/rollback")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "change_id": change_id.to_string(),
+                            "operation_id": operation_id,
+                            "actor": AuthorId::new("rollback-acceptance")
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 256 * 1024)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&body).to_string())
+    }
+
+    fn branch_change(state: &DaemonState) -> SemanticChangeId {
+        let authority = ActiveApiRepositoryAuthority::open(state).unwrap();
+        let lease = authority.manager.read_authority();
+        let target = lease
+            .metadata()
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == authority.workspace_id)
+            .unwrap()
+            .base_target
+            .clone()
+            .unwrap();
+        lease.resolve_target_change_id(&target).unwrap()
+    }
+
+    /// An operation id is matched before any history validation runs, and an
+    /// ordinary commit publishes the same receipt shape a rollback does. Only
+    /// the restored content separates them, so reusing a commit's operation id
+    /// must be refused instead of reported as a rollback that never happened.
+    #[tokio::test]
+    async fn command_rollback_refuses_an_operation_id_that_published_a_different_change() {
+        let state = test_state();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let root = state.layout.working_dir().to_path_buf();
+        let app = router(Arc::clone(&state));
+
+        std::fs::write(root.join("service.txt"), b"shipped\n").unwrap();
+        let restored = commit_through_api(
+            &app,
+            kin_model::OperationId::new(),
+            "publish the good state",
+        )
+        .await;
+        std::fs::write(root.join("service.txt"), b"regressed\n").unwrap();
+        let reused = kin_model::OperationId::new();
+        let regression = commit_through_api(&app, reused, "publish the regression").await;
+        assert_eq!(branch_change(&state), regression);
+
+        // The retained receipt for `reused` is an ordinary commit's. It carries
+        // one ref mutation onto a change under a MustEqual expectation and a
+        // workspace mutation, so every shape check passes; only the restored
+        // content refutes it.
+        let (status, body) = rollback_through_api(&app, reused, restored).await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "a commit's receipt was reported as this caller's rollback: {body}"
+        );
+        assert_eq!(
+            branch_change(&state),
+            regression,
+            "a refused rollback moved the branch"
+        );
+        assert_eq!(
+            std::fs::read(root.join("service.txt")).unwrap(),
+            b"regressed\n",
+            "a refused rollback restored the working copy anyway"
+        );
+
+        // The same reuse against a change this repository never materialized is
+        // refused for the same reason: the echoed target is never trusted.
+        let (status, body) = rollback_through_api(
+            &app,
+            reused,
+            SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "a rollback reported a target this repository does not have: {body}"
+        );
+
+        // Honest idempotency still reports success: a genuine rollback retried
+        // with its own operation id reports what it published and commits
+        // nothing further.
+        let rollback_operation = kin_model::OperationId::new();
+        let (status, body) = rollback_through_api(&app, rollback_operation, restored).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let first: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(first["mutated"], true);
+        assert_eq!(first["report"]["target_change_id"], restored.to_string());
+        let published = branch_change(&state);
+        assert_ne!(published, regression, "rollback published no change");
+
+        let (status, body) = rollback_through_api(&app, rollback_operation, restored).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let replay: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            replay["mutated"], false,
+            "an already-published rollback committed a second change"
+        );
+        assert_eq!(replay["report"]["idempotent"], true);
+        assert_eq!(replay["report"]["target_change_id"], restored.to_string());
+        assert_eq!(
+            replay["report"]["inverse_change_id"], first["report"]["inverse_change_id"],
+            "the replay reported a different published change"
+        );
+        assert_eq!(
+            branch_change(&state),
+            published,
+            "an already-published rollback moved the branch again"
+        );
+        assert_eq!(
+            std::fs::read(root.join("service.txt")).unwrap(),
+            b"shipped\n",
+            "the rollback did not leave the restored content in place"
+        );
+    }
+
     #[tokio::test]
     async fn graph_only_lsp_sweep_fails_closed() {
         let state = test_state();

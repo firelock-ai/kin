@@ -19,10 +19,10 @@ use kin_cli::commands::rollback::{
 use kin_db::ChangeStore;
 use kin_model::{
     compute_resolved_tree_hash, compute_semantic_change_id, ChangeOrigin,
-    EffectiveAdmissionPolicyStamp, EntityDelta, EntityStore, Hash256, RefExpectation, RefMutation,
-    RefTarget, RefUpdatePolicy, RelationDelta, RepositoryCommitOutcome, RepositoryTransaction,
-    ResolvedTree, SemanticChange, SemanticChangeId, SharedAdmissionPolicy, Timestamp,
-    TransactionDelta, WorkspaceExpectation, WorkspaceHead, WorkspaceMutation,
+    EffectiveAdmissionPolicyStamp, EntityDelta, EntityStore, Hash256, OperationId, RefExpectation,
+    RefMutation, RefTarget, RefUpdatePolicy, RelationDelta, RepositoryCommitOutcome,
+    RepositoryTransaction, ResolvedTree, SemanticChange, SemanticChangeId, SharedAdmissionPolicy,
+    Timestamp, TransactionDelta, WorkspaceExpectation, WorkspaceHead, WorkspaceMutation,
     REPOSITORY_TRANSACTION_SCHEMA_VERSION,
 };
 
@@ -455,10 +455,10 @@ fn plan_and_commit(
 /// Report an operation this repository already published.
 ///
 /// This path commits nothing and materializes nothing. It proves the retained
-/// receipt describes this request, that authority has not moved past it, and
-/// that the derived projection still matches the workspace the receipt
-/// published. Anything else is a refusal: a stale or foreign receipt must never
-/// be reported as this caller's success.
+/// receipt restored exactly the change this request names, that authority has
+/// not moved past it, and that the derived projection still matches the
+/// workspace the receipt published. Anything else is a refusal: a stale or
+/// foreign receipt must never be reported as this caller's success.
 fn report_already_committed(
     state: &DaemonState,
     authority: &ActiveLocalRepositoryAuthority,
@@ -528,6 +528,8 @@ fn report_already_committed(
                 authority.workspace_id
             )
         })?;
+    let mut snapshot = lease.snapshot().clone();
+    snapshot.repository_authority = None;
     drop(lease);
     if workspace.generation != workspace_mutation.new_generation
         || workspace.tree_hash != workspace_mutation.new_tree_hash
@@ -537,6 +539,16 @@ fn report_already_committed(
             request.operation_id
         )));
     }
+
+    let history = kin_db::InMemoryGraph::from_snapshot(snapshot)
+        .context("open immutable repository history for an already-published rollback")?;
+    require_receipt_restored_request(
+        &history,
+        request.operation_id,
+        target_change_id,
+        previous_change_id,
+        inverse_change_id,
+    )?;
 
     // The transition published its projection in the same operation, so there
     // is nothing to recover; verifying it proves that, and refuses instead of
@@ -570,6 +582,70 @@ fn report_already_committed(
         mutated: false,
         report: Some(report),
     })
+}
+
+/// Prove a retained receipt published exactly the rollback this request names.
+///
+/// Receipts are matched on operation id alone, and an ordinary commit carries
+/// the same receipt shape a rollback does: one ref mutation onto a change under
+/// a `MustEqual` expectation, alongside a workspace mutation. Only the restored
+/// content separates them. The change the receipt published must therefore
+/// resolve to exactly the tree the requested change resolves to, and that
+/// change must already be in the history the receipt published over. Otherwise
+/// the receipt belongs to some other operation that reused this id, and
+/// reporting it would claim a rollback that never happened.
+fn require_receipt_restored_request(
+    history: &kin_db::InMemoryGraph,
+    operation_id: OperationId,
+    target_change_id: SemanticChangeId,
+    previous_change_id: SemanticChangeId,
+    inverse_change_id: SemanticChangeId,
+) -> Result<()> {
+    if history
+        .get_change(&target_change_id)
+        .context("look up the rollback target")?
+        .is_none()
+    {
+        return Err(conflict(format!(
+            "change {target_change_id} is not materialized in this repository"
+        )));
+    }
+    if history
+        .get_change(&inverse_change_id)
+        .context("look up the change an already-published operation committed")?
+        .is_none()
+    {
+        return Err(conflict(format!(
+            "operation {operation_id} published change {inverse_change_id}, which is not \
+             materialized in this repository"
+        )));
+    }
+    if !reaches(history, previous_change_id, target_change_id)? {
+        return Err(conflict(format!(
+            "change {target_change_id} is not in the history of {previous_change_id}; rollback \
+             restores a change this branch already published"
+        )));
+    }
+    if resolved_tree_hash_at(history, inverse_change_id)?
+        != resolved_tree_hash_at(history, target_change_id)?
+    {
+        return Err(conflict(format!(
+            "operation {operation_id} published change {inverse_change_id}, which does not \
+             restore change {target_change_id}; it was already committed for a different request"
+        )));
+    }
+    Ok(())
+}
+
+fn resolved_tree_hash_at(
+    history: &kin_db::InMemoryGraph,
+    change_id: SemanticChangeId,
+) -> Result<Hash256> {
+    let state = history
+        .resolve_graph_at(&change_id)
+        .with_context(|| format!("resolve the repository graph at {change_id}"))?;
+    compute_resolved_tree_hash(&state.tree)
+        .with_context(|| format!("hash the repository tree at {change_id}"))
 }
 
 /// Whether `head` reaches `ancestor` through the immutable change DAG.
