@@ -49,8 +49,10 @@ intent.
 
 The release App has repository Contents permission but no `main` bypass. It can
 only update `automation/release-next`; the repository `GITHUB_TOKEN` opens the
-PR and arms auto-merge. A final App-authored synchronize event starts ordinary
-PR checks without a standing PAT. Main must require up-to-date checks so new
+PR, while the App activates ordinary checks and registers protected auto-merge.
+That App identity is important: GitHub suppresses most workflow events caused
+by `GITHUB_TOKEN`, whereas the App-owned merge emits the `main` push that starts
+CI and automatic tag admission. Main must require up-to-date checks so new
 merges cause the train to coalesce and re-test rather than release an older
 changelog against newer code.
 

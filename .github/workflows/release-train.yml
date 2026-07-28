@@ -433,7 +433,11 @@ jobs:
       - name: Arm protected auto-merge
         if: steps.plan.outputs.needed == 'true'
         env:
-          GH_TOKEN: ${{ github.token }}
+          # Register auto-merge as the release App, not GITHUB_TOKEN. GitHub
+          # suppresses most workflow events caused by GITHUB_TOKEN; an
+          # App-owned merge must emit the main push that starts CI and the
+          # automatic tag/release chain.
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           PR: ${{ steps.pr.outputs.number }}
         run: |
           set -euo pipefail

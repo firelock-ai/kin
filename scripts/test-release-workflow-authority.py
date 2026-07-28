@@ -171,6 +171,7 @@ def main() -> None:
         "highest_tag",
         "git merge --signoff --no-edit -X ours refs/remotes/origin/main",
         'gh pr merge "$PR"',
+        "GH_TOKEN: ${{ steps.app-token.outputs.token }}",
         "--auto",
         "--squash",
         "git commit --allow-empty --signoff",
