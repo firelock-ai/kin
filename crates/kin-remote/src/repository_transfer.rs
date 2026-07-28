@@ -130,13 +130,20 @@ pub struct RepositoryTransferStatus {
     pub git_authority_hash: Option<Hash256>,
     pub supported_features: Vec<String>,
     pub limits: RepositoryTransferLimits,
-    /// False until deterministic continuation packs make per-envelope limits
-    /// independent of repository history/blob size. Do not expose this
-    /// bounded primitive as general `kin push`.
+    /// This peer applies a publication whose closure is larger than one
+    /// envelope, by receiving the continuation packs it is split into.
+    ///
+    /// What this does not claim is freedom from every bound. A single change
+    /// whose new bodies exceed the negotiated byte limit is indivisible and is
+    /// refused by name, because there is no smaller step that still lands a
+    /// valid head. The bound that continuation packs removed is the one that
+    /// scaled with history length.
     pub push_apply_ready: bool,
     /// The server can export this bounded exact seam. The name deliberately
     /// avoids advertising a general pull capability.
     pub bounded_envelope_export_ready: bool,
+    /// This peer admits an exported closure larger than one envelope, pack by
+    /// pack, under the same bound as [`Self::push_apply_ready`].
     pub pull_apply_ready: bool,
 }
 
@@ -348,9 +355,9 @@ pub fn repository_transfer_status<B: StorageBackend + ?Sized + 'static>(
         git_authority_hash,
         supported_features: required_features(),
         limits: RepositoryTransferLimits::default(),
-        push_apply_ready: false,
+        push_apply_ready: true,
         bounded_envelope_export_ready: true,
-        pull_apply_ready: false,
+        pull_apply_ready: true,
     })
 }
 
@@ -2125,9 +2132,9 @@ mod tests {
         let advertised =
             repository_transfer_status(&fixture.destination, &fixture.repository_id, &fixture.main)
                 .unwrap();
-        assert!(!advertised.push_apply_ready);
+        assert!(advertised.push_apply_ready);
         assert!(advertised.bounded_envelope_export_ready);
-        assert!(!advertised.pull_apply_ready);
+        assert!(advertised.pull_apply_ready);
         assert_eq!(fixture.pack.changes.len(), 1);
         assert_eq!(fixture.pack.trees.len(), 1);
         assert_eq!(

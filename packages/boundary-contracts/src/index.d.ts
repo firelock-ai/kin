@@ -511,9 +511,9 @@ export interface RepositoryTransferStatus {
   git_authority_hash: string | null;
   supported_features: string[];
   limits: RepositoryTransferLimits;
-  push_apply_ready: false;
+  push_apply_ready: boolean;
   bounded_envelope_export_ready: boolean;
-  pull_apply_ready: false;
+  pull_apply_ready: boolean;
 }
 
 export interface RepositoryTransferBody {

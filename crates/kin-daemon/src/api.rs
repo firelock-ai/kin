@@ -10422,7 +10422,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repository_transfer_status_preserves_non_utf8_ref_bytes_and_gates_push() {
+    async fn repository_transfer_status_preserves_non_utf8_ref_bytes_and_advertises_apply() {
         let state = test_state();
         let repository_id = state.cached_repo_id.clone();
         let destination_ref =
@@ -10447,9 +10447,9 @@ mod tests {
         let status: kin_remote::repository_transfer::RepositoryTransferStatus =
             serde_json::from_slice(&body).unwrap();
         assert_eq!(status.destination_ref, destination_ref);
-        assert!(!status.push_apply_ready);
+        assert!(status.push_apply_ready);
         assert!(status.bounded_envelope_export_ready);
-        assert!(!status.pull_apply_ready);
+        assert!(status.pull_apply_ready);
     }
 
     #[test]
