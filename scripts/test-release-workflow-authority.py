@@ -227,9 +227,15 @@ def main() -> None:
         "Create the protected `release-tag` Environment",
         "allows **only `main`**",
         "forbids",
-        "branch-selectable `workflow_dispatch`",
+        "branch-selectable",
+        "`workflow_dispatch`",
         "last commit on the default branch",
         "exists there",
+        "only as `release-tag` Environment secrets",
+        "any other eligible workflow",
+        "repository could explicitly request a broadly scoped secret",
+        "Remove or rotate away every",
+        "organization-level copy visible",
         "gh api --method POST repos/firelock-ai/kin/dispatches --input -",
         '{event_type:"release_tag",client_payload:{tag:$tag,sha:$sha}}',
     ):
@@ -248,6 +254,10 @@ def main() -> None:
         "forbids",
         "branch-selectable `workflow_dispatch`",
         "exact current-main payload",
+        "must",
+        "exist only as Environment secrets",
+        "every broader copy must be removed or",
+        "production-ready",
     ):
         require(
             update_trust,

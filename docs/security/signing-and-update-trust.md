@@ -70,9 +70,10 @@ Environment, whose custom deployment policy admits `main` and no other branch.
 That boundary is defense in depth: the tag controller forbids
 branch-selectable `workflow_dispatch`, accepts only the typed `release_tag`
 repository event, validates its authorized actor and exact current-main payload,
-and rechecks main immediately before writing the ref. Environment-scoped App
-credentials remain the narrowest posture, but repository-scoped credentials do
-not expose branch code under this default-branch-pinned trigger model.
+and rechecks main immediately before writing the ref. The App credentials must
+exist only as Environment secrets; repository and organization secrets are
+available to other workflows in scope, so every broader copy must be removed or
+rotated away before the release controller is production-ready.
 
 After GitHub stable/latest, public install proof, both npm packages, and GHCR
 version/latest all succeed, the release publishes deterministic

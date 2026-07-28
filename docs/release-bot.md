@@ -192,19 +192,21 @@ These steps require the founder / org owner and gate the bot going live.
    deployment-branch policy that allows **only `main`**, with no required
    reviewer so trusted automatic reconciliation remains unattended.
    `release-train.yml` and `release-tag.yml` are the two token-minting
-   workflows. Both declare that Environment before minting a token. This is
-   defense in depth on top of trigger authority: `release-tag.yml` forbids
-   branch-selectable `workflow_dispatch`, and GitHub always resolves its typed
-   `repository_dispatch` from the default branch.
-4. **Add the App credentials:**
+   workflows. Both declare that Environment before minting a token.
+   `repository_dispatch` prevents a caller from selecting a branch copy of the
+   tag controller, and the controller forbids branch-selectable
+   `workflow_dispatch`. That still does not make a repository- or
+   organization-scoped private key safe: any other eligible workflow in the
+   repository could explicitly request a broadly scoped secret. The Environment
+   is therefore a required credential boundary, not optional hardening.
+4. **Add the App credentials only as `release-tag` Environment secrets:**
    - `KIN_RELEASE_BOT_APP_ID` — the App ID (numeric).
    - `KIN_RELEASE_BOT_PRIVATE_KEY` — the full PEM contents, including the
-     `-----BEGIN...-----` / `-----END...-----` lines.
-   Environment-scoped secrets are the narrowest posture, but repository-scoped
-   credentials are compatible with this trigger model: neither token-minting
-   workflow can execute branch-selected code, and both jobs still pass through
-   the main-only Environment. Never add `workflow_dispatch` to either workflow
-   while a repository- or organization-scoped copy is visible to `kin`.
+      `-----BEGIN...-----` / `-----END...-----` lines.
+   Remove or rotate away every repository- or organization-level copy visible
+   to `kin`. GitHub makes repository secrets available to every workflow in the
+   repository; only Environment scope confines these credentials to jobs that
+   name this main-only boundary.
 5. **Allowlist the App in the tag ruleset.** Org/repo → Rules → Rulesets →
    **"Protect version release tags"** → **Bypass list** → Add → the
    `kin-release-bot` App. Without this, the App's tag creation is rejected by the
@@ -227,8 +229,9 @@ does not depend on a repo-scoped install: the "Mint kin-release-bot installation
 token" step passes `owner: firelock-ai` + `repositories: kin` to
 `actions/create-github-app-token`, which narrows every minted installation token
 to the `kin` repository alone. The raw private key is more powerful than one
-narrowed token, so only default-branch-pinned trigger paths may consume it and
-both are additionally gated by the main-only `release-tag` Environment.
+narrowed token, so it must exist only as a secret in the main-only
+`release-tag` Environment and only default-branch-pinned trigger paths may
+consume it.
 Extending bot-mediated tagging to another repo is a deliberate act: replicate
 this workflow and its protected Environment in that repo and widen or duplicate
 the `repositories:` narrowing to name the new repo explicitly — never drop the
