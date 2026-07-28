@@ -12576,6 +12576,134 @@ mod tests {
         assert_eq!(workspace.tree_hash, entry.tree_hash);
     }
 
+    /// Install one entity into the daemon query graph alone, the way the
+    /// asynchronous LSP enrichment worker and parser reconciliation both do:
+    /// derived semantics that have not crossed the repository compare-and-swap.
+    fn install_unpublished_derived_entity(state: &DaemonState, name: &str) -> kin_model::EntityId {
+        let entity = kin_model::Entity {
+            id: kin_model::EntityId::new(),
+            kind: kin_model::EntityKind::Function,
+            name: name.to_string(),
+            language: kin_model::LanguageId::Rust,
+            fingerprint: kin_model::SemanticFingerprint {
+                algorithm: kin_model::FingerprintAlgorithm::V1TreeSitter,
+                ast_hash: kin_model::Hash256::from_bytes([7; 32]),
+                signature_hash: kin_model::Hash256::from_bytes([8; 32]),
+                behavior_hash: kin_model::Hash256::from_bytes([9; 32]),
+                equivalence_hash: kin_model::Hash256::from_bytes([0; 32]),
+                stability_score: 1.0,
+            },
+            file_origin: Some(kin_model::FilePathId::new("selected/compose.yaml")),
+            span: None,
+            signature: format!("fn {name}()"),
+            visibility: kin_model::Visibility::Public,
+            role: kin_model::EntityRole::Source,
+            doc_summary: None,
+            metadata: kin_model::EntityMetadata::default(),
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        };
+        let id = entity.id;
+        state
+            .graph
+            .apply_transaction_delta(&kin_model::TransactionDelta {
+                entity_deltas: vec![kin_model::EntityDelta::Added { new: entity }],
+                ..kin_model::TransactionDelta::default()
+            })
+            .unwrap();
+        id
+    }
+
+    /// The daemon query graph legitimately runs ahead of workspace authority:
+    /// enrichment is published into it continuously and reaches authority only
+    /// at commit. A switch must plan around that lead rather than refuse it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn switch_tolerates_derived_semantics_the_workspace_has_not_published() {
+        let (state, _layout, _repository, _main, _feature) =
+            universal_branch_test_state("switch-derived-lead");
+        install_unpublished_derived_entity(&state, "enriched_ahead_of_authority");
+
+        let switch = kin_cli::commands::branch::BranchRequest::Switch {
+            name: kin_model::RefName::branch(b"feature").unwrap(),
+            operation_id: kin_model::OperationId::new(),
+            actor: AuthorId::new("derived-lead-test"),
+        };
+        let (status, body) = post_branch_request(Arc::clone(&state), &switch, None).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "unpublished derived enrichment must not wedge a switch: {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+
+    /// The lead that is tolerated above is strictly additive. A daemon that
+    /// dropped semantics authority owns is answering from something other than
+    /// graph truth, and must still refuse.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn switch_refuses_a_daemon_that_lost_authority_owned_semantics() {
+        let (state, _layout, _repository, _main, _feature) =
+            universal_branch_test_state("switch-lost-authority");
+        install_unpublished_derived_entity(&state, "published_then_lost");
+        // Commit so the entity is authority-owned rather than merely derived.
+        let committed = router(Arc::clone(&state))
+            .oneshot(
+                Request::post("/commands/commit")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "operation_id": kin_model::OperationId::new(),
+                            "timestamp": kin_model::Timestamp::now(),
+                            "message": "publish the derived entity into authority"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(committed.status(), StatusCode::OK);
+
+        let authority_owned = state
+            .graph
+            .to_snapshot()
+            .entities
+            .values()
+            .find(|entity| entity.name == "published_then_lost")
+            .cloned()
+            .expect("the commit publishes the entity into workspace authority");
+        state
+            .graph
+            .apply_transaction_delta(&kin_model::TransactionDelta {
+                entity_deltas: vec![kin_model::EntityDelta::Removed {
+                    old: authority_owned,
+                }],
+                ..kin_model::TransactionDelta::default()
+            })
+            .unwrap();
+
+        let switch = kin_cli::commands::branch::BranchRequest::Switch {
+            name: kin_model::RefName::branch(b"feature").unwrap(),
+            operation_id: kin_model::OperationId::new(),
+            actor: AuthorId::new("lost-authority-test"),
+        };
+        let (status, body) = post_branch_request(Arc::clone(&state), &switch, None).await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "a daemon missing authority-owned semantics must refuse: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let message = String::from_utf8_lossy(&body);
+        assert!(
+            message.contains("no longer holds the repository workspace authority"),
+            "{message}"
+        );
+    }
+
     /// A seal must leave the daemon and repository authority agreeing, so the
     /// ready commands still work against the workspace it returned.
     #[cfg(unix)]
