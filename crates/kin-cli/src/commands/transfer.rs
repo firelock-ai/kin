@@ -75,7 +75,7 @@ pub(crate) fn resolve_peer(
     if let Some(url) = explicit_url.map(str::trim).filter(|url| !url.is_empty()) {
         return Ok(TransferPeer {
             base_url: url.trim_end_matches('/').to_string(),
-            token: transfer_bearer_token(),
+            token: crate::commands::remote::native_remote_bearer_token(url),
         });
     }
 
@@ -123,17 +123,11 @@ pub(crate) fn resolve_peer(
                 selected.name
             )
         })?;
+    let base_url = base_url.trim_end_matches('/').to_string();
     Ok(TransferPeer {
-        base_url: base_url.trim_end_matches('/').to_string(),
-        token: transfer_bearer_token(),
+        token: crate::commands::remote::native_remote_bearer_token(&base_url),
+        base_url,
     })
-}
-
-fn transfer_bearer_token() -> Option<String> {
-    std::env::var("KIN_REMOTE_TOKEN")
-        .ok()
-        .map(|token| token.trim().to_string())
-        .filter(|token| !token.is_empty())
 }
 
 fn parse_ref(value: Option<&str>) -> Result<Option<RefName>> {
