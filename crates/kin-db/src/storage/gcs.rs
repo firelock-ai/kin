@@ -1017,6 +1017,7 @@ mod tests {
             }),
             workspace_mutation: Some(workspace_mutation),
             local_overlay_delta: Some(FrozenLocalOverlayDelta::initialize(overlay)),
+            merge_transaction_delta: None,
         };
         drop(lease);
         transaction

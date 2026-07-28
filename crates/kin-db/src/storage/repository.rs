@@ -21,13 +21,14 @@ use kin_model::{
     EntityDelta, EntityStore, ExternalChangeAlias, ExternalObjectId, ExternalObjectKind,
     ExternalObjectRecord, FrozenLocalOverlay, GitExternalAuthority, GitObjectBodyLoader,
     GitObjectDependencyKind, GitObjectId, GitTreeEntryMode, Hash256, LocalAdmissionRuleSourceKind,
-    ModelError, OperationId, RefExpectation, RefMutation, RefName, RefTarget, RefUpdatePolicy,
-    RelationDelta, RepoPath, RepositoryAuthorityStore, RepositoryCommitOutcome,
-    RepositoryCommitReceipt, RepositoryId, RepositoryOperationRecord, RepositoryRef,
-    RepositoryRefState, RepositoryTransaction, ResolvedArtifact, ResolvedTree, RootBundle,
-    SemanticChangeId, SensitiveArtifactKind, SharedAdmissionPolicy, Timestamp, TreeDelta,
-    TreeEntry, WorkspaceHead, WorkspaceId, WorkspaceSemanticOverlay, WorkspaceSnapshotBinding,
-    WorkspaceState, WorkspaceTreeArtifact, WorkspaceTreeSnapshot, REPOSITORY_ROOT_SCHEMA_VERSION,
+    MergeTransactionRecord, ModelError, OperationId, RefExpectation, RefMutation, RefName,
+    RefTarget, RefUpdatePolicy, RelationDelta, RepoPath, RepositoryAuthorityStore,
+    RepositoryCommitOutcome, RepositoryCommitReceipt, RepositoryId, RepositoryOperationRecord,
+    RepositoryRef, RepositoryRefState, RepositoryTransaction, ResolvedArtifact, ResolvedTree,
+    RootBundle, SemanticChangeId, SensitiveArtifactKind, SharedAdmissionPolicy, Timestamp,
+    TreeDelta, TreeEntry, WorkspaceHead, WorkspaceId, WorkspaceSemanticOverlay,
+    WorkspaceSnapshotBinding, WorkspaceState, WorkspaceTreeArtifact, WorkspaceTreeSnapshot,
+    REPOSITORY_ROOT_SCHEMA_VERSION,
 };
 
 use crate::admission::{
@@ -96,6 +97,17 @@ pub struct PersistedRepositoryAuthority {
     pub admission_policies: Vec<ChangeAdmissionPolicy>,
     pub local_overlays: Vec<FrozenLocalOverlay>,
     pub receipts: Vec<RepositoryCommitReceipt>,
+    /// Durable merge state, at most one record per workspace.
+    ///
+    /// Deliberately last, and omitted when empty. The envelope is persisted
+    /// inside a MessagePack snapshot, where a struct is an array and position
+    /// decides the mapping, so a new collection is only additive at the end: an
+    /// already-written envelope runs out of elements and takes the default.
+    /// A repository that has never had a conflicting merge therefore keeps the
+    /// exact bytes and the exact local authority root it already had, and needs
+    /// no re-import.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub merge_transactions: Vec<MergeTransactionRecord>,
 }
 
 impl PersistedRepositoryAuthority {
@@ -113,6 +125,7 @@ impl PersistedRepositoryAuthority {
             admission_policies: Vec::new(),
             local_overlays: Vec::new(),
             receipts: Vec::new(),
+            merge_transactions: Vec::new(),
         };
         authority.roots = compute_roots(snapshot, &authority, 0)?;
         Ok(authority)
@@ -156,6 +169,11 @@ impl PersistedRepositoryAuthority {
             "local overlay",
         )?;
         require_sorted_unique(
+            &self.merge_transactions,
+            |record| record.workspace_id,
+            "merge transaction",
+        )?;
+        require_sorted_unique(
             &self.receipts,
             |receipt| receipt.operation_id,
             "operation receipt",
@@ -190,6 +208,25 @@ impl PersistedRepositoryAuthority {
         }
         for overlay in &self.local_overlays {
             overlay.validate()?;
+        }
+        for record in &self.merge_transactions {
+            record.validate()?;
+            if record.repository_id != self.repository_id {
+                return Err(storage(format!(
+                    "merge transaction for workspace {} belongs to repository {}, not {}",
+                    record.workspace_id, record.repository_id, self.repository_id
+                )));
+            }
+            if !self
+                .workspaces
+                .iter()
+                .any(|workspace| workspace.workspace_id == record.workspace_id)
+            {
+                return Err(storage(format!(
+                    "merge transaction names workspace {}, which this repository does not have",
+                    record.workspace_id
+                )));
+            }
         }
 
         if self.operation_log.len() != self.receipts.len() {
@@ -1239,6 +1276,7 @@ fn prepare_successor<B: StorageBackend + ?Sized>(
         transaction.local_overlay_delta.as_ref(),
     )?;
     apply_workspace(backend, &snapshot, &mut metadata, transaction)?;
+    apply_merge_transaction(&mut metadata, transaction)?;
     verify_transaction_admission(backend, current, &snapshot, &metadata, transaction)?;
     validate_new_change_bodies(
         backend,
@@ -1264,6 +1302,7 @@ fn prepare_successor<B: StorageBackend + ?Sized>(
         default_ref_mutation: transaction.default_ref_mutation.clone(),
         workspace_mutation: transaction.workspace_mutation.clone(),
         local_overlay_delta: transaction.local_overlay_delta.clone(),
+        merge_transaction_delta: transaction.merge_transaction_delta.clone(),
         roots_before: roots_before.clone(),
         roots_after: placeholder_roots(next_generation),
     };
@@ -2021,6 +2060,72 @@ fn apply_local_overlay(
     })?;
     overlays.insert(workspace_id, next);
     metadata.local_overlays = overlays.into_values().collect();
+    Ok(())
+}
+
+/// Compare-and-swap one workspace's durable merge record.
+///
+/// The lease discipline matches [`apply_local_overlay`]: the delta's `old` must
+/// be exactly what is stored, so two sessions cannot both advance a merge from
+/// the same view of it.
+///
+/// The citation check is what makes the record non-fabricable. A resolution
+/// names the operation that settled it, and any citation this delta introduces
+/// must be the transaction being committed right now. A caller therefore cannot
+/// author provenance pointing at some other transaction, or at one that never
+/// happened. Citations the previous record already carried were proven the same
+/// way when they were applied, so they are not rechecked here, which also keeps
+/// this sound across operation-log compaction.
+fn apply_merge_transaction(
+    metadata: &mut PersistedRepositoryAuthority,
+    transaction: &RepositoryTransaction,
+) -> Result<(), KinDbError> {
+    let Some(delta) = &transaction.merge_transaction_delta else {
+        return Ok(());
+    };
+    let workspace_id = delta.workspace_id().ok_or_else(|| {
+        ModelError::InvalidOperation(
+            "merge transaction delta has no workspace identity".to_string(),
+        )
+    })?;
+    let mut records: BTreeMap<WorkspaceId, MergeTransactionRecord> = metadata
+        .merge_transactions
+        .iter()
+        .cloned()
+        .map(|record| (record.workspace_id, record))
+        .collect();
+    if records.get(&workspace_id) != delta.old.as_ref() {
+        return Err(ModelError::Conflict(format!(
+            "merge transaction for workspace {workspace_id} no longer matches its lease"
+        ))
+        .into());
+    }
+
+    let previously_cited: BTreeSet<OperationId> = delta
+        .old
+        .as_ref()
+        .map(|old| {
+            kin_model::MergeTransactionDelta::open(old.clone())
+                .referenced_operations()
+                .into_iter()
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Some(new) = &delta.new {
+        for cited in kin_model::MergeTransactionDelta::open(new.clone()).referenced_operations() {
+            if !previously_cited.contains(&cited) && cited != transaction.operation_id {
+                return Err(ModelError::InvalidOperation(format!(
+                    "merge transaction cites operation {cited}, which is neither already recorded \
+                     nor the operation committing it"
+                ))
+                .into());
+            }
+        }
+        records.insert(workspace_id, new.clone());
+    } else {
+        records.remove(&workspace_id);
+    }
+    metadata.merge_transactions = records.into_values().collect();
     Ok(())
 }
 
@@ -3674,6 +3779,14 @@ fn local_state_root(
     root.unordered("downstream_warnings", &snapshot.downstream_warnings)?;
     root.ordered("workspaces", &authority.workspaces)?;
     root.ordered("local_overlays", &authority.local_overlays)?;
+    // Folded only when a merge record exists. An empty list contributes
+    // nothing, so every repository that predates durable merge state keeps the
+    // local root it already had and needs no re-import. There is no ambiguity
+    // between the two states: absent contributes nothing at all, and no
+    // non-empty list can fold to nothing.
+    if !authority.merge_transactions.is_empty() {
+        root.ordered("merge_transactions", &authority.merge_transactions)?;
+    }
     root.ordered("operation_identities", &operation_identities)?;
     Ok(root.finish())
 }
@@ -3785,7 +3898,10 @@ mod tests {
         ChangeOrigin, DefaultRefMutation, EffectiveAdmissionPolicyStamp, Entity, EntityDelta,
         EntityId, EntityKind, EntityMetadata, EntityRole, FilePathId, FingerprintAlgorithm,
         FrozenLocalOverlayDelta, GitExternalAuthorityDelta, GitObjectFormat, GitRawRef,
-        GitRawTarget, GraphNodeId, LanguageId, LocalAdmissionRuleSource, LocatedEntry, RefMutation,
+        GitRawTarget, GraphNodeId, LanguageId, LocalAdmissionRuleSource, LocatedEntry,
+        MergeConflictEntry, MergeConflictSubject, MergeDivergence, MergeEntryResolution,
+        MergeOpening, MergeParentBinding, MergeResolutionProvenance, MergeSide, MergeSideValue,
+        MergeTransactionDelta, MergeTransactionState, MergeWorkspaceRestorePoint, RefMutation,
         Relation, RelationDelta, RelationId, RelationKind, RelationOrigin, RepoPath, ResolvedTree,
         SemanticChange, SemanticFingerprint, SensitiveArtifactAllowance, SensitiveArtifactKind,
         TreeDelta, Visibility, WorkspaceExpectation, WorkspaceMutation, WorkspaceSemanticDelta,
@@ -4082,6 +4198,7 @@ mod tests {
             default_ref_mutation: None,
             workspace_mutation: None,
             local_overlay_delta: None,
+            merge_transaction_delta: None,
         }
     }
 
@@ -4234,6 +4351,356 @@ mod tests {
         transaction.workspace_mutation = Some(workspace_mutation);
         transaction.local_overlay_delta = Some(FrozenLocalOverlayDelta::initialize(overlay));
         transaction
+    }
+
+    /// Both parents of a conflicting merge, plus the base they share.
+    ///
+    /// The changes are named rather than published: what the record binds is
+    /// which change each side's value came from, and the persistence layer
+    /// checks the record's own shape, not history reachability.
+    fn merge_binding(ours_target: RefTarget) -> MergeParentBinding {
+        MergeParentBinding {
+            target_ref: RefName::branch(b"main").unwrap(),
+            source_ref: RefName::branch(b"feature").unwrap(),
+            base_change: SemanticChangeId::from_hash(Hash256::from_bytes([0xa1; 32])),
+            ours_change: SemanticChangeId::from_hash(Hash256::from_bytes([0xa2; 32])),
+            theirs_change: SemanticChangeId::from_hash(Hash256::from_bytes([0xa3; 32])),
+            ours_target,
+            theirs_target: RefTarget::change(SemanticChangeId::from_hash(Hash256::from_bytes(
+                [0xa3; 32],
+            ))),
+        }
+    }
+
+    fn merge_entry() -> MergeConflictEntry {
+        MergeConflictEntry {
+            subject: MergeConflictSubject::Artifact {
+                artifact: ArtifactId(Uuid::from_u128(12)),
+            },
+            divergence: MergeDivergence::ChangedBothSides,
+            base: MergeSideValue::Present {
+                content: Hash256::from_bytes([0xb0; 32]),
+            },
+            ours: MergeSideValue::Present {
+                content: Hash256::from_bytes([0xb1; 32]),
+            },
+            theirs: MergeSideValue::Present {
+                content: Hash256::from_bytes([0xb2; 32]),
+            },
+            label: Some("src/lib.rs".to_string()),
+            resolution: MergeEntryResolution::Unresolved,
+        }
+    }
+
+    /// Open a merge on the workspace the arbitrary fixture repository has,
+    /// citing `operation` as the transaction that opened it.
+    fn open_merge_record<B: StorageBackend + ?Sized + 'static>(
+        manager: &RepositoryAuthorityManager<B>,
+        operation: u128,
+    ) -> MergeTransactionRecord {
+        let workspace = manager.read_authority().metadata().workspaces[0].clone();
+        MergeTransactionRecord::open(
+            repository_id(),
+            workspace.workspace_id,
+            MergeOpening {
+                operation_id: OperationId::from_uuid(Uuid::from_u128(operation)),
+                actor: AuthorId::new("authority-test"),
+                opened_at: Timestamp(
+                    chrono::DateTime::parse_from_rfc3339("2026-07-28T12:00:00Z")
+                        .unwrap()
+                        .with_timezone(&chrono::Utc),
+                ),
+            },
+            merge_binding(workspace.base_target.clone().unwrap()),
+            MergeWorkspaceRestorePoint {
+                generation: workspace.generation,
+                head: workspace.head.clone(),
+                base_target: workspace.base_target.clone(),
+                base_tree_hash: workspace.base_tree_hash,
+                tree_hash: workspace.tree_hash,
+                semantic_overlay_hash: workspace.semantic_overlay_hash,
+                admission_policy: workspace.admission_policy,
+            },
+            vec![merge_entry()],
+        )
+        .unwrap()
+    }
+
+    fn merge_provenance(operation: u128) -> MergeResolutionProvenance {
+        MergeResolutionProvenance {
+            actor: AuthorId::new("authority-test"),
+            operation_id: OperationId::from_uuid(Uuid::from_u128(operation)),
+            resolved_at: Timestamp(
+                chrono::DateTime::parse_from_rfc3339("2026-07-28T12:05:00Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+            ),
+        }
+    }
+
+    /// A repository that has never had a conflicting merge must be bit-for-bit
+    /// what it was before durable merge state existed.
+    ///
+    /// The pinned digest was measured on the commit that introduced this test,
+    /// before `merge_transactions` was added. It is what makes the field
+    /// additive in fact: an empty collection is not folded into the local root
+    /// at all, so every repository already on disk keeps its authority roots
+    /// and needs no re-import. If this moves, the change owes a schema version.
+    #[test]
+    fn a_repository_without_a_merge_keeps_its_genesis_local_root() {
+        let snapshot = GraphSnapshot::empty();
+        let authority = PersistedRepositoryAuthority::empty(repository_id(), &snapshot).unwrap();
+        assert!(authority.merge_transactions.is_empty());
+        assert_eq!(
+            authority.roots.local_state.hash.to_string(),
+            "02a48df3559f359253d12baf60c3ae2df791ad77b267397af162018b3193c6f2",
+            "an empty merge collection must not perturb the local authority root"
+        );
+
+        // The envelope is persisted positionally, so an empty collection must
+        // also encode to the arity a pre-merge binary wrote.
+        let bytes = rmp_serde::to_vec(&authority).unwrap();
+        let decoded: PersistedRepositoryAuthority = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(decoded, authority);
+    }
+
+    /// The durability requirement behind `kin conflicts`: a parked merge is in
+    /// the persisted snapshot, not in daemon memory or a `.kin` sidecar, so it
+    /// is still there after a restart.
+    #[test]
+    fn a_parked_merge_survives_commit_and_reopen() {
+        let backend = Arc::new(MemoryBackend::default());
+        let manager = initial_manager(Arc::clone(&backend));
+        manager
+            .commit_repository_transaction(arbitrary_repository_transaction(&manager))
+            .unwrap();
+
+        let record = open_merge_record(&manager, 40);
+        let mut transaction = transaction_shell(&manager, 40);
+        transaction.merge_transaction_delta = Some(MergeTransactionDelta::open(record.clone()));
+        let receipt = manager.commit_repository_transaction(transaction).unwrap();
+        assert_eq!(
+            receipt
+                .operation
+                .merge_transaction_delta
+                .as_ref()
+                .unwrap()
+                .new,
+            Some(record.clone()),
+            "the operation log carries the transition, not just the outcome"
+        );
+
+        let reopened = initial_manager(backend);
+        let lease = reopened.read_authority();
+        let persisted = &lease.metadata().merge_transactions;
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0], record);
+        assert_eq!(persisted[0].unresolved().count(), 1);
+        assert!(persisted[0].state.is_in_progress());
+    }
+
+    /// An in-progress merge is workspace-local. It must move the local root, so
+    /// it cannot be forged outside the compare-and-swap commit path, and must
+    /// leave replicated truth alone, so a replica does not look divergent
+    /// because someone locally started a merge.
+    #[test]
+    fn a_parked_merge_moves_local_authority_but_not_replicated_truth() {
+        let backend = Arc::new(MemoryBackend::default());
+        let manager = initial_manager(Arc::clone(&backend));
+        manager
+            .commit_repository_transaction(arbitrary_repository_transaction(&manager))
+            .unwrap();
+        let before = manager.read_authority().roots().clone();
+
+        let mut transaction = transaction_shell(&manager, 41);
+        transaction.merge_transaction_delta =
+            Some(MergeTransactionDelta::open(open_merge_record(&manager, 41)));
+        manager.commit_repository_transaction(transaction).unwrap();
+
+        let after = manager.read_authority().roots().clone();
+        assert_ne!(after.local_state, before.local_state);
+        assert!(before.has_same_replicated_truth(&after));
+        assert_eq!(after.history, before.history);
+        assert_eq!(after.ref_state, before.ref_state);
+    }
+
+    /// The lease discipline the local overlay already has: two sessions cannot
+    /// both advance a merge from the same view of it.
+    #[test]
+    fn a_stale_merge_lease_is_refused() {
+        let backend = Arc::new(MemoryBackend::default());
+        let manager = initial_manager(Arc::clone(&backend));
+        manager
+            .commit_repository_transaction(arbitrary_repository_transaction(&manager))
+            .unwrap();
+
+        let record = open_merge_record(&manager, 42);
+        let mut opening = transaction_shell(&manager, 42);
+        opening.merge_transaction_delta = Some(MergeTransactionDelta::open(record.clone()));
+        manager.commit_repository_transaction(opening).unwrap();
+
+        // A second opener still holding the pre-merge view of the workspace.
+        let mut racing = transaction_shell(&manager, 43);
+        racing.merge_transaction_delta =
+            Some(MergeTransactionDelta::open(open_merge_record(&manager, 43)));
+        let error = manager
+            .commit_repository_transaction(racing)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("no longer matches its lease"),
+            "unexpected refusal: {error}"
+        );
+
+        // And the resolution path is held to the same lease.
+        let settled = record
+            .resolve_entry(
+                &record.entries[0].subject,
+                MergeEntryResolution::Side {
+                    side: MergeSide::Theirs,
+                    provenance: merge_provenance(44),
+                },
+            )
+            .unwrap();
+        let mut resolving = transaction_shell(&manager, 44);
+        resolving.merge_transaction_delta = Some(MergeTransactionDelta::update(record, settled));
+        manager.commit_repository_transaction(resolving).unwrap();
+    }
+
+    /// A resolution names the operation that settled it. Any citation a delta
+    /// introduces must be the transaction committing it, so provenance cannot
+    /// be authored pointing at some other transaction or at one that never
+    /// happened.
+    #[test]
+    fn a_merge_resolution_cannot_cite_a_foreign_operation() {
+        let backend = Arc::new(MemoryBackend::default());
+        let manager = initial_manager(Arc::clone(&backend));
+        manager
+            .commit_repository_transaction(arbitrary_repository_transaction(&manager))
+            .unwrap();
+
+        let record = open_merge_record(&manager, 45);
+        let mut opening = transaction_shell(&manager, 45);
+        opening.merge_transaction_delta = Some(MergeTransactionDelta::open(record.clone()));
+        manager.commit_repository_transaction(opening).unwrap();
+
+        let laundered = record
+            .resolve_entry(
+                &record.entries[0].subject,
+                MergeEntryResolution::Side {
+                    side: MergeSide::Ours,
+                    // Not the operation this transaction commits.
+                    provenance: merge_provenance(999),
+                },
+            )
+            .unwrap();
+        let mut resolving = transaction_shell(&manager, 46);
+        resolving.merge_transaction_delta =
+            Some(MergeTransactionDelta::update(record.clone(), laundered));
+        let error = manager
+            .commit_repository_transaction(resolving)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("neither already recorded nor the operation committing it"),
+            "unexpected refusal: {error}"
+        );
+
+        // The same resolution, citing the transaction that actually carries it.
+        let honest = record
+            .resolve_entry(
+                &record.entries[0].subject,
+                MergeEntryResolution::Side {
+                    side: MergeSide::Ours,
+                    provenance: merge_provenance(47),
+                },
+            )
+            .unwrap();
+        let mut resolving = transaction_shell(&manager, 47);
+        resolving.merge_transaction_delta =
+            Some(MergeTransactionDelta::update(record, honest.clone()));
+        manager.commit_repository_transaction(resolving).unwrap();
+
+        // A later transaction may carry the citation forward untouched: it was
+        // proven when it was first applied.
+        let committed = honest
+            .terminate(MergeTransactionState::Committed {
+                merge_change: SemanticChangeId::from_hash(Hash256::from_bytes([0xc4; 32])),
+                operation_id: OperationId::from_uuid(Uuid::from_u128(48)),
+                committed_at: Timestamp(
+                    chrono::DateTime::parse_from_rfc3339("2026-07-28T12:10:00Z")
+                        .unwrap()
+                        .with_timezone(&chrono::Utc),
+                ),
+            })
+            .unwrap();
+        let mut publishing = transaction_shell(&manager, 48);
+        publishing.merge_transaction_delta = Some(MergeTransactionDelta::update(honest, committed));
+        manager.commit_repository_transaction(publishing).unwrap();
+
+        let lease = manager.read_authority();
+        assert!(lease.metadata().merge_transactions[0].state.is_terminal());
+    }
+
+    /// A merge record is workspace authority, so it cannot name a workspace the
+    /// repository does not have.
+    #[test]
+    fn a_merge_record_must_name_a_workspace_this_repository_has() {
+        let backend = Arc::new(MemoryBackend::default());
+        let manager = initial_manager(Arc::clone(&backend));
+        manager
+            .commit_repository_transaction(arbitrary_repository_transaction(&manager))
+            .unwrap();
+
+        let mut orphan = open_merge_record(&manager, 49);
+        orphan.workspace_id = WorkspaceId::from_uuid(Uuid::from_u128(777));
+        orphan.hash = orphan.identity_hash().unwrap();
+        let mut transaction = transaction_shell(&manager, 49);
+        transaction.merge_transaction_delta = Some(MergeTransactionDelta::open(orphan));
+        let error = manager
+            .commit_repository_transaction(transaction)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("which this repository does not have"),
+            "unexpected refusal: {error}"
+        );
+    }
+
+    /// Dropping the record clears the workspace's merge state, and the drop is
+    /// itself a recorded transition rather than a silent erasure.
+    ///
+    /// The local root deliberately does not return to its pre-merge value: it
+    /// also folds every operation identity, and two operations have since been
+    /// committed. What must hold is that the merge collection contributes
+    /// nothing once empty, which the genesis pin proves against a digest
+    /// measured before the field existed.
+    #[test]
+    fn dropping_a_merge_record_clears_it_and_is_itself_recorded() {
+        let backend = Arc::new(MemoryBackend::default());
+        let manager = initial_manager(Arc::clone(&backend));
+        manager
+            .commit_repository_transaction(arbitrary_repository_transaction(&manager))
+            .unwrap();
+        let before = manager.read_authority().roots().local_state;
+
+        let record = open_merge_record(&manager, 50);
+        let mut opening = transaction_shell(&manager, 50);
+        opening.merge_transaction_delta = Some(MergeTransactionDelta::open(record.clone()));
+        manager.commit_repository_transaction(opening).unwrap();
+        let parked = manager.read_authority().roots().local_state;
+        assert_ne!(parked, before);
+
+        let mut dropping = transaction_shell(&manager, 51);
+        dropping.merge_transaction_delta = Some(MergeTransactionDelta::drop_record(record.clone()));
+        let receipt = manager.commit_repository_transaction(dropping).unwrap();
+
+        let lease = manager.read_authority();
+        assert!(lease.metadata().merge_transactions.is_empty());
+        assert_ne!(lease.roots().local_state, parked);
+        let delta = receipt.operation.merge_transaction_delta.as_ref().unwrap();
+        assert_eq!(delta.old, Some(record));
+        assert!(delta.new.is_none());
     }
 
     fn native_root_with_policy(
