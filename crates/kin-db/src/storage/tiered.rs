@@ -154,6 +154,7 @@ pub struct TieredGraph {
 struct ManagedHotScope {
     entity_ids: HashSet<EntityId>,
     relation_ids: HashSet<RelationId>,
+    external_reference_ids: HashSet<ExternalReferenceId>,
 }
 
 impl ManagedHotScope {
@@ -166,6 +167,8 @@ impl ManagedHotScope {
     fn record_snapshot(&mut self, snapshot: &GraphSnapshot) {
         self.entity_ids.extend(snapshot.entities.keys().copied());
         self.relation_ids.extend(snapshot.relations.keys().copied());
+        self.external_reference_ids
+            .extend(snapshot.external_references.keys().copied());
     }
 }
 
@@ -482,37 +485,46 @@ fn hydrate_graph_partial(
     snapshot: &GraphSnapshot,
     max_entities: usize,
 ) -> Result<InMemoryGraph, KinDbError> {
-    let graph = InMemoryGraph::new();
+    let mut hot = GraphSnapshot::empty();
+    hot.entities = snapshot
+        .entities
+        .values()
+        .take(max_entities)
+        .map(|entity| (entity.id, entity.clone()))
+        .collect();
+    let hot_entity_ids: HashSet<_> = hot.entities.keys().copied().collect();
 
-    for (loaded, entity) in snapshot.entities.values().enumerate() {
-        if loaded >= max_entities {
-            break;
-        }
-        graph.upsert_entity(entity)?;
-    }
-
-    // Load relations where both endpoints are in the hot set
+    // Load relations whose entity endpoints are all in the hot set. External
+    // endpoints needed by those relations join the same managed scope, while
+    // unrelated standalone references remain cold.
     for relation in snapshot.relations.values() {
-        let src_hot = relation
-            .src
-            .as_entity()
-            .map(|entity_id| graph.get_entity(&entity_id))
-            .transpose()?
-            .flatten()
-            .is_some();
-        let dst_hot = relation
-            .dst
-            .as_entity()
-            .map(|entity_id| graph.get_entity(&entity_id))
-            .transpose()?
-            .flatten()
-            .is_some();
-        if src_hot && dst_hot {
-            graph.upsert_relation(relation)?;
+        let endpoints = [relation.src, relation.dst];
+        let touches_hot_entity = endpoints
+            .iter()
+            .any(|node| matches!(node, GraphNodeId::Entity(id) if hot_entity_ids.contains(id)));
+        let all_endpoints_admitted = endpoints.iter().all(|node| match node {
+            GraphNodeId::Entity(id) => hot_entity_ids.contains(id),
+            GraphNodeId::ExternalReference(id) => snapshot.external_references.contains_key(id),
+            _ => false,
+        });
+        if touches_hot_entity && all_endpoints_admitted {
+            for node in endpoints {
+                if let GraphNodeId::ExternalReference(id) = node {
+                    let reference = snapshot.external_references.get(&id).ok_or_else(|| {
+                        KinDbError::StorageError(format!(
+                            "tiered relation {} references missing external endpoint {id}",
+                            relation.id
+                        ))
+                    })?;
+                    hot.external_references.insert(id, reference.clone());
+                }
+            }
+            hot.relations.insert(relation.id, relation.clone());
         }
     }
 
-    Ok(graph)
+    rebuild_relation_indexes(&mut hot);
+    hydrate_graph(hot)
 }
 
 fn merge_hot_into_cold(
@@ -527,35 +539,44 @@ fn merge_hot_into_cold(
         .difference(&hot_entity_ids)
         .copied()
         .collect();
+    let hot_external_reference_ids: HashSet<_> = hot.external_references.keys().copied().collect();
+    let deleted_managed_external_references: HashSet<_> = scope
+        .external_reference_ids
+        .difference(&hot_external_reference_ids)
+        .copied()
+        .collect();
 
     cold.entities
         .retain(|entity_id, _| !scope.entity_ids.contains(entity_id));
+    cold.external_references.retain(|external_reference_id, _| {
+        !scope.external_reference_ids.contains(external_reference_id)
+    });
     cold.relations.retain(|relation_id, relation| {
         !scope.relation_ids.contains(relation_id)
-            && relation
-                .src
-                .as_entity()
-                .map(|entity_id| !deleted_managed_entities.contains(&entity_id))
-                .unwrap_or(true)
-            && relation
-                .dst
-                .as_entity()
-                .map(|entity_id| !deleted_managed_entities.contains(&entity_id))
-                .unwrap_or(true)
+            && !endpoint_was_deleted(
+                relation.src,
+                &deleted_managed_entities,
+                &deleted_managed_external_references,
+            )
+            && !endpoint_was_deleted(
+                relation.dst,
+                &deleted_managed_entities,
+                &deleted_managed_external_references,
+            )
     });
     cold.entities.extend(hot.entities);
+    cold.external_references.extend(hot.external_references);
     cold.relations
         .extend(hot.relations.into_iter().filter(|(_, relation)| {
-            relation
-                .src
-                .as_entity()
-                .map(|entity_id| !deleted_managed_entities.contains(&entity_id))
-                .unwrap_or(true)
-                && relation
-                    .dst
-                    .as_entity()
-                    .map(|entity_id| !deleted_managed_entities.contains(&entity_id))
-                    .unwrap_or(true)
+            !endpoint_was_deleted(
+                relation.src,
+                &deleted_managed_entities,
+                &deleted_managed_external_references,
+            ) && !endpoint_was_deleted(
+                relation.dst,
+                &deleted_managed_entities,
+                &deleted_managed_external_references,
+            )
         }));
     cold.changes.extend(hot.changes);
     cold.change_children.extend(hot.change_children);
@@ -666,7 +687,20 @@ fn merge_hot_into_cold(
         );
     }
     rebuild_relation_indexes(&mut cold);
+    cold.validate_storage_admission()?;
     Ok(cold)
+}
+
+fn endpoint_was_deleted(
+    node: GraphNodeId,
+    deleted_entities: &HashSet<EntityId>,
+    deleted_external_references: &HashSet<ExternalReferenceId>,
+) -> bool {
+    match node {
+        GraphNodeId::Entity(id) => deleted_entities.contains(&id),
+        GraphNodeId::ExternalReference(id) => deleted_external_references.contains(&id),
+        _ => false,
+    }
 }
 
 fn rebuild_relation_indexes(snapshot: &mut GraphSnapshot) {
@@ -862,6 +896,24 @@ mod tests {
             origin: RelationOrigin::Parsed,
             created_in: None,
             import_source: None,
+            evidence: Vec::new(),
+        }
+    }
+
+    fn test_external_relation(
+        src: EntityId,
+        dst: ExternalReferenceId,
+        import_source: &str,
+    ) -> Relation {
+        Relation {
+            id: RelationId::from_content(&src.to_string(), &dst.to_string(), "imports"),
+            kind: RelationKind::Imports,
+            src: GraphNodeId::Entity(src),
+            dst: GraphNodeId::ExternalReference(dst),
+            confidence: 1.0,
+            origin: RelationOrigin::Lsp,
+            created_in: None,
+            import_source: Some(import_source.to_string()),
             evidence: Vec::new(),
         }
     }
@@ -1271,6 +1323,191 @@ mod tests {
             .get_relations(&e1.id, &[RelationKind::Calls])
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn mmap_backed_hydrates_relation_bound_external_reference_scope_only() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+        let entity = test_entity("external_client");
+        let bound = ExternalReference::new_resolved("python-module-v1", "requests", "get").unwrap();
+        let standalone =
+            ExternalReference::new_resolved("npm-package-v1", "@mui/utils", "merge").unwrap();
+        let relation = test_external_relation(entity.id, bound.id, "requests.get");
+        let mut snapshot = GraphSnapshot::empty();
+        snapshot.entities.insert(entity.id, entity);
+        snapshot.external_references.insert(bound.id, bound.clone());
+        snapshot
+            .external_references
+            .insert(standalone.id, standalone.clone());
+        snapshot.relations.insert(relation.id, relation.clone());
+        rebuild_relation_indexes(&mut snapshot);
+        mmap::atomic_write(&path, &snapshot).unwrap();
+
+        let config = force_mmap_config_with_full_hot(&path);
+        let tiered = TieredGraph::open(&path, config.clone()).unwrap();
+        assert_eq!(tiered.strategy(), LoadStrategy::MmapBacked);
+        assert_eq!(
+            tiered.hot.get_external_reference(&bound.id),
+            Some(bound.clone()),
+            "a relation-bound endpoint must hydrate with its managed relation"
+        );
+        assert_eq!(
+            tiered.hot.get_external_reference(&standalone.id),
+            None,
+            "an unrelated standalone record must remain cold"
+        );
+        assert_eq!(
+            tiered.hot.to_snapshot().relations.get(&relation.id),
+            Some(&relation)
+        );
+        {
+            let scope_guard = tiered.managed_scope.read();
+            let scope = scope_guard
+                .as_ref()
+                .expect("mmap mode records managed scope");
+            assert!(scope.external_reference_ids.contains(&bound.id));
+            assert!(!scope.external_reference_ids.contains(&standalone.id));
+        }
+
+        tiered.save().unwrap();
+        let reopened = TieredGraph::open(&path, config).unwrap();
+        let reopened_snapshot = reopened.cold_snapshot.read();
+        let reopened_snapshot = reopened_snapshot.as_ref().unwrap();
+        assert_eq!(
+            reopened_snapshot.external_references.get(&bound.id),
+            Some(&bound)
+        );
+        assert_eq!(
+            reopened_snapshot.external_references.get(&standalone.id),
+            Some(&standalone),
+            "saving the managed subset must preserve unrelated cold records"
+        );
+        assert_eq!(
+            reopened_snapshot.relations.get(&relation.id),
+            Some(&relation)
+        );
+    }
+
+    #[test]
+    fn mmap_backed_save_merges_external_reference_add_remove_and_reopen() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+        let entity = test_entity("external_mutator");
+        let old_bound =
+            ExternalReference::new_resolved("python-module-v1", "requests", "get").unwrap();
+        let untouched_cold =
+            ExternalReference::new_resolved("npm-package-v1", "left-pad", "default").unwrap();
+        let old_relation = test_external_relation(entity.id, old_bound.id, "requests.get");
+        let mut snapshot = GraphSnapshot::empty();
+        snapshot.entities.insert(entity.id, entity.clone());
+        snapshot
+            .external_references
+            .insert(old_bound.id, old_bound.clone());
+        snapshot
+            .external_references
+            .insert(untouched_cold.id, untouched_cold.clone());
+        snapshot
+            .relations
+            .insert(old_relation.id, old_relation.clone());
+        rebuild_relation_indexes(&mut snapshot);
+        mmap::atomic_write(&path, &snapshot).unwrap();
+
+        let config = force_mmap_config_with_full_hot(&path);
+        let tiered = TieredGraph::open(&path, config.clone()).unwrap();
+        assert_eq!(tiered.strategy(), LoadStrategy::MmapBacked);
+        let new_bound =
+            ExternalReference::new_resolved("python-module-v1", "urllib", "open").unwrap();
+        let new_standalone =
+            ExternalReference::new_resolved("npm-package-v1", "@kin/runtime", "connect").unwrap();
+        let new_relation = test_external_relation(entity.id, new_bound.id, "urllib.open");
+        tiered
+            .hot
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: Vec::new(),
+                relation_deltas: vec![
+                    RelationDelta::Removed {
+                        old: old_relation.clone(),
+                    },
+                    RelationDelta::Added {
+                        new: new_relation.clone(),
+                    },
+                ],
+                tree_deltas: Vec::new(),
+                admission_policy_delta: None,
+                external_reference_deltas: vec![
+                    ExternalReferenceDelta::Removed {
+                        old: old_bound.clone(),
+                    },
+                    ExternalReferenceDelta::Added {
+                        new: new_bound.clone(),
+                    },
+                    ExternalReferenceDelta::Added {
+                        new: new_standalone.clone(),
+                    },
+                ],
+            })
+            .unwrap();
+        tiered.save().unwrap();
+
+        {
+            let saved = tiered.cold_snapshot.read();
+            let saved = saved.as_ref().unwrap();
+            assert!(!saved.external_references.contains_key(&old_bound.id));
+            assert!(!saved.relations.contains_key(&old_relation.id));
+            assert_eq!(
+                saved.external_references.get(&untouched_cold.id),
+                Some(&untouched_cold),
+                "an unmanaged cold standalone record must not be replaced by the hot subset"
+            );
+            assert_eq!(
+                saved.external_references.get(&new_bound.id),
+                Some(&new_bound)
+            );
+            assert_eq!(
+                saved.external_references.get(&new_standalone.id),
+                Some(&new_standalone)
+            );
+            assert_eq!(saved.relations.get(&new_relation.id), Some(&new_relation));
+        }
+
+        tiered
+            .hot
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: Vec::new(),
+                relation_deltas: Vec::new(),
+                tree_deltas: Vec::new(),
+                admission_policy_delta: None,
+                external_reference_deltas: vec![ExternalReferenceDelta::Removed {
+                    old: new_standalone.clone(),
+                }],
+            })
+            .unwrap();
+        tiered.save().unwrap();
+
+        let reopened = TieredGraph::open(&path, config).unwrap();
+        let reopened_snapshot = reopened.cold_snapshot.read();
+        let reopened_snapshot = reopened_snapshot.as_ref().unwrap();
+        assert!(!reopened_snapshot
+            .external_references
+            .contains_key(&old_bound.id));
+        assert!(!reopened_snapshot
+            .external_references
+            .contains_key(&new_standalone.id));
+        assert_eq!(
+            reopened_snapshot
+                .external_references
+                .get(&untouched_cold.id),
+            Some(&untouched_cold)
+        );
+        assert_eq!(
+            reopened_snapshot.external_references.get(&new_bound.id),
+            Some(&new_bound)
+        );
+        assert_eq!(
+            reopened_snapshot.relations.get(&new_relation.id),
+            Some(&new_relation)
+        );
     }
 
     #[test]

@@ -9,10 +9,10 @@
 // IDs
 pub use kin_model::{
     ArtifactId, ArtifactRevisionId, AuthorId, ConflictId, ContractId, EntityId, EntityRevisionId,
-    EvidenceId, FilePathId, GitObjectId, Hash256, IntentId, LanguageId, OperationId, RefName,
-    RefTarget, RelationId, RelationRevisionId, RepoPath, RepositoryId, ResolvedArtifact,
-    ResolvedTree, RetrievalKey, RetrievalKeyFileResolver, SemanticChangeId, SessionId, SpecId,
-    TreeEntry, TreeStateError, WorkspaceId,
+    EvidenceId, ExternalReferenceId, FilePathId, GitObjectId, Hash256, IntentId, LanguageId,
+    OperationId, RefName, RefTarget, RelationId, RelationRevisionId, RepoPath, RepositoryId,
+    ResolvedArtifact, ResolvedTree, RetrievalKey, RetrievalKeyFileResolver, SemanticChangeId,
+    SessionId, SpecId, TreeEntry, TreeStateError, WorkspaceId,
 };
 
 // Entity types
@@ -26,7 +26,8 @@ pub use kin_model::{GraphNodeId, Relation, RelationKind, RelationOrigin, Relatio
 
 pub use kin_model::ArtifactRevision;
 pub use kin_model::{
-    EntityDelta, LocatedEntry, RelationDelta, SemanticChange, TransactionDelta, TreeDelta,
+    EntityDelta, ExternalReference, ExternalReferenceDelta, LocatedEntry, RelationDelta,
+    SemanticChange, TransactionDelta, TreeDelta,
 };
 
 // Graph query types

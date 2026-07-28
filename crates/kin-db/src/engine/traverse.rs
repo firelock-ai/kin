@@ -67,6 +67,7 @@ pub fn bfs_neighborhood(
         nodes,
         entities: result_entities.into_iter().collect(),
         relations,
+        external_references: std::collections::HashMap::new(),
     }
 }
 
@@ -151,7 +152,17 @@ pub fn expand_neighborhood(
         nodes,
         entities: result_entities.into_iter().collect(),
         relations,
+        external_references: std::collections::HashMap::new(),
     }
+}
+
+/// Borrowed graph collections needed by [`traverse`].
+pub struct TraversalGraph<'a> {
+    pub entities: &'a HashMap<EntityId, Entity>,
+    pub external_references: &'a HashMap<ExternalReferenceId, ExternalReference>,
+    pub relations: &'a HashMap<RelationId, Relation>,
+    pub outgoing: &'a HashMap<GraphNodeId, Vec<RelationId>>,
+    pub incoming: &'a HashMap<GraphNodeId, Vec<RelationId>>,
 }
 
 /// BFS from a typed start node following both incoming and outgoing edges.
@@ -159,15 +170,14 @@ pub fn traverse(
     start: &GraphNodeId,
     edge_kinds: &[RelationKind],
     max_depth: u32,
-    entities: &HashMap<EntityId, Entity>,
-    relations: &HashMap<RelationId, Relation>,
-    outgoing: &HashMap<GraphNodeId, Vec<RelationId>>,
-    incoming: &HashMap<GraphNodeId, Vec<RelationId>>,
+    graph: TraversalGraph<'_>,
 ) -> SubGraph {
     let mut visited: HashSet<GraphNodeId> = HashSet::new();
     let mut seen_relations: HashSet<RelationId> = HashSet::new();
     let mut result_nodes = Vec::new();
     let mut result_entities: HashMap<EntityId, Entity> = HashMap::new();
+    let mut result_external_references: HashMap<ExternalReferenceId, ExternalReference> =
+        HashMap::new();
     let mut result_relations = Vec::new();
     let mut queue: VecDeque<(GraphNodeId, u32)> = VecDeque::new();
     let filter_all = edge_kinds.is_empty();
@@ -175,8 +185,12 @@ pub fn traverse(
     visited.insert(*start);
     result_nodes.push(*start);
     if let Some(entity_id) = start.as_entity() {
-        if let Some(entity) = entities.get(&entity_id) {
+        if let Some(entity) = graph.entities.get(&entity_id) {
             result_entities.insert(entity_id, entity.clone());
+        }
+    } else if let GraphNodeId::ExternalReference(reference_id) = start {
+        if let Some(reference) = graph.external_references.get(reference_id) {
+            result_external_references.insert(*reference_id, reference.clone());
         }
     }
     queue.push_back((*start, 0));
@@ -186,13 +200,13 @@ pub fn traverse(
             continue;
         }
 
-        for edge_ids in [outgoing.get(&current), incoming.get(&current)] {
+        for edge_ids in [graph.outgoing.get(&current), graph.incoming.get(&current)] {
             let Some(edge_ids) = edge_ids else {
                 continue;
             };
 
             for rid in edge_ids {
-                let Some(rel) = relations.get(rid) else {
+                let Some(rel) = graph.relations.get(rid) else {
                     continue;
                 };
                 if !filter_all && !edge_kinds.contains(&rel.kind) {
@@ -213,8 +227,12 @@ pub fn traverse(
                 if visited.insert(neighbor) {
                     result_nodes.push(neighbor);
                     if let Some(entity_id) = neighbor.as_entity() {
-                        if let Some(entity) = entities.get(&entity_id) {
+                        if let Some(entity) = graph.entities.get(&entity_id) {
                             result_entities.insert(entity_id, entity.clone());
+                        }
+                    } else if let GraphNodeId::ExternalReference(reference_id) = neighbor {
+                        if let Some(reference) = graph.external_references.get(&reference_id) {
+                            result_external_references.insert(reference_id, reference.clone());
                         }
                     }
                     queue.push_back((neighbor, depth + 1));
@@ -227,6 +245,7 @@ pub fn traverse(
         nodes: result_nodes,
         entities: result_entities.into_iter().collect(),
         relations: result_relations,
+        external_references: result_external_references.into_iter().collect(),
     }
 }
 

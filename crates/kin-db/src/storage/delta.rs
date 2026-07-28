@@ -15,7 +15,7 @@
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 
 use crate::error::KinDbError;
@@ -150,6 +150,11 @@ pub struct GraphSnapshotDelta {
     pub intents: CollectionDelta<IntentId, Intent>,
     pub downstream_warnings: VecDelta<(IntentId, EntityId, String)>,
     pub entity_revisions: CollectionDelta<EntityId, Vec<EntityRevision>>,
+
+    /// Immutable resolved symbols owned outside this repository.
+    ///
+    /// Deliberately last for additive positional-wire compatibility.
+    pub external_references: CollectionDelta<ExternalReferenceId, ExternalReference>,
 }
 
 impl GraphSnapshotDelta {
@@ -157,7 +162,7 @@ impl GraphSnapshotDelta {
     pub const MAGIC: [u8; 4] = *b"KNDD";
 
     /// Current delta format version.
-    pub const CURRENT_VERSION: u32 = 4;
+    pub const CURRENT_VERSION: u32 = 5;
 
     /// Size of the SHA-256 checksum appended to the wire format.
     pub const CHECKSUM_LEN: usize = 32;
@@ -198,6 +203,7 @@ impl GraphSnapshotDelta {
             intents: CollectionDelta::default(),
             downstream_warnings: VecDelta::default(),
             entity_revisions: CollectionDelta::default(),
+            external_references: CollectionDelta::default(),
         }
     }
 
@@ -235,6 +241,7 @@ impl GraphSnapshotDelta {
             && self.intents.is_empty()
             && self.downstream_warnings.is_empty()
             && self.entity_revisions.is_empty()
+            && self.external_references.is_empty()
     }
 
     /// Total number of individual changes across all collections.
@@ -256,6 +263,7 @@ impl GraphSnapshotDelta {
             + self.resolved_tree.change_count()
             + self.sessions.change_count()
             + self.intents.change_count()
+            + self.external_references.change_count()
     }
 
     fn validate_semantic_changes(&self) -> Result<(), KinDbError> {
@@ -269,9 +277,47 @@ impl GraphSnapshotDelta {
         )
     }
 
+    fn validate_external_references(&self) -> Result<(), KinDbError> {
+        if !self.external_references.modified.is_empty() {
+            return Err(KinDbError::StorageError(
+                "snapshot delta cannot modify immutable external references; remove the old coordinate and add the new coordinate"
+                    .to_string(),
+            ));
+        }
+
+        let mut seen = HashSet::with_capacity(self.external_references.change_count());
+        for (id, reference) in &self.external_references.added {
+            if !seen.insert(*id) {
+                return Err(KinDbError::StorageError(format!(
+                    "snapshot delta repeats external reference {id}"
+                )));
+            }
+            if *id != reference.id {
+                return Err(KinDbError::StorageError(format!(
+                    "snapshot delta external-reference key {id} does not match record identity {}",
+                    reference.id
+                )));
+            }
+            reference.validate().map_err(|error| {
+                KinDbError::StorageError(format!(
+                    "snapshot delta external reference {id} is invalid: {error}"
+                ))
+            })?;
+        }
+        for id in &self.external_references.removed {
+            if !seen.insert(*id) {
+                return Err(KinDbError::StorageError(format!(
+                    "snapshot delta repeats external reference {id}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Serialize the delta to bytes with header and SHA-256 checksum.
     pub fn to_bytes(&self) -> Result<Vec<u8>, KinDbError> {
         self.validate_semantic_changes()?;
+        self.validate_external_references()?;
         let mut buf = Vec::new();
         buf.extend_from_slice(&Self::MAGIC);
         buf.extend_from_slice(&Self::CURRENT_VERSION.to_le_bytes());
@@ -346,6 +392,7 @@ impl GraphSnapshotDelta {
         let delta: Self = rmp_serde::from_slice(body)
             .map_err(|e| KinDbError::StorageError(format!("delta deserialization failed: {e}")))?;
         delta.validate_semantic_changes()?;
+        delta.validate_external_references()?;
         Ok(delta)
     }
 }
@@ -522,6 +569,7 @@ pub fn compute_graph_delta(
         intents: diff_maps(&old.intents, &new.intents),
         downstream_warnings: diff_vecs(&old.downstream_warnings, &new.downstream_warnings),
         entity_revisions: diff_maps(&old.entity_revisions, &new.entity_revisions),
+        external_references: diff_maps_eq(&old.external_references, &new.external_references),
     }
 }
 
@@ -622,6 +670,21 @@ pub fn apply_graph_delta(
         ));
     }
     delta.validate_semantic_changes()?;
+    delta.validate_external_references()?;
+    for (id, _) in &delta.external_references.added {
+        if snapshot.external_references.contains_key(id) {
+            return Err(KinDbError::StorageError(format!(
+                "snapshot delta adds existing external reference {id}"
+            )));
+        }
+    }
+    for id in &delta.external_references.removed {
+        if !snapshot.external_references.contains_key(id) {
+            return Err(KinDbError::StorageError(format!(
+                "snapshot delta removes absent external reference {id}"
+            )));
+        }
+    }
     // Apply into a private candidate so repository identity/path truth and
     // every enrichment that depends on it are validated as one state
     // transition. No snapshot domain becomes visible on any failure.
@@ -634,6 +697,7 @@ pub fn apply_graph_delta(
     apply_map_delta(&mut staged.relations, &delta.relations);
     apply_map_delta(&mut staged.outgoing, &delta.outgoing);
     apply_map_delta(&mut staged.incoming, &delta.incoming);
+    apply_map_delta(&mut staged.external_references, &delta.external_references);
 
     // Change history
     apply_map_delta(&mut staged.changes, &delta.changes);
@@ -745,6 +809,48 @@ mod tests {
     }
 
     #[test]
+    fn external_reference_delta_round_trips_and_rejects_record_tampering() {
+        let reference =
+            ExternalReference::new_resolved("python-module-v1", "requests", "get").unwrap();
+        let base = GraphSnapshot::empty();
+        let mut with_reference = base.clone();
+        with_reference
+            .external_references
+            .insert(reference.id, reference.clone());
+
+        let added = compute_graph_delta(&base, &with_reference, 11);
+        assert_eq!(added.external_references.added.len(), 1);
+        assert!(added.external_references.modified.is_empty());
+        assert!(added.external_references.removed.is_empty());
+
+        let decoded = GraphSnapshotDelta::from_bytes(&added.to_bytes().unwrap()).unwrap();
+        let mut applied = base.clone();
+        apply_graph_delta(&mut applied, &decoded).unwrap();
+        assert_eq!(
+            applied.external_references.get(&reference.id),
+            Some(&reference)
+        );
+
+        let removed = compute_graph_delta(&with_reference, &base, 12);
+        assert_eq!(removed.external_references.removed, vec![reference.id]);
+        let mut applied = with_reference;
+        apply_graph_delta(&mut applied, &removed).unwrap();
+        assert!(applied.external_references.is_empty());
+
+        let mut tampered = reference.clone();
+        tampered.canonical_source.push_str("-tampered");
+        let mut invalid = GraphSnapshotDelta::empty(13);
+        invalid
+            .external_references
+            .added
+            .push((reference.id, tampered));
+        let error = invalid
+            .to_bytes()
+            .expect_err("external-reference content tampering must fail admission");
+        assert!(error.to_string().contains("external reference"));
+    }
+
+    #[test]
     fn delta_decode_and_apply_reject_corrupted_semantic_change_identity_atomically() {
         let mut change = seal_change(SemanticChange {
             id: SemanticChangeId::from_hash(Hash256::from_bytes([0x92; 32])),
@@ -761,6 +867,7 @@ mod tests {
             risk_summary: None,
             origin: kin_model::ChangeOrigin::Native,
             admission_policy_delta: None,
+            external_reference_deltas: Vec::new(),
         });
         change.message.push_str(" after id was sealed");
         let mut delta = GraphSnapshotDelta::empty(0);
@@ -789,7 +896,7 @@ mod tests {
 
         assert!(error
             .to_string()
-            .contains("unsupported delta version: 2 (expected 4)"));
+            .contains("unsupported delta version: 2 (expected 5)"));
     }
 
     // -- Helpers -----------------------------------------------------------

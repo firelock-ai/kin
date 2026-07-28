@@ -369,6 +369,9 @@ fn compute_non_entity_node_hash(node: &GraphNodeId) -> MerkleHash {
         GraphNodeId::Contract(id) => hash_tagged_node("contract", &id.to_string()),
         GraphNodeId::Work(id) => hash_tagged_node("work", &id.to_string()),
         GraphNodeId::VerificationRun(id) => hash_tagged_node("verification_run", &id.to_string()),
+        GraphNodeId::ExternalReference(id) => {
+            hash_tagged_node("external_reference", &id.to_string())
+        }
     }
 }
 
@@ -649,9 +652,9 @@ pub fn compute_graph_root_hash(snapshot: &GraphSnapshot) -> MerkleHash {
 /// It is therefore not a safe sidecar identity for exact repository-tree or
 /// artifact enrichment changes. This digest binds those domains as well while
 /// remaining substantially cheaper than cloning and hashing a full snapshot.
-pub const RETRIEVAL_AUTHORITY_HASH_VERSION: u32 = 1;
+pub const RETRIEVAL_AUTHORITY_HASH_VERSION: u32 = 2;
 
-const RETRIEVAL_AUTHORITY_DOMAIN: &[u8] = b"kin-retrieval-authority-v1:";
+const RETRIEVAL_AUTHORITY_DOMAIN: &[u8] = b"kin-retrieval-authority-v2:";
 
 /// Compute the retrieval-sidecar authority for an owned snapshot.
 pub fn compute_retrieval_authority_hash(snapshot: &GraphSnapshot) -> MerkleHash {
@@ -663,6 +666,11 @@ pub fn compute_retrieval_authority_hash(snapshot: &GraphSnapshot) -> MerkleHash 
     hash_map_domain(&mut hasher, "retrieval_entities", &snapshot.entities);
     hash_map_domain(&mut hasher, "retrieval_relations", &snapshot.relations);
     hash_map_domain(&mut hasher, "retrieval_changes", &snapshot.changes);
+    hash_map_domain(
+        &mut hasher,
+        "retrieval_external_references",
+        &snapshot.external_references,
+    );
     hash_map_domain(
         &mut hasher,
         "retrieval_entity_revisions",
@@ -727,6 +735,11 @@ pub(crate) fn compute_locate_retrieval_authority_hash(
     );
     hash_domain_elements(
         &mut hasher,
+        "retrieval_external_references",
+        &snapshot.external_references.iter().collect::<Vec<_>>(),
+    );
+    hash_domain_elements(
+        &mut hasher,
         "retrieval_entity_revisions",
         &snapshot.entity_revisions.iter().collect::<Vec<_>>(),
     );
@@ -772,6 +785,7 @@ pub(crate) fn compute_live_retrieval_authority_hash(
     relations: &hashbrown::HashMap<RelationId, Relation>,
     changes: &hashbrown::HashMap<SemanticChangeId, SemanticChange>,
     entity_revisions: &hashbrown::HashMap<EntityId, Vec<EntityRevision>>,
+    external_references: &hashbrown::HashMap<ExternalReferenceId, ExternalReference>,
     resolved_tree: &ResolvedTree,
     shallow_files: &hashbrown::HashMap<FilePathId, ShallowTrackedFile>,
     file_layouts: &hashbrown::HashMap<FilePathId, FileLayout>,
@@ -797,6 +811,11 @@ pub(crate) fn compute_live_retrieval_authority_hash(
         &mut hasher,
         "retrieval_changes",
         &changes.iter().collect::<Vec<_>>(),
+    );
+    hash_domain_elements(
+        &mut hasher,
+        "retrieval_external_references",
+        &external_references.iter().collect::<Vec<_>>(),
     );
     hash_domain_elements(
         &mut hasher,
@@ -897,11 +916,11 @@ pub fn compute_root_hash_generic(
 /// that persist a truth hash should persist [`RepoTruthHash`] instead of a bare
 /// digest so a format upgrade is distinguishable from an actual change in repo
 /// truth.
-pub const REPO_TRUTH_HASH_VERSION: u32 = 4;
+pub const REPO_TRUTH_HASH_VERSION: u32 = 5;
 
 /// Domain separator for the repo-truth digest. Carries the encoding version so
 /// a v1 digest can never be mistaken for a v2 digest of the same snapshot.
-const REPO_TRUTH_DOMAIN: &[u8] = b"kin-repo-truth-v4:";
+const REPO_TRUTH_DOMAIN: &[u8] = b"kin-repo-truth-v5:";
 
 /// A repo-truth digest tagged with the encoding version that produced it.
 ///
@@ -1017,6 +1036,7 @@ pub fn compute_repo_truth_hash(snapshot: &GraphSnapshot) -> MerkleHash {
         // legitimately populate it on an otherwise unchanged repo.
         entity_revisions: _,
         repository_authority,
+        external_references,
     } = snapshot;
 
     let mut hasher = Sha256::new();
@@ -1032,6 +1052,7 @@ pub fn compute_repo_truth_hash(snapshot: &GraphSnapshot) -> MerkleHash {
 
     hash_map_domain(&mut hasher, "entities", entities);
     hash_map_domain(&mut hasher, "relations", relations);
+    hash_map_domain(&mut hasher, "external_references", external_references);
 
     hash_map_domain(&mut hasher, "changes", changes);
     hash_map_domain(&mut hasher, "work_items", work_items);
@@ -2096,6 +2117,7 @@ mod tests {
             risk_summary: None,
             origin: kin_model::ChangeOrigin::Native,
             admission_policy_delta: None,
+            external_reference_deltas: Vec::new(),
         };
         change.id =
             kin_model::compute_semantic_change_id(&change).expect("valid semantic change fixture");
@@ -2467,6 +2489,33 @@ mod tests {
     }
 
     #[test]
+    fn retrieval_and_repo_truth_bind_external_reference_records() {
+        let empty = GraphSnapshot::empty();
+        let reference =
+            ExternalReference::new_resolved("python-module-v1", "requests", "get").unwrap();
+        let mut with_reference = GraphSnapshot::empty();
+        with_reference
+            .external_references
+            .insert(reference.id, reference);
+
+        assert_eq!(
+            compute_graph_root_hash(&empty),
+            compute_graph_root_hash(&with_reference),
+            "the legacy entity/relation root deliberately omits unconnected records"
+        );
+        assert_ne!(
+            compute_retrieval_authority_hash(&empty),
+            compute_retrieval_authority_hash(&with_reference),
+            "retrieval sidecars must bind immutable external coordinates"
+        );
+        assert_ne!(
+            compute_repo_truth_hash(&empty),
+            compute_repo_truth_hash(&with_reference),
+            "repo truth must bind immutable external coordinates"
+        );
+    }
+
+    #[test]
     fn owned_locate_and_live_retrieval_authorities_are_byte_equivalent() {
         let mut snapshot = GraphSnapshot::empty();
         let artifact_id = ArtifactId::new();
@@ -2484,6 +2533,9 @@ mod tests {
         });
         let entity = test_entity("container_entry");
         snapshot.entities.insert(entity.id, entity);
+        let reference =
+            ExternalReference::new_resolved("python-module-v1", "requests", "get").unwrap();
+        snapshot.external_references.insert(reference.id, reference);
 
         let graph_root_hash = compute_graph_root_hash(&snapshot);
         let owned = compute_retrieval_authority_hash(&snapshot);
@@ -2533,6 +2585,11 @@ mod tests {
             .iter()
             .map(|value| (value.file_id.clone(), value.clone()))
             .collect();
+        let external_references = snapshot
+            .external_references
+            .iter()
+            .map(|(id, reference)| (*id, reference.clone()))
+            .collect();
         assert_eq!(
             owned,
             compute_live_retrieval_authority_hash(
@@ -2541,6 +2598,7 @@ mod tests {
                 &relations,
                 &changes,
                 &revisions,
+                &external_references,
                 &snapshot.resolved_tree,
                 &shallow,
                 &layouts,

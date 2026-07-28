@@ -19,16 +19,17 @@ use parking_lot::Mutex;
 use kin_model::{
     ArtifactId, AuthorId, AuthorityRoot, ChangeStore, DefaultRefExpectation, DefaultRefMutation,
     EntityDelta, EntityStore, ExternalChangeAlias, ExternalObjectId, ExternalObjectKind,
-    ExternalObjectRecord, FrozenLocalOverlay, GitExternalAuthority, GitObjectBodyLoader,
-    GitObjectDependencyKind, GitObjectId, GitTreeEntryMode, Hash256, LocalAdmissionRuleSourceKind,
-    MergeEntryResolution, MergeResolutionPayload, MergeTransactionRecord, ModelError, OperationId,
-    RefExpectation, RefMutation, RefName, RefTarget, RefUpdatePolicy, RelationDelta, RepoPath,
-    RepositoryAuthorityStore, RepositoryCommitOutcome, RepositoryCommitReceipt, RepositoryId,
-    RepositoryOperationRecord, RepositoryRef, RepositoryRefState, RepositoryTransaction,
-    ResolvedArtifact, ResolvedTree, RootBundle, SemanticChangeId, SensitiveArtifactKind,
-    SharedAdmissionPolicy, Timestamp, TreeDelta, TreeEntry, WorkspaceHead, WorkspaceId,
-    WorkspaceSemanticOverlay, WorkspaceSnapshotBinding, WorkspaceState, WorkspaceTreeArtifact,
-    WorkspaceTreeSnapshot, REPOSITORY_ROOT_SCHEMA_VERSION,
+    ExternalObjectRecord, ExternalReferenceDelta, FrozenLocalOverlay, GitExternalAuthority,
+    GitObjectBodyLoader, GitObjectDependencyKind, GitObjectId, GitTreeEntryMode, Hash256,
+    LocalAdmissionRuleSourceKind, MergeEntryResolution, MergeResolutionPayload,
+    MergeTransactionRecord, ModelError, OperationId, RefExpectation, RefMutation, RefName,
+    RefTarget, RefUpdatePolicy, RelationDelta, RepoPath, RepositoryAuthorityStore,
+    RepositoryCommitOutcome, RepositoryCommitReceipt, RepositoryId, RepositoryOperationRecord,
+    RepositoryRef, RepositoryRefState, RepositoryTransaction, ResolvedArtifact, ResolvedTree,
+    RootBundle, SemanticChangeId, SensitiveArtifactKind, SharedAdmissionPolicy, Timestamp,
+    TreeDelta, TreeEntry, WorkspaceHead, WorkspaceId, WorkspaceSemanticOverlay,
+    WorkspaceSnapshotBinding, WorkspaceState, WorkspaceTreeArtifact, WorkspaceTreeSnapshot,
+    REPOSITORY_ROOT_SCHEMA_VERSION,
 };
 
 use crate::admission::{
@@ -637,7 +638,7 @@ impl<B: StorageBackend + ?Sized + 'static> DurableAuthorityPersistence<Repositor
 
 /// Durable graph-first repository authority.
 ///
-/// This is the only public mutation surface for an authority-bearing v12
+/// This is the only public mutation surface for an authority-bearing v13
 /// snapshot. Mutable `InMemoryGraph` remains available for derived query
 /// preparation and legacy non-authority graphs, but is never stored inside
 /// this publication cell.
@@ -821,7 +822,7 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
                 .as_ref()
                 .ok_or_else(|| {
                     storage(format!(
-                        "repository {} snapshot has no v12 authority envelope",
+                        "repository {} snapshot has no v13 authority envelope",
                         repository_id
                     ))
                 })?;
@@ -1216,7 +1217,7 @@ impl RepositoryAuthorityManager<LocalFileBackend> {
         let snapshot = GraphSnapshot::from_bytes(&locked.authority().snapshot_bytes)?;
         let metadata = snapshot.repository_authority.as_ref().ok_or_else(|| {
             storage(format!(
-                "repository {} frozen snapshot has no v12 authority envelope",
+                "repository {} frozen snapshot has no v13 authority envelope",
                 self.repository_id
             ))
         })?;
@@ -1595,6 +1596,7 @@ fn validate_unscoped_history_caches(snapshot: &GraphSnapshot) -> Result<(), KinD
         || !snapshot.relations.is_empty()
         || !snapshot.outgoing.is_empty()
         || !snapshot.incoming.is_empty()
+        || !snapshot.external_references.is_empty()
         || !snapshot.resolved_tree.is_empty()
         || !snapshot.entity_revisions.is_empty()
         || !snapshot.shallow_files.is_empty()
@@ -3080,11 +3082,13 @@ fn resolve_workspace_base_graph_snapshot(
         base.relations = resolved.relations;
         base.entity_revisions = resolved.entity_revisions;
         base.resolved_tree = resolved.tree;
+        base.external_references = resolved.external_references;
     } else {
         base.entities.clear();
         base.relations.clear();
         base.entity_revisions.clear();
         base.resolved_tree = ResolvedTree::default();
+        base.external_references.clear();
     }
     rebuild_snapshot_adjacency(&mut base);
     base.validate_storage_admission()?;
@@ -3139,7 +3143,38 @@ fn derive_workspace_semantic_overlay(
             }
         })
         .collect();
-    WorkspaceSemanticOverlay::new(entity_deltas, relation_deltas).map_err(Into::into)
+    let external_reference_deltas = base
+        .external_references
+        .keys()
+        .chain(desired.external_references.keys())
+        .copied()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(|external_reference_id| {
+            match (
+                base.external_references.get(&external_reference_id),
+                desired.external_references.get(&external_reference_id),
+            ) {
+                (None, Some(new)) => Ok(Some(ExternalReferenceDelta::Added { new: new.clone() })),
+                (Some(old), Some(new)) if old != new => Err(storage(format!(
+                    "workspace cumulative semantic overlay cannot modify immutable external \
+                     reference {external_reference_id}; remove the old coordinate and add a new \
+                     identity"
+                ))),
+                (Some(old), None) => Ok(Some(ExternalReferenceDelta::Removed { old: old.clone() })),
+                (Some(_), Some(_)) | (None, None) => Ok(None),
+            }
+        })
+        .collect::<Result<Vec<_>, KinDbError>>()?
+        .into_iter()
+        .flatten()
+        .collect();
+    WorkspaceSemanticOverlay::new_with_external_references(
+        entity_deltas,
+        relation_deltas,
+        external_reference_deltas,
+    )
+    .map_err(Into::into)
 }
 
 fn validate_exact_workspace_graph(
@@ -3156,6 +3191,12 @@ fn validate_exact_workspace_graph(
     if desired.relations != rematerialized.relations {
         return Err(storage(format!(
             "workspace {} cumulative semantic overlay did not reproduce the desired relations",
+            workspace.workspace_id
+        )));
+    }
+    if desired.external_references != rematerialized.external_references {
+        return Err(storage(format!(
+            "workspace {} cumulative semantic overlay did not reproduce the desired external references",
             workspace.workspace_id
         )));
     }
@@ -4576,11 +4617,12 @@ mod tests {
         compute_resolved_tree_hash, compute_semantic_change_id, AdmissionCase,
         AdmissionPolicyDelta, AdmissionRuleSource, AdmissionRuleSourceKind, ArtifactId, AuthorId,
         ChangeOrigin, DefaultRefMutation, EffectiveAdmissionPolicyStamp, Entity, EntityDelta,
-        EntityId, EntityKind, EntityMetadata, EntityRole, FilePathId, FingerprintAlgorithm,
-        FrozenLocalOverlayDelta, GitExternalAuthorityDelta, GitObjectFormat, GitRawRef,
-        GitRawTarget, GraphNodeId, LanguageId, LocalAdmissionRuleSource, LocatedEntry,
-        MergeConflictEntry, MergeConflictSubject, MergeDivergence, MergeEntryResolution,
-        MergeOpening, MergeParentBinding, MergeResolutionProvenance, MergeSide, MergeSideValue,
+        EntityId, EntityKind, EntityMetadata, EntityRole, ExternalReference,
+        ExternalReferenceDelta, FilePathId, FingerprintAlgorithm, FrozenLocalOverlayDelta,
+        GitExternalAuthorityDelta, GitObjectFormat, GitRawRef, GitRawTarget, GraphNodeId,
+        LanguageId, LocalAdmissionRuleSource, LocatedEntry, MergeConflictEntry,
+        MergeConflictSubject, MergeDivergence, MergeEntryResolution, MergeOpening,
+        MergeParentBinding, MergeResolutionProvenance, MergeSide, MergeSideValue,
         MergeTransactionDelta, MergeTransactionState, MergeWorkspaceRestorePoint, RefMutation,
         Relation, RelationDelta, RelationId, RelationKind, RelationOrigin, RepoPath, ResolvedTree,
         SemanticChange, SemanticFingerprint, SensitiveArtifactAllowance, SensitiveArtifactKind,
@@ -4923,6 +4965,7 @@ mod tests {
             workspace_mutation: None,
             local_overlay_delta: None,
             merge_transaction_delta: None,
+            sealed_observation: None,
         }
     }
 
@@ -5028,6 +5071,7 @@ mod tests {
             relation_deltas: Vec::new(),
             tree_deltas: tree_deltas.clone(),
             admission_policy_delta: Some(AdmissionPolicyDelta::initialize(shared.clone())),
+            external_reference_deltas: Vec::new(),
             projected_files: Vec::new(),
             spec_link: None,
             evidence: Vec::new(),
@@ -5841,6 +5885,7 @@ mod tests {
                 ),
             }],
             admission_policy_delta: None,
+            external_reference_deltas: Vec::new(),
             projected_files: Vec::new(),
             spec_link: None,
             evidence: Vec::new(),
@@ -5893,6 +5938,7 @@ mod tests {
                 },
             ],
             admission_policy_delta: None,
+            external_reference_deltas: Vec::new(),
             projected_files: Vec::new(),
             spec_link: None,
             evidence: Vec::new(),
@@ -5978,6 +6024,7 @@ mod tests {
             relation_deltas: Vec::new(),
             tree_deltas: mutation.tree_deltas.clone(),
             admission_policy_delta: Some(AdmissionPolicyDelta::initialize(shared)),
+            external_reference_deltas: Vec::new(),
             projected_files: Vec::new(),
             spec_link: None,
             evidence: Vec::new(),
@@ -6215,6 +6262,7 @@ mod tests {
             relation_deltas: Vec::new(),
             tree_deltas: vec![removal],
             admission_policy_delta: None,
+            external_reference_deltas: Vec::new(),
             projected_files: Vec::new(),
             spec_link: None,
             evidence: Vec::new(),
@@ -6592,6 +6640,7 @@ mod tests {
             relation_deltas: Vec::new(),
             tree_deltas: Vec::new(),
             admission_policy_delta: None,
+            external_reference_deltas: Vec::new(),
             projected_files: Vec::new(),
             spec_link: None,
             evidence: Vec::new(),
@@ -6942,6 +6991,7 @@ mod tests {
                 new: original.clone(),
             }],
             admission_policy_delta: None,
+            external_reference_deltas: Vec::new(),
             projected_files: Vec::new(),
             spec_link: None,
             evidence: Vec::new(),
@@ -6967,6 +7017,7 @@ mod tests {
                 ),
             }],
             admission_policy_delta: None,
+            external_reference_deltas: Vec::new(),
             projected_files: Vec::new(),
             spec_link: None,
             evidence: Vec::new(),
@@ -7013,6 +7064,7 @@ mod tests {
             relation_deltas: Vec::new(),
             tree_deltas: Vec::new(),
             admission_policy_delta: None,
+            external_reference_deltas: Vec::new(),
             projected_files: Vec::new(),
             spec_link: None,
             evidence: Vec::new(),
@@ -7034,6 +7086,7 @@ mod tests {
             relation_deltas: Vec::new(),
             tree_deltas: Vec::new(),
             admission_policy_delta: None,
+            external_reference_deltas: Vec::new(),
             projected_files: Vec::new(),
             spec_link: None,
             evidence: Vec::new(),
@@ -7055,6 +7108,7 @@ mod tests {
             relation_deltas: Vec::new(),
             tree_deltas: Vec::new(),
             admission_policy_delta: None,
+            external_reference_deltas: Vec::new(),
             projected_files: Vec::new(),
             spec_link: None,
             evidence: Vec::new(),
@@ -7279,6 +7333,296 @@ mod tests {
             error.to_string().contains("workspace semantics"),
             "unexpected v11 authority rejection: {error}"
         );
+    }
+
+    fn assert_workspace_external_reference_authority<B>(backend: Arc<B>)
+    where
+        B: StorageBackend + ?Sized + 'static,
+    {
+        let manager =
+            RepositoryAuthorityManager::open(repository_id(), Arc::clone(&backend)).unwrap();
+        let mut entity =
+            semantic_test_entity("src/lib.rs", "imports_requests", LanguageId::Rust, 0x71);
+        entity.file_origin = None;
+        let base_reference =
+            ExternalReference::new_resolved("python-module-v1", "requests", "get").unwrap();
+        let base_relation = Relation {
+            id: RelationId::from_content(
+                &entity.id.to_string(),
+                &base_reference.id.to_string(),
+                "imports",
+            ),
+            kind: RelationKind::Imports,
+            src: GraphNodeId::Entity(entity.id),
+            dst: GraphNodeId::ExternalReference(base_reference.id),
+            confidence: 1.0,
+            origin: RelationOrigin::Lsp,
+            created_in: None,
+            import_source: Some("requests.get".to_string()),
+            evidence: Vec::new(),
+        };
+
+        let shared = SharedAdmissionPolicy::empty(0);
+        let mut change = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+            origin: ChangeOrigin::Native,
+            parents: Vec::new(),
+            timestamp: Timestamp(
+                chrono::DateTime::parse_from_rfc3339("2026-07-28T16:00:00Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+            ),
+            author: AuthorId::new("authority-test"),
+            message: "persist external-reference repository authority".to_string(),
+            entity_deltas: vec![EntityDelta::Added {
+                new: entity.clone(),
+            }],
+            relation_deltas: vec![RelationDelta::Added {
+                new: base_relation.clone(),
+            }],
+            tree_deltas: Vec::new(),
+            admission_policy_delta: Some(AdmissionPolicyDelta::initialize(shared.clone())),
+            external_reference_deltas: vec![ExternalReferenceDelta::Added {
+                new: base_reference.clone(),
+            }],
+            projected_files: Vec::new(),
+            spec_link: None,
+            evidence: Vec::new(),
+            risk_summary: None,
+        };
+        change.id = compute_semantic_change_id(&change).unwrap();
+        let base_target = RefTarget::change(change.id);
+        let tree_hash = compute_resolved_tree_hash(&ResolvedTree::default()).unwrap();
+        let workspace_id = WorkspaceId::from_uuid(Uuid::from_u128(0x5e2f));
+        let frozen_overlay =
+            FrozenLocalOverlay::new(workspace_id, 0, AdmissionCase::Sensitive, Vec::new()).unwrap();
+        let effective_policy = EffectiveAdmissionPolicyStamp {
+            shared: shared.stamp(),
+            local: frozen_overlay.stamp(),
+        };
+        let main = RefName::branch(b"main").unwrap();
+        let mut initial = transaction_shell(&manager, 0x5e2f);
+        initial.changes.push(change);
+        initial.ref_mutations.push(RefMutation {
+            name: main.clone(),
+            expected: RefExpectation::MustNotExist,
+            new_target: Some(base_target.clone()),
+            policy: RefUpdatePolicy::FastForwardOnly,
+        });
+        initial.default_ref_mutation = Some(DefaultRefMutation {
+            expected: DefaultRefExpectation::MustBeUnset,
+            new_default: Some(main.clone()),
+        });
+        initial.workspace_mutation = Some(WorkspaceMutation {
+            workspace_id,
+            expected: WorkspaceExpectation::MustNotExist,
+            new_generation: 0,
+            new_head: WorkspaceHead::Symbolic { target: main },
+            new_base_target: Some(base_target),
+            new_base_tree_hash: Some(tree_hash),
+            tree_deltas: Vec::new(),
+            new_tree_hash: tree_hash,
+            semantic_delta: WorkspaceSemanticDelta::new_with_external_references(
+                vec![EntityDelta::Added {
+                    new: entity.clone(),
+                }],
+                vec![RelationDelta::Added {
+                    new: base_relation.clone(),
+                }],
+                vec![ExternalReferenceDelta::Added {
+                    new: base_reference.clone(),
+                }],
+            )
+            .unwrap(),
+            new_shared_admission_policy: shared,
+            new_admission_policy: effective_policy,
+        });
+        initial.local_overlay_delta = Some(FrozenLocalOverlayDelta::initialize(frozen_overlay));
+
+        manager.commit_repository_transaction(initial).unwrap();
+        let workspace = manager.read_authority().metadata().workspaces[0].clone();
+        assert!(
+            workspace.semantic_overlay.is_empty(),
+            "a workspace matching its committed base must not persist a compensating overlay"
+        );
+        let committed_base = manager
+            .workspace_graph_snapshot(&repository_id(), &workspace.workspace_id)
+            .unwrap()
+            .expect("committed external-reference base materializes");
+        assert_eq!(
+            committed_base.external_references.get(&base_reference.id),
+            Some(&base_reference)
+        );
+        assert_eq!(
+            committed_base.relations.get(&base_relation.id),
+            Some(&base_relation)
+        );
+
+        let standalone =
+            ExternalReference::new_resolved("npm-package-v1", "@mui/utils", "merge").unwrap();
+        let workspace_reference =
+            ExternalReference::new_resolved("python-module-v1", "urllib", "open").unwrap();
+        let workspace_relation = Relation {
+            id: RelationId::from_content(
+                &entity.id.to_string(),
+                &workspace_reference.id.to_string(),
+                "imports",
+            ),
+            kind: RelationKind::Imports,
+            src: GraphNodeId::Entity(entity.id),
+            dst: GraphNodeId::ExternalReference(workspace_reference.id),
+            confidence: 1.0,
+            origin: RelationOrigin::Manual,
+            created_in: None,
+            import_source: Some("urllib.open".to_string()),
+            evidence: Vec::new(),
+        };
+        let addition = WorkspaceSemanticDelta::new_with_external_references(
+            Vec::new(),
+            vec![RelationDelta::Added {
+                new: workspace_relation.clone(),
+            }],
+            vec![
+                ExternalReferenceDelta::Added {
+                    new: standalone.clone(),
+                },
+                ExternalReferenceDelta::Added {
+                    new: workspace_reference.clone(),
+                },
+            ],
+        )
+        .unwrap();
+        manager
+            .commit_repository_transaction(semantic_workspace_transaction(
+                &manager, 0x5e30, addition,
+            ))
+            .unwrap();
+
+        let added_workspace = manager.read_authority().metadata().workspaces[0].clone();
+        assert_eq!(
+            added_workspace
+                .semantic_overlay
+                .external_reference_deltas()
+                .len(),
+            2,
+            "the cumulative overlay must retain both standalone and relation-bound additions"
+        );
+        let added = manager
+            .workspace_graph_snapshot(&repository_id(), &added_workspace.workspace_id)
+            .unwrap()
+            .expect("workspace external-reference additions materialize");
+        for reference in [&base_reference, &standalone, &workspace_reference] {
+            assert_eq!(
+                added.external_references.get(&reference.id),
+                Some(reference)
+            );
+        }
+        assert_eq!(
+            added.relations.get(&workspace_relation.id),
+            Some(&workspace_relation)
+        );
+
+        let reopened =
+            RepositoryAuthorityManager::open(repository_id(), Arc::clone(&backend)).unwrap();
+        let reopened_added = reopened
+            .workspace_graph_snapshot(&repository_id(), &added_workspace.workspace_id)
+            .unwrap()
+            .expect("workspace external-reference additions survive reopen");
+        assert_eq!(reopened_added.external_references.len(), 3);
+        assert_eq!(
+            reopened_added.relations.get(&workspace_relation.id),
+            Some(&workspace_relation)
+        );
+
+        let removal = WorkspaceSemanticDelta::new_with_external_references(
+            Vec::new(),
+            vec![
+                RelationDelta::Removed {
+                    old: base_relation.clone(),
+                },
+                RelationDelta::Removed {
+                    old: workspace_relation.clone(),
+                },
+            ],
+            vec![
+                ExternalReferenceDelta::Removed {
+                    old: base_reference.clone(),
+                },
+                ExternalReferenceDelta::Removed {
+                    old: standalone.clone(),
+                },
+                ExternalReferenceDelta::Removed {
+                    old: workspace_reference.clone(),
+                },
+            ],
+        )
+        .unwrap();
+        reopened
+            .commit_repository_transaction(semantic_workspace_transaction(
+                &reopened, 0x5e31, removal,
+            ))
+            .unwrap();
+
+        let removed_workspace = reopened.read_authority().metadata().workspaces[0].clone();
+        assert_eq!(
+            removed_workspace
+                .semantic_overlay
+                .external_reference_deltas(),
+            &[ExternalReferenceDelta::Removed {
+                old: base_reference.clone(),
+            }],
+            "the cumulative overlay must retain the exact removal relative to committed base"
+        );
+        let removed = reopened
+            .workspace_graph_snapshot(&repository_id(), &removed_workspace.workspace_id)
+            .unwrap()
+            .expect("workspace external-reference removals materialize");
+        assert!(removed.external_references.is_empty());
+        assert!(!removed.relations.contains_key(&base_relation.id));
+        assert!(!removed.relations.contains_key(&workspace_relation.id));
+
+        let final_reopen = RepositoryAuthorityManager::open(repository_id(), backend).unwrap();
+        let final_snapshot = final_reopen
+            .workspace_graph_snapshot(&repository_id(), &removed_workspace.workspace_id)
+            .unwrap()
+            .expect("workspace external-reference removals survive reopen");
+        assert!(final_snapshot.external_references.is_empty());
+        assert!(!final_snapshot.relations.contains_key(&base_relation.id));
+        assert!(!final_snapshot
+            .relations
+            .contains_key(&workspace_relation.id));
+    }
+
+    #[test]
+    fn workspace_external_reference_authority_is_backend_generic_in_memory() {
+        assert_workspace_external_reference_authority(Arc::new(MemoryBackend::default()));
+    }
+
+    #[test]
+    fn workspace_external_reference_authority_is_backend_generic_on_local_storage() {
+        let directory = TempDir::new().unwrap();
+        assert_workspace_external_reference_authority(Arc::new(LocalFileBackend::new(
+            directory.path(),
+        )));
+    }
+
+    #[cfg(feature = "sql")]
+    #[test]
+    fn workspace_external_reference_authority_is_backend_generic_on_sqlite() {
+        assert_workspace_external_reference_authority(Arc::new(
+            crate::storage::SqliteBackend::in_memory().unwrap(),
+        ));
+    }
+
+    #[cfg(feature = "gcs")]
+    #[test]
+    fn workspace_external_reference_authority_is_backend_generic_on_gcs_object_store() {
+        assert_workspace_external_reference_authority(Arc::new(
+            crate::storage::GcsBackend::from_store(
+                Box::new(crate::storage::gcs::tests::VersionedMemoryStore::new()),
+                "workspace-external-reference",
+            ),
+        ));
     }
 
     #[test]
@@ -7539,6 +7883,7 @@ mod tests {
             relation_deltas: Vec::new(),
             tree_deltas: Vec::new(),
             admission_policy_delta: None,
+            external_reference_deltas: Vec::new(),
             projected_files: Vec::new(),
             spec_link: None,
             evidence: Vec::new(),
@@ -8527,6 +8872,7 @@ mod tests {
             relation_deltas: Vec::new(),
             tree_deltas: Vec::new(),
             admission_policy_delta: None,
+            external_reference_deltas: Vec::new(),
             projected_files: Vec::new(),
             spec_link: None,
             evidence: Vec::new(),
@@ -8884,6 +9230,7 @@ mod tests {
             relation_deltas: Vec::new(),
             tree_deltas: Vec::new(),
             admission_policy_delta: None,
+            external_reference_deltas: Vec::new(),
             projected_files: Vec::new(),
             spec_link: None,
             evidence: Vec::new(),
@@ -9049,6 +9396,7 @@ mod tests {
                     new: LocatedEntry::new(path.clone(), TreeEntry::blob(body_hash, false)),
                 }],
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
                 projected_files: Vec::new(),
                 spec_link: None,
                 evidence: Vec::new(),

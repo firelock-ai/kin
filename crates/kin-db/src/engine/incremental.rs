@@ -341,6 +341,7 @@ mod tests {
                     new: LocatedEntry::new(path("src/a.rs"), make_entry(10)),
                 }],
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             })
             .unwrap();
 

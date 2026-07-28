@@ -729,7 +729,7 @@ impl GcsBackend {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::storage::format::GraphSnapshot;
     use crate::storage::RepositoryAuthorityManager;
@@ -761,7 +761,7 @@ mod tests {
 
     /// Deterministic GCS-compatible fixture: InMemory payload behavior plus
     /// numeric object versions and atomic UpdateVersion preconditions.
-    struct VersionedMemoryStore {
+    pub(crate) struct VersionedMemoryStore {
         inner: InMemory,
         state: Arc<tokio::sync::Mutex<VersionState>>,
         report_next_get_as_oversized: Arc<AtomicBool>,
@@ -770,7 +770,7 @@ mod tests {
     }
 
     impl VersionedMemoryStore {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             Self {
                 inner: InMemory::new(),
                 state: Arc::new(tokio::sync::Mutex::new(VersionState {
@@ -1021,6 +1021,7 @@ mod tests {
             workspace_mutation: Some(workspace_mutation),
             local_overlay_delta: Some(FrozenLocalOverlayDelta::initialize(overlay)),
             merge_transaction_delta: None,
+            sealed_observation: None,
         };
         drop(lease);
         transaction

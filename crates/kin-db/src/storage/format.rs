@@ -108,6 +108,12 @@ pub struct GraphSnapshot {
     /// CAS; incremental graph deltas are forbidden.
     #[serde(deserialize_with = "deserialize_required_repository_authority")]
     pub repository_authority: Option<PersistedRepositoryAuthority>,
+    /// Resolved symbols owned outside this repository.
+    ///
+    /// Deliberately appended after every v12 field because MessagePack encodes
+    /// this struct positionally. Reordering an existing field would reinterpret
+    /// persisted bytes instead of failing closed at the v13 format boundary.
+    pub external_references: HashMap<ExternalReferenceId, ExternalReference>,
 }
 
 fn deserialize_required_repository_authority<'de, D>(
@@ -142,11 +148,12 @@ pub(crate) struct LocateGraphSnapshot {
     pub structured_artifacts: Vec<StructuredArtifact>,
     pub opaque_artifacts: Vec<OpaqueArtifact>,
     pub resolved_tree: ResolvedTree,
+    pub external_references: FastHashMap<ExternalReferenceId, ExternalReference>,
 }
 
 impl GraphSnapshot {
     /// Current format version.
-    pub const CURRENT_VERSION: u32 = 12;
+    pub const CURRENT_VERSION: u32 = 13;
 
     /// The only on-disk format version this pre-release binary accepts.
     pub const MIN_SUPPORTED_VERSION: u32 = Self::CURRENT_VERSION;
@@ -198,6 +205,7 @@ impl GraphSnapshot {
             downstream_warnings: Vec::new(),
             entity_revisions: HashMap::new(),
             repository_authority: None,
+            external_references: HashMap::new(),
         }
     }
 
@@ -254,6 +262,8 @@ impl GraphSnapshot {
         let contract_ids: HashSet<ContractId> = self.contracts.keys().copied().collect();
         let work_ids: HashSet<WorkId> = self.work_items.keys().copied().collect();
         let run_ids: HashSet<VerificationRunId> = self.verification_runs.keys().copied().collect();
+        let external_reference_ids: HashSet<ExternalReferenceId> =
+            self.external_references.keys().copied().collect();
 
         // 1. Remove orphaned relations (missing node on either endpoint)
         let before = self.relations.len();
@@ -262,25 +272,17 @@ impl GraphSnapshot {
             .artifacts()
             .map(|artifact| artifact.artifact_id)
             .collect();
-        self.relations.retain(|_, rel| {
-            graph_node_exists(
-                rel.src,
-                &entity_ids,
-                &artifact_ids,
-                &test_ids,
-                &contract_ids,
-                &work_ids,
-                &run_ids,
-            ) && graph_node_exists(
-                rel.dst,
-                &entity_ids,
-                &artifact_ids,
-                &test_ids,
-                &contract_ids,
-                &work_ids,
-                &run_ids,
-            )
-        });
+        let graph_node_ids = GraphNodeIds {
+            entities: &entity_ids,
+            artifacts: &artifact_ids,
+            tests: &test_ids,
+            contracts: &contract_ids,
+            work_items: &work_ids,
+            verification_runs: &run_ids,
+            external_references: &external_reference_ids,
+        };
+        self.relations
+            .retain(|_, rel| graph_node_ids.contains(rel.src) && graph_node_ids.contains(rel.dst));
         stats.orphaned_relations_removed = before - self.relations.len();
 
         // 2. Clean outgoing edge lists
@@ -393,7 +395,7 @@ impl GraphSnapshot {
 
     /// Deserialize a snapshot from bytes (with header validation).
     ///
-    /// The pre-release v12 format persists complete base-relative semantic
+    /// The pre-release v13 format persists complete base-relative semantic
     /// workspace overlays alongside exact trees. Earlier snapshots fail closed
     /// because tree-only dirty workspace authority cannot be reconstructed.
     pub fn from_bytes(data: &[u8]) -> Result<Self, crate::error::KinDbError> {
@@ -499,9 +501,9 @@ impl GraphSnapshot {
 
         match version {
             Self::CURRENT_VERSION => {
-                let checksum_end = Self::require_checksum_slot(data, body_len, "v12")?;
+                let checksum_end = Self::require_checksum_slot(data, body_len, "v13")?;
                 let body_checksum = if verify_checksum {
-                    Some(Self::verify_checksum(data, body_len, "v12")?)
+                    Some(Self::verify_checksum(data, body_len, "v13")?)
                 } else {
                     None
                 };
@@ -536,7 +538,40 @@ impl GraphSnapshot {
 
     pub(crate) fn validate_storage_admission(&self) -> Result<(), crate::error::KinDbError> {
         validate_semantic_change_entries(self.changes.iter(), "snapshot")?;
+        for (id, reference) in &self.external_references {
+            validate_external_reference_entry(id, reference, "snapshot")?;
+        }
         self.validate_enrichment_admission()?;
+        let entity_ids: HashSet<_> = self.entities.keys().copied().collect();
+        let artifact_ids: HashSet<_> = self
+            .resolved_tree
+            .artifacts()
+            .map(|artifact| artifact.artifact_id)
+            .collect();
+        let test_ids: HashSet<_> = self.test_cases.keys().copied().collect();
+        let contract_ids: HashSet<_> = self.contracts.keys().copied().collect();
+        let work_ids: HashSet<_> = self.work_items.keys().copied().collect();
+        let run_ids: HashSet<_> = self.verification_runs.keys().copied().collect();
+        let external_reference_ids: HashSet<_> = self.external_references.keys().copied().collect();
+        let graph_node_ids = GraphNodeIds {
+            entities: &entity_ids,
+            artifacts: &artifact_ids,
+            tests: &test_ids,
+            contracts: &contract_ids,
+            work_items: &work_ids,
+            verification_runs: &run_ids,
+            external_references: &external_reference_ids,
+        };
+        for relation in self.relations.values() {
+            for (side, node) in [("source", relation.src), ("destination", relation.dst)] {
+                if !graph_node_ids.contains(node) {
+                    return Err(crate::error::KinDbError::StorageError(format!(
+                        "snapshot relation {} has unadmitted {side} endpoint {node}",
+                        relation.id
+                    )));
+                }
+            }
+        }
         if let Some(authority) = &self.repository_authority {
             authority.validate_against_snapshot(self)?;
         }
@@ -744,6 +779,38 @@ impl LocateGraphSnapshot {
 
     pub(crate) fn validate_storage_admission(&self) -> Result<(), crate::error::KinDbError> {
         validate_semantic_change_entries(self.changes.iter(), "locate snapshot")?;
+        for (id, reference) in &self.external_references {
+            validate_external_reference_entry(id, reference, "locate snapshot")?;
+        }
+        let artifact_ids: HashSet<_> = self
+            .resolved_tree
+            .artifacts()
+            .map(|artifact| artifact.artifact_id)
+            .collect();
+        for relation in self.relations.values() {
+            for (side, node) in [("source", relation.src), ("destination", relation.dst)] {
+                let admitted = match node {
+                    GraphNodeId::Entity(id) => self.entities.contains_key(&id),
+                    GraphNodeId::Artifact(id) => artifact_ids.contains(&id),
+                    GraphNodeId::ExternalReference(id) => {
+                        self.external_references.contains_key(&id)
+                    }
+                    // Locate snapshots intentionally omit these domains. Their
+                    // authority was checked when the canonical snapshot was
+                    // admitted; absence from this projection is not deletion.
+                    GraphNodeId::Test(_)
+                    | GraphNodeId::Contract(_)
+                    | GraphNodeId::Work(_)
+                    | GraphNodeId::VerificationRun(_) => true,
+                };
+                if !admitted {
+                    return Err(crate::error::KinDbError::StorageError(format!(
+                        "locate snapshot relation {} has unadmitted {side} endpoint {node}",
+                        relation.id
+                    )));
+                }
+            }
+        }
         self.validate_enrichment_admission()
     }
 
@@ -803,6 +870,7 @@ impl From<GraphSnapshot> for LocateGraphSnapshot {
             structured_artifacts: value.structured_artifacts,
             opaque_artifacts: value.opaque_artifacts,
             resolved_tree: value.resolved_tree,
+            external_references: value.external_references.into_iter().collect(),
         }
     }
 }
@@ -820,6 +888,7 @@ impl From<LocateGraphSnapshot> for GraphSnapshot {
         snapshot.structured_artifacts = value.structured_artifacts;
         snapshot.opaque_artifacts = value.opaque_artifacts;
         snapshot.resolved_tree = value.resolved_tree;
+        snapshot.external_references = value.external_references.into_iter().collect();
         snapshot
     }
 }
@@ -842,11 +911,11 @@ impl<'de> Deserialize<'de> for LocateGraphSnapshot {
             where
                 A: SeqAccess<'de>,
             {
-                // The locate cache persists the compact ten-field projection,
-                // while mmap cold-open decodes the canonical 34-field graph
+                // The locate cache persists the compact eleven-field projection,
+                // while mmap cold-open decodes the canonical 35-field graph
                 // snapshot directly. Both are current formats; distinguish
                 // them by their explicit MessagePack sequence width.
-                if seq.size_hint() == Some(10) {
+                if seq.size_hint() == Some(11) {
                     let version = seq
                         .next_element()?
                         .ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
@@ -877,6 +946,9 @@ impl<'de> Deserialize<'de> for LocateGraphSnapshot {
                     let resolved_tree = seq
                         .next_element()?
                         .ok_or_else(|| serde::de::Error::invalid_length(9, &self))?;
+                    let external_references = seq
+                        .next_element()?
+                        .ok_or_else(|| serde::de::Error::invalid_length(10, &self))?;
                     return Ok(LocateGraphSnapshot {
                         version,
                         entities,
@@ -888,10 +960,11 @@ impl<'de> Deserialize<'de> for LocateGraphSnapshot {
                         structured_artifacts,
                         opaque_artifacts,
                         resolved_tree,
+                        external_references,
                     });
                 }
 
-                if seq.size_hint() != Some(34) {
+                if seq.size_hint() != Some(35) {
                     return Err(serde::de::Error::invalid_length(
                         seq.size_hint().unwrap_or_default(),
                         &self,
@@ -953,6 +1026,9 @@ impl<'de> Deserialize<'de> for LocateGraphSnapshot {
                 let _: IgnoredAny = seq
                     .next_element()?
                     .ok_or_else(|| serde::de::Error::invalid_length(33, &self))?;
+                let external_references = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(34, &self))?;
 
                 Ok(LocateGraphSnapshot {
                     version,
@@ -965,6 +1041,7 @@ impl<'de> Deserialize<'de> for LocateGraphSnapshot {
                     structured_artifacts,
                     opaque_artifacts,
                     resolved_tree,
+                    external_references,
                 })
             }
         }
@@ -989,7 +1066,7 @@ struct SnapshotFrame<'a> {
 /// (hashbrown maps + vecs), we avoid the ~18 GB clone that `to_snapshot()`
 /// materialises for large graphs.
 ///
-/// The `Serialize` impl manually writes 34 fields in the same positional
+/// The `Serialize` impl manually writes 35 fields in the same positional
 /// order as the derive(Serialize) on `GraphSnapshot`, so the resulting
 /// msgpack is byte-for-byte compatible with the owned version.
 pub struct BorrowedGraphSnapshot<'a> {
@@ -1003,6 +1080,7 @@ pub struct BorrowedGraphSnapshot<'a> {
     pub file_layouts: &'a hashbrown::HashMap<FilePathId, FileLayout>,
     pub structured_artifacts: &'a hashbrown::HashMap<FilePathId, StructuredArtifact>,
     pub opaque_artifacts: &'a hashbrown::HashMap<FilePathId, OpaqueArtifact>,
+    pub external_references: &'a hashbrown::HashMap<ExternalReferenceId, ExternalReference>,
     // ChangeData fields
     pub changes: &'a hashbrown::HashMap<SemanticChangeId, SemanticChange>,
     pub change_children: &'a hashbrown::HashMap<SemanticChangeId, Vec<SemanticChangeId>>,
@@ -1037,10 +1115,10 @@ pub struct BorrowedGraphSnapshot<'a> {
 impl<'a> Serialize for BorrowedGraphSnapshot<'a> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        // Must produce exactly 34 fields in the same order as GraphSnapshot's
+        // Must produce exactly 35 fields in the same order as GraphSnapshot's
         // derive(Serialize).  rmp_serde serializes structs as arrays, so
         // position (not name) determines the mapping.
-        let mut state = serializer.serialize_struct("GraphSnapshot", 34)?;
+        let mut state = serializer.serialize_struct("GraphSnapshot", 35)?;
 
         // 1. version
         state.serialize_field("version", &GraphSnapshot::CURRENT_VERSION)?;
@@ -1058,70 +1136,72 @@ impl<'a> Serialize for BorrowedGraphSnapshot<'a> {
         state.serialize_field("change_children", self.change_children)?;
         // 8. work_items
         state.serialize_field("work_items", self.work_items)?;
-        // 10. annotations
+        // 9. annotations
         state.serialize_field("annotations", self.annotations)?;
-        // 11. work_links
+        // 10. work_links
         state.serialize_field("work_links", self.work_links)?;
-        // 12. reviews
+        // 11. reviews
         state.serialize_field("reviews", self.reviews)?;
-        // 13. review_decisions
+        // 12. review_decisions
         state.serialize_field("review_decisions", self.review_decisions)?;
-        // 14. review_notes  (HashMap values → seq)
+        // 13. review_notes  (HashMap values → seq)
         state.serialize_field("review_notes", &HashMapValuesAsSeq(self.review_notes))?;
-        // 15. review_discussions  (HashMap values → seq)
+        // 14. review_discussions  (HashMap values → seq)
         state.serialize_field(
             "review_discussions",
             &HashMapValuesAsSeq(self.review_discussions),
         )?;
-        // 16. review_assignments
+        // 15. review_assignments
         state.serialize_field("review_assignments", self.review_assignments)?;
-        // 17. test_cases
+        // 16. test_cases
         state.serialize_field("test_cases", self.test_cases)?;
-        // 18. assertions
+        // 17. assertions
         state.serialize_field("assertions", self.assertions)?;
-        // 19. verification_runs
+        // 18. verification_runs
         state.serialize_field("verification_runs", self.verification_runs)?;
-        // 20. mock_hints
+        // 19. mock_hints
         state.serialize_field("mock_hints", self.mock_hints)?;
-        // 21. contracts
+        // 20. contracts
         state.serialize_field("contracts", self.contracts)?;
-        // 22. actors
+        // 21. actors
         state.serialize_field("actors", self.actors)?;
-        // 23. delegations
+        // 22. delegations
         state.serialize_field("delegations", self.delegations)?;
-        // 24. approvals
+        // 23. approvals
         state.serialize_field("approvals", self.approvals)?;
-        // 25. audit_events
+        // 24. audit_events
         state.serialize_field("audit_events", self.audit_events)?;
-        // 26. shallow_files  (HashMap values → seq)
+        // 25. shallow_files  (HashMap values → seq)
         state.serialize_field("shallow_files", &HashMapValuesAsSeq(self.shallow_files))?;
-        // 27. file_layouts  (HashMap values → seq)
+        // 26. file_layouts  (HashMap values → seq)
         state.serialize_field("file_layouts", &HashMapValuesAsSeq(self.file_layouts))?;
-        // 28. structured_artifacts  (HashMap values → seq)
+        // 27. structured_artifacts  (HashMap values → seq)
         state.serialize_field(
             "structured_artifacts",
             &HashMapValuesAsSeq(self.structured_artifacts),
         )?;
-        // 29. opaque_artifacts  (HashMap values → seq)
+        // 28. opaque_artifacts  (HashMap values → seq)
         state.serialize_field(
             "opaque_artifacts",
             &HashMapValuesAsSeq(self.opaque_artifacts),
         )?;
-        // 30. resolved_tree
+        // 29. resolved_tree
         state.serialize_field("resolved_tree", self.resolved_tree)?;
-        // 31. sessions
+        // 30. sessions
         state.serialize_field("sessions", self.sessions)?;
-        // 32. intents
+        // 31. intents
         state.serialize_field("intents", self.intents)?;
-        // 33. downstream_warnings
+        // 32. downstream_warnings
         state.serialize_field("downstream_warnings", self.downstream_warnings)?;
-        // 34. entity_revisions
+        // 33. entity_revisions
         state.serialize_field("entity_revisions", self.entity_revisions)?;
         // 34. Mutable live graphs are not repository transaction authority.
         state.serialize_field(
             "repository_authority",
             &Option::<PersistedRepositoryAuthority>::None,
         )?;
+        // 35. Resolved external symbols (append-only v13 field).
+        state.serialize_field("external_references", self.external_references)?;
         state.end()
     }
 }
@@ -1172,6 +1252,9 @@ impl<'a> BorrowedGraphSnapshot<'a> {
 
     fn validate_storage_admission(&self) -> Result<(), crate::error::KinDbError> {
         validate_semantic_change_entries(self.changes.iter(), "borrowed snapshot")?;
+        for (id, reference) in self.external_references {
+            validate_external_reference_entry(id, reference, "borrowed snapshot")?;
+        }
         for file_id in self
             .shallow_files
             .keys()
@@ -1192,6 +1275,36 @@ impl<'a> BorrowedGraphSnapshot<'a> {
                 )));
             }
         }
+        let entity_ids: HashSet<_> = self.entities.keys().copied().collect();
+        let artifact_ids: HashSet<_> = self
+            .resolved_tree
+            .artifacts()
+            .map(|artifact| artifact.artifact_id)
+            .collect();
+        let test_ids: HashSet<_> = self.test_cases.keys().copied().collect();
+        let contract_ids: HashSet<_> = self.contracts.keys().copied().collect();
+        let work_ids: HashSet<_> = self.work_items.keys().copied().collect();
+        let run_ids: HashSet<_> = self.verification_runs.keys().copied().collect();
+        let external_reference_ids: HashSet<_> = self.external_references.keys().copied().collect();
+        let graph_node_ids = GraphNodeIds {
+            entities: &entity_ids,
+            artifacts: &artifact_ids,
+            tests: &test_ids,
+            contracts: &contract_ids,
+            work_items: &work_ids,
+            verification_runs: &run_ids,
+            external_references: &external_reference_ids,
+        };
+        for relation in self.relations.values() {
+            for (side, node) in [("source", relation.src), ("destination", relation.dst)] {
+                if !graph_node_ids.contains(node) {
+                    return Err(crate::error::KinDbError::StorageError(format!(
+                        "borrowed snapshot relation {} has unadmitted {side} endpoint {node}",
+                        relation.id
+                    )));
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -1206,23 +1319,46 @@ impl<K, V: Serialize> Serialize for HashMapValuesAsSeq<'_, K, V> {
     }
 }
 
-fn graph_node_exists(
-    node: GraphNodeId,
-    entity_ids: &HashSet<EntityId>,
-    artifact_ids: &HashSet<ArtifactId>,
-    test_ids: &HashSet<TestId>,
-    contract_ids: &HashSet<ContractId>,
-    work_ids: &HashSet<WorkId>,
-    run_ids: &HashSet<VerificationRunId>,
-) -> bool {
-    match node {
-        GraphNodeId::Entity(id) => entity_ids.contains(&id),
-        GraphNodeId::Artifact(id) => artifact_ids.contains(&id),
-        GraphNodeId::Test(id) => test_ids.contains(&id),
-        GraphNodeId::Contract(id) => contract_ids.contains(&id),
-        GraphNodeId::Work(id) => work_ids.contains(&id),
-        GraphNodeId::VerificationRun(id) => run_ids.contains(&id),
+struct GraphNodeIds<'a> {
+    entities: &'a HashSet<EntityId>,
+    artifacts: &'a HashSet<ArtifactId>,
+    tests: &'a HashSet<TestId>,
+    contracts: &'a HashSet<ContractId>,
+    work_items: &'a HashSet<WorkId>,
+    verification_runs: &'a HashSet<VerificationRunId>,
+    external_references: &'a HashSet<ExternalReferenceId>,
+}
+
+impl GraphNodeIds<'_> {
+    fn contains(&self, node: GraphNodeId) -> bool {
+        match node {
+            GraphNodeId::Entity(id) => self.entities.contains(&id),
+            GraphNodeId::Artifact(id) => self.artifacts.contains(&id),
+            GraphNodeId::Test(id) => self.tests.contains(&id),
+            GraphNodeId::Contract(id) => self.contracts.contains(&id),
+            GraphNodeId::Work(id) => self.work_items.contains(&id),
+            GraphNodeId::VerificationRun(id) => self.verification_runs.contains(&id),
+            GraphNodeId::ExternalReference(id) => self.external_references.contains(&id),
+        }
     }
+}
+
+fn validate_external_reference_entry(
+    id: &ExternalReferenceId,
+    reference: &ExternalReference,
+    context: &str,
+) -> Result<(), crate::error::KinDbError> {
+    if *id != reference.id {
+        return Err(crate::error::KinDbError::StorageError(format!(
+            "{context} external-reference key {id} does not match record identity {}",
+            reference.id
+        )));
+    }
+    reference.validate().map_err(|error| {
+        crate::error::KinDbError::StorageError(format!(
+            "{context} external reference {id} is invalid: {error}"
+        ))
+    })
 }
 
 #[cfg(test)]
@@ -1320,6 +1456,19 @@ mod tests {
             import_source: None,
             evidence: Vec::new(),
         };
+        let external_reference =
+            ExternalReference::new_resolved("python-module-v1", "requests", "get").unwrap();
+        let external_relation = Relation {
+            id: RelationId::new(),
+            kind: RelationKind::Imports,
+            src: GraphNodeId::Entity(caller.id),
+            dst: GraphNodeId::ExternalReference(external_reference.id),
+            confidence: 1.0,
+            origin: RelationOrigin::Lsp,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
+        };
         let change = seal_change(SemanticChange {
             id: SemanticChangeId::from_hash(Hash256::from_bytes([9; 32])),
             parents: Vec::new(),
@@ -1337,6 +1486,7 @@ mod tests {
             risk_summary: None,
             origin: kin_model::ChangeOrigin::Native,
             admission_policy_delta: None,
+            external_reference_deltas: Vec::new(),
         });
 
         let mut snapshot = GraphSnapshot::empty();
@@ -1347,6 +1497,12 @@ mod tests {
             non_legacy_locate_relation.id,
             non_legacy_locate_relation.clone(),
         );
+        snapshot
+            .relations
+            .insert(external_relation.id, external_relation);
+        snapshot
+            .external_references
+            .insert(external_reference.id, external_reference.clone());
         snapshot.outgoing.insert(caller.id, vec![relation.id]);
         snapshot.incoming.insert(callee.id, vec![relation.id]);
         snapshot.changes.insert(change.id, change.clone());
@@ -1380,7 +1536,7 @@ mod tests {
 
         assert_eq!(decoded_root_hash, Some(persisted_root_hash));
         assert_eq!(locate_snapshot.entities.len(), 2);
-        assert_eq!(locate_snapshot.relations.len(), 2);
+        assert_eq!(locate_snapshot.relations.len(), 3);
         assert_eq!(
             locate_snapshot
                 .relations
@@ -1389,6 +1545,12 @@ mod tests {
             Some(RelationKind::SendsMessage)
         );
         assert_eq!(locate_snapshot.changes.len(), 1);
+        assert_eq!(
+            locate_snapshot
+                .external_references
+                .get(&external_reference.id),
+            Some(&external_reference)
+        );
         assert!(!locate_snapshot.entity_revisions.is_empty());
         assert_eq!(locate_snapshot.shallow_files.len(), 1);
         assert_eq!(
@@ -1399,8 +1561,12 @@ mod tests {
         );
 
         let decoded: GraphSnapshot = locate_snapshot.into();
+        assert_eq!(
+            decoded.external_references.get(&external_reference.id),
+            Some(&external_reference)
+        );
         assert_eq!(decoded.entities.len(), 2);
-        assert_eq!(decoded.relations.len(), 2);
+        assert_eq!(decoded.relations.len(), 3);
         assert_eq!(decoded.changes.len(), 1);
         assert!(!decoded.entity_revisions.is_empty());
         assert_eq!(
@@ -1709,7 +1875,7 @@ mod tests {
 
         snap.version = 1;
         let error = snap.to_bytes().unwrap_err();
-        assert!(error.to_string().contains("exactly v12"));
+        assert!(error.to_string().contains("exactly v13"));
     }
 
     #[test]
@@ -1845,6 +2011,7 @@ mod tests {
             risk_summary: None,
             origin: kin_model::ChangeOrigin::Native,
             admission_policy_delta: None,
+            external_reference_deltas: Vec::new(),
         });
         snapshot.changes.insert(change.id, change.clone());
         snapshot
@@ -1935,6 +2102,46 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_rejects_external_reference_key_and_endpoint_corruption() {
+        let admitted =
+            ExternalReference::new_resolved("python-module-v1", "requests", "get").unwrap();
+        let missing =
+            ExternalReference::new_resolved("python-module-v1", "urllib", "open").unwrap();
+
+        let mut key_mismatch = GraphSnapshot::empty();
+        key_mismatch
+            .external_references
+            .insert(missing.id, admitted.clone());
+        let error = key_mismatch
+            .to_bytes()
+            .expect_err("map keys must bind the external record identity");
+        assert!(error.to_string().contains("does not match record identity"));
+
+        let mut dangling = GraphSnapshot::empty();
+        dangling
+            .external_references
+            .insert(admitted.id, admitted.clone());
+        let relation = Relation {
+            id: RelationId::new(),
+            kind: RelationKind::Imports,
+            src: GraphNodeId::ExternalReference(admitted.id),
+            dst: GraphNodeId::ExternalReference(missing.id),
+            confidence: 1.0,
+            origin: RelationOrigin::Lsp,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
+        };
+        dangling.relations.insert(relation.id, relation);
+        let error = dangling
+            .to_bytes()
+            .expect_err("relations cannot target an unadmitted external reference");
+        assert!(error
+            .to_string()
+            .contains("unadmitted destination endpoint"));
+    }
+
+    #[test]
     fn current_version_truncated_checksum_detected() {
         let snap = GraphSnapshot::empty();
         let bytes = snap.to_bytes().unwrap();
@@ -1975,7 +2182,7 @@ mod tests {
     #[test]
     fn v11_tree_only_workspace_snapshot_fails_fast_with_actionable_error() {
         let stale_version = 11u32;
-        assert_eq!(GraphSnapshot::MIN_SUPPORTED_VERSION, 12);
+        assert_eq!(GraphSnapshot::MIN_SUPPORTED_VERSION, 13);
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&GraphSnapshot::MAGIC);
         bytes.extend_from_slice(&stale_version.to_le_bytes());

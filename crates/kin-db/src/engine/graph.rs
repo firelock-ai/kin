@@ -1056,6 +1056,7 @@ impl ResolvedRetrievalItem {
 struct EntityData {
     entities: HashMap<EntityId, Entity>,
     entity_revisions: HashMap<EntityId, Vec<EntityRevision>>,
+    external_references: HashMap<ExternalReferenceId, ExternalReference>,
     relations: HashMap<RelationId, Relation>,
     /// Entity → outgoing relation IDs (entity's dependencies).
     outgoing: HashMap<EntityId, Vec<RelationId>>,
@@ -1278,6 +1279,46 @@ where
         .retain(|(existing_key, _)| existing_key != &key);
     if !delta.removed.iter().any(|removed| removed == &key) {
         delta.removed.push(key);
+    }
+}
+
+fn delta_external_reference_add(
+    delta: &mut CollectionDelta<ExternalReferenceId, ExternalReference>,
+    reference: ExternalReference,
+) {
+    debug_assert!(delta.modified.is_empty());
+    if let Some(position) = delta
+        .removed
+        .iter()
+        .position(|removed| *removed == reference.id)
+    {
+        // The immutable record existed in the persistence base and was
+        // removed earlier in this pending batch. Re-adding the same stable ID
+        // restores the base state and cancels that removal.
+        delta.removed.remove(position);
+        return;
+    }
+    debug_assert!(!delta
+        .added
+        .iter()
+        .any(|(existing, _)| *existing == reference.id));
+    delta.added.push((reference.id, reference));
+}
+
+fn delta_external_reference_remove(
+    delta: &mut CollectionDelta<ExternalReferenceId, ExternalReference>,
+    id: ExternalReferenceId,
+) {
+    debug_assert!(delta.modified.is_empty());
+    let before = delta.added.len();
+    delta.added.retain(|(existing, _)| *existing != id);
+    if delta.added.len() != before {
+        // The record did not exist in the persistence base; adding and then
+        // removing it inside one pending batch is a net no-op.
+        return;
+    }
+    if !delta.removed.contains(&id) {
+        delta.removed.push(id);
     }
 }
 
@@ -1924,6 +1965,7 @@ impl InMemoryGraph {
             entities: RwLock::new(EntityData {
                 entities: HashMap::new(),
                 entity_revisions: HashMap::new(),
+                external_references: HashMap::new(),
                 relations: HashMap::new(),
                 outgoing: HashMap::new(),
                 incoming: HashMap::new(),
@@ -2153,6 +2195,7 @@ impl InMemoryGraph {
             // Repository authority is owned by the immutable publication
             // manager, never by this in-place mutable graph.
             repository_authority: _,
+            external_references,
         } = snapshot;
         let entity_revisions: HashMap<EntityId, Vec<EntityRevision>> =
             if entity_revisions.is_empty() && !changes.is_empty() {
@@ -2300,6 +2343,7 @@ impl InMemoryGraph {
         let entity_data = EntityData {
             entities: entities.into_iter().collect(),
             entity_revisions,
+            external_references: external_references.into_iter().collect(),
             relations,
             outgoing,
             incoming,
@@ -2411,6 +2455,7 @@ impl InMemoryGraph {
             structured_artifacts,
             opaque_artifacts,
             resolved_tree,
+            external_references,
         } = snapshot;
         let _span = tracing::info_span!(
             "kindb.graph.from_locate_snapshot",
@@ -2521,6 +2566,7 @@ impl InMemoryGraph {
             } else {
                 entity_revisions
             },
+            external_references,
             relations,
             outgoing,
             incoming,
@@ -2840,6 +2886,7 @@ impl InMemoryGraph {
             &ent.relations,
             &chg.changes,
             &ent.entity_revisions,
+            &ent.external_references,
             &ent.resolved_tree,
             &ent.shallow_files,
             &ent.file_layouts,
@@ -3308,6 +3355,7 @@ impl InMemoryGraph {
             &ent.relations,
             &chg.changes,
             &ent.entity_revisions,
+            &ent.external_references,
             &ent.resolved_tree,
             &ent.shallow_files,
             &ent.file_layouts,
@@ -3321,6 +3369,7 @@ impl InMemoryGraph {
             let borrowed = BorrowedGraphSnapshot {
                 entities: &ent.entities,
                 entity_revisions: &ent.entity_revisions,
+                external_references: &ent.external_references,
                 relations: &ent.relations,
                 outgoing: &ent.outgoing,
                 incoming: &ent.incoming,
@@ -3397,6 +3446,7 @@ impl InMemoryGraph {
             &ent.relations,
             &chg.changes,
             &ent.entity_revisions,
+            &ent.external_references,
             &ent.resolved_tree,
             &ent.shallow_files,
             &ent.file_layouts,
@@ -3454,6 +3504,24 @@ impl InMemoryGraph {
         edges
     }
 
+    /// Resolve one persisted external symbol coordinate by its stable ID.
+    pub fn get_external_reference(&self, id: &ExternalReferenceId) -> Option<ExternalReference> {
+        self.entities.read().external_references.get(id).cloned()
+    }
+
+    /// Return every persisted external symbol coordinate.
+    pub fn list_external_references(&self) -> Vec<ExternalReference> {
+        let mut references: Vec<_> = self
+            .entities
+            .read()
+            .external_references
+            .values()
+            .cloned()
+            .collect();
+        references.sort_unstable_by_key(|reference| reference.id);
+        references
+    }
+
     pub fn to_snapshot(&self) -> GraphSnapshot {
         // Clone each sub-store under its own read lock, then drop the lock
         // immediately. Lock ordering: entities → changes → work → reviews
@@ -3501,6 +3569,7 @@ impl InMemoryGraph {
             intents: ses.intents.into_iter().collect(),
             downstream_warnings: ses.downstream_warnings,
             repository_authority: None,
+            external_references: ent.external_references.into_iter().collect(),
         }
     }
 
@@ -5879,6 +5948,7 @@ impl InMemoryGraph {
             relation_deltas: Vec::new(),
             tree_deltas: vec![tree_delta],
             admission_policy_delta: None,
+            external_reference_deltas: Vec::new(),
         })
         .expect("test artifact admission");
         artifact_id
@@ -5904,6 +5974,7 @@ impl InMemoryGraph {
                 old: artifact.located_entry(),
             }],
             admission_policy_delta: None,
+            external_reference_deltas: Vec::new(),
         })
         .expect("test artifact removal");
         Some(artifact.entry)
@@ -5969,6 +6040,7 @@ fn graph_node_is_admitted(
     node: GraphNodeId,
     entity_ids: &HashSet<EntityId>,
     artifact_ids: &HashSet<ArtifactId>,
+    external_reference_ids: &HashSet<ExternalReferenceId>,
     work: &WorkData,
     verification: &VerificationData,
 ) -> bool {
@@ -5979,6 +6051,7 @@ fn graph_node_is_admitted(
         GraphNodeId::Contract(id) => verification.contracts.contains_key(&id),
         GraphNodeId::Work(id) => work.work_items.contains_key(&id),
         GraphNodeId::VerificationRun(id) => verification.verification_runs.contains_key(&id),
+        GraphNodeId::ExternalReference(id) => external_reference_ids.contains(&id),
     }
 }
 
@@ -6466,10 +6539,13 @@ impl EntityStore for InMemoryGraph {
             start,
             edge_kinds,
             depth,
-            &ent.entities,
-            &ent.relations,
-            &ent.node_outgoing,
-            &ent.node_incoming,
+            traverse::TraversalGraph {
+                entities: &ent.entities,
+                external_references: &ent.external_references,
+                relations: &ent.relations,
+                outgoing: &ent.node_outgoing,
+                incoming: &ent.node_incoming,
+            },
         ))
     }
 
@@ -7118,6 +7194,43 @@ impl EntityStore for InMemoryGraph {
                 .artifacts()
                 .map(|artifact| artifact.artifact_id)
                 .collect();
+            let mut prospective_external_references = ent.external_references.clone();
+            for external_delta in &delta.external_reference_deltas {
+                match external_delta {
+                    ExternalReferenceDelta::Added { new } => {
+                        new.validate().map_err(|error| {
+                            KinDbError::StorageError(format!(
+                                "transaction external reference {} is invalid: {error}",
+                                new.id
+                            ))
+                        })?;
+                        if prospective_external_references.contains_key(&new.id) {
+                            return Err(KinDbError::StorageError(format!(
+                                "transaction adds existing external reference {}",
+                                new.id
+                            )));
+                        }
+                        prospective_external_references.insert(new.id, new.clone());
+                    }
+                    ExternalReferenceDelta::Removed { old } => {
+                        old.validate().map_err(|error| {
+                            KinDbError::StorageError(format!(
+                                "transaction external reference {} is invalid: {error}",
+                                old.id
+                            ))
+                        })?;
+                        if prospective_external_references.get(&old.id) != Some(old) {
+                            return Err(KinDbError::StorageError(format!(
+                                "transaction has stale old payload for removed external reference {}",
+                                old.id
+                            )));
+                        }
+                        prospective_external_references.remove(&old.id);
+                    }
+                }
+            }
+            let prospective_external_reference_ids: HashSet<ExternalReferenceId> =
+                prospective_external_references.keys().copied().collect();
             let mut prospective_relations = ent.relations.clone();
             for relation_delta in &delta.relation_deltas {
                 match relation_delta {
@@ -7164,6 +7277,7 @@ impl EntityStore for InMemoryGraph {
                         node,
                         &prospective_entity_ids,
                         &staged_artifact_ids,
+                        &prospective_external_reference_ids,
                         &work,
                         &verification,
                     ) {
@@ -7305,7 +7419,29 @@ impl EntityStore for InMemoryGraph {
                 }
             }
 
-            // 4. Process relation deltas.
+            // 4. Process immutable external-reference deltas before relations,
+            // so one pending persistence batch can introduce a reference and
+            // connect it without ever exposing a dangling endpoint.
+            for external_delta in &delta.external_reference_deltas {
+                match external_delta {
+                    ExternalReferenceDelta::Added { new } => {
+                        ent.external_references.insert(new.id, new.clone());
+                        delta_external_reference_add(
+                            &mut pending.delta.external_references,
+                            new.clone(),
+                        );
+                    }
+                    ExternalReferenceDelta::Removed { old } => {
+                        ent.external_references.remove(&old.id);
+                        delta_external_reference_remove(
+                            &mut pending.delta.external_references,
+                            old.id,
+                        );
+                    }
+                }
+            }
+
+            // 5. Process relation deltas.
             for rel_delta in &delta.relation_deltas {
                 match rel_delta {
                     RelationDelta::Added { new: relation } => {
@@ -9671,6 +9807,7 @@ mod tests {
                     new: test_located(&file_id.0, regular),
                 }],
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             })
             .unwrap();
         assert_eq!(graph.get_tree_entry(&file_id).unwrap(), Some(regular));
@@ -9685,6 +9822,7 @@ mod tests {
                     new: test_located(&file_id.0, executable),
                 }],
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             })
             .unwrap();
         assert_eq!(graph.get_tree_entry(&file_id).unwrap(), Some(executable));
@@ -9699,9 +9837,133 @@ mod tests {
                     new: test_located(&file_id.0, symlink),
                 }],
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             })
             .unwrap();
         assert_eq!(graph.get_tree_entry(&file_id).unwrap(), Some(symlink));
+    }
+
+    #[test]
+    fn transaction_persists_and_traverses_external_references_atomically() {
+        let graph = InMemoryGraph::new();
+        let artifact_id = ArtifactId::new();
+        let artifact_entry = TreeEntry::blob(Hash256::from_bytes([0x31; 32]), false);
+        let reference =
+            ExternalReference::new_resolved("python-module-v1", "requests", "get").unwrap();
+        let relation = Relation {
+            id: RelationId::new(),
+            src: GraphNodeId::Artifact(artifact_id),
+            dst: GraphNodeId::ExternalReference(reference.id),
+            kind: RelationKind::Imports,
+            confidence: 1.0,
+            origin: RelationOrigin::Lsp,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
+        };
+
+        graph
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: Vec::new(),
+                relation_deltas: vec![RelationDelta::Added {
+                    new: relation.clone(),
+                }],
+                tree_deltas: vec![TreeDelta::Added {
+                    artifact_id,
+                    new: test_located("src/client.py", artifact_entry),
+                }],
+                admission_policy_delta: None,
+                external_reference_deltas: vec![ExternalReferenceDelta::Added {
+                    new: reference.clone(),
+                }],
+            })
+            .unwrap();
+
+        assert_eq!(
+            graph.get_external_reference(&reference.id),
+            Some(reference.clone())
+        );
+        assert_eq!(graph.list_external_references(), vec![reference.clone()]);
+        let pending = graph.pending_delta_snapshot(7).unwrap();
+        assert_eq!(pending.external_references.added.len(), 1);
+        assert_eq!(
+            pending.external_references.added[0],
+            (reference.id, reference.clone())
+        );
+
+        let traversed = graph
+            .traverse(&GraphNodeId::Artifact(artifact_id), &[], 1)
+            .unwrap();
+        assert_eq!(
+            traversed.external_references.get(&reference.id),
+            Some(&reference)
+        );
+        assert!(traversed
+            .nodes
+            .contains(&GraphNodeId::ExternalReference(reference.id)));
+
+        let snapshot = graph.to_snapshot();
+        let owned_bytes = snapshot.to_bytes().unwrap();
+        let owned_round_trip = GraphSnapshot::from_bytes(&owned_bytes).unwrap();
+        assert_eq!(
+            owned_round_trip.external_references.get(&reference.id),
+            Some(&reference)
+        );
+        let reopened = InMemoryGraph::from_snapshot(owned_round_trip).unwrap();
+        assert_eq!(
+            reopened.get_external_reference(&reference.id),
+            Some(reference.clone())
+        );
+
+        let (borrowed_bytes, _) = graph.serialize_snapshot_borrowed().unwrap();
+        let borrowed_round_trip = GraphSnapshot::from_bytes(&borrowed_bytes).unwrap();
+        assert_eq!(
+            borrowed_round_trip.external_references.get(&reference.id),
+            Some(&reference)
+        );
+
+        let error = graph
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: Vec::new(),
+                relation_deltas: Vec::new(),
+                tree_deltas: Vec::new(),
+                admission_policy_delta: None,
+                external_reference_deltas: vec![ExternalReferenceDelta::Removed {
+                    old: reference.clone(),
+                }],
+            })
+            .expect_err("a referenced external endpoint cannot be removed alone");
+        assert!(error
+            .to_string()
+            .contains("unadmitted destination endpoint"));
+        assert_eq!(
+            graph.get_external_reference(&reference.id),
+            Some(reference.clone())
+        );
+
+        graph
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: Vec::new(),
+                relation_deltas: vec![RelationDelta::Removed {
+                    old: relation.clone(),
+                }],
+                tree_deltas: Vec::new(),
+                admission_policy_delta: None,
+                external_reference_deltas: vec![ExternalReferenceDelta::Removed {
+                    old: reference.clone(),
+                }],
+            })
+            .unwrap();
+        assert_eq!(graph.get_external_reference(&reference.id), None);
+        assert!(!graph.to_snapshot().relations.contains_key(&relation.id));
+        assert!(
+            graph
+                .pending_delta_snapshot(7)
+                .unwrap()
+                .external_references
+                .is_empty(),
+            "an add followed by an exact removal before persistence is a net no-op"
+        );
     }
 
     #[test]
@@ -9733,6 +9995,7 @@ mod tests {
                     new: test_located(&file_id.0, executable),
                 }],
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             })
             .unwrap();
 
@@ -9793,6 +10056,7 @@ mod tests {
                 risk_summary: None,
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             },
         );
         assert!(graph
@@ -9815,6 +10079,7 @@ mod tests {
                     new: test_located(&changed_file.0, new_entry),
                 }],
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             })
             .unwrap();
 
@@ -9894,6 +10159,7 @@ mod tests {
                     new: test_located(&file_id.0, new_entry),
                 }],
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             })
             .unwrap();
 
@@ -9953,6 +10219,7 @@ mod tests {
                     new: test_located(new_path, entry),
                 }],
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             })
             .unwrap();
 
@@ -10016,6 +10283,7 @@ mod tests {
                     old: test_located(artifact_path, entry),
                 }],
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             })
             .unwrap();
 
@@ -10041,6 +10309,7 @@ mod tests {
                 relation_deltas: Vec::new(),
                 tree_deltas: Vec::new(),
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             })
             .unwrap_err();
 
@@ -10069,6 +10338,7 @@ mod tests {
                     old: test_located(path, entry),
                 }],
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             })
             .expect_err("a tree transition cannot silently orphan semantic authority");
 
@@ -10104,6 +10374,7 @@ mod tests {
                     new: test_located("src/new.rs", entry),
                 }],
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             })
             .unwrap_err();
 
@@ -10144,6 +10415,7 @@ mod tests {
                     new: test_located(&file_id.0, new_entry),
                 }],
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             })
             .expect("derived cache failure cannot reverse committed authority");
 
@@ -10242,6 +10514,7 @@ mod tests {
                     new: test_located(&new_file_id.0, new_entry),
                 }],
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             })
             .unwrap();
 
@@ -10311,6 +10584,7 @@ mod tests {
                     old: test_located(&file_id.0, entry),
                 }],
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             })
             .unwrap();
 
@@ -10348,6 +10622,7 @@ mod tests {
                     new: test_located(&file_id.0, replacement),
                 }],
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             })
             .unwrap_err();
 
@@ -10413,6 +10688,7 @@ mod tests {
                     new: test_located(&file_id.0, replacement),
                 }],
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             })
             .unwrap_err();
 
@@ -11408,6 +11684,7 @@ mod tests {
             risk_summary: None,
             origin: kin_model::ChangeOrigin::Native,
             admission_policy_delta: None,
+            external_reference_deltas: Vec::new(),
         });
         let genesis_id = genesis.id;
         graph.create_change(&genesis).unwrap();
@@ -11427,6 +11704,7 @@ mod tests {
             risk_summary: None,
             origin: kin_model::ChangeOrigin::Native,
             admission_policy_delta: None,
+            external_reference_deltas: Vec::new(),
         });
         let child_id = child.id;
         graph.create_change(&child).unwrap();
@@ -11458,6 +11736,7 @@ mod tests {
             risk_summary: None,
             origin: kin_model::ChangeOrigin::Native,
             admission_policy_delta: None,
+            external_reference_deltas: Vec::new(),
         });
 
         graph.create_change(&change).unwrap();
@@ -11507,6 +11786,7 @@ mod tests {
             risk_summary: None,
             origin: kin_model::ChangeOrigin::Native,
             admission_policy_delta: None,
+            external_reference_deltas: Vec::new(),
         });
         graph.create_change(&change).unwrap();
 
@@ -11550,6 +11830,7 @@ mod tests {
             risk_summary: None,
             origin: kin_model::ChangeOrigin::Native,
             admission_policy_delta: None,
+            external_reference_deltas: Vec::new(),
         };
 
         let error = graph
@@ -11580,6 +11861,7 @@ mod tests {
             risk_summary: None,
             origin: kin_model::ChangeOrigin::Native,
             admission_policy_delta: None,
+            external_reference_deltas: Vec::new(),
         };
 
         let error = graph
@@ -11606,6 +11888,7 @@ mod tests {
             risk_summary: None,
             origin: kin_model::ChangeOrigin::Native,
             admission_policy_delta: None,
+            external_reference_deltas: Vec::new(),
         };
         let mut snapshot = GraphSnapshot::empty();
         snapshot.changes.insert(spoofed.id, spoofed);
@@ -11633,6 +11916,7 @@ mod tests {
             risk_summary: None,
             origin: kin_model::ChangeOrigin::Native,
             admission_policy_delta: None,
+            external_reference_deltas: Vec::new(),
         };
         graph.changes.write().changes.insert(spoofed.id, spoofed);
 
@@ -11663,6 +11947,7 @@ mod tests {
             risk_summary: None,
             origin: kin_model::ChangeOrigin::Native,
             admission_policy_delta: None,
+            external_reference_deltas: Vec::new(),
         });
         graph.create_change(&parent).unwrap();
         graph.clear_pending_delta();
@@ -11685,6 +11970,7 @@ mod tests {
             risk_summary: None,
             origin: kin_model::ChangeOrigin::Native,
             admission_policy_delta: None,
+            external_reference_deltas: Vec::new(),
         });
 
         let (at_revision_tx, at_revision_rx) = mpsc::channel();
@@ -11770,6 +12056,7 @@ mod tests {
             risk_summary: None,
             origin: kin_model::ChangeOrigin::Native,
             admission_policy_delta: None,
+            external_reference_deltas: Vec::new(),
         };
 
         for _ in 0..2 {
@@ -11800,6 +12087,7 @@ mod tests {
             risk_summary: None,
             origin: kin_model::ChangeOrigin::Native,
             admission_policy_delta: None,
+            external_reference_deltas: Vec::new(),
         });
         let mut spoofed = seal_change(SemanticChange {
             id: SemanticChangeId::from_hash(Hash256::from_bytes([0x42; 32])),
@@ -11816,6 +12104,7 @@ mod tests {
             risk_summary: None,
             origin: kin_model::ChangeOrigin::Native,
             admission_policy_delta: None,
+            external_reference_deltas: Vec::new(),
         });
         spoofed.id = SemanticChangeId::from_hash(Hash256::from_bytes([0xff; 32]));
         let error = graph
@@ -11850,6 +12139,7 @@ mod tests {
             risk_summary: None,
             origin: kin_model::ChangeOrigin::Native,
             admission_policy_delta: None,
+            external_reference_deltas: Vec::new(),
         });
         let mut conflicting = first.clone();
         let EntityDelta::Added { new: entity } = &mut conflicting.entity_deltas[0] else {
@@ -11887,6 +12177,7 @@ mod tests {
             risk_summary: None,
             origin: kin_model::ChangeOrigin::Native,
             admission_policy_delta: None,
+            external_reference_deltas: Vec::new(),
         });
         let source = test_entity("source", "src/source.rs");
         let target = test_entity("target", "src/target.rs");
@@ -11907,6 +12198,7 @@ mod tests {
             risk_summary: None,
             origin: kin_model::ChangeOrigin::Native,
             admission_policy_delta: None,
+            external_reference_deltas: Vec::new(),
         };
 
         let error = graph
@@ -11947,6 +12239,7 @@ mod tests {
             risk_summary: None,
             origin: kin_model::ChangeOrigin::Native,
             admission_policy_delta: None,
+            external_reference_deltas: Vec::new(),
         });
         let genesis_id = genesis.id;
         let first_child = seal_change(SemanticChange {
@@ -11967,6 +12260,7 @@ mod tests {
             risk_summary: None,
             origin: kin_model::ChangeOrigin::Native,
             admission_policy_delta: None,
+            external_reference_deltas: Vec::new(),
         });
         let first_child_id = first_child.id;
         let second_child = seal_change(SemanticChange {
@@ -11984,6 +12278,7 @@ mod tests {
             risk_summary: None,
             origin: kin_model::ChangeOrigin::Native,
             admission_policy_delta: None,
+            external_reference_deltas: Vec::new(),
         });
         let second_child_id = second_child.id;
         let changes = vec![genesis, first_child, second_child];
@@ -12130,6 +12425,7 @@ mod tests {
                 risk_summary: None,
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             })
         };
         let changes = vec![
@@ -12279,6 +12575,7 @@ mod tests {
                 risk_summary: None,
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             },
         );
 
@@ -12302,6 +12599,7 @@ mod tests {
                 risk_summary: None,
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             },
         );
 
@@ -12329,6 +12627,7 @@ mod tests {
                 risk_summary: None,
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             },
         );
 
@@ -12366,6 +12665,7 @@ mod tests {
                 risk_summary: None,
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             },
         );
 
@@ -12389,6 +12689,7 @@ mod tests {
                 risk_summary: None,
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             },
         );
 
@@ -12416,6 +12717,7 @@ mod tests {
                 risk_summary: None,
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             },
         );
 
@@ -12454,6 +12756,7 @@ mod tests {
                 risk_summary: None,
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             },
         );
 
@@ -12477,6 +12780,7 @@ mod tests {
                 risk_summary: None,
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             },
         );
 
@@ -12503,6 +12807,7 @@ mod tests {
                 risk_summary: None,
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             },
         );
 
@@ -12541,6 +12846,7 @@ mod tests {
                 risk_summary: None,
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             },
         );
 
@@ -12564,6 +12870,7 @@ mod tests {
                 risk_summary: None,
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             },
         );
 
@@ -12590,6 +12897,7 @@ mod tests {
                 risk_summary: None,
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             },
         );
 
@@ -12643,6 +12951,7 @@ mod tests {
                 risk_summary: None,
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             },
         );
 
@@ -12670,6 +12979,7 @@ mod tests {
                 risk_summary: None,
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             },
         );
 
@@ -12692,6 +13002,7 @@ mod tests {
                 risk_summary: None,
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             },
         );
 
@@ -12749,6 +13060,7 @@ mod tests {
                 risk_summary: None,
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             },
         );
 
@@ -12778,6 +13090,7 @@ mod tests {
                 risk_summary: None,
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             },
         );
 
@@ -12814,6 +13127,7 @@ mod tests {
                 risk_summary: None,
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             },
         );
 
@@ -12845,6 +13159,7 @@ mod tests {
                 risk_summary: None,
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             },
         );
 
@@ -12865,6 +13180,7 @@ mod tests {
                 risk_summary: None,
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             },
         );
 
@@ -12898,6 +13214,7 @@ mod tests {
                 risk_summary: None,
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             },
         );
 
@@ -12929,6 +13246,7 @@ mod tests {
                 risk_summary: None,
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             },
         );
 
@@ -12951,6 +13269,7 @@ mod tests {
                 risk_summary: None,
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             },
         );
 
@@ -12965,6 +13284,89 @@ mod tests {
             removed_state.relations.is_empty(),
             "entity and relation removal are both explicit in exact history"
         );
+    }
+
+    #[test]
+    fn resolve_graph_at_replays_external_reference_lifecycle() {
+        let graph = InMemoryGraph::new();
+        let mut caller = test_entity("caller", "src/client.py");
+        caller.file_origin = None;
+        let reference =
+            ExternalReference::new_resolved("python-module-v1", "requests", "get").unwrap();
+        let relation = Relation {
+            id: RelationId::new(),
+            src: GraphNodeId::Entity(caller.id),
+            dst: GraphNodeId::ExternalReference(reference.id),
+            kind: RelationKind::Imports,
+            confidence: 1.0,
+            origin: RelationOrigin::Lsp,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
+        };
+
+        let add_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x47; 32])),
+                parents: Vec::new(),
+                timestamp: Timestamp::now(),
+                author: AuthorId::new("test"),
+                message: "bind resolved dependency".to_string(),
+                entity_deltas: vec![EntityDelta::Added {
+                    new: caller.clone(),
+                }],
+                relation_deltas: vec![RelationDelta::Added {
+                    new: relation.clone(),
+                }],
+                tree_deltas: Vec::new(),
+                projected_files: Vec::new(),
+                spec_link: None,
+                evidence: Vec::new(),
+                risk_summary: None,
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
+                external_reference_deltas: vec![ExternalReferenceDelta::Added {
+                    new: reference.clone(),
+                }],
+            },
+        );
+        let remove_id = admit_change(
+            &graph,
+            SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0x48; 32])),
+                parents: vec![add_id],
+                timestamp: Timestamp::now(),
+                author: AuthorId::new("test"),
+                message: "retire resolved dependency".to_string(),
+                entity_deltas: Vec::new(),
+                relation_deltas: vec![RelationDelta::Removed {
+                    old: relation.clone(),
+                }],
+                tree_deltas: Vec::new(),
+                projected_files: Vec::new(),
+                spec_link: None,
+                evidence: Vec::new(),
+                risk_summary: None,
+                origin: kin_model::ChangeOrigin::Native,
+                admission_policy_delta: None,
+                external_reference_deltas: vec![ExternalReferenceDelta::Removed {
+                    old: reference.clone(),
+                }],
+            },
+        );
+
+        let added = graph.resolve_graph_at(&add_id).unwrap();
+        assert_eq!(
+            added.external_references.get(&reference.id),
+            Some(&reference)
+        );
+        assert_eq!(added.relations.get(&relation.id), Some(&relation));
+
+        let removed = graph.resolve_graph_at(&remove_id).unwrap();
+        assert!(removed.external_references.is_empty());
+        assert!(removed.relations.is_empty());
+        assert!(removed.entities.contains_key(&caller.id));
     }
 
     #[test]
@@ -12988,6 +13390,7 @@ mod tests {
                 risk_summary: None,
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             },
         );
 
@@ -13014,6 +13417,7 @@ mod tests {
                 risk_summary: None,
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             },
         );
 
@@ -13045,6 +13449,7 @@ mod tests {
                 risk_summary: None,
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             },
         );
 
@@ -13068,6 +13473,7 @@ mod tests {
                 risk_summary: None,
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             },
         );
 
@@ -13093,6 +13499,7 @@ mod tests {
                 risk_summary: None,
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             },
         );
 
@@ -13118,6 +13525,7 @@ mod tests {
                 risk_summary: None,
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             },
         );
 
@@ -13150,6 +13558,7 @@ mod tests {
                 risk_summary: None,
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             },
         );
 
@@ -13173,6 +13582,7 @@ mod tests {
                 risk_summary: None,
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             },
         );
 
@@ -13200,6 +13610,7 @@ mod tests {
                 risk_summary: None,
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             },
         );
 
@@ -13222,6 +13633,7 @@ mod tests {
                 risk_summary: None,
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             },
         );
 
@@ -13264,6 +13676,7 @@ mod tests {
                 risk_summary: None,
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             },
         );
 
@@ -13294,6 +13707,7 @@ mod tests {
                 risk_summary: None,
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             },
         );
 
@@ -13314,6 +13728,7 @@ mod tests {
                 risk_summary: None,
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             },
         );
 
@@ -13350,6 +13765,7 @@ mod tests {
                 risk_summary: None,
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             },
         );
 
@@ -13376,6 +13792,7 @@ mod tests {
                 risk_summary: None,
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             },
         );
 
@@ -13401,6 +13818,7 @@ mod tests {
                 risk_summary: None,
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             },
         );
 
@@ -13424,6 +13842,7 @@ mod tests {
                 risk_summary: None,
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             },
         );
 
@@ -13460,6 +13879,7 @@ mod tests {
                 risk_summary: None,
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             },
         );
 
@@ -13486,6 +13906,7 @@ mod tests {
                 risk_summary: None,
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             },
         );
 
@@ -13511,6 +13932,7 @@ mod tests {
                 risk_summary: None,
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             },
         );
 
@@ -13548,6 +13970,7 @@ mod tests {
                 risk_summary: None,
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             },
         );
 
@@ -13574,6 +13997,7 @@ mod tests {
                 risk_summary: None,
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             },
         );
 
@@ -13599,6 +14023,7 @@ mod tests {
                 risk_summary: None,
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             },
         );
 
@@ -14109,6 +14534,7 @@ mod tests {
                         new: test_located(&renamed_path.0, entry),
                     }],
                     admission_policy_delta: None,
+                    external_reference_deltas: Vec::new(),
                 })
                 .unwrap();
         }
@@ -14417,6 +14843,7 @@ mod tests {
             risk_summary: None,
             origin: kin_model::ChangeOrigin::Native,
             admission_policy_delta: None,
+            external_reference_deltas: Vec::new(),
         });
         graph.create_change(&change).unwrap();
         graph.batch_upsert_entities(entities).unwrap();
@@ -15260,6 +15687,7 @@ mod tests {
                 risk_summary: None,
                 origin: kin_model::ChangeOrigin::Native,
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             },
         );
 
@@ -15285,6 +15713,7 @@ mod tests {
                     risk_summary: None,
                     origin: kin_model::ChangeOrigin::Native,
                     admission_policy_delta: None,
+                    external_reference_deltas: Vec::new(),
                 },
             );
             previous = id;

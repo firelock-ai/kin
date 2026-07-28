@@ -3230,6 +3230,7 @@ mod tests {
                     ),
                 }],
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             })
             .unwrap();
 
@@ -4175,6 +4176,7 @@ mod tests {
             risk_summary: None,
             origin: kin_model::ChangeOrigin::Native,
             admission_policy_delta: None,
+            external_reference_deltas: Vec::new(),
         });
         let relation = Relation {
             id: RelationId::new(),
@@ -4258,6 +4260,7 @@ mod tests {
             risk_summary: None,
             origin: kin_model::ChangeOrigin::Native,
             admission_policy_delta: None,
+            external_reference_deltas: Vec::new(),
         });
 
         let calls = Relation {
@@ -4452,6 +4455,7 @@ mod tests {
             risk_summary: None,
             origin: kin_model::ChangeOrigin::Native,
             admission_policy_delta: None,
+            external_reference_deltas: Vec::new(),
         };
         let mut snapshot = crate::storage::format::LocateGraphSnapshot::from(
             crate::storage::GraphSnapshot::empty(),
@@ -4662,6 +4666,7 @@ mod tests {
             risk_summary: None,
             origin: kin_model::ChangeOrigin::Native,
             admission_policy_delta: None,
+            external_reference_deltas: Vec::new(),
         });
         graph.create_change(&change).unwrap();
 
@@ -5098,6 +5103,7 @@ mod tests {
                     new: LocatedEntry::new(RepoPath::from_utf8(&file_id.0).unwrap(), new_entry),
                 }],
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             })
             .unwrap();
         assert_ne!(before_authority, graph.retrieval_authority_hash());
@@ -5164,6 +5170,7 @@ mod tests {
                     new: LocatedEntry::new(RepoPath::from_utf8(&file_id.0).unwrap(), new_entry),
                 }],
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             })
             .unwrap();
         assert_eq!(
@@ -6413,6 +6420,7 @@ mod tests {
                     new: LocatedEntry::new(RepoPath::from_utf8(&new_path.0).unwrap(), entry),
                 }],
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             })
             .unwrap();
 
