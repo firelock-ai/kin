@@ -56,7 +56,7 @@ enum Command {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
-    /// [OPEN GATE] Create an exact semantic and artifact commit
+    /// Create an exact semantic and artifact commit
     Commit {
         /// Commit message
         #[arg(short, long)]
@@ -774,7 +774,7 @@ enum Command {
         #[arg(last = true)]
         task: Vec<String>,
     },
-    /// [OPEN GATE] Admit one exact disposable-session observation into repository-v6 authority
+    /// Admit one exact disposable-session observation into repository-v6 authority
     Reconcile {
         /// Session ID (defaults to most recent session)
         session: Option<String>,

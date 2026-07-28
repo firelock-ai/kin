@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 
 #[cfg(unix)]
 use super::repository_authority::ActiveRepositoryAuthority;
-use super::session_workspace::SessionWorkspaceBase;
+use crate::commands::session_workspace::SessionWorkspaceBase;
 
 pub const RECONCILE_SUMMARY_SCHEMA: &str = "kin.session-reconcile.v1";
 
@@ -115,18 +115,90 @@ pub struct ReconcileSummary {
 /// Source bodies have already been written and read back from the daemon's
 /// non-authoritative ingestion CAS, then released from request memory.
 /// Repository publication reloads them from CAS by identity.
+///
+/// The observation owns the retained no-follow directory capability it was
+/// taken through, so the capability outlives planning and reaches publication
+/// rather than being released when the scanner returns. Every field is
+/// private and every constructor path runs the scanner, so no caller outside
+/// this module can fabricate an observation or hand publication a desired tree
+/// that no retained walk produced.
+///
+/// The seal is a type-level one. Removing the capability, or building this
+/// value by hand, does not compile:
+///
+/// ```compile_fail
+/// # use kin_cli::commands::reconcile::SessionReconcileObservation;
+/// # fn fabricate(base: kin_cli::commands::session_workspace::SessionWorkspaceBase,
+/// #              tree: kin_model::ResolvedTree) -> SessionReconcileObservation {
+/// SessionReconcileObservation {
+///     base,
+///     desired_tree: tree,
+///     deltas: Vec::new(),
+///     observed_materialized_artifacts: 0,
+///     observed_body_bytes: 0,
+///     preserved_graph_only_artifacts: 0,
+/// }
+/// # }
+/// ```
 pub struct SessionReconcileObservation {
-    pub base: SessionWorkspaceBase,
-    pub desired_tree: ResolvedTree,
-    pub deltas: Vec<TreeDelta>,
-    pub observed_materialized_artifacts: usize,
-    pub observed_body_bytes: u64,
-    pub preserved_graph_only_artifacts: usize,
+    #[cfg(unix)]
+    retained: RetainedSession,
+    #[cfg(unix)]
+    base_bytes: Vec<u8>,
+    base: SessionWorkspaceBase,
+    desired_tree: ResolvedTree,
+    deltas: Vec<TreeDelta>,
+    observed_materialized_artifacts: usize,
+    observed_body_bytes: u64,
+    preserved_graph_only_artifacts: usize,
 }
 
 impl SessionReconcileObservation {
+    pub fn base(&self) -> &SessionWorkspaceBase {
+        &self.base
+    }
+
+    pub fn desired_tree(&self) -> &ResolvedTree {
+        &self.desired_tree
+    }
+
+    pub fn deltas(&self) -> &[TreeDelta] {
+        &self.deltas
+    }
+
+    pub const fn observed_materialized_artifacts(&self) -> usize {
+        self.observed_materialized_artifacts
+    }
+
+    pub const fn observed_body_bytes(&self) -> u64 {
+        self.observed_body_bytes
+    }
+
+    pub const fn preserved_graph_only_artifacts(&self) -> usize {
+        self.preserved_graph_only_artifacts
+    }
+
     pub fn changes(&self) -> Vec<ReconcileChange> {
         self.deltas.iter().map(reconcile_change).collect()
+    }
+
+    /// Re-prove the retained capability still names the observed session.
+    ///
+    /// Publication calls this after planning, so the window between the last
+    /// scan and the authority transaction is covered by the same directory
+    /// identities and the same base bytes the plan was derived from.
+    pub fn revalidate_retained_capability(&self, layout: &kin_core::KinLayout) -> Result<()> {
+        #[cfg(unix)]
+        {
+            self.retained
+                .revalidate_visible(layout, &self.base_bytes)
+                .context("revalidate retained session capability before publication")
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = layout;
+            bail!("retained session capability is unavailable on this platform")
+        }
     }
 }
 
@@ -203,6 +275,8 @@ pub fn observe_session_workspace(
         let observed_materialized_artifacts = first.entries.len();
 
         Ok(SessionReconcileObservation {
+            retained,
+            base_bytes,
             base,
             desired_tree,
             deltas,
@@ -970,6 +1044,53 @@ mod tests {
         assert_eq!(
             ReconcilePath::from(&raw),
             ReconcilePath::Hex("6173736574732f706f6c6963792dff".to_string())
+        );
+    }
+
+    /// The scanner returns, and the observation still holds the no-follow
+    /// directory capability the walk was taken through. Swapping the session
+    /// out from under a completed observation is therefore still detected at
+    /// the moment publication asks, not only while the scanner was running.
+    #[cfg(unix)]
+    #[test]
+    fn observation_retains_its_session_capability_after_the_scanner_returns() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join("member.txt"), b"admitted\n").unwrap();
+        let init = kin_core::init(repo.path()).unwrap();
+        let layout = init.layout;
+        let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&layout).unwrap();
+        let blobs = kin_blobs::BlobStore::new(layout.ingest_cas_dir()).unwrap();
+
+        let session_dir = layout.runs_dir().join("session-capability-probe");
+        let request = crate::commands::session_workspace::SessionWorkspaceRequest {
+            session_dir: session_dir.display().to_string(),
+            strategy: None,
+            scope: None,
+        };
+        crate::commands::session_workspace::materialize_session_workspace(
+            &layout, &binding, &request,
+        )
+        .unwrap();
+
+        let observation =
+            observe_session_workspace(&layout, &binding, &session_dir, &blobs, false).unwrap();
+        observation
+            .revalidate_retained_capability(&layout)
+            .expect("an untouched session must still satisfy its retained capability");
+
+        // Swap the observed session directory for a different directory of the
+        // same name, exactly as a racing writer or a symlink swap would.
+        let displaced = layout.runs_dir().join("session-capability-probe-displaced");
+        std::fs::rename(&session_dir, &displaced).unwrap();
+        std::fs::create_dir(&session_dir).unwrap();
+        std::fs::create_dir(session_dir.join(".kin-session")).unwrap();
+
+        let error = observation
+            .revalidate_retained_capability(&layout)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("retained session capability"),
+            "{error:#}"
         );
     }
 

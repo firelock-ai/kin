@@ -11,8 +11,8 @@ use kin_index::{
     FileClassification, FileClassifier, FileEvent, FileWatcher, IndexPipeline, IndexedAny,
 };
 use kin_model::{
-    ArtifactId, EntityFilter, EntityId, EntityStore, FilePathId, Hash256, LocatedEntry, RepoPath,
-    ShallowTrackedFile, TransactionDelta, TreeDelta, TreeEntry,
+    EntityFilter, EntityId, EntityStore, FilePathId, Hash256, RepoPath, ShallowTrackedFile,
+    TransactionDelta, TreeDelta, TreeEntry,
 };
 use tracing::{debug, error, info, warn};
 
@@ -110,7 +110,6 @@ enum AdmittedFileEvent {
     Removed {
         repo_path: RepoPath,
         file_id: Option<FilePathId>,
-        tree_delta: Option<TreeDelta>,
         tree_changed: bool,
     },
     Ignored,
@@ -348,14 +347,14 @@ fn is_within_graph_only_member(state: &DaemonState, path: &RepoPath) -> Result<b
 
 fn publish_exact_workspace_tree(
     state: &DaemonState,
-    desired_tree: &kin_model::ResolvedTree,
+    admitted: &crate::repository_commit::AdmittedWorkspaceTree,
 ) -> Result<()> {
     let authority_context =
         crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(state)?;
     let Some(admission) = crate::repository_commit::publish_workspace_tree(
         state.blobs.as_ref(),
         &authority_context,
-        desired_tree,
+        admitted,
         kin_model::OperationId::new(),
         kin_model::AuthorId::new(kin_core::whoami()),
     )?
@@ -379,6 +378,29 @@ fn invalid_tree_transition(error: impl std::fmt::Display) -> DaemonError {
             "invalid admitted exact-tree transition: {error}"
         )),
     ))
+}
+
+/// Refuse one whole observation whose removals were never confirmed.
+///
+/// This is a refusal of the observation, not of its removal subset: no tree,
+/// policy, or graph state derived from it may be published.
+fn mass_deletion_refused(removed: u64, total_graph_files: u64) -> DaemonError {
+    DaemonError::Graph(kin_db::KinDbError::Model(
+        kin_model::ModelError::InvalidOperation(format!(
+            "refusing one complete host observation: it removes {removed} of {total_graph_files} \
+             graph-known artifacts. No part of an unconfirmed mass deletion is published. Set \
+             KIN_ALLOW_MASS_DELETION=1 to confirm an intentional mass deletion"
+        )),
+    ))
+}
+
+/// Read the repository roots the next observation will be planned against.
+fn current_authority_roots(state: &DaemonState) -> Result<kin_model::RootBundle> {
+    let authority_context =
+        crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(state)?;
+    let authority = authority_context.open().map_err(DaemonError::Graph)?;
+    let roots = authority.read_authority().roots().clone();
+    Ok(roots)
 }
 
 /// Report whether one repository path was named by an observation, either
@@ -416,6 +438,11 @@ fn exact_tree_admission(
     observation: Option<&BTreeSet<RepoPath>>,
 ) -> Result<ExactTreeAdmission> {
     let working_dir = state.layout.working_dir();
+    // Read the authority roots the observation is about to be planned against.
+    // Publication compare-and-swaps on this bundle, so a repository that moves
+    // while the host walk is running fails the whole admission instead of
+    // having its desired tree replanned onto the newer authority.
+    let expected_roots = current_authority_roots(state)?;
     let previous = state.graph.resolved_tree();
     let tracked_paths = previous
         .artifacts_by_path()
@@ -449,7 +476,7 @@ fn exact_tree_admission(
         }
         observed.retain(|path, _| previous.artifact_id_at_path(path).is_some());
     }
-    let mut deltas = kin_core::plan_observed_tree_deltas(&previous, observed.clone())?;
+    let deltas = kin_core::plan_observed_tree_deltas(&previous, observed.entries().clone())?;
 
     let removed_count = deltas
         .iter()
@@ -461,20 +488,15 @@ fn exact_tree_admission(
         .unwrap_or(false);
     if should_block_mass_deletion(removed_count, previous.len() as u64, allow_mass_deletion) {
         state.mass_deletion_blocked.store(true, Ordering::Relaxed);
-        warn!(
-            total_graph_files = previous.len(),
-            removed_count,
-            "refusing filesystem-sync removals: they would wipe >75% of graph-known artifacts. Set KIN_ALLOW_MASS_DELETION=1 to confirm an intentional mass deletion"
-        );
-        for delta in &deltas {
-            if let TreeDelta::Removed { old, .. } = delta {
-                observed.insert(old.path.clone(), old.entry);
-            }
-        }
-        deltas = kin_core::plan_observed_tree_deltas(&previous, observed)?;
-    } else {
-        state.mass_deletion_blocked.store(false, Ordering::Relaxed);
+        // One host walk is one observation. Suppressing only its removals and
+        // replanning would publish the additions, modifications, and derived
+        // admission-policy state that the same unconfirmed observation carried,
+        // which is a partial publication of a transition the operator refused.
+        // The whole observation is dropped instead; nothing crosses authority
+        // and graph truth is retained until the deletion is confirmed.
+        return Err(mass_deletion_refused(removed_count, previous.len() as u64));
     }
+    state.mass_deletion_blocked.store(false, Ordering::Relaxed);
 
     let mut changed_paths = BTreeSet::new();
     let mut semantic_events = Vec::new();
@@ -499,8 +521,16 @@ fn exact_tree_admission(
         let desired_tree = previous.apply(&deltas).map_err(invalid_tree_transition)?;
         // Repository authority moves first. The in-memory graph is a derived
         // staging/query view and must never acknowledge dirty file truth that
-        // has not crossed the repository-v6 compare-and-swap.
-        publish_exact_workspace_tree(state, &desired_tree)?;
+        // has not crossed the repository-v6 compare-and-swap. The scanner's
+        // completion proof and the planning base travel with the tree so
+        // publication can verify both rather than trust the caller.
+        let admitted = crate::repository_commit::AdmittedWorkspaceTree::from_complete_observation(
+            observed.completion(),
+            expected_roots,
+            previous.clone(),
+            desired_tree,
+        );
+        publish_exact_workspace_tree(state, &admitted)?;
         state.graph.apply_transaction_delta(&TransactionDelta {
             entity_deltas: Vec::new(),
             relation_deltas: Vec::new(),
@@ -516,54 +546,14 @@ fn exact_tree_admission(
     })
 }
 
-fn planned_tree_delta(
-    state: &DaemonState,
-    path: RepoPath,
-    new_entry: Option<TreeEntry>,
-) -> Option<TreeDelta> {
-    let existing = state
-        .graph
-        .artifact_id_at_path(&path)
-        .and_then(|artifact_id| state.graph.resolved_artifact(&artifact_id));
-    match (existing, new_entry) {
-        (Some(existing), Some(entry)) if existing.entry == entry => None,
-        (Some(existing), Some(entry)) => Some(TreeDelta::Updated {
-            artifact_id: existing.artifact_id,
-            old: existing.located_entry(),
-            new: LocatedEntry::new(path, entry),
-        }),
-        (None, Some(entry)) => Some(TreeDelta::Added {
-            artifact_id: ArtifactId::new(),
-            new: LocatedEntry::new(path, entry),
-        }),
-        (Some(existing), None) => Some(TreeDelta::Removed {
-            artifact_id: existing.artifact_id,
-            old: existing.located_entry(),
-        }),
-        (None, None) => None,
-    }
-}
-
-fn apply_tree_delta(state: &DaemonState, delta: Option<TreeDelta>) -> Result<bool> {
-    let Some(delta) = delta else {
-        return Ok(false);
-    };
-    let desired_tree = state
-        .graph
-        .resolved_tree()
-        .apply(std::slice::from_ref(&delta))
-        .map_err(invalid_tree_transition)?;
-    publish_exact_workspace_tree(state, &desired_tree)?;
-    state.graph.apply_transaction_delta(&TransactionDelta {
-        entity_deltas: Vec::new(),
-        relation_deltas: Vec::new(),
-        tree_deltas: vec![delta],
-        ..TransactionDelta::default()
-    })?;
-    Ok(true)
-}
-
-/// Admit exact repository-tree truth before attempting any enrichment.
+/// Classify one host event against exact repository-tree truth that has
+/// already been admitted, before attempting any enrichment.
+///
+/// `admitted_paths` are the paths the preceding complete-scan transaction moved.
+/// This function never publishes: exact tree truth reaches repository authority
+/// only through [`exact_tree_admission`], which carries the scanner's completion
+/// proof. A per-event publication seam here would be a raw-filesystem rebuild of
+/// authority with no proof that the walk behind it ever completed.
 ///
 /// A removal notification is reclassified as a change when the directory
 /// entry exists again (including a dangling symlink); a change notification is
@@ -571,7 +561,7 @@ fn apply_tree_delta(state: &DaemonState, delta: Option<TreeDelta>) -> Result<boo
 fn admit_file_event_with_exact_tree(
     state: &DaemonState,
     event: &FileEvent,
-    admitted_paths: Option<&BTreeSet<RepoPath>>,
+    admitted_paths: &BTreeSet<RepoPath>,
 ) -> Result<AdmittedFileEvent> {
     let path = match event {
         FileEvent::Changed(path) | FileEvent::Removed(path) => path,
@@ -589,7 +579,7 @@ fn admit_file_event_with_exact_tree(
     }
     let file_id = semantic_file_id(&repo_path);
     let tracked = state.graph.artifact_id_at_path(&repo_path).is_some()
-        || admitted_paths.is_some_and(|paths| paths.contains(&repo_path));
+        || admitted_paths.contains(&repo_path);
     let ignore =
         kin_index::RepositoryIgnore::load(working_dir).map_err(kin_index::IndexError::from)?;
     if !tracked && ignore.matches(&repo_path) {
@@ -599,17 +589,10 @@ fn admit_file_event_with_exact_tree(
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let tree_delta = admitted_paths
-                .is_none()
-                .then(|| planned_tree_delta(state, repo_path.clone(), None))
-                .flatten();
-            let tree_changed = admitted_paths
-                .map(|paths| paths.contains(&repo_path))
-                .unwrap_or_else(|| tree_delta.is_some());
+            let tree_changed = admitted_paths.contains(&repo_path);
             return Ok(AdmittedFileEvent::Removed {
                 repo_path,
                 file_id,
-                tree_delta,
                 tree_changed,
             });
         }
@@ -658,13 +641,7 @@ fn admit_file_event_with_exact_tree(
         )));
     };
 
-    let tree_changed = match admitted_paths {
-        Some(paths) => paths.contains(&repo_path),
-        None => apply_tree_delta(
-            state,
-            planned_tree_delta(state, repo_path.clone(), Some(entry)),
-        )?,
-    };
+    let tree_changed = admitted_paths.contains(&repo_path);
 
     if is_symlink {
         Ok(AdmittedFileEvent::Symlink {
@@ -687,7 +664,10 @@ fn admit_file_event_with_exact_tree(
 
 #[cfg(test)]
 fn admit_file_event(state: &DaemonState, event: &FileEvent) -> Result<AdmittedFileEvent> {
-    admit_file_event_with_exact_tree(state, event, None)
+    // Mirror production ordering: one complete-scan transaction crosses
+    // authority first, then host events are classified against what it moved.
+    let admission = exact_tree_admission(state, None)?;
+    admit_file_event_with_exact_tree(state, event, &admission.changed_paths)
 }
 
 fn clear_incompatible_facets(
@@ -733,26 +713,21 @@ fn clear_incompatible_facets(
     Ok(cleanup)
 }
 
-/// Clear UTF-8-only enrichment while the artifact is still admitted, then
-/// remove exact tree identity. Non-UTF-8 artifacts have no `FilePathId`
-/// enrichment surface and proceed directly to the tree transaction.
+/// Clear UTF-8-only enrichment for an artifact the exact-tree transaction has
+/// already removed. Non-UTF-8 artifacts have no `FilePathId` enrichment
+/// surface and need no cleanup.
 fn finalize_tree_removal(
     state: &DaemonState,
     file_id: Option<&FilePathId>,
-    tree_delta: Option<TreeDelta>,
     tree_changed: bool,
 ) -> Result<FacetCleanup> {
     if !tree_changed {
         return Ok(FacetCleanup::default());
     }
-    let cleanup = match file_id {
-        Some(file_id) => clear_incompatible_facets(state, file_id, EnrichmentFacet::None)?,
-        None => FacetCleanup::default(),
-    };
-    if tree_delta.is_some() {
-        apply_tree_delta(state, tree_delta)?;
+    match file_id {
+        Some(file_id) => clear_incompatible_facets(state, file_id, EnrichmentFacet::None),
+        None => Ok(FacetCleanup::default()),
     }
-    Ok(cleanup)
 }
 
 fn shallow_tracked_file(shallow: kin_parser::ShallowFile) -> ShallowTrackedFile {
@@ -1079,7 +1054,7 @@ pub async fn run_loop(
             let admitted = match admit_file_event_with_exact_tree(
                 &state,
                 event,
-                Some(&exact_admission.changed_paths),
+                &exact_admission.changed_paths,
             ) {
                 Ok(admitted) => admitted,
                 Err(error) => {
@@ -1262,16 +1237,12 @@ pub async fn run_loop(
                     continue;
                 }
                 AdmittedFileEvent::Removed {
-                    repo_path,
-                    file_id,
-                    tree_delta,
-                    ..
+                    repo_path, file_id, ..
                 } => {
                     if !tree_changed {
                         continue;
                     }
-                    match finalize_tree_removal(&state, file_id.as_ref(), tree_delta, tree_changed)
-                    {
+                    match finalize_tree_removal(&state, file_id.as_ref(), tree_changed) {
                         Ok(cleanup) => {
                             if let Some(file_id) = &file_id {
                                 projection_changed.remove(file_id.clone());
@@ -1864,11 +1835,17 @@ mod tests {
         std::fs::remove_file(&tracked).unwrap();
         let _tracked_listener = UnixListener::bind(&tracked).unwrap();
 
+        // The walk itself refuses: a tracked path Kin cannot represent makes
+        // the scan incomplete, so there is no completion proof to publish with
+        // and graph truth is retained.
         let error = admit_file_event(&state, &FileEvent::Changed(tracked))
             .expect_err("tracked special type must fail instead of erasing graph truth");
-        assert!(error
-            .to_string()
-            .contains("tracked repository path changed"));
+        assert!(
+            error
+                .to_string()
+                .contains("tracked path changed to an unsupported special filesystem entry"),
+            "{error}"
+        );
         assert_eq!(tree_entry(&state, "tracked.sock"), Some(old_entry));
     }
 
@@ -1883,8 +1860,8 @@ mod tests {
                 entity_deltas: vec![],
                 relation_deltas: vec![],
                 tree_deltas: vec![TreeDelta::Added {
-                    artifact_id: ArtifactId::new(),
-                    new: LocatedEntry::new(test_repo_path("submodule"), gitlink),
+                    artifact_id: kin_model::ArtifactId::new(),
+                    new: kin_model::LocatedEntry::new(test_repo_path("submodule"), gitlink),
                 }],
                 ..TransactionDelta::default()
             })
@@ -2255,6 +2232,107 @@ mod tests {
         assert!(pending.is_empty());
     }
 
+    /// A walk that cannot complete has no completion proof, so it has nothing
+    /// to publish with. Authority must be untouched rather than advanced from
+    /// whatever the partial walk happened to read.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn incomplete_host_walk_publishes_no_workspace_authority() {
+        use std::os::unix::net::UnixListener;
+
+        let repo = tempfile::tempdir().unwrap();
+        let tracked = repo.path().join("service.txt");
+        std::fs::write(&tracked, b"regular while it is admitted\n").unwrap();
+        let init = kin_core::init(repo.path()).unwrap();
+        let state = Arc::new(DaemonState::open(init.layout).unwrap());
+        sync_filesystem_with_graph(&state).await.unwrap();
+
+        let tree_before = authority_tree(&state);
+        assert!(tree_before
+            .artifact_at_path(&test_repo_path("service.txt"))
+            .is_some());
+
+        std::fs::remove_file(&tracked).unwrap();
+        let _listener = UnixListener::bind(&tracked).unwrap();
+
+        let error = sync_filesystem_with_graph(&state).await.unwrap_err();
+        assert!(
+            error.to_string().contains("repository scan incomplete"),
+            "{error}"
+        );
+        assert_eq!(
+            authority_tree(&state),
+            tree_before,
+            "a walk that never completed must not move workspace authority"
+        );
+    }
+
+    /// The mass-deletion guard refuses an observation, not a delta subset.
+    /// Anything else the same unconfirmed walk saw must stay unpublished too.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unconfirmed_mass_deletion_publishes_no_part_of_the_observation() {
+        let repo = tempfile::tempdir().unwrap();
+        for index in 0..20 {
+            std::fs::write(
+                repo.path().join(format!("member{index}.txt")),
+                format!("admitted {index}\n"),
+            )
+            .unwrap();
+        }
+        let init = kin_core::init(repo.path()).unwrap();
+        let state = Arc::new(DaemonState::open(init.layout).unwrap());
+        sync_filesystem_with_graph(&state).await.unwrap();
+
+        let tree_before = authority_tree(&state);
+        assert_eq!(tree_before.len(), 20);
+
+        let survivor_entry_before = tree_before
+            .artifact_at_path(&test_repo_path("member19.txt"))
+            .unwrap()
+            .entry;
+
+        for index in 0..18 {
+            std::fs::remove_file(repo.path().join(format!("member{index}.txt"))).unwrap();
+        }
+        // The same walk also carries an ordinary modification. It is a delta
+        // the operator never refused, which is exactly why the old behavior
+        // published it while suppressing the removals beside it.
+        std::fs::write(
+            repo.path().join("member19.txt"),
+            b"edited in the same observation as the deletion\n",
+        )
+        .unwrap();
+
+        let error = sync_filesystem_with_graph(&state).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("No part of an unconfirmed mass deletion is published"),
+            "{error}"
+        );
+        assert!(state.is_mass_deletion_blocked());
+
+        let tree_after = authority_tree(&state);
+        assert_eq!(
+            tree_after, tree_before,
+            "no part of a refused observation may cross authority"
+        );
+        assert_eq!(
+            tree_after
+                .artifact_at_path(&test_repo_path("member19.txt"))
+                .unwrap()
+                .entry,
+            survivor_entry_before,
+            "the modification carried by a refused observation must not publish"
+        );
+        assert_eq!(
+            tree_entry(&state, "member19.txt"),
+            Some(survivor_entry_before),
+            "graph state derived from a refused observation must not publish either"
+        );
+    }
+
     #[test]
     fn mass_deletion_guard_blocks_drastic_removals_only() {
         assert!(should_block_mass_deletion(80, 100, false)); // 80% gone -> blocked
@@ -2337,7 +2415,7 @@ pub(crate) async fn sync_filesystem_with_graph_under_coordination(
         let admitted = match admit_file_event_with_exact_tree(
             state,
             &event,
-            Some(&exact_admission.changed_paths),
+            &exact_admission.changed_paths,
         ) {
             Ok(admitted) => admitted,
             Err(error) => {
@@ -2469,13 +2547,12 @@ pub(crate) async fn sync_filesystem_with_graph_under_coordination(
             AdmittedFileEvent::Removed {
                 repo_path,
                 file_id,
-                tree_delta,
                 tree_changed,
             } => {
                 if !tree_changed {
                     continue;
                 }
-                match finalize_tree_removal(state, file_id.as_ref(), tree_delta, tree_changed) {
+                match finalize_tree_removal(state, file_id.as_ref(), tree_changed) {
                     Ok(cleanup) => {
                         if let Some(file_id) = &file_id {
                             projection_changed.remove(file_id.clone());

@@ -2691,8 +2691,8 @@ async fn reconcile_session_workspace(
     )
     .map_err(session_reconcile_error)?;
 
-    let previous_tree_hash = observation.base.source_workspace.tree_hash;
-    let desired_tree_hash = kin_model::compute_resolved_tree_hash(&observation.desired_tree)
+    let previous_tree_hash = observation.base().source_workspace.tree_hash;
+    let desired_tree_hash = kin_model::compute_resolved_tree_hash(observation.desired_tree())
         .map_err(repository_authority_error)?;
     let changes = observation.changes();
     let added = changes
@@ -2708,8 +2708,8 @@ async fn reconcile_session_workspace(
         .filter(|change| change.kind == kin_cli::commands::reconcile::ReconcileChangeKind::Removed)
         .count();
 
-    if state.graph.resolved_tree() != observation.base.source_workspace.tree
-        && state.graph.resolved_tree() != observation.desired_tree
+    if state.graph.resolved_tree() != observation.base().source_workspace.tree
+        && state.graph.resolved_tree() != *observation.desired_tree()
     {
         return Err((
             StatusCode::CONFLICT,
@@ -2720,12 +2720,12 @@ async fn reconcile_session_workspace(
     }
 
     let (authority_generation, workspace_generation, idempotent_replay) = if observation
-        .deltas
+        .deltas()
         .is_empty()
     {
         (
-            observation.base.authority_roots.generation,
-            observation.base.source_workspace.generation,
+            observation.base().authority_roots.generation,
+            observation.base().source_workspace.generation,
             false,
         )
     } else {
@@ -2733,10 +2733,10 @@ async fn reconcile_session_workspace(
             crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(&state)
                 .map_err(repository_commit_error)?;
         let plan = crate::repository_commit::plan_session_workspace_admission(
+            &state.layout,
             state.blobs.as_ref(),
             &authority_context,
-            &observation.base,
-            &observation.desired_tree,
+            &observation,
         )
         .map_err(repository_commit_error)?;
         let committed = crate::repository_commit::commit_session_workspace_admission(
@@ -2766,15 +2766,15 @@ async fn reconcile_session_workspace(
         }
 
         let graph_tree = state.graph.resolved_tree();
-        if graph_tree == observation.base.source_workspace.tree {
+        if graph_tree == observation.base().source_workspace.tree {
             state
                 .graph
                 .apply_transaction_delta(&TransactionDelta {
-                    tree_deltas: observation.deltas.clone(),
+                    tree_deltas: observation.deltas().to_vec(),
                     ..TransactionDelta::default()
                 })
                 .map_err(internal_error)?;
-        } else if graph_tree != observation.desired_tree {
+        } else if graph_tree != *observation.desired_tree() {
             return Err((
                 StatusCode::CONFLICT,
                 "repository receipt is durable but the daemon query tree cannot be advanced \
@@ -2792,7 +2792,7 @@ async fn reconcile_session_workspace(
         (
             committed.receipt.generation,
             observation
-                .base
+                .base()
                 .source_workspace
                 .generation
                 .saturating_add(1),
@@ -2803,20 +2803,20 @@ async fn reconcile_session_workspace(
     drop(graph_mutation);
     Ok(Json(kin_cli::commands::reconcile::ReconcileSummary {
         schema: kin_cli::commands::reconcile::RECONCILE_SUMMARY_SCHEMA.to_string(),
-        operation_id: observation.base.reconcile_operation_id,
-        repository_id: observation.base.repository_id,
+        operation_id: observation.base().reconcile_operation_id,
+        repository_id: observation.base().repository_id.clone(),
         authority_generation,
         workspace_generation,
         previous_tree_hash,
         desired_tree_hash,
         idempotent_replay,
-        changed: !observation.deltas.is_empty(),
+        changed: !observation.deltas().is_empty(),
         added,
         modified,
         removed,
-        observed_materialized_artifacts: observation.observed_materialized_artifacts,
-        preserved_graph_only_artifacts: observation.preserved_graph_only_artifacts,
-        observed_body_bytes: observation.observed_body_bytes,
+        observed_materialized_artifacts: observation.observed_materialized_artifacts(),
+        preserved_graph_only_artifacts: observation.preserved_graph_only_artifacts(),
+        observed_body_bytes: observation.observed_body_bytes(),
         semantic_files_enriched: 0,
         semantic_enrichment_failures: 0,
         changes,
@@ -10690,10 +10690,16 @@ mod tests {
         let authority_context =
             crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(&state)
                 .unwrap();
+        let admitted = crate::repository_commit::admitted_workspace_tree_for_test(
+            state.layout.working_dir(),
+            roots_before.clone(),
+            state.graph.resolved_tree(),
+            desired.clone(),
+        );
         let publication_error = crate::repository_commit::publish_workspace_tree(
             state.blobs.as_ref(),
             &authority_context,
-            &desired,
+            &admitted,
             kin_model::OperationId::new(),
             AuthorId::new("kindb-root-swap-background-test"),
         )

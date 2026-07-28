@@ -492,6 +492,40 @@ fn compute_deltas_from_resolved_state(
     })
 }
 
+/// One host observation carried together with the scanner's completion proof.
+///
+/// [`kin_index::CompleteScanToken`] can only be minted by a repository walk in
+/// which every directory read, metadata lookup, file read, and symbolic-link
+/// read succeeded. Carrying it in the observation keeps the proof attached
+/// through planning and into publication, so a partial walk or a fabricated
+/// path map cannot reach repository authority.
+///
+/// The observed entry set stays mutable because the daemon narrows it to the
+/// paths one ambient notification batch actually named. Narrowing what may
+/// move never weakens the proof that the walk itself was complete.
+pub(crate) struct CompleteWorkspaceObservation {
+    entries: BTreeMap<RepoPath, TreeEntry>,
+    completion: kin_index::CompleteScanToken,
+}
+
+impl CompleteWorkspaceObservation {
+    pub(crate) fn insert(&mut self, path: RepoPath, entry: TreeEntry) {
+        self.entries.insert(path, entry);
+    }
+
+    pub(crate) fn retain(&mut self, keep: impl FnMut(&RepoPath, &mut TreeEntry) -> bool) {
+        self.entries.retain(keep);
+    }
+
+    pub(crate) fn entries(&self) -> &BTreeMap<RepoPath, TreeEntry> {
+        &self.entries
+    }
+
+    pub(crate) const fn completion(&self) -> kin_index::CompleteScanToken {
+        self.completion
+    }
+}
+
 /// Turn one complete host scan into exact graph entries.
 ///
 /// Graph-only entries (currently Gitlinks) are copied from the parent tree:
@@ -500,7 +534,7 @@ pub(crate) fn observed_tree_from_complete_scan(
     blobs: &kin_blobs::BlobStore,
     scan: &kin_index::CompleteRepositoryScan,
     previous: &ResolvedTree,
-) -> Result<BTreeMap<RepoPath, TreeEntry>> {
+) -> Result<CompleteWorkspaceObservation> {
     let mut observed = previous
         .artifacts_by_path()
         .filter(|artifact| matches!(artifact.entry, TreeEntry::Gitlink { .. }))
@@ -527,7 +561,10 @@ pub(crate) fn observed_tree_from_complete_scan(
         observed.insert(scanned.repo_path.clone(), entry);
     }
 
-    Ok(observed)
+    Ok(CompleteWorkspaceObservation {
+        entries: observed,
+        completion: scan.completion(),
+    })
 }
 
 fn read_scanned_entry(scanned: &kin_index::ScannedRepositoryEntry) -> Result<Vec<u8>> {
@@ -1037,7 +1074,8 @@ mod tests {
         )
         .map_err(kin_index::IndexError::from)?;
         let observed = observed_tree_from_complete_scan(blobs, &scan, &previous)?;
-        let tree_deltas = kin_core::plan_observed_tree_deltas(&previous, observed)?;
+        let tree_deltas =
+            kin_core::plan_observed_tree_deltas(&previous, observed.entries().clone())?;
         graph.apply_transaction_delta(&kin_model::TransactionDelta {
             entity_deltas: Vec::new(),
             relation_deltas: Vec::new(),

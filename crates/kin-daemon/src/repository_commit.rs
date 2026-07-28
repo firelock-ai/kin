@@ -79,6 +79,70 @@ pub struct WorkspaceAdmissionResult {
     pub file_count: usize,
 }
 
+/// One exact workspace transition that a complete host scan actually proved.
+///
+/// The constructor requires [`kin_index::CompleteScanToken`], which only a
+/// fully successful repository walk mints, so publication cannot be handed a
+/// tree assembled from a partial walk or from nothing at all. It also binds the
+/// authority roots and the workspace tree the transition was planned against,
+/// which is what lets publication refuse a stale desired tree instead of
+/// silently replanning it against newer authority.
+pub(crate) struct AdmittedWorkspaceTree {
+    previous_tree: kin_model::ResolvedTree,
+    desired_tree: kin_model::ResolvedTree,
+    expected_roots: RootBundle,
+    /// Held, not read: the proof does its work by being impossible to supply
+    /// without a completed walk, and by staying attached to the tree it
+    /// proved.
+    #[allow(dead_code)]
+    completion: kin_index::CompleteScanToken,
+}
+
+impl AdmittedWorkspaceTree {
+    pub(crate) fn from_complete_observation(
+        completion: kin_index::CompleteScanToken,
+        expected_roots: RootBundle,
+        previous_tree: kin_model::ResolvedTree,
+        desired_tree: kin_model::ResolvedTree,
+    ) -> Self {
+        Self {
+            previous_tree,
+            desired_tree,
+            expected_roots,
+            completion,
+        }
+    }
+}
+
+/// Admit `desired_tree` for a test by taking a real host walk first.
+///
+/// `CompleteScanToken` cannot be minted outside `kin-index`, so a test cannot
+/// fabricate an admission any more than production can. It has to walk the
+/// working directory and carry back the proof that the walk finished.
+#[cfg(test)]
+pub(crate) fn admitted_workspace_tree_for_test(
+    working_dir: &std::path::Path,
+    expected_roots: RootBundle,
+    previous_tree: kin_model::ResolvedTree,
+    desired_tree: kin_model::ResolvedTree,
+) -> AdmittedWorkspaceTree {
+    let ignore = kin_index::RepositoryIgnore::load(working_dir).expect("load repository ignore");
+    let scan = kin_index::scan_repository(
+        working_dir,
+        &ignore,
+        previous_tree
+            .artifacts_by_path()
+            .map(|artifact| &artifact.path),
+    )
+    .expect("complete host walk");
+    AdmittedWorkspaceTree::from_complete_observation(
+        scan.completion(),
+        expected_roots,
+        previous_tree,
+        desired_tree,
+    )
+}
+
 /// Immutable session-reconcile plan bound to the authority lease captured when
 /// the disposable session was materialized.
 pub struct SessionWorkspaceAdmissionPlan {
@@ -103,16 +167,26 @@ pub struct SessionWorkspaceAdmissionResult {
 /// Build one exact session admission against the session's retained roots and
 /// complete source workspace.
 ///
+/// Planning takes the sealed observation rather than a loose base and tree, so
+/// the retained no-follow directory capability is still held here and can be
+/// re-proved before anything is planned against it. A caller cannot reach this
+/// boundary with a desired tree that no retained walk produced.
+///
 /// Unlike the ambient filesystem synchronizer, this never silently rebases
 /// onto a newer workspace. The only accepted moved-authority state is the
 /// exact durable receipt for this session's caller-stable operation and
 /// transaction hash.
 pub(crate) fn plan_session_workspace_admission(
+    layout: &kin_core::KinLayout,
     blobs: &kin_blobs::BlobStore,
     authority_context: &LocalRepositoryAuthorityContext,
-    base: &kin_cli::commands::session_workspace::SessionWorkspaceBase,
-    desired_tree: &kin_model::ResolvedTree,
+    observation: &kin_cli::commands::reconcile::SessionReconcileObservation,
 ) -> Result<SessionWorkspaceAdmissionPlan> {
+    observation
+        .revalidate_retained_capability(layout)
+        .map_err(|error| invalid(error.to_string()))?;
+    let base = observation.base();
+    let desired_tree = observation.desired_tree();
     let repository_id = authority_context.repository_id().clone();
     let workspace_id = authority_context.workspace_id();
     if base.repository_id != repository_id
@@ -351,22 +425,35 @@ pub(crate) fn commit_session_workspace_admission(
 
 /// Atomically publish one exact graph-owned workspace tree.
 ///
-/// The caller has already performed the explicit filesystem-ingestion scan.
-/// This boundary consumes only its admitted exact tree plus bodies in the
-/// non-authoritative ingestion CAS, copies newly referenced bodies into
-/// repository CAS, and compare-and-swaps the workspace. It never creates a
-/// history node or advances a ref.
+/// The caller has already performed the explicit filesystem-ingestion scan and
+/// carries its completion proof in `admitted`. This boundary consumes only that
+/// admitted exact tree plus bodies in the non-authoritative ingestion CAS,
+/// copies newly referenced bodies into repository CAS, and compare-and-swaps
+/// the workspace. It never creates a history node or advances a ref.
+///
+/// Authority that moved after the observation was planned fails the whole
+/// publication. The desired tree describes one transition out of one observed
+/// prior tree; re-deriving it against a newer workspace would publish a
+/// transition nobody observed, and would silently revert whatever moved
+/// authority in the meantime.
 pub(crate) fn publish_workspace_tree(
     blobs: &kin_blobs::BlobStore,
     authority_context: &LocalRepositoryAuthorityContext,
-    desired_tree: &kin_model::ResolvedTree,
+    admitted: &AdmittedWorkspaceTree,
     operation_id: OperationId,
     actor: AuthorId,
 ) -> Result<Option<WorkspaceAdmissionResult>> {
+    let desired_tree = &admitted.desired_tree;
     let repository_id = authority_context.repository_id().clone();
     let workspace_id = authority_context.workspace_id();
     let authority = authority_context.open().map_err(DaemonError::Graph)?;
     let lease = authority.read_authority();
+    if lease.roots() != &admitted.expected_roots {
+        return Err(invalid(
+            "repository authority moved after the complete workspace observation was planned; \
+             exact admission does not replan a stale desired tree against newer authority",
+        ));
+    }
     let workspace = lease
         .metadata()
         .workspaces
@@ -383,6 +470,13 @@ pub(crate) fn publish_workspace_tree(
             "workspace {} belongs to {}, not {}",
             workspace.workspace_id, workspace.repository_id, repository_id
         )));
+    }
+    if workspace.tree != admitted.previous_tree {
+        return Err(invalid(
+            "the complete workspace observation was planned against a tree that is not this \
+             workspace's authority tree; exact admission does not replan a stale desired tree \
+             against newer authority",
+        ));
     }
     if workspace.tree == *desired_tree {
         return Ok(None);
@@ -1131,13 +1225,25 @@ mod tests {
         operation_id: OperationId,
         actor: AuthorId,
     ) -> Result<Option<WorkspaceAdmissionResult>> {
-        super::publish_workspace_tree(
-            blobs,
-            &test_authority_context(layout),
-            desired_tree,
-            operation_id,
-            actor,
-        )
+        let context = test_authority_context(layout);
+        let authority = context.open()?;
+        let lease = authority.read_authority();
+        let expected_roots = lease.roots().clone();
+        let previous_tree = lease
+            .metadata()
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == context.workspace_id())
+            .map(|workspace| workspace.tree.clone())
+            .unwrap_or_default();
+        drop(lease);
+        let admitted = super::admitted_workspace_tree_for_test(
+            layout.working_dir(),
+            expected_roots,
+            previous_tree,
+            desired_tree.clone(),
+        );
+        super::publish_workspace_tree(blobs, &context, &admitted, operation_id, actor)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1180,6 +1286,134 @@ mod tests {
             &test_authority_context(layout),
             plan,
         )
+    }
+
+    /// A desired tree describes one transition out of one observed prior tree.
+    /// Once authority has moved past that prior tree, re-deriving the same
+    /// desired tree against the newer workspace would publish a transition
+    /// nobody observed and silently revert whatever moved authority. The stale
+    /// admission must be refused instead.
+    #[test]
+    fn stale_desired_tree_is_refused_against_newer_authority() {
+        let root = tempfile::tempdir().unwrap();
+        let init = kin_core::init(root.path()).unwrap();
+        let blobs = kin_blobs::BlobStore::new(init.layout.ingest_cas_dir()).unwrap();
+        let graph = kin_db::InMemoryGraph::new();
+
+        let observed = add_artifact(&graph, &blobs, b"observed.txt", b"observed\n", |hash| {
+            TreeEntry::blob(hash, false)
+        });
+        let concurrent = add_artifact(
+            &graph,
+            &blobs,
+            b"concurrent.txt",
+            b"published by someone else\n",
+            |hash| TreeEntry::blob(hash, false),
+        );
+
+        let context = test_authority_context(&init.layout);
+        let roots_at_observation = context.open().unwrap().read_authority().roots().clone();
+        let previous_tree = ResolvedTree::default();
+
+        // The observation is planned against the empty workspace tree.
+        let stale = super::admitted_workspace_tree_for_test(
+            init.layout.working_dir(),
+            roots_at_observation.clone(),
+            previous_tree.clone(),
+            ResolvedTree::from_artifacts([observed]).unwrap(),
+        );
+
+        // Authority moves before the stale admission reaches publication.
+        publish_workspace_tree(
+            &init.layout,
+            &blobs,
+            &ResolvedTree::from_artifacts([concurrent.clone()]).unwrap(),
+            OperationId::new(),
+            AuthorId::new("concurrent-writer"),
+        )
+        .unwrap()
+        .expect("the concurrent transition must advance authority");
+
+        let roots_after_concurrent = context.open().unwrap().read_authority().roots().clone();
+        assert_ne!(roots_at_observation, roots_after_concurrent);
+
+        let error = super::publish_workspace_tree(
+            &blobs,
+            &context,
+            &stale,
+            OperationId::new(),
+            AuthorId::new("stale-observer"),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not replan a stale desired tree against newer authority"),
+            "{error}"
+        );
+
+        let lease = context.open().unwrap().read_authority();
+        let workspace = lease
+            .metadata()
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == init.workspace_id)
+            .unwrap()
+            .clone();
+        drop(lease);
+        assert_eq!(
+            workspace.tree,
+            ResolvedTree::from_artifacts([concurrent]).unwrap(),
+            "the refused stale admission must not revert the concurrent transition"
+        );
+        assert!(workspace
+            .tree
+            .artifact_at_path(&kin_model::RepoPath::from_utf8("observed.txt").unwrap())
+            .is_none());
+    }
+
+    /// The same refusal applies when authority did not move but the plan was
+    /// taken against a tree that was never this workspace's authority tree.
+    #[test]
+    fn desired_tree_planned_against_a_foreign_prior_tree_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let init = kin_core::init(root.path()).unwrap();
+        let blobs = kin_blobs::BlobStore::new(init.layout.ingest_cas_dir()).unwrap();
+        let graph = kin_db::InMemoryGraph::new();
+        let invented = add_artifact(
+            &graph,
+            &blobs,
+            b"invented.txt",
+            b"never admitted\n",
+            |hash| TreeEntry::blob(hash, false),
+        );
+        let desired = add_artifact(&graph, &blobs, b"desired.txt", b"desired\n", |hash| {
+            TreeEntry::blob(hash, false)
+        });
+
+        let context = test_authority_context(&init.layout);
+        let roots = context.open().unwrap().read_authority().roots().clone();
+        let admitted = super::admitted_workspace_tree_for_test(
+            init.layout.working_dir(),
+            roots,
+            ResolvedTree::from_artifacts([invented]).unwrap(),
+            ResolvedTree::from_artifacts([desired]).unwrap(),
+        );
+
+        let error = super::publish_workspace_tree(
+            &blobs,
+            &context,
+            &admitted,
+            OperationId::new(),
+            AuthorId::new("foreign-base-observer"),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not replan a stale desired tree against newer authority"),
+            "{error}"
+        );
     }
 
     #[test]
