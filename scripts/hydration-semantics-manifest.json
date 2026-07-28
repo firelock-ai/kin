@@ -68,7 +68,7 @@
     {
       "file": "crates/kin-index/src/history.rs",
       "function": "derive_tree_semantics",
-      "digest": "sha256:67acebf4f2c2a17cb6ff1a9f8f7868a9ed64cb50377607ec5594106ca52bbf86",
+      "digest": "sha256:7d3ef963c89f32d030c6a1b046fe4a55eeb56a51c1aa859ef05e88a0ef48efa8",
       "reason": "Derives one tree's semantic state and its first-parent deltas from carried-forward parent state: the incremental replacement for whole-tree recomputation, so its carry/patch rules decide the persisted history.",
       "owner": "kin-index"
     },

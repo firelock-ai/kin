@@ -467,7 +467,7 @@ fn derive_tree_semantics(
         .flat_map(|file| file.entities.iter())
         .collect();
     let known_files = known_file_paths(&file_refs, &universe_refs);
-    let era_signature = era_signature_of(&files);
+    let era_signature = engine.advance_era(&files);
     engine.refresh_analyses(&files, era_signature, &known_files);
 
     // Assemble the include graph from the per-file resolved include targets.
@@ -577,18 +577,36 @@ fn derive_tree_semantics(
             }
         }
     }
-    for artifact_id in &relink {
-        let file = files
-            .get(artifact_id)
-            .ok_or_else(|| invalid("relink set names an artifact absent from the tree"))?;
-        let linked_file = link_single_file(
-            file,
-            &ctx,
-            &known_files,
-            &artifact_ids,
-            &completeness,
-            &entities,
-        )?;
+    // Per-file resolution is pure against the shared context, so a large
+    // relink set (structural commits relink the whole tree) resolves in
+    // parallel exactly like the batch path; results merge serially in
+    // deterministic artifact order either way.
+    let relinked_files = {
+        use rayon::prelude::*;
+        let link_one = |artifact_id: &ArtifactId| -> Result<(ArtifactId, LinkedFile)> {
+            let file = files
+                .get(artifact_id)
+                .ok_or_else(|| invalid("relink set names an artifact absent from the tree"))?;
+            let linked_file = link_single_file(
+                file,
+                &ctx,
+                &known_files,
+                &artifact_ids,
+                &completeness,
+                &entities,
+            )?;
+            Ok((*artifact_id, linked_file))
+        };
+        if relink.len() >= 16 {
+            relink
+                .par_iter()
+                .map(link_one)
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            relink.iter().map(link_one).collect::<Result<Vec<_>>>()?
+        }
+    };
+    for (artifact_id, linked_file) in relinked_files {
         for relation in &linked_file.relations {
             let value = Arc::new(relation.clone());
             if relations.insert(relation.id, Arc::clone(&value)).is_some() {
@@ -598,7 +616,7 @@ fn derive_tree_semantics(
             }
             inserted_relations.insert(relation.id, value);
         }
-        linked.insert(*artifact_id, Arc::new(linked_file));
+        linked.insert(artifact_id, Arc::new(linked_file));
     }
     for (artifact_id, file) in &files {
         if linked.contains_key(artifact_id) {
@@ -846,6 +864,12 @@ fn deltas_from_relation_patch(
 struct LinkEngine {
     verify: bool,
     analyses: HashMap<ArtifactId, AnalysisSlot>,
+    /// Monotonic identifier for the current path-set era, advanced whenever
+    /// the sorted path membership actually differs from the previous tree.
+    /// Compared exactly, never by hash: a stale era silently changes what the
+    /// invalidation rules can see.
+    era_counter: u64,
+    era_paths: Vec<String>,
 }
 
 struct AnalysisSlot {
@@ -903,6 +927,8 @@ impl LinkEngine {
         Self {
             verify,
             analyses: HashMap::new(),
+            era_counter: 0,
+            era_paths: Vec::new(),
         }
     }
 
@@ -910,6 +936,20 @@ impl LinkEngine {
         self.analyses
             .get(artifact_id)
             .expect("analysis slots are refreshed for every file in the tree before use")
+    }
+
+    /// Advance to the era of `files`' exact sorted path membership. Module and
+    /// include-target resolution consult the known-file set, so per-file era
+    /// caches are only valid while this membership holds; the comparison is
+    /// over the paths themselves, never a digest of them.
+    fn advance_era(&mut self, files: &BTreeMap<ArtifactId, Arc<SemanticFileState>>) -> u64 {
+        let mut paths: Vec<String> = files.values().map(|file| file.path().to_string()).collect();
+        paths.sort_unstable();
+        if paths != self.era_paths {
+            self.era_counter += 1;
+            self.era_paths = paths;
+        }
+        self.era_counter
     }
 
     fn refresh_analyses(
@@ -1219,21 +1259,6 @@ fn analyze_file_era(parse: &FileParseData, known_files: &HashSet<&str>) -> FileE
         module_targets,
         include_targets,
     }
-}
-
-/// Stable signature of the tree's path membership. Module and include-target
-/// resolution consult the known-file set, so their per-file caches are only
-/// valid while this signature holds.
-fn era_signature_of(files: &BTreeMap<ArtifactId, Arc<SemanticFileState>>) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut paths: Vec<&str> = files.values().map(|file| file.path()).collect();
-    paths.sort_unstable();
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    for path in paths {
-        path.hash(&mut hasher);
-        0xffu8.hash(&mut hasher);
-    }
-    hasher.finish()
 }
 
 /// An entity endpoint of a linked relation that the tree does not define.
