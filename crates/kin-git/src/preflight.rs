@@ -440,10 +440,8 @@ fn observe(
         fs::canonicalize(repo_path).map_err(|error| GitError::io(repo_path, error))?;
     let repo = open_repo(&source_worktree)?;
     // Stability re-observation of the already-captured snapshot: refs, HEAD,
-    // and the reachable closure are re-proven byte-exactly (structure objects
-    // re-verified in full, blob bodies by presence, kind, and length) without
-    // re-reading every blob payload the initial capture already verified
-    // against both its OID and the CAS.
+    // and every reachable object body are re-proven byte-exactly against the
+    // initial capture, including blobs whose kind and length are unchanged.
     verify_lossless_snapshot_unchanged(&repo, expected_snapshot)?;
     let snapshot = expected_snapshot;
     let (source_git_dir, workdir) = assert_source_compatibility(&repo, &source_worktree)?;
