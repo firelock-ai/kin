@@ -40,6 +40,46 @@ pub const BUILD_TIMEOUT: Duration = Duration::from_secs(600);
 
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
+/// Per-test supervisor and registry state with best-effort lifecycle cleanup.
+///
+/// Daemon-backed integration tests must never discover the user's real Kin
+/// registry. The runtime lives under the fixture's reserved `.kin` control
+/// directory, and its `Drop` path asks the product CLI to stop every process it
+/// started even when an assertion returns early.
+pub struct IsolatedDaemonRuntime {
+    repository: PathBuf,
+    registry_path: PathBuf,
+}
+
+impl IsolatedDaemonRuntime {
+    pub fn new(repository: &Path) -> Self {
+        Self {
+            repository: repository.to_path_buf(),
+            registry_path: repository.join(".kin/test-runtime/registry.toml"),
+        }
+    }
+
+    pub fn kin_command(&self) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_kin"));
+        command
+            .env("KIN_REGISTRY_PATH", &self.registry_path)
+            .env("KIN_SUPERVISOR_IDLE_TIMEOUT_SECS", "1");
+        command
+    }
+}
+
+impl Drop for IsolatedDaemonRuntime {
+    fn drop(&mut self) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = self
+                .kin_command()
+                .args(["daemon", "stop", "--all"])
+                .current_dir(&self.repository)
+                .output_within(Duration::from_secs(15));
+        }));
+    }
+}
+
 /// A drop-in replacement for `std::process::Command` whose `output()` cannot
 /// block forever.
 ///
