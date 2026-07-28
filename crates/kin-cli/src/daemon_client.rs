@@ -2201,11 +2201,14 @@ async fn probe_daemon_endpoint(
         let probe_error = match client.get(format!("{base_url}/readiness")).send().await {
             Ok(resp) if resp.status().is_success() => {
                 match probe_health_for_repo(&client, &base_url, working_dir).await {
-                    // The daemon answered and identified itself: whatever it
-                    // said is real evidence, so a mismatch is a genuinely stale
-                    // record rather than a slow start.
-                    Ok(()) => return EndpointVerdict::Serving(base_url),
-                    Err(err) => return EndpointVerdict::Invalid(err.to_string()),
+                    HealthProbe::Matches => return EndpointVerdict::Serving(base_url),
+                    // The daemon answered and identified itself as something
+                    // else. That is real evidence the record is stale, not a
+                    // slow start.
+                    HealthProbe::Rejected(reason) => return EndpointVerdict::Invalid(reason),
+                    // No usable answer says nothing about whether the daemon is
+                    // alive, so it must not be treated as evidence against it.
+                    HealthProbe::Unanswered(detail) => detail,
                 }
             }
             Ok(resp) => {
@@ -2239,22 +2242,50 @@ async fn probe_daemon_endpoint(
     }
 }
 
+/// What a `/health` probe established about the daemon behind an endpoint.
+///
+/// The split that matters is answered vs unanswered. Only an answer identifies
+/// the daemon, and only an identification can prove an endpoint record wrong.
+/// A dropped connection or an unparseable body proves nothing, and collapsing
+/// it into "invalid" would put the endpoint-clobbering bug straight back.
+enum HealthProbe {
+    /// The daemon answered and serves this repo.
+    Matches,
+    /// The daemon answered and is serving a different repo, or reported a
+    /// status that is not serving at all.
+    Rejected(String),
+    /// No usable answer: transport error, HTTP error status, or a body that
+    /// would not parse.
+    Unanswered(String),
+}
+
 async fn probe_health_for_repo(
     client: &reqwest::Client,
     base_url: &str,
     working_dir: &Path,
-) -> Result<()> {
-    let health: HealthResponse = client
-        .get(format!("{base_url}/health"))
-        .send()
-        .await
-        .context("probe daemon health")?
-        .error_for_status()
-        .context("daemon health returned an error")?
-        .json()
-        .await
-        .context("parse daemon health response")?;
-    validate_health_repo(&health, working_dir)
+) -> HealthProbe {
+    let answered = async {
+        let health: HealthResponse = client
+            .get(format!("{base_url}/health"))
+            .send()
+            .await
+            .context("probe daemon health")?
+            .error_for_status()
+            .context("daemon health returned an error")?
+            .json()
+            .await
+            .context("parse daemon health response")?;
+        Ok::<HealthResponse, anyhow::Error>(health)
+    }
+    .await;
+
+    match answered {
+        Ok(health) => match validate_health_repo(&health, working_dir) {
+            Ok(()) => HealthProbe::Matches,
+            Err(reason) => HealthProbe::Rejected(reason.to_string()),
+        },
+        Err(error) => HealthProbe::Unanswered(error.to_string()),
+    }
 }
 
 async fn wait_for_daemon_ready(
@@ -2385,8 +2416,7 @@ async fn wait_for_existing_daemon_within(
             "daemon for this repo is alive but not ready yet; waiting rather than \
              replacing a running daemon"
         );
-        verdict =
-            probe_daemon_endpoint(kin_root, existing, patience.saturating_sub(short)).await;
+        verdict = probe_daemon_endpoint(kin_root, existing, patience.saturating_sub(short)).await;
     }
 
     match verdict {
@@ -3296,6 +3326,73 @@ mod tests {
             message.contains("kin daemon stop"),
             "the refusal must tell the operator how to act: {message}"
         );
+    }
+
+    /// A daemon that answers `/readiness` but drops every `/health` connection.
+    ///
+    /// Stands in for a live daemon too busy to complete a second request.
+    /// Returns its port and the task serving it.
+    async fn daemon_answering_readiness_but_not_health() -> (u16, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = vec![0u8; 2048];
+                let Ok(read) = socket.read(&mut buf).await else {
+                    continue;
+                };
+                let request = String::from_utf8_lossy(&buf[..read]).to_string();
+                if request.contains("/readiness") {
+                    let body = r#"{"ready":true,"warming":false}"#;
+                    let _ = socket
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                                 connection: close\r\ncontent-length: {}\r\n\r\n{body}",
+                                body.len()
+                            )
+                            .as_bytes(),
+                        )
+                        .await;
+                    let _ = socket.flush().await;
+                }
+                // Anything else (i.e. /health) gets no answer at all.
+            }
+        });
+        (port, server)
+    }
+
+    #[tokio::test]
+    async fn a_health_probe_that_never_answers_is_not_evidence_against_the_daemon() {
+        // Only an answer can identify a daemon, so only an answer can prove an
+        // endpoint record wrong. A dropped health connection says nothing, and
+        // treating it as proof would clobber the live daemon all over again.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (port, server) = daemon_answering_readiness_but_not_health().await;
+        write_endpoint_files(root, std::process::id(), port);
+
+        let verdict = wait_for_existing_daemon_within(
+            root,
+            Duration::from_millis(50),
+            Duration::from_millis(400),
+        )
+        .await;
+
+        assert!(
+            matches!(verdict, ExistingDaemon::LiveNotReady(_)),
+            "an unanswered health probe must not condemn a live daemon: {verdict:?}"
+        );
+        assert!(
+            root.join("daemon.pid").exists() && root.join("daemon.port").exists(),
+            "endpoint files must survive an unanswered health probe"
+        );
+        server.abort();
     }
 
     #[tokio::test]

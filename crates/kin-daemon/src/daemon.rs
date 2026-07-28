@@ -2164,8 +2164,8 @@ mod tests {
     use super::{
         drain_pending_flush, format_singleton_contention, next_embed_error_backoff,
         parse_duration_secs, parse_owner_watch_pid, should_enable_lsp_enrichment, should_flush_now,
-        shutdown_signalled, watched_process_is_alive, DaemonConfig,
-        DEFAULT_RUNTIME_SHUTDOWN_GRACE, DEFAULT_SHUTDOWN_ESCALATION_GRACE,
+        shutdown_signalled, watched_process_is_alive, DaemonConfig, DEFAULT_RUNTIME_SHUTDOWN_GRACE,
+        DEFAULT_SHUTDOWN_ESCALATION_GRACE,
     };
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;

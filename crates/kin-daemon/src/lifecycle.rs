@@ -1078,7 +1078,8 @@ mod tests {
 
         let started = std::time::Instant::now();
         let budget = Duration::from_millis(300);
-        let contended = acquire_singleton_lock_within(root, budget).expect("lock IO should succeed");
+        let contended =
+            acquire_singleton_lock_within(root, budget).expect("lock IO should succeed");
 
         assert!(contended.is_none(), "a held lock must not be handed out");
         assert!(
