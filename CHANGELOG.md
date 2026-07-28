@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-28
+
+### Breaking
+
+- Repository-v6 authority replaces the legacy Git-compatibility command path.
+  Session execution is now graph-backed; the former `kin run` alias and remote
+  daemon exec endpoint are removed.
+
+### Changed
+
+- Reviewed `main` drift now coalesces into one protected release PR, then a
+  scoped GitHub App automatically admits and tags the exact green release
+  commit. The existing signed release, installer, and hosted promotion chain
+  remains fail closed.
+- Give Kin its own macOS notification identity (#443)
+- docs: clarify Git hook safety (#444)
+- Cut Kin over to exact repository-v6 authority and retire the legacy Git-compatibility surface (#447)
+- Let the archive stager accept the macOS notification bundle (#446)
+- Narrow the whole-graph entity fallback and compact history output (#445)
+- Make every MCP daemon forward survive repo-daemon idle shutdown (#450)
+- Resolve history and blame revisions from committed state (#448)
+- Resolve compatibility remotes from sealed Git config (#451)
+- Prove and enforce sealed all-content observation at exact Git admission (#449)
+- Close replication preconditions on v6: replica init, pack identity, init determinism (#452)
+- Load LSP source from repository authority and normalize admitted event paths (#453)
+- Keep exact Git admission output replayable (#455)
+- Revalidate the pinned repository namespace on every authority bind and expose checkout (#454)
+- Seal exact workspace and session observation through publication (#456)
+- Bump kin-db to 0.6.4 (#457)
+- Negotiate, transport, and wire native repository-v6 push and pull (#458)
+- Publish repository-v6 semantic merges (#461)
+- README: brand lockup hero, live impact example, dynamic release badge (#463)
+- README: absolute srcset URLs for theme-aware lockup (#464)
+- README: keep theme sources inside the picture element (#465)
+- README: restore policy-compliant release badge (#466)
+- README: badges on one row (#467)
+- Seal exact workspace state as a graph-owned repository stash (#462)
+- Implement the release-ops commands on repository-v6 authority (#460)
+- Run exec, open, with, and shell in exact session projections (#459)
+- Name the upstream commits the historical enrichment fixtures encode (#469)
+- Gate daemon startup on the .kin layout version before manifest parsing (#473)
+- Carry repository-v6 transfers past one envelope and name a stale derived view (#470)
+- Plan daemon workspace transitions from the live graph (#472)
+- Adopt the kin-model merge-transaction schema (#475)
+
 ## [0.3.6] - 2026-07-26
 
 ### Added
@@ -50,18 +95,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   budget and, for adaptively sized declarations, within the confident prefix
   (`KIN_LOCATE_FUSED_DECLARATION_CAP`, default 8). Explicit `--max-files`
   widths are honored as-is.
-### Changed
-
-- `kin exec` executes exact argv locally in the materialized session workspace;
-  shell parsing requires one explicitly quoted `--shell` script, the `kin run`
-  compatibility alias is removed, and the redundant daemon remote-exec endpoint
-  no longer exists.
-- Session launchers now require graph-backed materialization from a
-  repository-verified daemon, register one heartbeating session identity for
-  the child lifetime, scrub inherited Git/Compose/Kin path authority, and
-  preserve failed workspaces. `kin open` now supports only the proven blocking
-  lifecycles of VS Code and Cursor.
-
 ## [0.3.4] - 2026-07-24
 
 ### Fixed
