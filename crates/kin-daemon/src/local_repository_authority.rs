@@ -53,7 +53,7 @@ impl LocalRepositoryAuthorityContext {
 
     pub(crate) fn revalidate_pinned_namespace(
         &self,
-    ) -> std::result::Result<(), kin_db::KinDbError> {
+    ) -> std::result::Result<(), kin_core::PinnedNamespaceRefusal> {
         self.binding.revalidate_pinned_namespace()
     }
 }
@@ -71,7 +71,9 @@ pub(crate) enum RepositoryAuthorityBindRefusal {
     /// namespace this daemon pinned: replaced at the same ambient path,
     /// detached, or a store that does not hold this repository.
     Identity(kin_db::KinDbError),
-    /// The pinned namespace is intact but its authority could not be opened.
+    /// The pinned namespace is intact but its authority could not be opened, or
+    /// the revalidation itself reached no verdict about identity. Neither says
+    /// the repository was replaced, so neither answers with a conflict.
     Unavailable(kin_db::KinDbError),
 }
 
@@ -111,7 +113,10 @@ impl ActiveLocalRepositoryAuthority {
     ///
     /// The revalidation is deliberately ahead of the authority open so a
     /// replaced or detached namespace is named as such, instead of surfacing as
-    /// whatever the authority decode happens to fail on.
+    /// whatever the authority decode happens to fail on. It reads namespace
+    /// identity from metadata alone and classifies its own refusal, so a fault
+    /// that says nothing about identity stays internal and the bind still pays
+    /// exactly one authority load and one exclusive lock, in the open below.
     pub(crate) fn open_bound(
         state: &DaemonState,
     ) -> std::result::Result<Self, RepositoryAuthorityBindRefusal> {
@@ -119,7 +124,14 @@ impl ActiveLocalRepositoryAuthority {
             .map_err(RepositoryAuthorityBindRefusal::Unbound)?;
         context
             .revalidate_pinned_namespace()
-            .map_err(RepositoryAuthorityBindRefusal::Identity)?;
+            .map_err(|refusal| match refusal {
+                kin_core::PinnedNamespaceRefusal::Identity(error) => {
+                    RepositoryAuthorityBindRefusal::Identity(error)
+                }
+                kin_core::PinnedNamespaceRefusal::Unavailable(error) => {
+                    RepositoryAuthorityBindRefusal::Unavailable(error)
+                }
+            })?;
         let manager = context
             .open()
             .map_err(RepositoryAuthorityBindRefusal::Unavailable)?;

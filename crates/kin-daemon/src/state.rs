@@ -1775,7 +1775,7 @@ impl DaemonState {
         // must refuse to start rather than run unpinned, because every later
         // authority bind treats whatever is retained as the baseline.
         kin_core::revalidate_pinned_local_namespace(&local_repository_backend, &repository_id)
-            .map_err(DaemonError::Graph)?;
+            .map_err(|refusal| DaemonError::Graph(refusal.into_error()))?;
         let lease = authority.read_authority();
         let workspace_id = match manifest_workspace_id {
             Some(recorded) => recorded,

@@ -13,8 +13,8 @@ use std::fmt;
 use std::sync::Arc;
 
 use kin_db::{
-    AuthorityPayloadStats, LocalFileBackend, RepositoryAuthorityManager, RepositoryAuthorityState,
-    StorageBackend,
+    AuthorityPayloadStats, LocalFileBackend, LocalNamespaceProbe, RepositoryAuthorityManager,
+    RepositoryAuthorityState,
 };
 use kin_model::{
     EntityDelta, EntityId, RelationDelta, RelationId, RepositoryId, SemanticChangeId, WorkspaceId,
@@ -264,11 +264,12 @@ impl LocalRepositoryAuthorityBinding {
     }
 
     /// Revalidate the retained storage root and per-repository authority
-    /// namespace without decoding the full graph snapshot.
+    /// namespace without acquiring the repository lock or decoding any
+    /// snapshot.
     ///
     /// See [`revalidate_pinned_local_namespace`] for the exact property this
     /// refuses on.
-    pub fn revalidate_pinned_namespace(&self) -> std::result::Result<(), kin_db::KinDbError> {
+    pub fn revalidate_pinned_namespace(&self) -> std::result::Result<(), PinnedNamespaceRefusal> {
         revalidate_pinned_local_namespace(&self.backend, &self.repository_id)
     }
 
@@ -277,7 +278,10 @@ impl LocalRepositoryAuthorityBinding {
     ///
     /// KinDB revalidates both the pinned storage-root identity and the
     /// retained per-repository namespace identity here, and retains the
-    /// per-repository capability on the first successful call.
+    /// per-repository capability on the first successful call. This is the one
+    /// authority load and the one exclusive lock a bind pays: the revalidation
+    /// ahead of it reads namespace identity from metadata alone, so naming a
+    /// replaced namespace as such costs no second load.
     pub fn open_manager(
         &self,
     ) -> std::result::Result<RepositoryAuthorityManager<LocalFileBackend>, kin_db::KinDbError> {
@@ -313,6 +317,49 @@ impl LocalRepositoryAuthorityBinding {
     }
 }
 
+/// Why revalidating a startup-pinned repository namespace refused.
+///
+/// The two arms carry different claims. [`Self::Identity`] says the exact
+/// storage this process bound is gone, which a caller may report as a conflict
+/// naming the repository. [`Self::Unavailable`] says the revalidation reached no
+/// verdict about identity at all, so reporting it as a replaced repository would
+/// be a false diagnosis.
+#[derive(Debug)]
+pub enum PinnedNamespaceRefusal {
+    /// The pinned namespace was replaced or detached, or this storage does not
+    /// hold the repository at all.
+    Identity(kin_db::KinDbError),
+    /// The namespace could not be revalidated for a reason that says nothing
+    /// about identity: IO, permissions, or an entry that could not be read.
+    Unavailable(kin_db::KinDbError),
+}
+
+impl PinnedNamespaceRefusal {
+    pub fn is_identity_refusal(&self) -> bool {
+        matches!(self, Self::Identity(_))
+    }
+
+    pub fn error(&self) -> &kin_db::KinDbError {
+        match self {
+            Self::Identity(error) | Self::Unavailable(error) => error,
+        }
+    }
+
+    pub fn into_error(self) -> kin_db::KinDbError {
+        match self {
+            Self::Identity(error) | Self::Unavailable(error) => error,
+        }
+    }
+}
+
+impl fmt::Display for PinnedNamespaceRefusal {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}", self.error())
+    }
+}
+
+impl std::error::Error for PinnedNamespaceRefusal {}
+
 /// Refuse `repository_id` unless `backend` still reaches the exact storage root
 /// and per-repository authority namespace it has already pinned.
 ///
@@ -329,6 +376,13 @@ impl LocalRepositoryAuthorityBinding {
 /// pass answers for entries that carry no authority and are not this caller's
 /// concern.
 ///
+/// It answers the identity question only. Reading identity through a full
+/// authority load conflated it with everything a load can fail on, so a
+/// truncated snapshot, a missing lock file, or a quarantined state on a
+/// namespace this process still reaches was reported as a replaced repository.
+/// A fault that says nothing about identity is [`PinnedNamespaceRefusal::Unavailable`]
+/// here, and the bind stays closed either way.
+///
 /// Ordering is load-bearing. The first read on a fresh backend is what takes
 /// the pin, so a long-lived process must take it once at startup and revalidate
 /// on every later authority bind; a swap that lands before the first read
@@ -336,12 +390,18 @@ impl LocalRepositoryAuthorityBinding {
 pub fn revalidate_pinned_local_namespace(
     backend: &LocalFileBackend,
     repository_id: &RepositoryId,
-) -> std::result::Result<(), kin_db::KinDbError> {
-    match backend.load_snapshot_authority(repository_id.as_str())? {
-        Some(_) => Ok(()),
-        None => Err(kin_db::KinDbError::StorageError(format!(
-            "local storage authority does not hold repository namespace {repository_id}"
-        ))),
+) -> std::result::Result<(), PinnedNamespaceRefusal> {
+    match backend.probe_pinned_repository_namespace(repository_id.as_str()) {
+        LocalNamespaceProbe::Retained => Ok(()),
+        LocalNamespaceProbe::IdentityLost(fault) => {
+            Err(PinnedNamespaceRefusal::Identity(fault.into_error()))
+        }
+        LocalNamespaceProbe::Absent => Err(PinnedNamespaceRefusal::Identity(
+            kin_db::KinDbError::StorageError(format!(
+                "local storage authority does not hold repository namespace {repository_id}"
+            )),
+        )),
+        LocalNamespaceProbe::Unavailable(error) => Err(PinnedNamespaceRefusal::Unavailable(error)),
     }
 }
 
@@ -541,10 +601,116 @@ mod tests {
             .revalidate_pinned_namespace()
             .expect_err("a binding must refuse a store that does not hold its repository");
         assert!(
+            error.is_identity_refusal(),
+            "a store that does not hold the repository is a namespace answer, not an IO fault"
+        );
+        assert!(
             error
                 .to_string()
                 .contains("does not hold repository namespace"),
             "unexpected wrong-store error: {error}"
+        );
+    }
+
+    /// Revalidation answers the identity question alone. Riding a full
+    /// authority load conflated it with everything a load can fail on, so a
+    /// corrupt payload on a namespace this process still reaches was reported
+    /// as a replaced repository. The bind still refuses, at the authority open,
+    /// where the fault actually is.
+    #[test]
+    fn revalidation_passes_a_corrupt_payload_on_an_intact_namespace_to_the_authority_open() {
+        let directory = tempfile::tempdir().unwrap();
+        let initialized = crate::init(directory.path()).unwrap();
+        let binding = LocalRepositoryAuthorityBinding::from_layout(&initialized.layout).unwrap();
+        binding.open_manager().unwrap();
+
+        let namespace = initialized
+            .layout
+            .kindb_dir()
+            .join(binding.repository_id().as_str());
+        std::fs::write(namespace.join("authority.json"), b"{ truncated").unwrap();
+        for entry in std::fs::read_dir(namespace.join("snapshots")).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_file() {
+                std::fs::write(entry.path(), b"not a snapshot").unwrap();
+            }
+        }
+
+        if let Err(refusal) = binding.revalidate_pinned_namespace() {
+            panic!("a corrupt payload on an intact namespace is not a namespace-identity refusal, got {refusal}");
+        }
+        if binding.open_manager().is_ok() {
+            panic!("the authority open must still refuse the corrupt payload");
+        }
+    }
+
+    /// A namespace genuinely replaced under the retained binding is still an
+    /// identity refusal, so narrowing the classification did not soften it.
+    #[test]
+    fn revalidation_classifies_a_replaced_namespace_as_an_identity_refusal() {
+        let directory = tempfile::tempdir().unwrap();
+        let initialized = crate::init(directory.path()).unwrap();
+        let binding = LocalRepositoryAuthorityBinding::from_layout(&initialized.layout).unwrap();
+        binding.open_manager().unwrap();
+
+        let namespace = initialized
+            .layout
+            .kindb_dir()
+            .join(binding.repository_id().as_str());
+        let replacement = initialized.layout.root().join("namespace-replacement");
+        copy_directory(&namespace, &replacement);
+        std::fs::rename(
+            &namespace,
+            initialized.layout.root().join("namespace-original"),
+        )
+        .unwrap();
+        std::fs::rename(&replacement, &namespace).unwrap();
+
+        let refusal = binding
+            .revalidate_pinned_namespace()
+            .expect_err("a replaced namespace must refuse");
+        assert!(
+            refusal.is_identity_refusal(),
+            "a replaced namespace must be classified as identity, got {refusal}"
+        );
+        assert!(
+            refusal
+                .to_string()
+                .contains("refusing replacement authority"),
+            "unexpected replacement refusal: {refusal}"
+        );
+    }
+
+    /// A detached namespace is the other structural identity answer.
+    #[test]
+    fn revalidation_classifies_a_detached_namespace_as_an_identity_refusal() {
+        let directory = tempfile::tempdir().unwrap();
+        let initialized = crate::init(directory.path()).unwrap();
+        let binding = LocalRepositoryAuthorityBinding::from_layout(&initialized.layout).unwrap();
+        binding.open_manager().unwrap();
+
+        let namespace = initialized
+            .layout
+            .kindb_dir()
+            .join(binding.repository_id().as_str());
+        std::fs::rename(
+            &namespace,
+            initialized.layout.root().join("namespace-detached"),
+        )
+        .unwrap();
+
+        let refusal = binding
+            .revalidate_pinned_namespace()
+            .expect_err("a detached namespace must refuse");
+        assert!(
+            refusal.is_identity_refusal(),
+            "a detached namespace must be classified as identity, got {refusal}"
+        );
+        assert!(
+            refusal
+                .to_string()
+                .contains("detached after this backend opened"),
+            "unexpected detachment refusal: {refusal}"
         );
     }
 }
