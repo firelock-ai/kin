@@ -757,6 +757,45 @@ def main() -> None:
         "Windows installer proof still reaching every main commit",
     )
 
+    # The single fact that keeps a skipped installer off a main commit is the
+    # diff classifier computing docs_only ONLY for pull_request events. The
+    # group above pins the consumer of that output; this pins the producer.
+    # Without it, moving the classification outside the pull_request guard (a
+    # plausible "skip heavy jobs on docs-only main pushes too" optimisation)
+    # would let the installer report skipped on a main commit, which
+    # release-tag.yml accepts, and a tag would mint on a sha whose Windows
+    # release build never ran, with this test still green.
+    classifier_start = ci_workflow.index("  changes:")
+    classifier_end = ci_workflow.index("\n  check-docs-only:", classifier_start)
+    classifier = ci_workflow[classifier_start:classifier_end]
+    pull_request_guard = 'if [ "$EVENT_NAME" = "pull_request" ]; then'
+    if classifier.count(pull_request_guard) != 1:
+        raise AssertionError(
+            "diff classifier must gate its whole classification on exactly one "
+            "pull_request guard; docs_only has to stay false on every push to main"
+        )
+    guard_at = classifier.index(pull_request_guard)
+    default_at = classifier.index("docs_only=false")
+    if default_at >= guard_at:
+        raise AssertionError(
+            "diff classifier must default docs_only=false before the "
+            "pull_request guard so any other event fails closed"
+        )
+    truthy = classifier.find("docs_only=true")
+    while truthy != -1:
+        if truthy < guard_at:
+            raise AssertionError(
+                "diff classifier sets docs_only=true outside the pull_request "
+                "guard; a main commit could then skip the Windows release build "
+                "while release-tag.yml still accepts the skipped check"
+            )
+        truthy = classifier.find("docs_only=true", truthy + 1)
+    require(
+        classifier,
+        'echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"',
+        "diff classifier single fail-closed output",
+    )
+
     release_tag = RELEASE_TAG.read_text(encoding="utf-8")
     for policy in (
         "REQUIRED_CHECKS: |",
@@ -771,11 +810,21 @@ def main() -> None:
     ):
         require(release_tag, policy, "release tag required-check gate")
 
-    # Cargo caches are restore-anywhere, save-from-main-only. That is what keeps
-    # one reusable warm entry per job alive under the repository cache budget,
-    # and it is also what denies a fork pull request any way to write a cache a
-    # trusted run would later restore. Checked across every workflow, so a new
-    # job cannot reintroduce pull-request cache writes in a file nobody pinned.
+    # Cargo caches are restore-anywhere, save-from-main-only, so one reusable
+    # warm entry per job stays alive under the repository cache budget instead
+    # of being evicted by per-pull-request entries no other run can read.
+    #
+    # The justification is budget, NOT trust. A run on refs/heads/main can only
+    # restore entries scoped to refs/heads/main, so GitHub already prevents a
+    # fork or pull request from planting a cache a trusted run would restore;
+    # save-if does not create that boundary. Do not reason about a related
+    # change as though it did.
+    #
+    # Scope: this covers Swatinem/rust-cache uses only. Three actions/cache
+    # uses still write pull-request-scoped entries and are deliberately not
+    # constrained here (the windows-installer and coverage jobs in this file,
+    # and the fuzz workflow), so this is not a repository-wide no-PR-writes
+    # invariant.
     rust_cache_uses = 0
     trusted_saves = 0
     for workflow in sorted(WORKFLOWS.glob("*.yml")):

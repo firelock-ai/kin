@@ -50,8 +50,10 @@ jobs:
           cache-from: type=gha
           # Export layers only from main. A pull request's Actions cache scope
           # is private to that pull request, so exporting mode=max from every
-          # round wrote layers nothing else could read while spending the shared
-          # repository cache budget. Pull requests still import main's layers.
+          # round wrote layers only that same branch could reread, while
+          # spending the shared repository cache budget. Pull requests still
+          # import main's layers, and skipping the export also removes the
+          # mode=max upload from every pull-request round.
           cache-to: ${{ github.ref == 'refs/heads/main' && 'type=gha,mode=max' || '' }}
 
       - name: Verify container build provenance

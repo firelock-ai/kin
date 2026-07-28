@@ -108,12 +108,14 @@ jobs:
           targets: x86_64-pc-windows-msvc
 
       # Restore on every event, save only from main. A cache entry written from
-      # a pull request ref is readable by that one pull request and nothing
-      # else, so saving from pull requests bought no warm start while consuming
-      # the shared repository cache budget and evicting main's entry, which is
-      # why no reusable cargo cache existed on refs/heads/main at all. Saving
-      # only from main keeps one warm entry per job that every pull request
-      # restores, and leaves fork pull requests with no path to write one.
+      # a pull request ref is readable by later runs on that SAME ref and by
+      # nothing else, so the old configuration warmed pushes 2..N of one pull
+      # request while spending the shared repository cache budget and evicting
+      # main's entry, which is why no reusable cargo cache existed on
+      # refs/heads/main at all. Saving only from main trades that intra-branch
+      # warm start for one entry every pull request restores from push 1.
+      # The tradeoff is real and measured: see the trusted-ref note in
+      # scripts/test-release-workflow-authority.py.
       - name: Cache cargo registry and build
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:

@@ -48,8 +48,8 @@ jobs:
       # Registry only, matching what this job used to cache: the smoke asserts on
       # freshly built binaries, so no target directory is carried across runs.
       # Restore on every event, save only from main, for the same reason as the
-      # CI jobs: an entry written from a pull request ref is readable by that one
-      # pull request, so saving from pull requests warmed nothing and spent the
+      # CI jobs: an entry written from a pull request ref is readable only by
+      # later runs on that same ref, so it warmed one branch while spending the
       # shared repository cache budget that main's reusable entry needs.
       - name: Cache cargo registry
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
