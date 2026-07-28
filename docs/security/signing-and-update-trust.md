@@ -63,6 +63,13 @@ Publishing identity, and post-publication proofs then admit and verify every
 public release surface without a second manual approval. Manual tag dispatch is
 break glass, not the normal release path.
 
+The App ID and private key are scoped only to the separate `release-tag`
+Environment, whose custom deployment policy admits `main` and no other branch.
+Both workflows that mint an App token declare that Environment. No repository-
+or organization-level duplicate of either secret may remain visible to `kin`;
+otherwise branch-selected manual workflow code could bypass an in-job ref guard
+and extract the raw org-wide App credential.
+
 After GitHub stable/latest, public install proof, both npm packages, and GHCR
 version/latest all succeed, the release publishes deterministic
 `release-promotion.json` plus its checksum and a source-bound GitHub

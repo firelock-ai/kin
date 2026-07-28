@@ -51,6 +51,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Carry repository-v6 transfers past one envelope and name a stale derived view (#470)
 - Plan daemon workspace transitions from the live graph (#472)
 - Adopt the kin-model merge-transaction schema (#475)
+- Consume kin-db 0.6.7 reopen proof (#476)
 
 ## [0.3.6] - 2026-07-26
 

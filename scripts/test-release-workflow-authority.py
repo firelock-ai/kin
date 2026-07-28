@@ -17,6 +17,7 @@ RELEASE = WORKFLOWS / "release.yml"
 RELEASE_RECOVERY = WORKFLOWS / "release-recovery.yml"
 RELEASE_TAG = WORKFLOWS / "release-tag.yml"
 RELEASE_TRAIN = WORKFLOWS / "release-train.yml"
+RELEASE_BOT_DOC = ROOT / "docs" / "release-bot.md"
 INSTALL_PROOF = WORKFLOWS / "install-proof.yml"
 INSTALLER_CALLBACK = WORKFLOWS / "publish-release-installers.yml"
 UPDATE_TRUST = ROOT / "docs" / "security" / "signing-and-update-trust.md"
@@ -47,6 +48,7 @@ def main() -> None:
     release_recovery = RELEASE_RECOVERY.read_text(encoding="utf-8")
     release_tag = RELEASE_TAG.read_text(encoding="utf-8")
     release_train = RELEASE_TRAIN.read_text(encoding="utf-8")
+    release_bot_doc = RELEASE_BOT_DOC.read_text(encoding="utf-8")
     install_proof = INSTALL_PROOF.read_text(encoding="utf-8")
     readme = README.read_text(encoding="utf-8")
     ci_workflow = (WORKFLOWS / "ci.yml").read_text(encoding="utf-8")
@@ -111,6 +113,7 @@ def main() -> None:
         "github.event.workflow_run.event == 'push'",
         "github.event.workflow_run.head_branch == 'main'",
         "github.event.workflow_run.conclusion == 'success'",
+        "environment: release-tag",
         "node scripts/release-intent.mjs",
         "git merge-base --is-ancestor",
         "manual release sha",
@@ -136,9 +139,16 @@ def main() -> None:
         "matching_count",
         "highest_tag",
         "REQUIRED_CHECKS:",
+        'GITHUB_ACTIONS_APP_ID: "15368"',
+        "GITHUB_ACTIONS_APP_SLUG: github-actions",
+        "app_id: (.app.id // 0)",
+        'identity = (run["app_id"], run["app_slug"], run["name"])',
+        "run = runs.get((expected_app_id, expected_app_slug, name))",
+        'name != "DCO Sign-off" and run["conclusion"] != "success"',
         "did not settle within 20 minutes",
         "actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1",
         "repositories: kin",
+        "manual release sha $SHA is no longer current origin/main HEAD",
         'ref="refs/tags/$TAG"',
     ):
         require(release_tag, policy, "automatic App-mediated release tag admission")
@@ -164,6 +174,7 @@ def main() -> None:
         "github.event.workflow_run.event == 'push'",
         "github.event.workflow_run.head_branch == 'main'",
         "github.event.workflow_run.conclusion == 'success'",
+        "environment: release-tag",
         "actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1",
         "repositories: kin",
         "BRANCH: automation/release-next",
@@ -198,6 +209,33 @@ def main() -> None:
             raise AssertionError(
                 f"release train contains forbidden authority or history rewrite: {forbidden}"
             )
+
+    for policy in (
+        "Create the protected `release-tag` Environment",
+        "allows **only `main`**",
+        "only as `release-tag` Environment secrets",
+        "Remove any repository- or organization-level copies visible to `kin`",
+        "Both workflows that mint an App token declare that Environment",
+    ):
+        require(
+            release_bot_doc,
+            policy,
+            "mandatory release App credential isolation runbook",
+        )
+    if "Recommended hardening (optional)" in release_bot_doc:
+        raise AssertionError(
+            "release App Environment isolation must be mandatory, not optional"
+        )
+    for policy in (
+        "scoped only to the separate `release-tag`",
+        "No repository-",
+        "or organization-level duplicate of either secret",
+    ):
+        require(
+            update_trust,
+            policy,
+            "release App credential trust boundary",
+        )
 
     for policy in (
         "name: Release Recovery",

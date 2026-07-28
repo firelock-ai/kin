@@ -35,6 +35,10 @@ jobs:
       )
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    # The same main-only Environment protects the raw release App key used by
+    # the branch writer. Only the repository-scoped installation token leaves
+    # the credential-minting step.
+    environment: release-tag
     steps:
       - name: Mint repository-scoped release branch token
         id: app-token

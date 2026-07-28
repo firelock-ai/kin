@@ -60,6 +60,10 @@ jobs:
       )
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    # The App private key exists only in this main-only Environment. This is
+    # the non-bypassable credential boundary for branch-selectable manual
+    # dispatches; the shell guard below is defense in depth.
+    environment: release-tag
     steps:
       - name: Guard manual authority
         env:
@@ -520,15 +524,18 @@ jobs:
           steps.prior.outputs.ready == 'true'
         # Fail closed on the commit's check-runs. REQUIRED_CHECKS is the
         # presence-required release-critical set — a sha missing any of these is
-        # refused even if nothing failed. Each must be present and green
-        # (skipped/neutral allowed — DCO is skipped on a merged HEAD). Separately,
-        # no check anywhere may be failing or still in progress; the second loop
-        # owns that present-check strictness, so this list need not mirror every
-        # CI context. It is the main branch-protection required contexts plus the
+        # refused even if nothing failed. Each non-DCO required context must
+        # complete with success. DCO alone may be skipped because its push job is
+        # intentionally absent on a merged HEAD. Separately, no check anywhere
+        # may be failing or still in progress; the second loop owns that
+        # present-check strictness, so this list need not mirror every CI
+        # context. It is the main branch-protection required contexts plus the
         # Windows installer leg, which is release-critical and never optional.
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
+          GITHUB_ACTIONS_APP_ID: "15368"
+          GITHUB_ACTIONS_APP_SLUG: github-actions
           REQUIRED_CHECKS: |
             Check & Test (ubuntu-latest)
             Check & Test (macos-latest)
@@ -540,7 +547,14 @@ jobs:
           set -euo pipefail
           for attempt in $(seq 1 40); do
             gh api "repos/$REPO/commits/$SHA/check-runs?per_page=100" --paginate \
-              -q '.check_runs[] | {name: .name, status: .status, conclusion: .conclusion, id: .id}' \
+              -q '.check_runs[] | {
+                name: .name,
+                status: .status,
+                conclusion: .conclusion,
+                id: .id,
+                app_id: (.app.id // 0),
+                app_slug: (.app.slug // "")
+              }' \
               > check_runs.ndjson || {
                 echo "::error::failed to fetch check-runs for $SHA"
                 exit 1
@@ -556,12 +570,17 @@ jobs:
                   if not line:
                       continue
                   run = json.loads(line)
-                  name = run["name"]
-                  # Keep only the latest attempt per check name (highest id).
-                  if name not in runs or run["id"] > runs[name]["id"]:
-                      runs[name] = run
+                  identity = (run["app_id"], run["app_slug"], run["name"])
+                  # Keep only the latest attempt for one exact App + check
+                  # identity. A different check-writing App must never
+                  # supersede GitHub Actions release evidence by reusing a
+                  # required context name.
+                  if identity not in runs or run["id"] > runs[identity]["id"]:
+                      runs[identity] = run
 
           required = [c.strip() for c in os.environ["REQUIRED_CHECKS"].splitlines() if c.strip()]
+          expected_app_id = int(os.environ["GITHUB_ACTIONS_APP_ID"])
+          expected_app_slug = os.environ["GITHUB_ACTIONS_APP_SLUG"]
           acceptable = {"success", "skipped", "neutral"}
           failures = []
           pending = []
@@ -570,22 +589,40 @@ jobs:
               pending.append("no check-runs found on sha")
 
           for name in required:
-              run = runs.get(name)
+              run = runs.get((expected_app_id, expected_app_slug, name))
               if run is None:
-                  pending.append(f"missing required check: {name}")
+                  pending.append(
+                      f"missing required GitHub Actions check: {name} "
+                      f"(app={expected_app_slug}/{expected_app_id})"
+                  )
               elif run["status"] != "completed":
                   pending.append(f"required check not completed: {name} (status={run['status']})")
-              elif run["conclusion"] not in acceptable:
+              elif name == "DCO Sign-off" and run["conclusion"] not in {"success", "skipped"}:
+                  failures.append(
+                      f"required DCO check not green/skipped-on-push: "
+                      f"{name} (conclusion={run['conclusion']})"
+                  )
+              elif name != "DCO Sign-off" and run["conclusion"] != "success":
                   failures.append(f"required check not green: {name} (conclusion={run['conclusion']})")
 
-          for name, run in runs.items():
+          for (app_id, app_slug, name), run in runs.items():
               # Self-exclude this workflow's own job ("Mint release tag") — a gate must not read its own refusals as evidence.
-              if name == "Mint release tag":
+              if (
+                  app_id == expected_app_id and
+                  app_slug == expected_app_slug and
+                  name == "Mint release tag"
+              ):
                   continue
               if run["status"] != "completed":
-                  pending.append(f"check still in progress: {name} (status={run['status']})")
+                  pending.append(
+                      f"check still in progress: {name} "
+                      f"(app={app_slug}/{app_id}, status={run['status']})"
+                  )
               elif run["conclusion"] not in acceptable:
-                  failures.append(f"check not green: {name} (conclusion={run['conclusion']})")
+                  failures.append(
+                      f"check not green: {name} "
+                      f"(app={app_slug}/{app_id}, conclusion={run['conclusion']})"
+                  )
 
           if failures:
               print("::error::refusing — check verification failed:")
@@ -656,8 +693,25 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           REPO: ${{ github.repository }}
+          AUTOMATIC: ${{ steps.resolve.outputs.automatic }}
         run: |
           set -euo pipefail
+          # Close the manual-dispatch head-pin window immediately before the
+          # only write. Automatic reconciliation intentionally admits the
+          # earliest coherent reviewed ancestor; manual break glass remains
+          # exact-current-main.
+          git fetch --no-tags origin main
+          current_main="$(git rev-parse FETCH_HEAD)"
+          [[ "$current_main" =~ ^[0-9a-f]{40}$ ]]
+          if [ "$AUTOMATIC" = true ]; then
+            if ! git merge-base --is-ancestor "$SHA" "$current_main"; then
+              echo "::error::automatic release sha $SHA left reviewed main history before tag creation"
+              exit 1
+            fi
+          elif [ "$SHA" != "$current_main" ]; then
+            echo "::error::manual release sha $SHA is no longer current origin/main HEAD ($current_main)"
+            exit 1
+          fi
           echo "creating refs/tags/$TAG -> $SHA via kin-release-bot"
           gh api "repos/$REPO/git/refs" \
             -f ref="refs/tags/$TAG" \

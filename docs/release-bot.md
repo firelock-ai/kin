@@ -179,20 +179,30 @@ These steps require the founder / org owner and gate the bot going live.
    Scoping the install to **Only select repositories → `kin`** is the tightest
    posture, but the App is currently installed **org-wide** (founder decision) —
    see "Install scope and token narrowing" below for why that is still safe.
-3. **Add the Actions secrets** (org-level, scoped to `kin`, or repo-level on
-   `firelock-ai/kin`):
+3. **Create the protected `release-tag` Environment.** Give it a custom
+   deployment-branch policy that allows **only `main`**, with no required
+   reviewer so trusted automatic reconciliation remains unattended.
+   `release-train.yml` and `release-tag.yml` are the two token-minting
+   workflows. Both workflows that mint an App token declare that Environment
+   before they can reach either secret. This is a required credential boundary,
+   not optional defense in depth: a branch-selected `workflow_dispatch` can
+   change shell steps, so an in-job branch guard cannot protect a
+   repository-level private key.
+4. **Add the App credentials only as `release-tag` Environment secrets:**
    - `KIN_RELEASE_BOT_APP_ID` — the App ID (numeric).
    - `KIN_RELEASE_BOT_PRIVATE_KEY` — the full PEM contents, including the
      `-----BEGIN...-----` / `-----END...-----` lines.
-4. **Allowlist the App in the tag ruleset.** Org/repo → Rules → Rulesets →
+   Remove any repository- or organization-level copies visible to `kin`.
+   Environment gating protects only Environment-scoped secrets; leaving a
+   broader duplicate would restore the branch-dispatch exfiltration path.
+5. **Allowlist the App in the tag ruleset.** Org/repo → Rules → Rulesets →
    **"Protect version release tags"** → **Bypass list** → Add → the
    `kin-release-bot` App. Without this, the App's tag creation is rejected by the
    ruleset and the workflow fails at "Create release tag ref".
-5. **Confirm the workflow token permission.** The workflow declares
-   `permissions: contents: read` + `checks: read`. Ensure repo/org Actions
-   settings permit those read scopes on `GITHUB_TOKEN` (default). The App token,
-   not `GITHUB_TOKEN`, carries the write.
-6. **Admit protected release PR automation.** Keep the repository default
+6. **Confirm the workflow token permission.** The tag controller declares only
+   read scopes on its `GITHUB_TOKEN`; the App token, not `GITHUB_TOKEN`, carries
+   the tag write.
+7. **Admit protected release PR automation.** Keep the repository default
    workflow token permission at **read**, enable **Allow GitHub Actions to create
    and approve pull requests**, and keep the main required-status rule in strict
    up-to-date mode. `release-train.yml` explicitly elevates only Issues and Pull
@@ -206,9 +216,10 @@ decision), so the App itself can reach every repository in the org. The workflow
 does not depend on a repo-scoped install: the "Mint kin-release-bot installation
 token" step passes `owner: firelock-ai` + `repositories: kin` to
 `actions/create-github-app-token`, which narrows every minted installation token
-to the `kin` repository alone — so a compromised or misused run can only write to
-`kin`, never a sibling repo. Extending bot-mediated tagging to another repo is a
-deliberate act: replicate this workflow and its secrets in that repo and widen or
+to the `kin` repository alone. The raw private key is more powerful than one
+narrowed token, which is why it exists only behind the main-only `release-tag`
+Environment. Extending bot-mediated tagging to another repo is a deliberate act:
+replicate this workflow and its protected Environment in that repo and widen or
 duplicate the `repositories:` narrowing to name the new repo explicitly — never
 drop the `owner`/`repositories` inputs, since without them a single token would
 span every repository the org-wide install can reach.
@@ -227,16 +238,7 @@ gh run list --workflow=release-tag.yml -L 1     # expect: failure
 gh api repos/firelock-ai/kin/git/ref/tags/v0.0.0   # expect: 404 (nothing created)
 ```
 
-A clean refusal with no tag created confirms the guards, token wiring, and
-permissions are correct end-to-end short of an actual release.
-
-## Recommended hardening (optional)
-
-For defense-in-depth against a modified copy of this workflow being dispatched
-from a branch (which could otherwise read the App secrets), bind
-`KIN_RELEASE_BOT_APP_ID` / `KIN_RELEASE_BOT_PRIVATE_KEY` to a GitHub
-**Environment** (e.g. `release-tag`) whose deployment branch policy allows only
-`main`, and add `environment: release-tag` to the job. The environment's
-branch policy then blocks secret access on any non-`main` dispatch, on top of
-the in-job actor/ref guard. This mirrors how `release.yml` isolates its
-publish secrets behind the protected `release` environment.
+A clean refusal with no tag created proves the untrusted input and head guards.
+It deliberately stops before App-token minting, so verify the Environment
+policy and secret placement independently during setup; the first admitted
+release proves the complete token-and-ruleset path.
