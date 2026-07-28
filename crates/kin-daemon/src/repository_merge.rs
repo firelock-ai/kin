@@ -376,9 +376,15 @@ fn fast_forward(
         drop(lease);
         policy
     };
+    let daemon_semantic_delta = crate::local_repository_authority::plan_daemon_semantic_delta(
+        state,
+        &theirs_state.entities,
+        &theirs_state.relations,
+    )
+    .context("plan the exact fast-forward semantic transition for the daemon view")?;
     let daemon_delta = TransactionDelta {
-        entity_deltas: semantic_delta.entity_deltas().to_vec(),
-        relation_deltas: semantic_delta.relation_deltas().to_vec(),
+        entity_deltas: daemon_semantic_delta.entity_deltas().to_vec(),
+        relation_deltas: daemon_semantic_delta.relation_deltas().to_vec(),
         tree_deltas: tree_deltas.clone(),
         admission_policy_delta: None,
     };
@@ -585,9 +591,15 @@ fn three_way(
         &authoritative.relations,
     )
     .context("plan exact merged workspace semantics")?;
+    let daemon_semantic_delta = crate::local_repository_authority::plan_daemon_semantic_delta(
+        state,
+        &authoritative.entities,
+        &authoritative.relations,
+    )
+    .context("plan the exact merged workspace semantics for the daemon view")?;
     let daemon_delta = TransactionDelta {
-        entity_deltas: workspace_semantic_delta.entity_deltas().to_vec(),
-        relation_deltas: workspace_semantic_delta.relation_deltas().to_vec(),
+        entity_deltas: daemon_semantic_delta.entity_deltas().to_vec(),
+        relation_deltas: daemon_semantic_delta.relation_deltas().to_vec(),
         tree_deltas: workspace_tree_deltas.clone(),
         admission_policy_delta: None,
     };

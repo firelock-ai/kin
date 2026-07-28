@@ -313,21 +313,26 @@
     },
     {
       "command": "stash",
-      "status": "open_gate",
-      "exposure": "fail_closed",
+      "status": "ready",
+      "exposure": "enabled",
       "authority": "repository-v6 workspace transaction",
       "required_for_bounded_dogfood": false,
       "acceptance_spec": [
         "persist and restore exact graph-owned workspace state without branch sidecars or raw-file inference"
       ],
       "evidence_tests": [
-        "kin_daemon::api::tests::command_stash_seals_restores_and_round_trips_exact_workspace_state",
+        "crates/kin-cli/tests/repository_stash.rs",
+        "kin_cli::commands::stash::tests::stash_ref_names_round_trip_only_through_canonical_ordinals",
+        "kin_daemon::api::tests::command_stash_leaves_ready_commands_working_on_the_returned_workspace",
         "kin_daemon::api::tests::command_stash_refuses_restore_onto_moved_authority",
         "kin_daemon::api::tests::command_stash_refuses_sealing_a_clean_workspace_and_restoring_over_a_dirty_one",
-        "kin_daemon::api::tests::command_stash_leaves_ready_commands_working_on_the_returned_workspace",
-        "kin_cli::commands::stash::tests::stash_ref_names_round_trip_only_through_canonical_ordinals"
+        "kin_daemon::api::tests::command_stash_seals_restores_and_round_trips_exact_workspace_state",
+        "kin_daemon::api::tests::switch_refuses_a_daemon_that_lost_authority_owned_semantics",
+        "kin_daemon::api::tests::switch_survives_enrichment_that_lands_after_the_authority_commit",
+        "kin_daemon::api::tests::switch_tolerates_derived_semantics_the_workspace_has_not_published",
+        "kin_daemon::commit_deltas::tests::commit_publishes_an_entity_whose_provenance_moved_without_its_fingerprint"
       ],
-      "note": "The graph-owned path exists and is covered: sealing writes the exact workspace tree and base-relative semantics as one immutable change under refs/kin/stash/, and restore refuses a moved authority base rather than rebasing onto it. It stays fail-closed because against a live daemon a seal can leave the daemon query graph disagreeing with workspace authority, so the next ready command refuses until the daemon reopens. In-process route coverage does not reproduce it; the background daemon loop is the missing variable."
+      "note": "Sealing writes the exact workspace tree and base-relative semantics as one immutable change under refs/kin/stash/, and restore refuses a moved authority base rather than rebasing onto it. The live-daemon wedge that held this gate closed is fixed: the daemon query graph is a derived view that runs ahead of workspace authority because reconciliation and asynchronous LSP enrichment publish into it continuously, so commands now plan their daemon-side transition from the live graph, and a commit publishes an entity whose provenance moved even when its fingerprint did not. Against a live daemon a seal now returns a clean workspace, restore succeeds, and the freshness-gated commands that follow either half of the cycle succeed rather than refusing until the daemon reopens."
     },
     {
       "command": "reconcile",

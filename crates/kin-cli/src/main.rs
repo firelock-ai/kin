@@ -483,7 +483,7 @@ enum Command {
         #[arg(long)]
         abort: bool,
     },
-    /// [OPEN GATE] Seal and restore exact graph-owned workspace state
+    /// Seal and restore exact graph-owned workspace state
     Stash {
         #[command(subcommand)]
         action: StashAction,
@@ -1482,7 +1482,7 @@ enum AssistantAction {
 
 #[derive(Subcommand)]
 enum StashAction {
-    /// [OPEN GATE] Seal exact graph-owned workspace state and return the workspace to its base.
+    /// Seal exact graph-owned workspace state and return the workspace to its base.
     Push {
         /// Label the sealed state. Defaults to the workspace head it was sealed on.
         #[arg(long, short = 'm')]
@@ -1492,9 +1492,9 @@ enum StashAction {
         #[arg(long)]
         yes: bool,
     },
-    /// [OPEN GATE] Restore the most recently sealed workspace state and drop its stash
+    /// Restore the most recently sealed workspace state and drop its stash
     Pop,
-    /// [OPEN GATE] List sealed workspace states
+    /// List sealed workspace states
     List {
         /// Output the machine-readable stash report
         #[arg(long)]

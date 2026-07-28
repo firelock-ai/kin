@@ -259,7 +259,10 @@ fn plan_and_commit(
         .iter()
         .find(|receipt| receipt.operation_id == request.operation_id)
         .cloned();
-    if existing_receipt.is_none() {
+    // Materialized only on the planning path. A replay returns before the
+    // authority transition is planned, so demanding a workspace authority
+    // graph there would fail a recovery that can otherwise complete.
+    let workspace_graph = if existing_receipt.is_none() {
         let workspace_graph = lease
             .workspace_graph_snapshot(&workspace.workspace_id)
             .map_err(|error| {
@@ -274,7 +277,10 @@ fn plan_and_commit(
             })?;
         require_fresh_daemon_workspace(state, &roots, &workspace_graph, "checking out a path")
             .map_err(CheckoutCommandError::conflict)?;
-    }
+        Some(workspace_graph)
+    } else {
+        None
+    };
     let mut snapshot = lease.snapshot().clone();
     snapshot.repository_authority = None;
     drop(lease);
@@ -502,9 +508,35 @@ fn plan_and_commit(
             "checkout graph preflight was not bound to the exact repository tree transition"
         )));
     }
+    // The authority-side transition is planned from the workspace lease, not
+    // from the daemon delta above. The daemon graph carries derived enrichment
+    // that has not crossed the compare-and-swap, so reusing its delta here
+    // would ask authority to publish or retract semantics it never owned.
+    let workspace_graph = workspace_graph.ok_or_else(|| {
+        CheckoutCommandError::internal(anyhow::anyhow!(
+            "checkout planning reached the authority transition without a workspace authority graph"
+        ))
+    })?;
+    let authority_graph = kin_db::InMemoryGraph::from_snapshot(workspace_graph)
+        .context("prepare exact checkout workspace authority graph")?;
+    let authority_delta = crate::commit_deltas::compute_selected_checkout_delta(
+        &authority_graph,
+        &graph_plan.selected,
+        &graph_plan.target_state,
+        &graph_plan.previous_tree,
+        &graph_plan.desired_tree,
+    )
+    .map_err(|error| {
+        classify_daemon_checkout_error(error, "plan exact checkout authority graph transition")
+    })?;
+    if authority_delta.tree_deltas != tree_deltas {
+        return Err(CheckoutCommandError::internal(anyhow::anyhow!(
+            "checkout authority plan was not bound to the exact repository tree transition"
+        )));
+    }
     let semantic_delta = WorkspaceSemanticDelta::new(
-        daemon_delta.entity_deltas.clone(),
-        daemon_delta.relation_deltas.clone(),
+        authority_delta.entity_deltas.clone(),
+        authority_delta.relation_deltas.clone(),
     )
     .context("canonicalize exact checkout semantic transition")?;
     let repository_changed = !tree_deltas.is_empty() || !semantic_delta.is_empty();

@@ -916,6 +916,12 @@ pub struct DaemonState {
     /// daemon installs its derived graph/generation cursor.
     #[cfg(test)]
     pub(crate) repository_command_fail_after_authority_once: AtomicBool,
+    /// Deterministic enrichment seam in the same window: the asynchronous LSP
+    /// worker writes derived relations into the live graph without taking the
+    /// coordination gate or the persistence lock, so it can land between a
+    /// command's plan and its finalization.
+    #[cfg(test)]
+    pub(crate) repository_command_enrich_after_authority_once: AtomicBool,
     /// Monotonically increasing version counter for VFS cache invalidation.
     /// Incremented on every graph mutation (reconcile, commit, overlay update).
     /// Unlike entity_count, this never decreases on deletions.
@@ -1702,6 +1708,8 @@ impl DaemonState {
             mcp_fail_after_authority_once: AtomicBool::new(false),
             #[cfg(test)]
             repository_command_fail_after_authority_once: AtomicBool::new(false),
+            #[cfg(test)]
+            repository_command_enrich_after_authority_once: AtomicBool::new(false),
             vfs_version: AtomicU64::new(persisted_vfs_version),
             event_tx: tokio::sync::broadcast::channel(256).0,
             session_scopes: RwLock::new(HashMap::new()),
@@ -1864,6 +1872,8 @@ impl DaemonState {
             mcp_fail_after_authority_once: AtomicBool::new(false),
             #[cfg(test)]
             repository_command_fail_after_authority_once: AtomicBool::new(false),
+            #[cfg(test)]
+            repository_command_enrich_after_authority_once: AtomicBool::new(false),
             vfs_version: AtomicU64::new(persisted_vfs_version),
             event_tx: tokio::sync::broadcast::channel(256).0,
             session_scopes: RwLock::new(HashMap::new()),
@@ -3318,20 +3328,93 @@ impl DaemonState {
         Ok(())
     }
 
+    /// Write derived semantics into the live query graph the way the LSP
+    /// enrichment worker does: additive upserts under nothing but the graph
+    /// authority epoch, holding neither the coordination gate nor the
+    /// persistence lock. Used to place an enrichment tick at an exact point
+    /// inside a repository command rather than waiting for a real worker to
+    /// race one in.
+    #[cfg(test)]
+    pub(crate) fn install_derived_enrichment(&self) {
+        use kin_model::EntityStore;
+        let anchor = kin_model::Entity {
+            id: kin_model::EntityId::new(),
+            kind: kin_model::EntityKind::Function,
+            name: "enriched_inside_the_command_window".to_string(),
+            language: kin_model::LanguageId::Rust,
+            fingerprint: kin_model::SemanticFingerprint {
+                algorithm: kin_model::FingerprintAlgorithm::V1TreeSitter,
+                ast_hash: kin_model::Hash256::from_bytes([11; 32]),
+                signature_hash: kin_model::Hash256::from_bytes([12; 32]),
+                behavior_hash: kin_model::Hash256::from_bytes([13; 32]),
+                equivalence_hash: kin_model::Hash256::from_bytes([0; 32]),
+                stability_score: 1.0,
+            },
+            file_origin: None,
+            span: None,
+            signature: "fn enriched_inside_the_command_window()".to_string(),
+            visibility: kin_model::Visibility::Public,
+            role: kin_model::EntityRole::Source,
+            doc_summary: None,
+            metadata: kin_model::EntityMetadata::default(),
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        };
+        let relation = kin_model::Relation {
+            id: kin_model::RelationId::new(),
+            kind: kin_model::RelationKind::Calls,
+            src: kin_model::GraphNodeId::Entity(anchor.id),
+            dst: kin_model::GraphNodeId::Entity(anchor.id),
+            confidence: 0.95,
+            origin: kin_model::RelationOrigin::Lsp,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
+        };
+        let _guard = self.begin_graph_authority_mutation();
+        self.graph
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: vec![kin_model::EntityDelta::Added { new: anchor }],
+                ..TransactionDelta::default()
+            })
+            .expect("derived enrichment entity must reach the live graph");
+        self.graph
+            .upsert_relation(&relation)
+            .expect("derived enrichment relation must reach the live graph");
+        self.bump_version();
+    }
+
     /// Install one already-durable local repository receipt into the daemon's
     /// derived graph and generation cursor.
     ///
     /// Callers must hold `coordination_gate`, `persist_lock`, and one
     /// `GraphAuthorityMutationGuard` across both the repository CAS and this
     /// method. The complete delta must have been constructed and preflighted
-    /// before that irreversible CAS. This method revalidates it against the
-    /// still-live graph so a replay heals the authority/daemon crash gap without
-    /// absorbing an unrelated later generation.
+    /// before that irreversible CAS. This method revalidates the transition
+    /// against the still-live graph so a replay heals the authority/daemon crash
+    /// gap without absorbing an unrelated later generation.
+    ///
+    /// The daemon-side semantic and tree transition is planned here rather than
+    /// taken from `planned_delta`. Between planning and this call the authority
+    /// transaction committed and the projection was materialized, and the
+    /// asynchronous LSP enrichment worker writes into the live graph without
+    /// taking either the coordination gate or the persistence lock. A plan-time
+    /// delta can therefore no longer describe the transition the live graph
+    /// needs, and applying it would leave the daemon short of the exact
+    /// authority graph after authority had already advanced. Only the admission
+    /// policy transition, which no derived writer produces, is carried over from
+    /// the plan.
+    ///
+    /// One consequence is worth naming: because the target is the exact
+    /// authority graph, every finalization discards whatever derived enrichment
+    /// the live graph is holding beyond authority. That lead is derived, and the
+    /// enrichment worker recomputes it.
     pub(crate) fn finalize_local_repository_commit(
         &self,
         receipt: &RepositoryCommitReceipt,
         authority_freeze: &LocalRepositoryAuthorityFreeze,
-        delta: &TransactionDelta,
+        planned_delta: &TransactionDelta,
         expected_previous_tree: &ResolvedTree,
         desired_tree: &ResolvedTree,
     ) -> Result<LocalRepositoryFinalization> {
@@ -3402,15 +3485,26 @@ impl DaemonState {
 
         let authority_snapshot = authority_graph.to_snapshot();
         let live_snapshot = self.graph.to_snapshot();
-        let already_installed = live_snapshot.resolved_tree == *desired_tree
-            && live_snapshot.entities == authority_snapshot.entities
-            && live_snapshot.relations == authority_snapshot.relations;
-        let graph_changed = !already_installed && delta != &TransactionDelta::default();
+        let semantics = kin_core::diff_workspace_semantics(
+            &live_snapshot.entities,
+            &live_snapshot.relations,
+            &authority_snapshot.entities,
+            &authority_snapshot.relations,
+        )?;
+        let tree_deltas =
+            kin_core::exact_tree_correction(&live_snapshot.resolved_tree, desired_tree)?;
+        let finalization_delta = TransactionDelta {
+            entity_deltas: semantics.entity_deltas().to_vec(),
+            relation_deltas: semantics.relation_deltas().to_vec(),
+            tree_deltas,
+            admission_policy_delta: planned_delta.admission_policy_delta.clone(),
+        };
+        let graph_changed = finalization_delta != TransactionDelta::default();
         if graph_changed {
             let preflight =
                 kin_db::InMemoryGraph::from_snapshot(live_snapshot).map_err(DaemonError::from)?;
             preflight
-                .apply_transaction_delta(delta)
+                .apply_transaction_delta(&finalization_delta)
                 .map_err(DaemonError::from)?;
             let preflight_snapshot = preflight.to_snapshot();
             if preflight_snapshot.resolved_tree != *desired_tree
@@ -3423,7 +3517,7 @@ impl DaemonState {
                 )));
             }
             self.graph
-                .apply_transaction_delta(delta)
+                .apply_transaction_delta(&finalization_delta)
                 .map_err(DaemonError::from)?;
         }
         let live_snapshot = self.graph.to_snapshot();

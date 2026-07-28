@@ -145,6 +145,14 @@ pub(crate) fn execute(
         ));
     }
 
+    #[cfg(test)]
+    if state
+        .repository_command_enrich_after_authority_once
+        .swap(false, std::sync::atomic::Ordering::SeqCst)
+    {
+        state.install_derived_enrichment();
+    }
+
     let finalization = state
         .finalize_local_repository_commit(
             &execution.receipt,
@@ -604,9 +612,15 @@ fn switch(
         &target_state.relations,
     )
     .context("plan exact branch semantic transition")?;
+    let daemon_semantic_delta = crate::local_repository_authority::plan_daemon_semantic_delta(
+        state,
+        &target_state.entities,
+        &target_state.relations,
+    )
+    .context("plan the branch semantic transition for the daemon view")?;
     let daemon_delta = TransactionDelta {
-        entity_deltas: semantic_delta.entity_deltas().to_vec(),
-        relation_deltas: semantic_delta.relation_deltas().to_vec(),
+        entity_deltas: daemon_semantic_delta.entity_deltas().to_vec(),
+        relation_deltas: daemon_semantic_delta.relation_deltas().to_vec(),
         tree_deltas: tree_deltas.clone(),
         admission_policy_delta: None,
     };
@@ -823,9 +837,29 @@ fn replay_switch(
     let previous_tree = desired_tree
         .apply(&inverse)
         .context("reconstruct pre-switch workspace tree from persisted receipt")?;
+    // A replay recovers the daemon after authority already moved, so the
+    // workspace graph the lease holds now is the switch target. Planning the
+    // daemon side from the live graph to that target keeps the recovery honest
+    // when derived enrichment landed before the crash.
+    let target_graph = lease
+        .workspace_graph_snapshot(&workspace.workspace_id)
+        .context("materialize the replayed branch-switch workspace authority")?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "repository {} has no graph snapshot for workspace {}",
+                authority.repository_id,
+                workspace.workspace_id
+            )
+        })?;
+    let daemon_semantic_delta = crate::local_repository_authority::plan_daemon_semantic_delta(
+        state,
+        &target_graph.entities,
+        &target_graph.relations,
+    )
+    .context("plan the replayed branch semantic transition for the daemon view")?;
     let daemon_delta = TransactionDelta {
-        entity_deltas: mutation.semantic_delta.entity_deltas().to_vec(),
-        relation_deltas: mutation.semantic_delta.relation_deltas().to_vec(),
+        entity_deltas: daemon_semantic_delta.entity_deltas().to_vec(),
+        relation_deltas: daemon_semantic_delta.relation_deltas().to_vec(),
         tree_deltas: mutation.tree_deltas.clone(),
         admission_policy_delta: None,
     };

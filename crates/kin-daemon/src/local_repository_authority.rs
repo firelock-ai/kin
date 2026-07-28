@@ -138,8 +138,23 @@ impl ActiveLocalRepositoryAuthority {
     }
 }
 
-/// Refuse a fresh repository mutation unless the daemon's complete derived
-/// workspace still names the exact authority lease used to plan it.
+/// Refuse a fresh repository mutation unless the daemon's derived workspace is
+/// still a faithful view of the exact authority lease used to plan it.
+///
+/// The daemon query graph is a derived view that legitimately runs ahead of
+/// workspace authority. Parser reconciliation and the asynchronous LSP
+/// enrichment worker publish semantic facets into it continuously, and those
+/// facets cross the repository-v6 compare-and-swap only when a change is
+/// committed. Demanding exact equality here therefore refuses every authority
+/// command that follows any enrichment tick, which wedges routine sessions
+/// rather than protecting them.
+///
+/// What must still hold is narrower and is enforced below: the daemon is at the
+/// same authority generation, it holds no exact tree state authority has not
+/// admitted, and it has neither dropped nor rewritten any entity or relation
+/// that authority owns. Because a derived lead is permitted, every caller must
+/// plan its daemon-side transition from the live graph via
+/// [`plan_daemon_semantic_delta`] rather than reusing the authority-side delta.
 pub(crate) fn require_fresh_daemon_workspace(
     state: &DaemonState,
     roots: &RootBundle,
@@ -155,14 +170,68 @@ pub(crate) fn require_fresh_daemon_workspace(
         );
     }
     let live = state.graph.to_snapshot();
-    if live.resolved_tree != workspace_graph.resolved_tree
-        || live.entities != workspace_graph.entities
-        || live.relations != workspace_graph.relations
-    {
+    if live.resolved_tree != workspace_graph.resolved_tree {
         bail!(
-            "daemon graph does not match the exact repository workspace authority; reopen before \
+            "daemon exact tree does not match the repository workspace authority; reopen before \
              {operation}"
         );
     }
+    if let Some(divergence) = authority_semantics_divergence(&live, workspace_graph) {
+        bail!(
+            "daemon graph no longer holds the repository workspace authority it was planned \
+             against ({divergence}); reopen before {operation}"
+        );
+    }
     Ok(())
+}
+
+/// Describe the first authority-owned entity or relation the daemon graph has
+/// dropped or rewritten, or `None` when authority is still fully retained.
+///
+/// A derived view may hold more than authority owns. It may never hold less,
+/// and it may never hold a different value under an identity authority already
+/// published: either would mean the daemon is answering from something other
+/// than graph truth.
+fn authority_semantics_divergence(
+    live: &kin_db::GraphSnapshot,
+    authority: &kin_db::GraphSnapshot,
+) -> Option<String> {
+    for (entity_id, entity) in &authority.entities {
+        match live.entities.get(entity_id) {
+            Some(live_entity) if live_entity == entity => {}
+            Some(_) => return Some(format!("entity {entity_id} was rewritten")),
+            None => return Some(format!("entity {entity_id} is missing")),
+        }
+    }
+    for (relation_id, relation) in &authority.relations {
+        match live.relations.get(relation_id) {
+            Some(live_relation) if live_relation == relation => {}
+            Some(_) => return Some(format!("relation {relation_id} was rewritten")),
+            None => return Some(format!("relation {relation_id} is missing")),
+        }
+    }
+    None
+}
+
+/// Plan the daemon-side semantic transition of one repository command from the
+/// live query graph.
+///
+/// The authority-side delta of the same command is planned from the workspace
+/// lease. These are deliberately two different deltas over the same transition:
+/// the live graph carries derived enrichment that has not crossed the
+/// compare-and-swap, so reusing the authority delta would leave that enrichment
+/// installed and land the daemon on a graph that is not the exact target.
+pub(crate) fn plan_daemon_semantic_delta(
+    state: &DaemonState,
+    target_entities: &std::collections::HashMap<kin_model::EntityId, kin_model::Entity>,
+    target_relations: &std::collections::HashMap<kin_model::RelationId, kin_model::Relation>,
+) -> Result<kin_model::WorkspaceSemanticDelta> {
+    let live = state.graph.to_snapshot();
+    kin_core::diff_workspace_semantics(
+        &live.entities,
+        &live.relations,
+        target_entities,
+        target_relations,
+    )
+    .map_err(Into::into)
 }
