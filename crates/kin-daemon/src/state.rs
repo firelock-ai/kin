@@ -1019,6 +1019,16 @@ pub struct DaemonState {
     /// daemon-health signal so this degraded state is LOUD, never silent (the
     /// worker dying must NOT take the whole daemon down).
     pub embed_worker_failed: AtomicBool,
+    /// Why the views this daemon derives from repository authority stopped
+    /// matching it, or `None` when they match.
+    ///
+    /// Set when an admitted repository transfer became durable and the refresh
+    /// of everything derived from it then failed. Authority is the truth and it
+    /// moved, so that is not a failed transfer and must not be reported as one.
+    /// It is also not nothing: retrieval served from these views is behind
+    /// authority until they are rebuilt. Surfaced as a daemon-health signal so
+    /// the gap is loud rather than inferred from stale answers.
+    pub derived_views_stale: RwLock<Option<String>>,
     /// Durable store for in-flight MCP transactions, keyed by transaction id.
     ///
     /// Each `/mcp/tools/call` rebuilds a fresh `SessionRegistry` for the request,
@@ -1452,6 +1462,20 @@ impl DaemonState {
     /// the process entrypoint. Local overrides must name the manifest's exact
     /// authority; they cannot rebind one workspace to another repository.
     pub fn open_with_repo_id(layout: KinLayout, explicit_repo_id: Option<&str>) -> Result<Self> {
+        // Layout gate first. A pre-v2 `.kin/` (file/branch-authority era) must
+        // be refused before any manifest or storage parsing runs: its manifest
+        // may predate required fields and its storage holds no repository
+        // namespace, so letting either path speak first buries the real story
+        // under a serde or storage error instead of the version gap.
+        if let Err(error) = layout.check_version() {
+            return Err(DaemonError::IncompatibleRepo(format!(
+                "{error}. This repository was created before the \
+                 repository-authority layout change; re-create it with this \
+                 build (`kin clone` or `kin init` in a fresh checkout), or \
+                 open it with a matching older kin."
+            )));
+        }
+
         // Up-front compatibility gate. A repo created by a pre-0.2 kin carries
         // an on-disk graph/index that this build's post-load embed/readiness
         // path cannot serve. Without this gate the daemon loads the snapshot,
@@ -1480,7 +1504,7 @@ impl DaemonState {
         // standalone graph.kndb snapshot is not a fallback.
         let cached_repo_id = kin_core::manifest::resolve_repo_id(&layout, explicit_repo_id)
             .map_err(DaemonError::from)?;
-        let manifest = kin_core::manifest::KinManifest::load(&layout.manifest_path())
+        let mut manifest = kin_core::manifest::KinManifest::load(&layout.manifest_path())
             .map_err(DaemonError::from)?;
         if manifest.repo_id != cached_repo_id {
             return Err(DaemonError::Core(kin_core::KinError::Config(format!(
@@ -1488,12 +1512,23 @@ impl DaemonState {
                 cached_repo_id, manifest.repo_id
             ))));
         }
-        let workspace_uuid = uuid::Uuid::parse_str(&manifest.workspace_id).map_err(|error| {
-            DaemonError::Core(kin_core::KinError::Config(format!(
-                "invalid workspace identity in manifest: {error}"
-            )))
-        })?;
-        let workspace_id = WorkspaceId::from_uuid(workspace_uuid);
+        // A manifest that lost its `workspace_id` (or predates the field on a
+        // current layout) is healed after authority opens, by recovering the
+        // identity the storage authority already registered at admission.
+        // Minting a fresh one here would diverge from that registration and be
+        // refused downstream, so an absent identity defers resolution.
+        let manifest_workspace_id = match manifest.workspace_id.trim() {
+            "" => None,
+            recorded => Some(
+                uuid::Uuid::parse_str(recorded)
+                    .map(WorkspaceId::from_uuid)
+                    .map_err(|error| {
+                        DaemonError::Core(kin_core::KinError::Config(format!(
+                            "invalid workspace identity in manifest: {error}"
+                        )))
+                    })?,
+            ),
+        };
         let repository_id = RepositoryId::new(cached_repo_id.clone()).map_err(|error| {
             DaemonError::Core(kin_core::KinError::Config(format!(
                 "invalid repository identity in manifest: {error}"
@@ -1517,6 +1552,48 @@ impl DaemonState {
         kin_core::revalidate_pinned_local_namespace(&local_repository_backend, &repository_id)
             .map_err(DaemonError::Graph)?;
         let lease = authority.read_authority();
+        let workspace_id = match manifest_workspace_id {
+            Some(recorded) => recorded,
+            None => {
+                // Recover the identity the authority registered at admission.
+                // Exactly one registered workspace names it unambiguously;
+                // anything else cannot be disambiguated and must be refused.
+                let registered = &lease.metadata().workspaces;
+                match registered.as_slice() {
+                    [only] => {
+                        let recovered = only.workspace_id;
+                        manifest.workspace_id = recovered.to_string();
+                        manifest
+                            .save(&layout.manifest_path())
+                            .map_err(DaemonError::from)?;
+                        info!(
+                            repository = %cached_repo_id,
+                            workspace = %recovered,
+                            "restored missing manifest workspace identity from repository authority"
+                        );
+                        recovered
+                    }
+                    [] => {
+                        return Err(DaemonError::IncompatibleRepo(format!(
+                            "manifest for repository {cached_repo_id} carries no workspace \
+                             identity and the repository authority holds no registered \
+                             workspace to recover it from; re-create the repository with \
+                             `kin clone` or `kin init`, or restore .kin/manifest.json from \
+                             a backup"
+                        )));
+                    }
+                    many => {
+                        return Err(DaemonError::IncompatibleRepo(format!(
+                            "manifest for repository {cached_repo_id} carries no workspace \
+                             identity and the repository authority holds {} registered \
+                             workspaces; restore .kin/manifest.json from a backup so the \
+                             identity is unambiguous",
+                            many.len()
+                        )));
+                    }
+                }
+            }
+        };
         let workspace_snapshot = lease
             .workspace_graph_snapshot(&workspace_id)
             .map_err(DaemonError::Graph)?
@@ -1649,6 +1726,7 @@ impl DaemonState {
             persisted_entity_count: AtomicU64::new(loaded_entity_count as u64),
             mass_deletion_blocked: AtomicBool::new(false),
             embed_worker_failed: AtomicBool::new(false),
+            derived_views_stale: RwLock::new(None),
             mcp_transactions: Mutex::new(HashMap::new()),
             locate_rankings: Mutex::new(HashMap::new()),
             semantic_locate_pages: Mutex::new(HashMap::new()),
@@ -1810,6 +1888,7 @@ impl DaemonState {
             persisted_entity_count: AtomicU64::new(loaded_entity_count as u64),
             mass_deletion_blocked: AtomicBool::new(false),
             embed_worker_failed: AtomicBool::new(false),
+            derived_views_stale: RwLock::new(None),
             mcp_transactions: Mutex::new(HashMap::new()),
             locate_rankings: Mutex::new(HashMap::new()),
             semantic_locate_pages: Mutex::new(HashMap::new()),
@@ -5324,15 +5403,61 @@ mod tests {
     }
 
     #[test]
+    fn open_refuses_pre_v2_layout_before_manifest_parsing() {
+        // A pre-v2 `.kin/` (no version marker, or v1) must be refused by the
+        // layout gate in its own voice, before manifest parsing runs. The
+        // manifest here is the exact field set released 0.3.6 wrote — no
+        // `workspace_id` — so if manifest parsing ran first this would fail
+        // with a serde error instead of the version gap.
+        let repo_dir = tempfile::tempdir().unwrap();
+        let kin_dir = repo_dir.path().join(".kin");
+        std::fs::create_dir_all(&kin_dir).unwrap();
+        std::fs::write(
+            kin_dir.join("manifest.json"),
+            r#"{"kin_version":"0.3.6","languages":[],"adapters":[],"repo_id":"54c48711-e6f0-4950-b00d-5585b59188fe","created_at":"2026-07-28T03:10:45Z"}"#,
+        )
+        .unwrap();
+        let layout = kin_core::KinLayout::new(kin_dir);
+
+        let err = match DaemonState::open(layout) {
+            Ok(_) => panic!("expected pre-v2 layout open to be refused"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err, DaemonError::IncompatibleRepo(_)),
+            "expected IncompatibleRepo, got {err:?}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("found v1") && message.contains("requires v2"),
+            "message must name the layout gap: {message}"
+        );
+        assert!(
+            message.contains("kin clone") || message.contains("kin init"),
+            "message must name a remediation path: {message}"
+        );
+        assert!(
+            !message.contains("missing field"),
+            "layout refusal must not surface as a serde error: {message}"
+        );
+    }
+
+    #[test]
     fn open_rejects_pre_0_2_repo_with_actionable_error() {
         // A repo created by a pre-0.2 kin must be refused UP FRONT with
         // a clear, actionable error — never loaded into a daemon that then fails
         // readiness and gets SIGTERM-killed by the supervisor. The gate fires
         // before the graph snapshot is touched, so a tiny manifest fixture (just
-        // the version field) is enough to reproduce it.
+        // the version field) is enough to reproduce it. The layout marker is
+        // stamped current so the version gate, not the layout gate, speaks.
         let repo_dir = tempfile::tempdir().unwrap();
         let kin_dir = repo_dir.path().join(".kin");
         std::fs::create_dir_all(&kin_dir).unwrap();
+        std::fs::write(
+            kin_dir.join("version"),
+            kin_core::layout::KIN_LAYOUT_VERSION.to_string(),
+        )
+        .unwrap();
         std::fs::write(kin_dir.join("manifest.json"), r#"{"kin_version":"0.1.0"}"#).unwrap();
         let layout = kin_core::KinLayout::new(kin_dir);
 

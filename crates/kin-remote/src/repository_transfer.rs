@@ -52,7 +52,11 @@ impl RepositoryAuthorityMetadata for RepositoryAuthorityState {
 }
 
 pub const REPOSITORY_TRANSFER_PROTOCOL: &str = "kin-repository-v6-fast-forward";
-pub const REPOSITORY_TRANSFER_SCHEMA_VERSION: u32 = 1;
+/// Version 2 adds `transfer_target_head`, which is what lets a receiver tell a
+/// deliberate continuation segment apart from a peer whose authority moved
+/// under the negotiation. A version 1 peer is refused by name rather than
+/// through a field-shape parse error.
+pub const REPOSITORY_TRANSFER_SCHEMA_VERSION: u32 = 2;
 pub const FEATURE_EXACT_TREES: &str = "exact-trees-v1";
 pub const FEATURE_IMMUTABLE_SOURCE_CAS: &str = "immutable-source-cas-v1";
 pub const FEATURE_REF_CAS: &str = "ref-cas-v1";
@@ -111,6 +115,31 @@ impl Default for RepositoryTransferLimits {
     }
 }
 
+impl RepositoryTransferLimits {
+    /// Bound peer- or request-supplied ceilings by what this implementation can
+    /// construct and validate locally.
+    ///
+    /// Transfer limits are ceilings rather than quotas, so choosing the
+    /// smaller local value remains compatible with a peer that can accept a
+    /// larger envelope. It also keeps an untrusted advertisement or export
+    /// request from making this process assemble a pack its own receiver would
+    /// reject, or from turning one bounded transfer step into unbounded work.
+    fn bounded_by_local(self) -> Self {
+        let local = Self::default();
+        Self {
+            max_changes: self.max_changes.min(local.max_changes),
+            max_trees: self.max_trees.min(local.max_trees),
+            max_bodies: self.max_bodies.min(local.max_bodies),
+            max_external_objects: self.max_external_objects.min(local.max_external_objects),
+            max_aliases: self.max_aliases.min(local.max_aliases),
+            max_decoded_body_bytes: self
+                .max_decoded_body_bytes
+                .min(local.max_decoded_body_bytes),
+            max_single_body_bytes: self.max_single_body_bytes.min(local.max_single_body_bytes),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RepositoryTransferStatus {
@@ -126,13 +155,20 @@ pub struct RepositoryTransferStatus {
     pub git_authority_hash: Option<Hash256>,
     pub supported_features: Vec<String>,
     pub limits: RepositoryTransferLimits,
-    /// False until deterministic continuation packs make per-envelope limits
-    /// independent of repository history/blob size. Do not expose this
-    /// bounded primitive as general `kin push`.
+    /// This peer applies a publication whose closure is larger than one
+    /// envelope, by receiving the continuation packs it is split into.
+    ///
+    /// What this does not claim is freedom from every bound. A single change
+    /// whose new bodies exceed the negotiated byte limit is indivisible and is
+    /// refused by name, because there is no smaller step that still lands a
+    /// valid head. The bound that continuation packs removed is the one that
+    /// scaled with history length.
     pub push_apply_ready: bool,
     /// The server can export this bounded exact seam. The name deliberately
     /// avoids advertising a general pull capability.
     pub bounded_envelope_export_ready: bool,
+    /// This peer admits an exported closure larger than one envelope, pack by
+    /// pack, under the same bound as [`Self::push_apply_ready`].
     pub pull_apply_ready: bool,
 }
 
@@ -155,6 +191,7 @@ impl TryFrom<RepositoryTransferStatus> for RepositoryTransferExpectation {
 
     fn try_from(status: RepositoryTransferStatus) -> Result<Self> {
         validate_status(&status)?;
+        let limits = status.limits.bounded_by_local();
         Ok(Self {
             repository_id: status.repository_id,
             destination_ref: status.destination_ref,
@@ -164,7 +201,7 @@ impl TryFrom<RepositoryTransferStatus> for RepositoryTransferExpectation {
             default_ref: status.default_ref,
             git_authority_hash: status.git_authority_hash,
             supported_features: status.supported_features,
-            limits: status.limits,
+            limits,
         })
     }
 }
@@ -238,7 +275,21 @@ pub struct RepositoryTransferPack {
     pub repository_id: RepositoryId,
     pub source_ref: RefName,
     pub destination_ref: RefName,
+    /// The exact head this one pack publishes.
+    ///
+    /// For a transfer that fits a single envelope this is the source ref head.
+    /// For a continuation segment it is an intermediate checkpoint: an exact
+    /// ancestor of [`Self::transfer_target_head`] that the destination ref can
+    /// fast-forward to on its own.
     pub source_head: SemanticChangeId,
+    /// The head the whole transfer is moving toward.
+    ///
+    /// A receiver needs this to tell two very different things apart. A pack
+    /// whose `source_head` is not the head the peer advertised is either one
+    /// segment of a deliberate continuation, or a peer whose authority moved
+    /// mid-negotiation. Without a declared target those are indistinguishable,
+    /// and the safe reading of the second one is to refuse.
+    pub transfer_target_head: SemanticChangeId,
     pub source_tree_hash: Hash256,
     pub expected_destination_target: Option<RefTarget>,
     pub expected_destination_head: Option<SemanticChangeId>,
@@ -330,9 +381,9 @@ pub fn repository_transfer_status<B: StorageBackend + ?Sized + 'static>(
         git_authority_hash,
         supported_features: required_features(),
         limits: RepositoryTransferLimits::default(),
-        push_apply_ready: false,
+        push_apply_ready: true,
         bounded_envelope_export_ready: true,
-        pull_apply_ready: false,
+        pull_apply_ready: true,
     })
 }
 
@@ -417,57 +468,376 @@ pub fn repository_ref_advertisement<B: StorageBackend + ?Sized + 'static>(
     })
 }
 
+/// One pack of a transfer that may need more than one, and what is left after
+/// it is published.
+///
+/// A segment is a complete, self-validating transfer in its own right: it
+/// carries a parent-closed change closure, publishes one exact head, and comes
+/// back with one receipt. What makes it a segment rather than the whole
+/// transfer is only that [`Self::remaining_changes`] is not zero.
+#[derive(Debug, Clone)]
+pub struct RepositoryTransferSegment {
+    pub pack: RepositoryTransferPack,
+    /// Exact changes still to move after this pack is published.
+    pub remaining_changes: usize,
+}
+
+impl RepositoryTransferSegment {
+    /// True when this pack lands the transfer target head, so nothing follows.
+    pub fn is_final(&self) -> bool {
+        self.remaining_changes == 0
+    }
+}
+
+/// The changes one pack carries, and how many are left behind it.
+struct SegmentPlan {
+    ordered: Vec<SemanticChangeId>,
+    remaining: usize,
+    /// The plan had to reach past the change budget to end on a change the
+    /// destination ref can fast-forward to.
+    ///
+    /// This is what tells a caller whether a refusal can be answered by trying
+    /// a smaller step. Nothing inside this segment can end one, so replanning
+    /// under any smaller budget rebuilds exactly this segment.
+    is_smallest_publishable_step: bool,
+}
+
+/// A pack that could not be assembled inside the negotiated bounds.
+///
+/// This is separated from a genuine error because it is the one refusal a
+/// segmented transfer can answer by trying a smaller step. Every other failure
+/// means the history or the lease is wrong, and retrying would only repeat it.
+enum Assembled {
+    Pack(Box<RepositoryTransferPack>),
+    OverNegotiatedBound(String),
+}
+
 pub fn build_repository_transfer_pack<B: StorageBackend + ?Sized + 'static>(
     authority: &RepositoryAuthorityManager<B>,
     source_ref: &RefName,
     expectation: &RepositoryTransferExpectation,
 ) -> Result<RepositoryTransferPack> {
-    validate_expectation(expectation)?;
-    let lease = authority.read_authority();
-    if lease.authority_metadata().repository_id != expectation.repository_id {
+    let expectation = locally_bounded_expectation(expectation)?;
+    let context = TransferSourceContext::read(authority, source_ref, &expectation)?;
+    let ordered = collect_fast_forward_closure(
+        &context.all_changes,
+        context.source_head,
+        expectation.destination_head,
+    )?;
+    enforce_count("changes", ordered.len(), expectation.limits.max_changes)?;
+    let plan = SegmentPlan {
+        ordered,
+        remaining: 0,
+        is_smallest_publishable_step: false,
+    };
+    match assemble_segment_pack(authority, &context, &expectation, source_ref, &plan)? {
+        Assembled::Pack(pack) => Ok(*pack),
+        Assembled::OverNegotiatedBound(reason) => Err(invalid(reason)),
+    }
+}
+
+/// Build the largest pack that fits the negotiated bounds and still publishes a
+/// head the destination ref can fast-forward to.
+///
+/// The bound this works around is the negotiated envelope, not the history. A
+/// closure past the envelope is split into a sequence of packs, each of which
+/// is published atomically on its own. What it cannot split is one change: a
+/// single change whose new bodies exceed the negotiated byte bound is refused
+/// by name, because there is no smaller step that still lands a valid head.
+pub fn build_repository_transfer_segment<B: StorageBackend + ?Sized + 'static>(
+    authority: &RepositoryAuthorityManager<B>,
+    source_ref: &RefName,
+    expectation: &RepositoryTransferExpectation,
+) -> Result<RepositoryTransferSegment> {
+    let expectation = locally_bounded_expectation(expectation)?;
+    let context = TransferSourceContext::read(authority, source_ref, &expectation)?;
+    let closure = collect_fast_forward_closure(
+        &context.all_changes,
+        context.source_head,
+        expectation.destination_head,
+    )?;
+    if closure.is_empty() {
         return Err(invalid(format!(
-            "source repository {} does not match destination repository {}",
-            lease.authority_metadata().repository_id,
-            expectation.repository_id
+            "source head {} is already the destination head; there is no segment to build",
+            context.source_head
         )));
     }
-    require_negotiated_features(&expectation.supported_features)?;
 
-    let source_target = lease
-        .resolve_ref_target(source_ref)
-        .map_err(storage)?
-        .ok_or_else(|| invalid(format!("source ref {source_ref} is absent")))?;
-    let source_head = lease
-        .resolve_target_change_id(&source_target)
-        .map_err(storage)?;
-    let source_git_authority_hash =
-        hash_git_authority(lease.authority_metadata().git_external_authority.as_ref())?;
-    if source_git_authority_hash != expectation.git_authority_hash {
-        return Err(RepositoryTransferError::Conflict(
-            "repository-v6 transfer v1 requires identical imported-Git authority on both replicas; Git-authority bootstrap/divergence is not adapted"
-                .to_string(),
-        ));
-    }
-
-    let all_changes = lease.snapshot().changes.clone();
-    let ordered_ids =
-        collect_fast_forward_closure(&all_changes, source_head, expectation.destination_head)?;
-    enforce_count("changes", ordered_ids.len(), expectation.limits.max_changes)?;
-    let store = TransferChangeStore::new(all_changes.values().cloned());
-    let source_tree = store.resolve_tree_at(&source_head).map_err(model)?;
-    let source_tree_hash = compute_resolved_tree_hash(&source_tree).map_err(model)?;
-    let mut source_tree_bodies = BTreeSet::new();
-    for artifact in source_tree.artifacts() {
-        if let Some(hash) = artifact.entry.blob_identity() {
-            source_tree_bodies.insert(hash);
-        } else if !matches!(artifact.entry, TreeEntry::Gitlink { .. }) {
-            return Err(invalid(format!(
-                "source tree entry at {} has neither CAS body nor Gitlink identity",
-                artifact.path
-            )));
+    let mut budget = expectation.limits.max_changes;
+    loop {
+        let plan = plan_transfer_segment(
+            &context.all_changes,
+            &closure,
+            expectation.destination_head,
+            &expectation.limits,
+            budget,
+        )?;
+        let planned = plan.ordered.len();
+        match assemble_segment_pack(authority, &context, &expectation, source_ref, &plan)? {
+            Assembled::Pack(pack) => {
+                return Ok(RepositoryTransferSegment {
+                    pack: *pack,
+                    remaining_changes: plan.remaining,
+                })
+            }
+            Assembled::OverNegotiatedBound(reason) => {
+                if planned <= 1 {
+                    return Err(invalid(format!(
+                        "the next publishable step of this transfer is one exact change and it {reason}; \
+                         a single change cannot be split across continuation packs"
+                    )));
+                }
+                // A smaller budget is only worth trying when it can produce a
+                // smaller segment, and here it cannot: the planner already had
+                // to reach past the budget to end on a change this ref can
+                // fast-forward to, so every replan rebuilds this same segment.
+                // Refusing by name is the answer the caller needs; shrinking
+                // the budget again would be a hang standing in for a refusal.
+                //
+                // This is also what bounds the loop. A plan that stayed inside
+                // its budget is never longer than it, so the next budget is
+                // strictly smaller than the segment just refused, and a plan
+                // that reached past its budget stops here.
+                if plan.is_smallest_publishable_step {
+                    return Err(invalid(format!(
+                        "the next publishable step of this transfer is {planned} changes and it \
+                         {reason}; no smaller part of it ends on a change this destination ref can \
+                         fast-forward to, so it cannot be split across continuation packs"
+                    )));
+                }
+                // Halve rather than step down one change at a time: the bound
+                // that was hit is a byte or object total, so the useful search
+                // is over magnitudes, and this converges in log steps instead
+                // of rebuilding the pack once per change.
+                budget = u32::try_from(planned / 2).unwrap_or(1).max(1);
+            }
         }
     }
-    for hash in source_tree_bodies {
+}
+
+/// Check everything a publication decides before it assembles a pack.
+///
+/// This exists so a plan can refuse what a push refuses without publishing
+/// anything: the repository identity, the negotiated features, the source ref,
+/// the imported-Git authority baseline, and the presence and identity of every
+/// immutable body the publication head's tree depends on. It deliberately does
+/// not build packs, so it says nothing about per-pack byte totals.
+pub fn verify_transfer_source_readiness<B: StorageBackend + ?Sized + 'static>(
+    authority: &RepositoryAuthorityManager<B>,
+    source_ref: &RefName,
+    expectation: &RepositoryTransferExpectation,
+) -> Result<()> {
+    let expectation = locally_bounded_expectation(expectation)?;
+    let context = TransferSourceContext::read(authority, source_ref, &expectation)?;
+    let store = TransferChangeStore::new(context.all_changes.values().cloned());
+    let tree = store.resolve_tree_at(&context.source_head).map_err(model)?;
+    for hash in resolved_tree_body_identities(&tree)? {
+        let bytes = authority
+            .load_source_blob(hash)
+            .map_err(storage)?
+            .ok_or_else(|| invalid(format!("source tree CAS body {hash} is absent")))?;
+        verify_body(hash, &bytes)?;
+    }
+    Ok(())
+}
+
+/// How many packs the gap in `expectation` takes, counting nothing that needs
+/// bytes to be read.
+///
+/// This is a floor, not a promise. Segmentation also splits on the negotiated
+/// byte bounds, and those are only known once bodies are loaded, so a
+/// publication can take more packs than this and never fewer.
+pub fn count_repository_transfer_packs<B: StorageBackend + ?Sized + 'static>(
+    authority: &RepositoryAuthorityManager<B>,
+    source_ref: &RefName,
+    expectation: &RepositoryTransferExpectation,
+) -> Result<usize> {
+    let expectation = locally_bounded_expectation(expectation)?;
+    let context = TransferSourceContext::read(authority, source_ref, &expectation)?;
+    let mut boundary = expectation.destination_head;
+    let mut packs = 0usize;
+    loop {
+        let closure =
+            collect_fast_forward_closure(&context.all_changes, context.source_head, boundary)?;
+        if closure.is_empty() {
+            return Ok(packs);
+        }
+        let plan = plan_transfer_segment(
+            &context.all_changes,
+            &closure,
+            boundary,
+            &expectation.limits,
+            expectation.limits.max_changes,
+        )?;
+        packs += 1;
+        if plan.remaining == 0 {
+            return Ok(packs);
+        }
+        boundary = plan.ordered.last().copied();
+    }
+}
+
+/// Everything one coherent authority lease contributes to a pack.
+struct TransferSourceContext {
+    all_changes: std::collections::HashMap<SemanticChangeId, SemanticChange>,
+    source_head: SemanticChangeId,
+    source_git_authority_hash: Option<Hash256>,
+    aliases: Vec<ExternalChangeAlias>,
+    external_objects: Vec<ExternalObjectRecord>,
+}
+
+impl TransferSourceContext {
+    fn read<B: StorageBackend + ?Sized + 'static>(
+        authority: &RepositoryAuthorityManager<B>,
+        source_ref: &RefName,
+        expectation: &RepositoryTransferExpectation,
+    ) -> Result<Self> {
+        validate_expectation(expectation)?;
+        let lease = authority.read_authority();
+        if lease.authority_metadata().repository_id != expectation.repository_id {
+            return Err(invalid(format!(
+                "source repository {} does not match destination repository {}",
+                lease.authority_metadata().repository_id,
+                expectation.repository_id
+            )));
+        }
+        require_negotiated_features(&expectation.supported_features)?;
+
+        let source_target = lease
+            .resolve_ref_target(source_ref)
+            .map_err(storage)?
+            .ok_or_else(|| invalid(format!("source ref {source_ref} is absent")))?;
+        let source_head = lease
+            .resolve_target_change_id(&source_target)
+            .map_err(storage)?;
+        let source_git_authority_hash =
+            hash_git_authority(lease.authority_metadata().git_external_authority.as_ref())?;
+        if source_git_authority_hash != expectation.git_authority_hash {
+            return Err(RepositoryTransferError::Conflict(
+                "repository-v6 transfer v1 requires identical imported-Git authority on both replicas; Git-authority bootstrap/divergence is not adapted"
+                    .to_string(),
+            ));
+        }
+
+        Ok(Self {
+            all_changes: lease.snapshot().changes.clone(),
+            source_head,
+            source_git_authority_hash,
+            aliases: lease.authority_metadata().aliases.clone(),
+            external_objects: lease.authority_metadata().external_objects.clone(),
+        })
+    }
+}
+
+/// The earliest change in `closure` the destination ref can fast-forward to.
+fn smallest_publishable_step(
+    closure: &[SemanticChangeId],
+    descends: &BTreeMap<SemanticChangeId, bool>,
+) -> Option<usize> {
+    closure
+        .iter()
+        .position(|id| descends.get(id) == Some(&true))
+}
+
+/// Choose the longest parent-closed prefix of `closure` that stays inside the
+/// negotiated bounds and ends on a change the destination ref can fast-forward
+/// to.
+///
+/// Both conditions matter and only one of them is obvious. The prefix is
+/// parent-closed because the closure is ordered parent-before-child. The
+/// endpoint has to be a descendant of the destination head as well, which a
+/// prefix does not give for free: merging a side line puts that line's changes
+/// in the closure ahead of the merge, and none of them descend from the
+/// destination head. Ending a segment there would ask the destination ref to
+/// move sideways onto an unrelated change.
+fn plan_transfer_segment(
+    changes: &std::collections::HashMap<SemanticChangeId, SemanticChange>,
+    closure: &[SemanticChangeId],
+    destination_head: Option<SemanticChangeId>,
+    limits: &RepositoryTransferLimits,
+    change_budget: u32,
+) -> Result<SegmentPlan> {
+    let mut descends = BTreeMap::new();
+    let mut bodies = BTreeSet::new();
+    let mut last_publishable: Option<usize> = None;
+
+    for (index, id) in closure.iter().enumerate() {
+        let change = changes
+            .get(id)
+            .ok_or_else(|| invalid(format!("source closure is missing change {id}")))?;
+        descends.insert(
+            *id,
+            destination_head.is_none()
+                || change.parents.iter().any(|parent| {
+                    Some(*parent) == destination_head || descends.get(parent) == Some(&true)
+                }),
+        );
+        for delta in &change.tree_deltas {
+            if let Some(new) = delta.new_state() {
+                if let Some(hash) = new.entry.blob_identity() {
+                    bodies.insert(hash);
+                }
+            }
+        }
+        let count = u32::try_from(index + 1).unwrap_or(u32::MAX);
+        let within_budget = count <= change_budget
+            && u32::try_from(bodies.len()).unwrap_or(u32::MAX) <= limits.max_bodies;
+        if within_budget && descends.get(id) == Some(&true) {
+            last_publishable = Some(index);
+        }
+    }
+
+    // No boundary fits the budget. That does not mean the transfer is stuck:
+    // it means the smallest step that lands a head this ref can reach is
+    // bigger than the envelope asked for. Merging a side line does this, and
+    // it does it partway through a publication that has already moved history,
+    // so refusing here would strand a transfer rather than bound it. Take the
+    // smallest publishable step there is and let the pack limits refuse it if
+    // it genuinely cannot be built.
+    let (end, is_smallest_publishable_step) = match last_publishable {
+        Some(end) => (end, false),
+        None => (
+            smallest_publishable_step(closure, &descends).ok_or_else(|| {
+                invalid(format!(
+                    "no change in this closure descends from destination head {}, so no pack can \
+                     publish a head this ref reaches",
+                    destination_head
+                        .map(|head| head.to_string())
+                        .unwrap_or_else(|| "an unborn ref".to_string()),
+                ))
+            })?,
+            true,
+        ),
+    };
+    // Carry exactly the endpoint's own ancestry rather than the whole scanned
+    // prefix. A topological prefix can hold a change that is not an ancestor
+    // of the change it ends on: order a merge's two lines the other way and
+    // the far line lands ahead of the near one. Sending it in this segment
+    // would leave the next segment's closure carrying it a second time.
+    let ordered = collect_fast_forward_closure(changes, closure[end], destination_head)?;
+    let remaining = closure.len().saturating_sub(ordered.len());
+    Ok(SegmentPlan {
+        ordered,
+        remaining,
+        is_smallest_publishable_step,
+    })
+}
+
+fn assemble_segment_pack<B: StorageBackend + ?Sized + 'static>(
+    authority: &RepositoryAuthorityManager<B>,
+    context: &TransferSourceContext,
+    expectation: &RepositoryTransferExpectation,
+    source_ref: &RefName,
+    plan: &SegmentPlan,
+) -> Result<Assembled> {
+    // An empty closure means the two replicas already resolve the ref to the
+    // same change. The pack then publishes that head and carries nothing,
+    // which is what a caller that asked for a pack anyway should get back.
+    let segment_head = plan.ordered.last().copied().unwrap_or(context.source_head);
+    let store = TransferChangeStore::new(context.all_changes.values().cloned());
+    let segment_tree = store.resolve_tree_at(&segment_head).map_err(model)?;
+    let segment_tree_hash = compute_resolved_tree_hash(&segment_tree).map_err(model)?;
+    for hash in resolved_tree_body_identities(&segment_tree)? {
         let bytes = authority
             .load_source_blob(hash)
             .map_err(storage)?
@@ -475,14 +845,15 @@ pub fn build_repository_transfer_pack<B: StorageBackend + ?Sized + 'static>(
         verify_body(hash, &bytes)?;
     }
 
-    let mut changes = Vec::with_capacity(ordered_ids.len());
-    let mut trees = Vec::with_capacity(ordered_ids.len());
+    let mut changes = Vec::with_capacity(plan.ordered.len());
+    let mut trees = Vec::with_capacity(plan.ordered.len());
     let mut required_body_hashes = BTreeSet::new();
-    let included = ordered_ids.iter().copied().collect::<BTreeSet<_>>();
+    let included = plan.ordered.iter().copied().collect::<BTreeSet<_>>();
     let mut required_git_oids = BTreeSet::new();
-    for change_id in ordered_ids {
-        let change = all_changes
-            .get(&change_id)
+    for change_id in &plan.ordered {
+        let change = context
+            .all_changes
+            .get(change_id)
             .cloned()
             .ok_or_else(|| invalid(format!("source closure is missing change {change_id}")))?;
         validate_semantic_change_id(&change).map_err(model)?;
@@ -504,8 +875,7 @@ pub fn build_repository_transfer_pack<B: StorageBackend + ?Sized + 'static>(
         changes.push(change);
     }
 
-    let aliases = lease
-        .authority_metadata()
+    let aliases = context
         .aliases
         .iter()
         .filter(|alias| {
@@ -513,8 +883,7 @@ pub fn build_repository_transfer_pack<B: StorageBackend + ?Sized + 'static>(
         })
         .cloned()
         .collect::<Vec<_>>();
-    let external_objects = lease
-        .authority_metadata()
+    let external_objects = context
         .external_objects
         .iter()
         .filter(|record| required_git_oids.contains(&record.object.oid))
@@ -524,18 +893,24 @@ pub fn build_repository_transfer_pack<B: StorageBackend + ?Sized + 'static>(
         required_body_hashes.insert(record.body_hash);
     }
 
-    enforce_count("trees", trees.len(), expectation.limits.max_trees)?;
-    enforce_count(
-        "external objects",
-        external_objects.len(),
-        expectation.limits.max_external_objects,
-    )?;
-    enforce_count("aliases", aliases.len(), expectation.limits.max_aliases)?;
-    enforce_count(
-        "source bodies",
-        required_body_hashes.len(),
-        expectation.limits.max_bodies,
-    )?;
+    for (label, actual, limit) in [
+        ("trees", trees.len(), expectation.limits.max_trees),
+        (
+            "external objects",
+            external_objects.len(),
+            expectation.limits.max_external_objects,
+        ),
+        ("aliases", aliases.len(), expectation.limits.max_aliases),
+        (
+            "source bodies",
+            required_body_hashes.len(),
+            expectation.limits.max_bodies,
+        ),
+    ] {
+        if let Some(reason) = over_count(label, actual, limit) {
+            return Ok(Assembled::OverNegotiatedBound(reason));
+        }
+    }
 
     let mut total_bytes = 0_u64;
     let mut bodies = Vec::with_capacity(required_body_hashes.len());
@@ -547,8 +922,8 @@ pub fn build_repository_transfer_pack<B: StorageBackend + ?Sized + 'static>(
         let byte_len = u64::try_from(bytes.len())
             .map_err(|_| invalid("source body length does not fit u64"))?;
         if byte_len > expectation.limits.max_single_body_bytes {
-            return Err(invalid(format!(
-                "source body {hash} is {byte_len} bytes, over negotiated limit {}",
+            return Ok(Assembled::OverNegotiatedBound(format!(
+                "carries source body {hash} at {byte_len} bytes, over negotiated limit {}",
                 expectation.limits.max_single_body_bytes
             )));
         }
@@ -556,8 +931,8 @@ pub fn build_repository_transfer_pack<B: StorageBackend + ?Sized + 'static>(
             .checked_add(byte_len)
             .ok_or_else(|| invalid("source body byte total overflow"))?;
         if total_bytes > expectation.limits.max_decoded_body_bytes {
-            return Err(invalid(format!(
-                "source body closure is {total_bytes} bytes, over negotiated limit {}",
+            return Ok(Assembled::OverNegotiatedBound(format!(
+                "carries a {total_bytes} byte source body closure, over negotiated limit {}",
                 expectation.limits.max_decoded_body_bytes
             )));
         }
@@ -572,13 +947,14 @@ pub fn build_repository_transfer_pack<B: StorageBackend + ?Sized + 'static>(
         repository_id: expectation.repository_id.clone(),
         source_ref: source_ref.clone(),
         destination_ref: expectation.destination_ref.clone(),
-        source_head,
-        source_tree_hash,
+        source_head: segment_head,
+        transfer_target_head: context.source_head,
+        source_tree_hash: segment_tree_hash,
         expected_destination_target: expectation.destination_target.clone(),
         expected_destination_head: expectation.destination_head,
         expected_destination_roots: expectation.roots.clone(),
         expected_destination_default_ref: expectation.default_ref.clone(),
-        source_git_authority_hash,
+        source_git_authority_hash: context.source_git_authority_hash,
         expected_destination_git_authority_hash: expectation.git_authority_hash,
         required_features: required_features(),
         changes,
@@ -589,7 +965,23 @@ pub fn build_repository_transfer_pack<B: StorageBackend + ?Sized + 'static>(
     };
     pack.transfer_id = compute_transfer_id(&pack)?;
     validate_pack(&pack)?;
-    Ok(pack)
+    Ok(Assembled::Pack(Box::new(pack)))
+}
+
+/// Every immutable CAS body one resolved tree depends on.
+fn resolved_tree_body_identities(tree: &kin_model::ResolvedTree) -> Result<BTreeSet<Hash256>> {
+    let mut identities = BTreeSet::new();
+    for artifact in tree.artifacts() {
+        if let Some(hash) = artifact.entry.blob_identity() {
+            identities.insert(hash);
+        } else if !matches!(artifact.entry, TreeEntry::Gitlink { .. }) {
+            return Err(invalid(format!(
+                "source tree entry at {} has neither CAS body nor Gitlink identity",
+                artifact.path
+            )));
+        }
+    }
+    Ok(identities)
 }
 
 pub fn apply_repository_transfer_pack<B: StorageBackend + ?Sized + 'static>(
@@ -762,6 +1154,31 @@ pub fn validate_pack(pack: &RepositoryTransferPack) -> Result<()> {
             pack.source_head
         )));
     }
+    // The head a pack publishes is the last change it carries. A pack that
+    // carried changes past its own publish head would be describing a segment
+    // boundary that its ref mutation does not match, which is exactly the
+    // ambiguity continuation packs exist to remove.
+    if let Some(last) = pack.changes.last() {
+        if last.id != pack.source_head {
+            return Err(invalid(format!(
+                "pack publishes {} but its closure ends at {}",
+                pack.source_head, last.id
+            )));
+        }
+    }
+    // A pack that already carries the transfer target has nothing left to
+    // continue toward, so it must be publishing it.
+    if pack.transfer_target_head != pack.source_head
+        && pack
+            .changes
+            .iter()
+            .any(|change| change.id == pack.transfer_target_head)
+    {
+        return Err(invalid(format!(
+            "pack carries transfer target {} but publishes {} instead",
+            pack.transfer_target_head, pack.source_head
+        )));
+    }
 
     if pack.trees.len() != pack.changes.len() {
         return Err(invalid(
@@ -868,17 +1285,56 @@ fn validate_status(status: &RepositoryTransferStatus) -> Result<()> {
         return Err(invalid("unsupported repository transfer status protocol"));
     }
     status.roots.validate().map_err(model)?;
+    validate_limits(&status.limits)?;
     require_negotiated_features(&status.supported_features)
+}
+
+/// Refuse an envelope that cannot carry anything.
+///
+/// A continuation loop asks the peer how much it accepts and then sends that
+/// much until the gap closes. A peer advertising a zero-sized envelope would
+/// make every segment empty, so the loop has to refuse it here rather than
+/// discover it as a lack of progress after the first round trip.
+///
+/// The same numbers come back the other way on the export route, where they
+/// arrive in a request body rather than from a status this process built, so
+/// an exporter checks them too rather than trusting the sender to have asked
+/// for something it can answer.
+fn validate_limits(limits: &RepositoryTransferLimits) -> Result<()> {
+    for (label, value) in [
+        ("max_changes", u64::from(limits.max_changes)),
+        ("max_trees", u64::from(limits.max_trees)),
+        ("max_bodies", u64::from(limits.max_bodies)),
+        ("max_single_body_bytes", limits.max_single_body_bytes),
+        ("max_decoded_body_bytes", limits.max_decoded_body_bytes),
+    ] {
+        if value == 0 {
+            return Err(invalid(format!(
+                "the negotiated {label} is zero, which can never carry a transfer"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn validate_expectation(expectation: &RepositoryTransferExpectation) -> Result<()> {
     expectation.roots.validate().map_err(model)?;
+    validate_limits(&expectation.limits)?;
     if expectation.destination_head.is_some() != expectation.destination_target.is_some() {
         return Err(invalid(
             "destination target and resolved head must both be present or absent",
         ));
     }
     require_negotiated_features(&expectation.supported_features)
+}
+
+fn locally_bounded_expectation(
+    expectation: &RepositoryTransferExpectation,
+) -> Result<RepositoryTransferExpectation> {
+    validate_expectation(expectation)?;
+    let mut bounded = expectation.clone();
+    bounded.limits = bounded.limits.bounded_by_local();
+    Ok(bounded)
 }
 
 fn required_features() -> Vec<String> {
@@ -1190,6 +1646,15 @@ fn verify_body(expected: Hash256, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Describe a count past its negotiated limit, or `None` when it fits.
+///
+/// Separate from [`enforce_count`] because a segmented transfer answers this
+/// by building a smaller pack rather than by failing.
+fn over_count(label: &str, actual: usize, limit: u32) -> Option<String> {
+    let fits = u32::try_from(actual).is_ok_and(|actual| actual <= limit);
+    (!fits).then(|| format!("carries {actual} {label}, over negotiated limit {limit}"))
+}
+
 fn enforce_count(label: &str, actual: usize, limit: u32) -> Result<()> {
     if actual > limit as usize {
         return Err(invalid(format!(
@@ -1327,6 +1792,19 @@ mod tests {
             Arc::new(LocalFileBackend::new(storage_root)),
         )
         .unwrap()
+    }
+
+    fn limits_above_every_local_ceiling() -> RepositoryTransferLimits {
+        let local = RepositoryTransferLimits::default();
+        RepositoryTransferLimits {
+            max_changes: local.max_changes.checked_add(1).unwrap(),
+            max_trees: local.max_trees.checked_add(1).unwrap(),
+            max_bodies: local.max_bodies.checked_add(1).unwrap(),
+            max_external_objects: local.max_external_objects.checked_add(1).unwrap(),
+            max_aliases: local.max_aliases.checked_add(1).unwrap(),
+            max_decoded_body_bytes: local.max_decoded_body_bytes.checked_add(1).unwrap(),
+            max_single_body_bytes: local.max_single_body_bytes.checked_add(1).unwrap(),
+        }
     }
 
     fn native_change(
@@ -1759,9 +2237,9 @@ mod tests {
         let advertised =
             repository_transfer_status(&fixture.destination, &fixture.repository_id, &fixture.main)
                 .unwrap();
-        assert!(!advertised.push_apply_ready);
+        assert!(advertised.push_apply_ready);
         assert!(advertised.bounded_envelope_export_ready);
-        assert!(!advertised.pull_apply_ready);
+        assert!(advertised.pull_apply_ready);
         assert_eq!(fixture.pack.changes.len(), 1);
         assert_eq!(fixture.pack.trees.len(), 1);
         assert_eq!(
@@ -1837,6 +2315,45 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("different exact transaction"));
+    }
+
+    #[test]
+    fn status_advertisement_above_local_caps_is_bounded_before_negotiation() {
+        let fixture = fixture();
+        let mut advertised =
+            repository_transfer_status(&fixture.destination, &fixture.repository_id, &fixture.main)
+                .unwrap();
+        advertised.limits = limits_above_every_local_ceiling();
+
+        let expectation = RepositoryTransferExpectation::try_from(advertised).unwrap();
+
+        assert_eq!(
+            expectation.limits,
+            RepositoryTransferLimits::default(),
+            "a peer's larger ceilings must not enlarge this process's bounded envelope"
+        );
+    }
+
+    #[test]
+    fn export_expectation_above_local_caps_is_bounded_before_assembly() {
+        let fixture = fixture();
+        let status =
+            repository_transfer_status(&fixture.destination, &fixture.repository_id, &fixture.main)
+                .unwrap();
+        let mut expectation = RepositoryTransferExpectation::try_from(status).unwrap();
+        expectation.limits = limits_above_every_local_ceiling();
+
+        let bounded = locally_bounded_expectation(&expectation).unwrap();
+        assert_eq!(
+            bounded.limits,
+            RepositoryTransferLimits::default(),
+            "request-body ceilings must be bounded before an export is planned"
+        );
+
+        let segment =
+            build_repository_transfer_segment(&fixture.source, &fixture.main, &expectation)
+                .unwrap();
+        validate_pack(&segment.pack).expect("the locally bounded exporter must build a valid pack");
     }
 
     #[test]

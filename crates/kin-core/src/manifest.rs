@@ -39,6 +39,13 @@ pub struct KinManifest {
     ///
     /// This is deliberately distinct from `repo_id`: two clones share
     /// repository truth but must never share local workspace/session authority.
+    ///
+    /// Defaults to empty on load so a manifest written before this field
+    /// existed still parses; the layout version gate, not a serde error, is
+    /// what refuses a repository this build cannot serve. Consumers that need
+    /// workspace identity must validate it or mint one via
+    /// [`Self::ensure_workspace_identity`].
+    #[serde(default)]
     pub workspace_id: String,
 
     /// Timestamp of repository creation.
@@ -236,6 +243,22 @@ mod tests {
         let parsed: KinManifest = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.repo_id, manifest.repo_id);
         assert_eq!(parsed.workspace_id, manifest.workspace_id);
+    }
+
+    #[test]
+    fn legacy_manifest_without_workspace_id_parses() {
+        // The exact field set released 0.3.6 wrote. It must parse, so the
+        // layout gate can refuse in its own voice instead of a serde error.
+        let legacy = r#"{
+  "kin_version": "0.3.6",
+  "languages": [],
+  "adapters": [],
+  "repo_id": "54c48711-e6f0-4950-b00d-5585b59188fe",
+  "created_at": "2026-07-28T03:10:45.730166+00:00"
+}"#;
+        let parsed: KinManifest = serde_json::from_str(legacy).unwrap();
+        assert_eq!(parsed.repo_id, "54c48711-e6f0-4950-b00d-5585b59188fe");
+        assert!(parsed.workspace_id.is_empty());
     }
 
     #[test]
