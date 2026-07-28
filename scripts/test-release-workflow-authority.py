@@ -113,10 +113,21 @@ def main() -> None:
         "github.event.workflow_run.event == 'push'",
         "github.event.workflow_run.head_branch == 'main'",
         "github.event.workflow_run.conclusion == 'success'",
+        "repository_dispatch:",
+        "types: [release_tag]",
+        "github.event.action",
+        "github.event.repository.default_branch",
+        "github.event.client_payload.tag",
+        "github.event.client_payload.sha",
+        "EVENT_SHA: ${{ github.sha }}",
+        'EVENT_NAME" != repository_dispatch',
+        'EVENT_ACTION" != release_tag',
+        'DEFAULT_BRANCH" != main',
+        'REF" != "refs/heads/$DEFAULT_BRANCH"',
         "environment: release-tag",
         "node scripts/release-intent.mjs",
         "git merge-base --is-ancestor",
-        "manual release sha",
+        "break-glass release sha",
         "actions/workflows/release.yml/runs?per_page=100",
         '.status == "requested"',
         ".status == \"queued\"",
@@ -148,11 +159,13 @@ def main() -> None:
         "did not settle within 20 minutes",
         "actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1",
         "repositories: kin",
-        "manual release sha $SHA is no longer current origin/main HEAD",
+        "break-glass release sha $SHA is no longer current origin/main HEAD",
         'ref="refs/tags/$TAG"',
     ):
         require(release_tag, policy, "automatic App-mediated release tag admission")
     for forbidden in (
+        "workflow_dispatch:",
+        "${{ inputs.",
         "contents: write",
         "packages: write",
         "id-token: write",
@@ -213,28 +226,33 @@ def main() -> None:
     for policy in (
         "Create the protected `release-tag` Environment",
         "allows **only `main`**",
-        "only as `release-tag` Environment secrets",
-        "Remove any repository- or organization-level copies visible to `kin`",
-        "Both workflows that mint an App token declare that Environment",
+        "forbids",
+        "branch-selectable `workflow_dispatch`",
+        "last commit on the default branch",
+        "exists there",
+        "gh api --method POST repos/firelock-ai/kin/dispatches --input -",
+        '{event_type:"release_tag",client_payload:{tag:$tag,sha:$sha}}',
     ):
         require(
             release_bot_doc,
             policy,
-            "mandatory release App credential isolation runbook",
+            "default-branch-pinned release dispatch runbook",
         )
     if "Recommended hardening (optional)" in release_bot_doc:
         raise AssertionError(
             "release App Environment isolation must be mandatory, not optional"
         )
     for policy in (
-        "scoped only to the separate `release-tag`",
-        "No repository-",
-        "or organization-level duplicate of either secret",
+        "last commit on the default branch",
+        "exists there",
+        "forbids",
+        "branch-selectable `workflow_dispatch`",
+        "exact current-main payload",
     ):
         require(
             update_trust,
             policy,
-            "release App credential trust boundary",
+            "default-branch-pinned release App trust boundary",
         )
 
     for policy in (
@@ -1178,7 +1196,7 @@ def main() -> None:
                 )
 
         if "workflow_dispatch:" in content and re.search(
-            r"secrets\.(?:KIN_[A-Z0-9_]*TOKEN|NPM_TOKEN|WIF_PROVIDER|WIF_SERVICE_ACCOUNT)",
+            r"secrets\.(?:KIN_[A-Z0-9_]*(?:TOKEN|KEY|APP_ID)|NPM_TOKEN|WIF_PROVIDER|WIF_SERVICE_ACCOUNT)",
             content,
         ):
             raise AssertionError(

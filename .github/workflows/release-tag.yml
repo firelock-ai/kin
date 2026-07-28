@@ -15,7 +15,7 @@ name: Release Tag (bot-mediated)
 # Automatic reconciliation uses only trusted default-branch workflow code. It
 # finds the exact reviewed commit where an untagged coherent version first
 # appeared, waits for release-critical checks and the prior release lane, then
-# uses the same App-mediated tag write as the manual break-glass path.
+# uses the same App-mediated tag write as the break-glass dispatch path.
 
 on:
   schedule:
@@ -23,16 +23,11 @@ on:
   workflow_run:
     workflows: ["CI"]
     types: [completed]
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: "Release tag to create (must match ^v[0-9]+.[0-9]+.[0-9]+$, e.g. v0.3.0)"
-        required: true
-        type: string
-      sha:
-        description: "40-hex commit SHA that MUST equal current origin/main HEAD"
-        required: true
-        type: string
+  # Unlike workflow_dispatch, repository_dispatch always executes the workflow
+  # from the last commit on the default branch and only when this file exists
+  # there. The typed event preserves break glass without branch-selectable code.
+  repository_dispatch:
+    types: [release_tag]
 
 # The App installation token carries the only write capability (creating the
 # tag ref). The workflow's own GITHUB_TOKEN stays read-only: contents:read for
@@ -60,27 +55,42 @@ jobs:
       )
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    # The App private key exists only in this main-only Environment. This is
-    # the non-bypassable credential boundary for branch-selectable manual
-    # dispatches; the shell guard below is defense in depth.
+    # Keep App-token minting behind the main-only Environment as an additional
+    # credential boundary even though repository_dispatch already pins the
+    # executed workflow and ref to protected default-branch history.
     environment: release-tag
     steps:
-      - name: Guard manual authority
+      - name: Guard trigger authority
         env:
           EVENT_NAME: ${{ github.event_name }}
+          EVENT_ACTION: ${{ github.event.action }}
           ACTOR: ${{ github.actor }}
           REF: ${{ github.ref }}
+          EVENT_SHA: ${{ github.sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           ALLOWED_ACTORS: |
             troyjr4103
             kin-release-bot[bot]
         run: |
           set -euo pipefail
-          if [ "$EVENT_NAME" != workflow_dispatch ]; then
+          if [ "$EVENT_NAME" != repository_dispatch ]; then
             echo "trusted automatic trigger: $EVENT_NAME"
             exit 0
           fi
-          if [ "$REF" != "refs/heads/main" ]; then
-            echo "::error::release-tag must be dispatched from main (got '$REF')"
+          if [ "$EVENT_ACTION" != release_tag ]; then
+            echo "::error::unsupported repository dispatch action '$EVENT_ACTION'"
+            exit 1
+          fi
+          if [ "$DEFAULT_BRANCH" != main ]; then
+            echo "::error::release-tag requires main as the repository default branch (got '$DEFAULT_BRANCH')"
+            exit 1
+          fi
+          if [ "$REF" != "refs/heads/$DEFAULT_BRANCH" ]; then
+            echo "::error::release-tag dispatch must execute from the default branch (got '$REF')"
+            exit 1
+          fi
+          if ! printf '%s' "$EVENT_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::repository dispatch workflow sha '$EVENT_SHA' is not exact lowercase hex"
             exit 1
           fi
           authorized=0
@@ -92,7 +102,7 @@ jobs:
             echo "::error::actor '$ACTOR' is not authorized to mint release tags"
             exit 1
           fi
-          echo "authorized actor=$ACTOR ref=$REF"
+          echo "authorized actor=$ACTOR action=$EVENT_ACTION ref=$REF workflow_sha=$EVENT_SHA"
 
       - name: Checkout trusted release policy
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -105,8 +115,8 @@ jobs:
         id: resolve
         env:
           EVENT_NAME: ${{ github.event_name }}
-          RAW_TAG: ${{ inputs.tag }}
-          RAW_SHA: ${{ inputs.sha }}
+          RAW_TAG: ${{ github.event.client_payload.tag }}
+          RAW_SHA: ${{ github.event.client_payload.sha }}
           WORKFLOW_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
           set -euo pipefail
@@ -117,7 +127,7 @@ jobs:
           automatic=true
           tag=""
           case "$EVENT_NAME" in
-            workflow_dispatch)
+            repository_dispatch)
               automatic=false
               tag="$RAW_TAG"
               sha="$(printf '%s' "$RAW_SHA" | tr '[:upper:]' '[:lower:]')"
@@ -221,7 +231,7 @@ jobs:
               exit 1
             fi
           elif [ "$head_sha" != "$main_sha" ]; then
-            echo "::error::manual release sha $SHA is not current origin/main HEAD ($main_sha)"
+            echo "::error::break-glass release sha $SHA is not current origin/main HEAD ($main_sha)"
             exit 1
           fi
           echo "sha confirmed on reviewed origin/main history"
@@ -696,9 +706,9 @@ jobs:
           AUTOMATIC: ${{ steps.resolve.outputs.automatic }}
         run: |
           set -euo pipefail
-          # Close the manual-dispatch head-pin window immediately before the
+          # Close the break-glass dispatch head-pin window immediately before
           # only write. Automatic reconciliation intentionally admits the
-          # earliest coherent reviewed ancestor; manual break glass remains
+          # earliest coherent reviewed ancestor; break glass remains
           # exact-current-main.
           git fetch --no-tags origin main
           current_main="$(git rev-parse FETCH_HEAD)"
@@ -709,7 +719,7 @@ jobs:
               exit 1
             fi
           elif [ "$SHA" != "$current_main" ]; then
-            echo "::error::manual release sha $SHA is no longer current origin/main HEAD ($current_main)"
+            echo "::error::break-glass release sha $SHA is no longer current origin/main HEAD ($current_main)"
             exit 1
           fi
           echo "creating refs/tags/$TAG -> $SHA via kin-release-bot"

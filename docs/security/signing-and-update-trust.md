@@ -60,15 +60,19 @@ After the coalescing release PR passes protected-main checks, the repository-
 scoped release App automatically creates the authorized version tag at that
 exact reviewed commit. The tag policy, main-ancestor check, exact Trusted
 Publishing identity, and post-publication proofs then admit and verify every
-public release surface without a second manual approval. Manual tag dispatch is
-break glass, not the normal release path.
+public release surface without a second manual approval. A typed
+`repository_dispatch` is break glass, not the normal release path. GitHub runs
+that event from the last commit on the default branch and only when the workflow
+exists there; the caller cannot select a branch copy of the release controller.
 
-The App ID and private key are scoped only to the separate `release-tag`
+Both workflows that mint an App token declare the separate `release-tag`
 Environment, whose custom deployment policy admits `main` and no other branch.
-Both workflows that mint an App token declare that Environment. No repository-
-or organization-level duplicate of either secret may remain visible to `kin`;
-otherwise branch-selected manual workflow code could bypass an in-job ref guard
-and extract the raw org-wide App credential.
+That boundary is defense in depth: the tag controller forbids
+branch-selectable `workflow_dispatch`, accepts only the typed `release_tag`
+repository event, validates its authorized actor and exact current-main payload,
+and rechecks main immediately before writing the ref. Environment-scoped App
+credentials remain the narrowest posture, but repository-scoped credentials do
+not expose branch code under this default-branch-pinned trigger model.
 
 After GitHub stable/latest, public install proof, both npm packages, and GHCR
 version/latest all succeed, the release publishes deterministic
