@@ -168,43 +168,20 @@ pub fn classify_local_ancestry(
         return Ok(LocalAncestry::Same);
     }
 
-    // Count every change reachable from the local head but not from the
-    // advertised head. That count is the exact fast-forward distance, which is
-    // what a caller reports and what the pack will carry.
-    let mut behind = HashSet::new();
-    let mut stack = vec![advertised];
-    let mut advertised_seen = false;
-    while let Some(id) = stack.pop() {
-        if !behind.insert(id) {
-            continue;
-        }
-        let Some(change) = changes.get(&id) else {
-            // The advertised head itself is simply absent from local history.
-            // Any other missing parent is a broken local closure, not a peer
-            // disagreement, and must not be reported as "unreachable".
-            if id == advertised {
-                return Ok(LocalAncestry::Unreachable);
-            }
-            return Err(invalid(format!(
-                "exact local history is missing change {id} while classifying {advertised}"
-            )));
-        };
-        advertised_seen = true;
-        stack.extend(change.parents.iter().copied());
-    }
-    if !advertised_seen {
-        return Ok(LocalAncestry::Unreachable);
-    }
-
+    // Walk back from the local head and stop at the advertised change, which is
+    // exactly how the fast-forward closure is collected when the pack is built.
+    // Counting "reachable from the local head but not from the advertised head"
+    // instead would under-count a merge: a shared ancestor reachable from the
+    // local head by a path that never passes through the advertised change is
+    // carried by the pack, and a plan that omitted it would report a smaller
+    // transfer than the one that actually runs.
     let mut distance = 0usize;
     let mut visited = HashSet::new();
     let mut stack = vec![local_head];
     let mut reached_advertised = false;
     while let Some(id) = stack.pop() {
-        if behind.contains(&id) {
-            if id == advertised {
-                reached_advertised = true;
-            }
+        if id == advertised {
+            reached_advertised = true;
             continue;
         }
         if !visited.insert(id) {
@@ -219,8 +196,10 @@ pub fn classify_local_ancestry(
         stack.extend(change.parents.iter().copied());
     }
     if !reached_advertised {
-        // Local history contains the advertised change but not on any path from
-        // the local head: the two lines share ancestry and then part.
+        // The advertised change is on no path back from the local head, whether
+        // because this replica has never admitted it or because the two lines
+        // share ancestry and then part. Local history cannot tell those apart,
+        // and neither is a fast-forward.
         return Ok(LocalAncestry::Unreachable);
     }
     Ok(LocalAncestry::Ancestor { distance })
@@ -725,8 +704,39 @@ mod tests {
         operation: u128,
         message: &str,
     ) -> SemanticChangeId {
-        let change = native_change(previous.into_iter().collect(), message, Vec::new());
+        publish_with_parents(
+            manager,
+            repository_id,
+            ref_name,
+            previous.into_iter().collect(),
+            previous,
+            operation,
+            message,
+        )
+    }
+
+    /// Publish a change with arbitrary parents onto `ref_name`.
+    ///
+    /// `previous` is the ref's current target, which is what the publication
+    /// expects, and is independent of the change's parents once merges exist.
+    fn publish_with_parents(
+        manager: &TestManager,
+        repository_id: &RepositoryId,
+        ref_name: &RefName,
+        parents: Vec<SemanticChangeId>,
+        previous: Option<SemanticChangeId>,
+        operation: u128,
+        message: &str,
+    ) -> SemanticChangeId {
+        let change = native_change(parents, message, Vec::new());
         let lease = manager.read_authority();
+        // A repository adopts its default ref once. A second ref published
+        // later must not try to claim it again.
+        let adopts_default_ref = lease
+            .snapshot()
+            .repository_authority
+            .as_ref()
+            .is_some_and(|metadata| metadata.ref_state.default_ref.is_none());
         let transaction = RepositoryTransaction {
             schema_version: REPOSITORY_TRANSACTION_SCHEMA_VERSION,
             operation_id: OperationId::from_uuid(Uuid::from_u128(operation)),
@@ -750,7 +760,7 @@ mod tests {
                 new_target: Some(RefTarget::change(change.id)),
                 policy: RefUpdatePolicy::FastForwardOnly,
             }],
-            default_ref_mutation: previous.is_none().then_some(DefaultRefMutation {
+            default_ref_mutation: adopts_default_ref.then_some(DefaultRefMutation {
                 expected: DefaultRefExpectation::MustBeUnset,
                 new_default: Some(ref_name.clone()),
             }),
@@ -961,6 +971,134 @@ mod tests {
             1,
             "an up-to-date negotiation must not build or ship a pack at all"
         );
+    }
+
+    #[test]
+    fn the_planned_distance_is_exactly_what_the_pack_carries() {
+        // The plan counts the gap by walking local history; the pack counts it
+        // by building the fast-forward closure. Those are two separate walks,
+        // and a caller acts on the first while the second is what actually
+        // moves. If they can disagree, every reported change count is a guess.
+        let fixture = fixture();
+        let peer = LocalPeer::new(&fixture.destination);
+        push_to_remote(
+            &fixture.source,
+            &peer,
+            &fixture.repository_id,
+            &fixture.main,
+            &fixture.main,
+        )
+        .unwrap();
+
+        let advanced = publish(
+            &fixture.source,
+            &fixture.repository_id,
+            &fixture.main,
+            Some(fixture.source_head),
+            3,
+            "advance past the published head",
+        );
+
+        let planned = plan_push_to_remote(
+            &fixture.source,
+            &peer,
+            &fixture.repository_id,
+            &fixture.main,
+            &fixture.main,
+        )
+        .unwrap();
+        assert_eq!(
+            planned.plan,
+            RepositoryTransferPlan::FastForward {
+                source_head: advanced,
+                destination_head: Some(fixture.source_head),
+                change_count: Some(1),
+            }
+        );
+        assert_eq!(planned.max_changes_per_envelope, 512);
+        assert!(planned.fits_one_envelope);
+
+        let outcome = push_to_remote(
+            &fixture.source,
+            &peer,
+            &fixture.repository_id,
+            &fixture.main,
+            &fixture.main,
+        )
+        .unwrap();
+        assert_eq!(
+            outcome.plan, planned.plan,
+            "the executed push must move exactly what the plan reported"
+        );
+        assert_eq!(head_of(&fixture.destination, &fixture.main), Some(advanced));
+    }
+
+    #[test]
+    fn a_merge_plan_counts_every_change_the_pack_carries() {
+        // A shared ancestor can be reachable from the source head by a path that
+        // never passes through the destination head. The pack carries it, so a
+        // plan that counted "reachable from the source but not from the
+        // destination" would under-report the transfer. Both walks must agree.
+        let repository_id = RepositoryId::new(format!("merge-{}", Uuid::new_v4())).unwrap();
+        let source_dir = TempDir::new().unwrap();
+        let destination_dir = TempDir::new().unwrap();
+        let source = manager(&source_dir, &repository_id);
+        let destination = manager(&destination_dir, &repository_id);
+        let main = RefName::branch(b"main").unwrap();
+        let side = RefName::branch(b"side").unwrap();
+
+        let root = publish(&source, &repository_id, &main, None, 1, "root");
+        let published = publish(&source, &repository_id, &main, Some(root), 2, "mainline");
+        // The side line forks from the root, so the root is reachable from the
+        // merge without passing through the published mainline head.
+        let sibling = publish_with_parents(
+            &source,
+            &repository_id,
+            &side,
+            vec![root],
+            None,
+            3,
+            "side line",
+        );
+
+        // Bring the destination to the mainline head, then merge the side line.
+        let peer = LocalPeer::new(&destination);
+        push_to_remote(&source, &peer, &repository_id, &main, &main).unwrap();
+        assert_eq!(head_of(&destination, &main), Some(published));
+
+        let merged = publish_with_parents(
+            &source,
+            &repository_id,
+            &main,
+            vec![published, sibling],
+            Some(published),
+            4,
+            "merge the side line",
+        );
+
+        let planned = plan_push_to_remote(&source, &peer, &repository_id, &main, &main).unwrap();
+        let RepositoryTransferPlan::FastForward { change_count, .. } = planned.plan else {
+            panic!("a merge past the published head is a fast-forward");
+        };
+
+        let outcome = push_to_remote(&source, &peer, &repository_id, &main, &main).unwrap();
+        let RepositoryTransferPlan::FastForward {
+            change_count: packed,
+            ..
+        } = outcome.plan
+        else {
+            panic!("the executed push is the same fast-forward");
+        };
+        assert_eq!(
+            change_count, packed,
+            "the planned count must equal what the pack carried"
+        );
+        assert_eq!(
+            packed,
+            Some(3),
+            "the merge, the side change, and the root all reach the destination by this path"
+        );
+        assert_eq!(head_of(&destination, &main), Some(merged));
     }
 
     #[test]
