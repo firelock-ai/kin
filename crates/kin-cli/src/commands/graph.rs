@@ -590,10 +590,11 @@ struct InspectRelationRow {
 
 /// Build the deduplicated peer rows for one inspected entity.
 ///
-/// Two rows are the same observation when they share direction, kind, and peer
-/// node, so only one is rendered. The peer label carries the peer's kind because
-/// distinct entities can share a name and a file, and a label without the kind
-/// would render them as one row that the reader cannot tell apart.
+/// Two rows are the same observation when they share direction marker, kind,
+/// and peer node, so only one is rendered. The peer label carries the peer's
+/// kind because distinct entities can share a name and a file, and a label
+/// without the kind would render them as one row that the reader cannot tell
+/// apart.
 fn inspect_relation_rows(
     graph: &kin_db::InMemoryGraph,
     entity: &Entity,
@@ -602,9 +603,15 @@ fn inspect_relation_rows(
     let mut seen = HashSet::new();
 
     for rel in graph.get_all_relations_for_entity(&entity.id)? {
-        let incoming = matches!(rel.dst, kin_model::GraphNodeId::Entity(id) if id == entity.id);
-        let peer = if incoming { rel.src } else { rel.dst };
-        if !seen.insert((incoming, rel.kind, peer)) {
+        let src_is_self = matches!(rel.src, kin_model::GraphNodeId::Entity(id) if id == entity.id);
+        let dst_is_self = matches!(rel.dst, kin_model::GraphNodeId::Entity(id) if id == entity.id);
+        let (direction, peer) = match (src_is_self, dst_is_self) {
+            (true, true) => ("<->", rel.src),
+            (false, true) => ("<-", rel.src),
+            (true, false) => ("->", rel.dst),
+            (false, false) => continue,
+        };
+        if !seen.insert((direction, rel.kind, peer)) {
             continue;
         }
 
@@ -624,7 +631,7 @@ fn inspect_relation_rows(
         };
 
         rows.push(InspectRelationRow {
-            direction: if incoming { "<-" } else { "->" },
+            direction,
             kind: rel.kind,
             peer_label,
         });
@@ -1220,6 +1227,24 @@ mod tests {
             .lines
             .iter()
             .any(|line| line.starts_with("    -> Calls format_row ")));
+    }
+
+    #[test]
+    fn graph_inspect_renders_self_relation_bidirectionally() {
+        let graph = kin_db::InMemoryGraph::new();
+        let subject = test_entity("render");
+        graph.upsert_entity(&subject).unwrap();
+        graph
+            .upsert_relation(&test_relation(RelationKind::Calls, subject.id, subject.id))
+            .unwrap();
+
+        let response = build_graph_inspect_response(&graph, "render").unwrap();
+
+        assert!(response.lines.iter().any(|line| line == "  Relations (1):"));
+        assert!(response
+            .lines
+            .iter()
+            .any(|line| line.starts_with("    <-> Calls render ")));
     }
 
     #[test]

@@ -3094,15 +3094,7 @@ fn is_projection_artifact_path(path: &str) -> bool {
 }
 
 /// Derive a deterministic RelationId from the (src, dst, kind) triple.
-///
-/// Every producer of an entity-to-entity edge must mint through this function.
-/// A second derivation of the same triple yields a different key, and the graph
-/// then stores one logical edge twice.
-pub(crate) fn stable_relation_id(
-    src: &EntityId,
-    dst: &EntityId,
-    kind: &RelationKind,
-) -> RelationId {
+fn stable_relation_id(src: &EntityId, dst: &EntityId, kind: &RelationKind) -> RelationId {
     stable_relation_node_id(&GraphNodeId::Entity(*src), &GraphNodeId::Entity(*dst), kind)
 }
 
