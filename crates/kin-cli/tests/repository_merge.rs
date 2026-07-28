@@ -4,8 +4,9 @@
 //! End-to-end proof for daemon-owned repository-v6 semantic merges.
 
 use kin_db::{LocalFileBackend, RepositoryAuthorityManager};
-use kin_model::{RefName, RefTarget, RepositoryId, SemanticChangeId};
+use kin_model::{EntityId, RefName, RefTarget, RepositoryId, SemanticChangeId};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
@@ -128,6 +129,26 @@ fn workspace_is_dirty(layout: &kin_core::KinLayout) -> bool {
 
 fn json_id<T: serde::Serialize>(id: &T) -> Value {
     serde_json::to_value(id).expect("serialize a repository identity")
+}
+
+/// Identify the entities a resolved state carries, without the derived
+/// per-entity provenance that replay owns and is free to restate.
+fn entity_identities(
+    state: &kin_model::graph::ResolvedGraphState,
+) -> BTreeMap<EntityId, (String, Option<String>)> {
+    state
+        .entities
+        .iter()
+        .map(|(id, entity)| {
+            (
+                *id,
+                (
+                    entity.name.clone(),
+                    entity.span.as_ref().map(|span| span.file.to_string()),
+                ),
+            )
+        })
+        .collect()
 }
 
 fn merge_report(output: &std::process::Output) -> Value {
@@ -254,11 +275,19 @@ fn merge_composes_disjoint_semantic_and_tree_work_into_one_merge_change() {
     // The graph replays the merge without a stale-payload refusal, and the
     // replayed state is the composed one.
     let graph = kin_db::InMemoryGraph::from_snapshot(snapshot).expect("replay merged history");
-    let resolved = {
+    let (resolved, ours_state, theirs_state) = {
         use kin_model::ChangeStore;
-        graph
-            .resolve_graph_at(&merge_change)
-            .expect("resolve the merged graph state")
+        (
+            graph
+                .resolve_graph_at(&merge_change)
+                .expect("resolve the merged graph state"),
+            graph
+                .resolve_graph_at(&ours_before)
+                .expect("resolve the active branch parent"),
+            graph
+                .resolve_graph_at(&theirs)
+                .expect("resolve the source branch parent"),
+        )
     };
     for path in [
         "shared.txt",
@@ -275,6 +304,27 @@ fn merge_composes_disjoint_semantic_and_tree_work_into_one_merge_change() {
             "merged tree keeps {path}"
         );
     }
+
+    // Entities, not only tree paths. Every guard inside the merge compares the
+    // replayed state against itself, so a file-presence check alone stays green
+    // on a replay that dropped or invented the semantics a parent published.
+    let ours_entities = entity_identities(&ours_state);
+    let theirs_entities = entity_identities(&theirs_state);
+    let merged_entities = entity_identities(&resolved);
+    let mut composed = ours_entities.clone();
+    composed.extend(theirs_entities.clone());
+    assert_eq!(
+        merged_entities, composed,
+        "the merged head carries exactly the entities of both parents"
+    );
+    assert!(
+        merged_entities.len() > ours_entities.len()
+            && merged_entities.len() > theirs_entities.len(),
+        "each parent contributed entities the other lacked: merged={} ours={} theirs={}",
+        merged_entities.len(),
+        ours_entities.len(),
+        theirs_entities.len()
+    );
 }
 
 /// The source branch is already an ancestor: nothing to publish.
@@ -352,7 +402,7 @@ fn merge_of_a_descendant_branch_fast_forwards_the_active_branch() {
 /// durable merge transaction to park the conflict in, so the whole merge is
 /// refused and nothing is published.
 #[test]
-fn conflicting_merge_is_refused_atomically_and_names_every_conflict() {
+fn conflicting_merge_is_refused_atomically_and_names_what_conflicted() {
     let root = tempdir().expect("temp root");
     let home = root.path().join("home");
     let repo = root.path().join("repo");
@@ -389,9 +439,16 @@ fn conflicting_merge_is_refused_atomically_and_names_every_conflict() {
         stderr.contains("unresolved conflict"),
         "the refusal names the conflict set: {stderr}"
     );
+    // Each dimension is asserted on its own. An `artifact || entity` check
+    // would stay green with the entity detector deleted, because divergent
+    // bytes report an artifact conflict for the same file either way.
     assert!(
-        stderr.contains("artifact") || stderr.contains("entity"),
-        "the refusal names what conflicted: {stderr}"
+        stderr.contains("artifact shared.txt"),
+        "the refusal names the conflicting artifact: {stderr}"
+    );
+    assert!(
+        stderr.contains("entity "),
+        "the refusal names the conflicting entity: {stderr}"
     );
 
     // Nothing moved: refs, authority generation, and the working copy.
@@ -404,6 +461,66 @@ fn conflicting_merge_is_refused_atomically_and_names_every_conflict() {
         b"pub fn base(value: u64) {}\n"
     );
 
+    assert!(
+        !workspace_is_dirty(&layout),
+        "a refused merge leaves no partial workspace state"
+    );
+}
+
+/// One branch moves an artifact while the other edits it. Composition decides
+/// each identity by whole value and an artifact's path is part of that value,
+/// so this is a conflict rather than a move carrying an edit along with it.
+#[test]
+fn merge_of_a_move_against_an_edit_is_refused_atomically() {
+    let root = tempdir().expect("temp root");
+    let home = root.path().join("home");
+    let repo = root.path().join("repo");
+    fs::create_dir_all(&home).expect("create home");
+    initialize_git_repo(&repo);
+
+    run_git(&repo, &["switch", "-c", "feature"]);
+    run_git(&repo, &["mv", "src/lib.rs", "src/renamed.rs"]);
+    run_git(&repo, &["commit", "-m", "move source on feature"]);
+
+    run_git(&repo, &["switch", "main"]);
+    fs::write(repo.join("src/lib.rs"), b"pub fn base(value: u64) {}\n")
+        .expect("edit source on main");
+    run_git(&repo, &["add", "--all"]);
+    run_git(&repo, &["commit", "-m", "main work"]);
+
+    let layout = initialize_kin_repo(&repo, &home);
+    let main_before = branch_change(&layout, "main");
+    let feature_before = branch_change(&layout, "feature");
+    let generation_before = authority_generation(&layout);
+
+    let merged = run_kin(&repo, &home, &["merge", "feature"]);
+    assert!(
+        !merged.status.success(),
+        "a move against an edit must fail closed: stdout={}",
+        String::from_utf8_lossy(&merged.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&merged.stderr);
+    assert!(
+        stderr.contains("unresolved conflict"),
+        "the refusal names the conflict set: {stderr}"
+    );
+    assert!(
+        stderr.contains("src/lib.rs"),
+        "the refusal names the artifact both branches moved apart: {stderr}"
+    );
+
+    // Nothing moved: refs, authority generation, and the working copy.
+    assert_eq!(branch_change(&layout, "main"), main_before);
+    assert_eq!(branch_change(&layout, "feature"), feature_before);
+    assert_eq!(authority_generation(&layout), generation_before);
+    assert_eq!(
+        fs::read(repo.join("src/lib.rs")).unwrap(),
+        b"pub fn base(value: u64) {}\n"
+    );
+    assert!(
+        !repo.join("src/renamed.rs").exists(),
+        "a refused merge does not materialize the source branch's move"
+    );
     assert!(
         !workspace_is_dirty(&layout),
         "a refused merge leaves no partial workspace state"
