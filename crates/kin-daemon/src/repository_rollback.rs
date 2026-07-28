@@ -77,7 +77,15 @@ pub(crate) fn execute(
     let previous_graph_root = hex::encode(state.graph.compute_root_hash());
     let authority =
         ActiveLocalRepositoryAuthority::open_bound(state).map_err(rollback_bind_refusal)?;
-    let execution = plan_and_commit(state, &authority, request).map_err(classify_rollback_error)?;
+    let execution =
+        match plan_and_commit(state, &authority, request).map_err(classify_rollback_error)? {
+            RollbackOutcome::Committed(execution) => execution,
+            RollbackOutcome::AlreadyCommitted(response) => {
+                drop(persistence);
+                drop(graph_mutation);
+                return Ok(response);
+            }
+        };
 
     let finalization = state
         .finalize_local_repository_commit(
@@ -122,15 +130,45 @@ struct RollbackExecution {
     target_tree: ResolvedTree,
 }
 
+enum RollbackOutcome {
+    Committed(Box<RollbackExecution>),
+    /// This operation id already published its rollback. Nothing is committed
+    /// and nothing is materialized; the already-published result is reported.
+    AlreadyCommitted(RollbackResponse),
+}
+
 fn plan_and_commit(
     state: &DaemonState,
     authority: &ActiveLocalRepositoryAuthority,
     request: &RollbackRequest,
-) -> Result<RollbackExecution> {
+) -> Result<RollbackOutcome> {
     let target_change_id = parse_change_id(&request.change_id)?;
     let lease = authority.manager.read_authority();
     let roots = lease.roots().clone();
     let metadata = lease.metadata();
+    // The client retries a lost response with the same operation id, so an
+    // operation that already published must be reported as what it is rather
+    // than replanned. Replanning would compare the restored head against the
+    // same target, find nothing left to restore, and report a false failure for
+    // an operation that succeeded.
+    if let Some(receipt) = metadata
+        .receipts
+        .iter()
+        .find(|receipt| receipt.operation_id == request.operation_id)
+        .cloned()
+    {
+        let roots = roots.clone();
+        drop(lease);
+        return report_already_committed(
+            state,
+            authority,
+            request,
+            &roots,
+            receipt,
+            target_change_id,
+        )
+        .map(RollbackOutcome::AlreadyCommitted);
+    }
     let workspace = metadata
         .workspaces
         .iter()
@@ -400,7 +438,7 @@ fn plan_and_commit(
         projected_entries,
         idempotent: matches!(receipt.outcome, RepositoryCommitOutcome::IdempotentReplay),
     };
-    Ok(RollbackExecution {
+    Ok(RollbackOutcome::Committed(Box::new(RollbackExecution {
         response: RollbackResponse {
             lines: kin_cli::commands::rollback::render_lines(&report),
             mutated: matches!(receipt.outcome, RepositoryCommitOutcome::Committed),
@@ -411,6 +449,126 @@ fn plan_and_commit(
         daemon_delta,
         previous_tree: workspace.tree,
         target_tree,
+    })))
+}
+
+/// Report an operation this repository already published.
+///
+/// This path commits nothing and materializes nothing. It proves the retained
+/// receipt describes this request, that authority has not moved past it, and
+/// that the derived projection still matches the workspace the receipt
+/// published. Anything else is a refusal: a stale or foreign receipt must never
+/// be reported as this caller's success.
+fn report_already_committed(
+    state: &DaemonState,
+    authority: &ActiveLocalRepositoryAuthority,
+    request: &RollbackRequest,
+    current_roots: &kin_model::RootBundle,
+    receipt: kin_model::RepositoryCommitReceipt,
+    target_change_id: SemanticChangeId,
+) -> Result<RollbackResponse> {
+    receipt
+        .validate()
+        .context("validate the persisted rollback receipt")?;
+    if current_roots != &receipt.roots_after {
+        return Err(conflict(format!(
+            "rollback operation {} committed at generation {}, but authority is now at generation \
+             {}; reopen against current authority before retrying",
+            request.operation_id, receipt.generation, current_roots.generation
+        )));
+    }
+    let [mutation] = receipt.operation.ref_mutations.as_slice() else {
+        return Err(conflict(format!(
+            "operation {} was already committed for a different request",
+            request.operation_id
+        )));
+    };
+    let Some(RefTarget::Change {
+        change_id: inverse_change_id,
+    }) = mutation.new_target.clone()
+    else {
+        return Err(conflict(format!(
+            "operation {} was already committed for a different request",
+            request.operation_id
+        )));
+    };
+    let workspace_mutation = receipt
+        .operation
+        .workspace_mutation
+        .as_ref()
+        .ok_or_else(|| {
+            conflict(format!(
+                "operation {} was already committed for a different request",
+                request.operation_id
+            ))
+        })?;
+    let previous_change_id = match &mutation.expected {
+        RefExpectation::MustEqual {
+            target: RefTarget::Change { change_id },
+        } => *change_id,
+        _ => {
+            return Err(conflict(format!(
+                "operation {} was already committed for a different request",
+                request.operation_id
+            )))
+        }
+    };
+
+    let lease = authority.manager.read_authority();
+    let workspace = lease
+        .metadata()
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.workspace_id == authority.workspace_id)
+        .cloned()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "repository {} has no workspace {} in repository-v6 authority",
+                authority.repository_id,
+                authority.workspace_id
+            )
+        })?;
+    drop(lease);
+    if workspace.generation != workspace_mutation.new_generation
+        || workspace.tree_hash != workspace_mutation.new_tree_hash
+    {
+        return Err(conflict(format!(
+            "rollback operation {} no longer matches current workspace authority",
+            request.operation_id
+        )));
+    }
+
+    // The transition published its projection in the same operation, so there
+    // is nothing to recover; verifying it proves that, and refuses instead of
+    // reporting success over a projection that no longer matches.
+    let (projected_entries, authority_freeze) = kin_core::verify_repository_workspace_projection(
+        state.layout.working_dir(),
+        &workspace.tree,
+        &authority.manager,
+    )
+    .context("verify the projection an already-published rollback materialized")?;
+    drop(authority_freeze);
+
+    let report = RollbackReport {
+        schema: ROLLBACK_SCHEMA.to_string(),
+        authority: "repository-v6".to_string(),
+        repository_id: authority.repository_id.clone(),
+        branch: mutation.name.clone(),
+        target_change_id: target_change_id.to_string(),
+        previous_change_id: previous_change_id.to_string(),
+        inverse_change_id: inverse_change_id.to_string(),
+        authority_generation: receipt.generation,
+        workspace_generation: workspace.generation,
+        entity_deltas: workspace_mutation.semantic_delta.entity_deltas().len(),
+        relation_deltas: workspace_mutation.semantic_delta.relation_deltas().len(),
+        tree_deltas: workspace_mutation.tree_deltas.len(),
+        projected_entries,
+        idempotent: true,
+    };
+    Ok(RollbackResponse {
+        lines: kin_cli::commands::rollback::render_lines(&report),
+        mutated: false,
+        report: Some(report),
     })
 }
 
