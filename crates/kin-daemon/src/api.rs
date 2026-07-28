@@ -880,6 +880,10 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route("/repos/{repo_id}/refs", get(repo_refs))
         .route("/repos/{repo_id}/history", get(repo_history))
         .route(
+            "/repos/{repo_id}/transfer/advertise",
+            get(repo_transfer_advertise),
+        )
+        .route(
             "/repos/{repo_id}/transfer/status",
             post(repo_transfer_status),
         )
@@ -6423,6 +6427,23 @@ fn repository_transfer_error(
         RepositoryTransferError::Storage(_) => StatusCode::FAILED_DEPENDENCY,
     };
     (status, error.to_string())
+}
+
+/// GET /repos/{repo_id}/transfer/advertise — every published ref and the
+/// default ref a fresh replica adopts.
+///
+/// This is where a negotiation starts. A replica that has no ref of its own yet
+/// cannot ask the per-ref transfer status about anything, so discovery has to
+/// be answerable without naming a ref first.
+async fn repo_transfer_advertise(
+    Path(repo_id): Path<String>,
+    State(state): State<Arc<DaemonState>>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let (repository_id, authority) = repository_transfer_authority(&state, &repo_id)?;
+    let advertisement =
+        kin_remote::repository_transfer::repository_ref_advertisement(&authority, &repository_id)
+            .map_err(repository_transfer_error)?;
+    Ok(Json(advertisement))
 }
 
 /// POST /repos/{repo_id}/transfer/status — exact destination lease and
