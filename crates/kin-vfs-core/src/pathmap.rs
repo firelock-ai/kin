@@ -460,4 +460,42 @@ mod tests {
         assert_eq!(join_at_path(b"/cwd", b""), b"/cwd/");
         assert_eq!(join_at_path(b"/cwd", b"raw-\xff"), b"/cwd/raw-\xff");
     }
+
+    #[test]
+    fn cwd_joined_relative_path_maps_to_its_absolute_twin() {
+        // A relative path read from inside the workspace must reach exactly the
+        // graph key its absolute spelling does; anything else lets the same file
+        // be answered by two different authorities.
+        let root: &[u8] = b"/ws/project";
+        for (cwd, relative, absolute) in [
+            (
+                &b"/ws/project"[..],
+                &b"src/main.rs"[..],
+                &b"/ws/project/src/main.rs"[..],
+            ),
+            (b"/ws/project/src", b"main.rs", b"/ws/project/src/main.rs"),
+            (b"/ws/project/src", b"./main.rs", b"/ws/project/src/main.rs"),
+            (
+                b"/ws/project",
+                b"logs/x-\xff\xfe.log",
+                b"/ws/project/logs/x-\xff\xfe.log",
+            ),
+        ] {
+            assert_eq!(
+                workspace_graph_key(&join_at_path(cwd, relative), root),
+                workspace_graph_key(absolute, root)
+            );
+        }
+
+        // Joining does not widen the boundary: a relative path from a cwd
+        // outside the workspace stays outside it.
+        assert_eq!(
+            workspace_graph_key(&join_at_path(b"/etc", b"passwd"), root),
+            Err(WorkspacePathError::OutsideRoot)
+        );
+        assert_eq!(
+            workspace_graph_key(&join_at_path(b"/ws/project2", b"file.rs"), root),
+            Err(WorkspacePathError::OutsideRoot)
+        );
+    }
 }
