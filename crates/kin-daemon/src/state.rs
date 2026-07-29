@@ -7221,3 +7221,182 @@ mod tests {
         assert!(load_persisted_mcp_transactions(&layout).is_empty());
     }
 }
+
+#[cfg(test)]
+mod ingest_cas_tests {
+    use super::*;
+    use kin_model::{ArtifactId, RepoPath, ResolvedArtifact, ResolvedTree, TreeEntry};
+
+    /// Publish one blob as the repository's exact workspace tree and return its
+    /// content address. The published body lives in repository authority, which
+    /// is the only source an ingest-CAS hydration is allowed to read from.
+    fn publish_single_blob_workspace(layout: &KinLayout, body: &[u8]) -> Hash256 {
+        let blobs = BlobStore::new(layout.ingest_cas_dir()).unwrap();
+        let hash = Hash256::from_bytes(blobs.write(body).unwrap().0);
+        let desired = ResolvedTree::from_artifacts(vec![ResolvedArtifact::new(
+            ArtifactId::new(),
+            RepoPath::from_utf8("service.yaml").unwrap(),
+            TreeEntry::blob(hash, false),
+        )])
+        .unwrap();
+        let context =
+            crate::local_repository_authority::LocalRepositoryAuthorityContext::from_layout_for_test(
+                layout,
+            )
+            .unwrap();
+        let admitted = crate::repository_commit::admitted_workspace_tree_for_test(
+            layout.working_dir(),
+            context.open().unwrap().read_authority().roots().clone(),
+            ResolvedTree::default(),
+            desired,
+        );
+        crate::repository_commit::publish_workspace_tree(
+            &blobs,
+            &context,
+            &admitted,
+            kin_model::OperationId::new(),
+            kin_model::AuthorId::new("ingest-cas-hydration-test"),
+        )
+        .unwrap()
+        .expect("exact workspace admission must advance authority");
+        hash
+    }
+
+    #[test]
+    fn backend_hydration_installs_every_body_the_graph_names() {
+        // "Rehydrated on every daemon open" used to be true of the local path
+        // only. The backend path reads the same derived store through
+        // `rebuild_projection`, keyed on exactly this resolved tree, and used to
+        // open against whatever happened to be on local disk.
+        let repo_dir = tempfile::tempdir().unwrap();
+        let body = b"services:\n  api:\n    image: kin:dev\n";
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let hash = publish_single_blob_workspace(&init.layout, body);
+
+        let ingest_cas = init.layout.ingest_cas_dir();
+        let kindb_dir = init.layout.kindb_dir();
+        let repo_id = kin_core::manifest::resolve_repo_id(&init.layout, None).unwrap();
+        // Take the graph a hosted snapshot of this repository would carry, then
+        // release every local authority handle before hydrating through the
+        // backend seam.
+        let graph = {
+            let local = DaemonState::open(init.layout).expect("local open");
+            Arc::clone(&local.graph)
+        };
+        assert!(
+            !graph.resolved_tree().is_empty(),
+            "the fixture must carry the tree the projection would read"
+        );
+
+        std::fs::remove_dir_all(&ingest_cas).unwrap();
+        let blobs = BlobStore::new(ingest_cas).unwrap();
+        let backend: Arc<dyn StorageBackend> = Arc::new(LocalFileBackend::new(kindb_dir));
+
+        let hydrated =
+            DaemonState::hydrate_backend_ingest_cas(&repo_id, &backend, graph.as_ref(), &blobs)
+                .expect("repository authority must supply every body the graph names");
+
+        assert_eq!(hydrated, 1);
+        assert_eq!(
+            blobs.read(&hash).unwrap(),
+            body,
+            "hydration must install the exact repository-authority body"
+        );
+    }
+
+    #[test]
+    fn the_local_open_path_hydrates_the_ingest_cas() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let body = b"local authority body\n";
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let hash = publish_single_blob_workspace(&init.layout, body);
+        std::fs::remove_dir_all(init.layout.ingest_cas_dir()).unwrap();
+
+        let state = DaemonState::open(init.layout).expect("local open");
+
+        assert_eq!(state.blobs.read(&hash).unwrap(), body);
+        assert!(state.ingest_cas_hydration_gap.is_none());
+    }
+
+    #[test]
+    fn an_empty_hosted_graph_needs_no_repository_authority() {
+        // A graph with no resolved artifacts references no source bodies, so
+        // there is nothing to hydrate and no authority to demand. This is the
+        // ordinary first-boot hosted case and must not be reported as a gap.
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let kindb_dir = init.layout.kindb_dir();
+        let repo_id = kin_core::manifest::resolve_repo_id(&init.layout, None).unwrap();
+
+        let state = DaemonState::open_with_backend(
+            init.layout,
+            Box::new(LocalFileBackend::new(kindb_dir)),
+            &repo_id,
+            None,
+        )
+        .expect("backend open");
+
+        assert!(
+            state.ingest_cas_hydration_gap.is_none(),
+            "an empty tree is not an authority gap: {:?}",
+            state.ingest_cas_hydration_gap
+        );
+    }
+
+    #[test]
+    fn a_recorded_hydration_gap_is_named_in_projection_errors() {
+        // A hosted graph whose backend carries no repository authority still
+        // serves every query that needs no source body, so an un-hydratable
+        // store is recorded rather than fatal. The reads that DO need one must
+        // then report the authority gap instead of a bare missing blob, which
+        // reads as graph corruption.
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let mut state = DaemonState::open(init.layout).expect("local open");
+        state.ingest_cas_hydration_gap = Some("hosted backend carries no authority".to_string());
+
+        let reported = state
+            .attribute_ingest_cas_gap(exact_source_storage_error("cannot load graph-owned blob"))
+            .to_string();
+        assert!(
+            reported.contains("never hydrated on this open path")
+                && reported.contains("hosted backend carries no authority"),
+            "the error must name the hydration gap: {reported}"
+        );
+    }
+
+    #[test]
+    fn a_hydrated_state_reports_blob_errors_unchanged() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let state = DaemonState::open(init.layout).expect("local open");
+
+        let reported = state
+            .attribute_ingest_cas_gap(exact_source_storage_error("cannot load graph-owned blob"))
+            .to_string();
+        assert!(
+            !reported.contains("never hydrated"),
+            "a hydrated store must not blame a gap it does not have: {reported}"
+        );
+    }
+
+    #[test]
+    fn syncing_the_blob_store_commits_pending_barriers() {
+        // The store defers each blob's directory barrier and commits it on an
+        // explicit sync, on Drop, or on a self-drain. The daemon exits through
+        // `process::exit`, so this is the only commit point it can actually
+        // reach on a clean shutdown.
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let state = DaemonState::open(init.layout).expect("local open");
+
+        let hash = state.blobs.write(b"pending rename\n").unwrap();
+        state
+            .sync_blob_store()
+            .expect("the shutdown commit point must succeed on a healthy store");
+        assert_eq!(state.blobs.read(&hash).unwrap(), b"pending rename\n");
+        state
+            .sync_blob_store()
+            .expect("a second barrier with nothing pending is a no-op, not an error");
+    }
+}

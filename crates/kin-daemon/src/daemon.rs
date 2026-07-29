@@ -385,20 +385,20 @@ fn classify_control_plane(state: &DaemonState) -> ControlPlane {
     if !root.exists() {
         return ControlPlane::RootGone;
     }
+    // Yielding is gated on proof, not on a PID. This daemon holds the
+    // repository singleton for its whole lifetime, so no legitimate successor
+    // can exist; a foreign endpoint that cannot prove a live owner is debris,
+    // and treating debris as an eviction notice is what killed the incumbent.
+    if let Some(pid) = crate::lifecycle::proven_live_other_endpoint_owner(root) {
+        return ControlPlane::Superseded { pid };
+    }
     match crate::lifecycle::endpoint_ownership(root) {
-        crate::lifecycle::EndpointOwnership::CurrentProcess => {
-            if crate::lifecycle::read_port_file(root).is_some() {
-                ControlPlane::Ours
-            } else {
-                ControlPlane::EndpointLost
-            }
+        crate::lifecycle::EndpointOwnership::CurrentProcess
+            if crate::lifecycle::read_port_file(root).is_some() =>
+        {
+            ControlPlane::Ours
         }
-        crate::lifecycle::EndpointOwnership::OtherProcess { pid, live: true } => {
-            ControlPlane::Superseded { pid }
-        }
-        crate::lifecycle::EndpointOwnership::OtherProcess { .. }
-        | crate::lifecycle::EndpointOwnership::Unattributed
-        | crate::lifecycle::EndpointOwnership::Absent => ControlPlane::EndpointLost,
+        _ => ControlPlane::EndpointLost,
     }
 }
 
@@ -2341,7 +2341,7 @@ mod tests {
     use super::{
         drain_pending_flush, format_singleton_contention, next_embed_error_backoff,
         parse_duration_secs, parse_owner_watch_pid, should_enable_lsp_enrichment, should_flush_now,
-        shutdown_signalled, watched_process_is_alive, DaemonConfig, DaemonState,
+        shutdown_signalled, watched_process_is_alive, ControlPlane, DaemonConfig, DaemonState,
         DEFAULT_RUNTIME_SHUTDOWN_GRACE, DEFAULT_SHUTDOWN_ESCALATION_GRACE,
     };
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -2393,6 +2393,127 @@ mod tests {
                 && !repo_b_kin_root.join("daemon.port").exists(),
             "authority mismatch must fail before endpoint publication"
         );
+    }
+
+    // ── Control-plane classification ──────────────────────────────────────
+    //
+    // A healthy daemon used to read "my endpoint files are gone" as "the
+    // repository is gone" and shut itself down, which is how a refused second
+    // start killed the incumbent it lost to. The two states that genuinely end
+    // a daemon are distinguishable from the one that is repairable.
+
+    #[tokio::test]
+    async fn a_published_endpoint_reads_as_this_daemons_own() {
+        let repo = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let kin_root = initialized.layout.root().to_path_buf();
+        let state = DaemonState::open(initialized.layout).unwrap();
+        crate::lifecycle::publish_daemon_endpoint(&kin_root, 51234).unwrap();
+
+        assert_eq!(super::classify_control_plane(&state), ControlPlane::Ours);
+    }
+
+    #[tokio::test]
+    async fn a_deleted_endpoint_is_repairable_rather_than_fatal() {
+        let repo = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let kin_root = initialized.layout.root().to_path_buf();
+        let state = DaemonState::open(initialized.layout).unwrap();
+        crate::lifecycle::publish_daemon_endpoint(&kin_root, 51234).unwrap();
+
+        std::fs::remove_file(kin_root.join("daemon.pid")).unwrap();
+        std::fs::remove_file(kin_root.join("daemon.port")).unwrap();
+
+        assert_eq!(
+            super::classify_control_plane(&state),
+            ControlPlane::EndpointLost
+        );
+        assert!(
+            !super::control_plane_demands_shutdown(&state, 51234),
+            "a daemon that still owns the repo must repair its endpoint, not exit"
+        );
+        assert_eq!(
+            super::classify_control_plane(&state),
+            ControlPlane::Ours,
+            "the repair must republish this daemon's own endpoint"
+        );
+        assert_eq!(
+            crate::lifecycle::read_port_file(&kin_root),
+            Some(51234),
+            "republication must restore the port this daemon actually bound"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_removed_repository_root_ends_the_daemon() {
+        let repo = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let kin_root = initialized.layout.root().to_path_buf();
+        let state = DaemonState::open(initialized.layout).unwrap();
+        crate::lifecycle::publish_daemon_endpoint(&kin_root, 51234).unwrap();
+
+        std::fs::remove_dir_all(&kin_root).unwrap();
+
+        assert_eq!(
+            super::classify_control_plane(&state),
+            ControlPlane::RootGone
+        );
+        assert!(super::control_plane_demands_shutdown(&state, 51234));
+    }
+
+    #[tokio::test]
+    async fn a_proven_live_successor_endpoint_ends_the_daemon() {
+        let repo = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let kin_root = initialized.layout.root().to_path_buf();
+        let state = DaemonState::open(initialized.layout).unwrap();
+
+        let mut successor = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn a stand-in successor");
+        let identity = kin_cli::daemon_client::process_identity(successor.id())
+            .expect("read the successor's identity")
+            .expect("the successor is running");
+        crate::lifecycle::publish_foreign_endpoint_for_test(&kin_root, identity, 51234);
+
+        assert_eq!(
+            super::classify_control_plane(&state),
+            ControlPlane::Superseded {
+                pid: successor.id()
+            }
+        );
+        assert!(super::control_plane_demands_shutdown(&state, 4219));
+        assert_eq!(
+            std::fs::read_to_string(kin_root.join("daemon.port")).unwrap(),
+            "51234",
+            "yielding to a successor must not disturb the endpoint it published"
+        );
+
+        let _ = successor.kill();
+        let _ = successor.wait();
+    }
+
+    #[tokio::test]
+    async fn a_foreign_endpoint_that_proves_nothing_is_repaired_not_obeyed() {
+        // PID 1 is alive and is not this process, but a bare-PID record cannot
+        // prove that number still names a daemon. This process holds the
+        // repository singleton, so no successor can legitimately exist and the
+        // record is debris — the exact debris a refusing starter used to leave.
+        let repo = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let kin_root = initialized.layout.root().to_path_buf();
+        let state = DaemonState::open(initialized.layout).unwrap();
+        std::fs::write(kin_root.join("daemon.pid"), "1").unwrap();
+        std::fs::write(kin_root.join("daemon.port"), "51234").unwrap();
+
+        assert_eq!(
+            super::classify_control_plane(&state),
+            ControlPlane::EndpointLost
+        );
+        assert!(!super::control_plane_demands_shutdown(&state, 4219));
+        assert_eq!(super::classify_control_plane(&state), ControlPlane::Ours);
+        assert_eq!(crate::lifecycle::read_port_file(&kin_root), Some(4219));
     }
 
     #[test]
