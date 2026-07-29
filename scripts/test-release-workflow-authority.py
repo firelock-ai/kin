@@ -442,6 +442,17 @@ def job_top_level_mapping_fields(job: str) -> list[tuple[str, str]]:
     """Return canonical job-level fields, rejecting YAML key aliases."""
 
     active_lines = classifier_active_job_source(job).splitlines()
+    child_indents = [
+        len(line) - len(line.lstrip()) for line in active_lines[1:] if line.strip()
+    ]
+    if not child_indents:
+        return []
+    if min(child_indents) != 2:
+        raise AssertionError(
+            "workflow job top-level fields must use canonical two-space "
+            "child indentation"
+        )
+
     fields: list[tuple[str, str]] = []
     for line in active_lines[1:]:
         indent = len(line) - len(line.lstrip())
@@ -1215,6 +1226,50 @@ def main() -> None:
         raise AssertionError(
             "workflow census falsification could not identify an unnamed job"
         )
+    unnamed_source = workflow_sources[unnamed_workflow]
+    unnamed_lines = unnamed_source.splitlines()
+    try:
+        unnamed_job_start = unnamed_lines.index("  migrate:")
+    except ValueError as error:
+        raise AssertionError(
+            "workflow census falsification could not identify the unnamed job block"
+        ) from error
+    for label, child_indent in (
+        ("one-space job child mapping", 1),
+        ("three-space job child mapping", 3),
+        ("wider four-space job child mapping", 4),
+    ):
+        delta = child_indent - 2
+        reindented_children = []
+        for line in unnamed_lines[unnamed_job_start + 1 :]:
+            if not line.strip():
+                reindented_children.append(line)
+            elif delta > 0:
+                reindented_children.append(" " * delta + line)
+            else:
+                remove = -delta
+                if len(line) - len(line.lstrip()) < remove:
+                    raise AssertionError(
+                        f"workflow census falsification could not reindent {label}"
+                    )
+                reindented_children.append(line[remove:])
+        indentation_spoof = dict(workflow_sources)
+        indentation_spoof[unnamed_workflow] = (
+            "\n".join(
+                unnamed_lines[: unnamed_job_start + 1]
+                + [" " * (2 + child_indent) + "name: cargo-deny"]
+                + reindented_children
+            )
+            + "\n"
+        )
+        expect_assertion(
+            f"{label} hides a required context on an expected unnamed job",
+            "canonical two-space child indentation",
+            lambda indentation_spoof=indentation_spoof: assert_workflow_job_census(
+                indentation_spoof
+            ),
+        )
+
     for label, alternate_name_key in (
         ("double-quoted job name key", '"name": cargo-deny'),
         ("single-quoted job name key", "'name': cargo-deny"),
