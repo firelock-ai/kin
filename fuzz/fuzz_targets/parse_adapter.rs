@@ -14,8 +14,7 @@
 
 #![no_main]
 
-use kin_model::FilePathId;
-use kin_parser::AdapterRegistry;
+use kin_parser::{AdapterRegistry, FilePathId};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {

@@ -14,8 +14,7 @@
 
 #![no_main]
 
-use kin_model::FilePathId;
-use kin_parser::parse_shallow_file;
+use kin_parser::{parse_shallow_file, FilePathId};
 use libfuzzer_sys::fuzz_target;
 
 // Language hints accepted by `get_shallow_grammar`.

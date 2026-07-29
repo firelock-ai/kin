@@ -3546,14 +3546,24 @@ def main() -> None:
 
     field_compensation = dict(workflow_sources)
     field_compensation[ci_path] = unbound_ci
-    fuzz_key = (
-        "          key: ${{ runner.os }}-parser-fuzz-"
-        "${{ hashFiles('fuzz/Cargo.toml', 'crates/kin-parser/**') }}\n"
-    )
-    if field_compensation[fuzz_path].count(fuzz_key) != 1:
+    # Matched by prefix, not by the whole line. What this falsification needs is
+    # an active field on an unrelated cache step; which inputs the fuzz key
+    # happens to hash, and whether it carries a toolchain pin, is incidental to
+    # that and changes whenever the fuzz job is retuned. Pinning the exact text
+    # here would fail the release-authority suite for an unrelated edit. The
+    # `key:` prefix still distinguishes it from the `restore-keys:` entries,
+    # which are indented further and carry no field name.
+    fuzz_key_prefix = "          key: ${{ runner.os }}-parser-fuzz-"
+    fuzz_key_matches = [
+        line
+        for line in field_compensation[fuzz_path].splitlines(keepends=True)
+        if line.startswith(fuzz_key_prefix)
+    ]
+    if len(fuzz_key_matches) != 1:
         raise AssertionError(
             "cache falsification could not identify the unrelated fuzz cache step"
         )
+    fuzz_key = fuzz_key_matches[0]
     field_compensation[fuzz_path] = field_compensation[fuzz_path].replace(
         fuzz_key,
         fuzz_key + f"          {MAIN_ONLY_CACHE_SAVE}\n",
