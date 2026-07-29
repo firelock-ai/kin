@@ -8,6 +8,7 @@
 //! auto-start logic so the CLI does not need to depend on `kin-daemon`.
 
 use anyhow::{anyhow, bail, Context, Result};
+use fs2::FileExt;
 use kin_core::KinLayout;
 use serde::Deserialize;
 use serde::Serialize;
@@ -1612,43 +1613,110 @@ pub fn daemon_required() -> bool {
     true
 }
 
-/// Whether a process with the given pid currently exists (signal 0 probe on
-/// unix). Used by the daemon lifecycle and by `kin daemon status`/`stop` to
-/// classify a recorded pid as live or stale.
-pub fn is_process_alive(pid: u32) -> bool {
+/// What the operating system can prove about a process identifier.
+///
+/// `Unknown` is deliberately ownership-preserving. Permission failures and
+/// other indeterminate probes are not evidence that a live owner disappeared,
+/// so callers may retire process-owned state only for [`ProcessLiveness::Dead`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessLiveness {
+    Alive,
+    Dead,
+    Unknown,
+}
+
+impl ProcessLiveness {
+    /// Compatibility view for callers that only need a conservative boolean.
+    ///
+    /// Unknown owners are treated as possibly alive so existing status,
+    /// supervisor, session, and stop paths fail closed instead of pruning or
+    /// replacing authority they could not inspect.
+    pub fn may_be_alive(self) -> bool {
+        !matches!(self, Self::Dead)
+    }
+
+    fn authorizes_cleanup(self) -> bool {
+        matches!(self, Self::Dead)
+    }
+}
+
+/// Classify whether a process with the given PID exists.
+pub fn process_liveness(pid: u32) -> ProcessLiveness {
     #[cfg(unix)]
     {
         let Ok(pid) = libc::pid_t::try_from(pid) else {
-            return false;
+            return ProcessLiveness::Dead;
         };
         if unsafe { libc::kill(pid, 0) } == 0 {
-            return true;
+            return ProcessLiveness::Alive;
         }
-        std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+        return match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::ESRCH) => ProcessLiveness::Dead,
+            Some(libc::EPERM) => ProcessLiveness::Unknown,
+            _ => ProcessLiveness::Unknown,
+        };
     }
     #[cfg(windows)]
     {
-        use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+        use windows_sys::Win32::Foundation::{CloseHandle, GetLastError};
         use windows_sys::Win32::System::Threading::{
             GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
         };
 
         let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
         if process.is_null() {
-            return false;
+            return classify_windows_process_probe(false, unsafe { GetLastError() }, false, 0);
         }
         let mut code = 0;
         let queried = unsafe { GetExitCodeProcess(process, &mut code) } != 0;
         let _ = unsafe { CloseHandle(process) };
-        queried && code == STILL_ACTIVE as u32
+        return classify_windows_process_probe(true, 0, queried, code);
     }
     #[cfg(not(any(unix, windows)))]
     {
         let _ = pid;
         // Unknown targets have no reliable process primitive here. Preserve
         // ownership rather than guessing "dead" and deleting live authority.
-        true
+        ProcessLiveness::Unknown
     }
+}
+
+#[cfg(windows)]
+fn classify_windows_process_probe(
+    opened: bool,
+    open_error: u32,
+    queried: bool,
+    exit_code: u32,
+) -> ProcessLiveness {
+    use windows_sys::Win32::Foundation::{ERROR_INVALID_PARAMETER, STILL_ACTIVE};
+
+    if !opened {
+        // OpenProcess documents ERROR_INVALID_PARAMETER for a PID that cannot
+        // identify a process. Access denied and every other failure are
+        // indeterminate: the process may be live but inaccessible.
+        return if open_error == ERROR_INVALID_PARAMETER {
+            ProcessLiveness::Dead
+        } else {
+            ProcessLiveness::Unknown
+        };
+    }
+    if !queried {
+        return ProcessLiveness::Unknown;
+    }
+    if exit_code == STILL_ACTIVE as u32 {
+        ProcessLiveness::Alive
+    } else {
+        ProcessLiveness::Dead
+    }
+}
+
+/// Whether a process may still be alive.
+///
+/// Retained as the conservative compatibility surface. Call
+/// [`process_liveness`] when a destructive decision needs to distinguish
+/// affirmative death from an indeterminate probe.
+pub fn is_process_alive(pid: u32) -> bool {
+    process_liveness(pid).may_be_alive()
 }
 
 /// Whether a TCP port on localhost is accepting connections. Distinguishes a
@@ -1679,8 +1747,64 @@ pub fn repo_daemon_port_path(kin_root: &Path) -> PathBuf {
 /// these itself on graceful shutdown; `kin daemon stop` also calls this after a
 /// confirmed stop so a later `status` never reports the dead endpoint as stale.
 pub fn remove_stale_daemon_files(kin_root: &Path) {
+    let Ok(_authority) = try_acquire_daemon_endpoint_authority(kin_root) else {
+        warn!(
+            repo = %kin_root.display(),
+            "preserving daemon endpoint because lifecycle authority is contended"
+        );
+        return;
+    };
+    let pid_path = repo_daemon_pid_path(kin_root);
+    match read_pid_file(kin_root) {
+        Some(pid) if process_liveness(pid).authorizes_cleanup() => {
+            remove_stale_daemon_files_uncoordinated(kin_root);
+        }
+        Some(pid) => {
+            warn!(
+                pid,
+                repo = %kin_root.display(),
+                "preserving daemon endpoint because its recorded owner may still be alive"
+            );
+        }
+        None if !pid_path.exists() => {
+            let _ = std::fs::remove_file(repo_daemon_port_path(kin_root));
+        }
+        None => {
+            warn!(
+                repo = %kin_root.display(),
+                "preserving daemon endpoint because its PID record is unparseable"
+            );
+        }
+    }
+}
+
+/// Remove a port record only when lifecycle authority proves there is still no
+/// PID owner. Used before startup and by setup hygiene; a successor publishing
+/// its complete endpoint takes the same authority and therefore survives.
+pub fn remove_orphaned_daemon_port(kin_root: &Path) -> bool {
+    let Ok(_authority) = try_acquire_daemon_endpoint_authority(kin_root) else {
+        return false;
+    };
+    if repo_daemon_pid_path(kin_root).exists() {
+        return false;
+    }
+    std::fs::remove_file(repo_daemon_port_path(kin_root)).is_ok()
+}
+
+fn remove_stale_daemon_files_uncoordinated(kin_root: &Path) {
     let _ = std::fs::remove_file(repo_daemon_pid_path(kin_root));
     let _ = std::fs::remove_file(repo_daemon_port_path(kin_root));
+}
+
+fn try_acquire_daemon_endpoint_authority(kin_root: &Path) -> std::io::Result<File> {
+    let authority = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(kin_root.join("daemon.lifecycle"))?;
+    authority.try_lock_exclusive()?;
+    Ok(authority)
 }
 
 /// Remove endpoint files only while they still name the exact endpoint a verdict
@@ -1708,12 +1832,38 @@ fn remove_daemon_files_if_unchanged(
     judged_pid: u32,
     judged_port: Option<u16>,
 ) -> bool {
+    remove_daemon_files_if_unchanged_with_hook(kin_root, judged_pid, judged_port, || {})
+}
+
+fn remove_daemon_files_if_unchanged_with_hook<F>(
+    kin_root: &Path,
+    judged_pid: u32,
+    judged_port: Option<u16>,
+    after_comparison: F,
+) -> bool
+where
+    F: FnOnce(),
+{
+    // Current daemon publication and every current retirement path take this
+    // same never-unlinked authority. Holding it across the final comparison
+    // and both unlinks makes the judgement linearizable: a successor either
+    // publishes before the comparison (and is preserved) or after retirement.
+    let Ok(_authority) = try_acquire_daemon_endpoint_authority(kin_root) else {
+        warn!(
+            judged_pid,
+            ?judged_port,
+            repo = %kin_root.display(),
+            "preserving daemon endpoint because lifecycle authority is contended"
+        );
+        return false;
+    };
     let current_pid = read_pid_file(kin_root);
     let current_port = read_port_file(kin_root);
     let same_owner = current_pid == Some(judged_pid);
-    // An unchanged pid that republished its port is still a live daemon whose
-    // endpoint must survive, so a known port has to match too.
-    let same_endpoint = judged_port.is_none_or(|port| current_port == Some(port));
+    // An unchanged PID that gained or changed a port is a different endpoint
+    // generation (including PID reuse) and must survive. `None` means the
+    // judged endpoint had no port, not "ignore whichever port exists now."
+    let same_endpoint = current_port == judged_port;
     if !(same_owner && same_endpoint) {
         warn!(
             judged_pid,
@@ -1725,7 +1875,8 @@ fn remove_daemon_files_if_unchanged(
         );
         return false;
     }
-    remove_stale_daemon_files(kin_root);
+    after_comparison();
+    remove_stale_daemon_files_uncoordinated(kin_root);
     true
 }
 
@@ -1787,16 +1938,28 @@ pub fn supervisor_recorded_endpoint() -> (Option<u32>, Option<u16>) {
 }
 
 fn live_daemon_endpoint(kin_root: &Path) -> Option<LiveDaemonEndpoint> {
+    live_daemon_endpoint_with_probe(kin_root, process_liveness)
+}
+
+fn live_daemon_endpoint_with_probe(
+    kin_root: &Path,
+    probe: impl FnOnce(u32) -> ProcessLiveness,
+) -> Option<LiveDaemonEndpoint> {
     let pid = read_pid_file(kin_root)?;
-    if !is_process_alive(pid) {
+    // Capture both components before forming the liveness verdict. Reading the
+    // port afterward could bind a true "dead" result about the predecessor PID
+    // to a same-PID successor's newly published port, making the final
+    // compare-and-retire accept the wrong endpoint generation.
+    let port = read_port_file(kin_root);
+    if probe(pid).authorizes_cleanup() {
         // Compare-and-delete even here, where the window is only as wide as this
         // function: a successor that republished between the read and the
         // liveness check would otherwise lose its endpoint to a true statement
         // about its predecessor.
-        remove_daemon_files_if_unchanged(kin_root, pid, read_port_file(kin_root));
+        remove_daemon_files_if_unchanged(kin_root, pid, port);
         return None;
     }
-    let port = read_port_file(kin_root)?;
+    let port = port?;
     Some(LiveDaemonEndpoint { pid, port })
 }
 
@@ -3161,9 +3324,9 @@ pub async fn ensure_daemon_running_with_idle_timeout(
     // The daemon owns port selection: it binds :0 and reports the real bound
     // port via the port file. Passing 0 (rather than a port we reserve here)
     // eliminates the reserve-release-rebind race where a sibling process steals
-    // the port between our probe and the daemon's bind. Clear any stale port
-    // file first so wait_for_daemon_ready only reads the port this spawn writes.
-    let _ = std::fs::remove_file(kin_root.join("daemon.port"));
+    // the port between our probe and the daemon's bind. Clear an orphaned port
+    // only while lifecycle authority proves no successor PID was published.
+    remove_orphaned_daemon_port(kin_root);
 
     info!(binary = %daemon_bin.display(), repo = %working_dir.display(), "starting daemon (OS-assigned port)");
 
@@ -3741,6 +3904,85 @@ mod tests {
         write_endpoint_files(root, 4242, 51001);
         assert!(!remove_daemon_files_if_unchanged(root, 4242, Some(51000)));
         assert!(root.join("daemon.port").exists());
+
+        // A judgement formed before any port existed must not match a
+        // same-PID endpoint that has since published one.
+        assert!(!remove_daemon_files_if_unchanged(root, 4242, None));
+        assert!(root.join("daemon.port").exists());
+    }
+
+    #[test]
+    fn generic_stale_cleanup_preserves_a_live_successor() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_endpoint_files(root, std::process::id(), 51000);
+
+        remove_stale_daemon_files(root);
+
+        assert_eq!(read_pid_file(root), Some(std::process::id()));
+        assert_eq!(read_port_file(root), Some(51000));
+    }
+
+    #[test]
+    fn orphan_port_cleanup_requires_an_absent_pid_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("daemon.pid"), "indeterminate").unwrap();
+        std::fs::write(root.join("daemon.port"), "51000").unwrap();
+
+        assert!(!remove_orphaned_daemon_port(root));
+        assert!(root.join("daemon.pid").exists());
+        assert!(root.join("daemon.port").exists());
+
+        std::fs::remove_file(root.join("daemon.pid")).unwrap();
+        assert!(remove_orphaned_daemon_port(root));
+        assert!(!root.join("daemon.port").exists());
+    }
+
+    #[test]
+    fn successor_publication_after_final_comparison_is_serialized() {
+        use std::sync::mpsc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        write_endpoint_files(&root, 4242, 51000);
+
+        let (comparison_tx, comparison_rx) = mpsc::channel();
+        let (publication_started_tx, publication_started_rx) = mpsc::channel();
+        let successor_root = root.clone();
+        let successor = std::thread::spawn(move || {
+            comparison_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("retirement must reach the final comparison");
+            publication_started_tx.send(()).unwrap();
+            let authority = loop {
+                match try_acquire_daemon_endpoint_authority(&successor_root) {
+                    Ok(authority) => break authority,
+                    Err(error) if error.kind() == fs2::lock_contended_error().kind() => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("successor publication authority: {error}"),
+                }
+            };
+            write_endpoint_files(&successor_root, 4243, 51001);
+            drop(authority);
+        });
+
+        assert!(remove_daemon_files_if_unchanged_with_hook(
+            &root,
+            4242,
+            Some(51000),
+            || {
+                comparison_tx.send(()).unwrap();
+                publication_started_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("successor must attempt publication after comparison");
+            }
+        ));
+        successor.join().expect("successor publisher");
+
+        assert_eq!(read_pid_file(&root), Some(4243));
+        assert_eq!(read_port_file(&root), Some(51001));
     }
 
     #[tokio::test]
@@ -3994,6 +4236,41 @@ mod tests {
             is_process_alive(std::process::id()),
             "the current process must be observable as alive"
         );
+        assert_eq!(process_liveness(std::process::id()), ProcessLiveness::Alive);
+    }
+
+    #[test]
+    fn indeterminate_liveness_never_retires_an_endpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_endpoint_files(root, 4242, 51000);
+
+        let endpoint = live_daemon_endpoint_with_probe(root, |_| ProcessLiveness::Unknown)
+            .expect("unknown liveness must preserve possible ownership");
+
+        assert_eq!(endpoint.pid, 4242);
+        assert_eq!(endpoint.port, 51000);
+        assert!(root.join("daemon.pid").exists());
+        assert!(root.join("daemon.port").exists());
+    }
+
+    #[test]
+    fn dead_verdict_cannot_bind_to_a_same_pid_successor_port() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_endpoint_files(root, 4242, 51000);
+
+        let endpoint = live_daemon_endpoint_with_probe(root, |_| {
+            // Model PID reuse: the predecessor was judged by its original
+            // (pid, port), then a successor with the same numeric PID published
+            // a new endpoint generation before conditional retirement.
+            write_endpoint_files(root, 4242, 51001);
+            ProcessLiveness::Dead
+        });
+
+        assert_eq!(endpoint, None);
+        assert_eq!(read_pid_file(root), Some(4242));
+        assert_eq!(read_port_file(root), Some(51001));
     }
 
     #[cfg(windows)]
@@ -4002,6 +4279,35 @@ mod tests {
         assert!(
             !is_process_alive(u32::MAX),
             "an unopenable Windows process id must not wedge daemon ownership forever"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_access_denied_and_query_failure_are_indeterminate() {
+        use windows_sys::Win32::Foundation::{
+            ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, STILL_ACTIVE,
+        };
+
+        assert_eq!(
+            classify_windows_process_probe(false, ERROR_INVALID_PARAMETER, false, 0),
+            ProcessLiveness::Dead
+        );
+        assert_eq!(
+            classify_windows_process_probe(false, ERROR_ACCESS_DENIED, false, 0),
+            ProcessLiveness::Unknown
+        );
+        assert_eq!(
+            classify_windows_process_probe(true, 0, false, 0),
+            ProcessLiveness::Unknown
+        );
+        assert_eq!(
+            classify_windows_process_probe(true, 0, true, STILL_ACTIVE as u32),
+            ProcessLiveness::Alive
+        );
+        assert_eq!(
+            classify_windows_process_probe(true, 0, true, 0),
+            ProcessLiveness::Dead
         );
     }
 

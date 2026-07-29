@@ -10,7 +10,7 @@
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use fs2::FileExt;
 use tracing::info;
@@ -23,13 +23,15 @@ use tracing::info;
 /// process per repo. The lock is an OS-level advisory `flock(2)` on
 /// `.kin/daemon.lock`. Because the kernel ties the lock to the open file
 /// description, it is released automatically when this handle is dropped *or*
-/// when the process dies — including a hard `SIGKILL` — so it can never go
-/// stale and strand the repo.
+/// when the last process holding that description exits. A forked child can
+/// inherit the description and keep it locked after the stamped daemon dies;
+/// that case is detected and reported, but not automatically unlinked.
 ///
-/// The on-disk lock file is unlinked only by dead-owner recovery while holding
-/// the separate lifecycle coordination lock. Acquisition takes that same
-/// coordination lock before opening this inode, so no successor can lock and
-/// stamp the old inode between the reclaimer's owner check and unlink.
+/// Current builds never unlink this pathname automatically. The separate
+/// lifecycle coordination lock serializes all current acquisition and endpoint
+/// publication paths, but it cannot exclude a compatible older writer that
+/// does not participate. Recovery therefore fails closed rather than replacing
+/// an inode that a legacy process could have acquired after a userspace check.
 #[derive(Debug)]
 pub struct DaemonLock {
     file: std::fs::File,
@@ -120,18 +122,29 @@ pub fn acquire_singleton_lock(kin_root: &Path) -> std::io::Result<Option<DaemonL
 }
 
 fn acquire_singleton_lock_inner(kin_root: &Path) -> std::io::Result<Option<DaemonLock>> {
-    acquire_singleton_lock_inner_with_coordination_hook(kin_root, || {})
+    acquire_singleton_lock_inner_until(kin_root, Instant::now() + SINGLETON_LOCK_RETRY_BUDGET)
 }
 
-fn acquire_singleton_lock_inner_with_coordination_hook<F>(
+fn acquire_singleton_lock_inner_until(
     kin_root: &Path,
+    deadline: Instant,
+) -> std::io::Result<Option<DaemonLock>> {
+    acquire_singleton_lock_inner_until_with_coordination_hook(kin_root, deadline, || {})
+}
+
+fn acquire_singleton_lock_inner_until_with_coordination_hook<F>(
+    kin_root: &Path,
+    deadline: Instant,
     on_coordination_contention: F,
 ) -> std::io::Result<Option<DaemonLock>>
 where
     F: FnMut(),
 {
-    let _coordination =
-        acquire_singleton_coordination_guard_with_hook(kin_root, on_coordination_contention)?;
+    let _coordination = acquire_singleton_coordination_guard_until_with_hook(
+        kin_root,
+        deadline,
+        on_coordination_contention,
+    )?;
     let path = kin_root.join("daemon.lock");
     let mut file = std::fs::OpenOptions::new()
         .create(true)
@@ -154,19 +167,29 @@ where
     }
 }
 
-/// Serialize daemon-lock inode replacement against acquisition.
+/// Serialize current daemon acquisition, evidence reads, and endpoint changes.
 ///
-/// `daemon.lock` itself cannot provide this serialization: dead-owner recovery
-/// exists specifically because a leaked child fd can keep that inode locked
-/// after its daemon owner dies. This second, never-unlinked inode is held only
-/// for the short owner-check/open/stamp critical section. A bounded acquire
-/// fails closed if an inherited coordination fd ever does leak.
+/// `daemon.lock` itself cannot provide this coordination while a leaked child
+/// fd keeps that inode locked after its stamped owner dies. This second,
+/// never-unlinked inode is held only for short authority sections. A bounded
+/// acquire fails closed if an inherited coordination fd ever leaks.
 fn acquire_singleton_coordination_guard(kin_root: &Path) -> std::io::Result<std::fs::File> {
-    acquire_singleton_coordination_guard_with_hook(kin_root, || {})
+    acquire_singleton_coordination_guard_until(
+        kin_root,
+        Instant::now() + SINGLETON_LOCK_RETRY_BUDGET,
+    )
 }
 
-fn acquire_singleton_coordination_guard_with_hook<F>(
+fn acquire_singleton_coordination_guard_until(
     kin_root: &Path,
+    deadline: Instant,
+) -> std::io::Result<std::fs::File> {
+    acquire_singleton_coordination_guard_until_with_hook(kin_root, deadline, || {})
+}
+
+fn acquire_singleton_coordination_guard_until_with_hook<F>(
+    kin_root: &Path,
+    deadline: Instant,
     mut on_contention: F,
 ) -> std::io::Result<std::fs::File>
 where
@@ -179,19 +202,21 @@ where
         .write(true)
         .truncate(false)
         .open(path)?;
-    let deadline = std::time::Instant::now() + SINGLETON_LOCK_RETRY_BUDGET;
     loop {
         match file.try_lock_exclusive() {
             Ok(()) => return Ok(file),
             Err(err) if err.kind() == fs2::lock_contended_error().kind() => {
                 on_contention();
-                if std::time::Instant::now() >= deadline {
+                let now = Instant::now();
+                if now >= deadline {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::WouldBlock,
                         "timed out waiting for daemon lifecycle coordination lock",
                     ));
                 }
-                std::thread::sleep(SINGLETON_LOCK_RETRY_INTERVAL);
+                std::thread::sleep(
+                    SINGLETON_LOCK_RETRY_INTERVAL.min(deadline.saturating_duration_since(now)),
+                );
             }
             Err(err) => return Err(err),
         }
@@ -214,15 +239,26 @@ pub fn acquire_singleton_lock_within(
     budget: Duration,
 ) -> std::io::Result<Option<DaemonLock>> {
     without_blocking_runtime_worker(|| {
-        let deadline = std::time::Instant::now() + budget;
+        let deadline = Instant::now() + budget;
         loop {
-            if let Some(lock) = acquire_singleton_lock_inner(kin_root)? {
-                return Ok(Some(lock));
+            match acquire_singleton_lock_inner_until(kin_root, deadline) {
+                Ok(Some(lock)) => return Ok(Some(lock)),
+                Ok(None) => {}
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && Instant::now() >= deadline =>
+                {
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
             }
-            if std::time::Instant::now() >= deadline {
+            let now = Instant::now();
+            if now >= deadline {
                 return Ok(None);
             }
-            std::thread::sleep(SINGLETON_LOCK_RETRY_INTERVAL);
+            std::thread::sleep(
+                SINGLETON_LOCK_RETRY_INTERVAL.min(deadline.saturating_duration_since(now)),
+            );
         }
     })
 }
@@ -294,24 +330,6 @@ impl LockOwnerEvidence {
     }
 }
 
-/// All on-disk lock files for a repo: the daemon singleton lock under the `.kin`
-/// root, plus every `*.lock` under `.kin/kindb/` (kin-db's snapshot `graph.lock`
-/// and any future sibling such as a kvec write lock). Enumerated by extension so
-/// the set tracks kin-db across versions without hard-coding paths that may not
-/// exist in every build.
-fn lock_files(kin_root: &Path) -> Vec<PathBuf> {
-    let mut locks = vec![kin_root.join("daemon.lock")];
-    if let Ok(entries) = std::fs::read_dir(kin_root.join("kindb")) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().is_some_and(|ext| ext == "lock") {
-                locks.push(path);
-            }
-        }
-    }
-    locks
-}
-
 /// What a reclaim attempt concluded, and why.
 ///
 /// Every variant is reported: a reclaim that declines must say which evidence
@@ -319,7 +337,8 @@ fn lock_files(kin_root: &Path) -> Vec<PathBuf> {
 /// to the caller exactly like "nothing was wrong here".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StaleLockReclaim {
-    /// The recorded owner is dead; these lock files were removed.
+    /// Legacy/historical outcome retained for source compatibility. Current
+    /// mixed-version-safe recovery does not produce it automatically.
     Cleared(Vec<PathBuf>),
     /// A recorded owner is alive, so the locks are deliberately preserved.
     OwnerAlive(u32),
@@ -335,8 +354,9 @@ pub enum StaleLockReclaim {
         current_lock_owner: Option<u32>,
         current_endpoint_owner: Option<u32>,
     },
-    /// The separate acquisition/reclaim coordination inode could not be
-    /// acquired. Recovery fails closed instead of unlinking without exclusion.
+    /// Safe acquisition/retirement coordination is unavailable. This includes
+    /// both a contended lifecycle inode and the mixed-version boundary where
+    /// compatible older writers do not participate in that protocol.
     CoordinationUnavailable(String),
 }
 
@@ -375,17 +395,65 @@ impl StaleLockReclaim {
 /// permanent no-op while the repo stayed wedged. If either record names a live
 /// process, nothing is touched.
 ///
-/// Unlinking a genuinely leaked-fd lock is safe: the next acquire creates a new
-/// inode, while the zombie child's flock stays on the now-orphaned old one.
+/// Automatic unlink is intentionally unsupported while non-participating older
+/// writers remain compatible. A dead owner is reported precisely, but every
+/// lock is preserved; the operator can stop the leaked holder or allow it to
+/// exit, after which the ordinary bounded acquire succeeds on the same inode.
 pub fn reclaim_stale_locks(kin_root: &Path) -> StaleLockReclaim {
-    without_blocking_runtime_worker(|| reclaim_stale_locks_with_hook(kin_root, || {}))
+    reclaim_stale_locks_within(kin_root, SINGLETON_LOCK_RETRY_BUDGET)
 }
 
+/// Resolve stale-lock evidence within the caller's remaining acquisition
+/// budget. Coordination timeout is reported fail-closed.
+pub fn reclaim_stale_locks_within(kin_root: &Path, budget: Duration) -> StaleLockReclaim {
+    let deadline = Instant::now() + budget;
+    without_blocking_runtime_worker(|| {
+        reclaim_stale_locks_with_hooks_until(kin_root, deadline, || {}, || {})
+    })
+}
+
+#[cfg(test)]
 fn reclaim_stale_locks_with_hook<F>(kin_root: &Path, before_revalidation: F) -> StaleLockReclaim
 where
     F: FnOnce(),
 {
-    let _coordination = match acquire_singleton_coordination_guard(kin_root) {
+    reclaim_stale_locks_with_hooks_until(
+        kin_root,
+        Instant::now() + SINGLETON_LOCK_RETRY_BUDGET,
+        before_revalidation,
+        || {},
+    )
+}
+
+#[cfg(test)]
+fn reclaim_stale_locks_with_hooks<F, G>(
+    kin_root: &Path,
+    before_revalidation: F,
+    after_revalidation: G,
+) -> StaleLockReclaim
+where
+    F: FnOnce(),
+    G: FnOnce(),
+{
+    reclaim_stale_locks_with_hooks_until(
+        kin_root,
+        Instant::now() + SINGLETON_LOCK_RETRY_BUDGET,
+        before_revalidation,
+        after_revalidation,
+    )
+}
+
+fn reclaim_stale_locks_with_hooks_until<F, G>(
+    kin_root: &Path,
+    deadline: Instant,
+    before_revalidation: F,
+    after_revalidation: G,
+) -> StaleLockReclaim
+where
+    F: FnOnce(),
+    G: FnOnce(),
+{
+    let _coordination = match acquire_singleton_coordination_guard_until(kin_root, deadline) {
         Ok(coordination) => coordination,
         Err(error) => {
             tracing::warn!(
@@ -413,9 +481,9 @@ where
     before_revalidation();
 
     // The coordination inode excludes every current acquisition path. Re-read
-    // anyway immediately before unlink so an older/non-participating writer,
-    // PID reuse, or an endpoint publisher cannot turn dead-owner evidence into
-    // authority over a successor.
+    // anyway so PID reuse or a current endpoint publisher is reported
+    // accurately. It cannot exclude an older/non-participating writer, which
+    // is why the verified dead-owner case below still refuses automatic unlink.
     let current = LockOwnerEvidence::read(kin_root);
     if let Some(alive) = current.live_owner() {
         return StaleLockReclaim::OwnerAlive(alive);
@@ -437,41 +505,71 @@ where
         };
     }
 
-    let mut cleared = Vec::new();
-    for lock in lock_files(kin_root) {
-        if !lock.exists() {
-            continue;
-        }
-        match std::fs::remove_file(&lock) {
-            Ok(()) => {
-                tracing::warn!(
-                    lock = %lock.display(),
-                    owner_pid = dead_owner,
-                    "reclaimed stale repo lock left by a dead daemon owner"
-                );
-                cleared.push(lock);
-            }
-            Err(err) => {
-                tracing::warn!(
-                    lock = %lock.display(),
-                    error = %err,
-                    "failed to reclaim stale repo lock"
-                );
-            }
-        }
-    }
-    StaleLockReclaim::Cleared(cleared)
+    after_revalidation();
+
+    tracing::warn!(
+        repo = %kin_root.display(),
+        owner_pid = dead_owner,
+        "recorded daemon owner is dead, but automatic singleton retirement is disabled at the \
+         mixed-version compatibility boundary; preserving every lock"
+    );
+    StaleLockReclaim::CoordinationUnavailable(format!(
+        "recorded owner pid {dead_owner} is dead, but automatic singleton retirement is \
+         unsupported while compatible older daemons may acquire without daemon.lifecycle"
+    ))
 }
 
 // ── Daemon State Files ──────────────────────────────────────────────────
 
+fn write_atomic_endpoint_component(
+    kin_root: &Path,
+    name: &str,
+    value: impl AsRef<[u8]>,
+) -> std::io::Result<()> {
+    let tmp = kin_root.join(format!("{name}.tmp"));
+    let dst = kin_root.join(name);
+    std::fs::write(&tmp, value)?;
+    std::fs::rename(tmp, dst)
+}
+
+/// Publish the daemon's complete endpoint while holding lifecycle authority.
+///
+/// Current endpoint retirement takes the same never-unlinked lock, so a
+/// successor publication cannot land between a predecessor comparison and
+/// deletion. Both temporary files are prepared before either visible component
+/// changes; on any publication failure the incomplete endpoint is removed
+/// before authority is released.
+pub fn publish_daemon_endpoint(kin_root: &Path, port: u16) -> std::io::Result<()> {
+    let _authority = acquire_singleton_coordination_guard(kin_root)?;
+    let pid = std::process::id().to_string();
+    let port = port.to_string();
+    let result: std::io::Result<()> = (|| {
+        std::fs::write(kin_root.join("daemon.pid.tmp"), pid.as_bytes())?;
+        std::fs::write(kin_root.join("daemon.port.tmp"), port.as_bytes())?;
+        std::fs::rename(kin_root.join("daemon.pid.tmp"), kin_root.join("daemon.pid"))?;
+        std::fs::rename(
+            kin_root.join("daemon.port.tmp"),
+            kin_root.join("daemon.port"),
+        )?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(kin_root.join("daemon.pid.tmp"));
+        let _ = std::fs::remove_file(kin_root.join("daemon.port.tmp"));
+        let _ = std::fs::remove_file(kin_root.join("daemon.pid"));
+        let _ = std::fs::remove_file(kin_root.join("daemon.port"));
+    }
+    result
+}
+
 /// Write PID file atomically (write tmp + rename).
+///
+/// Retained for API compatibility and tests. Production startup publishes the
+/// PID and bound port together with [`publish_daemon_endpoint`].
 pub fn write_pid_file(kin_root: &Path) {
-    let pid = std::process::id();
-    let tmp = kin_root.join("daemon.pid.tmp");
-    let dst = kin_root.join("daemon.pid");
-    if std::fs::write(&tmp, pid.to_string()).is_ok() {
-        let _ = std::fs::rename(&tmp, &dst);
+    if let Ok(_authority) = acquire_singleton_coordination_guard(kin_root) {
+        let _ =
+            write_atomic_endpoint_component(kin_root, "daemon.pid", std::process::id().to_string());
     }
 }
 
@@ -480,10 +578,8 @@ pub fn write_pid_file(kin_root: &Path) {
 /// Written atomically (temp + rename) so a CLI polling the port file during the
 /// daemon→CLI port handshake never parses a torn or partial value.
 pub fn write_port_file(kin_root: &Path, port: u16) {
-    let tmp = kin_root.join("daemon.port.tmp");
-    let dst = kin_root.join("daemon.port");
-    if std::fs::write(&tmp, port.to_string()).is_ok() {
-        let _ = std::fs::rename(&tmp, &dst);
+    if let Ok(_authority) = acquire_singleton_coordination_guard(kin_root) {
+        let _ = write_atomic_endpoint_component(kin_root, "daemon.port", port.to_string());
     }
 }
 
@@ -496,6 +592,9 @@ pub fn read_port_file(kin_root: &Path) -> Option<u16> {
 
 /// Remove PID file, but only if it's ours (prevents removing a successor's).
 pub fn remove_pid_file(kin_root: &Path) {
+    let Ok(_authority) = acquire_singleton_coordination_guard(kin_root) else {
+        return;
+    };
     let path = kin_root.join("daemon.pid");
     if let Ok(content) = std::fs::read_to_string(&path) {
         if content.trim().parse::<u32>().ok() == Some(std::process::id()) {
@@ -509,6 +608,13 @@ pub fn remove_pid_file(kin_root: &Path) {
 /// This avoids a shutdown race where an older daemon removes the port file for
 /// a newer successor that already replaced `daemon.pid`.
 pub fn remove_daemon_files_if_current_process(kin_root: &Path) {
+    let Ok(_authority) = acquire_singleton_coordination_guard(kin_root) else {
+        tracing::warn!(
+            repo = %kin_root.display(),
+            "preserving daemon endpoint because lifecycle authority is unavailable"
+        );
+        return;
+    };
     let pid_path = kin_root.join("daemon.pid");
     let belongs_to_current = std::fs::read_to_string(&pid_path)
         .ok()
@@ -535,9 +641,13 @@ pub fn daemon_is_up(kin_root: &Path) -> Option<u16> {
         .parse()
         .ok()?;
     if !is_process_alive(pid) {
-        // Stale — clean up.
-        let _ = std::fs::remove_file(kin_root.join("daemon.pid"));
-        let _ = std::fs::remove_file(kin_root.join("daemon.port"));
+        // Stale — clean up only while publication is excluded and this PID is
+        // still the endpoint owner.
+        let _authority = acquire_singleton_coordination_guard(kin_root).ok()?;
+        if recorded_daemon_pid(kin_root) == Some(pid) && !is_process_alive(pid) {
+            let _ = std::fs::remove_file(kin_root.join("daemon.pid"));
+            let _ = std::fs::remove_file(kin_root.join("daemon.port"));
+        }
         return None;
     }
     let port = read_port_file(kin_root)?;
@@ -895,6 +1005,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn complete_endpoint_publication_writes_pid_and_bound_port_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        publish_daemon_endpoint(root, 51234).expect("publish endpoint");
+
+        assert_eq!(recorded_daemon_pid(root), Some(std::process::id()));
+        assert_eq!(read_port_file(root), Some(51234));
+        assert!(!root.join("daemon.pid.tmp").exists());
+        assert!(!root.join("daemon.port.tmp").exists());
+    }
+
     // ── Idle-timeout env resolution ────────────────────────────────────────
     //
     // These lock the scoped-timeout contract: user env wins over everything,
@@ -1006,10 +1129,11 @@ mod tests {
     }
 
     #[test]
-    fn reclaim_clears_locks_when_owner_pid_is_dead() {
-        // A SIGKILLed daemon whose forked child leaked the flock fd
-        // leaves a dead-owner PID and lingering lock files. The reclaim path
-        // clears them so startup proceeds instead of failing with os error 35.
+    fn reclaim_fails_closed_when_owner_pid_is_dead() {
+        // A SIGKILLed daemon whose forked child leaked the flock fd leaves a
+        // dead-owner PID and lingering lock files. Because compatible legacy
+        // starters do not take daemon.lifecycle, automatic pathname
+        // replacement cannot prove exclusion and must preserve every lock.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         std::fs::create_dir_all(root.join("kindb")).unwrap();
@@ -1018,21 +1142,18 @@ mod tests {
         std::fs::write(root.join("kindb").join("graph.lock"), b"").unwrap();
 
         let reclaim = reclaim_stale_locks(root);
-        assert_eq!(
-            reclaim.cleared().len(),
-            2,
-            "both stale locks should be reclaimed"
-        );
-        assert!(!root.join("daemon.lock").exists());
-        assert!(!root.join("kindb").join("graph.lock").exists());
-
-        // Startup proceeds: the singleton lock acquires cleanly afterward.
         assert!(
-            acquire_singleton_lock(root)
-                .expect("lock IO should succeed")
-                .is_some(),
-            "singleton lock should acquire after stale-lock reclaim"
+            matches!(
+                &reclaim,
+                StaleLockReclaim::CoordinationUnavailable(reason)
+                    if reason.contains("compatible older daemons")
+                        && reason.contains("999999999")
+            ),
+            "dead-owner retirement must disclose the mixed-version boundary: {reclaim:?}"
         );
+        assert!(reclaim.cleared().is_empty());
+        assert!(root.join("daemon.lock").exists());
+        assert!(root.join("kindb").join("graph.lock").exists());
     }
 
     #[test]
@@ -1057,74 +1178,63 @@ mod tests {
     }
 
     #[test]
-    fn reclaim_serializes_a_successor_acquire_before_unlink() {
-        use std::sync::mpsc;
+    fn legacy_acquirer_after_final_read_cannot_be_unlinked() {
+        use std::cell::RefCell;
 
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().to_path_buf();
+        let root = dir.path();
         std::fs::write(root.join("daemon.lock"), "999999999").unwrap();
+        let legacy_lock = RefCell::new(None);
 
-        let (reclaim_checked_tx, reclaim_checked_rx) = mpsc::channel();
-        let (release_reclaim_tx, release_reclaim_rx) = mpsc::channel();
-        let reclaim_root = root.clone();
-        let reclaimer = std::thread::spawn(move || {
-            reclaim_stale_locks_with_hook(&reclaim_root, || {
-                reclaim_checked_tx.send(()).unwrap();
-                release_reclaim_rx
-                    .recv_timeout(Duration::from_secs(5))
-                    .expect("test must release the reclaimer");
-            })
-        });
-        reclaim_checked_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("reclaimer must reach its final owner check");
+        let reclaim = reclaim_stale_locks_with_hooks(
+            root,
+            || {},
+            || {
+                // This hook is after the final owner read. It models an older
+                // daemon that does not take daemon.lifecycle: acquire and stamp
+                // the existing singleton inode at the exact former unlink
+                // window.
+                let mut file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(root.join("daemon.lock"))
+                    .unwrap();
+                file.try_lock_exclusive()
+                    .expect("legacy successor acquires the old inode");
+                file.set_len(0).unwrap();
+                file.seek(SeekFrom::Start(0)).unwrap();
+                write!(file, "{}", std::process::id()).unwrap();
+                file.flush().unwrap();
+                legacy_lock.replace(Some(file));
+            },
+        );
 
-        let (acquire_blocked_tx, acquire_blocked_rx) = mpsc::channel();
-        let (acquired_tx, acquired_rx) = mpsc::channel();
-        let acquire_root = root.clone();
-        let successor = std::thread::spawn(move || {
-            let mut blocked_signal = Some(acquire_blocked_tx);
-            let acquired =
-                acquire_singleton_lock_inner_with_coordination_hook(&acquire_root, || {
-                    if let Some(signal) = blocked_signal.take() {
-                        signal.send(()).unwrap();
-                    }
-                });
-            acquired_tx.send(acquired).unwrap();
-        });
-        acquire_blocked_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("successor must observe lifecycle-lock contention");
         assert!(
-            matches!(acquired_rx.try_recv(), Err(mpsc::TryRecvError::Empty)),
-            "a successor must not acquire and stamp daemon.lock while a reclaimer can still \
-             unlink that inode"
+            matches!(
+                &reclaim,
+                StaleLockReclaim::CoordinationUnavailable(reason)
+                    if reason.contains("compatible older daemons")
+                        && reason.contains("999999999")
+            ),
+            "the legacy-acquirer seam must fail closed: {reclaim:?}"
         );
-
-        release_reclaim_tx.send(()).unwrap();
-        let reclaim = reclaimer.join().expect("reclaimer must not panic");
+        assert!(root.join("daemon.lock").exists());
         assert_eq!(
-            reclaim.cleared(),
-            &[root.join("daemon.lock")],
-            "the dead predecessor inode should be cleared before the successor opens one"
-        );
-
-        let lock = acquired_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("successor must finish after reclaim releases coordination")
-            .expect("successor acquisition IO")
-            .expect("successor must acquire the replacement inode");
-        successor.join().expect("successor must not panic");
-        assert_eq!(
-            lock_owner_pid(&root),
+            lock_owner_pid(root),
             Some(std::process::id()),
-            "the replacement inode must retain the successor's live owner stamp"
+            "the legacy successor's stamp must survive the former unlink window"
         );
-        drop(lock);
+        assert!(
+            acquire_singleton_lock_within(root, Duration::ZERO)
+                .expect("current acquire IO")
+                .is_none(),
+            "current acquisition must observe the legacy holder on the preserved inode"
+        );
+        drop(legacy_lock.into_inner());
     }
 
     #[test]
-    fn reclaim_revalidates_owner_evidence_immediately_before_unlink() {
+    fn reclaim_revalidates_owner_evidence_before_reporting_retirement_boundary() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         std::fs::write(root.join("daemon.lock"), "999999999").unwrap();
@@ -1230,13 +1340,17 @@ mod tests {
         );
 
         let reclaim = reclaim_stale_locks(root);
-        assert_eq!(
-            reclaim.cleared().len(),
-            2,
-            "a dead owner named only by the lock stamp must still be reclaimable"
+        assert!(
+            matches!(
+                &reclaim,
+                StaleLockReclaim::CoordinationUnavailable(reason)
+                    if reason.contains("compatible older daemons")
+                        && reason.contains("999999999")
+            ),
+            "dead stamp-only ownership must fail closed: {reclaim:?}"
         );
-        assert!(!root.join("daemon.lock").exists());
-        assert!(!root.join("kindb").join("graph.lock").exists());
+        assert!(root.join("daemon.lock").exists());
+        assert!(root.join("kindb").join("graph.lock").exists());
     }
 
     #[test]
@@ -1317,6 +1431,30 @@ mod tests {
             "the retry must be bounded, not a spin"
         );
         drop(held);
+    }
+
+    #[test]
+    fn bounded_retry_deadline_includes_lifecycle_coordination() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let lifecycle = acquire_singleton_coordination_guard(root)
+            .expect("test must hold lifecycle coordination");
+
+        let started = Instant::now();
+        let budget = Duration::from_millis(150);
+        let contended =
+            acquire_singleton_lock_within(root, budget).expect("bounded acquire result");
+
+        assert!(contended.is_none());
+        assert!(
+            started.elapsed() >= budget,
+            "the caller budget must be honored rather than skipped"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the inner lifecycle wait must not substitute its five-second budget"
+        );
+        drop(lifecycle);
     }
 
     #[test]

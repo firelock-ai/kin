@@ -2,7 +2,7 @@
 // Copyright 2026 Firelock, LLC
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tracing::{debug, error, info, warn};
 
@@ -56,6 +56,50 @@ fn should_enable_lsp_enrichment(config_enabled: bool, filesystem_reconcile_disab
     config_enabled && !filesystem_reconcile_disabled
 }
 
+/// Acquire the process-lifetime repository authority before daemon state opens.
+pub fn acquire_daemon_authority(
+    kin_root: &std::path::Path,
+) -> Result<crate::lifecycle::DaemonLock> {
+    acquire_daemon_authority_within(kin_root, crate::lifecycle::SINGLETON_LOCK_RETRY_BUDGET)
+}
+
+/// Acquire process-lifetime repository authority with one caller-owned budget.
+///
+/// Exposed so the process entrypoint can acquire before constructing
+/// [`DaemonState`], and so deterministic tests can use a short deadline without
+/// changing the production retry contract.
+pub fn acquire_daemon_authority_within(
+    kin_root: &std::path::Path,
+    budget: Duration,
+) -> Result<crate::lifecycle::DaemonLock> {
+    let deadline = Instant::now() + budget;
+    let reclaim = match crate::lifecycle::acquire_singleton_lock_within(kin_root, Duration::ZERO) {
+        Ok(Some(lock)) => return Ok(lock),
+        Ok(None) => {
+            // Current automatic recovery deliberately refuses pathname
+            // replacement at the mixed-version boundary. It still resolves
+            // and reports owner evidence before the bounded retry. Both that
+            // resolution and retry share this caller's one deadline.
+            crate::lifecycle::reclaim_stale_locks_within(
+                kin_root,
+                deadline.saturating_duration_since(Instant::now()),
+            )
+        }
+        Err(error) => return Err(DaemonError::Io(error)),
+    };
+
+    match crate::lifecycle::acquire_singleton_lock_within(
+        kin_root,
+        deadline.saturating_duration_since(Instant::now()),
+    ) {
+        Ok(Some(lock)) => Ok(lock),
+        Ok(None) => Err(DaemonError::RepoOwnedByAnotherDaemon(
+            singleton_contention_message(kin_root, reclaim),
+        )),
+        Err(error) => Err(DaemonError::Io(error)),
+    }
+}
+
 /// Actionable refusal text for a daemon that lost the per-repo singleton lock.
 ///
 /// Reads the holder from disk evidence and renders it. Kept split from
@@ -105,13 +149,26 @@ fn format_singleton_contention(
         ),
         _ => "stop any remaining kin-daemon process for this repo, then retry".to_string(),
     };
+    let compatibility_boundary = match reclaim {
+        crate::lifecycle::StaleLockReclaim::CoordinationUnavailable(reason) => {
+            format!(
+                " Automatic lock-file retirement was refused because safe coordination is \
+                 unavailable: {reason}. Replacing the inode cannot be proven safe."
+            )
+        }
+        _ => String::new(),
+    };
     if reclaimed > 0 {
         format!(
             "refusing to start a second daemon: {context} (reclaimed {reclaimed} stale lock \
-             file(s) first, and the lock is still contended). To proceed, {remedy}."
+             file(s) first, and the lock is still contended).{compatibility_boundary} To proceed, \
+             {remedy}."
         )
     } else {
-        format!("refusing to start a second daemon: {context}. To proceed, {remedy}.")
+        format!(
+            "refusing to start a second daemon: {context}.{compatibility_boundary} To proceed, \
+             {remedy}."
+        )
     }
 }
 
@@ -569,66 +626,21 @@ async fn enrich_single_entity(
 /// 3. The orphan session sweeper (Phase 7)
 ///
 /// All run concurrently. Any shutting down causes the others to stop.
-pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
-    // Singleton guard: at most one daemon per repo. Acquire an exclusive OS
-    // lock on `.kin/daemon.lock` before any side effects (no LSP discovery, no
-    // pid/port files, no bound port). If another live daemon already owns this
-    // repo, refuse to start a second process that would fight over the same
-    // graph/kindb state — exit cleanly so the caller treats it as a no-op. The
-    // kernel releases the lock on process death (including SIGKILL), so it can
-    // never go stale.
-    //
-    // Held in `_daemon_lock` for the whole body of `run()`; it is dropped only
-    // after the final endpoint-file cleanup below, releasing the lock last.
-    let _daemon_lock = match crate::lifecycle::acquire_singleton_lock(state.layout.root()) {
-        Ok(Some(lock)) => lock,
-        Ok(None) => {
-            // Contended. Either a live daemon already owns this repo, or a
-            // forked child leaked the flock fd past its dead parent (os error 35
-            // with no live owner). Reclaim clears only the latter — it acts only
-            // on a recorded owner that is present and dead — so a genuine second
-            // daemon still refuses to start.
-            let reclaim = crate::lifecycle::reclaim_stale_locks(state.layout.root());
-            let cleared = reclaim.cleared().len();
-            if cleared > 0 {
-                warn!(
-                    repo = %state.layout.root().display(),
-                    cleared,
-                    "reclaimed stale repo locks left by a dead daemon; retrying singleton acquire"
-                );
-            }
-            // Retry for a bounded window either way: an exiting daemon releases
-            // the flock as its process dies, and refusing on the first
-            // EWOULDBLOCK turns that handoff into a user-visible failure.
-            match crate::lifecycle::acquire_singleton_lock_within(
-                state.layout.root(),
-                crate::lifecycle::SINGLETON_LOCK_RETRY_BUDGET,
-            ) {
-                Ok(Some(lock)) => lock,
-                Ok(None) => {
-                    // Still held. Name the holder from real process evidence so
-                    // the operator knows exactly which process to wait for or
-                    // stop, and fail loudly instead of exiting 0 — a silent
-                    // clean exit reaches the CLI only as "daemon exited during
-                    // startup", which describes nothing.
-                    return Err(DaemonError::RepoOwnedByAnotherDaemon(
-                        singleton_contention_message(state.layout.root(), reclaim),
-                    ));
-                }
-                Err(error) => return Err(DaemonError::Io(error)),
-            }
-        }
-        Err(error) => return Err(DaemonError::Io(error)),
-    };
+pub async fn run(state: DaemonState, config: DaemonConfig) -> Result<()> {
+    let authority = acquire_daemon_authority(state.layout.root())?;
+    run_with_authority(state, config, authority).await
+}
 
-    // Stamp ownership immediately, before the slower migrate / LSP-discovery
-    // steps below. A contending starter consults `daemon.pid` to decide whether
-    // a contended lock is a live owner (refuse) or a dead-owner stale lock
-    // (reclaim); recording our live PID now closes the window where a lingering
-    // dead-owner PID could be mistaken for reclaimable while we already hold the
-    // lock. The port file is still written later, once the port is bound.
-    crate::lifecycle::write_pid_file(state.layout.root());
-
+/// Run with repository singleton authority already acquired.
+///
+/// The production process entrypoint uses this form so the lifetime guard is
+/// held before `DaemonState::open*` can recover or publish persisted state.
+/// [`run`] remains as the source-compatible wrapper for library callers.
+pub async fn run_with_authority(
+    mut state: DaemonState,
+    config: DaemonConfig,
+    _daemon_lock: crate::lifecycle::DaemonLock,
+) -> Result<()> {
     // Refuse to serve an incompatible `.kin/` layout. We now hold the singleton
     // lock (sole writer for this repo) but have not bound a port, written
     // endpoint files, or touched graph/kindb state — the safe point to validate
@@ -682,19 +694,14 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
     // a port, dropped it, and a sibling process stole it before the daemon bound.
     let (api_listener, bound_port) = match api::bind_api_listener(&state, config.api_port) {
         Ok(bound) => bound,
-        Err(error) => {
-            // We hold the singleton lock and already wrote daemon.pid; drop the
-            // pid file so a failed bind never strands a stale endpoint record.
-            crate::lifecycle::remove_pid_file(state.layout.root());
-            return Err(DaemonError::Io(error));
-        }
+        Err(error) => return Err(DaemonError::Io(error)),
     };
 
-    // Publish the actual bound port so CLI processes can discover and auto-connect.
-    // Each repo gets its own daemon on its own port — the port file enables
-    // per-repo isolation (critical for benchmark worktrees). The PID file was
-    // written earlier, immediately after acquiring the singleton lock.
-    crate::lifecycle::write_port_file(state.layout.root(), bound_port);
+    // Publish PID and the actual bound port as one lifecycle-authorized
+    // operation. Endpoint retirement takes the same authority, so no client can
+    // delete a successor publication using a verdict about its predecessor.
+    crate::lifecycle::publish_daemon_endpoint(state.layout.root(), bound_port)
+        .map_err(DaemonError::Io)?;
 
     // Shutdown signal: when set to true, all loops exit.
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
@@ -2501,6 +2508,27 @@ mod tests {
         assert!(
             unknown.contains("names no owner"),
             "an unidentifiable holder must be described as such, not guessed at: {unknown}"
+        );
+
+        let compatibility_boundary = format_singleton_contention(
+            "/repo/.kin",
+            Some(crate::lifecycle::SingletonLockHolder {
+                pid: 4242,
+                alive: false,
+            }),
+            &crate::lifecycle::StaleLockReclaim::CoordinationUnavailable(
+                "recorded owner pid 4242 is dead, but compatible older daemons do not participate"
+                    .to_string(),
+            ),
+        );
+        assert!(
+            compatibility_boundary.contains("Automatic lock-file retirement was refused"),
+            "the refusal must disclose the unsupported mixed-version boundary: \
+             {compatibility_boundary}"
+        );
+        assert!(
+            compatibility_boundary.contains("cannot be proven safe"),
+            "the message must not claim exclusion it cannot enforce: {compatibility_boundary}"
         );
     }
 

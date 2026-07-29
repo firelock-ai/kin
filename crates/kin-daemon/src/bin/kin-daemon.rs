@@ -12,7 +12,7 @@ use std::process;
 use std::time::Duration;
 
 use kin_core::KinLayout;
-use kin_daemon::{run, DaemonConfig, DaemonState};
+use kin_daemon::{acquire_daemon_authority, run_with_authority, DaemonConfig, DaemonState};
 use tracing_subscriber::EnvFilter;
 
 kin_buildinfo::embed_update_build_identity!(
@@ -173,6 +173,17 @@ fn create_state(
             )?)
         }
     }
+}
+
+fn acquire_before_state<T>(
+    kin_root: &Path,
+    acquire: impl FnOnce(&Path) -> kin_daemon::Result<kin_daemon::lifecycle::DaemonLock>,
+    create: impl FnOnce() -> std::result::Result<T, Box<dyn std::error::Error>>,
+) -> std::result::Result<(T, kin_daemon::lifecycle::DaemonLock), Box<dyn std::error::Error>> {
+    let authority =
+        acquire(kin_root).map_err(|error| Box::new(error) as Box<dyn std::error::Error>)?;
+    let state = create()?;
+    Ok((state, authority))
 }
 
 #[cfg(feature = "gcs")]
@@ -408,10 +419,13 @@ async fn async_main() -> i32 {
         }
     };
 
-    let state = match create_state(layout, &args.storage, &repo_id) {
-        Ok(state) => state,
+    let kin_root = layout.root().to_path_buf();
+    let (state, authority) = match acquire_before_state(&kin_root, acquire_daemon_authority, || {
+        create_state(layout, &args.storage, &repo_id)
+    }) {
+        Ok(opened) => opened,
         Err(error) => {
-            eprintln!("kin-daemon: failed to open daemon state: {error}");
+            eprintln!("kin-daemon: failed to acquire daemon authority or open state: {error}");
             process::exit(1);
         }
     };
@@ -451,7 +465,7 @@ async fn async_main() -> i32 {
         ..DaemonConfig::default()
     };
 
-    if let Err(error) = run(state, config).await {
+    if let Err(error) = run_with_authority(state, config, authority).await {
         eprintln!("kin-daemon: {error}");
         return 1;
     }
@@ -462,6 +476,7 @@ async fn async_main() -> i32 {
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use tracing::level_filters::LevelFilter;
     use tracing_subscriber::fmt::MakeWriter;
@@ -471,6 +486,32 @@ mod tests {
     /// the process's stdout/stderr to.
     #[derive(Clone)]
     struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+
+    #[test]
+    fn singleton_authority_is_acquired_before_state_construction() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let first = kin_daemon::lifecycle::acquire_singleton_lock(root)
+            .expect("first lock IO")
+            .expect("first starter must own the repo");
+        let state_constructor_called = AtomicBool::new(false);
+
+        let opened = acquire_before_state(
+            root,
+            |root| kin_daemon::daemon::acquire_daemon_authority_within(root, Duration::ZERO),
+            || {
+                state_constructor_called.store(true, Ordering::SeqCst);
+                Ok::<_, Box<dyn std::error::Error>>(())
+            },
+        );
+
+        assert!(opened.is_err(), "the contending starter must be refused");
+        assert!(
+            !state_constructor_called.load(Ordering::SeqCst),
+            "state construction must not run before singleton authority is acquired"
+        );
+        drop(first);
+    }
 
     impl Write for SharedBuf {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
