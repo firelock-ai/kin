@@ -54,6 +54,11 @@ pub struct GraphHealthReport {
     pub semantic_relation_density_excluding_cochanges: f64,
     pub critical_issues: Vec<String>,
     pub warnings: Vec<String>,
+    /// Observations that describe a healthy graph rather than a defect. They
+    /// are reported separately so a first import does not present expected
+    /// absences as problems.
+    #[serde(default)]
+    pub notes: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -318,6 +323,7 @@ fn build_graph_health_report(
 ) -> GraphHealthReport {
     let test_role_entity_count = stats.role_counts.get("Test").copied().unwrap_or(0);
     let cochange_relation_count = stats.relation_counts.get("CoChanges").copied().unwrap_or(0);
+    let coverage_relation_count = stats.relation_counts.get("Covers").copied().unwrap_or(0);
     let semantic_relation_count = stats
         .total_relations
         .saturating_sub(cochange_relation_count);
@@ -337,6 +343,7 @@ fn build_graph_health_report(
 
     let mut critical_issues = Vec::new();
     let mut warnings = Vec::new();
+    let mut notes = Vec::new();
 
     if !artifact_coverage.repository_tree_in_sync {
         critical_issues.push(format!(
@@ -387,11 +394,21 @@ fn build_graph_health_report(
         ));
     }
 
+    // Test-role entities without a catalog are the normal shape of a repository
+    // that has never run `kin verify`; only surviving coverage relationships
+    // prove a catalog existed and is now gone.
     if test_role_entity_count > 0 && stats.test_case_count == 0 {
-        warnings.push(format!(
-            "graph contains {} Test-role entities but no verification test-case catalog",
-            test_role_entity_count
-        ));
+        if coverage_relation_count > 0 {
+            warnings.push(format!(
+                "graph contains {} Test-role entities and {} Covers relations, but the verification test-case catalog is empty",
+                test_role_entity_count, coverage_relation_count
+            ));
+        } else {
+            notes.push(format!(
+                "graph contains {} Test-role entities; no verification test-case catalog has been recorded yet",
+                test_role_entity_count
+            ));
+        }
     }
 
     if stats.total_entities > 0 && stats.total_relations == 0 {
@@ -436,6 +453,7 @@ fn build_graph_health_report(
         semantic_relation_density_excluding_cochanges: semantic_density,
         critical_issues,
         warnings,
+        notes,
     }
 }
 
@@ -514,16 +532,18 @@ mod tests {
         assert!(report.critical_issues.is_empty());
     }
 
-    #[test]
-    fn health_report_flags_contamination_and_missing_test_cases() {
+    fn test_role_stats() -> GraphStats {
         let mut stats = stats();
         stats.total_entities = 12;
         stats.total_relations = 9;
         stats.role_counts.insert("Test".to_string(), 4);
         stats.relation_counts.insert("CoChanges".to_string(), 8);
+        stats
+    }
 
-        let report = build_graph_health_report(
-            &stats,
+    fn contamination_report(stats: &GraphStats) -> GraphHealthReport {
+        build_graph_health_report(
+            stats,
             &SupportedInputCounts {
                 entity_source: 2,
                 shallow_source: 0,
@@ -535,7 +555,12 @@ mod tests {
                 path_samples: vec!["out/generated.rs".to_string()],
             },
             complete_coverage(),
-        );
+        )
+    }
+
+    #[test]
+    fn health_report_flags_contamination() {
+        let report = contamination_report(&test_role_stats());
 
         assert_eq!(report.contaminated_path_count, 3);
         assert_eq!(report.semantic_relation_count, 1);
@@ -543,10 +568,55 @@ mod tests {
             .critical_issues
             .iter()
             .any(|issue| issue.contains("skipped/generated/internal paths")));
+    }
+
+    #[test]
+    fn absent_test_case_catalog_without_coverage_edges_is_a_note() {
+        let report = contamination_report(&test_role_stats());
+
+        assert!(report
+            .notes
+            .iter()
+            .any(|note| note.contains("no verification test-case catalog has been recorded yet")));
+        assert!(!report
+            .warnings
+            .iter()
+            .any(|issue| issue.contains("test-case catalog")));
+    }
+
+    #[test]
+    fn absent_test_case_catalog_with_surviving_coverage_edges_is_a_warning() {
+        let mut stats = test_role_stats();
+        stats.relation_counts.insert("Covers".to_string(), 5);
+        let report = contamination_report(&stats);
+
         assert!(report
             .warnings
             .iter()
-            .any(|issue| issue.contains("no verification test-case catalog")));
+            .any(|issue| issue.contains("5 Covers relations")
+                && issue.contains("verification test-case catalog is empty")));
+        assert!(!report
+            .notes
+            .iter()
+            .any(|note| note.contains("test-case catalog")));
+    }
+
+    #[test]
+    fn populated_test_case_catalog_reports_neither_note_nor_warning() {
+        let mut stats = test_role_stats();
+        stats.test_case_count = 7;
+        stats.relation_counts.insert("Covers".to_string(), 5);
+
+        let report = contamination_report(&stats);
+
+        assert!(!report
+            .warnings
+            .iter()
+            .any(|issue| issue.contains("test-case catalog")));
+        assert!(!report
+            .notes
+            .iter()
+            .any(|note| note.contains("test-case catalog")));
     }
 
     #[test]
