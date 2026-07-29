@@ -1966,7 +1966,7 @@ fn main() -> Result<()> {
             .init();
     } else {
         tracing_subscriber::registry()
-            .with(default_env_filter(false))
+            .with(default_env_filter(false, &command_name))
             .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
             .init();
     }
@@ -3114,20 +3114,133 @@ fn env_flag(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn default_env_filter(profile_enabled: bool) -> EnvFilter {
+/// Commands that run one long uninterruptible phase over a whole repository.
+///
+/// For everything else the default stays `warn`, because a short command that
+/// prints its own result has nothing to report in between. These two can spend
+/// hours inside a single call, and at that length no output at all is
+/// indistinguishable from a wedged process: a full-history admission was once
+/// killed after 11h43m of silence that turned out to be ordinary progress.
+const PROGRESS_REPORTING_COMMANDS: [&str; 2] = ["init", "clone"];
+
+/// Progress-bearing targets raised to `info` for [`PROGRESS_REPORTING_COMMANDS`].
+///
+/// Deliberately target-scoped rather than crate-wide. `kin_core=info` would also
+/// surface every unrelated event those crates emit, which is how a default
+/// filter becomes noise nobody reads. Add a target here only when it reports
+/// admission or validation progress.
+///
+/// The two `kin_core` modules hold three event callsites between them, none in a
+/// loop, so they contribute at most three lines to an admission. The KinDB
+/// target reports periodic replay progress and is throttled at its source; it
+/// stays inert until this workspace depends on a KinDB that emits it, because a
+/// directive naming an absent target simply never matches.
+const ADMISSION_PROGRESS_TARGETS: [&str; 3] = [
+    "kin_core::init",
+    "kin_core::git_init",
+    "kin_db::storage::history_replay",
+];
+
+fn default_env_filter(profile_enabled: bool, command: &str) -> EnvFilter {
     if std::env::var_os("RUST_LOG").is_some() {
-        EnvFilter::from_default_env()
-    } else if profile_enabled {
-        EnvFilter::new("info")
-    } else {
-        EnvFilter::new("warn")
+        return EnvFilter::from_default_env();
     }
+    EnvFilter::new(default_filter_directives(profile_enabled, command))
+}
+
+/// The directive string [`default_env_filter`] would install, absent `RUST_LOG`.
+///
+/// Split out so the choice is testable without mutating process environment,
+/// which no test can do without racing every other test in the binary.
+fn default_filter_directives(profile_enabled: bool, command: &str) -> String {
+    if profile_enabled {
+        return "info".to_string();
+    }
+    if !PROGRESS_REPORTING_COMMANDS.contains(&command) {
+        return "warn".to_string();
+    }
+    let mut directives = String::from("warn");
+    for target in ADMISSION_PROGRESS_TARGETS {
+        directives.push(',');
+        directives.push_str(target);
+        directives.push_str("=info");
+    }
+    directives
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    /// A long admission must report progress without `RUST_LOG` being set.
+    #[test]
+    fn progress_reporting_commands_raise_admission_targets_to_info() {
+        for command in PROGRESS_REPORTING_COMMANDS {
+            let directives = default_filter_directives(false, command);
+            assert!(
+                directives.starts_with("warn"),
+                "{command} must keep warn as its floor: {directives}"
+            );
+            for target in ADMISSION_PROGRESS_TARGETS {
+                assert!(
+                    directives.contains(&format!("{target}=info")),
+                    "{command} must report {target} progress: {directives}"
+                );
+            }
+        }
+    }
+
+    /// Ordinary commands print their own result, so raising them would only add
+    /// noise to every invocation.
+    #[test]
+    fn ordinary_commands_keep_the_quiet_default() {
+        for command in ["locate", "commit", "status", "log", "help"] {
+            assert!(
+                !PROGRESS_REPORTING_COMMANDS.contains(&command),
+                "{command} is not a long single-phase command"
+            );
+            assert_eq!(
+                default_filter_directives(false, command),
+                "warn",
+                "{command} must stay quiet by default"
+            );
+        }
+    }
+
+    #[test]
+    fn profiling_still_raises_everything_to_info() {
+        for command in ["init", "locate"] {
+            assert_eq!(default_filter_directives(true, command), "info");
+        }
+    }
+
+    /// A malformed directive is silently dropped by `EnvFilter`, which would
+    /// disable progress reporting while every other test still passed. Parse the
+    /// exact string the binary installs and require each target to survive.
+    #[test]
+    fn every_default_directive_parses_and_is_retained() {
+        for (profile, command) in [
+            (false, "init"),
+            (false, "clone"),
+            (false, "locate"),
+            (true, "init"),
+        ] {
+            let directives = default_filter_directives(profile, command);
+            let filter = tracing_subscriber::filter::EnvFilter::builder()
+                .parse(&directives)
+                .unwrap_or_else(|error| {
+                    panic!("default directives {directives:?} must parse: {error}")
+                });
+            let rendered = filter.to_string();
+            for directive in directives.split(',') {
+                assert!(
+                    rendered.contains(directive),
+                    "directive {directive:?} was dropped from {rendered:?}"
+                );
+            }
+        }
+    }
 
     fn on_cli_test_stack(test: impl FnOnce() + Send + 'static) {
         std::thread::Builder::new()
