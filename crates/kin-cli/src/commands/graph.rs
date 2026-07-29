@@ -363,11 +363,7 @@ fn build_graph_status_response(
             lines.push(format!("⚠ {}", w));
         }
     }
-    // Notes describe expected absences, so they follow the verdict rather than
-    // suppressing it.
-    for note in &health.notes {
-        lines.push(format!("ℹ {}", note));
-    }
+    append_health_notes(&mut lines, &health.notes);
 
     Ok(GraphCommandResponse {
         lines,
@@ -375,6 +371,20 @@ fn build_graph_status_response(
             .then(|| format!("{} critical graph health issue(s) found", criticals.len())),
         source: None,
     })
+}
+
+/// Render a health report's notes in the single form every graph reporting
+/// surface uses.
+///
+/// Notes describe expected absences rather than defects, so they follow the
+/// verdict instead of suppressing it. `status` and `validate` render them from
+/// here so the two cannot drift: a surface that carries the verdict but drops
+/// the notes reports a repository whose enrichment is still pending as
+/// indistinguishable from a fully enriched one.
+fn append_health_notes(lines: &mut Vec<String>, notes: &[String]) {
+    for note in notes {
+        lines.push(format!("ℹ {}", note));
+    }
 }
 
 fn build_graph_validate_response(
@@ -502,6 +512,7 @@ fn build_graph_validate_response(
             lines.push(format!("✗ {}", issue));
         }
     }
+    append_health_notes(&mut lines, &health.notes);
 
     Ok(GraphCommandResponse {
         lines,
@@ -1776,6 +1787,48 @@ mod tests {
 
         let line = orphan_line(&response).expect("graph tree lacks the file, so it is orphaned");
         assert!(line.contains('1'), "{line}");
+    }
+
+    fn note_lines(response: &GraphCommandResponse) -> Vec<&String> {
+        response
+            .lines
+            .iter()
+            .filter(|line| line.starts_with('ℹ'))
+            .collect()
+    }
+
+    /// Notes describe a healthy graph rather than a defect, so a surface that
+    /// keeps the verdict but drops them under-reports the repository's real
+    /// state. Both graph surfaces read one health report, so both must render
+    /// the same notes for the same state, and a reported issue must not
+    /// suppress them.
+    #[test]
+    fn graph_validate_and_status_report_the_same_health_notes() {
+        let (_temp, _layout, binding, graph) = orphan_fixture(&["src/tracked.rs"]);
+        let mut entity = test_entity("covered");
+        entity.role = EntityRole::Test;
+        entity.file_origin = Some(FilePathId::new("src/tracked.rs"));
+        graph.upsert_entity(&entity).unwrap();
+
+        let validate = build_graph_validate_response(&binding, &graph).unwrap();
+        let status = build_graph_status_response(&binding, &graph).unwrap();
+
+        let validate_notes = note_lines(&validate);
+        assert!(
+            !validate_notes.is_empty(),
+            "validate must carry the health notes: {:?}",
+            validate.lines
+        );
+        assert_eq!(
+            validate_notes,
+            note_lines(&status),
+            "the two surfaces must not drift on note reporting"
+        );
+        assert!(
+            validate.lines.iter().any(|line| line.starts_with('✗')),
+            "this fixture also diverges, so notes are proven to survive a verdict: {:?}",
+            validate.lines
+        );
     }
 
     /// The converse: a file the graph's exact tree carries is not an orphan
