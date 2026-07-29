@@ -567,11 +567,24 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Install runtime guard tools
-        if: runner.os == 'macOS'
+        shell: bash
         run: |
           if ! command -v rg >/dev/null 2>&1; then
-            brew install ripgrep
+            case "$RUNNER_OS" in
+              Linux)
+                sudo apt-get update
+                sudo apt-get install --yes ripgrep
+                ;;
+              macOS)
+                brew install ripgrep
+                ;;
+              *)
+                echo "::error::unsupported runner OS for ripgrep install: $RUNNER_OS"
+                exit 1
+                ;;
+            esac
           fi
+          command -v rg
 
       - name: Validate installer checksum fixtures
         run: python3 scripts/test-install-checksum.py
