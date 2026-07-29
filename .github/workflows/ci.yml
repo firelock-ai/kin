@@ -543,6 +543,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Install runtime guard tools
+        if: runner.os == 'macOS'
+        run: |
+          if ! command -v rg >/dev/null 2>&1; then
+            brew install ripgrep
+          fi
+
       - name: Validate installer checksum fixtures
         run: python3 scripts/test-install-checksum.py
 

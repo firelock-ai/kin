@@ -23,6 +23,7 @@ use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use fs2::FileExt;
 #[cfg(target_os = "macos")]
 use sha2::{Digest as _, Sha256};
+#[cfg(target_os = "macos")]
 use tracing::info;
 
 pub use kin_cli::daemon_client::AutoStartError;
@@ -781,6 +782,7 @@ fn is_port_open(port: u16) -> bool {
     std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok()
 }
 
+#[cfg(target_os = "macos")]
 fn find_free_port() -> Option<u16> {
     std::net::TcpListener::bind("127.0.0.1:0")
         .ok()
@@ -790,6 +792,7 @@ fn find_free_port() -> Option<u16> {
 
 // ── Daemon Binary Discovery ─────────────────────────────────────────────
 
+#[cfg(target_os = "macos")]
 fn find_daemon_binary() -> Option<PathBuf> {
     if let Ok(explicit) = std::env::var("KIN_DAEMON_BIN") {
         let path = PathBuf::from(explicit);

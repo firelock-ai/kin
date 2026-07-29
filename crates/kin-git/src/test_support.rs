@@ -1290,7 +1290,6 @@ fn read_capture_pipe(
     pipe: &mut (impl io::Read + std::os::windows::io::AsRawHandle),
     buffer: &mut [u8],
 ) -> io::Result<PipeRead> {
-    use std::os::windows::io::AsRawHandle as _;
     use windows_sys::Win32::Foundation::{
         ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_PIPE_NOT_CONNECTED,
     };
@@ -1536,8 +1535,11 @@ mod tests {
     const RUNAWAY_OUTPUT_WORKER: &str = "TEST_FIXTURE_GIT_RUNAWAY_OUTPUT_WORKER";
     const DESCENDANT_PARENT: &str = "TEST_FIXTURE_GIT_DESCENDANT_PARENT";
     const DESCENDANT_MARKER: &str = "TEST_FIXTURE_GIT_DESCENDANT_MARKER";
+    #[cfg(unix)]
     const PARENT_DEATH_OWNER: &str = "TEST_FIXTURE_GIT_PARENT_DEATH_OWNER";
+    #[cfg(unix)]
     const PARENT_DEATH_DESCENDANT: &str = "TEST_FIXTURE_GIT_PARENT_DEATH_DESCENDANT";
+    #[cfg(unix)]
     const HOSTILE_GIT_MARKER: &str = "TEST_FIXTURE_GIT_HOSTILE_EXECUTABLE_MARKER";
 
     struct NeverEofCapturePipe;
