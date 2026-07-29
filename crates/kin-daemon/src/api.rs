@@ -6406,6 +6406,14 @@ async fn mcp_tools_call(
                 |_| {},
             )
             .await
+        } else if request.name == "kin_graph_status" {
+            let scope = match graph_authority {
+                RequestGraphAuthority::Head => kin_mcp::handlers::entities::GraphStatusScope::Head,
+                RequestGraphAuthority::SessionScope => {
+                    kin_mcp::handlers::entities::GraphStatusScope::TemporalSession
+                }
+            };
+            kin_mcp::handlers::entities::handle_daemon_graph_status(graph.as_ref(), scope)
         } else if request.name == "kin_transaction_commit" {
             Ok(crate::mcp_commit::commit_exact_transaction(
                 &state,
@@ -15270,6 +15278,7 @@ mod tests {
         assert!(result.text.contains("Live graph enrichment"));
 
         let graph_response = app
+            .clone()
             .oneshot(
                 Request::post("/commands/graph")
                     .header("content-type", "application/json")
@@ -15294,6 +15303,104 @@ mod tests {
             "graph status must report the daemon's mutable live view: {:?}",
             graph_result.lines
         );
+
+        let mcp_result = mcp_call(app, "kin_graph_status", serde_json::json!({})).await;
+        assert_ne!(
+            mcp_result.is_error,
+            Some(true),
+            "live MCP graph status failed: {mcp_result:?}"
+        );
+        let mcp_status: kin_mcp::handlers::entities::GraphStatusReport =
+            serde_json::from_str(&mcp_result_text(&mcp_result)).unwrap();
+        assert_eq!(
+            mcp_status.entity_count, 1,
+            "MCP graph status must not reuse the durable zero count"
+        );
+        assert_eq!(
+            mcp_status.view,
+            kin_mcp::handlers::entities::GraphStatusView::DaemonSelectedGraph
+        );
+        assert_eq!(
+            mcp_status.scope,
+            kin_mcp::handlers::entities::GraphStatusScope::Head
+        );
+        assert_eq!(
+            mcp_status.embedding_source,
+            kin_mcp::handlers::entities::GraphStatusEmbeddingSource::SelectedGraph
+        );
+        assert_eq!(
+            mcp_status.authority,
+            kin_mcp::handlers::entities::GraphStatusAuthority::RepoDaemon
+        );
+        assert!(!mcp_status.completion_attested);
+    }
+
+    #[tokio::test]
+    async fn mcp_graph_status_labels_the_graph_selected_by_temporal_scope() {
+        let state = test_state();
+        state
+            .graph
+            .upsert_entity(&test_entity("head_only", "src/head.rs"))
+            .unwrap();
+
+        let scoped_graph = Arc::new(kin_db::InMemoryGraph::new());
+        scoped_graph
+            .upsert_entity(&test_entity("historical_one", "src/old_one.rs"))
+            .unwrap();
+        scoped_graph
+            .upsert_entity(&test_entity("historical_two", "src/old_two.rs"))
+            .unwrap();
+        let scoped_stats = scoped_graph.graph_stats();
+        let scoped_embeddings = scoped_graph.embedding_status();
+        let session_id = SessionId::new();
+        state
+            .set_session_scope(
+                &session_id,
+                "git:historical".to_string(),
+                SemanticChangeId::from_hash(Hash256::from_bytes([0x7a; 32])),
+                Arc::clone(&scoped_graph),
+            )
+            .await;
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let result = mcp_call_as(
+            router(Arc::clone(&state)),
+            "kin_graph_status",
+            serde_json::json!({}),
+            session_id,
+        )
+        .await;
+        assert_ne!(result.is_error, Some(true), "{result:?}");
+        let report: kin_mcp::handlers::entities::GraphStatusReport =
+            serde_json::from_str(&mcp_result_text(&result)).unwrap();
+        assert_eq!(
+            report.scope,
+            kin_mcp::handlers::entities::GraphStatusScope::TemporalSession
+        );
+        assert_eq!(report.entity_count, scoped_stats.total_entities);
+        assert_eq!(report.relation_count, scoped_stats.total_relations);
+        assert_eq!(report.embeddings_indexed, scoped_embeddings.indexed);
+        assert_eq!(report.embeddings_pending, scoped_embeddings.pending);
+        assert_eq!(report.embeddings_total, scoped_embeddings.total);
+
+        // Scope comes from the graph resolver, not merely from the presence of
+        // a header. An unknown session therefore reports the actual HEAD view.
+        let unscoped = mcp_call_as(
+            router(state),
+            "kin_graph_status",
+            serde_json::json!({}),
+            SessionId::new(),
+        )
+        .await;
+        let unscoped_report: kin_mcp::handlers::entities::GraphStatusReport =
+            serde_json::from_str(&mcp_result_text(&unscoped)).unwrap();
+        assert_eq!(
+            unscoped_report.scope,
+            kin_mcp::handlers::entities::GraphStatusScope::Head
+        );
+        assert_eq!(unscoped_report.entity_count, 1);
     }
 
     #[tokio::test]

@@ -7,6 +7,7 @@ use kin_core::LocalRepositoryAuthorityBinding;
 use kin_model::entity::EntityKind;
 use kin_model::graph::{EntityFilter, GraphStore};
 use kin_model::relation::RelationKind;
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::error::{McpError, Result};
 use crate::session::SessionRegistry;
@@ -2511,47 +2512,136 @@ fn compact_entity_summary(entity: &kin_model::Entity) -> serde_json::Value {
     })
 }
 
-pub const GRAPH_STATUS_DESC: &str = "\
-Report the status of the semantic graph that MCP is serving from — the live entity, \
-relation and semantic-change counts, embedding-index coverage (embeddings_indexed / \
-embeddings_total / embeddings_pending), and the authority backing it. In product mode \
-this is answered by the repo daemon, so it reflects the daemon-owned, live graph state \
-rather than a stale MCP-local snapshot. Reach for it as a quick health/readiness check: \
-confirm the graph is populated, check how much of it has embeddings indexed (so you know \
-whether semantic_locate / vector retrieval will be complete or still warming up), and \
-verify you're talking to graph-owned truth before relying on the other tools. \
-Counts are exact but enrichment completeness is not attested (completion_attested), so a \
-populated graph is not by itself a complete one. Embedding coverage is measured on a \
-separate daemon surface: when it cannot be read, embeddings_available is false and the \
-numeric embedding fields are absent rather than zero — absent means not measured, never \
-measured-as-empty.";
+pub const GRAPH_STATUS_SCHEMA: &str = "kin.graph-status.v1";
 
-/// Report the health of the graph visible to this dispatcher.
+fn deserialize_graph_status_schema<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let schema = String::deserialize(deserializer)?;
+    if schema != GRAPH_STATUS_SCHEMA {
+        return Err(serde::de::Error::custom(format!(
+            "unsupported graph status schema '{schema}', expected '{GRAPH_STATUS_SCHEMA}'"
+        )));
+    }
+    Ok(schema)
+}
+
+fn deserialize_graph_status_unattested<'de, D>(
+    deserializer: D,
+) -> std::result::Result<bool, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let completion_attested = bool::deserialize(deserializer)?;
+    if completion_attested {
+        return Err(serde::de::Error::custom(
+            "kin.graph-status.v1 does not carry an enrichment-completion attestation",
+        ));
+    }
+    Ok(false)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphStatusView {
+    DaemonSelectedGraph,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphStatusScope {
+    Head,
+    TemporalSession,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphStatusEmbeddingSource {
+    SelectedGraph,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum GraphStatusAuthority {
+    RepoDaemon,
+}
+
+/// Exact readiness counters for the one daemon query graph selected for an MCP
+/// call.
 ///
-/// In product mode this handler runs inside the repo daemon, so the count
-/// reflects daemon-owned live graph state. Offline tests may still call it
-/// against an explicit in-process graph.
+/// The schema, view, and scope are load-bearing. In particular, HEAD and a
+/// temporal session graph are both daemon-owned but are not interchangeable.
+/// Unknown fields require a new schema version instead of silently changing
+/// what an existing consumer believes it measured.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GraphStatusReport {
+    #[serde(deserialize_with = "deserialize_graph_status_schema")]
+    pub schema: String,
+    pub view: GraphStatusView,
+    pub scope: GraphStatusScope,
+    pub authority: GraphStatusAuthority,
+    pub entity_count: usize,
+    pub relation_count: usize,
+    pub embedding_source: GraphStatusEmbeddingSource,
+    pub embeddings_indexed: usize,
+    pub embeddings_pending: usize,
+    pub embeddings_total: usize,
+    /// Exact counts do not attest that every eligible source has been enriched.
+    #[serde(deserialize_with = "deserialize_graph_status_unattested")]
+    pub completion_attested: bool,
+}
+
+pub const GRAPH_STATUS_DESC: &str = "\
+Report the status of the exact semantic graph selected for this MCP call — live entity \
+and relation counts, embedding-index coverage (embeddings_indexed / embeddings_total / \
+embeddings_pending), and the schema, view, scope, and authority backing them. In product \
+mode one repo-daemon response owns every field, including for an X-Kin-Session temporal \
+scope, so durable repository counts cannot be mixed with a different live/session graph. \
+Reach for it as a quick health/readiness check: confirm the selected graph is populated, \
+check how much of its own retrieval universe has embeddings indexed, and verify the scope \
+before relying on other tools. embedding_source is selected_graph; any pipeline-specific \
+fallback coverage is reported by semantic_locate itself. Counts are exact but enrichment \
+completeness is not attested (completion_attested=false), so a populated graph is not by \
+itself a complete one. This tool requires the Kin daemon; it does not invent an offline \
+approximation.";
+
+pub fn handle_daemon_graph_status(
+    graph: &kin_db::InMemoryGraph,
+    scope: GraphStatusScope,
+) -> Result<ToolCallResult> {
+    let stats = graph.graph_stats();
+    let embeddings = graph.embedding_status();
+    let report = GraphStatusReport {
+        schema: GRAPH_STATUS_SCHEMA.to_string(),
+        view: GraphStatusView::DaemonSelectedGraph,
+        scope,
+        authority: GraphStatusAuthority::RepoDaemon,
+        entity_count: stats.total_entities,
+        relation_count: stats.total_relations,
+        embedding_source: GraphStatusEmbeddingSource::SelectedGraph,
+        embeddings_indexed: embeddings.indexed,
+        embeddings_pending: embeddings.pending,
+        embeddings_total: embeddings.total,
+        completion_attested: false,
+    };
+    Ok(ToolCallResult::text(serde_json::to_string_pretty(&report)?))
+}
+
+/// Fail closed on the generic in-process dispatcher.
+///
+/// Product mode is special-cased by the daemon so it can identify the selected
+/// scope and read the concrete embedding status. A bare [`GraphStore`] cannot
+/// satisfy that contract.
 pub fn handle_graph_status<G: GraphStore>(
     _args: &HashMap<String, serde_json::Value>,
-    store: &G,
+    _store: &G,
 ) -> Result<ToolCallResult> {
-    let entities = store.list_all_entities().map_err(McpError::graph)?;
-    let entity_count = entities.len();
-
-    let result = serde_json::json!({
-        "entity_count": entity_count,
-        "authority": "repo-daemon",
-        // Embedding coverage is computed by the daemon from its live graph and
-        // is not reachable from a bare `GraphStore`. Marked unavailable rather
-        // than omitted silently, so this path cannot be read as a measurement
-        // of an unembedded graph.
-        "embeddings_available": false,
-        "embeddings_unavailable_reason": "in-process dispatch has no daemon embedding surface",
-        "note": "Product MCP calls are served by the repo daemon. Offline in-process dispatch is test-only."
-    });
-
-    let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
-    Ok(ToolCallResult::text(json))
+    Ok(ToolCallResult::error(
+        "kin_graph_status requires the Kin daemon: the generic in-process graph surface cannot \
+         measure the exact embedding universe or identify HEAD versus a temporal session scope",
+    ))
 }
 
 #[cfg(test)]
@@ -3695,5 +3785,45 @@ mod tests {
             call_site.is_none(),
             "outgoing-only neighborhood traversal reintroduced: {call_site:?}"
         );
+    }
+
+    #[test]
+    fn daemon_graph_status_measures_one_selected_graph() {
+        let graph = InMemoryGraph::new();
+        let caller = make_entity("caller", "src/caller.rs");
+        let callee = make_entity("callee", "src/callee.rs");
+        graph.upsert_entity(&caller).unwrap();
+        graph.upsert_entity(&callee).unwrap();
+        graph
+            .upsert_relation(&make_relation(caller.id, callee.id, RelationKind::Calls))
+            .unwrap();
+        let stats = graph.graph_stats();
+        let embeddings = graph.embedding_status();
+
+        let result = handle_daemon_graph_status(&graph, GraphStatusScope::TemporalSession).unwrap();
+        let report: GraphStatusReport = serde_json::from_value(parsed_response(&result)).unwrap();
+
+        assert_eq!(report.schema, GRAPH_STATUS_SCHEMA);
+        assert_eq!(report.view, GraphStatusView::DaemonSelectedGraph);
+        assert_eq!(report.scope, GraphStatusScope::TemporalSession);
+        assert_eq!(report.authority, GraphStatusAuthority::RepoDaemon);
+        assert_eq!(report.entity_count, stats.total_entities);
+        assert_eq!(report.relation_count, stats.total_relations);
+        assert_eq!(
+            report.embedding_source,
+            GraphStatusEmbeddingSource::SelectedGraph
+        );
+        assert_eq!(report.embeddings_indexed, embeddings.indexed);
+        assert_eq!(report.embeddings_pending, embeddings.pending);
+        assert_eq!(report.embeddings_total, embeddings.total);
+        assert!(!report.completion_attested);
+    }
+
+    #[test]
+    fn generic_graph_status_refuses_an_unmeasured_offline_approximation() {
+        let result = handle_graph_status(&HashMap::new(), &InMemoryGraph::new()).unwrap();
+        assert_eq!(result.is_error, Some(true));
+        let crate::types::ContentBlock::Text { text } = &result.content[0];
+        assert!(text.contains("requires the Kin daemon"), "{text}");
     }
 }
