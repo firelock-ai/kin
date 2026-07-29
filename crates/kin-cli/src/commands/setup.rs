@@ -1598,8 +1598,8 @@ fn configure_codex() -> Result<PathBuf> {
     let home = home_dir()?;
     let target = home.join(".codex").join("config.toml");
     let cwd = env::current_dir().context("could not determine the current directory")?;
-    let repo_root = kin_core::KinLayout::discover(&cwd)
-        .and_then(|layout| layout.working_dir().canonicalize().ok())
+    let repo_root = crate::commands::managed_config_scope::discover_repo_root()
+        .and_then(|root| root.canonicalize().ok())
         .with_context(|| {
             format!(
                 "Codex MCP setup requires an initialized Kin repository; run `kin init` in the target repository and re-run `kin setup` from it (current directory: {})",
@@ -1636,8 +1636,8 @@ fn configure_windsurf() -> Result<PathBuf> {
 
 fn current_initialized_setup_repo(client: &str) -> Result<PathBuf> {
     let cwd = env::current_dir().context("could not determine the current directory")?;
-    kin_core::KinLayout::discover(&cwd)
-        .and_then(|layout| layout.working_dir().canonicalize().ok())
+    crate::commands::managed_config_scope::discover_repo_root()
+        .and_then(|root| root.canonicalize().ok())
         .and_then(|root| canonical_initialized_repo(&root))
         .with_context(|| {
             format!(
@@ -8550,6 +8550,7 @@ impl ConfigLock {
     }
 
     fn plan_with_policy(path: &Path, private: bool) -> Result<ConfigLockPlan> {
+        crate::commands::managed_config_scope::guard_managed_path(path);
         #[cfg(unix)]
         let (path, parent) = Self::normalized_path_with_parent_authority(path)?;
         #[cfg(not(unix))]
@@ -15116,6 +15117,7 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
         assert!(git.status.success());
         let _home = EnvGuard::set("HOME", &home);
         let _kin_home = EnvGuard::set("KIN_HOME", &kin_home);
+        let _scan_root = EnvGuard::set(crate::commands::managed_config_scope::SCAN_ROOT_ENV, &repo);
         let previous = env::current_dir().unwrap();
         env::set_current_dir(&repo).unwrap();
         let _cwd = CurrentDirGuard(previous);
@@ -15160,6 +15162,79 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
         assert!(repaired.contains(&ConfigLock::normalized_path(&workspace).unwrap()));
         assert!(mcp_repair_targets_ledger_verified(&targets).unwrap());
         assert!(!kin_home.join("update-restart-ack-required.json").exists());
+    }
+
+    /// A repository enclosing the fixture is not the repository under test.
+    /// Discovery walks upward, so without a ceiling a test running below a real
+    /// checkout binds that checkout and captures its workspace MCP config.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn enclosing_workspace_config_is_never_captured_from_a_scoped_fixture() {
+        struct CurrentDirGuard(PathBuf);
+        impl Drop for CurrentDirGuard {
+            fn drop(&mut self) {
+                let _ = env::set_current_dir(&self.0);
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let outer = dir.path().join("enclosing-checkout");
+        let inner = outer.join("fixture");
+        let home = dir.path().join("home");
+        let kin_home = dir.path().join("kin-home");
+        fs::create_dir_all(outer.join(".kin")).unwrap();
+        fs::create_dir_all(outer.join(".agents")).unwrap();
+        fs::create_dir_all(&inner).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        let decoy = outer.join(".agents").join("mcp_config.json");
+        let decoy_bytes =
+            br#"{"mcpServers":{"kin":{"command":"/enclosing/kin","args":["mcp","start"]}}}"#;
+        fs::write(&decoy, decoy_bytes).unwrap();
+
+        let _home = EnvGuard::set("HOME", &home);
+        let _kin_home = EnvGuard::set("KIN_HOME", &kin_home);
+        let _scan_root =
+            EnvGuard::set(crate::commands::managed_config_scope::SCAN_ROOT_ENV, &inner);
+        let previous = env::current_dir().unwrap();
+        env::set_current_dir(&inner).unwrap();
+        let _cwd = CurrentDirGuard(previous);
+
+        let canonical_decoy = decoy.canonicalize().unwrap();
+        let discovered = crate::commands::health::mcp_client_config_paths();
+        assert!(
+            !discovered.iter().any(|(_, _, path)| path
+                .canonicalize()
+                .is_ok_and(|path| path == canonical_decoy)),
+            "discovery reached the enclosing checkout: {discovered:?}"
+        );
+
+        let targets = current_mcp_repair_targets().unwrap();
+        assert!(
+            !targets.iter().any(|target| target.path == canonical_decoy
+                || target.repo_root.as_deref() == Some(outer.canonicalize().unwrap().as_path())),
+            "repair capture reached the enclosing checkout: {targets:?}"
+        );
+        assert_eq!(fs::read(&decoy).unwrap(), decoy_bytes);
+    }
+
+    /// The fixture guard must fail at the moment an escaping path is resolved,
+    /// so a leak is reported against the flow that produced it.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    #[should_panic(expected = "managed config path escaped its fixture")]
+    fn managed_config_outside_the_declared_fixture_aborts_immediately() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = dir.path().join("fixture");
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(&fixture).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let _fixture_root = EnvGuard::set(
+            crate::commands::managed_config_scope::FIXTURE_ROOT_ENV,
+            &fixture,
+        );
+        let _ = ConfigLock::acquire(&outside.join("mcp.json"));
     }
 
     #[test]

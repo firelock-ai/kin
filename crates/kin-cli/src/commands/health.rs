@@ -792,9 +792,7 @@ pub(crate) fn mcp_client_config_paths() -> Vec<(&'static str, &'static str, Path
 }
 
 fn current_health_repo() -> Option<PathBuf> {
-    let cwd = env::current_dir().ok()?;
-    let layout = kin_core::KinLayout::discover(&cwd)?;
-    Some(layout.working_dir().to_path_buf())
+    crate::commands::managed_config_scope::discover_repo_root()
 }
 
 /// Inspect a single MCP config file for a `kin` server entry carrying the
