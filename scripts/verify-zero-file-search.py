@@ -340,7 +340,7 @@ QUERY_COMMANDS = {
 # never found, and a `pub(crate)` body an allowlist entry means to excuse would
 # not resolve.
 FN_DECL = re.compile(
-    r"^\s*(?:pub\s*(?:\([^)]*\)\s*)?)?(?:default\s+)?(?:const\s+)?(?:async\s+)?"
+    r"^\s*(?:pub(?:\s*\([^)]*\))?\s+)?(?:default\s+)?(?:const\s+)?(?:async\s+)?"
     r"(?:unsafe\s+)?(?:extern\s+\"[^\"]*\"\s+)?fn\s+([A-Za-z0-9_]+)\s*[(<]"
 )
 
@@ -417,7 +417,8 @@ def find_fn_body_ranges(lines, fn_names=None):
     A declaration with no body, a trait method or an `extern` signature ending
     in `;`, is skipped. Brace counting alone would find no opening brace and
     run the "body" to end of file, so a name that matched such a signature would
-    exempt everything after it.
+    exempt everything after it. The terminating `;` is only recognised outside
+    parentheses and brackets, so a `[u8; 32]` parameter is not mistaken for one.
     """
     found = {}
     n = len(lines)
@@ -431,13 +432,23 @@ def find_fn_body_ranges(lines, fn_names=None):
         depth = 0
         started = False
         bodyless = False
+        nesting = 0
         j = i
         while j < n:
             line = lines[j]
             if not started:
-                brace = line.find("{")
-                semi = line.find(";")
-                if semi >= 0 and (brace < 0 or semi < brace):
+                stop = -1
+                for pos, ch in enumerate(line):
+                    if ch in "([":
+                        nesting += 1
+                    elif ch in ")]":
+                        nesting -= 1
+                    elif ch == "{" and nesting <= 0:
+                        break
+                    elif ch == ";" and nesting <= 0:
+                        stop = pos
+                        break
+                if stop >= 0:
                     bodyless = True
                     break
             opens = line.count("{")
