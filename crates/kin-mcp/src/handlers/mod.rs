@@ -3477,6 +3477,73 @@ mod tests {
         }
     }
 
+    /// The widened refusal must be unreachable on the product surface.
+    ///
+    /// Refusing a body is only safe because `kin mcp start` pins
+    /// `DaemonRequired`, and in that mode every arm of the delegate match
+    /// returns before the in-process path is reached: a live daemon takes the
+    /// commit, and an unreachable one gets `daemon_required_unavailable`. That
+    /// invariant is the entire safety argument, and it currently holds only
+    /// because `uses_daemon()` and `requires_daemon()` happen to return the same
+    /// thing. They are separate methods, and the delegate match already carries
+    /// the fall-through arm that a third mode would activate; the first mode
+    /// that preferred a daemon but tolerated its absence would route product
+    /// writes into a path that refuses every body-carrying operation.
+    ///
+    /// Pinned here so that change fails a test instead of failing a user.
+    #[tokio::test]
+    async fn daemon_required_mode_never_reaches_the_in_process_refusal() {
+        use crate::session::{McpMutationOperation, McpMutationPayload};
+
+        let store = InMemoryGraph::default();
+        let entity = placement_free_entity("value");
+        store.upsert_entity(&entity).unwrap();
+
+        let sessions = SessionRegistry::new();
+        sessions.set_coordination_mode(crate::session::CoordinationEnforcementMode::Warn);
+        // Staged under OfflineFallback so the transaction exists locally; the
+        // commit below is the call under test.
+        let tx_id = begin_offline_transaction(&sessions, "daemon-required-refusal").await;
+        sessions
+            .stage_transaction(
+                &tx_id,
+                vec![McpMutationOperation {
+                    verb: "update".into(),
+                    target: entity.id.to_string(),
+                    payload: None::<McpMutationPayload>,
+                    body: Some("pub fn value() -> u8 { 2 }".into()),
+                    description: "body update".into(),
+                }],
+            )
+            .unwrap();
+
+        let mut commit_args = HashMap::new();
+        commit_args.insert("transaction_id".into(), serde_json::json!(tx_id));
+        let commit_res = sessions::handle_transaction_commit(
+            &commit_args,
+            &store,
+            &sessions,
+            SessionAuthorityMode::DaemonRequired,
+        )
+        .await
+        .unwrap();
+
+        let text = tool_result_text(&commit_res);
+        assert!(
+            !text.contains("source_body_requires_daemon_commit"),
+            "the in-process refusal must be unreachable under DaemonRequired, got: {text}"
+        );
+        assert!(
+            text.contains("daemon"),
+            "an unreachable daemon must say so rather than refuse the operation: {text}"
+        );
+        assert_eq!(
+            sessions.get_transaction(&tx_id).unwrap().state,
+            "active",
+            "delegation must not terminalize the transaction"
+        );
+    }
+
     #[tokio::test]
     async fn handle_transaction_stage_rejects_malformed_op_at_stage_time() {
         // D.7 Track A: a payload-less operation must fail loud at stage time —

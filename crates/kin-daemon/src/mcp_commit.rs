@@ -97,8 +97,11 @@ fn commit_exact_transaction_inner(
                 return Err(format!(
                     "Cannot commit transaction {transaction_id}: the inline operations differ from \
                      the operations already fenced for publication, and a fenced payload cannot be \
-                     edited. Re-send the fenced operations to resume it, or begin a new transaction \
-                     with kin_transaction_begin for a different change."
+                     edited. Re-send this commit with no `operations` array at all to resume the \
+                     fenced payload as it stands, which is the exit that always works and the one \
+                     to use when the fenced set includes operations staged separately. Re-sending \
+                     the exact fenced operations also resumes it. Begin a new transaction with \
+                     kin_transaction_begin only for a genuinely different change."
                 ));
             }
         } else {
@@ -405,6 +408,9 @@ fn resolve_commit_actor(sessions: &kin_mcp::SessionRegistry, session_id: &str) -
 /// `kin history` reads everything before the first `<` as the author's name and
 /// prints one row per revision, so an angle bracket or a newline arriving from a
 /// client-supplied session name would truncate or break the row it appears in.
+/// `/` goes too, because it is the separator the vendor and client names are
+/// joined with: a vendor of `a/b` with client `c` would otherwise render
+/// identically to a vendor of `a` with client `b/c`.
 fn provenance_label(raw: &str) -> String {
     /// Long enough for a real vendor and session name, short enough that a
     /// pathological one cannot dominate a change record.
@@ -413,7 +419,7 @@ fn provenance_label(raw: &str) -> String {
     let collapsed = raw
         .chars()
         .map(|character| {
-            if character.is_control() || matches!(character, '<' | '>') {
+            if character.is_control() || matches!(character, '<' | '>' | '/') {
                 ' '
             } else {
                 character
@@ -481,10 +487,18 @@ fn record_commit_provenance(
     committed: &NativeCommitResult,
 ) -> Result<(), String> {
     /// How far back a resume looks for the attribution it may already have
-    /// written. MCP commits are serialized behind the coordination gate, so a
-    /// resume sits within a handful of events of the attempt it is resuming;
-    /// the window is wide enough to absorb an interleaved restart and bounded
-    /// so the scan does not grow with the audit log.
+    /// written.
+    ///
+    /// Queried without an actor filter deliberately. The store applies its
+    /// limit with `take`, after any filter, so a filtered query short-circuits
+    /// only once it has found that many matching events; a session with fewer
+    /// commits than the limit never reaches it and the traversal runs the whole
+    /// log. Unfiltered, the limit bounds the traversal itself, which is the
+    /// property this needs. The derived event ids do the matching.
+    ///
+    /// MCP commits are serialized behind the coordination gate, so a resume
+    /// sits within a handful of events of the attempt it is resuming, and the
+    /// window is wide enough to absorb an interleaved restart.
     const DEDUP_WINDOW: usize = 1024;
 
     graph
@@ -520,7 +534,7 @@ fn record_commit_provenance(
     };
 
     let already_recorded = graph
-        .query_audit_events(Some(&actor.actor.actor_id), DEDUP_WINDOW)
+        .query_audit_events(None, DEDUP_WINDOW)
         .map_err(|error| format!("read existing commit attribution: {error}"))?
         .into_iter()
         .map(|event| event.event_id)
@@ -745,6 +759,29 @@ fn plan_exact_transaction(
                 {
                     return Err(format!(
                         "staged source span for entity {} does not match repository authority",
+                        existing.id
+                    ));
+                }
+                // The commit publishes whatever reparsing the new bytes derives,
+                // so a payload field the caller edited by hand cannot survive.
+                // Refusing an edited one is the same rule already applied to
+                // name, kind, origin, and span, extended to the two fields an
+                // agent would plausibly try to change on their own: keeping
+                // them would report a metadata edit as committed while
+                // publishing only the body.
+                if payload_entity.doc_summary != existing.doc_summary {
+                    return Err(format!(
+                        "staged doc summary for entity {} differs from repository authority; \
+                         entity metadata is derived from the committed source, so send it \
+                         unchanged and put the new documentation in `body`",
+                        existing.id
+                    ));
+                }
+                if payload_entity.metadata != existing.metadata {
+                    return Err(format!(
+                        "staged metadata for entity {} differs from repository authority; \
+                         entity metadata is derived from the committed source and cannot be \
+                         set directly, so send it unchanged",
                         existing.id
                     ));
                 }
@@ -2079,12 +2116,17 @@ mod tests {
             },
         )
         .unwrap();
+        // `kin history` gives the author column 20 characters and ellipsizes
+        // past that, so "claude-code/one-change-demo" (27) renders cut. Asserted
+        // in its rendered form rather than on a prefix, so the truncation is a
+        // stated property of this surface instead of an accident the assertion
+        // happens to survive.
         assert!(
             history
                 .lines
                 .iter()
-                .any(|line| line.contains("claude-code/one-c")),
-            "history must name the committing agent: {:#?}",
+                .any(|line| line.contains("claude-code/one-cha\u{2026}")),
+            "history must name the committing agent, truncated to its column: {:#?}",
             history.lines
         );
 
@@ -2150,6 +2192,203 @@ mod tests {
                 .len(),
             1,
             "the audit trail must be queryable by the agent that wrote it"
+        );
+    }
+
+    /// Asking who touched one entity must not answer with another entity's writer.
+    ///
+    /// Every field of the provenance response is keyed to the entity asked
+    /// about, so an audit list filled from the repository's most recent activity
+    /// reads as that entity's history. Before anything wrote audit events the
+    /// list was always empty and the omission was invisible; once commits record
+    /// attribution it becomes a confident wrong answer. Two entities, two
+    /// sessions, and the later commit is the unrelated one, so an unfiltered
+    /// list would put the wrong agent at the top.
+    #[test]
+    fn provenance_answers_for_the_entity_asked_about_not_the_latest_commit() {
+        let (_dir, state) = test_state();
+        let (subject, _) = install_exact_source(
+            &state,
+            "src/subject.rs",
+            b"pub fn subject() -> u8 { 1 }\n",
+            "subject",
+        );
+        let (unrelated, _) = install_exact_source(
+            &state,
+            "src/unrelated.rs",
+            b"pub fn unrelated() -> u8 { 1 }\n",
+            "unrelated",
+        );
+        let sessions = kin_mcp::SessionRegistry::new();
+
+        let author = start_agent_session(&sessions, "claude-code", "feature-work");
+        let result = commit_one_entity_edit(
+            &state,
+            &sessions,
+            &author.session_id.to_string(),
+            &subject,
+            "pub fn subject() -> u8 { 2 }",
+        );
+        assert_ne!(
+            result.is_error,
+            Some(true),
+            "subject commit failed: {}",
+            result_text(&result)
+        );
+
+        // A different session commits something else, afterwards, so it owns
+        // the most recent audit rows.
+        let other = start_agent_session(&sessions, "codex", "cleanup");
+        let result = commit_one_entity_edit(
+            &state,
+            &sessions,
+            &other.session_id.to_string(),
+            &unrelated,
+            "pub fn unrelated() -> u8 { 2 }",
+        );
+        assert_ne!(
+            result.is_error,
+            Some(true),
+            "unrelated commit failed: {}",
+            result_text(&result)
+        );
+
+        let provenance = kin_mcp::handlers::provenance::handle_provenance_query(
+            &HashMap::from([(
+                "entity_id".to_string(),
+                serde_json::json!(subject.id.to_string()),
+            )]),
+            state.graph.as_ref(),
+        )
+        .unwrap();
+        let provenance: serde_json::Value = serde_json::from_str(result_text(&provenance)).unwrap();
+        let events = provenance["recent_audit_events"].as_array().unwrap();
+        assert_eq!(
+            events.len(),
+            1,
+            "only the subject's own write belongs in its provenance: {provenance}"
+        );
+        assert_eq!(
+            events[0]["target_scope"]["Entity"],
+            serde_json::json!(subject.id.to_string()),
+            "the surviving event must name the entity that was asked about"
+        );
+        let details: serde_json::Value =
+            serde_json::from_str(events[0]["details"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            details["actor"], "claude-code/feature-work",
+            "the answer must be the agent that wrote this entity, not the last agent to write anything"
+        );
+
+        // And the same query for the other entity answers with the other agent,
+        // so the filter narrows rather than simply returning the first event.
+        let other_provenance = kin_mcp::handlers::provenance::handle_provenance_query(
+            &HashMap::from([(
+                "entity_id".to_string(),
+                serde_json::json!(unrelated.id.to_string()),
+            )]),
+            state.graph.as_ref(),
+        )
+        .unwrap();
+        let other_provenance: serde_json::Value =
+            serde_json::from_str(result_text(&other_provenance)).unwrap();
+        let other_events = other_provenance["recent_audit_events"].as_array().unwrap();
+        assert_eq!(other_events.len(), 1);
+        let other_details: serde_json::Value =
+            serde_json::from_str(other_events[0]["details"].as_str().unwrap()).unwrap();
+        assert_eq!(other_details["actor"], "codex/cleanup");
+    }
+
+    /// A payload field the commit cannot honor is refused, not dropped.
+    ///
+    /// The commit publishes what reparsing the new bytes derives, so a
+    /// doc summary the caller edited by hand never lands. Committing the body
+    /// and discarding that edit reports `ops_applied: 1` for an operation only
+    /// half of which happened, which is the same defect this PR closes on the
+    /// other path, in the other half of the operation.
+    #[test]
+    fn an_edited_payload_field_the_commit_cannot_honor_is_refused() {
+        let (_dir, state) = test_state();
+        let (entity, _) = install_exact_source(
+            &state,
+            "src/lib.rs",
+            b"pub fn value() -> u8 { 1 }\n",
+            "value",
+        );
+        let before = load_native_commit_base(&state.layout).unwrap();
+        let sessions = test_sessions();
+        let transaction = sessions
+            .begin_transaction(TEST_SESSION, "file:src/lib.rs")
+            .unwrap();
+
+        let mut edited = entity.clone();
+        edited.doc_summary = Some("returns the configured value".to_string());
+        let arguments = HashMap::from([
+            (
+                "transaction_id".to_string(),
+                serde_json::json!(transaction.transaction_id),
+            ),
+            (
+                "operations".to_string(),
+                serde_json::json!([{
+                    "verb": "update",
+                    "target": entity.id.to_string(),
+                    "payload": {"Entity": edited},
+                    "body": "pub fn value() -> u8 { 2 }",
+                    "description": "body edit plus a hand-edited doc summary",
+                }]),
+            ),
+        ]);
+        let result = commit_exact_transaction(&state, &sessions, &arguments, None);
+        assert_eq!(
+            result.is_error,
+            Some(true),
+            "a metadata edit that cannot land must be refused: {}",
+            result_text(&result)
+        );
+        assert!(
+            result_text(&result).contains("doc summary"),
+            "the refusal must name the field it could not honor: {}",
+            result_text(&result)
+        );
+
+        let after = load_native_commit_base(&state.layout).unwrap();
+        assert_eq!(
+            after.roots.generation, before.roots.generation,
+            "the body must not land on its own while the metadata half is refused"
+        );
+        assert_eq!(
+            std::fs::read(state.layout.working_dir().join("src/lib.rs")).unwrap(),
+            b"pub fn value() -> u8 { 1 }\n"
+        );
+    }
+
+    /// An unchanged payload beside a body still commits.
+    ///
+    /// The refusal above is scoped to a field the caller edited. Echoing back
+    /// the entity exactly as it was read is the documented shape and must keep
+    /// working.
+    #[test]
+    fn an_unedited_payload_beside_a_body_still_commits() {
+        let (_dir, state) = test_state();
+        let (entity, _) = install_exact_source(
+            &state,
+            "src/lib.rs",
+            b"pub fn value() -> u8 { 1 }\n",
+            "value",
+        );
+        let sessions = test_sessions();
+        let (_tx, arguments) = stage_entity_edit(&sessions, &entity, "pub fn value() -> u8 { 2 }");
+        let result = commit_exact_transaction(&state, &sessions, &arguments, None);
+        assert_ne!(
+            result.is_error,
+            Some(true),
+            "an unedited payload must still commit: {}",
+            result_text(&result)
+        );
+        assert_eq!(
+            std::fs::read(state.layout.working_dir().join("src/lib.rs")).unwrap(),
+            b"pub fn value() -> u8 { 2 }\n"
         );
     }
 
