@@ -303,25 +303,36 @@
     },
     {
       "file": "crates/kin-daemon/src/daemon.rs",
-      "reason": "Daemon run loop boundary. Two of the excused bodies decide whether this daemon's own endpoint records and control plane are still present, which is a liveness question about the process rather than a query about the repository. The third is the run loop itself, which canonicalizes the bound repository root and reports the process id while wiring authority into the server. No repository content is read and no query answer derives from any of it. Function-scoped so the rest of the module stays scanned.",
+      "reason": "Daemon run loop boundary. Two pins are the liveness checks that ask whether this daemon's own endpoint records and control plane are still present, which is a question about the process rather than about the repository. The rest are the run loop reporting its process id, exiting, and canonicalizing the bound repository root twice while wiring authority into the server. No repository content is read and no query answer derives from any of it. Pinned by expression rather than by function, because the run loop is half this module and exempting its body would leave more unscanned than the primitives justify.",
       "owner": "kin-daemon",
       "expiration": "2026-12-31",
-      "allow_fn": [
-        "endpoint_files_missing",
-        "control_plane_missing",
-        "run_with_authority"
+      "allow_match": [
+        "!root.join(\"daemon.pid\").exists() || !root.join(\"daemon.port\").exists()",
+        "!state.layout.root().exists() || endpoint_files_missing(state)",
+        {
+          "expr": ".canonicalize()",
+          "count": 2
+        },
+        "std::process::id(),",
+        "std::process::exit(0);"
       ]
     },
     {
       "file": "crates/kin-daemon/src/bin/kin-daemon.rs",
-      "reason": "Daemon process entry point. The excused bodies are argument parsing, layout resolution, and the two main functions, whose tripped primitives are process exits and the directory probe that recognizes a .kin layout when binding a repository. Both classes are process lifecycle: choosing what to bind and terminating with a status. Neither reads repository content nor answers a query. Function-scoped so anything added to this binary stays scanned.",
+      "reason": "Daemon process entry point. Every pin is either a process exit with a status or the directory probe that recognizes a .kin layout when deciding which repository to bind, which precedes any graph consult. Neither class reads repository content nor answers a query. Pinned by expression with exact counts rather than by function, because the four functions involved are most of this binary and exempting their bodies would leave more unscanned than the primitives justify.",
       "owner": "kin-daemon",
       "expiration": "2026-12-31",
-      "allow_fn": [
-        "parse_args",
-        "resolve_layout",
-        "main",
-        "async_main"
+      "allow_match": [
+        {
+          "expr": "process::exit(0);",
+          "count": 2
+        },
+        {
+          "expr": "process::exit(1);",
+          "count": 8
+        },
+        "process::exit(exit_code);",
+        "if path.file_name().and_then(|name| name.to_str()) == Some(\".kin\") && path.is_dir() {"
       ]
     },
     {
