@@ -2100,6 +2100,7 @@ const SUPERVISOR_PID_FILE: &str = "supervisor.pid";
 const SUPERVISOR_PORT_FILE: &str = "supervisor.port";
 const SUPERVISOR_LIFECYCLE_FILE: &str = "supervisor.lifecycle";
 const SUPERVISOR_SINGLETON_FILE: &str = "supervisor.lock";
+const SUPERVISOR_STARTUP_FILE: &str = "supervisor.start.lock";
 
 /// Path to the per-user supervisor pid file (under the Kin registry directory).
 pub fn supervisor_pid_path() -> PathBuf {
@@ -2115,10 +2116,28 @@ pub fn supervisor_port_path() -> PathBuf {
 /// supervisor stop so a later `status` never reports the dead endpoint as stale.
 pub fn remove_stale_supervisor_files() {
     let dir = supervisor_dir();
+    let startup_authority = match try_acquire_supervisor_startup_lock_in_dir(&dir) {
+        Ok(authority) => authority,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            warn!(
+                dir = %dir.display(),
+                "preserving supervisor endpoint because legacy startup authority is held"
+            );
+            return;
+        }
+        Err(error) => {
+            warn!(
+                dir = %dir.display(),
+                %error,
+                "preserving supervisor endpoint because legacy startup authority is unavailable"
+            );
+            return;
+        }
+    };
     let recorded = supervisor_endpoint_snapshot(&dir);
     match recorded.pid {
         Some(pid) if process_liveness(pid).authorizes_cleanup() => {
-            let _ = retire_supervisor_endpoint_if_unchanged(&dir, recorded);
+            let _ = retire_supervisor_endpoint_if_unchanged(&dir, recorded, &startup_authority);
         }
         Some(_) => {
             warn!(
@@ -2133,7 +2152,7 @@ pub fn remove_stale_supervisor_files() {
             );
         }
         None => {
-            let _ = retire_supervisor_endpoint_if_unchanged(&dir, recorded);
+            let _ = retire_supervisor_endpoint_if_unchanged(&dir, recorded, &startup_authority);
         }
     }
 }
@@ -2194,10 +2213,12 @@ impl SupervisorEndpointRetirement {
 fn retire_supervisor_endpoint_if_unchanged(
     dir: &Path,
     judged: SupervisorEndpointSnapshot,
+    startup_authority: &SupervisorStartupLock,
 ) -> SupervisorEndpointRetirement {
     retire_supervisor_endpoint_if_unchanged_with_hooks(
         dir,
         judged,
+        startup_authority,
         || {},
         |path| std::fs::remove_file(path),
     )
@@ -2206,13 +2227,21 @@ fn retire_supervisor_endpoint_if_unchanged(
 fn retire_supervisor_endpoint_if_unchanged_with_hooks<F, G>(
     dir: &Path,
     judged: SupervisorEndpointSnapshot,
-    after_comparison: F,
+    startup_authority: &SupervisorStartupLock,
+    after_final_snapshot: F,
     remove_file: G,
 ) -> SupervisorEndpointRetirement
 where
     F: FnOnce(),
     G: FnMut(&Path) -> std::io::Result<()>,
 {
+    if !startup_authority.authorizes(dir) {
+        return SupervisorEndpointRetirement::CoordinationUnavailable(format!(
+            "legacy startup authority at {} does not authorize {}",
+            startup_authority.path().display(),
+            dir.display()
+        ));
+    }
     if let Err(error) = std::fs::create_dir_all(dir) {
         return SupervisorEndpointRetirement::CoordinationUnavailable(error.to_string());
     }
@@ -2238,9 +2267,10 @@ where
         }
     }
 
-    // The lifetime inode is opened before the comparison for the same reason as
-    // daemon.lock: current publishers hold it continuously, while a
-    // non-participating legacy endpoint is still protected by its live PID.
+    // Current publishers continuously hold the lifetime inode. Compatible
+    // older publishers do not know this lock, so callers must also hold the
+    // legacy supervisor.start.lock from before this comparison through the
+    // final retire-or-spawn decision.
     let singleton = match OpenOptions::new()
         .create(true)
         .read(true)
@@ -2257,7 +2287,6 @@ where
     if current != judged {
         return SupervisorEndpointRetirement::Changed { current };
     }
-    after_comparison();
     match singleton.try_lock_exclusive() {
         Ok(()) => {}
         Err(error) if error.kind() == fs2::lock_contended_error().kind() => {
@@ -2271,6 +2300,7 @@ where
     if current != judged {
         return SupervisorEndpointRetirement::Changed { current };
     }
+    after_final_snapshot();
     let pid_path = dir.join(SUPERVISOR_PID_FILE);
     let port_path = dir.join(SUPERVISOR_PORT_FILE);
     match remove_endpoint_files_with(&pid_path, &port_path, remove_file) {
@@ -2357,7 +2387,9 @@ fn live_supervisor_endpoint() -> Option<LiveDaemonEndpoint> {
     let recorded = supervisor_endpoint_snapshot(&dir);
     let pid = recorded.pid?;
     if process_liveness(pid).authorizes_cleanup() {
-        let _ = retire_supervisor_endpoint_if_unchanged(&dir, recorded);
+        // Route lookups are observers, not startup authorities. Leave stale
+        // endpoint cleanup to the path holding supervisor.start.lock so a
+        // compatible older launcher cannot publish through an unlink window.
         return None;
     }
     let port = recorded.port?;
@@ -2827,6 +2859,29 @@ impl Drop for StartupLock {
     }
 }
 
+/// Proof that this process owns the cross-version supervisor startup
+/// authority for one state directory.
+///
+/// Compatible pre-singleton CLIs use the same create-new lock path and keep it
+/// until their child publishes and passes health. Requiring this token for
+/// endpoint retirement therefore excludes both current publishers (through
+/// lifecycle/singleton locks) and supported legacy publishers (through this
+/// startup lock).
+struct SupervisorStartupLock {
+    dir: PathBuf,
+    lock: StartupLock,
+}
+
+impl SupervisorStartupLock {
+    fn path(&self) -> &Path {
+        &self.lock.path
+    }
+
+    fn authorizes(&self, dir: &Path) -> bool {
+        self.dir == dir && self.lock.path == dir.join(SUPERVISOR_STARTUP_FILE)
+    }
+}
+
 fn startup_lock_is_stale(path: &Path, stale_after: Duration) -> bool {
     std::fs::metadata(path)
         .and_then(|metadata| metadata.modified())
@@ -2875,26 +2930,43 @@ async fn acquire_startup_lock(kin_root: &Path) -> Result<StartupLock> {
     }
 }
 
-async fn acquire_supervisor_startup_lock() -> Result<StartupLock> {
+fn try_acquire_supervisor_startup_lock_in_dir(
+    dir: &Path,
+) -> std::io::Result<SupervisorStartupLock> {
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join(SUPERVISOR_STARTUP_FILE);
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
+    let _ = writeln!(
+        file,
+        "pid={} acquired_at={:?}",
+        std::process::id(),
+        std::time::SystemTime::now()
+    );
+    Ok(SupervisorStartupLock {
+        dir: dir.to_path_buf(),
+        lock: StartupLock { path, _file: file },
+    })
+}
+
+async fn acquire_supervisor_startup_lock() -> Result<SupervisorStartupLock> {
     let dir = supervisor_dir();
-    std::fs::create_dir_all(&dir)
+    acquire_supervisor_startup_lock_in_dir(&dir).await
+}
+
+async fn acquire_supervisor_startup_lock_in_dir(dir: &Path) -> Result<SupervisorStartupLock> {
+    std::fs::create_dir_all(dir)
         .with_context(|| format!("create supervisor state directory {}", dir.display()))?;
-    let path = dir.join("supervisor.start.lock");
+    let path = dir.join(SUPERVISOR_STARTUP_FILE);
     let timeout = Duration::from_secs(startup_lock_timeout_secs());
     let stale_after = timeout.saturating_mul(2).max(Duration::from_secs(10));
     let deadline = Instant::now() + timeout;
 
     loop {
-        match OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(mut file) => {
-                let _ = writeln!(
-                    file,
-                    "pid={} acquired_at={:?}",
-                    std::process::id(),
-                    std::time::SystemTime::now()
-                );
-                return Ok(StartupLock { path, _file: file });
-            }
+        match try_acquire_supervisor_startup_lock_in_dir(dir) {
+            Ok(authority) => return Ok(authority),
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
                 if startup_lock_is_stale(&path, stale_after) {
                     warn!(path = %path.display(), "removing stale supervisor startup lock");
@@ -3428,16 +3500,33 @@ async fn validate_supervisor_endpoint(endpoint: LiveDaemonEndpoint) -> Result<St
 #[derive(Debug)]
 enum ExistingSupervisor {
     Connected(String),
-    None,
+    NeedsStartupAuthority,
+    SpawnAuthorized,
     LiveNotReady(String),
 }
 
-async fn wait_for_existing_supervisor() -> ExistingSupervisor {
-    wait_for_existing_supervisor_in_dir(&supervisor_dir()).await
+async fn probe_existing_supervisor() -> ExistingSupervisor {
+    let dir = supervisor_dir();
+    wait_for_existing_supervisor_in_dir(&dir, None).await
 }
 
-async fn wait_for_existing_supervisor_in_dir(dir: &Path) -> ExistingSupervisor {
+async fn wait_for_existing_supervisor_in_dir(
+    dir: &Path,
+    startup_authority: Option<&SupervisorStartupLock>,
+) -> ExistingSupervisor {
+    wait_for_existing_supervisor_in_dir_with_hook(dir, startup_authority, || {}).await
+}
+
+async fn wait_for_existing_supervisor_in_dir_with_hook<F>(
+    dir: &Path,
+    startup_authority: Option<&SupervisorStartupLock>,
+    after_snapshot: F,
+) -> ExistingSupervisor
+where
+    F: FnOnce(),
+{
     let recorded = supervisor_endpoint_snapshot(dir);
+    after_snapshot();
     let Some(pid) = recorded.pid else {
         if recorded.pid_exists {
             return ExistingSupervisor::LiveNotReady(
@@ -3446,9 +3535,12 @@ async fn wait_for_existing_supervisor_in_dir(dir: &Path) -> ExistingSupervisor {
                     .to_string(),
             );
         }
+        let Some(startup_authority) = startup_authority else {
+            return ExistingSupervisor::NeedsStartupAuthority;
+        };
         if !recorded.port_exists {
-            return match retire_supervisor_endpoint_if_unchanged(dir, recorded) {
-                SupervisorEndpointRetirement::Retired => ExistingSupervisor::None,
+            return match retire_supervisor_endpoint_if_unchanged(dir, recorded, startup_authority) {
+                SupervisorEndpointRetirement::Retired => ExistingSupervisor::SpawnAuthorized,
                 preserved => ExistingSupervisor::LiveNotReady(format!(
                     "supervisor startup authority is unavailable because {}; kin will not start \
                      a replacement",
@@ -3456,8 +3548,8 @@ async fn wait_for_existing_supervisor_in_dir(dir: &Path) -> ExistingSupervisor {
                 )),
             };
         }
-        return match retire_supervisor_endpoint_if_unchanged(dir, recorded) {
-            SupervisorEndpointRetirement::Retired => ExistingSupervisor::None,
+        return match retire_supervisor_endpoint_if_unchanged(dir, recorded, startup_authority) {
+            SupervisorEndpointRetirement::Retired => ExistingSupervisor::SpawnAuthorized,
             preserved => ExistingSupervisor::LiveNotReady(format!(
                 "supervisor endpoint retirement was refused because {}; kin will not start a \
                  replacement",
@@ -3467,8 +3559,11 @@ async fn wait_for_existing_supervisor_in_dir(dir: &Path) -> ExistingSupervisor {
     };
 
     if process_liveness(pid).authorizes_cleanup() {
-        return match retire_supervisor_endpoint_if_unchanged(dir, recorded) {
-            SupervisorEndpointRetirement::Retired => ExistingSupervisor::None,
+        let Some(startup_authority) = startup_authority else {
+            return ExistingSupervisor::NeedsStartupAuthority;
+        };
+        return match retire_supervisor_endpoint_if_unchanged(dir, recorded, startup_authority) {
+            SupervisorEndpointRetirement::Retired => ExistingSupervisor::SpawnAuthorized,
             preserved => ExistingSupervisor::LiveNotReady(format!(
                 "supervisor endpoint retirement was refused because {}; kin will not start a \
                  replacement",
@@ -3571,26 +3666,38 @@ pub async fn ensure_supervisor_running() -> Result<String> {
         .map(|_| url);
     }
 
-    match wait_for_existing_supervisor().await {
+    // The fast path is deliberately read-only. A compatible older CLI holds
+    // supervisor.start.lock until its older supervisor has published and
+    // passed health, so no endpoint may be retired before we acquire that
+    // cross-version authority.
+    match probe_existing_supervisor().await {
         ExistingSupervisor::Connected(base_url) => return Ok(base_url),
         ExistingSupervisor::LiveNotReady(message) => bail!(message),
-        ExistingSupervisor::None => {}
+        ExistingSupervisor::NeedsStartupAuthority => {}
+        ExistingSupervisor::SpawnAuthorized => {
+            bail!("supervisor probe authorized a spawn without legacy startup authority")
+        }
     }
 
-    let _startup_lock = acquire_supervisor_startup_lock().await?;
-    match wait_for_existing_supervisor().await {
+    let startup_authority = acquire_supervisor_startup_lock().await?;
+    let dir = supervisor_dir();
+    match wait_for_existing_supervisor_in_dir(&dir, Some(&startup_authority)).await {
         ExistingSupervisor::Connected(base_url) => return Ok(base_url),
         ExistingSupervisor::LiveNotReady(message) => bail!(message),
-        ExistingSupervisor::None => {}
+        ExistingSupervisor::SpawnAuthorized => {}
+        ExistingSupervisor::NeedsStartupAuthority => {
+            bail!("supervisor startup authority was lost before the spawn decision")
+        }
     }
 
     let daemon_bin = find_daemon_binary()?;
     // The supervisor binds :0 and reports its real bound port via its endpoint
     // files; passing 0 (rather than a reserved port) removes the same
     // reserve-release-rebind race the repo-daemon path had. The prior
-    // ExistingSupervisor::None decision is the only spawn authorization; stale
-    // endpoint retirement has already completed under lifecycle + singleton
-    // authority, so this path never performs an unconditional unlink.
+    // ExistingSupervisor::SpawnAuthorized is the only spawn authorization.
+    // Stale endpoint retirement completed while holding the legacy startup
+    // authority plus current lifecycle/singleton authority, and that startup
+    // authority remains held until this child has published and passed health.
     info!(binary = %daemon_bin.display(), "starting supervisor (OS-assigned port)");
 
     let mut cmd = std::process::Command::new(&daemon_bin);
@@ -4260,6 +4367,19 @@ mod tests {
         std::fs::write(kin_root.join("daemon.port"), port.to_string()).unwrap();
     }
 
+    /// Model the merge-base supervisor publisher exactly: atomically replace
+    /// each endpoint component without taking supervisor.lifecycle or
+    /// supervisor.lock. Its parent CLI owns supervisor.start.lock.
+    fn write_legacy_supervisor_endpoint_files(dir: &Path, pid: u32, port: u16) {
+        let pid_tmp = dir.join(format!("{SUPERVISOR_PID_FILE}.tmp"));
+        std::fs::write(&pid_tmp, pid.to_string()).unwrap();
+        std::fs::rename(pid_tmp, dir.join(SUPERVISOR_PID_FILE)).unwrap();
+
+        let port_tmp = dir.join(format!("{SUPERVISOR_PORT_FILE}.tmp"));
+        std::fs::write(&port_tmp, port.to_string()).unwrap();
+        std::fs::rename(port_tmp, dir.join(SUPERVISOR_PORT_FILE)).unwrap();
+    }
+
     #[tokio::test]
     async fn unready_endpoint_with_a_live_owner_is_preserved_not_clobbered() {
         let dir = tempfile::tempdir().unwrap();
@@ -4568,9 +4688,95 @@ mod tests {
     }
 
     #[test]
+    fn legacy_supervisor_publisher_is_excluded_after_final_retirement_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let startup_authority = try_acquire_supervisor_startup_lock_in_dir(dir.path()).unwrap();
+        write_legacy_supervisor_endpoint_files(dir.path(), 999_999_999, 51000);
+        let judged = supervisor_endpoint_snapshot(dir.path());
+        let mut legacy_publication_was_excluded = false;
+
+        let decision = retire_supervisor_endpoint_if_unchanged_with_hooks(
+            dir.path(),
+            judged,
+            &startup_authority,
+            || match try_acquire_supervisor_startup_lock_in_dir(dir.path()) {
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    legacy_publication_was_excluded = true;
+                }
+                Err(error) => panic!("legacy startup authority probe failed: {error}"),
+                Ok(_legacy_authority) => {
+                    write_legacy_supervisor_endpoint_files(dir.path(), std::process::id(), 51001);
+                    panic!("a legacy launcher acquired startup authority during retirement");
+                }
+            },
+            |path| std::fs::remove_file(path),
+        );
+
+        assert!(legacy_publication_was_excluded);
+        assert_eq!(decision, SupervisorEndpointRetirement::Retired);
+        assert!(!dir.path().join(SUPERVISOR_PID_FILE).exists());
+        assert!(!dir.path().join(SUPERVISOR_PORT_FILE).exists());
+        assert!(
+            dir.path().join(SUPERVISOR_STARTUP_FILE).exists(),
+            "startup authority must remain held after retirement for the caller's spawn decision"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_supervisor_publication_during_probe_is_followed_and_forbids_spawn() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy_startup_authority =
+            try_acquire_supervisor_startup_lock_in_dir(dir.path()).unwrap();
+        let legacy_port = closed_loopback_port();
+
+        let initial = wait_for_existing_supervisor_in_dir_with_hook(dir.path(), None, || {
+            // The merge-base supervisor itself writes without either new lock.
+            // Its merge-base parent CLI still owns supervisor.start.lock.
+            write_legacy_supervisor_endpoint_files(dir.path(), std::process::id(), legacy_port);
+        })
+        .await;
+
+        assert!(
+            matches!(initial, ExistingSupervisor::NeedsStartupAuthority),
+            "a read-only pre-lock probe must defer stale retirement: {initial:?}"
+        );
+        assert_eq!(
+            supervisor_endpoint_snapshot(dir.path()),
+            SupervisorEndpointSnapshot {
+                pid: Some(std::process::id()),
+                port: Some(legacy_port),
+                pid_exists: true,
+                port_exists: true,
+            },
+            "the post-snapshot legacy publication must survive the read-only probe"
+        );
+
+        drop(legacy_startup_authority);
+        let current_startup_authority =
+            try_acquire_supervisor_startup_lock_in_dir(dir.path()).unwrap();
+        let final_decision =
+            wait_for_existing_supervisor_in_dir(dir.path(), Some(&current_startup_authority)).await;
+
+        assert!(
+            matches!(final_decision, ExistingSupervisor::LiveNotReady(_)),
+            "the final serialized check must follow/preserve the live legacy owner and forbid a \
+             second spawn: {final_decision:?}"
+        );
+        assert_eq!(
+            supervisor_endpoint_snapshot(dir.path()).pid,
+            Some(std::process::id())
+        );
+        assert_eq!(
+            supervisor_endpoint_snapshot(dir.path()).port,
+            Some(legacy_port)
+        );
+    }
+
+    #[test]
     fn supervisor_retirement_permission_denial_never_authorizes_replacement() {
         for denied_name in [SUPERVISOR_PID_FILE, SUPERVISOR_PORT_FILE] {
             let dir = tempfile::tempdir().unwrap();
+            let startup_authority = try_acquire_supervisor_startup_lock_in_dir(dir.path()).unwrap();
             std::fs::write(dir.path().join(SUPERVISOR_PID_FILE), "999999999").unwrap();
             std::fs::write(dir.path().join(SUPERVISOR_PORT_FILE), "51000").unwrap();
             let judged = supervisor_endpoint_snapshot(dir.path());
@@ -4578,6 +4784,7 @@ mod tests {
             let decision = retire_supervisor_endpoint_if_unchanged_with_hooks(
                 dir.path(),
                 judged,
+                &startup_authority,
                 || {},
                 |path| {
                     if path.file_name().and_then(|name| name.to_str()) == Some(denied_name) {
@@ -4631,11 +4838,14 @@ mod tests {
         );
 
         let supervisor_dir = tempfile::tempdir().unwrap();
+        let supervisor_startup_authority =
+            try_acquire_supervisor_startup_lock_in_dir(supervisor_dir.path()).unwrap();
         let supervisor_judged = supervisor_endpoint_snapshot(supervisor_dir.path());
         assert_eq!(
             retire_supervisor_endpoint_if_unchanged_with_hooks(
                 supervisor_dir.path(),
                 supervisor_judged,
+                &supervisor_startup_authority,
                 || {},
                 |_| Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
             ),
@@ -4846,6 +5056,7 @@ mod tests {
     #[tokio::test]
     async fn live_supervisor_health_failure_preserves_lifetime_owner_and_forbids_spawn() {
         let dir = tempfile::tempdir().unwrap();
+        let startup_authority = try_acquire_supervisor_startup_lock_in_dir(dir.path()).unwrap();
         let singleton = OpenOptions::new()
             .create(true)
             .read(true)
@@ -4862,7 +5073,7 @@ mod tests {
         .unwrap();
         std::fs::write(dir.path().join(SUPERVISOR_PORT_FILE), port.to_string()).unwrap();
 
-        let verdict = wait_for_existing_supervisor_in_dir(dir.path()).await;
+        let verdict = wait_for_existing_supervisor_in_dir(dir.path(), None).await;
         assert!(
             matches!(verdict, ExistingSupervisor::LiveNotReady(_)),
             "a health hiccup from a live owner must forbid spawning: {verdict:?}"
@@ -4872,7 +5083,8 @@ mod tests {
         assert_eq!(
             retire_supervisor_endpoint_if_unchanged(
                 dir.path(),
-                supervisor_endpoint_snapshot(dir.path())
+                supervisor_endpoint_snapshot(dir.path()),
+                &startup_authority,
             ),
             SupervisorEndpointRetirement::SingletonHeld,
             "the process-lifetime singleton must independently prevent retirement"
@@ -4884,7 +5096,8 @@ mod tests {
 
         std::fs::remove_file(dir.path().join(SUPERVISOR_PID_FILE)).unwrap();
         std::fs::remove_file(dir.path().join(SUPERVISOR_PORT_FILE)).unwrap();
-        let unpublished_owner = wait_for_existing_supervisor_in_dir(dir.path()).await;
+        let unpublished_owner =
+            wait_for_existing_supervisor_in_dir(dir.path(), Some(&startup_authority)).await;
         assert!(
             matches!(unpublished_owner, ExistingSupervisor::LiveNotReady(_)),
             "a supervisor holding its lifetime singleton before publication must still forbid a \
