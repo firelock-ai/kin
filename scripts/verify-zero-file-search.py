@@ -652,7 +652,10 @@ def scan_file(filepath, rel_path, exempt_fn_names=None, allowed_matches=None):
         # whole-line exemption.
         scan_line = line
         if allowed_matches:
-            for match in allowed_matches:
+            # Longest first, so a pin that is a substring of another cannot mask
+            # the shorter one's bytes out from under it and leave the longer pin
+            # unmatched. Also makes the result independent of set iteration order.
+            for match in sorted(allowed_matches, key=len, reverse=True):
                 offset = scan_line.find(match)
                 while offset >= 0:
                     scan_line = (
