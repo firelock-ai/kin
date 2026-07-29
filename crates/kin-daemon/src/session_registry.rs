@@ -1015,30 +1015,8 @@ fn timestamp_age(ts: &Timestamp, now: &Timestamp) -> Option<Duration> {
     }
 }
 
-/// Check if a process is alive by checking /proc or using kill -0.
 fn is_process_alive(pid: u32) -> bool {
-    // Use std::fs to check /proc on Linux, or signal 0 via Command on macOS/Unix.
-    #[cfg(target_os = "linux")]
-    {
-        std::path::Path::new(&format!("/proc/{}", pid)).exists()
-    }
-    #[cfg(target_os = "macos")]
-    {
-        // On macOS, use `kill -0 <pid>` via Command to avoid libc dependency.
-        std::process::Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(true) // If we can't check, assume alive (conservative).
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        // On unsupported platforms, assume alive (conservative).
-        let _ = pid;
-        true
-    }
+    kin_cli::daemon_client::is_process_alive(pid)
 }
 
 #[cfg(test)]

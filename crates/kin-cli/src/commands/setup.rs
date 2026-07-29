@@ -11803,8 +11803,9 @@ fn cleanup_stale_daemons() -> Result<usize> {
         let has_port = kin_root.join("daemon.port").exists();
         let has_pid = kin_root.join("daemon.pid").exists();
         if has_port && !has_pid {
-            let _ = std::fs::remove_file(kin_root.join("daemon.port"));
-            cleaned += 1;
+            if crate::daemon_client::remove_orphaned_daemon_port(&kin_root) {
+                cleaned += 1;
+            }
         }
     }
     Ok(cleaned)
