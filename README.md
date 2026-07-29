@@ -125,9 +125,10 @@ repository-v6 graph authority. It never substitutes an exact-HEAD snapshot or
 raw-filesystem semantic rebuild. Remote-bearing repositories currently fail
 closed until exact Kin remote mapping is available.
 
-Repository admission does not run semantic enrichment. Query surfaces consume
-graph-owned enrichment when it exists and report its absence instead of hiding
-the gap behind raw file search.
+Admission also derives the semantic entity and relation layer for every
+supported source in that history, and `kin init` reports the counts it bound.
+Query surfaces consume graph-owned enrichment when it exists and report its
+absence instead of hiding the gap behind raw file search.
 
 ### 3. Ask the graph a real question
 
@@ -144,8 +145,9 @@ Once embeddings are complete, your configured AI agent can use the vector-backed
 `semantic_locate` tool; `get_context_pack`, `find_references`, and
 `trace_data_flow` expose the graph neighborhood directly.
 
-After graph-native semantic enrichment exists, run `kin embed` to add local
-vector similarity and confirm coverage with `kin status --json`.
+Admission derives the semantic entities, not their vectors. Run `kin embed` to
+add local vector similarity over them, and confirm coverage with
+`kin graph status`.
 
 ## Review an AI-written change
 
