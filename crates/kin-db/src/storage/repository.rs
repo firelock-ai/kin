@@ -5356,6 +5356,26 @@ mod tests {
         }
     }
 
+    /// `MergeConflictEntry` is nested in KinDB's positional repository
+    /// authority. An absent optional label must still occupy its array slot
+    /// because the resolution follows it.
+    #[test]
+    fn an_unlabelled_merge_entry_keeps_its_positional_label_slot() {
+        let mut entry = merge_entry();
+        entry.label = None;
+
+        let bytes = rmp_serde::to_vec(&entry).unwrap();
+        assert_eq!(
+            bytes.first(),
+            Some(&0x97),
+            "the MessagePack struct must retain all seven positional fields"
+        );
+
+        let decoded: MergeConflictEntry = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(decoded, entry);
+        assert_eq!(decoded.resolution, MergeEntryResolution::Unresolved);
+    }
+
     /// Open a merge on the workspace the arbitrary fixture repository has,
     /// citing `operation` as the transaction that opened it.
     fn open_merge_record<B: StorageBackend + ?Sized + 'static>(
