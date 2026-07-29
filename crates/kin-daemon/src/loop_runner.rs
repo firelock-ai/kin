@@ -12,7 +12,7 @@ use kin_index::{
 };
 use kin_model::{
     EntityFilter, EntityId, EntityStore, FilePathId, Hash256, RepoPath, ShallowTrackedFile,
-    TransactionDelta, TreeDelta, TreeEntry,
+    TreeDelta, TreeEntry,
 };
 use tracing::{debug, error, info, warn};
 
@@ -519,6 +519,11 @@ fn exact_tree_admission(
 
     if !deltas.is_empty() {
         let desired_tree = previous.apply(&deltas).map_err(invalid_tree_transition)?;
+        let live_semantic_cleanup =
+            crate::repository_commit::workspace_semantic_cleanup_from_graph(
+                state.graph.as_ref(),
+                &deltas,
+            )?;
         // Repository authority moves first. The in-memory graph is a derived
         // staging/query view and must never acknowledge dirty file truth that
         // has not crossed the repository-v6 compare-and-swap. The scanner's
@@ -531,12 +536,9 @@ fn exact_tree_admission(
             desired_tree,
         );
         publish_exact_workspace_tree(state, &admitted)?;
-        state.graph.apply_transaction_delta(&TransactionDelta {
-            entity_deltas: Vec::new(),
-            relation_deltas: Vec::new(),
-            tree_deltas: deltas.clone(),
-            ..TransactionDelta::default()
-        })?;
+        let mut live_delta = live_semantic_cleanup.transaction_delta();
+        live_delta.tree_deltas = deltas.clone();
+        state.graph.apply_transaction_delta(&live_delta)?;
     }
 
     Ok(ExactTreeAdmission {
@@ -1546,11 +1548,136 @@ fn take_file_event_batch(pending: &mut VecDeque<FileEvent>, batch_size: usize) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kin_model::TransactionDelta;
     use std::path::PathBuf;
+    use std::process::Command as ProcessCommand;
+
+    #[cfg(windows)]
+    const NULL_GIT_CONFIG: &str = "NUL";
+    #[cfg(not(windows))]
+    const NULL_GIT_CONFIG: &str = "/dev/null";
 
     fn open_test_state(repo: &tempfile::TempDir) -> Arc<DaemonState> {
         let init = kin_core::init(repo.path()).unwrap();
         Arc::new(DaemonState::open(init.layout).unwrap())
+    }
+
+    fn run_test_git(repo: &std::path::Path, args: &[&str]) {
+        let output = ProcessCommand::new("git")
+            .args(args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", NULL_GIT_CONFIG)
+            .current_dir(repo)
+            .output()
+            .expect("run fixture git command");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn exact_tree_content_change_retires_durable_and_live_semantics() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join("src")).unwrap();
+        run_test_git(repo.path(), &["init", "--initial-branch=main"]);
+        run_test_git(
+            repo.path(),
+            &["config", "user.email", "kin@example.invalid"],
+        );
+        run_test_git(repo.path(), &["config", "user.name", "Kin"]);
+        std::fs::write(
+            repo.path().join("src/lib.rs"),
+            b"pub fn helper() -> u32 { 7 }\npub fn caller() -> u32 { helper() }\n",
+        )
+        .unwrap();
+        run_test_git(repo.path(), &["add", "--all"]);
+        run_test_git(repo.path(), &["commit", "-m", "seed semantic source"]);
+
+        let init = kin_core::init_from_git(repo.path()).unwrap();
+        let state = Arc::new(DaemonState::open(init.layout).unwrap());
+        let file_id = FilePathId::new("src/lib.rs");
+        let old_entities = state
+            .graph
+            .query_entities(&EntityFilter {
+                file_path: Some(file_id.clone()),
+                ..EntityFilter::default()
+            })
+            .unwrap();
+        assert!(
+            old_entities.len() >= 2,
+            "historical admission must seed live semantics for the source"
+        );
+        assert!(
+            old_entities.iter().any(|entity| {
+                !state
+                    .graph
+                    .get_all_relations_for_entity(&entity.id)
+                    .unwrap()
+                    .is_empty()
+            }),
+            "fixture must exercise relation retirement as well as entities"
+        );
+
+        std::fs::write(
+            repo.path().join("src/lib.rs"),
+            b"pub fn replacement() -> u32 { 11 }\n",
+        )
+        .unwrap();
+        let admission = exact_tree_admission(&state, None).unwrap();
+        assert!(
+            !admission.deltas.is_empty(),
+            "content replacement must publish an exact tree transition"
+        );
+
+        assert!(
+            state
+                .graph
+                .query_entities(&EntityFilter {
+                    file_path: Some(file_id.clone()),
+                    ..EntityFilter::default()
+                })
+                .unwrap()
+                .is_empty(),
+            "old live entities must be absent before optional H2 enrichment"
+        );
+        for entity in &old_entities {
+            assert!(
+                state
+                    .graph
+                    .get_all_relations_for_entity(&entity.id)
+                    .unwrap()
+                    .is_empty(),
+                "old live relations must retire with their source entity"
+            );
+        }
+
+        let binding =
+            kin_core::LocalRepositoryAuthorityBinding::from_layout(&state.layout).unwrap();
+        let manager = binding.open_manager().unwrap();
+        let lease = manager.read_authority();
+        let authority = lease
+            .workspace_graph_snapshot(&binding.workspace_id())
+            .unwrap()
+            .unwrap();
+        assert!(
+            authority
+                .entities
+                .values()
+                .all(|entity| entity.file_origin.as_ref() != Some(&file_id)),
+            "durable workspace authority must not retain H1 entities"
+        );
+        assert!(
+            authority.relations.values().all(|relation| {
+                [relation.src, relation.dst].into_iter().all(|node| {
+                    node.as_entity()
+                        .is_none_or(|id| !old_entities.iter().any(|entity| entity.id == id))
+                })
+            }),
+            "durable workspace authority must not retain relations to H1 entities"
+        );
     }
 
     #[cfg(unix)]

@@ -13,12 +13,13 @@ use std::sync::Arc;
 
 use kin_db::{LocalFileBackend, RepositoryAuthorityManager};
 use kin_model::{
-    compute_resolved_tree_hash, compute_semantic_change_id, AuthorId, ChangeOrigin,
-    EffectiveAdmissionPolicyStamp, Hash256, ModelError, OperationId, RefExpectation, RefMutation,
-    RefName, RefTarget, RefUpdatePolicy, RepositoryCommitOutcome, RepositoryCommitReceipt,
+    compute_resolved_tree_hash, compute_semantic_change_id, ArtifactId, AuthorId, ChangeOrigin,
+    EffectiveAdmissionPolicyStamp, EntityDelta, EntityFilter, EntityStore, FilePathId, GraphNodeId,
+    Hash256, ModelError, OperationId, RefExpectation, RefMutation, RefName, RefTarget,
+    RefUpdatePolicy, RelationDelta, RepositoryCommitOutcome, RepositoryCommitReceipt,
     RepositoryTransaction, RootBundle, SemanticChange, SemanticChangeId, SharedAdmissionPolicy,
-    Timestamp, WorkspaceExpectation, WorkspaceHead, WorkspaceId, WorkspaceMutation,
-    WorkspaceSemanticDelta, REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+    Timestamp, TreeDelta, TreeEntry, WorkspaceExpectation, WorkspaceHead, WorkspaceId,
+    WorkspaceMutation, WorkspaceSemanticDelta, REPOSITORY_TRANSACTION_SCHEMA_VERSION,
 };
 
 use crate::commit_deltas::compute_deltas_vs_repository_authority;
@@ -77,6 +78,159 @@ pub struct WorkspaceAdmissionResult {
     pub workspace_id: WorkspaceId,
     pub tree_hash: Hash256,
     pub file_count: usize,
+}
+
+#[derive(Default)]
+struct InvalidatedSemanticSubjects {
+    file_paths: BTreeSet<String>,
+    artifact_ids: BTreeSet<ArtifactId>,
+}
+
+impl InvalidatedSemanticSubjects {
+    fn is_empty(&self) -> bool {
+        self.file_paths.is_empty() && self.artifact_ids.is_empty()
+    }
+}
+
+fn tree_delta_invalidates_semantics(delta: &TreeDelta) -> bool {
+    match (delta.old_state(), delta.new_state()) {
+        (Some(_), None) => true,
+        (Some(old), Some(new)) if old.path != new.path => true,
+        (
+            Some(kin_model::LocatedEntry {
+                entry: TreeEntry::Blob { hash: old, .. },
+                ..
+            }),
+            Some(kin_model::LocatedEntry {
+                entry: TreeEntry::Blob { hash: new, .. },
+                ..
+            }),
+        ) => old != new,
+        (Some(old), Some(new)) => old.entry != new.entry,
+        (None, _) => false,
+    }
+}
+
+fn invalidated_semantic_subjects(tree_deltas: &[TreeDelta]) -> InvalidatedSemanticSubjects {
+    let mut subjects = InvalidatedSemanticSubjects::default();
+    for delta in tree_deltas {
+        if !tree_delta_invalidates_semantics(delta) {
+            continue;
+        }
+        subjects.artifact_ids.insert(delta.artifact_id());
+        let Some(old) = delta.old_state() else {
+            continue;
+        };
+        let Some(path) = old.path.as_utf8() else {
+            continue;
+        };
+        subjects.file_paths.insert(path.to_string());
+    }
+    subjects
+}
+
+fn relation_touches_invalidated_subject(
+    relation: &kin_model::Relation,
+    entity_ids: &BTreeSet<kin_model::EntityId>,
+    artifact_ids: &BTreeSet<ArtifactId>,
+) -> bool {
+    [relation.src, relation.dst]
+        .into_iter()
+        .any(|node| match node {
+            GraphNodeId::Entity(id) => entity_ids.contains(&id),
+            GraphNodeId::Artifact(id) => artifact_ids.contains(&id),
+            _ => false,
+        })
+}
+
+fn workspace_semantic_cleanup_from_snapshot(
+    snapshot: &kin_db::GraphSnapshot,
+    tree_deltas: &[TreeDelta],
+) -> Result<WorkspaceSemanticDelta> {
+    let subjects = invalidated_semantic_subjects(tree_deltas);
+    if subjects.is_empty() {
+        return Ok(WorkspaceSemanticDelta::default());
+    }
+    let entities = snapshot
+        .entities
+        .values()
+        .filter(|entity| {
+            entity
+                .file_origin
+                .as_ref()
+                .is_some_and(|file_id| subjects.file_paths.contains(&file_id.0))
+        })
+        .map(|entity| (entity.id, entity.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let entity_ids = entities.keys().copied().collect::<BTreeSet<_>>();
+    let relations = snapshot
+        .relations
+        .values()
+        .filter(|relation| {
+            relation_touches_invalidated_subject(relation, &entity_ids, &subjects.artifact_ids)
+        })
+        .map(|relation| (relation.id, relation.clone()))
+        .collect::<BTreeMap<_, _>>();
+
+    WorkspaceSemanticDelta::new(
+        entities
+            .into_values()
+            .map(|old| EntityDelta::Removed { old })
+            .collect(),
+        relations
+            .into_values()
+            .map(|old| RelationDelta::Removed { old })
+            .collect(),
+    )
+    .map_err(|error| invalid(format!("build exact-tree semantic cleanup: {error}")))
+}
+
+/// Remove live semantics derived from tree entries whose path or content
+/// identity is being replaced.
+///
+/// Repository publication performs the same cleanup from its coherent
+/// workspace snapshot. The live graph can carry additional derived entities,
+/// so it plans against its own old payloads and applies removals together with
+/// the exact tree transition.
+pub(crate) fn workspace_semantic_cleanup_from_graph(
+    graph: &kin_db::InMemoryGraph,
+    tree_deltas: &[TreeDelta],
+) -> Result<WorkspaceSemanticDelta> {
+    let subjects = invalidated_semantic_subjects(tree_deltas);
+    if subjects.is_empty() {
+        return Ok(WorkspaceSemanticDelta::default());
+    }
+    let mut entities = BTreeMap::new();
+    let mut relations = BTreeMap::new();
+    for path in &subjects.file_paths {
+        let file_id = FilePathId::new(path);
+        for entity in graph.query_entities(&EntityFilter {
+            file_path: Some(file_id),
+            ..EntityFilter::default()
+        })? {
+            for relation in graph.get_all_relations_for_entity(&entity.id)? {
+                relations.insert(relation.id, relation);
+            }
+            entities.insert(entity.id, entity);
+        }
+    }
+    for artifact_id in &subjects.artifact_ids {
+        for relation in graph.get_all_relations_for_node(&GraphNodeId::Artifact(*artifact_id))? {
+            relations.insert(relation.id, relation);
+        }
+    }
+
+    WorkspaceSemanticDelta::new(
+        entities
+            .into_values()
+            .map(|old| EntityDelta::Removed { old })
+            .collect(),
+        relations
+            .into_values()
+            .map(|old| RelationDelta::Removed { old })
+            .collect(),
+    )
+    .map_err(|error| invalid(format!("build live exact-tree semantic cleanup: {error}")))
 }
 
 /// One exact workspace transition that a complete host scan actually proved.
@@ -484,6 +638,19 @@ pub(crate) fn publish_workspace_tree(
     }
 
     let tree_deltas = kin_core::exact_tree_correction(&workspace.tree, desired_tree)?;
+    let semantic_cleanup = if invalidated_semantic_subjects(&tree_deltas).is_empty() {
+        WorkspaceSemanticDelta::default()
+    } else {
+        let authority_workspace_graph =
+            lease
+                .workspace_graph_snapshot(&workspace_id)?
+                .ok_or_else(|| {
+                    invalid(format!(
+                        "repository authority has no graph snapshot for workspace {workspace_id}"
+                    ))
+                })?;
+        workspace_semantic_cleanup_from_snapshot(&authority_workspace_graph, &tree_deltas)?
+    };
     let mut source_lengths = std::collections::BTreeMap::new();
     let (shared_policy, _) = SharedAdmissionPolicy::derive_from_tree(
         Some(&workspace.shared_admission_policy),
@@ -546,7 +713,7 @@ pub(crate) fn publish_workspace_tree(
             new_base_tree_hash: workspace.base_tree_hash,
             tree_deltas: tree_deltas.clone(),
             new_tree_hash: tree_hash,
-            semantic_delta: WorkspaceSemanticDelta::default(),
+            semantic_delta: semantic_cleanup,
             new_shared_admission_policy: shared_policy.clone(),
             new_admission_policy: EffectiveAdmissionPolicyStamp {
                 shared: shared_policy.stamp(),
@@ -1170,8 +1337,10 @@ fn invalid(message: impl Into<String>) -> DaemonError {
 mod tests {
     use super::*;
     use kin_model::{
-        ArtifactId, EntityStore, LocatedEntry, RepoPath, RepositoryAuthorityStore,
-        ResolvedArtifact, ResolvedTree, TransactionDelta, TreeDelta, TreeEntry,
+        ArtifactId, Entity, EntityKind, EntityMetadata, EntityStore, FilePathId,
+        FingerprintAlgorithm, GraphNodeId, LanguageId, LocatedEntry, Relation, RelationId,
+        RelationKind, RelationOrigin, RepoPath, RepositoryAuthorityStore, ResolvedArtifact,
+        ResolvedTree, SemanticFingerprint, TransactionDelta, TreeDelta, TreeEntry, Visibility,
     };
 
     fn add_artifact(
@@ -1207,6 +1376,148 @@ mod tests {
                 .unwrap()
                 .with_timezone(&chrono::Utc),
         )
+    }
+
+    fn test_entity(name: &str, path: &str) -> Entity {
+        Entity {
+            id: kin_model::EntityId::new(),
+            kind: EntityKind::Function,
+            name: name.to_string(),
+            language: LanguageId::Rust,
+            fingerprint: SemanticFingerprint {
+                algorithm: FingerprintAlgorithm::V1TreeSitter,
+                ast_hash: Hash256::from_bytes([0x11; 32]),
+                signature_hash: Hash256::from_bytes([0x12; 32]),
+                behavior_hash: Hash256::from_bytes([0x13; 32]),
+                equivalence_hash: Hash256::from_bytes([0; 32]),
+                stability_score: 1.0,
+            },
+            file_origin: Some(FilePathId::new(path)),
+            span: None,
+            signature: format!("fn {name}()"),
+            visibility: Visibility::Public,
+            role: kin_model::EntityRole::Source,
+            doc_summary: None,
+            metadata: EntityMetadata::default(),
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        }
+    }
+
+    #[test]
+    fn content_change_retires_path_semantics_with_the_exact_tree_transition() {
+        let graph = kin_db::InMemoryGraph::new();
+        let artifact_id = ArtifactId::new();
+        let path = RepoPath::from_utf8("src/lib.rs").unwrap();
+        let old_entry = TreeEntry::blob(Hash256::from_bytes([0x21; 32]), false);
+        let new_entry = TreeEntry::blob(Hash256::from_bytes([0x22; 32]), false);
+        let entity = test_entity("old_definition", "src/lib.rs");
+        let relation = Relation {
+            id: RelationId::new(),
+            kind: RelationKind::References,
+            src: GraphNodeId::Entity(entity.id),
+            dst: GraphNodeId::Artifact(artifact_id),
+            confidence: 1.0,
+            origin: RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
+        };
+        graph
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: vec![EntityDelta::Added {
+                    new: entity.clone(),
+                }],
+                relation_deltas: vec![RelationDelta::Added {
+                    new: relation.clone(),
+                }],
+                tree_deltas: vec![TreeDelta::Added {
+                    artifact_id,
+                    new: LocatedEntry::new(path.clone(), old_entry),
+                }],
+                ..TransactionDelta::default()
+            })
+            .unwrap();
+
+        let tree_delta = TreeDelta::Updated {
+            artifact_id,
+            old: LocatedEntry::new(path.clone(), old_entry),
+            new: LocatedEntry::new(path.clone(), new_entry),
+        };
+        let cleanup = workspace_semantic_cleanup_from_snapshot(
+            &graph.to_snapshot(),
+            std::slice::from_ref(&tree_delta),
+        )
+        .unwrap();
+        let live_cleanup =
+            workspace_semantic_cleanup_from_graph(&graph, std::slice::from_ref(&tree_delta))
+                .unwrap();
+        assert_eq!(live_cleanup, cleanup);
+        assert_eq!(
+            cleanup.entity_deltas(),
+            &[EntityDelta::Removed {
+                old: entity.clone()
+            }]
+        );
+        assert_eq!(
+            cleanup.relation_deltas(),
+            &[RelationDelta::Removed {
+                old: relation.clone()
+            }]
+        );
+
+        let mut combined = cleanup.transaction_delta();
+        combined.tree_deltas = vec![tree_delta];
+        graph.apply_transaction_delta(&combined).unwrap();
+
+        assert!(graph.list_all_entities().unwrap().is_empty());
+        assert_eq!(graph.graph_stats().total_relations, 0);
+        assert_eq!(
+            graph.resolved_tree().artifact_at_path(&path).unwrap().entry,
+            new_entry
+        );
+    }
+
+    #[test]
+    fn mode_only_change_preserves_content_derived_semantics() {
+        let graph = kin_db::InMemoryGraph::new();
+        let artifact_id = ArtifactId::new();
+        let path = RepoPath::from_utf8("src/lib.rs").unwrap();
+        let hash = Hash256::from_bytes([0x31; 32]);
+        let entity = test_entity("unchanged_definition", "src/lib.rs");
+        graph
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: vec![EntityDelta::Added {
+                    new: entity.clone(),
+                }],
+                tree_deltas: vec![TreeDelta::Added {
+                    artifact_id,
+                    new: LocatedEntry::new(path.clone(), TreeEntry::blob(hash, false)),
+                }],
+                ..TransactionDelta::default()
+            })
+            .unwrap();
+        let tree_delta = TreeDelta::Updated {
+            artifact_id,
+            old: LocatedEntry::new(path.clone(), TreeEntry::blob(hash, false)),
+            new: LocatedEntry::new(path.clone(), TreeEntry::blob(hash, true)),
+        };
+
+        let cleanup = workspace_semantic_cleanup_from_snapshot(
+            &graph.to_snapshot(),
+            std::slice::from_ref(&tree_delta),
+        )
+        .unwrap();
+        assert!(cleanup.is_empty());
+
+        graph
+            .apply_transaction_delta(&TransactionDelta {
+                tree_deltas: vec![tree_delta],
+                ..TransactionDelta::default()
+            })
+            .unwrap();
+        assert_eq!(graph.list_all_entities().unwrap(), vec![entity]);
     }
 
     fn reopen(init: &kin_core::InitResult) -> RepositoryAuthorityManager<LocalFileBackend> {

@@ -975,4 +975,76 @@ mod tests {
             vec!["compose.yaml".to_string(), "ghost.bin".to_string()]
         );
     }
+
+    #[test]
+    fn content_change_atomically_retires_source_and_shallow_facets() {
+        use kin_model::{
+            ArtifactId, FileLayout, FilePathId, ImportSection, LocatedEntry, ParseCompleteness,
+            ResolvedArtifact, ShallowTrackedFile, TransactionDelta, TreeDelta,
+        };
+
+        let old_hash = Hash256::from_bytes([0x51; 32]);
+        let new_hash = Hash256::from_bytes([0x52; 32]);
+        let artifact_id = ArtifactId::new();
+        let path = RepoPath::from_utf8("src/lib.rs").unwrap();
+        let file_id = FilePathId::new("src/lib.rs");
+        let graph = kin_db::InMemoryGraph::new();
+        graph
+            .apply_transaction_delta(&TransactionDelta {
+                tree_deltas: vec![TreeDelta::Added {
+                    artifact_id,
+                    new: LocatedEntry::new(path.clone(), TreeEntry::blob(old_hash, false)),
+                }],
+                ..TransactionDelta::default()
+            })
+            .unwrap();
+        graph
+            .upsert_file_layout(&FileLayout {
+                file_id: file_id.clone(),
+                parse_completeness: ParseCompleteness::Full,
+                imports: ImportSection {
+                    byte_range: 0..0,
+                    items: Vec::new(),
+                },
+                regions: Vec::new(),
+            })
+            .unwrap();
+        graph
+            .upsert_shallow_file(&ShallowTrackedFile {
+                file_id: file_id.clone(),
+                language_hint: "rust".to_string(),
+                declaration_count: 1,
+                import_count: 0,
+                syntax_hash: old_hash,
+                signature_hash: Some(old_hash),
+                declaration_names: vec!["old_definition".to_string()],
+                import_paths: Vec::new(),
+            })
+            .unwrap();
+
+        graph
+            .apply_transaction_delta(&TransactionDelta {
+                tree_deltas: vec![TreeDelta::Updated {
+                    artifact_id,
+                    old: LocatedEntry::new(path.clone(), TreeEntry::blob(old_hash, false)),
+                    new: LocatedEntry::new(path.clone(), TreeEntry::blob(new_hash, false)),
+                }],
+                ..TransactionDelta::default()
+            })
+            .unwrap();
+
+        assert!(graph.get_file_layout(&file_id).unwrap().is_none());
+        assert!(graph.get_shallow_file(&file_id).unwrap().is_none());
+        let authority_tree = ResolvedTree::from_artifacts([ResolvedArtifact::new(
+            artifact_id,
+            path,
+            TreeEntry::blob(new_hash, false),
+        )])
+        .unwrap();
+        let coverage =
+            collect_repository_artifact_coverage_for_tree(&authority_tree, &graph).unwrap();
+        assert_eq!(coverage.missing_enrichment_path_count, 1);
+        assert_eq!(coverage.content_mismatch_path_count, 0);
+        assert_eq!(coverage.stale_enrichment_path_count, 0);
+    }
 }

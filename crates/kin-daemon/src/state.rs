@@ -2947,9 +2947,6 @@ impl DaemonState {
                             file_id
                         )))
                     })?;
-                self.graph
-                    .upsert_file_layout(&layout)
-                    .map_err(DaemonError::from)?;
                 let entry = self
                     .graph
                     .get_tree_entry(file_id)
@@ -2971,6 +2968,12 @@ impl DaemonState {
                         expected
                     )));
                 }
+                // Content identity is the precondition for publishing the
+                // query-facing layout. Mutating first would leave a stale
+                // same-path layout behind when this check fails.
+                self.graph
+                    .upsert_file_layout(&layout)
+                    .map_err(DaemonError::from)?;
             }
             kin_reconcile::ReconcileOutcome::FileRemoved { file_id, .. } => {
                 self.graph
@@ -5029,6 +5032,53 @@ mod tests {
         assert_eq!(
             state.graph.get_tree_entry(&file_id).unwrap(),
             Some(TreeEntry::blob(content_hash, false))
+        );
+    }
+
+    #[test]
+    fn persist_projection_truth_rejects_wrong_bytes_before_publishing_layout() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let state = test_state(init.layout, repo_dir.path());
+        let mut reconciler = Reconciler::new(repo_dir.path().to_path_buf());
+        let file_id = FilePathId::new("src/lib.rs");
+        let admitted = b"fn admitted() {}\n".to_vec();
+        let stale = b"fn stale() {}\n".to_vec();
+        let admitted_hash = Hash256::from_bytes(kin_blobs::digest_bytes(&admitted));
+        state
+            .graph
+            .apply_transaction_delta(&kin_model::TransactionDelta {
+                tree_deltas: vec![TreeDelta::Added {
+                    artifact_id: ArtifactId::new(),
+                    new: LocatedEntry::new(
+                        RepoPath::from_utf8(&file_id.0).unwrap(),
+                        TreeEntry::blob(admitted_hash, false),
+                    ),
+                }],
+                ..Default::default()
+            })
+            .unwrap();
+        reconciler
+            .projection_mut()
+            .register_file(simple_layout(&file_id), stale);
+
+        let error = state
+            .persist_projection_truth_from_reconcile(
+                &reconciler,
+                &ReconcileOutcome::Updated {
+                    file_id: file_id.clone(),
+                    added: vec![],
+                    modified: vec![],
+                    removed: vec![],
+                    collision_warnings: vec![],
+                },
+            )
+            .expect_err("wrong projection bytes must fail before publishing a layout");
+
+        assert!(error.to_string().contains("do not match graph-owned tree"));
+        assert!(
+            state.graph.get_file_layout(&file_id).unwrap().is_none(),
+            "a failed content precondition must leave no query-facing layout"
         );
     }
 
