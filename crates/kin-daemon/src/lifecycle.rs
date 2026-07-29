@@ -700,6 +700,19 @@ fn read_endpoint_owner_record(kin_root: &Path) -> Option<EndpointOwnerRecord> {
 /// with no PID file beside it attributes nothing, and the next publication
 /// overwrites it.
 pub fn endpoint_ownership(kin_root: &Path) -> EndpointOwnership {
+    endpoint_ownership_with_probe(
+        kin_root,
+        kin_cli::daemon_client::process_identity_is_current,
+    )
+}
+
+/// The probe is injectable for the same reason publication's is: the
+/// indeterminate arm is a decision, not an accident, and a decision that cannot
+/// be exercised in a test is one a later change can silently invert.
+fn endpoint_ownership_with_probe(
+    kin_root: &Path,
+    probe: impl FnOnce(&kin_cli::daemon_client::ProcessIdentity) -> std::io::Result<bool>,
+) -> EndpointOwnership {
     if !kin_root.join("daemon.pid").exists() {
         return EndpointOwnership::Absent;
     }
@@ -724,7 +737,7 @@ pub fn endpoint_ownership(kin_root: &Path) -> EndpointOwnership {
                 },
             };
         }
-        return match kin_cli::daemon_client::process_identity_is_current(&record.identity) {
+        return match probe(&record.identity) {
             Ok(is_current) => EndpointOwnership::OtherProcess {
                 pid: record.identity.pid(),
                 live: is_current,
@@ -2194,23 +2207,78 @@ mod tests {
         assert_eq!(read_port_file(root), Some(4219));
     }
 
+    #[cfg(unix)]
     #[test]
     fn an_unreadable_owner_probe_still_protects_the_endpoint_from_removal() {
         // The other half of the split: failing closed is right for deleting.
         // The same indeterminate probe that must not block publication must
         // still stop this process from retiring an endpoint it cannot prove is
         // dead.
+        //
+        // This drives a real owner record for a real foreign process and
+        // injects the unreadable probe, so the indeterminate arm is actually
+        // executed. An earlier version wrote a bare `daemon.pid` and reached
+        // the legacy branch instead, testing something else entirely under this
+        // name.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut foreign = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn a stand-in foreign owner");
+        let identity = kin_cli::daemon_client::process_identity(foreign.id())
+            .expect("read the foreign owner's identity")
+            .expect("the foreign owner is running");
+        publish_foreign_endpoint_for_test(root, identity, 51234);
+
+        let unreadable = |_: &kin_cli::daemon_client::ProcessIdentity| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "cannot read birth identity for a foreign process",
+            ))
+        };
+        let ownership = endpoint_ownership_with_probe(root, unreadable);
+
+        assert_eq!(
+            ownership,
+            EndpointOwnership::OtherProcess {
+                pid: foreign.id(),
+                live: true,
+            },
+            "an owner that cannot be inspected must read as live for the removal decision"
+        );
+        assert!(
+            !ownership.authorizes_removal(),
+            "never delete an endpoint whose owner cannot be inspected"
+        );
+
+        // And end to end, through the real probe: the endpoint survives.
+        remove_daemon_files_if_current_process(root);
+        assert!(
+            root.join("daemon.pid").exists() && root.join("daemon.port").exists(),
+            "an endpoint owned by another live process must survive retirement"
+        );
+
+        let _ = foreign.kill();
+        let _ = foreign.wait();
+    }
+
+    #[test]
+    fn a_legacy_endpoint_naming_a_live_pid_is_not_removed() {
+        // The legacy branch the test above used to reach by accident, kept
+        // deliberately and named for what it is: no owner record, a bare PID
+        // that resolves to something alive, so removal is refused.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         std::fs::write(root.join("daemon.pid"), "1").unwrap();
         std::fs::write(root.join("daemon.port"), "51234").unwrap();
 
-        remove_daemon_files_if_current_process(root);
-
-        assert!(
-            root.join("daemon.pid").exists() && root.join("daemon.port").exists(),
-            "an endpoint owned by a process this one cannot inspect must survive"
+        assert_eq!(
+            endpoint_ownership(root),
+            EndpointOwnership::OtherProcess { pid: 1, live: true }
         );
+        remove_daemon_files_if_current_process(root);
+        assert!(root.join("daemon.pid").exists() && root.join("daemon.port").exists());
     }
 
     #[test]
