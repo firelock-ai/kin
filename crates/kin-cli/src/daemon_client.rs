@@ -14,7 +14,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -131,7 +131,13 @@ struct SupervisorRouteResponse {
 
 #[derive(Debug, Deserialize)]
 struct DaemonCompatResponse {
+    #[serde(default)]
+    schema: String,
     graph_snapshot_version: u32,
+    #[serde(default)]
+    supervisor_startup_protocol: Option<u32>,
+    #[serde(default)]
+    supervisor_startup_capabilities: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1627,6 +1633,19 @@ pub enum ProcessLiveness {
     Unknown,
 }
 
+/// Stable identity of one operating-system process incarnation.
+///
+/// A numeric PID is only a lookup key: after exit it can name an unrelated
+/// process. Startup capabilities therefore bind both the current boot and the
+/// process creation instant. On supported targets, failure to obtain either
+/// component is an indeterminate owner and must fail closed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessIdentity {
+    pid: u32,
+    boot_id: String,
+    birth_token: String,
+}
+
 impl ProcessLiveness {
     /// Compatibility view for callers that only need a conservative boolean.
     ///
@@ -1681,6 +1700,247 @@ pub fn process_liveness(pid: u32) -> ProcessLiveness {
         // ownership rather than guessing "dead" and deleting live authority.
         ProcessLiveness::Unknown
     }
+}
+
+fn stable_boot_identity() -> std::io::Result<String> {
+    #[cfg(target_os = "linux")]
+    {
+        let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
+        let boot_id = boot_id.trim();
+        if boot_id.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Linux boot_id is empty",
+            ));
+        }
+        return Ok(format!("linux-boot-id:{boot_id}"));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let mut boot_time = libc::timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        };
+        let mut len = std::mem::size_of::<libc::timeval>();
+        let mut mib = [libc::CTL_KERN, libc::KERN_BOOTTIME];
+        let status = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                mib.len() as _,
+                &mut boot_time as *mut libc::timeval as *mut _,
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if status != 0 || len != std::mem::size_of::<libc::timeval>() {
+            return Err(std::io::Error::last_os_error());
+        }
+        return Ok(format!(
+            "macos-kern-boottime:{}:{:06}",
+            boot_time.tv_sec, boot_time.tv_usec
+        ));
+    }
+
+    #[cfg(windows)]
+    {
+        use windows_sys::core::GUID;
+        use windows_sys::Wdk::System::SystemInformation::NtQuerySystemInformation;
+
+        #[repr(C)]
+        struct SystemBootEnvironmentInformation {
+            boot_identifier: GUID,
+            firmware_type: u32,
+            boot_flags: u64,
+        }
+
+        let mut info = SystemBootEnvironmentInformation {
+            boot_identifier: GUID::default(),
+            firmware_type: 0,
+            boot_flags: 0,
+        };
+        let mut returned = 0_u32;
+        // SYSTEM_INFORMATION_CLASS 90 is
+        // SystemBootEnvironmentInformation. Its BootIdentifier is generated
+        // once by the kernel for this boot and does not derive from wall time.
+        let status = unsafe {
+            NtQuerySystemInformation(
+                90,
+                &mut info as *mut _ as *mut _,
+                std::mem::size_of::<SystemBootEnvironmentInformation>() as u32,
+                &mut returned,
+            )
+        };
+        if status < 0 {
+            return Err(std::io::Error::other(format!(
+                "NtQuerySystemInformation(SystemBootEnvironmentInformation) failed with NTSTATUS \
+                 0x{:08x}",
+                status as u32
+            )));
+        }
+        let guid = info.boot_identifier;
+        return Ok(format!(
+            "windows-boot-guid:{:08x}-{:04x}-{:04x}-{}",
+            guid.data1,
+            guid.data2,
+            guid.data3,
+            hex::encode(guid.data4)
+        ));
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "stable boot identity is unsupported on this platform",
+        ))
+    }
+}
+
+fn process_identity(pid: u32) -> std::io::Result<Option<ProcessIdentity>> {
+    let liveness = process_liveness(pid);
+    if liveness == ProcessLiveness::Dead {
+        return Ok(None);
+    }
+
+    let boot_id = stable_boot_identity()?;
+
+    #[cfg(target_os = "linux")]
+    {
+        let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => stat,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    && process_liveness(pid) == ProcessLiveness::Dead =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        // `comm` is parenthesized and may contain spaces or `)`, so split only
+        // after its final closing delimiter. The 20th field in the remaining
+        // sequence is field 22 (`starttime`, in boot-relative clock ticks).
+        let after_comm = stat.rsplit_once(')').map(|(_, rest)| rest).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("process {pid} stat has no command delimiter"),
+            )
+        })?;
+        let start_ticks = after_comm
+            .split_whitespace()
+            .nth(19)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("process {pid} stat has no start-time field"),
+                )
+            })?
+            .parse::<u64>()
+            .map_err(|error| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("process {pid} start-time field is invalid: {error}"),
+                )
+            })?;
+        return Ok(Some(ProcessIdentity {
+            pid,
+            boot_id,
+            birth_token: format!("linux-start-ticks:{start_ticks}"),
+        }));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let Ok(raw_pid) = libc::pid_t::try_from(pid) else {
+            return Ok(None);
+        };
+        let mut info = unsafe { std::mem::zeroed::<libc::proc_bsdinfo>() };
+        let expected = std::mem::size_of::<libc::proc_bsdinfo>();
+        let written = unsafe {
+            libc::proc_pidinfo(
+                raw_pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                &mut info as *mut _ as *mut _,
+                expected as i32,
+            )
+        };
+        if written != expected as i32 {
+            if process_liveness(pid) == ProcessLiveness::Dead {
+                return Ok(None);
+            }
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("cannot read birth identity for process {pid}"),
+            ));
+        }
+        return Ok(Some(ProcessIdentity {
+            pid,
+            boot_id,
+            birth_token: format!(
+                "macos-start-time:{}:{:06}",
+                info.pbi_start_tvsec, info.pbi_start_tvusec
+            ),
+        }));
+    }
+
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
+        use windows_sys::Win32::System::Threading::{
+            GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+
+        let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if process.is_null() {
+            if process_liveness(pid) == ProcessLiveness::Dead {
+                return Ok(None);
+            }
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut created = FILETIME::default();
+        let mut exited = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+        let queried =
+            unsafe { GetProcessTimes(process, &mut created, &mut exited, &mut kernel, &mut user) };
+        let _ = unsafe { CloseHandle(process) };
+        if queried == 0 {
+            if process_liveness(pid) == ProcessLiveness::Dead {
+                return Ok(None);
+            }
+            return Err(std::io::Error::last_os_error());
+        }
+        let created_100ns = ((created.dwHighDateTime as u64) << 32) | created.dwLowDateTime as u64;
+        return Ok(Some(ProcessIdentity {
+            pid,
+            boot_id,
+            birth_token: format!("windows-created-100ns:{created_100ns}"),
+        }));
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    {
+        let _ = boot_id;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "process birth identity is unsupported on this platform",
+        ))
+    }
+}
+
+fn current_process_identity() -> std::io::Result<ProcessIdentity> {
+    process_identity(std::process::id())?.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "the current process disappeared while reading its birth identity",
+        )
+    })
+}
+
+fn process_identity_is_current(identity: &ProcessIdentity) -> std::io::Result<bool> {
+    Ok(process_identity(identity.pid)?.as_ref() == Some(identity))
 }
 
 #[cfg(windows)]
@@ -2103,6 +2363,10 @@ const SUPERVISOR_PORT_FILE: &str = "supervisor.port";
 const SUPERVISOR_LIFECYCLE_FILE: &str = "supervisor.lifecycle";
 const SUPERVISOR_SINGLETON_FILE: &str = "supervisor.lock";
 const SUPERVISOR_STARTUP_FILE: &str = "supervisor.start.lock";
+const SUPERVISOR_STARTUP_AUTHORITY_FILE: &str = "authority.lock";
+const SUPERVISOR_STARTUP_PROTOCOL: u32 = 2;
+const SUPERVISOR_STARTUP_CAPABILITY: &str = "generation-adoption-ack-v2";
+const SUPERVISOR_LEGACY_SENTINEL_CAPABILITY: &str = "legacy-directory-sentinel-v1";
 /// Internal handoff from the current CLI launcher to the supervisor child.
 ///
 /// This is scrubbed from every daemon command and set only on a supervisor
@@ -2167,27 +2431,7 @@ pub fn remove_stale_supervisor_files() {
 fn try_acquire_supervisor_startup_lock_for_cleanup(
     dir: &Path,
 ) -> std::io::Result<SupervisorStartupLock> {
-    match try_acquire_supervisor_startup_lock_in_dir(dir) {
-        Ok(authority) => Ok(authority),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let path = dir.join(SUPERVISOR_STARTUP_FILE);
-            let (snapshot, record) = supervisor_startup_record_at(&path)?;
-            let Some(record) = record else {
-                return Err(error);
-            };
-            if !process_liveness(record.pid).authorizes_cleanup() {
-                return Err(error);
-            }
-            if !remove_supervisor_startup_lock_if_unchanged(&path, &snapshot)? {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::AlreadyExists,
-                    "supervisor startup authority changed during dead-owner cleanup",
-                ));
-            }
-            try_acquire_supervisor_startup_lock_in_dir(dir)
-        }
-        Err(error) => Err(error),
-    }
+    try_acquire_supervisor_startup_lock_in_dir(dir)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2270,7 +2514,7 @@ where
 {
     if !startup_authority.authorizes(dir) {
         return SupervisorEndpointRetirement::CoordinationUnavailable(format!(
-            "legacy startup authority at {} does not authorize {}",
+            "startup protocol authority at {} does not authorize {}",
             startup_authority.path().display(),
             dir.display()
         ));
@@ -2300,10 +2544,9 @@ where
         }
     }
 
-    // Current publishers continuously hold the lifetime inode. Compatible
-    // older publishers do not know this lock, so callers must also hold the
-    // legacy supervisor.start.lock from before this comparison through the
-    // final retire-or-spawn decision.
+    // Current publishers continuously hold the lifetime inode. The permanent
+    // startup directory excludes immutable create-new launchers, while this
+    // caller's v2 authority lock serializes the final retire-or-spawn decision.
     let singleton = match OpenOptions::new()
         .create(true)
         .read(true)
@@ -2500,11 +2743,33 @@ fn daemon_binary_matches_cli_graph(path: &Path) -> Result<(), String> {
     }
     let compat: DaemonCompatResponse = serde_json::from_slice(&output.stdout)
         .map_err(|error| format!("compat probe returned invalid JSON: {error}"))?;
+    validate_daemon_compat_response(&compat)
+}
+
+fn validate_daemon_compat_response(compat: &DaemonCompatResponse) -> Result<(), String> {
     let expected = kin_db::GraphSnapshot::CURRENT_VERSION;
     if compat.graph_snapshot_version != expected {
         return Err(format!(
             "graph snapshot version {} does not match CLI expected version {expected}",
             compat.graph_snapshot_version
+        ));
+    }
+    if compat.schema != "kin.daemon.compat.v2"
+        || compat.supervisor_startup_protocol != Some(SUPERVISOR_STARTUP_PROTOCOL)
+        || !compat
+            .supervisor_startup_capabilities
+            .iter()
+            .any(|capability| capability == SUPERVISOR_STARTUP_CAPABILITY)
+        || !compat
+            .supervisor_startup_capabilities
+            .iter()
+            .any(|capability| capability == SUPERVISOR_LEGACY_SENTINEL_CAPABILITY)
+    {
+        return Err(format!(
+            "daemon does not acknowledge supervisor startup protocol v{} ({}, {})",
+            SUPERVISOR_STARTUP_PROTOCOL,
+            SUPERVISOR_STARTUP_CAPABILITY,
+            SUPERVISOR_LEGACY_SENTINEL_CAPABILITY
         ));
     }
     Ok(())
@@ -2518,6 +2783,20 @@ fn validate_daemon_binary(path: &Path) -> Result<(), String> {
 }
 
 fn find_daemon_binary() -> Result<PathBuf> {
+    if let Ok(explicit) = std::env::var("KIN_DAEMON_BIN") {
+        let path = PathBuf::from(explicit);
+        if !path.exists() {
+            bail!("explicit KIN_DAEMON_BIN does not exist: {}", path.display());
+        }
+        return match validate_daemon_binary(&path) {
+            Ok(()) => Ok(path),
+            Err(reason) => bail!(
+                "explicit KIN_DAEMON_BIN {} is incompatible with this kin CLI: {reason}",
+                path.display()
+            ),
+        };
+    }
+
     let mut rejected = Vec::new();
     let mut consider = |path: PathBuf| -> Option<PathBuf> {
         if !path.exists() {
@@ -2532,12 +2811,6 @@ fn find_daemon_binary() -> Result<PathBuf> {
         }
     };
 
-    if let Ok(explicit) = std::env::var("KIN_DAEMON_BIN") {
-        let path = PathBuf::from(explicit);
-        if let Some(path) = consider(path) {
-            return Ok(path);
-        }
-    }
     if let Ok(exe) = std::env::current_exe() {
         let sibling = exe.with_file_name("kin-daemon");
         if let Some(path) = consider(sibling) {
@@ -2892,113 +3165,214 @@ impl Drop for StartupLock {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SupervisorStartupRecord {
-    pid: u32,
-    generation: Option<String>,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct StartupFileIdentity {
+    volume: u64,
+    file: u64,
 }
 
-fn parse_supervisor_startup_record(content: &str) -> Option<SupervisorStartupRecord> {
-    let mut pid = None;
-    let mut generation = None;
-    for field in content.split_whitespace() {
-        if let Some(value) = field.strip_prefix("pid=") {
-            pid = value.parse::<u32>().ok();
-        } else if let Some(value) = field.strip_prefix("generation=") {
-            generation = (!value.is_empty()).then(|| value.to_string());
+fn startup_file_identity(metadata: &std::fs::Metadata) -> std::io::Result<StartupFileIdentity> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        return Ok(StartupFileIdentity {
+            volume: metadata.dev(),
+            file: metadata.ino(),
+        });
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        return Ok(StartupFileIdentity {
+            volume: metadata.volume_serial_number().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "startup authority volume identity is unavailable",
+                )
+            })? as u64,
+            file: metadata.file_index().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "startup authority file identity is unavailable",
+                )
+            })?,
+        });
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = metadata;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "startup authority file identity is unsupported on this platform",
+        ))
+    }
+}
+
+fn startup_metadata_is_reparse_point(metadata: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        metadata.file_attributes()
+            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+            != 0
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = metadata;
+        false
+    }
+}
+
+fn open_startup_regular_file(
+    path: &Path,
+    create: bool,
+    create_new: bool,
+    write: bool,
+) -> std::io::Result<File> {
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .write(write)
+        .create(create)
+        .create_new(create_new)
+        .truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if metadata.file_type().is_symlink()
+        || startup_metadata_is_reparse_point(&metadata)
+        || !metadata.is_file()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "supervisor startup protocol refuses non-regular file {}",
+                path.display()
+            ),
+        ));
+    }
+    Ok(file)
+}
+
+fn ensure_supervisor_startup_namespace(dir: &Path) -> std::io::Result<PathBuf> {
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join(SUPERVISOR_STARTUP_FILE);
+    loop {
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata)
+                if metadata.file_type().is_symlink()
+                    || startup_metadata_is_reparse_point(&metadata) =>
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "supervisor startup protocol refuses symlink {}",
+                        path.display()
+                    ),
+                ));
+            }
+            Ok(metadata) if metadata.is_dir() => return Ok(path),
+            Ok(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    format!(
+                        "legacy supervisor launcher marker at {} is incompatible with startup \
+                         protocol v{SUPERVISOR_STARTUP_PROTOCOL}; refusing before supervisor boot",
+                        path.display()
+                    ),
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match std::fs::create_dir(&path) {
+                    Ok(()) => return Ok(path),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(error) => return Err(error),
         }
     }
-    pid.map(|pid| SupervisorStartupRecord { pid, generation })
 }
 
-fn write_supervisor_startup_record(
-    file: &mut File,
-    pid: u32,
-    generation: &str,
-) -> std::io::Result<()> {
-    FileExt::lock_exclusive(file)?;
-    let result = (|| {
-        file.set_len(0)?;
-        file.seek(SeekFrom::Start(0))?;
-        writeln!(
-            file,
-            "pid={pid} generation={generation} heartbeat_at={:?}",
-            std::time::SystemTime::now()
-        )?;
-        file.flush()
-    })();
-    let unlock = FileExt::unlock(file);
-    result.and(unlock)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SupervisorLaunchRecord {
+    schema: String,
+    protocol: u32,
+    generation: String,
+    launcher: ProcessIdentity,
+    authority: StartupFileIdentity,
 }
 
-fn supervisor_startup_record_at(
-    path: &Path,
-) -> std::io::Result<(String, Option<SupervisorStartupRecord>)> {
-    let mut file = OpenOptions::new().read(true).write(true).open(path)?;
-    FileExt::lock_shared(&file)?;
-    let mut content = String::new();
-    let result = file.read_to_string(&mut content);
-    let unlock = FileExt::unlock(&file);
-    result.and(unlock)?;
-    let record = parse_supervisor_startup_record(&content);
-    Ok((content, record))
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SupervisorAdoptionRecord {
+    schema: String,
+    protocol: u32,
+    generation: String,
+    supervisor: ProcessIdentity,
+    authority: StartupFileIdentity,
 }
 
-fn remove_supervisor_startup_lock_if_unchanged(
-    path: &Path,
-    expected: &str,
-) -> std::io::Result<bool> {
-    let current = match supervisor_startup_record_at(path) {
-        Ok((current, _)) => current,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(error),
-    };
-    if current != expected {
-        return Ok(false);
+fn supervisor_launch_record_path(namespace: &Path, generation: &str) -> PathBuf {
+    namespace.join(format!("launch-{generation}.json"))
+}
+
+fn supervisor_adoption_record_path(namespace: &Path, generation: &str) -> PathBuf {
+    namespace.join(format!("adopt-{generation}.json"))
+}
+
+fn write_immutable_startup_record<T: Serialize>(path: &Path, record: &T) -> std::io::Result<()> {
+    let mut file = open_startup_regular_file(path, false, true, true)?;
+    serde_json::to_writer(&mut file, record).map_err(std::io::Error::other)?;
+    file.write_all(b"\n")?;
+    file.flush()?;
+    file.sync_all()
+}
+
+fn read_startup_record<T: serde::de::DeserializeOwned>(path: &Path) -> std::io::Result<T> {
+    let mut file = open_startup_regular_file(path, false, false, false)?;
+    if file.metadata()?.len() > 64 * 1024 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("startup record is unexpectedly large: {}", path.display()),
+        ));
     }
-    match std::fs::remove_file(path) {
-        Ok(()) => Ok(true),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(error),
-    }
+    serde_json::from_reader(&mut file).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid startup record {}: {error}", path.display()),
+        )
+    })
 }
 
-fn remove_supervisor_startup_lock_generation(
-    path: &Path,
-    generation: &str,
-) -> std::io::Result<bool> {
-    let (content, record) = match supervisor_startup_record_at(path) {
-        Ok(record) => record,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(error),
-    };
-    if record.and_then(|record| record.generation).as_deref() != Some(generation) {
-        return Ok(false);
-    }
-    remove_supervisor_startup_lock_if_unchanged(path, &content)
-}
-
-/// Generation-bound proof that one startup participant owns the cross-version
-/// supervisor launch authority for one state directory.
+/// Process-bound startup serialization for protocol-v2 launchers.
 ///
-/// Compatible pre-singleton CLIs use the same create-new pathname. Current
-/// launchers add a generation and transfer that exact generation to the
-/// supervisor child, which keeps the marker present for its entire lifetime.
-/// Every destructive use re-reads the pathname, so an unlinked/replaced token
-/// immediately stops authorizing work and its eventual `Drop` cannot remove a
-/// successor generation.
+/// `supervisor.start.lock` is now a permanent directory. Immutable old clients
+/// use `remove_file`, which cannot delete it even after sleep or scheduler
+/// starvation; current clients serialize on the never-unlinked
+/// `authority.lock` inode inside it. Drop only releases the kernel lock, so it
+/// has no pathname transition that could remove or overwrite a successor.
 #[derive(Debug)]
 pub struct SupervisorStartupLock {
     dir: PathBuf,
-    path: PathBuf,
+    namespace: PathBuf,
     file: File,
+    file_identity: StartupFileIdentity,
     generation: String,
-    remove_on_drop: bool,
+    launch: SupervisorLaunchRecord,
 }
 
 impl SupervisorStartupLock {
     fn path(&self) -> &Path {
-        &self.path
+        &self.namespace
     }
 
     /// Exact generation handed from a launcher to its supervisor child.
@@ -3006,85 +3380,101 @@ impl SupervisorStartupLock {
         &self.generation
     }
 
+    fn current_authority_identity(&self) -> std::io::Result<StartupFileIdentity> {
+        let path = self.namespace.join(SUPERVISOR_STARTUP_AUTHORITY_FILE);
+        let file = open_startup_regular_file(&path, false, false, false)?;
+        startup_file_identity(&file.metadata()?)
+    }
+
     fn authorizes(&self, dir: &Path) -> bool {
-        if self.dir != dir || self.path != dir.join(SUPERVISOR_STARTUP_FILE) {
+        if self.dir != dir || self.namespace != dir.join(SUPERVISOR_STARTUP_FILE) {
             return false;
         }
-        supervisor_startup_record_at(&self.path)
-            .ok()
-            .and_then(|(_, record)| record)
-            .and_then(|record| record.generation)
-            .as_deref()
-            == Some(self.generation.as_str())
+        let own_identity = self
+            .file
+            .metadata()
+            .and_then(|metadata| startup_file_identity(&metadata));
+        if own_identity.ok().as_ref() != Some(&self.file_identity) {
+            return false;
+        }
+        if self.current_authority_identity().ok().as_ref() != Some(&self.file_identity) {
+            return false;
+        }
+        if process_identity_is_current(&self.launch.launcher).ok() != Some(true) {
+            return false;
+        }
+        read_startup_record::<SupervisorLaunchRecord>(&supervisor_launch_record_path(
+            &self.namespace,
+            &self.generation,
+        ))
+        .ok()
+        .as_ref()
+            == Some(&self.launch)
     }
 
-    /// Refresh the old-client-visible marker without changing its current
-    /// owner. Returns false if the pathname no longer names this generation.
+    /// Validate authority without refreshing wall-clock metadata.
     pub fn heartbeat(&mut self) -> std::io::Result<bool> {
-        let Some(record) = supervisor_startup_record_at(&self.path)?.1 else {
-            return Ok(false);
-        };
-        if record.generation.as_deref() != Some(self.generation.as_str()) {
-            return Ok(false);
-        }
-        write_supervisor_startup_record(&mut self.file, record.pid, &self.generation)?;
         Ok(self.authorizes(&self.dir))
     }
 
-    /// Refresh this generation while assigning its liveness record to `pid`.
-    /// The launcher uses the spawned child's PID at final handoff; the child
-    /// then keeps stamping its own PID for its process lifetime.
-    pub fn heartbeat_for_pid(&mut self, pid: u32) -> std::io::Result<bool> {
+    fn verify_adoption(&self, child_pid: u32) -> std::io::Result<()> {
         if !self.authorizes(&self.dir) {
-            return Ok(false);
-        }
-        write_supervisor_startup_record(&mut self.file, pid, &self.generation)?;
-        Ok(self.authorizes(&self.dir))
-    }
-
-    /// Leave pathname cleanup to the supervisor child that adopted this same
-    /// generation. Used only after that child has answered health.
-    fn handoff_cleanup_to_supervisor(&mut self) {
-        self.remove_on_drop = false;
-    }
-
-    fn adopt_in_dir(dir: &Path, generation: &str) -> std::io::Result<Self> {
-        let path = dir.join(SUPERVISOR_STARTUP_FILE);
-        let record = supervisor_startup_record_at(&path)?.1.ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "supervisor startup marker has no parseable owner",
-            )
-        })?;
-        if record.generation.as_deref() != Some(generation) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
-                "supervisor startup generation does not match the launcher handoff",
+                "supervisor startup authority changed before adoption acknowledgement",
             ));
         }
-        let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
-        write_supervisor_startup_record(&mut file, std::process::id(), generation)?;
-        let authority = Self {
-            dir: dir.to_path_buf(),
-            path,
-            file,
-            generation: generation.to_string(),
-            remove_on_drop: true,
-        };
-        if !authority.authorizes(dir) {
+        let adoption: SupervisorAdoptionRecord = read_startup_record(
+            &supervisor_adoption_record_path(&self.namespace, &self.generation),
+        )?;
+        if adoption.schema != "kin.supervisor.adoption.v2"
+            || adoption.protocol != SUPERVISOR_STARTUP_PROTOCOL
+            || adoption.generation != self.generation
+            || adoption.authority != self.file_identity
+            || adoption.supervisor.pid != child_pid
+            || !process_identity_is_current(&adoption.supervisor)?
+        {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
-                "supervisor startup generation changed during child handoff",
+                "supervisor adoption acknowledgement is not bound to the launched child",
             ));
         }
-        Ok(authority)
+        Ok(())
     }
 }
 
-impl Drop for SupervisorStartupLock {
-    fn drop(&mut self) {
-        if self.remove_on_drop {
-            let _ = remove_supervisor_startup_lock_generation(&self.path, &self.generation);
+#[derive(Debug)]
+pub struct SupervisorRuntimeStartup {
+    namespace: PathBuf,
+    generation: String,
+    authority: StartupFileIdentity,
+    supervisor: ProcessIdentity,
+}
+
+impl SupervisorRuntimeStartup {
+    pub fn acknowledge(&self) -> std::io::Result<()> {
+        let record = SupervisorAdoptionRecord {
+            schema: "kin.supervisor.adoption.v2".to_string(),
+            protocol: SUPERVISOR_STARTUP_PROTOCOL,
+            generation: self.generation.clone(),
+            supervisor: self.supervisor.clone(),
+            authority: self.authority.clone(),
+        };
+        let path = supervisor_adoption_record_path(&self.namespace, &self.generation);
+        match write_immutable_startup_record(&path, &record) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let existing: SupervisorAdoptionRecord = read_startup_record(&path)?;
+                if existing == record {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "supervisor adoption record belongs to a different process incarnation",
+                    ))
+                }
+            }
+            Err(error) => Err(error),
         }
     }
 }
@@ -3137,37 +3527,55 @@ async fn acquire_startup_lock(kin_root: &Path) -> Result<StartupLock> {
     }
 }
 
-/// Create a fresh generation only when the shared startup pathname is absent.
-///
-/// Exposed for the supervisor runtime and cross-version executable tests; normal
-/// callers should use the bounded acquisition path.
+/// Acquire the current protocol's persistent startup authority without waiting.
 #[doc(hidden)]
 pub fn try_acquire_supervisor_startup_lock_in_dir(
     dir: &Path,
 ) -> std::io::Result<SupervisorStartupLock> {
-    std::fs::create_dir_all(dir)?;
-    let path = dir.join(SUPERVISOR_STARTUP_FILE);
-    let generation = Uuid::new_v4().to_string();
-    let mut file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .open(&path)?;
-    if let Err(error) = write_supervisor_startup_record(&mut file, std::process::id(), &generation)
-    {
-        let _ = std::fs::remove_file(&path);
-        return Err(error);
+    let namespace = ensure_supervisor_startup_namespace(dir)?;
+    let authority_path = namespace.join(SUPERVISOR_STARTUP_AUTHORITY_FILE);
+    let file = open_startup_regular_file(&authority_path, true, false, true)?;
+    let file_identity = startup_file_identity(&file.metadata()?)?;
+    match file.try_lock_exclusive() {
+        Ok(()) => {}
+        Err(error) if error.kind() == fs2::lock_contended_error().kind() => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "another current launcher holds supervisor startup authority",
+            ));
+        }
+        Err(error) => return Err(error),
     }
+
+    let generation = Uuid::new_v4().to_string();
+    let launch = SupervisorLaunchRecord {
+        schema: "kin.supervisor.launch.v2".to_string(),
+        protocol: SUPERVISOR_STARTUP_PROTOCOL,
+        generation: generation.clone(),
+        launcher: current_process_identity()?,
+        authority: file_identity.clone(),
+    };
+    write_immutable_startup_record(
+        &supervisor_launch_record_path(&namespace, &generation),
+        &launch,
+    )?;
     Ok(SupervisorStartupLock {
         dir: dir.to_path_buf(),
-        path,
+        namespace,
         file,
+        file_identity,
         generation,
-        remove_on_drop: true,
+        launch,
     })
 }
 
-async fn acquire_supervisor_startup_lock() -> Result<SupervisorStartupLock> {
+#[derive(Debug)]
+enum SupervisorStartupAcquisition {
+    Authority(SupervisorStartupLock),
+    Connected(String),
+}
+
+async fn acquire_supervisor_startup_lock() -> Result<SupervisorStartupAcquisition> {
     let dir = supervisor_dir();
     acquire_supervisor_startup_lock_in_dir_with_timeout(
         &dir,
@@ -3179,56 +3587,28 @@ async fn acquire_supervisor_startup_lock() -> Result<SupervisorStartupLock> {
 async fn acquire_supervisor_startup_lock_in_dir_with_timeout(
     dir: &Path,
     timeout: Duration,
-) -> Result<SupervisorStartupLock> {
+) -> Result<SupervisorStartupAcquisition> {
     std::fs::create_dir_all(dir)
         .with_context(|| format!("create supervisor state directory {}", dir.display()))?;
     let path = dir.join(SUPERVISOR_STARTUP_FILE);
     let deadline = Instant::now() + timeout;
-    let mut reported_unparseable_owner = false;
 
     loop {
         match try_acquire_supervisor_startup_lock_in_dir(dir) {
-            Ok(authority) => return Ok(authority),
+            Ok(authority) => return Ok(SupervisorStartupAcquisition::Authority(authority)),
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                match supervisor_startup_record_at(&path) {
-                    Ok((snapshot, Some(record)))
-                        if process_liveness(record.pid).authorizes_cleanup() =>
-                    {
-                        match remove_supervisor_startup_lock_if_unchanged(&path, &snapshot) {
-                            Ok(true) => {
-                                warn!(
-                                    path = %path.display(),
-                                    pid = record.pid,
-                                    "reclaimed supervisor startup lock from a dead owner"
-                                );
-                                continue;
-                            }
-                            Ok(false) => continue,
-                            Err(error) => {
-                                return Err(error).with_context(|| {
-                                    format!(
-                                        "reclaim dead supervisor startup lock at {}",
-                                        path.display()
-                                    )
-                                });
-                            }
+                // A caller waiting behind a live launch must follow discovery
+                // while it waits. Returning the repaired endpoint promptly is
+                // the normal outcome; waiting for the launcher's lock to drop
+                // would strand this command behind a healthy supervisor.
+                let recorded = supervisor_endpoint_snapshot(dir);
+                if let (Some(pid), Some(port)) = (recorded.pid, recorded.port) {
+                    if process_liveness(pid).may_be_alive() {
+                        if let Ok(base_url) =
+                            validate_supervisor_endpoint(LiveDaemonEndpoint { pid, port }).await
+                        {
+                            return Ok(SupervisorStartupAcquisition::Connected(base_url));
                         }
-                    }
-                    Ok((_snapshot, Some(_record))) => {}
-                    Ok((_snapshot, None)) => {
-                        if !reported_unparseable_owner {
-                            warn!(
-                                path = %path.display(),
-                                "preserving supervisor startup lock with an unparseable owner"
-                            );
-                            reported_unparseable_owner = true;
-                        }
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(error) => {
-                        return Err(error).with_context(|| {
-                            format!("read supervisor startup lock at {}", path.display())
-                        });
                     }
                 }
                 if Instant::now() >= deadline {
@@ -3248,22 +3628,120 @@ async fn acquire_supervisor_startup_lock_in_dir_with_timeout(
     }
 }
 
-/// Adopt the launcher's exact startup generation inside the supervisor child.
-///
-/// A direct/manual supervisor launch may create a fresh generation only when
-/// no launcher owns the path. If a legacy launcher holds the marker but did not
-/// pass a generation, the current child fails closed instead of running without
-/// cross-version lifetime protection.
-#[doc(hidden)]
-pub fn acquire_supervisor_runtime_startup_lock(
-    dir: &Path,
-) -> std::io::Result<SupervisorStartupLock> {
-    match std::env::var(SUPERVISOR_STARTUP_GENERATION_ENV) {
-        Ok(generation) if !generation.trim().is_empty() => {
-            SupervisorStartupLock::adopt_in_dir(dir, generation.trim())
+fn supervisor_startup_authority_is_held(namespace: &Path) -> std::io::Result<bool> {
+    let file = open_startup_regular_file(
+        &namespace.join(SUPERVISOR_STARTUP_AUTHORITY_FILE),
+        false,
+        false,
+        true,
+    )?;
+    match file.try_lock_exclusive() {
+        Ok(()) => {
+            FileExt::unlock(&file)?;
+            Ok(false)
         }
-        _ => try_acquire_supervisor_startup_lock_in_dir(dir),
+        Err(error) if error.kind() == fs2::lock_contended_error().kind() => Ok(true),
+        Err(error) => Err(error),
     }
+}
+
+/// Validate a versioned launch capability inside the supervisor child.
+///
+/// The immutable PR-base launcher supplies no generation. It is rejected
+/// before singleton acquisition or endpoint publication, so its unconditional
+/// Drop cleanup cannot inherit a current daemon lifetime. A current launcher is
+/// accepted only while its exact authority inode is locked and its
+/// boot/birth-bound identity is still current. A same-process supervisor
+/// re-exec may reuse an existing adoption record because `exec` preserves both
+/// PID and process birth identity.
+#[doc(hidden)]
+pub fn validate_supervisor_runtime_startup(
+    dir: &Path,
+) -> std::io::Result<SupervisorRuntimeStartup> {
+    let generation = std::env::var(SUPERVISOR_STARTUP_GENERATION_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            let marker = dir.join(SUPERVISOR_STARTUP_FILE);
+            let detail = match std::fs::symlink_metadata(&marker) {
+                Ok(metadata) if !metadata.is_dir() => {
+                    "legacy launcher marker detected; this daemon requires startup protocol v2"
+                }
+                Ok(_) => "startup protocol v2 launch capability is missing",
+                Err(_) => "startup protocol v2 launch capability is missing",
+            };
+            std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                format!("{detail}; refusing before supervisor boot"),
+            )
+        })?;
+    let generation = generation.trim();
+    Uuid::parse_str(generation).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "supervisor startup generation is not a UUID",
+        )
+    })?;
+
+    let namespace = dir.join(SUPERVISOR_STARTUP_FILE);
+    let namespace_metadata = std::fs::symlink_metadata(&namespace)?;
+    if namespace_metadata.file_type().is_symlink()
+        || startup_metadata_is_reparse_point(&namespace_metadata)
+        || !namespace_metadata.is_dir()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "supervisor startup namespace is not a real directory",
+        ));
+    }
+    let authority_file = open_startup_regular_file(
+        &namespace.join(SUPERVISOR_STARTUP_AUTHORITY_FILE),
+        false,
+        false,
+        false,
+    )?;
+    let authority = startup_file_identity(&authority_file.metadata()?)?;
+    let launch: SupervisorLaunchRecord =
+        read_startup_record(&supervisor_launch_record_path(&namespace, generation))?;
+    if launch.schema != "kin.supervisor.launch.v2"
+        || launch.protocol != SUPERVISOR_STARTUP_PROTOCOL
+        || launch.generation != generation
+        || launch.authority != authority
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "supervisor launch capability does not match the current startup authority",
+        ));
+    }
+
+    let supervisor = current_process_identity()?;
+    let adoption_path = supervisor_adoption_record_path(&namespace, generation);
+    let accepted_reexec = match read_startup_record::<SupervisorAdoptionRecord>(&adoption_path) {
+        Ok(existing) => {
+            existing.schema == "kin.supervisor.adoption.v2"
+                && existing.protocol == SUPERVISOR_STARTUP_PROTOCOL
+                && existing.generation == generation
+                && existing.authority == authority
+                && existing.supervisor == supervisor
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error),
+    };
+    if !accepted_reexec
+        && (!process_identity_is_current(&launch.launcher)?
+            || !supervisor_startup_authority_is_held(&namespace)?)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "supervisor launcher is not the live owner of the launch capability",
+        ));
+    }
+    Ok(SupervisorRuntimeStartup {
+        namespace,
+        generation: generation.to_string(),
+        authority,
+        supervisor,
+    })
 }
 
 /// What probing a recorded daemon endpoint established.
@@ -3958,20 +4436,26 @@ pub async fn ensure_supervisor_running() -> Result<String> {
         .map(|_| url);
     }
 
-    // The fast path is deliberately read-only. A compatible older CLI holds
-    // supervisor.start.lock until its older supervisor has published and
-    // passed health, so no endpoint may be retired before we acquire that
-    // cross-version authority.
+    // The fast path is deliberately read-only. No endpoint may be retired
+    // before the current CLI holds the v2 startup authority; immutable clients
+    // are excluded by the permanent directory sentinel.
     match probe_existing_supervisor().await {
         ExistingSupervisor::Connected(base_url) => return Ok(base_url),
         ExistingSupervisor::LiveNotReady(message) => bail!(message),
         ExistingSupervisor::NeedsStartupAuthority => {}
         ExistingSupervisor::SpawnAuthorized => {
-            bail!("supervisor probe authorized a spawn without legacy startup authority")
+            bail!("supervisor probe authorized a spawn without startup protocol authority")
         }
     }
 
-    let mut startup_authority = acquire_supervisor_startup_lock().await?;
+    // Validate the binary's explicit protocol acknowledgement before taking
+    // cleanup or spawn authority. In particular, an immutable base daemon is
+    // rejected here and is never started under a marker it cannot adopt.
+    let daemon_bin = find_daemon_binary()?;
+    let mut startup_authority = match acquire_supervisor_startup_lock().await? {
+        SupervisorStartupAcquisition::Connected(base_url) => return Ok(base_url),
+        SupervisorStartupAcquisition::Authority(authority) => authority,
+    };
     let dir = supervisor_dir();
     match wait_for_existing_supervisor_in_dir(&dir, Some(&startup_authority)).await {
         ExistingSupervisor::Connected(base_url) => return Ok(base_url),
@@ -3982,14 +4466,14 @@ pub async fn ensure_supervisor_running() -> Result<String> {
         }
     }
 
-    let daemon_bin = find_daemon_binary()?;
     // The supervisor binds :0 and reports its real bound port via its endpoint
     // files; passing 0 (rather than a reserved port) removes the same
     // reserve-release-rebind race the repo-daemon path had. The prior
     // ExistingSupervisor::SpawnAuthorized is the only spawn authorization.
-    // Stale endpoint retirement completed while holding the legacy startup
-    // authority plus current lifecycle/singleton authority, and that startup
-    // authority remains held until this child has published and passed health.
+    // Stale endpoint retirement completed while holding the v2 kernel-locked
+    // startup authority plus lifecycle/singleton authority, and that startup
+    // authority remains held until this child has published, acknowledged the
+    // exact generation, and passed health.
     info!(binary = %daemon_bin.display(), "starting supervisor (OS-assigned port)");
 
     let mut cmd = std::process::Command::new(&daemon_bin);
@@ -4026,15 +4510,13 @@ pub async fn ensure_supervisor_running() -> Result<String> {
     let mut child = cmd.spawn().context("spawn kin supervisor")?;
     let deadline = Instant::now() + Duration::from_secs(daemon_ready_timeout_secs());
     let base_url = wait_for_supervisor_ready(&mut child, deadline, &mut startup_authority).await?;
-    if !startup_authority
-        .heartbeat_for_pid(child.id())
-        .context("transfer supervisor startup authority to the ready child")?
-    {
+    if let Err(error) = startup_authority.verify_adoption(child.id()) {
         let _ = child.kill();
         let _ = child.wait();
-        bail!("supervisor startup authority changed before lifetime handoff");
+        return Err(error).context(
+            "supervisor became healthy without acknowledging the exact startup generation",
+        );
     }
-    startup_authority.handoff_cleanup_to_supervisor();
     info!(supervisor = %base_url, "supervisor is up and ready");
     Ok(base_url)
 }
@@ -4993,123 +5475,334 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn supervisor_startup_authority_is_live_owner_and_generation_bound() {
+    async fn supervisor_startup_authority_serializes_a_b_c_and_drop_never_unlinks() {
         let dir = tempfile::tempdir().unwrap();
         let mut launcher_a = try_acquire_supervisor_startup_lock_in_dir(dir.path()).unwrap();
         assert!(
             startup_lock_is_stale(launcher_a.path(), Duration::ZERO),
-            "the marker must be old enough for the former time-only predicate"
+            "the test must make the former wall-clock lease look expired"
         );
 
-        let shortened_wait =
+        let b_while_a =
             acquire_supervisor_startup_lock_in_dir_with_timeout(dir.path(), Duration::ZERO)
                 .await
                 .unwrap_err();
         assert!(
-            shortened_wait
+            b_while_a
                 .to_string()
                 .contains("timed out waiting for supervisor startup lock"),
-            "launcher B must not time-steal launcher A while A's PID is live: {shortened_wait:#}"
+            "B must not time-steal A even when the directory mtime looks expired: {b_while_a:#}"
         );
         assert!(launcher_a.authorizes(dir.path()));
         assert!(launcher_a.heartbeat().unwrap());
-
-        // Model an external/legacy pathname replacement while A still has its
-        // original open file. A must immediately lose authority, and its later
-        // Drop must compare-preserve B's generation.
-        std::fs::remove_file(launcher_a.path()).unwrap();
-        let launcher_b = try_acquire_supervisor_startup_lock_in_dir(dir.path()).unwrap();
-        assert_ne!(launcher_a.generation(), launcher_b.generation());
-        assert!(!launcher_a.authorizes(dir.path()));
+        let namespace = launcher_a.path().to_path_buf();
+        let generation_a = launcher_a.generation().to_string();
         drop(launcher_a);
+
+        let launcher_b = try_acquire_supervisor_startup_lock_in_dir(dir.path()).unwrap();
+        assert_ne!(generation_a, launcher_b.generation());
         assert!(
             launcher_b.authorizes(dir.path()),
-            "launcher A's Drop must not unlink launcher B's generation"
+            "A's Drop only releases its kernel lock and cannot unlink B"
         );
+        assert!(namespace.is_dir());
 
-        let launcher_c_error =
+        let c_while_b =
             acquire_supervisor_startup_lock_in_dir_with_timeout(dir.path(), Duration::ZERO)
                 .await
                 .unwrap_err();
         assert!(
-            launcher_c_error
+            c_while_b
                 .to_string()
                 .contains("timed out waiting for supervisor startup lock"),
-            "launcher C must not enter while launcher B is live: {launcher_c_error:#}"
+            "C must not enter while B owns the authority: {c_while_b:#}"
         );
         assert!(launcher_b.authorizes(dir.path()));
 
         drop(launcher_b);
         let launcher_c = try_acquire_supervisor_startup_lock_in_dir(dir.path()).unwrap();
         assert!(launcher_c.authorizes(dir.path()));
+        drop(launcher_c);
+        assert!(
+            namespace.is_dir(),
+            "no Drop edge removes the old-client-blocking directory sentinel"
+        );
     }
 
     #[test]
-    fn supervisor_startup_generation_transfers_without_a_cleanup_gap() {
+    fn supervisor_adoption_ack_is_generation_process_and_inode_bound() {
         let dir = tempfile::tempdir().unwrap();
-        let mut launcher = try_acquire_supervisor_startup_lock_in_dir(dir.path()).unwrap();
+        let launcher = try_acquire_supervisor_startup_lock_in_dir(dir.path()).unwrap();
         let generation = launcher.generation().to_string();
-        let child = SupervisorStartupLock::adopt_in_dir(dir.path(), &generation).unwrap();
+        let runtime = SupervisorRuntimeStartup {
+            namespace: launcher.path().to_path_buf(),
+            generation: generation.clone(),
+            authority: launcher.file_identity.clone(),
+            supervisor: current_process_identity().unwrap(),
+        };
+        runtime.acknowledge().unwrap();
+        launcher.verify_adoption(std::process::id()).unwrap();
 
-        launcher.handoff_cleanup_to_supervisor();
-        drop(launcher);
+        let adoption_path = supervisor_adoption_record_path(launcher.path(), &generation);
+        let replacement = SupervisorAdoptionRecord {
+            schema: "kin.supervisor.adoption.v2".to_string(),
+            protocol: SUPERVISOR_STARTUP_PROTOCOL,
+            generation,
+            supervisor: ProcessIdentity {
+                birth_token: "reused-pid".to_string(),
+                ..current_process_identity().unwrap()
+            },
+            authority: launcher.file_identity.clone(),
+        };
+        std::fs::remove_file(&adoption_path).unwrap();
+        write_immutable_startup_record(&adoption_path, &replacement).unwrap();
         assert!(
-            child.authorizes(dir.path()),
-            "the launcher must leave the adopted generation present"
-        );
-
-        drop(child);
-        assert!(
-            !dir.path().join(SUPERVISOR_STARTUP_FILE).exists(),
-            "the adopted child owns compare-removal at process exit"
+            launcher.verify_adoption(std::process::id()).is_err(),
+            "a replacement acknowledgement cannot inherit an earlier validation"
         );
     }
 
-    #[tokio::test]
-    async fn live_legacy_startup_owner_is_not_reclaimed_by_elapsed_time() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(SUPERVISOR_STARTUP_FILE);
-        let legacy_record = format!(
-            "pid={} acquired_at={:?}\n",
-            std::process::id(),
-            std::time::SystemTime::now()
-        );
-        std::fs::write(&path, &legacy_record).unwrap();
-        assert!(startup_lock_is_stale(&path, Duration::ZERO));
+    #[test]
+    #[serial_test::serial]
+    fn runtime_reexec_requires_prior_adoption_and_survives_launcher_drop() {
+        let prior = std::env::var_os(SUPERVISOR_STARTUP_GENERATION_ENV);
 
-        let error = acquire_supervisor_startup_lock_in_dir_with_timeout(dir.path(), Duration::ZERO)
-            .await
-            .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("timed out waiting for supervisor startup lock"));
+        let adopted_dir = tempfile::tempdir().unwrap();
+        let adopted_launcher =
+            try_acquire_supervisor_startup_lock_in_dir(adopted_dir.path()).unwrap();
+        let adopted_generation = adopted_launcher.generation().to_string();
+        std::env::set_var(SUPERVISOR_STARTUP_GENERATION_ENV, &adopted_generation);
+        let first_runtime = validate_supervisor_runtime_startup(adopted_dir.path()).unwrap();
+        first_runtime.acknowledge().unwrap();
+        drop(adopted_launcher);
+
+        let reexec_runtime = validate_supervisor_runtime_startup(adopted_dir.path()).unwrap();
+        assert_eq!(reexec_runtime.generation, adopted_generation);
         assert_eq!(
-            std::fs::read_to_string(&path).unwrap(),
-            legacy_record,
-            "a parseable live legacy owner is liveness authority, not an mtime lease"
+            reexec_runtime.supervisor,
+            current_process_identity().unwrap(),
+            "an exec-preserved process incarnation may adopt its immutable acknowledgement"
+        );
+
+        let crashed_dir = tempfile::tempdir().unwrap();
+        let crashed_launcher =
+            try_acquire_supervisor_startup_lock_in_dir(crashed_dir.path()).unwrap();
+        std::env::set_var(
+            SUPERVISOR_STARTUP_GENERATION_ENV,
+            crashed_launcher.generation(),
+        );
+        drop(crashed_launcher);
+        let error = validate_supervisor_runtime_startup(crashed_dir.path()).unwrap_err();
+
+        match prior {
+            Some(value) => std::env::set_var(SUPERVISOR_STARTUP_GENERATION_ENV, value),
+            None => std::env::remove_var(SUPERVISOR_STARTUP_GENERATION_ENV),
+        }
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(
+            error.to_string().contains("launcher is not the live owner"),
+            "a launcher crash before adoption must fail closed: {error}"
         );
     }
 
     #[tokio::test]
-    async fn dead_legacy_startup_owner_is_reclaimed_without_time_authority() {
+    async fn legacy_file_marker_is_rejected_and_never_reclaimed_by_pid_or_time() {
+        for record in [
+            format!("pid={} acquired_at=old\n", std::process::id()),
+            "pid=999999999 acquired_at=old\n".to_string(),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(SUPERVISOR_STARTUP_FILE);
+            std::fs::write(&path, &record).unwrap();
+            assert!(startup_lock_is_stale(&path, Duration::ZERO));
+
+            let error =
+                acquire_supervisor_startup_lock_in_dir_with_timeout(dir.path(), Duration::ZERO)
+                    .await
+                    .unwrap_err();
+            assert!(
+                format!("{error:#}").contains("legacy supervisor launcher marker"),
+                "unsupported legacy pairing must reject explicitly: {error:#}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                record,
+                "neither a dead-looking PID nor elapsed wall time authorizes unlink"
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn runtime_rejects_immutable_legacy_launcher_before_singleton_or_endpoint_publish() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(SUPERVISOR_STARTUP_FILE);
+        let marker = dir.path().join(SUPERVISOR_STARTUP_FILE);
         std::fs::write(
-            &path,
-            "pid=999999999 acquired_at=SystemTime { tv_sec: 0, tv_nsec: 0 }\n",
+            &marker,
+            format!("pid={} acquired_at=legacy\n", std::process::id()),
         )
         .unwrap();
+        let prior = std::env::var_os(SUPERVISOR_STARTUP_GENERATION_ENV);
+        std::env::remove_var(SUPERVISOR_STARTUP_GENERATION_ENV);
+        let error = validate_supervisor_runtime_startup(dir.path()).unwrap_err();
+        match prior {
+            Some(value) => std::env::set_var(SUPERVISOR_STARTUP_GENERATION_ENV, value),
+            None => std::env::remove_var(SUPERVISOR_STARTUP_GENERATION_ENV),
+        }
 
-        let authority =
-            acquire_supervisor_startup_lock_in_dir_with_timeout(dir.path(), Duration::ZERO)
-                .await
-                .unwrap();
-        assert!(authority.authorizes(dir.path()));
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
         assert!(
-            std::fs::read_to_string(path)
-                .unwrap()
-                .contains(authority.generation()),
-            "dead legacy recovery must mint a fresh generation"
+            error.to_string().contains("legacy launcher marker"),
+            "rejection must diagnose the immutable launcher pairing: {error}"
+        );
+        assert!(!dir.path().join(SUPERVISOR_SINGLETON_FILE).exists());
+        assert!(!dir.path().join(SUPERVISOR_PID_FILE).exists());
+        assert!(!dir.path().join(SUPERVISOR_PORT_FILE).exists());
+        assert!(
+            marker.is_file(),
+            "the daemon must leave cleanup to the immutable launcher's own Drop"
+        );
+    }
+
+    #[test]
+    fn compat_handshake_rejects_base_daemon_without_adoption_ack() {
+        let base: DaemonCompatResponse = serde_json::from_value(serde_json::json!({
+            "schema": "kin.daemon.compat.v1",
+            "graph_snapshot_version": kin_db::GraphSnapshot::CURRENT_VERSION,
+        }))
+        .unwrap();
+        let error = validate_daemon_compat_response(&base).unwrap_err();
+        assert!(
+            error.contains("does not acknowledge supervisor startup protocol"),
+            "old daemons must be rejected explicitly before spawn: {error}"
+        );
+
+        let current: DaemonCompatResponse = serde_json::from_value(serde_json::json!({
+            "schema": "kin.daemon.compat.v2",
+            "graph_snapshot_version": kin_db::GraphSnapshot::CURRENT_VERSION,
+            "supervisor_startup_protocol": SUPERVISOR_STARTUP_PROTOCOL,
+            "supervisor_startup_capabilities": [
+                SUPERVISOR_STARTUP_CAPABILITY,
+                SUPERVISOR_LEGACY_SENTINEL_CAPABILITY,
+            ],
+        }))
+        .unwrap();
+        validate_daemon_compat_response(&current).unwrap();
+    }
+
+    #[test]
+    fn process_identity_rejects_pid_reuse_and_reboot_boundaries() {
+        let first_boot = stable_boot_identity().unwrap();
+        std::thread::sleep(Duration::from_millis(10));
+        assert_eq!(
+            stable_boot_identity().unwrap(),
+            first_boot,
+            "boot identity must be a kernel boot token, not wall-clock-minus-uptime"
+        );
+
+        let current = current_process_identity().unwrap();
+        assert!(process_identity_is_current(&current).unwrap());
+
+        let reused = ProcessIdentity {
+            birth_token: format!("{}-reused", current.birth_token),
+            ..current.clone()
+        };
+        assert!(!process_identity_is_current(&reused).unwrap());
+
+        let rebooted = ProcessIdentity {
+            boot_id: format!("{}-next-boot", current.boot_id),
+            ..current
+        };
+        assert!(!process_identity_is_current(&rebooted).unwrap());
+    }
+
+    async fn supervisor_health_server() -> (u16, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buffer = [0_u8; 2048];
+                let Ok(read) = socket.read(&mut buffer).await else {
+                    continue;
+                };
+                if !String::from_utf8_lossy(&buffer[..read]).contains("/health") {
+                    continue;
+                }
+                let body = r#"{"status":"ok"}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                     connection: close\r\ncontent-length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.flush().await;
+            }
+        });
+        (port, server)
+    }
+
+    #[tokio::test]
+    async fn waiter_behind_live_startup_authority_follows_republished_discovery_promptly() {
+        let dir = tempfile::tempdir().unwrap();
+        let launcher = try_acquire_supervisor_startup_lock_in_dir(dir.path()).unwrap();
+        let waiter_dir = dir.path().to_path_buf();
+        let waiter = tokio::spawn(async move {
+            acquire_supervisor_startup_lock_in_dir_with_timeout(&waiter_dir, Duration::from_secs(5))
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let (port, server) = supervisor_health_server().await;
+        write_legacy_supervisor_endpoint_files(dir.path(), std::process::id(), port);
+        let outcome = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("waiter must follow repaired discovery promptly")
+            .expect("waiter task")
+            .expect("waiter result");
+        assert!(
+            matches!(
+                outcome,
+                SupervisorStartupAcquisition::Connected(ref url)
+                    if url == &format!("http://127.0.0.1:{port}")
+            ),
+            "the waiter must connect instead of waiting for the launch lock: {outcome:?}"
+        );
+        assert!(
+            launcher.authorizes(dir.path()),
+            "following discovery must not steal startup authority"
+        );
+        server.abort();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_namespace_and_authority_symlinks_fail_closed() {
+        let state = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(target.path(), state.path().join(SUPERVISOR_STARTUP_FILE))
+            .unwrap();
+        let namespace_error = try_acquire_supervisor_startup_lock_in_dir(state.path()).unwrap_err();
+        assert_eq!(namespace_error.kind(), std::io::ErrorKind::PermissionDenied);
+
+        let state = tempfile::tempdir().unwrap();
+        let namespace = state.path().join(SUPERVISOR_STARTUP_FILE);
+        std::fs::create_dir(&namespace).unwrap();
+        let target_file = state.path().join("target.lock");
+        std::fs::write(&target_file, "").unwrap();
+        std::os::unix::fs::symlink(
+            &target_file,
+            namespace.join(SUPERVISOR_STARTUP_AUTHORITY_FILE),
+        )
+        .unwrap();
+        assert!(
+            try_acquire_supervisor_startup_lock_in_dir(state.path()).is_err(),
+            "authority symlinks must never become lock authority"
         );
     }
 

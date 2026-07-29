@@ -354,9 +354,14 @@ async fn async_main() -> i32 {
         println!(
             "{}",
             serde_json::json!({
-                "schema": "kin.daemon.compat.v1",
+                "schema": "kin.daemon.compat.v2",
                 "version": env!("CARGO_PKG_VERSION"),
                 "graph_snapshot_version": kin_db::GraphSnapshot::CURRENT_VERSION,
+                "supervisor_startup_protocol": 2,
+                "supervisor_startup_capabilities": [
+                    "generation-adoption-ack-v2",
+                    "legacy-directory-sentinel-v1",
+                ],
                 "build": {
                     "sha": build.sha,
                     "dirty": build.dirty,

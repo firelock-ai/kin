@@ -103,6 +103,7 @@ rustix = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
+    "Wdk_System_SystemInformation",
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Authorization",
