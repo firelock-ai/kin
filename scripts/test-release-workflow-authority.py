@@ -185,12 +185,66 @@ REQUIRED_RELEASE_CHECKS = (
     "gitleaks (full history)",
     "Windows installer + vector-free release build",
 )
+DOCS_ONLY_WORKFLOW_HEADER = textwrap.dedent(
+    """\
+    name: CI
+    on:
+      push:
+        branches: [main]
+      pull_request:
+        branches: [main]
+      repository_dispatch:
+        types: [dependency-updated]
+    permissions:
+      contents: read
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}
+      cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+    env:
+      CARGO_TERM_COLOR: always
+      RUSTFLAGS: "-D warnings"
+    """
+).rstrip()
 DOCS_ONLY_CLASSIFIER_SHELL = textwrap.dedent(
     """\
     set -euo pipefail
     docs_only=false
     if [ "$EVENT_NAME" = "pull_request" ]; then
-      changed="$(git diff --name-only "$BASE_SHA...$HEAD_SHA")"
+      changed="$(
+        /usr/bin/env -i \\
+          HOME=/dev/null \\
+          PATH=/usr/bin:/bin \\
+          LC_ALL=C \\
+          GIT_CONFIG_NOSYSTEM=1 \\
+          GIT_CONFIG_SYSTEM=/dev/null \\
+          GIT_CONFIG_GLOBAL=/dev/null \\
+          GIT_CONFIG_COUNT=0 \\
+          GIT_ATTR_NOSYSTEM=1 \\
+          GIT_PAGER=cat \\
+          GIT_TERMINAL_PROMPT=0 \\
+          /usr/bin/git \\
+            --no-pager \\
+            --no-replace-objects \\
+            --no-lazy-fetch \\
+            --no-optional-locks \\
+            --literal-pathspecs \\
+            --git-dir="$WORKSPACE/.git" \\
+            --work-tree="$WORKSPACE" \\
+            -c core.attributesFile=/dev/null \\
+            -c core.fsmonitor=false \\
+            -c diff.external= \\
+            -c diff.renames=false \\
+            -c diff.ignoreSubmodules=none \\
+            diff \\
+            --no-ext-diff \\
+            --no-textconv \\
+            --no-renames \\
+            --ignore-submodules=none \\
+            --submodule=short \\
+            --name-only \\
+            "$BASE_SHA...$HEAD_SHA" \\
+            --
+      )"
       if [ -n "$changed" ]; then
         docs_only=true
         while IFS= read -r path; do
@@ -222,7 +276,13 @@ DOCS_ONLY_CLASSIFIER_JOB = textwrap.dedent(
           id: classify
           shell: /usr/bin/bash --noprofile --norc -p -e -u -o pipefail {0}
           env:
+            PATH: /usr/bin:/bin
             BASH_ENV: ""
+            ENV: ""
+            LD_AUDIT: ""
+            LD_LIBRARY_PATH: /dev/null
+            LD_PRELOAD: ""
+            WORKSPACE: ${{ github.workspace }}
             EVENT_NAME: ${{ github.event_name }}
             BASE_SHA: ${{ github.event.pull_request.base.sha }}
             HEAD_SHA: ${{ github.event.pull_request.head.sha }}
@@ -230,7 +290,41 @@ DOCS_ONLY_CLASSIFIER_JOB = textwrap.dedent(
             set -euo pipefail
             docs_only=false
             if [ "$EVENT_NAME" = "pull_request" ]; then
-              changed="$(git diff --name-only "$BASE_SHA...$HEAD_SHA")"
+              changed="$(
+                /usr/bin/env -i \\
+                  HOME=/dev/null \\
+                  PATH=/usr/bin:/bin \\
+                  LC_ALL=C \\
+                  GIT_CONFIG_NOSYSTEM=1 \\
+                  GIT_CONFIG_SYSTEM=/dev/null \\
+                  GIT_CONFIG_GLOBAL=/dev/null \\
+                  GIT_CONFIG_COUNT=0 \\
+                  GIT_ATTR_NOSYSTEM=1 \\
+                  GIT_PAGER=cat \\
+                  GIT_TERMINAL_PROMPT=0 \\
+                  /usr/bin/git \\
+                    --no-pager \\
+                    --no-replace-objects \\
+                    --no-lazy-fetch \\
+                    --no-optional-locks \\
+                    --literal-pathspecs \\
+                    --git-dir="$WORKSPACE/.git" \\
+                    --work-tree="$WORKSPACE" \\
+                    -c core.attributesFile=/dev/null \\
+                    -c core.fsmonitor=false \\
+                    -c diff.external= \\
+                    -c diff.renames=false \\
+                    -c diff.ignoreSubmodules=none \\
+                    diff \\
+                    --no-ext-diff \\
+                    --no-textconv \\
+                    --no-renames \\
+                    --ignore-submodules=none \\
+                    --submodule=short \\
+                    --name-only \\
+                    "$BASE_SHA...$HEAD_SHA" \\
+                    --
+              )"
               if [ -n "$changed" ]; then
                 docs_only=true
                 while IFS= read -r path; do
@@ -534,9 +628,28 @@ def classifier_active_job_source(classifier: str) -> str:
     return "\n".join(active_lines)
 
 
-def assert_docs_only_classifier_guard(classifier: str) -> None:
-    """Require the exact reviewed job and shell, with comments as the only slack."""
+def workflow_active_header_source(workflow: str) -> str:
+    """Return the active workflow-level contract above the jobs mapping."""
 
+    marker = "\njobs:\n"
+    if workflow.count(marker) != 1:
+        raise AssertionError(
+            "docs_only authority requires exactly one canonical jobs mapping"
+        )
+    return classifier_active_job_source(workflow.split(marker, 1)[0])
+
+
+def assert_docs_only_classifier_guard(workflow: str) -> None:
+    """Require the exact workflow header, classifier job, and classifier shell."""
+
+    if workflow_active_header_source(workflow) != DOCS_ONLY_WORKFLOW_HEADER:
+        raise AssertionError(
+            "diff classifier workflow header must exactly match the closed-form "
+            "process environment authority contract"
+        )
+    classifier = workflow_job_blocks(workflow).get("changes")
+    if classifier is None:
+        raise AssertionError("diff classifier workflow must contain the changes job")
     job_source = classifier_active_job_source(classifier)
     if job_source != DOCS_ONLY_CLASSIFIER_JOB:
         raise AssertionError(
@@ -792,6 +905,7 @@ def execute_docs_only_classifier(
                 "EVENT_NAME": "push",
                 "BASE_SHA": "unused-on-push",
                 "HEAD_SHA": "unused-on-push",
+                "WORKSPACE": str(cwd),
                 "GITHUB_OUTPUT": str(output),
             }
         )
@@ -835,7 +949,7 @@ def execute_docs_only_classifier(
 
 def assert_classifier_bypass_rejected(
     label: str,
-    classifier: str,
+    workflow: str,
     *,
     execute: bool = True,
 ) -> None:
@@ -843,12 +957,13 @@ def assert_classifier_bypass_rejected(
 
     expect_assertion(
         label,
-        "exactly match the closed-form docs_only authority contract",
-        lambda: assert_docs_only_classifier_guard(classifier),
+        "closed-form",
+        lambda: assert_docs_only_classifier_guard(workflow),
     )
     if not execute:
         return
 
+    classifier = workflow_job_blocks(workflow)["changes"]
     result, outputs = execute_docs_only_classifier(classifier)
     assert_classifier_execution_won(label, result, outputs)
 
@@ -894,6 +1009,33 @@ def assert_classifier_execution_failed_closed(
         raise AssertionError(f"classifier did not fail closed: {label}: {outputs}")
 
 
+def assert_classifier_execution_code_bearing(
+    label: str,
+    result: subprocess.CompletedProcess[str],
+    outputs: list[str],
+    *,
+    changed_paths: tuple[str, ...],
+) -> None:
+    """Prove the real classifier rejects and reports a code-bearing diff."""
+
+    if result.returncode != 0:
+        raise AssertionError(
+            f"classifier code-bearing proof did not execute: {label}: "
+            f"{result.stdout}{result.stderr}"
+        )
+    if outputs != ["docs_only=false"]:
+        raise AssertionError(
+            f"classifier admitted a code-bearing diff: {label}: {outputs}"
+        )
+    reported = set(result.stdout.splitlines())
+    missing = [path for path in changed_paths if path not in reported]
+    if missing:
+        raise AssertionError(
+            f"classifier omitted code-bearing paths: {label}: {missing}: "
+            f"{result.stdout}"
+        )
+
+
 def bash_supports_nameref() -> bool:
     """Return whether the local bash can execute the hosted nameref bypass."""
 
@@ -914,46 +1056,69 @@ def bash_supports_nameref() -> bool:
     return probe.returncode == 0
 
 
+def git_fixture_environment(directory: Path) -> dict[str, str]:
+    """Return a process and Git-authority-clean fixture environment."""
+
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("GIT_")
+        and key not in {"LD_AUDIT", "LD_LIBRARY_PATH", "LD_PRELOAD"}
+    }
+    global_config = directory / "git-global-config"
+    global_config.write_text("", encoding="utf-8")
+    environment.update(
+        {
+            "PATH": "/usr/bin:/bin",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_SYSTEM": "/dev/null",
+            "GIT_CONFIG_GLOBAL": str(global_config),
+            "GIT_CONFIG_COUNT": "0",
+            "GIT_ATTR_NOSYSTEM": "1",
+        }
+    )
+    return environment
+
+
+def run_fixture_git(
+    repository: Path,
+    environment: dict[str, str],
+    *args: str,
+) -> str:
+    """Run the reviewed hosted-runner Git path for a hermetic fixture."""
+
+    result = subprocess.run(
+        [
+            "/usr/bin/git",
+            "-c",
+            "maintenance.auto=false",
+            "-c",
+            "gc.auto=0",
+            *args,
+        ],
+        cwd=repository,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise AssertionError(
+            f"classifier Git fixture failed: git {args}: {result.stdout}{result.stderr}"
+        )
+    return result.stdout.strip()
+
+
 def create_docs_only_git_fixture(directory: Path) -> tuple[Path, str, str]:
     """Create a hermetic two-commit repository with one docs-only change."""
 
     repository = directory / "repository"
     repository.mkdir()
-    global_config = directory / "git-global-config"
-    global_config.write_text("", encoding="utf-8")
-    environment = {
-        key: value for key, value in os.environ.items() if not key.startswith("GIT_")
-    }
-    environment.update(
-        {
-            "GIT_CONFIG_NOSYSTEM": "1",
-            "GIT_CONFIG_GLOBAL": str(global_config),
-        }
-    )
+    environment = git_fixture_environment(directory)
 
     def git(*args: str) -> str:
-        result = subprocess.run(
-            [
-                "git",
-                "-c",
-                "maintenance.auto=false",
-                "-c",
-                "gc.auto=0",
-                *args,
-            ],
-            cwd=repository,
-            env=environment,
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-        if result.returncode != 0:
-            raise AssertionError(
-                f"docs-only Git fixture failed: git {args}: "
-                f"{result.stdout}{result.stderr}"
-            )
-        return result.stdout.strip()
+        return run_fixture_git(repository, environment, *args)
 
     git("init", "--initial-branch=main")
     git("config", "user.email", "kin@example.invalid")
@@ -970,6 +1135,119 @@ def create_docs_only_git_fixture(directory: Path) -> tuple[Path, str, str]:
     git("commit", "-m", "docs only")
     head_sha = git("rev-parse", "HEAD")
     return repository, base_sha, head_sha
+
+
+def create_classifier_authority_attack_fixture(
+    directory: Path,
+    base_workflow: str,
+    hostile_workflow: str,
+) -> tuple[Path, str, str, dict[str, str], tuple[Path, ...]]:
+    """Create a code diff plus executable, Git-env, and replace-object attacks."""
+
+    repository = directory / "authority-repository"
+    repository.mkdir()
+    environment = git_fixture_environment(directory)
+
+    def git(*args: str) -> str:
+        return run_fixture_git(repository, environment, *args)
+
+    git("init", "--initial-branch=main")
+    git("config", "user.email", "kin@example.invalid")
+    git("config", "user.name", "Kin")
+    (repository / "README.md").write_text("base\n", encoding="utf-8")
+    source = repository / "src"
+    source.mkdir()
+    (source / "lib.rs").write_text("pub fn authority() -> bool { true }\n")
+    workflows = repository / ".github" / "workflows"
+    workflows.mkdir(parents=True)
+    (workflows / "ci.yml").write_text(base_workflow, encoding="utf-8")
+    git("add", "--all")
+    git("commit", "-m", "seed")
+    base_sha = git("rev-parse", "HEAD")
+
+    docs = repository / "docs"
+    docs.mkdir()
+    (docs / "release-bot.md").write_text("docs-only\n", encoding="utf-8")
+    git("add", "--all")
+    git("commit", "-m", "docs only")
+    docs_sha = git("rev-parse", "HEAD")
+
+    (source / "lib.rs").write_text("pub fn authority() -> bool { false }\n")
+    (workflows / "ci.yml").write_text(hostile_workflow, encoding="utf-8")
+    (repository / ".gitattributes").write_text(
+        "src/lib.rs diff=hostile\n",
+        encoding="utf-8",
+    )
+    attack = repository / "attack"
+    attack.mkdir()
+    path_git = attack / "git"
+    path_git.write_text(
+        "#!/bin/sh\nprintf '%s\\n' docs/decoy.md\n",
+        encoding="utf-8",
+    )
+    path_git.chmod(0o755)
+    external_marker = directory / "external-diff-ran"
+    external_diff = attack / "external-diff"
+    external_diff.write_text(
+        f"#!/bin/sh\n: > {external_marker!s}\nexit 0\n",
+        encoding="utf-8",
+    )
+    external_diff.chmod(0o755)
+    textconv_marker = directory / "textconv-ran"
+    textconv = attack / "textconv"
+    textconv.write_text(
+        f"#!/bin/sh\n: > {textconv_marker!s}\nprintf decoy\n",
+        encoding="utf-8",
+    )
+    textconv.chmod(0o755)
+    hostile_config = attack / "gitconfig"
+    hostile_config.write_text(
+        "[diff]\n"
+        f"\texternal = {external_diff!s}\n"
+        "\trenames = true\n"
+        '[diff "hostile"]\n'
+        f"\ttextconv = {textconv!s}\n",
+        encoding="utf-8",
+    )
+    git("add", "--all")
+    git("commit", "-m", "code and workflow attack")
+    head_sha = git("rev-parse", "HEAD")
+    git("replace", head_sha, docs_sha)
+
+    hostile_environment = {
+        "PATH": f"{attack!s}:/usr/local/bin:/usr/bin:/bin",
+        "HOME": str(attack),
+        "XDG_CONFIG_HOME": str(attack),
+        "LD_LIBRARY_PATH": str(attack),
+        "GIT_DIR": str(attack / "decoy.git"),
+        "GIT_WORK_TREE": str(attack),
+        "GIT_INDEX_FILE": str(attack / "index"),
+        "GIT_COMMON_DIR": str(attack / "common"),
+        "GIT_OBJECT_DIRECTORY": str(attack / "objects"),
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(attack / "alternate-objects"),
+        "GIT_EXEC_PATH": str(attack),
+        "GIT_CONFIG": str(hostile_config),
+        "GIT_CONFIG_NOSYSTEM": "0",
+        "GIT_CONFIG_SYSTEM": str(hostile_config),
+        "GIT_CONFIG_GLOBAL": str(hostile_config),
+        "GIT_CONFIG_COUNT": "2",
+        "GIT_CONFIG_KEY_0": "diff.external",
+        "GIT_CONFIG_VALUE_0": str(external_diff),
+        "GIT_CONFIG_KEY_1": "diff.hostile.textconv",
+        "GIT_CONFIG_VALUE_1": str(textconv),
+        "GIT_CONFIG_PARAMETERS": "'diff.renames'='true'",
+        "GIT_ATTR_NOSYSTEM": "0",
+        "GIT_EXTERNAL_DIFF": str(external_diff),
+        "GIT_DIFF_OPTS": "--unified=0",
+        "GIT_REPLACE_REF_BASE": "refs/replace",
+    }
+    return (
+        repository,
+        base_sha,
+        head_sha,
+        hostile_environment,
+        (external_marker, textconv_marker),
+    )
 
 
 def workflow_structural_lines(content: str) -> list[tuple[int, int, str]]:
@@ -2353,7 +2631,7 @@ def main() -> None:
     classifier_start = ci_workflow.index("  changes:")
     classifier_end = ci_workflow.index("\n  check-docs-only:", classifier_start)
     classifier = ci_workflow[classifier_start:classifier_end]
-    assert_docs_only_classifier_guard(classifier)
+    assert_docs_only_classifier_guard(ci_workflow)
     assert_check_consumer_authority(ci_workflow)
     consumer_blocks = workflow_job_blocks(ci_workflow)
     docs_only_check = consumer_blocks["check-docs-only"]
@@ -2521,14 +2799,136 @@ def main() -> None:
                 f"diff classifier falsification could not identify {label}"
             )
         mutant = classifier.replace(old, new, 1)
+        mutant_workflow = ci_workflow.replace(classifier, mutant, 1)
         expect_assertion(
             label,
             "exactly match the closed-form docs_only authority contract",
-            lambda mutant=mutant: assert_docs_only_classifier_guard(mutant),
+            lambda mutant_workflow=mutant_workflow: assert_docs_only_classifier_guard(
+                mutant_workflow
+            ),
         )
 
+    workflow_environment_needle = '  RUSTFLAGS: "-D warnings"'
+    if ci_workflow.count(workflow_environment_needle) != 1:
+        raise AssertionError(
+            "diff classifier falsification could not identify workflow environment"
+        )
+    workflow_environment_attacks = (
+        (
+            "workflow PATH resolves Git from a checked-out executable",
+            "  PATH: ${{ github.workspace }}/attack:/usr/local/bin:/usr/bin:/bin",
+        ),
+        (
+            "workflow Git repository and index authority redirected",
+            "  GIT_DIR: ${{ github.workspace }}/attack/decoy.git\n"
+            "  GIT_WORK_TREE: ${{ github.workspace }}/attack\n"
+            "  GIT_INDEX_FILE: ${{ github.workspace }}/attack/index",
+        ),
+        (
+            "workflow Git configuration and external diff authority injected",
+            '  GIT_CONFIG_NOSYSTEM: "0"\n'
+            "  GIT_CONFIG_GLOBAL: ${{ github.workspace }}/attack/gitconfig\n"
+            '  GIT_CONFIG_COUNT: "1"\n'
+            "  GIT_CONFIG_KEY_0: diff.external\n"
+            "  GIT_CONFIG_VALUE_0: ${{ github.workspace }}/attack/external-diff\n"
+            "  GIT_EXTERNAL_DIFF: ${{ github.workspace }}/attack/external-diff",
+        ),
+        (
+            "workflow Git object, replacement, and executable authority injected",
+            "  GIT_OBJECT_DIRECTORY: ${{ github.workspace }}/attack/objects\n"
+            "  GIT_ALTERNATE_OBJECT_DIRECTORIES: "
+            "${{ github.workspace }}/attack/alternate-objects\n"
+            "  GIT_EXEC_PATH: ${{ github.workspace }}/attack\n"
+            "  GIT_REPLACE_REF_BASE: refs/replace",
+        ),
+    )
+    path_attack_workflow = ""
+    for label, injected_environment in workflow_environment_attacks:
+        mutant_workflow = ci_workflow.replace(
+            workflow_environment_needle,
+            f"{workflow_environment_needle}\n{injected_environment}",
+            1,
+        )
+        if not path_attack_workflow:
+            path_attack_workflow = mutant_workflow
+        expect_assertion(
+            label,
+            "workflow header must exactly match the closed-form",
+            lambda mutant_workflow=mutant_workflow: assert_docs_only_classifier_guard(
+                mutant_workflow
+            ),
+        )
+
+    # The exact PATH attack remains a structurally valid member of the old
+    # census/cache/consumer contracts. Only the workflow-level process contract
+    # should reject it, and the runtime proof below must remain safe if that
+    # header defense is accidentally bypassed.
+    path_attack_sources = dict(workflow_sources)
+    path_attack_sources[WORKFLOWS / "ci.yml"] = path_attack_workflow
+    assert_workflow_job_census(path_attack_sources)
+    assert_rust_cache_steps(path_attack_sources)
+    assert_check_consumer_authority(path_attack_workflow)
+    with tempfile.TemporaryDirectory() as directory:
+        (
+            fixture,
+            code_base_sha,
+            code_head_sha,
+            hostile_environment,
+            execution_markers,
+        ) = create_classifier_authority_attack_fixture(
+            Path(directory),
+            ci_workflow,
+            path_attack_workflow,
+        )
+        fake_git = subprocess.run(
+            ["git", "diff", "--name-only", f"{code_base_sha}...{code_head_sha}"],
+            cwd=fixture,
+            env={"PATH": hostile_environment["PATH"]},
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if fake_git.returncode != 0 or fake_git.stdout.splitlines() != [
+            "docs/decoy.md"
+        ]:
+            raise AssertionError(
+                "workflow PATH attack fixture did not substitute its executable: "
+                f"{fake_git.stdout}{fake_git.stderr}"
+            )
+
+        result, outputs = execute_docs_only_classifier(
+            classifier,
+            cwd=fixture,
+            environment_overrides={
+                **hostile_environment,
+                "EVENT_NAME": "pull_request",
+                "BASE_SHA": code_base_sha,
+                "HEAD_SHA": code_head_sha,
+                "WORKSPACE": str(fixture),
+            },
+        )
+        assert_classifier_execution_code_bearing(
+            "absolute environment-clean Git rejects workflow PATH and Git authority",
+            result,
+            outputs,
+            changed_paths=(".github/workflows/ci.yml", "src/lib.rs"),
+        )
+        executed_markers = [marker for marker in execution_markers if marker.exists()]
+        if executed_markers:
+            raise AssertionError(
+                "classifier executed an inherited external diff or textconv: "
+                f"{executed_markers}"
+            )
+
     environment_binding = (
+        "          PATH: /usr/bin:/bin\n"
         '          BASH_ENV: ""\n'
+        '          ENV: ""\n'
+        '          LD_AUDIT: ""\n'
+        "          LD_LIBRARY_PATH: /dev/null\n"
+        '          LD_PRELOAD: ""\n'
+        "          WORKSPACE: ${{ github.workspace }}\n"
         "          EVENT_NAME: ${{ github.event_name }}\n"
         "          BASE_SHA: ${{ github.event.pull_request.base.sha }}\n"
         "          HEAD_SHA: ${{ github.event.pull_request.head.sha }}"
@@ -2540,7 +2940,13 @@ def main() -> None:
     with tempfile.TemporaryDirectory() as directory:
         fixture, base_sha, head_sha = create_docs_only_git_fixture(Path(directory))
         fixed_range_binding = (
+            "          PATH: /usr/bin:/bin\n"
             '          BASH_ENV: ""\n'
+            '          ENV: ""\n'
+            '          LD_AUDIT: ""\n'
+            "          LD_LIBRARY_PATH: /dev/null\n"
+            '          LD_PRELOAD: ""\n'
+            f"          WORKSPACE: {fixture!s}\n"
             "          EVENT_NAME: pull_request\n"
             f"          BASE_SHA: {base_sha}\n"
             f"          HEAD_SHA: {head_sha}"
@@ -2553,7 +2959,9 @@ def main() -> None:
         expect_assertion(
             "push classifier bound to a fixed historical docs-only range",
             "exactly match the closed-form docs_only authority contract",
-            lambda: assert_docs_only_classifier_guard(fixed_range),
+            lambda: assert_docs_only_classifier_guard(
+                ci_workflow.replace(classifier, fixed_range, 1)
+            ),
         )
         result, outputs = execute_docs_only_classifier(
             fixed_range,
@@ -2562,6 +2970,7 @@ def main() -> None:
                 "EVENT_NAME": "pull_request",
                 "BASE_SHA": base_sha,
                 "HEAD_SHA": head_sha,
+                "WORKSPACE": str(fixture),
             },
         )
         assert_classifier_execution_won(
@@ -2584,7 +2993,9 @@ def main() -> None:
         expect_assertion(
             "classifier shell startup overridden through BASH_ENV",
             "exactly match the closed-form docs_only authority contract",
-            lambda: assert_docs_only_classifier_guard(bash_env_mutant),
+            lambda: assert_docs_only_classifier_guard(
+                ci_workflow.replace(classifier, bash_env_mutant, 1)
+            ),
         )
         result, outputs = execute_docs_only_classifier(
             bash_env_mutant,
@@ -2608,11 +3019,14 @@ def main() -> None:
         expect_assertion(
             "classifier shell drops privileged startup",
             "exactly match the closed-form docs_only authority contract",
-            lambda: assert_docs_only_classifier_guard(unprivileged_shell),
+            lambda: assert_docs_only_classifier_guard(
+                ci_workflow.replace(classifier, unprivileged_shell, 1)
+            ),
         )
         hostile_functions = {
-            "BASH_FUNC_[%%": "() { return 0; }",
-            "BASH_FUNC_git%%": "() { printf 'docs/release-bot.md\\n'; }",
+            "BASH_FUNC_echo%%": (
+                '() { builtin echo "docs_only=true" >> "$GITHUB_OUTPUT"; }'
+            ),
         }
         result, outputs = execute_docs_only_classifier(
             classifier,
@@ -2620,7 +3034,7 @@ def main() -> None:
             environment_overrides=hostile_functions,
         )
         assert_classifier_execution_failed_closed(
-            "privileged classifier rejects inherited test and git functions",
+            "privileged classifier rejects an inherited output function",
             result,
             outputs,
         )
@@ -2631,10 +3045,9 @@ def main() -> None:
             privileged=False,
         )
         assert_classifier_execution_won(
-            "unprivileged classifier imports hostile test and git functions",
+            "unprivileged classifier imports a hostile output function",
             result,
             outputs,
-            changed_path="docs/release-bot.md",
         )
 
         hostile_shell = classifier.replace(
@@ -2648,7 +3061,9 @@ def main() -> None:
         expect_assertion(
             "classifier custom shell overrides event and SHA authority",
             "exactly match the closed-form docs_only authority contract",
-            lambda: assert_docs_only_classifier_guard(hostile_shell),
+            lambda: assert_docs_only_classifier_guard(
+                ci_workflow.replace(classifier, hostile_shell, 1)
+            ),
         )
         result, outputs = execute_docs_only_classifier(
             hostile_shell,
@@ -2686,7 +3101,7 @@ def main() -> None:
     )
     assert_classifier_bypass_rejected(
         "docs_only=true after the matching pull_request fi",
-        truthy_after_guard,
+        ci_workflow.replace(classifier, truthy_after_guard, 1),
     )
     for label, command in (
         ("single-quoted docs_only assignment", "docs_only='true'"),
@@ -2707,7 +3122,7 @@ def main() -> None:
         )
         assert_classifier_bypass_rejected(
             label,
-            bypass,
+            ci_workflow.replace(classifier, bypass, 1),
         )
     nameref_bypass = classifier.replace(
         classifier_falsification_needle,
@@ -2718,7 +3133,7 @@ def main() -> None:
     )
     assert_classifier_bypass_rejected(
         "nameref docs_only assignment",
-        nameref_bypass,
+        ci_workflow.replace(classifier, nameref_bypass, 1),
         execute=bash_supports_nameref(),
     )
     duplicate_computed_output = classifier.replace(
@@ -2731,7 +3146,7 @@ def main() -> None:
     )
     assert_classifier_bypass_rejected(
         "duplicate computed docs_only output",
-        duplicate_computed_output,
+        ci_workflow.replace(classifier, duplicate_computed_output, 1),
     )
     comment_only = classifier.replace(
         classifier_falsification_needle,
@@ -2740,7 +3155,7 @@ def main() -> None:
         '          echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"',
         1,
     )
-    assert_docs_only_classifier_guard(comment_only)
+    assert_docs_only_classifier_guard(ci_workflow.replace(classifier, comment_only, 1))
 
     release_tag = RELEASE_TAG.read_text(encoding="utf-8")
     release_tag_header = release_tag.split("\njobs:", 1)[0]

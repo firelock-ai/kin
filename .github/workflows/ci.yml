@@ -330,11 +330,17 @@ jobs:
           fetch-depth: 0
       - name: Classify changed paths
         id: classify
-        # This step gates release-critical jobs. Override workflow defaults and
-        # shell startup injection rather than inheriting mutable semantics.
+        # This step gates release-critical jobs. Pin its process startup and run
+        # Git with an empty environment rather than inheriting mutable authority.
         shell: /usr/bin/bash --noprofile --norc -p -e -u -o pipefail {0}
         env:
+          PATH: /usr/bin:/bin
           BASH_ENV: ""
+          ENV: ""
+          LD_AUDIT: ""
+          LD_LIBRARY_PATH: /dev/null
+          LD_PRELOAD: ""
+          WORKSPACE: ${{ github.workspace }}
           EVENT_NAME: ${{ github.event_name }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
@@ -342,7 +348,43 @@ jobs:
           set -euo pipefail
           docs_only=false
           if [ "$EVENT_NAME" = "pull_request" ]; then
-            changed="$(git diff --name-only "$BASE_SHA...$HEAD_SHA")"
+            # env -i drops inherited GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE,
+            # GIT_CONFIG_*, object/replace, executable, and diff authority.
+            changed="$(
+              /usr/bin/env -i \
+                HOME=/dev/null \
+                PATH=/usr/bin:/bin \
+                LC_ALL=C \
+                GIT_CONFIG_NOSYSTEM=1 \
+                GIT_CONFIG_SYSTEM=/dev/null \
+                GIT_CONFIG_GLOBAL=/dev/null \
+                GIT_CONFIG_COUNT=0 \
+                GIT_ATTR_NOSYSTEM=1 \
+                GIT_PAGER=cat \
+                GIT_TERMINAL_PROMPT=0 \
+                /usr/bin/git \
+                  --no-pager \
+                  --no-replace-objects \
+                  --no-lazy-fetch \
+                  --no-optional-locks \
+                  --literal-pathspecs \
+                  --git-dir="$WORKSPACE/.git" \
+                  --work-tree="$WORKSPACE" \
+                  -c core.attributesFile=/dev/null \
+                  -c core.fsmonitor=false \
+                  -c diff.external= \
+                  -c diff.renames=false \
+                  -c diff.ignoreSubmodules=none \
+                  diff \
+                  --no-ext-diff \
+                  --no-textconv \
+                  --no-renames \
+                  --ignore-submodules=none \
+                  --submodule=short \
+                  --name-only \
+                  "$BASE_SHA...$HEAD_SHA" \
+                  --
+            )"
             if [ -n "$changed" ]; then
               docs_only=true
               while IFS= read -r path; do
