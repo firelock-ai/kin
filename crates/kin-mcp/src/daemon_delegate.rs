@@ -1023,11 +1023,12 @@ pub async fn forward_tool_call(
                 .map(text_result_from_value)
                 .transpose()
         }
-        // Coverage exposure: surface embedding-index coverage to MCP agents.
-        // The generic graph tool dispatcher only knows entity_count; the
-        // daemon's status command computes embedding coverage from the live
-        // graph (`graph.embedding_status()`), so forward there and project the
-        // fields MCP agents need. Self-contained — no daemon-api coordination.
+        // Coverage exposure: surface graph and embedding-index coverage to MCP
+        // agents. The generic graph tool dispatcher only knows entity_count.
+        // The two counts live on two different daemon surfaces: enrichment
+        // counts on the status command's authority lease, embedding coverage on
+        // the resources command's live `graph.embedding_status()`. Forward to
+        // both and project the fields MCP agents need.
         "kin_graph_status" => forward_graph_status(arguments).await,
         // Stage-time validation in product mode: reject intrinsically-malformed
         // staged operations locally before the daemon round-trip, so the agent
@@ -1061,54 +1062,215 @@ fn validate_stage_arguments(arguments: &HashMap<String, serde_json::Value>) -> R
     crate::session::validate_staged_operations(&operations)
 }
 
-/// Forward `kin_graph_status` to the daemon's status command and project the
-/// graph/embedding coverage fields agents care about.
+/// Forward `kin_graph_status` to the daemon surfaces that actually carry the
+/// counts and project them.
 ///
-/// In product mode coverage is otherwise CLI-only (`kin status`); this gives
-/// MCP agents the same embedding-index visibility without leaving graph-owned
-/// truth — the daemon computes the counts from its live graph.
+/// Two round-trips because the two halves of the answer have two owners:
+/// `/commands/status` renders the repository-v6 authority lease (enrichment
+/// counts), and `/commands/resources` attaches the daemon's live
+/// `graph.embedding_status()` (embedding coverage). Status carries no embedding
+/// field at all, so a single call cannot answer both halves.
+///
+/// The embedding half degrades rather than failing the whole call: an agent
+/// reaching for a readiness check still gets the graph counts when the resource
+/// surface is unavailable, and gets an explicit unavailable marker instead of a
+/// fabricated zero.
 async fn forward_graph_status(
     arguments: &HashMap<String, serde_json::Value>,
 ) -> Result<Option<ToolCallResult>, String> {
     let Some(base) = daemon_base_url() else {
         return Ok(None);
     };
-    let value = daemon_json_request("graph status", &base, |client, base| {
+    let status = daemon_json_request("graph status", &base, |client, base| {
         let request = client
             .post(format!("{base}/commands/status"))
             .json(&serde_json::json!({ "json": false }));
         with_session_header(with_auth(request), arguments)
     })
     .await?;
-    text_result_from_value(project_graph_status(&value)?).map(Some)
+    let resources =
+        daemon_json_request("graph status embedding coverage", &base, |client, base| {
+            let request = client
+                .post(format!("{base}/commands/resources"))
+                .json(&serde_json::json!({ "json": false }));
+            with_session_header(with_auth(request), arguments)
+        })
+        .await;
+    text_result_from_value(project_graph_status(&status, resources.as_ref())?).map(Some)
 }
 
-/// Project the daemon's status response into the coverage fields MCP agents
-/// need.
+/// Read a `u64` at `object[key]`, naming the miss instead of defaulting.
 ///
-/// Rejects an empty body loudly. The shared request helper reads one as `Null`
-/// so the mutations that answer `204 No Content` work, but every count here
-/// falls back to 0, so letting `Null` through would render a missing answer as
-/// a real reading of an empty graph. A status surface that reports zeros it did
-/// not measure is worse than one that fails.
-fn project_graph_status(value: &serde_json::Value) -> Result<serde_json::Value, String> {
-    if value.is_null() {
+/// Every count in this projection is load-bearing: a default would render an
+/// unread field as a measurement. `path` names the full location so a drifted
+/// producer is diagnosable from the error alone.
+fn required_u64(object: &serde_json::Value, key: &str, path: &str) -> Result<u64, String> {
+    object
+        .get(key)
+        .ok_or_else(|| format!("daemon graph status response carries no `{path}`"))?
+        .as_u64()
+        .ok_or_else(|| format!("daemon graph status field `{path}` is not a number"))
+}
+
+/// Project the daemon's status and resources responses into the coverage fields
+/// MCP agents need.
+///
+/// Every field is read from the exact path its producer writes and every miss
+/// is an error. The previous projection read `summary.entities` and
+/// `summary.embeddings_*`, keys no daemon surface has ever emitted, and floored
+/// each miss to 0 — so the tool reported a fully enriched repository as an empty
+/// graph while stamping the answer with daemon authority. A status surface that
+/// reports zeros it did not measure is worse than one that fails, which is why
+/// an absent key now fails loud and cannot be mistaken for a real reading.
+///
+/// `status` is `kin_cli::commands::status::CommandStatusResponse` and
+/// `resources` is `kin_cli::commands::resources::CommandResourcesResponse`.
+/// kin-mcp cannot depend on kin-cli to name those types directly (kin-cli
+/// depends on this crate), so the strictness above is what holds the two shapes
+/// together: drift surfaces as a named error on the next call rather than as a
+/// silent zero.
+fn project_graph_status(
+    status: &serde_json::Value,
+    resources: Result<&serde_json::Value, &String>,
+) -> Result<serde_json::Value, String> {
+    if status.is_null() {
         return Err(
             "daemon graph status returned an empty body; refusing to report zero counts as \
              graph truth"
                 .to_string(),
         );
     }
-    let summary = value.get("summary").unwrap_or(value);
-    let field_u64 = |key: &str| summary.get(key).and_then(serde_json::Value::as_u64);
-    Ok(serde_json::json!({
-        "entity_count": field_u64("entities").unwrap_or(0),
-        "embeddings_indexed": field_u64("embeddings_indexed").unwrap_or(0),
-        "embeddings_total": field_u64("embeddings_total").unwrap_or(0),
-        "embeddings_pending": field_u64("embeddings_pending").unwrap_or(0),
+    let report = status
+        .get("report")
+        .ok_or_else(|| "daemon graph status response carries no `report`".to_string())?;
+    let enrichment = report.get("semantic_enrichment").ok_or_else(|| {
+        "daemon graph status response carries no `report.semantic_enrichment`".to_string()
+    })?;
+
+    let entity_count = required_u64(
+        enrichment,
+        "entity_count",
+        "report.semantic_enrichment.entity_count",
+    )?;
+    let relation_count = required_u64(
+        enrichment,
+        "relation_count",
+        "report.semantic_enrichment.relation_count",
+    )?;
+    let semantic_change_count = required_u64(
+        enrichment,
+        "semantic_change_count",
+        "report.semantic_enrichment.semantic_change_count",
+    )?;
+    let presence = enrichment
+        .get("presence")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            "daemon graph status response carries no `report.semantic_enrichment.presence`"
+                .to_string()
+        })?;
+    // Repository-v6 has no completion attestation yet: counts are exact and
+    // completeness is deliberately not inferred from them. Carrying the flag
+    // keeps an agent from reading a populated graph as a complete one.
+    let completion_attested = enrichment
+        .get("completion_attested")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| {
+            "daemon graph status response carries no \
+             `report.semantic_enrichment.completion_attested`"
+                .to_string()
+        })?;
+
+    let mut projected = serde_json::json!({
+        "entity_count": entity_count,
+        "relation_count": relation_count,
+        "semantic_change_count": semantic_change_count,
+        "enrichment_presence": presence,
+        "completion_attested": completion_attested,
         "authority": "repo-daemon",
-        "note": "Embedding coverage is computed from the daemon-owned live graph."
-    }))
+        "note": "Enrichment counts come from the daemon-owned repository-v6 authority lease; \
+                 embedding coverage from the daemon's live graph. Counts are exact; \
+                 enrichment completeness is not attested.",
+    });
+
+    // Embedding coverage is a separate measurement on a separate surface. When
+    // it cannot be read, the numeric fields are omitted entirely rather than
+    // zeroed: an absent field makes an agent look, where a 0 reads as a real
+    // count of an unembedded graph.
+    let embedding = match resources {
+        Ok(resources) => project_embedding_coverage(resources),
+        Err(error) => Err(error.clone()),
+    };
+    let object = projected
+        .as_object_mut()
+        .expect("projected status is a JSON object");
+    match embedding {
+        Ok(coverage) => {
+            object.insert("embeddings_available".into(), serde_json::json!(true));
+            for (key, value) in coverage {
+                object.insert(key, value);
+            }
+        }
+        Err(reason) => {
+            object.insert("embeddings_available".into(), serde_json::json!(false));
+            object.insert(
+                "embeddings_unavailable_reason".into(),
+                serde_json::json!(reason),
+            );
+        }
+    }
+    Ok(projected)
+}
+
+/// Project the embedding half from `/commands/resources`.
+///
+/// `embeddings_total` is read, never derived: `InMemoryGraph::embedding_status`
+/// computes `pending = queue_len.max(total - indexed)`, so total is not indexed
+/// plus pending and reconstructing it would invent a number.
+fn project_embedding_coverage(
+    resources: &serde_json::Value,
+) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    if resources.is_null() {
+        return Err("daemon resources returned an empty body".to_string());
+    }
+    let runtime = resources
+        .get("embed_runtime")
+        .ok_or_else(|| "daemon resources response carries no `embed_runtime`".to_string())?;
+    let indexed = required_u64(
+        runtime,
+        "embeddings_indexed",
+        "embed_runtime.embeddings_indexed",
+    )?;
+    let pending = required_u64(
+        runtime,
+        "embeddings_pending",
+        "embed_runtime.embeddings_pending",
+    )?;
+    let total = required_u64(
+        runtime,
+        "embeddings_total",
+        "embed_runtime.embeddings_total",
+    )?;
+    let mut coverage = serde_json::Map::new();
+    coverage.insert("embeddings_indexed".into(), serde_json::json!(indexed));
+    coverage.insert("embeddings_pending".into(), serde_json::json!(pending));
+    coverage.insert("embeddings_total".into(), serde_json::json!(total));
+    // Embed-degraded state decides whether a pending count is still draining or
+    // is stuck forever; a readiness check that omits it can wait on a worker
+    // that already died.
+    if let Some(failed) = runtime
+        .get("embed_worker_failed")
+        .and_then(serde_json::Value::as_bool)
+    {
+        coverage.insert("embed_worker_failed".into(), serde_json::json!(failed));
+    }
+    if let Some(busy) = runtime
+        .get("embedding_work_busy")
+        .and_then(serde_json::Value::as_bool)
+    {
+        coverage.insert("embedding_work_busy".into(), serde_json::json!(busy));
+    }
+    Ok(coverage)
 }
 
 pub fn daemon_unavailable_tool_result(name: &str) -> ToolCallResult {
@@ -1533,29 +1695,177 @@ mod tests {
         handle.abort();
     }
 
+    /// A `POST /commands/status` body as the daemon really renders it:
+    /// `kin_cli::commands::status::CommandStatusResponse`, whose fields are
+    /// `report`, `build`, `text` and `json`, with the enrichment counts nested
+    /// under `report.semantic_enrichment`. Non-zero throughout so a projection
+    /// that silently defaults cannot pass.
+    fn daemon_status_body() -> serde_json::Value {
+        serde_json::json!({
+            "report": {
+                "schema": "kin.status.v1",
+                "authority": "repository-v6",
+                "repo_root": "/tmp/repo",
+                "repository": {
+                    "repository_id": "01930000-0000-7000-8000-000000000001",
+                    "generation": 4,
+                    "roots": { "generation": 4 },
+                    "ref_count": 2,
+                    "source_cas_verified": true
+                },
+                "workspace": {
+                    "workspace_id": "01930000-0000-7000-8000-000000000002",
+                    "generation": 4,
+                    "head": { "symbolic": { "target": "main" } },
+                    "tree_hash": "00",
+                    "dirty": false,
+                    "artifact_count": 11
+                },
+                "semantic_enrichment": {
+                    "presence": "present",
+                    "entity_count": 42,
+                    "relation_count": 17,
+                    "semantic_change_count": 3,
+                    "completion_attested": false
+                }
+            },
+            "build": null,
+            "text": "Kin repository-v6 status\n",
+            "json": null
+        })
+    }
+
+    /// A `POST /commands/resources` body as the daemon really renders it:
+    /// `kin_cli::commands::resources::CommandResourcesResponse`, with live
+    /// embedding state under `embed_runtime`.
+    fn daemon_resources_body() -> serde_json::Value {
+        serde_json::json!({
+            "plan": { "schema_version": "kin.resource_plan.v1" },
+            "embed_runtime": {
+                "embed_worker_failed": false,
+                "embedding_work_busy": true,
+                "embeddings_indexed": 7,
+                "embeddings_pending": 3,
+                "embeddings_total": 10,
+                "hybrid_metrics": {},
+                "metal_profile": null
+            },
+            "actual": {},
+            "text": "",
+            "json": null
+        })
+    }
+
     /// The empty-body allowance exists for the 204 mutations. It must not reach
-    /// the status projection, where every count defaults to 0 and an absent
-    /// answer would render as a genuine reading of an empty graph.
+    /// the status projection, where an absent answer would render as a genuine
+    /// reading of an empty graph.
     #[test]
     fn graph_status_refuses_to_report_an_empty_body_as_zero_counts() {
-        let err = project_graph_status(&serde_json::Value::Null)
+        let resources = daemon_resources_body();
+        let err = project_graph_status(&serde_json::Value::Null, Ok(&resources))
             .expect_err("an empty status body must fail loudly");
         assert!(err.contains("empty body"), "{err}");
         assert!(err.contains("refusing"), "{err}");
     }
 
+    /// The wiring test: every count is projected from the shape the daemon
+    /// really produces, and every one of them is non-zero, so a projection that
+    /// missed its key and floored to 0 fails here instead of shipping.
     #[test]
-    fn graph_status_projects_summary_counts() {
-        let value = serde_json::json!({
+    fn graph_status_projects_the_real_daemon_bodies() {
+        let status = daemon_status_body();
+        let resources = daemon_resources_body();
+        let projected =
+            project_graph_status(&status, Ok(&resources)).expect("a real body must project");
+        assert_eq!(projected["entity_count"], 42);
+        assert_eq!(projected["relation_count"], 17);
+        assert_eq!(projected["semantic_change_count"], 3);
+        assert_eq!(projected["enrichment_presence"], "present");
+        assert_eq!(projected["completion_attested"], false);
+        assert_eq!(projected["embeddings_available"], true);
+        assert_eq!(projected["embeddings_indexed"], 7);
+        assert_eq!(projected["embeddings_pending"], 3);
+        assert_eq!(projected["embeddings_total"], 10);
+        assert_eq!(projected["embed_worker_failed"], false);
+        assert_eq!(projected["embedding_work_busy"], true);
+        assert_eq!(projected["authority"], "repo-daemon");
+    }
+
+    /// The regression this projection exists to prevent: the shape the old
+    /// projector was written against is not a shape any daemon surface emits,
+    /// and feeding it must now fail loudly rather than answer four zeros
+    /// stamped with daemon authority.
+    #[test]
+    fn graph_status_rejects_the_shape_the_old_projector_assumed() {
+        let legacy = serde_json::json!({
             "summary": { "entities": 42, "embeddings_indexed": 7, "embeddings_total": 10 }
         });
-        let projected = project_graph_status(&value).expect("a real body must project");
+        let resources = daemon_resources_body();
+        let err = project_graph_status(&legacy, Ok(&resources))
+            .expect_err("the invented `summary` shape must not project");
+        assert!(err.contains("`report`"), "{err}");
+    }
+
+    /// Key drift inside an otherwise well-formed body names the exact path that
+    /// went missing, so the next producer change is diagnosable from the tool
+    /// output alone.
+    #[test]
+    fn graph_status_names_the_field_that_drifted() {
+        let mut status = daemon_status_body();
+        status["report"]["semantic_enrichment"]
+            .as_object_mut()
+            .unwrap()
+            .remove("entity_count");
+        let resources = daemon_resources_body();
+        let err = project_graph_status(&status, Ok(&resources))
+            .expect_err("a missing count must fail loudly");
+        assert!(
+            err.contains("report.semantic_enrichment.entity_count"),
+            "{err}"
+        );
+    }
+
+    /// The embedding half is a separate measurement on a separate surface. When
+    /// it is unavailable the graph counts still answer, and the numeric fields
+    /// are absent rather than zero — an agent must not read "not measured" as
+    /// "measured zero".
+    #[test]
+    fn graph_status_marks_embedding_coverage_unavailable_without_faking_zeros() {
+        let status = daemon_status_body();
+        let error = "daemon resources failed: HTTP 503".to_string();
+        let projected =
+            project_graph_status(&status, Err(&error)).expect("graph counts must still answer");
         assert_eq!(projected["entity_count"], 42);
-        assert_eq!(projected["embeddings_indexed"], 7);
-        assert_eq!(projected["embeddings_total"], 10);
-        // Absent within a present body is still 0: that is a real reading.
-        assert_eq!(projected["embeddings_pending"], 0);
-        assert_eq!(projected["authority"], "repo-daemon");
+        assert_eq!(projected["embeddings_available"], false);
+        assert!(projected["embeddings_unavailable_reason"]
+            .as_str()
+            .expect("a reason must be carried")
+            .contains("503"));
+        assert!(
+            projected.get("embeddings_indexed").is_none(),
+            "an unmeasured count must be absent, not zero: {projected}"
+        );
+        assert!(
+            projected.get("embeddings_total").is_none(),
+            "an unmeasured count must be absent, not zero: {projected}"
+        );
+    }
+
+    /// A resources body whose embedding block drifted degrades the embedding
+    /// half only; it must not fabricate coverage or take down the graph counts.
+    #[test]
+    fn graph_status_degrades_when_the_embedding_block_drifts() {
+        let status = daemon_status_body();
+        let resources = serde_json::json!({ "plan": {}, "text": "", "json": null });
+        let projected =
+            project_graph_status(&status, Ok(&resources)).expect("graph counts must still answer");
+        assert_eq!(projected["entity_count"], 42);
+        assert_eq!(projected["embeddings_available"], false);
+        assert!(projected["embeddings_unavailable_reason"]
+            .as_str()
+            .expect("a reason must be carried")
+            .contains("embed_runtime"));
+        assert!(projected.get("embeddings_indexed").is_none());
     }
 
     /// An HTTP error from a live daemon must classify as `DaemonError`, never

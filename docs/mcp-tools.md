@@ -50,7 +50,7 @@ can run `kin mcp start` with the same `agent-default` profile), see
 - **`get_entity_source` / `get_entity_body`**: Retrieve the implementation source of an entity, served from the graph.
 - **`get_context_pack`**: Package a target entity alongside its caller/import neighborhood into a single prompt-friendly bundle.
 - **`explore_codebase`**: Get a one-shot map of the codebase via a selectable strategy (e.g. `overview`: entity counts by kind and language, plus the top public declarations).
-- **`graph_neighborhood`**: Return the dependency neighborhood of an entity — what it depends on and what depends on it — traversed to a given depth.
+- **`graph_neighborhood`**: Return the dependency neighborhood of an entity — what it depends on and what depends on it — traversed to a given depth. `direction` selects which side to walk: `out` for dependencies, `in` for dependents (blast radius), `both` (default) for the merged neighborhood; every returned edge is tagged with the direction it was traversed in.
 
 ---
 
