@@ -1077,8 +1077,15 @@ async fn forward_graph_status(
 }
 
 fn validate_graph_status_result(result: ToolCallResult) -> Result<ToolCallResult, String> {
+    parse_graph_status_report(&result)?;
+    Ok(result)
+}
+
+pub(crate) fn parse_graph_status_report(
+    result: &ToolCallResult,
+) -> Result<Option<crate::handlers::entities::GraphStatusReport>, String> {
     if result.is_error == Some(true) {
-        return Ok(result);
+        return Ok(None);
     }
     let [ContentBlock::Text { text }] = result.content.as_slice() else {
         return Err(format!(
@@ -1086,9 +1093,9 @@ fn validate_graph_status_result(result: ToolCallResult) -> Result<ToolCallResult
             result.content.len()
         ));
     };
-    serde_json::from_str::<crate::handlers::entities::GraphStatusReport>(text)
-        .map_err(|error| format!("daemon kin_graph_status contract validation failed: {error}"))?;
-    Ok(result)
+    serde_json::from_str(text)
+        .map(Some)
+        .map_err(|error| format!("daemon kin_graph_status contract validation failed: {error}"))
 }
 
 pub fn daemon_unavailable_tool_result(name: &str) -> ToolCallResult {
@@ -1520,6 +1527,8 @@ mod tests {
                 "view": "daemon_selected_graph",
                 "scope": "head",
                 "authority": "repo-daemon",
+                "sampling": "point_in_time_selected_graph",
+                "authority_epoch": 42,
                 "entity_count": 42,
                 "relation_count": 17,
                 "embedding_source": "selected_graph",
@@ -1593,6 +1602,33 @@ mod tests {
             let error = validate_graph_status_result(ToolCallResult::text(body.to_string()))
                 .expect_err("contract drift must fail before the result reaches stdio");
             assert!(error.contains(expected), "{field}: {error}");
+        }
+    }
+
+    #[test]
+    fn graph_status_rejects_impossible_embedding_coverage() {
+        for (indexed, pending, total, expected) in [
+            (
+                11,
+                0,
+                10,
+                "embeddings_indexed (11) exceeds embeddings_total (10)",
+            ),
+            (
+                7,
+                2,
+                10,
+                "embeddings_pending (2) is below the uncovered embedding count (3)",
+            ),
+        ] {
+            let ContentBlock::Text { text } = &valid_graph_status_result().content[0];
+            let mut body: serde_json::Value = serde_json::from_str(text).unwrap();
+            body["embeddings_indexed"] = serde_json::json!(indexed);
+            body["embeddings_pending"] = serde_json::json!(pending);
+            body["embeddings_total"] = serde_json::json!(total);
+            let error = validate_graph_status_result(ToolCallResult::text(body.to_string()))
+                .expect_err("impossible coverage must fail before the result reaches stdio");
+            assert!(error.contains(expected), "{error}");
         }
     }
 

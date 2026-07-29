@@ -140,4 +140,4 @@ can run `kin mcp start` with the same `agent-default` profile), see
 
 - **`dead_code` / `find_dead_code_seeded`**: Identify unreachable or orphaned entities (whole-repo or seeded by a semantic query).
 - **`benchmark`**: Run Kin's retrieval/locate benchmarks.
-- **`kin_graph_status`**: Report one schema-bound status view of the exact daemon graph selected for the call — entity and relation counts, selected-graph embedding coverage (indexed / total / pending), temporal-session versus HEAD scope, and backing authority. Exact counts do not attest enrichment completeness.
+- **`kin_graph_status`**: Report one schema-bound, point-in-time status view of the exact daemon graph selected for the call — entity and relation counts, selected-graph embedding coverage (indexed / total / pending), temporal-session versus HEAD scope, a process-local authority epoch, and backing authority. The daemon serializes embedding mutation and revalidates graph/scope authority before publishing; observed counts still do not attest enrichment completeness.

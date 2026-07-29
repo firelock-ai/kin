@@ -1410,6 +1410,76 @@ async fn resolve_session_source_scope(
 }
 
 const XREF_STABLE_READ_ATTEMPTS: usize = 3;
+const GRAPH_STATUS_STABLE_READ_ATTEMPTS: usize = 3;
+
+/// Capture one point-in-time status observation of the graph selected for this
+/// request.
+///
+/// Entity/relation mutations participate in the daemon's graph-authority
+/// seqlock. Embedding queue/vector mutations use `embedding_work`. Holding the
+/// latter while reading all counters, then revalidating the former and the
+/// selected HEAD/session graph, gives the MCP layer one coherent observation
+/// without asking kin-mcp to reread a mutable graph.
+async fn mcp_graph_status_with_stable_authority(
+    state: &DaemonState,
+    session_id: Option<&SessionId>,
+    selected_graph: &Arc<kin_db::InMemoryGraph>,
+    authority: RequestGraphAuthority,
+    scope: kin_mcp::handlers::entities::GraphStatusScope,
+) -> kin_mcp::Result<kin_mcp::ToolCallResult> {
+    for _ in 0..GRAPH_STATUS_STABLE_READ_ATTEMPTS {
+        let Some(authority_epoch) = state.stable_graph_authority_epoch() else {
+            tokio::task::yield_now().await;
+            continue;
+        };
+
+        let observation = match state.embedding_work.try_lock() {
+            Ok(_embedding_guard) => {
+                let embeddings = selected_graph.embedding_status();
+                kin_mcp::handlers::entities::GraphStatusObservation {
+                    authority_epoch,
+                    entity_count: selected_graph.entity_count(),
+                    relation_count: selected_graph.relation_count(),
+                    embeddings_indexed: embeddings.indexed,
+                    embeddings_pending: embeddings.pending,
+                    embeddings_total: embeddings.total,
+                }
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Ok(kin_mcp::ToolCallResult::error(
+                    "selected-graph embedding coverage is changing; retry kin_graph_status",
+                ));
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(kin_mcp::McpError::Other(
+                    "embedding work lock poisoned while sampling kin_graph_status".to_string(),
+                ));
+            }
+        };
+
+        if !state.graph_authority_epoch_is_current(authority_epoch) {
+            tokio::task::yield_now().await;
+            continue;
+        }
+        if !state
+            .graph_authority_is_current(session_id, selected_graph, authority)
+            .await
+            || !state.graph_authority_epoch_is_current(authority_epoch)
+        {
+            tokio::task::yield_now().await;
+            continue;
+        }
+
+        return kin_mcp::handlers::entities::handle_daemon_graph_status_observation(
+            scope,
+            observation,
+        );
+    }
+
+    Ok(kin_mcp::ToolCallResult::error(
+        "selected graph changed during status sampling; retry kin_graph_status",
+    ))
+}
 
 /// One optimistic, point-in-time graph authority used by xref-style reads.
 ///
@@ -6413,7 +6483,14 @@ async fn mcp_tools_call(
                     kin_mcp::handlers::entities::GraphStatusScope::TemporalSession
                 }
             };
-            kin_mcp::handlers::entities::handle_daemon_graph_status(graph.as_ref(), scope)
+            mcp_graph_status_with_stable_authority(
+                &state,
+                session_id.as_ref(),
+                &graph,
+                graph_authority,
+                scope,
+            )
+            .await
         } else if request.name == "kin_transaction_commit" {
             Ok(crate::mcp_commit::commit_exact_transaction(
                 &state,
@@ -15332,7 +15409,12 @@ mod tests {
             mcp_status.authority,
             kin_mcp::handlers::entities::GraphStatusAuthority::RepoDaemon
         );
+        assert_eq!(
+            mcp_status.sampling,
+            kin_mcp::handlers::entities::GraphStatusSampling::PointInTimeSelectedGraph
+        );
         assert!(!mcp_status.completion_attested);
+        assert!(mcp_status.response_envelope.is_none());
     }
 
     #[tokio::test]
@@ -15350,7 +15432,8 @@ mod tests {
         scoped_graph
             .upsert_entity(&test_entity("historical_two", "src/old_two.rs"))
             .unwrap();
-        let scoped_stats = scoped_graph.graph_stats();
+        let scoped_entity_count = scoped_graph.entity_count();
+        let scoped_relation_count = scoped_graph.relation_count();
         let scoped_embeddings = scoped_graph.embedding_status();
         let session_id = SessionId::new();
         state
@@ -15379,8 +15462,8 @@ mod tests {
             report.scope,
             kin_mcp::handlers::entities::GraphStatusScope::TemporalSession
         );
-        assert_eq!(report.entity_count, scoped_stats.total_entities);
-        assert_eq!(report.relation_count, scoped_stats.total_relations);
+        assert_eq!(report.entity_count, scoped_entity_count);
+        assert_eq!(report.relation_count, scoped_relation_count);
         assert_eq!(report.embeddings_indexed, scoped_embeddings.indexed);
         assert_eq!(report.embeddings_pending, scoped_embeddings.pending);
         assert_eq!(report.embeddings_total, scoped_embeddings.total);
@@ -15401,6 +15484,52 @@ mod tests {
             kin_mcp::handlers::entities::GraphStatusScope::Head
         );
         assert_eq!(unscoped_report.entity_count, 1);
+    }
+
+    #[tokio::test]
+    async fn mcp_graph_status_fails_loud_while_embedding_coverage_is_changing() {
+        let state = test_state();
+        let graph = Arc::clone(&state.graph);
+        let _embedding_guard = state.embedding_work.lock().unwrap();
+
+        let result = mcp_graph_status_with_stable_authority(
+            &state,
+            None,
+            &graph,
+            RequestGraphAuthority::Head,
+            kin_mcp::handlers::entities::GraphStatusScope::Head,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.is_error, Some(true));
+        assert!(
+            mcp_result_text(&result).contains("embedding coverage is changing"),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_graph_status_fails_loud_during_graph_authority_mutation() {
+        let state = test_state();
+        let graph = Arc::clone(&state.graph);
+        let _mutation_guard = state.begin_graph_authority_mutation();
+
+        let result = mcp_graph_status_with_stable_authority(
+            &state,
+            None,
+            &graph,
+            RequestGraphAuthority::Head,
+            kin_mcp::handlers::entities::GraphStatusScope::Head,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.is_error, Some(true));
+        assert!(
+            mcp_result_text(&result).contains("changed during status sampling"),
+            "{result:?}"
+        );
     }
 
     #[tokio::test]

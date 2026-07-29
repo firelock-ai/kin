@@ -1013,6 +1013,16 @@ async fn handle_tools_call_daemon(
             Err(error) => (ToolCallResult::error(error), Envelope::daemon()),
         };
 
+    // `kin_graph_status` already reports the exact graph view selected by the
+    // daemon, including temporal-session scope. Generic `/health` is HEAD-only:
+    // borrowing its entity count or generation here would mix two authorities
+    // in one response. Build the standard `_kin` envelope from the report
+    // itself and validate the fully annotated stdio payload instead.
+    if call_params.name == "kin_graph_status" {
+        let enveloped = finalize_daemon_graph_status(result, base_env);
+        return JsonRpcResponse::success(id, serde_json::to_value(&enveloped).unwrap_or_default());
+    }
+
     // Enrich the envelope with honest degraded/freshness signals from the daemon
     // `/health` body when the daemon is actually reachable. When it was already
     // determined unreachable, skip the probe — there is nothing to ask.
@@ -1024,6 +1034,47 @@ async fn handle_tools_call_daemon(
 
     let enveloped = envelope::finalize(result, base_env, &call_params.name);
     JsonRpcResponse::success(id, serde_json::to_value(&enveloped).unwrap_or_default())
+}
+
+fn finalize_daemon_graph_status(result: ToolCallResult, base_env: Envelope) -> ToolCallResult {
+    let report = match daemon_delegate::parse_graph_status_report(&result) {
+        Ok(Some(report)) => report,
+        Ok(None) => return envelope::finalize(result, base_env, "kin_graph_status"),
+        Err(error) => {
+            return envelope::finalize(ToolCallResult::error(error), base_env, "kin_graph_status");
+        }
+    };
+
+    let counts = (
+        u64::try_from(report.entity_count),
+        u64::try_from(report.embeddings_indexed),
+        u64::try_from(report.embeddings_pending),
+        u64::try_from(report.embeddings_total),
+    );
+    let (Ok(entity_count), Ok(indexed), Ok(pending), Ok(total)) = counts else {
+        return envelope::finalize(
+            ToolCallResult::error(
+                "daemon kin_graph_status counters do not fit the stdio response envelope",
+            ),
+            base_env,
+            "kin_graph_status",
+        );
+    };
+
+    let selected_env =
+        base_env.with_selected_graph_observation(entity_count, indexed, pending, total);
+    let enveloped = envelope::finalize(result, selected_env, "kin_graph_status");
+    if let Err(error) = daemon_delegate::parse_graph_status_report(&enveloped) {
+        return envelope::finalize(
+            ToolCallResult::error(format!(
+                "stdio kin_graph_status contract validation failed after envelope annotation: \
+                 {error}"
+            )),
+            Envelope::daemon(),
+            "kin_graph_status",
+        );
+    }
+    enveloped
 }
 
 fn tool_requires_persist(name: &str) -> bool {
@@ -1132,6 +1183,87 @@ mod tests {
         assert!(
             message.contains("requires the Kin daemon"),
             "original error message preserved, got: {message}"
+        );
+    }
+
+    fn direct_graph_status_result() -> ToolCallResult {
+        ToolCallResult::text(
+            serde_json::json!({
+                "schema": "kin.graph-status.v1",
+                "view": "daemon_selected_graph",
+                "scope": "temporal_session",
+                "authority": "repo-daemon",
+                "sampling": "point_in_time_selected_graph",
+                "authority_epoch": 42,
+                "entity_count": 2,
+                "relation_count": 1,
+                "embedding_source": "selected_graph",
+                "embeddings_indexed": 1,
+                "embeddings_pending": 1,
+                "embeddings_total": 2,
+                "completion_attested": false
+            })
+            .to_string(),
+        )
+    }
+
+    #[test]
+    fn graph_status_stdio_envelope_is_derived_from_the_selected_graph() {
+        // Even if a caller accidentally supplies a HEAD-derived base envelope,
+        // finalization must replace every graph-specific field with the
+        // temporal report's own observation.
+        let head_health = serde_json::json!({
+            "graph_entity_count": 999,
+            "graph_generation": 77,
+            "initialized": true,
+            "graph_loaded": true,
+            "reconciliation_status": "head-only",
+            "embed_worker_failed": true
+        });
+        let base = Envelope::daemon().with_health(&head_health);
+        let enveloped = finalize_daemon_graph_status(direct_graph_status_result(), base);
+        let report = daemon_delegate::parse_graph_status_report(&enveloped)
+            .unwrap()
+            .expect("successful stdio status report");
+        let response_env = report
+            .response_envelope
+            .expect("stdio status carries the standard envelope");
+
+        assert_eq!(
+            report.scope,
+            crate::handlers::entities::GraphStatusScope::TemporalSession
+        );
+        assert_eq!(report.entity_count, 2);
+        assert_eq!(response_env.graph_state.entity_count, Some(2));
+        assert!(response_env.graph_as_of.is_none());
+        assert!(response_env.graph_state.loaded.is_none());
+        assert!(response_env.graph_state.initialized.is_none());
+        assert!(response_env.graph_state.reconciliation_status.is_none());
+        assert!(response_env.degraded.embed_worker_failed.is_none());
+        let coverage = response_env
+            .semantic_coverage
+            .expect("selected-graph embedding coverage");
+        assert_eq!(coverage.indexed, 1);
+        assert_eq!(coverage.pending, 1);
+        assert_eq!(coverage.total, 2);
+        assert!(!coverage.complete);
+    }
+
+    #[test]
+    fn graph_status_stdio_schema_rejects_a_mixed_head_envelope() {
+        let enveloped =
+            finalize_daemon_graph_status(direct_graph_status_result(), Envelope::daemon());
+        let ContentBlock::Text { text } = &enveloped.content[0];
+        let mut payload: serde_json::Value = serde_json::from_str(text).unwrap();
+        payload["_kin"]["graph_state"]["entity_count"] = serde_json::json!(999);
+        payload["_kin"]["graph_as_of"] = serde_json::json!({ "generation": 77 });
+
+        let error = serde_json::from_value::<crate::handlers::entities::GraphStatusReport>(payload)
+            .expect_err("HEAD metadata must not validate beside a temporal selected graph");
+        assert!(
+            error.to_string().contains("_kin graph_as_of")
+                || error.to_string().contains("_kin graph_state"),
+            "{error}"
         );
     }
 

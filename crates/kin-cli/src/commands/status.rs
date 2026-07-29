@@ -41,6 +41,32 @@ where
     Ok(schema)
 }
 
+fn deserialize_status_authority<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let authority = String::deserialize(deserializer)?;
+    if authority != "repository-v6" {
+        return Err(serde::de::Error::custom(format!(
+            "unsupported status authority '{authority}', expected 'repository-v6'"
+        )));
+    }
+    Ok(authority)
+}
+
+fn deserialize_status_unattested<'de, D>(deserializer: D) -> std::result::Result<bool, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let completion_attested = bool::deserialize(deserializer)?;
+    if completion_attested {
+        return Err(serde::de::Error::custom(
+            "kin.status.v2 does not carry a semantic-enrichment completion attestation",
+        ));
+    }
+    Ok(false)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SemanticEnrichmentPresence {
@@ -54,7 +80,7 @@ pub enum SemanticEnrichmentView {
     DurableRepositoryAuthority,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct SemanticEnrichmentStatus {
     /// This is durable repository/workspace authority, not the daemon's live
     /// query graph. `kin graph status` reports the latter.
@@ -68,6 +94,41 @@ pub struct SemanticEnrichmentStatus {
     /// There is no repository-v6 completion attestation yet. Counts are exact;
     /// completeness is deliberately not inferred from them.
     pub completion_attested: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SemanticEnrichmentStatusWire {
+    view: SemanticEnrichmentView,
+    authority_generation: u64,
+    workspace_generation: u64,
+    presence: SemanticEnrichmentPresence,
+    entity_count: usize,
+    relation_count: usize,
+    semantic_change_count: usize,
+    #[serde(deserialize_with = "deserialize_status_unattested")]
+    completion_attested: bool,
+}
+
+impl<'de> Deserialize<'de> for SemanticEnrichmentStatus {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = SemanticEnrichmentStatusWire::deserialize(deserializer)?;
+        let enrichment = Self {
+            view: wire.view,
+            authority_generation: wire.authority_generation,
+            workspace_generation: wire.workspace_generation,
+            presence: wire.presence,
+            entity_count: wire.entity_count,
+            relation_count: wire.relation_count,
+            semantic_change_count: wire.semantic_change_count,
+            completion_attested: wire.completion_attested,
+        };
+        enrichment.validate().map_err(serde::de::Error::custom)?;
+        Ok(enrichment)
+    }
 }
 
 impl SemanticEnrichmentStatus {
@@ -87,6 +148,21 @@ impl SemanticEnrichmentStatus {
             relation_count: summary.relation_count,
             semantic_change_count: summary.semantic_change_count,
             completion_attested: false,
+        }
+    }
+
+    fn validate(&self) -> std::result::Result<(), String> {
+        let has_graph_semantics = self.entity_count > 0 || self.relation_count > 0;
+        match (&self.presence, has_graph_semantics) {
+            (SemanticEnrichmentPresence::Absent, true) => Err(
+                "semantic_enrichment.presence is absent despite nonzero entity/relation counts"
+                    .to_string(),
+            ),
+            (SemanticEnrichmentPresence::Present, false) => Err(
+                "semantic_enrichment.presence is present despite zero entity/relation counts"
+                    .to_string(),
+            ),
+            _ => Ok(()),
         }
     }
 }
@@ -143,15 +219,66 @@ pub struct WorkspaceStatus {
     pub artifact_count: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct StatusReport {
-    #[serde(deserialize_with = "deserialize_status_schema")]
     pub schema: String,
     pub authority: String,
     pub repo_root: PathBuf,
     pub repository: RepositoryStatus,
     pub workspace: WorkspaceStatus,
     pub semantic_enrichment: SemanticEnrichmentStatus,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StatusReportWire {
+    #[serde(deserialize_with = "deserialize_status_schema")]
+    schema: String,
+    #[serde(deserialize_with = "deserialize_status_authority")]
+    authority: String,
+    repo_root: PathBuf,
+    repository: RepositoryStatus,
+    workspace: WorkspaceStatus,
+    semantic_enrichment: SemanticEnrichmentStatus,
+}
+
+impl<'de> Deserialize<'de> for StatusReport {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = StatusReportWire::deserialize(deserializer)?;
+        let report = Self {
+            schema: wire.schema,
+            authority: wire.authority,
+            repo_root: wire.repo_root,
+            repository: wire.repository,
+            workspace: wire.workspace,
+            semantic_enrichment: wire.semantic_enrichment,
+        };
+        report.validate().map_err(serde::de::Error::custom)?;
+        Ok(report)
+    }
+}
+
+impl StatusReport {
+    fn validate(&self) -> std::result::Result<(), String> {
+        if self.semantic_enrichment.authority_generation != self.repository.generation {
+            return Err(format!(
+                "semantic_enrichment.authority_generation ({}) does not match \
+                 repository.generation ({})",
+                self.semantic_enrichment.authority_generation, self.repository.generation
+            ));
+        }
+        if self.semantic_enrichment.workspace_generation != self.workspace.generation {
+            return Err(format!(
+                "semantic_enrichment.workspace_generation ({}) does not match \
+                 workspace.generation ({})",
+                self.semantic_enrichment.workspace_generation, self.workspace.generation
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -420,6 +547,45 @@ mod tests {
             serde_json::from_value::<SemanticEnrichmentStatus>(encoded).unwrap(),
             enrichment
         );
+    }
+
+    #[test]
+    fn v2_rejects_false_authority_completion_and_generation_claims() {
+        let root = tempfile::tempdir().unwrap();
+        let init = kin_core::init(root.path()).unwrap();
+        let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&init.layout).unwrap();
+        let valid = serde_json::to_value(inspect(&init.layout, &binding).unwrap()).unwrap();
+
+        let mut wrong_authority = valid.clone();
+        wrong_authority["authority"] = serde_json::json!("live-daemon-graph");
+        let mut false_completion = valid.clone();
+        false_completion["semantic_enrichment"]["completion_attested"] = serde_json::json!(true);
+        let mut wrong_authority_generation = valid.clone();
+        wrong_authority_generation["semantic_enrichment"]["authority_generation"] =
+            serde_json::json!(99);
+        let mut wrong_workspace_generation = valid;
+        wrong_workspace_generation["semantic_enrichment"]["workspace_generation"] =
+            serde_json::json!(99);
+
+        for (payload, expected) in [
+            (wrong_authority, "unsupported status authority"),
+            (
+                false_completion,
+                "does not carry a semantic-enrichment completion attestation",
+            ),
+            (
+                wrong_authority_generation,
+                "does not match repository.generation",
+            ),
+            (
+                wrong_workspace_generation,
+                "does not match workspace.generation",
+            ),
+        ] {
+            let error = serde_json::from_value::<StatusReport>(payload)
+                .expect_err("a contradictory v2 status claim must fail deserialization");
+            assert!(error.to_string().contains(expected), "{error}");
+        }
     }
 
     #[test]

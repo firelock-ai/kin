@@ -2567,34 +2567,182 @@ pub enum GraphStatusAuthority {
     RepoDaemon,
 }
 
-/// Exact readiness counters for the one daemon query graph selected for an MCP
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphStatusSampling {
+    /// The daemon held embedding-work serialization while it sampled every
+    /// counter, then revalidated the selected graph's mutation epoch and scope
+    /// authority before publishing the report.
+    PointInTimeSelectedGraph,
+}
+
+/// Readiness observations for the one daemon query graph selected for an MCP
 /// call.
 ///
 /// The schema, view, and scope are load-bearing. In particular, HEAD and a
 /// temporal session graph are both daemon-owned but are not interchangeable.
 /// Unknown fields require a new schema version instead of silently changing
 /// what an existing consumer believes it measured.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct GraphStatusReport {
-    #[serde(deserialize_with = "deserialize_graph_status_schema")]
     pub schema: String,
     pub view: GraphStatusView,
     pub scope: GraphStatusScope,
     pub authority: GraphStatusAuthority,
+    pub sampling: GraphStatusSampling,
+    /// Process-local optimistic graph-authority epoch revalidated after every
+    /// counter was captured. This is an observation fence, not a durable
+    /// repository generation and not stable across daemon restarts.
+    pub authority_epoch: u64,
     pub entity_count: usize,
     pub relation_count: usize,
     pub embedding_source: GraphStatusEmbeddingSource,
     pub embeddings_indexed: usize,
     pub embeddings_pending: usize,
     pub embeddings_total: usize,
-    /// Exact counts do not attest that every eligible source has been enriched.
-    #[serde(deserialize_with = "deserialize_graph_status_unattested")]
+    /// Observed counts do not attest that every eligible source was enriched.
     pub completion_attested: bool,
+    /// The stdio server's standard response envelope. Direct daemon calls omit
+    /// it; stdio adds a report-derived envelope that is validated against these
+    /// same selected-graph observations. No unscoped `/health` graph metadata
+    /// is allowed into this schema.
+    #[serde(default, rename = "_kin", skip_serializing_if = "Option::is_none")]
+    pub response_envelope: Option<crate::envelope::Envelope>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GraphStatusReportWire {
+    #[serde(deserialize_with = "deserialize_graph_status_schema")]
+    schema: String,
+    view: GraphStatusView,
+    scope: GraphStatusScope,
+    authority: GraphStatusAuthority,
+    sampling: GraphStatusSampling,
+    authority_epoch: u64,
+    entity_count: usize,
+    relation_count: usize,
+    embedding_source: GraphStatusEmbeddingSource,
+    embeddings_indexed: usize,
+    embeddings_pending: usize,
+    embeddings_total: usize,
+    #[serde(deserialize_with = "deserialize_graph_status_unattested")]
+    completion_attested: bool,
+    #[serde(default, rename = "_kin")]
+    response_envelope: Option<crate::envelope::Envelope>,
+}
+
+impl<'de> Deserialize<'de> for GraphStatusReport {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = GraphStatusReportWire::deserialize(deserializer)?;
+        let report = Self {
+            schema: wire.schema,
+            view: wire.view,
+            scope: wire.scope,
+            authority: wire.authority,
+            sampling: wire.sampling,
+            authority_epoch: wire.authority_epoch,
+            entity_count: wire.entity_count,
+            relation_count: wire.relation_count,
+            embedding_source: wire.embedding_source,
+            embeddings_indexed: wire.embeddings_indexed,
+            embeddings_pending: wire.embeddings_pending,
+            embeddings_total: wire.embeddings_total,
+            completion_attested: wire.completion_attested,
+            response_envelope: wire.response_envelope,
+        };
+        report.validate().map_err(serde::de::Error::custom)?;
+        Ok(report)
+    }
+}
+
+impl GraphStatusReport {
+    fn validate(&self) -> std::result::Result<(), String> {
+        if self.embeddings_indexed > self.embeddings_total {
+            return Err(format!(
+                "embeddings_indexed ({}) exceeds embeddings_total ({})",
+                self.embeddings_indexed, self.embeddings_total
+            ));
+        }
+        let uncovered = self
+            .embeddings_total
+            .saturating_sub(self.embeddings_indexed);
+        if self.embeddings_pending < uncovered {
+            return Err(format!(
+                "embeddings_pending ({}) is below the uncovered embedding count ({uncovered})",
+                self.embeddings_pending
+            ));
+        }
+        if let Some(envelope) = &self.response_envelope {
+            self.validate_response_envelope(envelope)?;
+        }
+        Ok(())
+    }
+
+    fn validate_response_envelope(
+        &self,
+        envelope: &crate::envelope::Envelope,
+    ) -> std::result::Result<(), String> {
+        use crate::envelope::{Runtime, ENVELOPE_VERSION};
+
+        if envelope.envelope_version != ENVELOPE_VERSION {
+            return Err(format!(
+                "_kin envelope version {} does not match {ENVELOPE_VERSION}",
+                envelope.envelope_version
+            ));
+        }
+        if envelope.runtime != Runtime::RepoDaemon {
+            return Err("_kin runtime is not repo-daemon".to_string());
+        }
+        if envelope.graph_as_of.is_some() {
+            return Err(
+                "_kin graph_as_of is not selected-graph identity and must be absent".to_string(),
+            );
+        }
+        let entity_count = u64::try_from(self.entity_count)
+            .map_err(|_| "entity_count does not fit the response envelope".to_string())?;
+        if envelope.graph_state.entity_count != Some(entity_count)
+            || envelope.graph_state.reconciliation_status.is_some()
+            || envelope.graph_state.loaded.is_some()
+            || envelope.graph_state.initialized.is_some()
+        {
+            return Err("_kin graph_state is not the exact selected-graph observation".to_string());
+        }
+        if envelope.degraded.daemon_unreachable.is_some()
+            || envelope.degraded.embed_worker_failed.is_some()
+            || envelope.degraded.mass_deletion_blocked.is_some()
+            || envelope.degraded.offline_fallback.is_some()
+        {
+            return Err(
+                "_kin carries unscoped daemon health alongside selected-graph status".to_string(),
+            );
+        }
+        let coverage = envelope.semantic_coverage.as_ref().ok_or_else(|| {
+            "_kin semantic_coverage is missing from selected-graph status".to_string()
+        })?;
+        let indexed = u64::try_from(self.embeddings_indexed)
+            .map_err(|_| "embeddings_indexed does not fit the response envelope".to_string())?;
+        let pending = u64::try_from(self.embeddings_pending)
+            .map_err(|_| "embeddings_pending does not fit the response envelope".to_string())?;
+        let total = u64::try_from(self.embeddings_total)
+            .map_err(|_| "embeddings_total does not fit the response envelope".to_string())?;
+        let complete = pending == 0 && indexed == total;
+        if coverage.indexed != indexed
+            || coverage.pending != pending
+            || coverage.total != total
+            || coverage.complete != complete
+        {
+            return Err("_kin semantic_coverage disagrees with selected-graph status".to_string());
+        }
+        Ok(())
+    }
 }
 
 pub const GRAPH_STATUS_DESC: &str = "\
-Report the status of the exact semantic graph selected for this MCP call — live entity \
+Report the status of the semantic graph selected for this MCP call — live entity \
 and relation counts, embedding-index coverage (embeddings_indexed / embeddings_total / \
 embeddings_pending), and the schema, view, scope, and authority backing them. In product \
 mode one repo-daemon response owns every field, including for an X-Kin-Session temporal \
@@ -2602,29 +2750,42 @@ scope, so durable repository counts cannot be mixed with a different live/sessio
 Reach for it as a quick health/readiness check: confirm the selected graph is populated, \
 check how much of its own retrieval universe has embeddings indexed, and verify the scope \
 before relying on other tools. embedding_source is selected_graph; any pipeline-specific \
-fallback coverage is reported by semantic_locate itself. Counts are exact but enrichment \
-completeness is not attested (completion_attested=false), so a populated graph is not by \
-itself a complete one. This tool requires the Kin daemon; it does not invent an offline \
-approximation.";
+fallback coverage is reported by semantic_locate itself. sampling=point_in_time_selected_graph \
+means the daemon serialized embedding mutation and revalidated authority_epoch after capturing \
+every counter; authority_epoch is process-local, not a durable repository generation. \
+Enrichment completeness is not attested \
+(completion_attested=false), so a populated graph is not by itself a complete one. This \
+tool requires the Kin daemon; it does not invent an offline approximation.";
 
-pub fn handle_daemon_graph_status(
-    graph: &kin_db::InMemoryGraph,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GraphStatusObservation {
+    pub authority_epoch: u64,
+    pub entity_count: usize,
+    pub relation_count: usize,
+    pub embeddings_indexed: usize,
+    pub embeddings_pending: usize,
+    pub embeddings_total: usize,
+}
+
+pub fn handle_daemon_graph_status_observation(
     scope: GraphStatusScope,
+    observation: GraphStatusObservation,
 ) -> Result<ToolCallResult> {
-    let stats = graph.graph_stats();
-    let embeddings = graph.embedding_status();
     let report = GraphStatusReport {
         schema: GRAPH_STATUS_SCHEMA.to_string(),
         view: GraphStatusView::DaemonSelectedGraph,
         scope,
         authority: GraphStatusAuthority::RepoDaemon,
-        entity_count: stats.total_entities,
-        relation_count: stats.total_relations,
+        sampling: GraphStatusSampling::PointInTimeSelectedGraph,
+        authority_epoch: observation.authority_epoch,
+        entity_count: observation.entity_count,
+        relation_count: observation.relation_count,
         embedding_source: GraphStatusEmbeddingSource::SelectedGraph,
-        embeddings_indexed: embeddings.indexed,
-        embeddings_pending: embeddings.pending,
-        embeddings_total: embeddings.total,
+        embeddings_indexed: observation.embeddings_indexed,
+        embeddings_pending: observation.embeddings_pending,
+        embeddings_total: observation.embeddings_total,
         completion_attested: false,
+        response_envelope: None,
     };
     Ok(ToolCallResult::text(serde_json::to_string_pretty(&report)?))
 }
@@ -3797,18 +3958,31 @@ mod tests {
         graph
             .upsert_relation(&make_relation(caller.id, callee.id, RelationKind::Calls))
             .unwrap();
-        let stats = graph.graph_stats();
         let embeddings = graph.embedding_status();
-
-        let result = handle_daemon_graph_status(&graph, GraphStatusScope::TemporalSession).unwrap();
+        let observation = GraphStatusObservation {
+            authority_epoch: 42,
+            entity_count: graph.entity_count(),
+            relation_count: graph.relation_count(),
+            embeddings_indexed: embeddings.indexed,
+            embeddings_pending: embeddings.pending,
+            embeddings_total: embeddings.total,
+        };
+        let result =
+            handle_daemon_graph_status_observation(GraphStatusScope::TemporalSession, observation)
+                .unwrap();
         let report: GraphStatusReport = serde_json::from_value(parsed_response(&result)).unwrap();
 
         assert_eq!(report.schema, GRAPH_STATUS_SCHEMA);
         assert_eq!(report.view, GraphStatusView::DaemonSelectedGraph);
         assert_eq!(report.scope, GraphStatusScope::TemporalSession);
         assert_eq!(report.authority, GraphStatusAuthority::RepoDaemon);
-        assert_eq!(report.entity_count, stats.total_entities);
-        assert_eq!(report.relation_count, stats.total_relations);
+        assert_eq!(
+            report.sampling,
+            GraphStatusSampling::PointInTimeSelectedGraph
+        );
+        assert_eq!(report.authority_epoch, 42);
+        assert_eq!(report.entity_count, observation.entity_count);
+        assert_eq!(report.relation_count, observation.relation_count);
         assert_eq!(
             report.embedding_source,
             GraphStatusEmbeddingSource::SelectedGraph
@@ -3817,6 +3991,7 @@ mod tests {
         assert_eq!(report.embeddings_pending, embeddings.pending);
         assert_eq!(report.embeddings_total, embeddings.total);
         assert!(!report.completion_attested);
+        assert!(report.response_envelope.is_none());
     }
 
     #[test]
