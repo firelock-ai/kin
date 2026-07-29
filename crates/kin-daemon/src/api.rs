@@ -21813,15 +21813,22 @@ mod tests {
         assert!(hit["kind"].as_str().is_some());
     }
 
-    /// `include_snippet` is one contract, and the field it fills must be named
-    /// the same on whichever arm the daemon's profile happens to serve.
+    /// The fused arm must fill `snippet`, the field the schema names, and must
+    /// keep its entity ranking when snippets are declined.
     ///
-    /// The two arms previously disagreed: the cosine arm wrote `snippet`, the
-    /// fused arm wrote `body`. An agent that asked for a snippet and read
+    /// The two arms disagreed on the field: the cosine arm wrote `snippet`, the
+    /// fused arm wrote only `body`. An agent that asked for a snippet and read
     /// `snippet` therefore found no snippet key at all under the fused profile,
     /// which closed the one in-profile path to source text it had.
+    ///
+    /// Scope of this test: the FUSED arm. The cosine arm's `snippet` emission is
+    /// unchanged and cannot be exercised here, because the cosine ranking needs a
+    /// populated vector index and this fixture has none (see
+    /// `mcp_semantic_locate_reports_coverage_without_hard_gate`, which asserts the
+    /// no-index behavior). Field-name agreement between the arms therefore rests
+    /// on the cosine arm's existing emission plus this assertion on the fused one.
     #[tokio::test]
-    async fn mcp_semantic_locate_serves_snippets_under_one_field_name_on_both_arms() {
+    async fn mcp_semantic_locate_fused_serves_snippets_and_keeps_hits_when_declined() {
         let state = test_state();
         let source = "def parse_config(path):\n    return {\"path\": path}\n";
         install_repository_file(&state, "src/config.py", source.as_bytes());
