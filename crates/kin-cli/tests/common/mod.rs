@@ -316,12 +316,13 @@ fn process_group_is_empty(process_group: libc::pid_t) -> std::io::Result<bool> {
 
 #[cfg(windows)]
 struct WindowsJob {
-    handle: windows_sys::Win32::Foundation::HANDLE,
+    handle: std::os::windows::io::OwnedHandle,
 }
 
 #[cfg(windows)]
 impl WindowsJob {
     fn new() -> std::io::Result<Self> {
+        use std::os::windows::io::FromRawHandle as _;
         use windows_sys::Win32::System::JobObjects::{
             CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
             JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
@@ -331,12 +332,17 @@ impl WindowsJob {
         if handle.is_null() {
             return Err(std::io::Error::last_os_error());
         }
-        let job = Self { handle };
+        let job = Self {
+            // SAFETY: CreateJobObjectW returned a fresh, non-null owned
+            // handle. OwnedHandle closes it exactly once, including on later
+            // configuration failure.
+            handle: unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(handle) },
+        };
         let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
         limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
         let configured = unsafe {
             SetInformationJobObject(
-                job.handle,
+                job.raw_handle(),
                 JobObjectExtendedLimitInformation,
                 std::ptr::from_ref(&limits).cast(),
                 std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
@@ -348,14 +354,20 @@ impl WindowsJob {
         Ok(job)
     }
 
+    fn raw_handle(&self) -> windows_sys::Win32::Foundation::HANDLE {
+        use std::os::windows::io::AsRawHandle as _;
+
+        self.handle.as_raw_handle()
+    }
+
     fn spawn(&self, command: &mut std::process::Command, label: &str) -> std::io::Result<Child> {
-        spawn_in_windows_job(command, self.handle, label)
+        spawn_in_windows_job(command, self.raw_handle(), label)
     }
 
     fn terminate(&self) -> std::io::Result<()> {
         use windows_sys::Win32::System::JobObjects::TerminateJobObject;
 
-        if unsafe { TerminateJobObject(self.handle, 1) } == 0 {
+        if unsafe { TerminateJobObject(self.raw_handle(), 1) } == 0 {
             Err(std::io::Error::last_os_error())
         } else {
             Ok(())
@@ -371,7 +383,7 @@ impl WindowsJob {
         let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
         let queried = unsafe {
             QueryInformationJobObject(
-                self.handle,
+                self.raw_handle(),
                 JobObjectBasicAccountingInformation,
                 std::ptr::from_mut(&mut accounting).cast(),
                 std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
@@ -387,10 +399,11 @@ impl WindowsJob {
 }
 
 #[cfg(windows)]
-impl Drop for WindowsJob {
-    fn drop(&mut self) {
-        let _ = unsafe { windows_sys::Win32::Foundation::CloseHandle(self.handle) };
-    }
+#[test]
+fn isolated_daemon_runtime_is_send_and_sync() {
+    fn assert_send_and_sync<T: Send + Sync>() {}
+
+    assert_send_and_sync::<IsolatedDaemonRuntime>();
 }
 
 #[cfg(windows)]

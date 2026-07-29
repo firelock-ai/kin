@@ -210,6 +210,25 @@ jobs:
             cargo test "$@" -- --test-threads=1
           }
 
+          compile_required_target() {
+            local label="$1"
+            local required_test="$2"
+            shift 2
+            local listing
+            local matches
+            listing="$(list_tests "$@")"
+            assert_nonempty_listing "$label" "$listing"
+            matches="$(printf '%s\n' "$listing" \
+              | awk -v expected="$required_test: test" \
+                '$0 == expected { count += 1 } END { print count + 0 }')"
+            if [[ "$matches" -ne 1 ]]; then
+              echo "::error title=Missing native Windows compile target::$label expected exactly one '$required_test', found $matches"
+              printf '%s\n' "$listing"
+              exit 1
+            fi
+            echo "$label: compiled and listed required test '$required_test'"
+          }
+
           run_nonempty_target "kin-registry library" \
             --locked --target x86_64-pc-windows-msvc \
             -p kin-registry --lib
@@ -249,6 +268,10 @@ jobs:
           run_required_filter "daemon isolation support" "common::daemon_isolation" \
             --locked --target x86_64-pc-windows-msvc \
             -p kin-daemon --no-default-features --test port_handshake
+          compile_required_target "durable merge resolution containment compile" \
+            "concurrent_resolutions_from_one_view_leave_one_winner" \
+            --locked --target x86_64-pc-windows-msvc \
+            -p kin-cli --no-default-features --test repository_merge_resolution
 
   windows-installer:
     name: Windows installer + vector-free release build
