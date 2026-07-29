@@ -9,7 +9,7 @@
 
 use std::path::Path;
 
-use kin_model::entity::{Entity, EntityKind, Visibility};
+use kin_model::entity::{Entity, EntityKind, EntityRole, Visibility};
 use kin_model::graph::GraphStore;
 use kin_model::relation::RelationKind;
 
@@ -84,6 +84,14 @@ pub fn entity_ranking_key(
 ///
 /// Queries the store by name pattern, then ranks all matches using
 /// [`entity_ranking_key`] to pick the single best result.
+///
+/// A candidate the repository holds no file for is never selected. Every caller
+/// of this function wants a declaration it can open, and an external reference
+/// target carries the imported symbol's name while standing for a definition
+/// another repository owns, so selecting one turns a clean not-found into a
+/// located answer that has no location. A repository that vendors its own copy
+/// of a dependency keeps its [`EntityRole::External`] entities eligible, because
+/// those carry real files.
 pub fn select_best_entity<G: GraphStore>(
     store: &G,
     query: &str,
@@ -94,6 +102,10 @@ pub fn select_best_entity<G: GraphStore>(
         name_pattern: Some(query.to_string()),
         ..Default::default()
     })?;
+    let matches: Vec<Entity> = matches
+        .into_iter()
+        .filter(|entity| entity.file_origin.is_some() || entity.role != EntityRole::External)
+        .collect();
     if matches.is_empty() {
         return Ok(None);
     }

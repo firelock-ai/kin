@@ -11,7 +11,7 @@
 //! supplies the entity the consumer's unresolved import names; the consumer
 //! side must carry that import as a change-owned external-reference relation.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::path::Path;
 use std::process::{Command, Output};
@@ -52,6 +52,12 @@ fn clean_brownfield_admission_binds_cross_repo_external_references() {
             "use provider::do_work;\n\npub fn run_task() -> u32 {\n    do_work()\n}\n",
         )],
     );
+
+    // Both checkouts go away here, before a single assertion runs. Everything
+    // below is answered from admitted graph truth alone, so the claim that no
+    // query re-derives a cross-repo reference from the filesystem is what makes
+    // this test pass rather than something it merely fails to exercise.
+    drop(root);
 
     // The consumer's admitted history owns the external reference. Nothing has
     // edited the checkout, and no query has re-derived it from the filesystem.
@@ -221,13 +227,34 @@ fn admit_repository(dir: &Path, repository_id: &str, files: &[(&str, &str)]) -> 
 
 /// Apply every change's deltas in parent-first order, the way durable authority
 /// replay derives the state a workspace reports.
+///
+/// The order is derived rather than approximated by parent count, which is an
+/// all-ties no-op on a linear history and would silently produce wrong state the
+/// first time this is pointed at a repository with more than one commit. A
+/// parent outside this change set is treated as already applied, because a
+/// caller may replay a subset.
 fn replay_first_parent(changes: &[SemanticChange]) -> AdmittedRepository {
-    let mut ordered = changes.to_vec();
-    ordered.sort_by_key(|change| change.parents.len());
+    let known: BTreeSet<_> = changes.iter().map(|change| change.id).collect();
+    let mut applied = BTreeSet::new();
+    let mut ordered = Vec::with_capacity(changes.len());
+    while ordered.len() < changes.len() {
+        let next = changes
+            .iter()
+            .find(|change| {
+                !applied.contains(&change.id)
+                    && change
+                        .parents
+                        .iter()
+                        .all(|parent| !known.contains(parent) || applied.contains(parent))
+            })
+            .expect("the admitted change set must be a DAG rooted in this history");
+        applied.insert(next.id);
+        ordered.push(next);
+    }
 
     let mut entities = BTreeMap::new();
     let mut relations = BTreeMap::new();
-    for change in &ordered {
+    for change in ordered {
         for delta in &change.entity_deltas {
             match delta {
                 EntityDelta::Added { new } | EntityDelta::Modified { new, .. } => {

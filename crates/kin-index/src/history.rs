@@ -32,12 +32,21 @@ use crate::pipeline::IndexPipeline;
 ///
 /// Kin's deep history is not a stored fact. It is re-authored here from
 /// graph-owned trees and CAS bodies, so editing any of the replay functions
-/// pinned by `scripts/hydration-semantics-manifest.json` changes what Kin
-/// reports about the past on repositories that were already ingested. A digest
-/// mismatch in that guard is a decision to make, not a file to regenerate:
-/// establish whether replay semantics actually changed, and if they did, bump
-/// this constant and the manifest's recorded version together. Never
-/// regenerate a digest silently.
+/// pinned by `scripts/hydration-semantics-manifest.json` changes what a
+/// repository's past is said to contain the next time that repository is
+/// admitted. A digest mismatch in that guard is a decision to make, not a file
+/// to regenerate: establish whether replay semantics actually changed, and if
+/// they did, bump this constant and the manifest's recorded version together.
+/// Never regenerate a digest silently.
+///
+/// This constant is a declaration, not an enforcement point. Nothing persists
+/// it beside a graph and nothing compares it when one is opened, and no path
+/// re-derives historical deltas for a repository that was already admitted, so
+/// bumping it does not invalidate, migrate, or re-enrich an existing graph. A
+/// repository admitted under an earlier version keeps whatever its past was
+/// authored to contain until it is admitted again, and reports nothing about
+/// which version authored it. Coupling the dial to graph authority so a
+/// version gap can be detected and refused is open follow-up work.
 pub const HYDRATION_SEMANTICS_VERSION: u32 = 7;
 
 /// Semantic graph delta derived for one pre-enrichment change identity.
@@ -87,6 +96,12 @@ pub fn derive_historical_semantic_deltas(
     blob_store: &BlobStore,
 ) -> Result<Vec<HistoricalSemanticDelta>> {
     let pipeline = IndexPipeline::new();
+    // An external target's fingerprint is a pure function of the import source
+    // and symbol its identity is derived from, so it is the same value in every
+    // tree that observes the import. The fold relinks the whole tree per change,
+    // which would otherwise recompute those digests once per commit for a value
+    // that cannot change.
+    let mut external_fingerprints = BTreeMap::<EntityId, SemanticFingerprint>::new();
     let mut states = BTreeMap::<SemanticChangeId, SemanticTreeState>::new();
     let mut known_changes = HashSet::with_capacity(changes.len());
     let mut remaining_child_uses = BTreeMap::<SemanticChangeId, usize>::new();
@@ -144,7 +159,13 @@ pub fn derive_historical_semantic_deltas(
                 change.id
             ))
         })?;
-        let current = semantic_state_for_tree(tree, &parent_states, blob_store, &pipeline)?;
+        let current = semantic_state_for_tree(
+            tree,
+            &parent_states,
+            blob_store,
+            &pipeline,
+            &mut external_fingerprints,
+        )?;
         let entity_deltas = diff_entities(&first_parent.entities, &current.entities);
         let relation_deltas = diff_relations(&first_parent.relations, &current.relations);
 
@@ -190,6 +211,7 @@ fn semantic_state_for_tree(
     parents: &[&SemanticTreeState],
     blob_store: &BlobStore,
     pipeline: &IndexPipeline,
+    external_fingerprints: &mut BTreeMap<EntityId, SemanticFingerprint>,
 ) -> Result<SemanticTreeState> {
     let mut files = BTreeMap::new();
 
@@ -310,7 +332,11 @@ fn semantic_state_for_tree(
     parse_data.sort_by(|left, right| left.file_path.cmp(&right.file_path));
 
     let linked = link_cross_file_with_completeness(&parse_data, &artifact_ids, &completeness)?;
-    entities.extend(external_reference_targets(&linked, &entities));
+    entities.extend(external_reference_targets(
+        &linked,
+        &entities,
+        external_fingerprints,
+    ));
     let mut relations = BTreeMap::new();
     for relation in linked {
         if let Some(absent) = absent_local_endpoint(&relation, &entities) {
@@ -362,17 +388,28 @@ struct AbsentEndpoint {
 /// Binding an external target instead makes the reference complete,
 /// change-owned truth at the admission boundary. The target keeps the linker's
 /// deterministic identity, so every commit that observes the same import binds
-/// the same node and the fold emits no churn. It carries no file origin,
-/// because this tree does not contain the definition, and no signature,
-/// because none was observed. Its uniform [`EntityKind::Module`] says only what
-/// this repository can prove, that the symbol is reached through a module it
-/// does not own, and keeps external targets from ever matching a local
-/// definition by kind.
+/// the same node. It carries no file origin, because this tree does not contain
+/// the definition, and no signature, because none was observed. Its uniform
+/// [`EntityKind::Module`] says only what this repository can prove, that the
+/// symbol is reached through a module it does not own, and keeps external
+/// targets from ever matching a local definition by kind.
+///
+/// Every field is derived from the target itself rather than from whichever
+/// importer happened to be walked first, so a commit that only reorders or
+/// renames unrelated files cannot restate the target and make history record a
+/// modification to a node it never touched.
 fn external_reference_targets(
     linked: &[Relation],
     entities: &BTreeMap<EntityId, Entity>,
+    fingerprints: &mut BTreeMap<EntityId, SemanticFingerprint>,
 ) -> BTreeMap<EntityId, Entity> {
-    let mut targets = BTreeMap::new();
+    // One target can be imported by several files, and in a polyglot tree those
+    // importers do not share a language. The importers are collected first so
+    // the language is chosen from all of them by a total order, because the id
+    // the linker derives excludes language: picking the first importer in walk
+    // order would let an unrelated added or renamed file change which language a
+    // target claims.
+    let mut importers: BTreeMap<EntityId, (&str, &str, Vec<LanguageId>)> = BTreeMap::new();
     for relation in linked {
         if !is_external_import_placeholder(relation) {
             continue;
@@ -380,7 +417,7 @@ fn external_reference_targets(
         let Some(destination) = relation.dst.as_entity() else {
             continue;
         };
-        if entities.contains_key(&destination) || targets.contains_key(&destination) {
+        if entities.contains_key(&destination) {
             continue;
         }
         // The placeholder contract guarantees a local source, a non-empty
@@ -395,27 +432,73 @@ fn external_reference_targets(
         ) else {
             continue;
         };
+        importers
+            .entry(destination)
+            .or_insert((import_source, symbol, Vec::new()))
+            .2
+            .push(source.language);
+    }
+
+    let mut targets = BTreeMap::new();
+    for (destination, (import_source, symbol, languages)) in importers {
+        let fingerprint = fingerprints
+            .entry(destination)
+            .or_insert_with(|| external_reference_fingerprint(import_source, symbol))
+            .clone();
+        let Some(language) = lowest_language(&languages) else {
+            continue;
+        };
         targets.insert(
             destination,
-            external_reference_entity(destination, import_source, symbol, source.language),
+            external_reference_entity(destination, symbol, language, fingerprint),
         );
     }
     targets
 }
 
+/// Choose one language from every language that reached an external target.
+///
+/// [`LanguageId`] carries no total order of its own, so the languages are
+/// ordered by their canonical names. Any total order would do; what matters is
+/// that the choice depends on the set of importing languages and on nothing
+/// else, so it holds still while that set does.
+fn lowest_language(languages: &[LanguageId]) -> Option<LanguageId> {
+    languages
+        .iter()
+        .min_by_key(|language| language.to_string())
+        .copied()
+}
+
+/// Report whether `entity` is an external reference target rather than
+/// something this repository defines.
+///
+/// Consumers of graph truth need this because such a target answers a different
+/// question than every other entity: it names a symbol reached through a module
+/// this repository does not own, so it has no file, no span, and no signature to
+/// report, and it is never the definition of anything found here.
+///
+/// The test is deliberately the conjunction of the role and the absent file
+/// origin rather than the role alone. [`EntityRole::External`] is also assigned
+/// by path classification to real, locally defined entities under `third_party/`
+/// and its siblings, and those own their source; only a target with no file
+/// origin at all stands for a definition that lives elsewhere.
+pub fn is_external_reference_target(entity: &Entity) -> bool {
+    entity.role == EntityRole::External && entity.file_origin.is_none()
+}
+
 /// Build the external target a cross-repo reference resolves against.
 fn external_reference_entity(
     id: EntityId,
-    import_source: &str,
     symbol: &str,
     language: LanguageId,
+    fingerprint: SemanticFingerprint,
 ) -> Entity {
     Entity {
         id,
         kind: EntityKind::Module,
         name: symbol.to_string(),
         language,
-        fingerprint: external_reference_fingerprint(import_source, symbol),
+        fingerprint,
         file_origin: None,
         span: None,
         signature: String::new(),
