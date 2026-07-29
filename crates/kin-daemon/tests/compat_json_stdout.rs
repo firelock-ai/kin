@@ -38,11 +38,25 @@ fn compat_json_stdout_is_pure_json_under_env_overrides() {
             )
         });
 
-    assert_eq!(parsed["schema"], "kin.daemon.compat.v1");
+    assert_eq!(parsed["schema"], "kin.daemon.compat.v2");
     assert!(
         parsed["graph_snapshot_version"].is_number(),
         "compat payload must carry a numeric graph_snapshot_version"
     );
+    assert_eq!(parsed["supervisor_startup_protocol"], 2);
+    let capabilities = parsed["supervisor_startup_capabilities"]
+        .as_array()
+        .expect("compat payload must carry startup capabilities");
+    for required in [
+        "generation-adoption-ack-v2",
+        "legacy-directory-sentinel-v1",
+        "bounded-legacy-rollback-v1",
+    ] {
+        assert!(
+            capabilities.iter().any(|capability| capability == required),
+            "compat payload must advertise {required}: {parsed}"
+        );
+    }
     assert!(parsed["build"]["sha"].is_string());
     assert!(parsed["build"]["dirty"].is_boolean());
     assert!(parsed["build"]["source_known"].is_boolean());

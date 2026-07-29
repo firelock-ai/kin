@@ -2178,6 +2178,13 @@ impl DaemonEndpointRetirement {
             }
         }
     }
+
+    fn may_reflect_publication(&self) -> bool {
+        matches!(
+            self,
+            Self::Changed { .. } | Self::LifecycleContended | Self::SingletonHeld
+        )
+    }
 }
 
 /// Remove endpoint files only while they still name the exact endpoint a verdict
@@ -2364,9 +2371,11 @@ const SUPERVISOR_LIFECYCLE_FILE: &str = "supervisor.lifecycle";
 const SUPERVISOR_SINGLETON_FILE: &str = "supervisor.lock";
 const SUPERVISOR_STARTUP_FILE: &str = "supervisor.start.lock";
 const SUPERVISOR_STARTUP_AUTHORITY_FILE: &str = "authority.lock";
+const SUPERVISOR_STARTUP_RECORDS_DIR: &str = "records-v2";
 const SUPERVISOR_STARTUP_PROTOCOL: u32 = 2;
 const SUPERVISOR_STARTUP_CAPABILITY: &str = "generation-adoption-ack-v2";
 const SUPERVISOR_LEGACY_SENTINEL_CAPABILITY: &str = "legacy-directory-sentinel-v1";
+const SUPERVISOR_BOUNDED_ROLLBACK_CAPABILITY: &str = "bounded-legacy-rollback-v1";
 /// Internal handoff from the current CLI launcher to the supervisor child.
 ///
 /// This is scrubbed from every daemon command and set only on a supervisor
@@ -2484,6 +2493,13 @@ impl SupervisorEndpointRetirement {
                 format!("supervisor retirement coordination is unavailable: {detail}")
             }
         }
+    }
+
+    fn may_reflect_publication(&self) -> bool {
+        matches!(
+            self,
+            Self::Changed { .. } | Self::LifecycleContended | Self::SingletonHeld
+        )
     }
 }
 
@@ -2764,12 +2780,17 @@ fn validate_daemon_compat_response(compat: &DaemonCompatResponse) -> Result<(), 
             .supervisor_startup_capabilities
             .iter()
             .any(|capability| capability == SUPERVISOR_LEGACY_SENTINEL_CAPABILITY)
+        || !compat
+            .supervisor_startup_capabilities
+            .iter()
+            .any(|capability| capability == SUPERVISOR_BOUNDED_ROLLBACK_CAPABILITY)
     {
         return Err(format!(
-            "daemon does not acknowledge supervisor startup protocol v{} ({}, {})",
+            "daemon does not acknowledge supervisor startup protocol v{} ({}, {}, {})",
             SUPERVISOR_STARTUP_PROTOCOL,
             SUPERVISOR_STARTUP_CAPABILITY,
-            SUPERVISOR_LEGACY_SENTINEL_CAPABILITY
+            SUPERVISOR_LEGACY_SENTINEL_CAPABILITY,
+            SUPERVISOR_BOUNDED_ROLLBACK_CAPABILITY
         ));
     }
     Ok(())
@@ -3171,10 +3192,11 @@ struct StartupFileIdentity {
     file: u64,
 }
 
-fn startup_file_identity(metadata: &std::fs::Metadata) -> std::io::Result<StartupFileIdentity> {
+fn startup_file_identity(file: &File) -> std::io::Result<StartupFileIdentity> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
+        let metadata = file.metadata()?;
         return Ok(StartupFileIdentity {
             volume: metadata.dev(),
             file: metadata.ino(),
@@ -3182,25 +3204,30 @@ fn startup_file_identity(metadata: &std::fs::Metadata) -> std::io::Result<Startu
     }
     #[cfg(windows)]
     {
-        use std::os::windows::fs::MetadataExt;
+        use std::mem::zeroed;
+        use std::os::windows::io::AsRawHandle as _;
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+        };
+
+        // The std MetadataExt accessors for these fields are still unstable.
+        // Query the exact open handle instead, so identity cannot drift through
+        // a pathname reopen between validation and use.
+        // SAFETY: zero is a valid initializer for this output structure and
+        // `file` owns a live handle for the duration of the call.
+        let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { zeroed() };
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), &mut information) } == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
         return Ok(StartupFileIdentity {
-            volume: metadata.volume_serial_number().ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::Unsupported,
-                    "startup authority volume identity is unavailable",
-                )
-            })? as u64,
-            file: metadata.file_index().ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::Unsupported,
-                    "startup authority file identity is unavailable",
-                )
-            })?,
+            volume: information.dwVolumeSerialNumber as u64,
+            file: ((information.nFileIndexHigh as u64) << 32) | information.nFileIndexLow as u64,
         });
     }
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = metadata;
+        let _ = file;
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "startup authority file identity is unsupported on this platform",
@@ -3263,11 +3290,114 @@ fn open_startup_regular_file(
     Ok(file)
 }
 
-fn ensure_supervisor_startup_namespace(dir: &Path) -> std::io::Result<PathBuf> {
+fn open_startup_directory(path: &Path) -> std::io::Result<File> {
+    let mut options = OpenOptions::new();
+    #[cfg(not(windows))]
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_DIRECTORY);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+            FILE_WRITE_ATTRIBUTES,
+        };
+        options
+            .access_mode(FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if metadata.file_type().is_symlink()
+        || startup_metadata_is_reparse_point(&metadata)
+        || !metadata.is_dir()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "supervisor startup protocol refuses non-directory handle {}",
+                path.display()
+            ),
+        ));
+    }
+    Ok(file)
+}
+
+#[derive(Debug)]
+struct SupervisorStartupNamespace {
+    sentinel: PathBuf,
+    records: PathBuf,
+    sentinel_file: File,
+    sentinel_identity: StartupFileIdentity,
+}
+
+/// Keep immutable protocol-v1 launchers on their bounded deadline path.
+///
+/// Those launchers treat an old `supervisor.start.lock` mtime as permission to
+/// call `remove_file` and immediately retry. The permanent v2 directory cannot
+/// be removed that way, so an aged ordinary mtime would turn the retry into an
+/// unbounded busy loop after a binary rollback. Current launchers instead stamp
+/// the outer, never-mutated sentinel far into the future. The legacy
+/// `modified().elapsed()` check then returns `Err` and reaches its configured
+/// deadline, while the directory continues to exclude legacy `create_new`
+/// launchers structurally.
+///
+/// All mutable v2 records live one level below the sentinel so creating a
+/// generation cannot refresh or age this compatibility stamp. Failure to set
+/// and read back a future timestamp fails current startup closed.
+fn preserve_bounded_legacy_rollback(
+    sentinel: &Path,
+    sentinel_file: &File,
+) -> std::io::Result<StartupFileIdentity> {
+    // One hundred leap years is inside the supported timestamp range of the
+    // filesystems Kin supports and is refreshed by every current launcher.
+    const FUTURE_SECS: u64 = 100 * 366 * 24 * 60 * 60;
+    let future = std::time::SystemTime::now()
+        .checked_add(Duration::from_secs(FUTURE_SECS))
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "cannot represent the supervisor rollback sentinel timestamp",
+            )
+        })?;
+    let identity = startup_file_identity(sentinel_file)?;
+    filetime::set_file_handle_times(
+        sentinel_file,
+        None,
+        Some(filetime::FileTime::from_system_time(future)),
+    )?;
+    let readback_identity = startup_file_identity(sentinel_file)?;
+    if readback_identity != identity {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "supervisor rollback sentinel handle identity changed at {}",
+                sentinel.display()
+            ),
+        ));
+    }
+    let modified = sentinel_file.metadata()?.modified()?;
+    if modified.elapsed().is_ok() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "filesystem did not preserve a future supervisor rollback sentinel timestamp at {}",
+                sentinel.display()
+            ),
+        ));
+    }
+    Ok(identity)
+}
+
+fn ensure_supervisor_startup_namespace(dir: &Path) -> std::io::Result<SupervisorStartupNamespace> {
     std::fs::create_dir_all(dir)?;
-    let path = dir.join(SUPERVISOR_STARTUP_FILE);
+    let sentinel = dir.join(SUPERVISOR_STARTUP_FILE);
     loop {
-        match std::fs::symlink_metadata(&path) {
+        match std::fs::symlink_metadata(&sentinel) {
             Ok(metadata)
                 if metadata.file_type().is_symlink()
                     || startup_metadata_is_reparse_point(&metadata) =>
@@ -3276,24 +3406,24 @@ fn ensure_supervisor_startup_namespace(dir: &Path) -> std::io::Result<PathBuf> {
                     std::io::ErrorKind::PermissionDenied,
                     format!(
                         "supervisor startup protocol refuses symlink {}",
-                        path.display()
+                        sentinel.display()
                     ),
                 ));
             }
-            Ok(metadata) if metadata.is_dir() => return Ok(path),
+            Ok(metadata) if metadata.is_dir() => break,
             Ok(_) => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::Unsupported,
                     format!(
                         "legacy supervisor launcher marker at {} is incompatible with startup \
                          protocol v{SUPERVISOR_STARTUP_PROTOCOL}; refusing before supervisor boot",
-                        path.display()
+                        sentinel.display()
                     ),
                 ));
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                match std::fs::create_dir(&path) {
-                    Ok(()) => return Ok(path),
+                match std::fs::create_dir(&sentinel) {
+                    Ok(()) => break,
                     Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                     Err(error) => return Err(error),
                 }
@@ -3301,6 +3431,51 @@ fn ensure_supervisor_startup_namespace(dir: &Path) -> std::io::Result<PathBuf> {
             Err(error) => return Err(error),
         }
     }
+
+    // Create every fixed entry before stamping the outer sentinel. Per-launch
+    // records are written only beneath `records`, so the outer directory mtime
+    // remains a stable compatibility signal after this point.
+    drop(open_startup_regular_file(
+        &sentinel.join(SUPERVISOR_STARTUP_AUTHORITY_FILE),
+        true,
+        false,
+        true,
+    )?);
+    let records = sentinel.join(SUPERVISOR_STARTUP_RECORDS_DIR);
+    loop {
+        match std::fs::symlink_metadata(&records) {
+            Ok(metadata)
+                if metadata.file_type().is_symlink()
+                    || startup_metadata_is_reparse_point(&metadata)
+                    || !metadata.is_dir() =>
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "supervisor startup protocol refuses non-directory records namespace {}",
+                        records.display()
+                    ),
+                ));
+            }
+            Ok(_) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match std::fs::create_dir(&records) {
+                    Ok(()) => break,
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    let sentinel_file = open_startup_directory(&sentinel)?;
+    let sentinel_identity = preserve_bounded_legacy_rollback(&sentinel, &sentinel_file)?;
+    Ok(SupervisorStartupNamespace {
+        sentinel,
+        records,
+        sentinel_file,
+        sentinel_identity,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3363,7 +3538,10 @@ fn read_startup_record<T: serde::de::DeserializeOwned>(path: &Path) -> std::io::
 #[derive(Debug)]
 pub struct SupervisorStartupLock {
     dir: PathBuf,
-    namespace: PathBuf,
+    sentinel: PathBuf,
+    records: PathBuf,
+    sentinel_file: File,
+    sentinel_identity: StartupFileIdentity,
     file: File,
     file_identity: StartupFileIdentity,
     generation: String,
@@ -3372,7 +3550,7 @@ pub struct SupervisorStartupLock {
 
 impl SupervisorStartupLock {
     fn path(&self) -> &Path {
-        &self.namespace
+        &self.sentinel
     }
 
     /// Exact generation handed from a launcher to its supervisor child.
@@ -3381,19 +3559,29 @@ impl SupervisorStartupLock {
     }
 
     fn current_authority_identity(&self) -> std::io::Result<StartupFileIdentity> {
-        let path = self.namespace.join(SUPERVISOR_STARTUP_AUTHORITY_FILE);
+        let path = self.sentinel.join(SUPERVISOR_STARTUP_AUTHORITY_FILE);
         let file = open_startup_regular_file(&path, false, false, false)?;
-        startup_file_identity(&file.metadata()?)
+        startup_file_identity(&file)
+    }
+
+    fn current_sentinel_identity(&self) -> std::io::Result<StartupFileIdentity> {
+        let file = open_startup_directory(&self.sentinel)?;
+        startup_file_identity(&file)
     }
 
     fn authorizes(&self, dir: &Path) -> bool {
-        if self.dir != dir || self.namespace != dir.join(SUPERVISOR_STARTUP_FILE) {
+        if self.dir != dir
+            || self.sentinel != dir.join(SUPERVISOR_STARTUP_FILE)
+            || self.records != self.sentinel.join(SUPERVISOR_STARTUP_RECORDS_DIR)
+        {
             return false;
         }
-        let own_identity = self
-            .file
-            .metadata()
-            .and_then(|metadata| startup_file_identity(&metadata));
+        if startup_file_identity(&self.sentinel_file).ok().as_ref() != Some(&self.sentinel_identity)
+            || self.current_sentinel_identity().ok().as_ref() != Some(&self.sentinel_identity)
+        {
+            return false;
+        }
+        let own_identity = startup_file_identity(&self.file);
         if own_identity.ok().as_ref() != Some(&self.file_identity) {
             return false;
         }
@@ -3404,7 +3592,7 @@ impl SupervisorStartupLock {
             return false;
         }
         read_startup_record::<SupervisorLaunchRecord>(&supervisor_launch_record_path(
-            &self.namespace,
+            &self.records,
             &self.generation,
         ))
         .ok()
@@ -3425,7 +3613,7 @@ impl SupervisorStartupLock {
             ));
         }
         let adoption: SupervisorAdoptionRecord = read_startup_record(
-            &supervisor_adoption_record_path(&self.namespace, &self.generation),
+            &supervisor_adoption_record_path(&self.records, &self.generation),
         )?;
         if adoption.schema != "kin.supervisor.adoption.v2"
             || adoption.protocol != SUPERVISOR_STARTUP_PROTOCOL
@@ -3445,7 +3633,7 @@ impl SupervisorStartupLock {
 
 #[derive(Debug)]
 pub struct SupervisorRuntimeStartup {
-    namespace: PathBuf,
+    records: PathBuf,
     generation: String,
     authority: StartupFileIdentity,
     supervisor: ProcessIdentity,
@@ -3460,7 +3648,7 @@ impl SupervisorRuntimeStartup {
             supervisor: self.supervisor.clone(),
             authority: self.authority.clone(),
         };
-        let path = supervisor_adoption_record_path(&self.namespace, &self.generation);
+        let path = supervisor_adoption_record_path(&self.records, &self.generation);
         match write_immutable_startup_record(&path, &record) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -3533,9 +3721,9 @@ pub fn try_acquire_supervisor_startup_lock_in_dir(
     dir: &Path,
 ) -> std::io::Result<SupervisorStartupLock> {
     let namespace = ensure_supervisor_startup_namespace(dir)?;
-    let authority_path = namespace.join(SUPERVISOR_STARTUP_AUTHORITY_FILE);
-    let file = open_startup_regular_file(&authority_path, true, false, true)?;
-    let file_identity = startup_file_identity(&file.metadata()?)?;
+    let authority_path = namespace.sentinel.join(SUPERVISOR_STARTUP_AUTHORITY_FILE);
+    let file = open_startup_regular_file(&authority_path, false, false, true)?;
+    let file_identity = startup_file_identity(&file)?;
     match file.try_lock_exclusive() {
         Ok(()) => {}
         Err(error) if error.kind() == fs2::lock_contended_error().kind() => {
@@ -3545,6 +3733,21 @@ pub fn try_acquire_supervisor_startup_lock_in_dir(
             ));
         }
         Err(error) => return Err(error),
+    }
+    let current_sentinel = open_startup_directory(&namespace.sentinel)?;
+    if startup_file_identity(&current_sentinel)? != namespace.sentinel_identity {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "supervisor startup sentinel changed before authority acquisition",
+        ));
+    }
+    if preserve_bounded_legacy_rollback(&namespace.sentinel, &namespace.sentinel_file)?
+        != namespace.sentinel_identity
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "supervisor startup sentinel changed while preserving rollback compatibility",
+        ));
     }
 
     let generation = Uuid::new_v4().to_string();
@@ -3556,12 +3759,15 @@ pub fn try_acquire_supervisor_startup_lock_in_dir(
         authority: file_identity.clone(),
     };
     write_immutable_startup_record(
-        &supervisor_launch_record_path(&namespace, &generation),
+        &supervisor_launch_record_path(&namespace.records, &generation),
         &launch,
     )?;
     Ok(SupervisorStartupLock {
         dir: dir.to_path_buf(),
-        namespace,
+        sentinel: namespace.sentinel,
+        records: namespace.records,
+        sentinel_file: namespace.sentinel_file,
+        sentinel_identity: namespace.sentinel_identity,
         file,
         file_identity,
         generation,
@@ -3683,26 +3889,25 @@ pub fn validate_supervisor_runtime_startup(
         )
     })?;
 
-    let namespace = dir.join(SUPERVISOR_STARTUP_FILE);
-    let namespace_metadata = std::fs::symlink_metadata(&namespace)?;
-    if namespace_metadata.file_type().is_symlink()
-        || startup_metadata_is_reparse_point(&namespace_metadata)
-        || !namespace_metadata.is_dir()
-    {
+    let sentinel = dir.join(SUPERVISOR_STARTUP_FILE);
+    let sentinel_file = open_startup_directory(&sentinel)?;
+    if sentinel_file.metadata()?.modified()?.elapsed().is_ok() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
-            "supervisor startup namespace is not a real directory",
+            "supervisor startup sentinel does not preserve bounded legacy rollback",
         ));
     }
+    let records = sentinel.join(SUPERVISOR_STARTUP_RECORDS_DIR);
+    let _records_file = open_startup_directory(&records)?;
     let authority_file = open_startup_regular_file(
-        &namespace.join(SUPERVISOR_STARTUP_AUTHORITY_FILE),
+        &sentinel.join(SUPERVISOR_STARTUP_AUTHORITY_FILE),
         false,
         false,
         false,
     )?;
-    let authority = startup_file_identity(&authority_file.metadata()?)?;
+    let authority = startup_file_identity(&authority_file)?;
     let launch: SupervisorLaunchRecord =
-        read_startup_record(&supervisor_launch_record_path(&namespace, generation))?;
+        read_startup_record(&supervisor_launch_record_path(&records, generation))?;
     if launch.schema != "kin.supervisor.launch.v2"
         || launch.protocol != SUPERVISOR_STARTUP_PROTOCOL
         || launch.generation != generation
@@ -3715,7 +3920,7 @@ pub fn validate_supervisor_runtime_startup(
     }
 
     let supervisor = current_process_identity()?;
-    let adoption_path = supervisor_adoption_record_path(&namespace, generation);
+    let adoption_path = supervisor_adoption_record_path(&records, generation);
     let accepted_reexec = match read_startup_record::<SupervisorAdoptionRecord>(&adoption_path) {
         Ok(existing) => {
             existing.schema == "kin.supervisor.adoption.v2"
@@ -3729,7 +3934,7 @@ pub fn validate_supervisor_runtime_startup(
     };
     if !accepted_reexec
         && (!process_identity_is_current(&launch.launcher)?
-            || !supervisor_startup_authority_is_held(&namespace)?)
+            || !supervisor_startup_authority_is_held(&sentinel)?)
     {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
@@ -3737,7 +3942,7 @@ pub fn validate_supervisor_runtime_startup(
         ));
     }
     Ok(SupervisorRuntimeStartup {
-        namespace,
+        records,
         generation: generation.to_string(),
         authority,
         supervisor,
@@ -3994,6 +4199,10 @@ enum ExistingDaemon {
     Connected(String),
     /// No usable record (absent, or proven wrong and now cleared). Start one.
     None,
+    /// A serialized owner exists, but its endpoint publication is not complete
+    /// yet. Re-snapshot until the shared startup deadline instead of treating a
+    /// legitimate no-endpoint or PID-only state as terminal.
+    Starting(String),
     /// A live daemon owns this repo but is not serving yet. Starting a second
     /// one would lose the singleton flock, so the caller must report this
     /// instead.
@@ -4023,6 +4232,29 @@ async fn wait_for_existing_daemon_within(
     patience: Duration,
 ) -> ExistingDaemon {
     let deadline = Instant::now() + patience;
+    loop {
+        match inspect_existing_daemon_once(kin_root, short, deadline, patience).await {
+            ExistingDaemon::Starting(_detail) if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            ExistingDaemon::Starting(detail) => {
+                return ExistingDaemon::LiveNotReady(format!(
+                    "kin daemon startup is serialized but endpoint publication did not complete \
+                     within {}s: {detail}. Kin will not start a second daemon",
+                    patience.as_secs()
+                ));
+            }
+            resolved => return resolved,
+        }
+    }
+}
+
+async fn inspect_existing_daemon_once(
+    kin_root: &Path,
+    short: Duration,
+    deadline: Instant,
+    patience: Duration,
+) -> ExistingDaemon {
     let recorded = daemon_endpoint_snapshot(kin_root);
     let Some(pid) = recorded.pid else {
         if recorded.pid_exists {
@@ -4036,6 +4268,12 @@ async fn wait_for_existing_daemon_within(
             let retirement = retire_daemon_endpoint_if_unchanged(kin_root, recorded);
             return match retirement {
                 DaemonEndpointRetirement::Retired => ExistingDaemon::None,
+                preserved if preserved.may_reflect_publication() => {
+                    ExistingDaemon::Starting(format!(
+                        "the endpoint is not published yet and {}",
+                        preserved.preserved_reason()
+                    ))
+                }
                 preserved => {
                     follow_preserved_daemon_endpoint(kin_root, deadline, patience, preserved).await
                 }
@@ -4044,6 +4282,10 @@ async fn wait_for_existing_daemon_within(
         let retirement = retire_daemon_endpoint_if_unchanged(kin_root, recorded);
         return match retirement {
             DaemonEndpointRetirement::Retired => ExistingDaemon::None,
+            preserved if preserved.may_reflect_publication() => ExistingDaemon::Starting(format!(
+                "the endpoint PID is not published yet and {}",
+                preserved.preserved_reason()
+            )),
             preserved => {
                 follow_preserved_daemon_endpoint(kin_root, deadline, patience, preserved).await
             }
@@ -4054,6 +4296,10 @@ async fn wait_for_existing_daemon_within(
         let retirement = retire_daemon_endpoint_if_unchanged(kin_root, recorded);
         return match retirement {
             DaemonEndpointRetirement::Retired => ExistingDaemon::None,
+            preserved if preserved.may_reflect_publication() => ExistingDaemon::Starting(format!(
+                "the recorded owner changed during startup and {}",
+                preserved.preserved_reason()
+            )),
             preserved => {
                 follow_preserved_daemon_endpoint(kin_root, deadline, patience, preserved).await
             }
@@ -4061,9 +4307,8 @@ async fn wait_for_existing_daemon_within(
     }
 
     let Some(port) = recorded.port else {
-        return ExistingDaemon::LiveNotReady(format!(
-            "kin daemon pid {pid} may still own this repo, but its port record is absent or \
-             unparseable; refusing to start a second daemon"
+        return ExistingDaemon::Starting(format!(
+            "kin daemon pid {pid} may still own this repo and has not published a usable port yet"
         ));
     };
     let existing = LiveDaemonEndpoint { pid, port };
@@ -4110,6 +4355,12 @@ async fn wait_for_existing_daemon_within(
                 remove_daemon_files_if_unchanged(kin_root, existing.pid, Some(existing.port));
             match retirement {
                 DaemonEndpointRetirement::Retired => ExistingDaemon::None,
+                preserved if preserved.may_reflect_publication() => {
+                    ExistingDaemon::Starting(format!(
+                        "the endpoint changed while its predecessor was retired and {}",
+                        preserved.preserved_reason()
+                    ))
+                }
                 preserved => {
                     follow_preserved_daemon_endpoint(kin_root, deadline, patience, preserved).await
                 }
@@ -4256,6 +4507,7 @@ enum ExistingSupervisor {
     Connected(String),
     NeedsStartupAuthority,
     SpawnAuthorized,
+    Starting(String),
     LiveNotReady(String),
 }
 
@@ -4295,6 +4547,12 @@ where
         if !recorded.port_exists {
             return match retire_supervisor_endpoint_if_unchanged(dir, recorded, startup_authority) {
                 SupervisorEndpointRetirement::Retired => ExistingSupervisor::SpawnAuthorized,
+                preserved if preserved.may_reflect_publication() => {
+                    ExistingSupervisor::Starting(format!(
+                        "the supervisor endpoint is not published yet and {}",
+                        preserved.preserved_reason()
+                    ))
+                }
                 preserved => ExistingSupervisor::LiveNotReady(format!(
                     "supervisor startup authority is unavailable because {}; kin will not start \
                      a replacement",
@@ -4304,6 +4562,12 @@ where
         }
         return match retire_supervisor_endpoint_if_unchanged(dir, recorded, startup_authority) {
             SupervisorEndpointRetirement::Retired => ExistingSupervisor::SpawnAuthorized,
+            preserved if preserved.may_reflect_publication() => {
+                ExistingSupervisor::Starting(format!(
+                    "the supervisor PID is not published yet and {}",
+                    preserved.preserved_reason()
+                ))
+            }
             preserved => ExistingSupervisor::LiveNotReady(format!(
                 "supervisor endpoint retirement was refused because {}; kin will not start a \
                  replacement",
@@ -4318,6 +4582,12 @@ where
         };
         return match retire_supervisor_endpoint_if_unchanged(dir, recorded, startup_authority) {
             SupervisorEndpointRetirement::Retired => ExistingSupervisor::SpawnAuthorized,
+            preserved if preserved.may_reflect_publication() => {
+                ExistingSupervisor::Starting(format!(
+                    "the supervisor endpoint changed during startup and {}",
+                    preserved.preserved_reason()
+                ))
+            }
             preserved => ExistingSupervisor::LiveNotReady(format!(
                 "supervisor endpoint retirement was refused because {}; kin will not start a \
                  replacement",
@@ -4327,9 +4597,9 @@ where
     }
 
     let Some(port) = recorded.port else {
-        return ExistingSupervisor::LiveNotReady(format!(
-            "kin supervisor pid {pid} may still own the per-user control plane, but its port \
-             record is absent or unparseable; refusing to start a second supervisor"
+        return ExistingSupervisor::Starting(format!(
+            "kin supervisor pid {pid} may still own the per-user control plane and has not \
+             published a usable port yet"
         ));
     };
     let existing = LiveDaemonEndpoint { pid, port };
@@ -4343,11 +4613,34 @@ where
                 "supervisor owner is live or indeterminate but health is unavailable; \
                  preserving endpoint and refusing replacement"
             );
-            ExistingSupervisor::LiveNotReady(format!(
+            ExistingSupervisor::Starting(format!(
                 "kin supervisor (pid {}, port {}) may still own the per-user control plane but \
-                 did not pass health: {err}. Kin will not replace a live or indeterminate owner",
+                 has not passed health yet: {err}",
                 existing.pid, existing.port
             ))
+        }
+    }
+}
+
+async fn follow_existing_supervisor_publication(
+    dir: &Path,
+    startup_authority: &SupervisorStartupLock,
+    timeout: Duration,
+) -> ExistingSupervisor {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match wait_for_existing_supervisor_in_dir(dir, Some(startup_authority)).await {
+            ExistingSupervisor::Starting(_detail) if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            ExistingSupervisor::Starting(detail) => {
+                return ExistingSupervisor::LiveNotReady(format!(
+                    "kin supervisor startup is serialized but endpoint publication did not \
+                     complete within {}s: {detail}. Kin will not start a second supervisor",
+                    timeout.as_secs()
+                ));
+            }
+            resolved => return resolved,
         }
     }
 }
@@ -4442,7 +4735,7 @@ pub async fn ensure_supervisor_running() -> Result<String> {
     match probe_existing_supervisor().await {
         ExistingSupervisor::Connected(base_url) => return Ok(base_url),
         ExistingSupervisor::LiveNotReady(message) => bail!(message),
-        ExistingSupervisor::NeedsStartupAuthority => {}
+        ExistingSupervisor::NeedsStartupAuthority | ExistingSupervisor::Starting(_) => {}
         ExistingSupervisor::SpawnAuthorized => {
             bail!("supervisor probe authorized a spawn without startup protocol authority")
         }
@@ -4457,9 +4750,17 @@ pub async fn ensure_supervisor_running() -> Result<String> {
         SupervisorStartupAcquisition::Authority(authority) => authority,
     };
     let dir = supervisor_dir();
-    match wait_for_existing_supervisor_in_dir(&dir, Some(&startup_authority)).await {
+    match follow_existing_supervisor_publication(
+        &dir,
+        &startup_authority,
+        Duration::from_secs(daemon_ready_timeout_secs()),
+    )
+    .await
+    {
         ExistingSupervisor::Connected(base_url) => return Ok(base_url),
-        ExistingSupervisor::LiveNotReady(message) => bail!(message),
+        ExistingSupervisor::Starting(message) | ExistingSupervisor::LiveNotReady(message) => {
+            bail!(message)
+        }
         ExistingSupervisor::SpawnAuthorized => {}
         ExistingSupervisor::NeedsStartupAuthority => {
             bail!("supervisor startup authority was lost before the spawn decision")
@@ -4775,7 +5076,9 @@ pub async fn ensure_daemon_running_with_idle_timeout(
             register_repo_daemon_with_supervisor(kin_root, &base_url, &supervisor_url).await?;
             return Ok(base_url);
         }
-        ExistingDaemon::LiveNotReady(message) => bail!(message),
+        ExistingDaemon::Starting(message) | ExistingDaemon::LiveNotReady(message) => {
+            bail!(message)
+        }
         ExistingDaemon::None => {}
     }
 
@@ -4788,7 +5091,9 @@ pub async fn ensure_daemon_running_with_idle_timeout(
             register_repo_daemon_with_supervisor(kin_root, &base_url, &supervisor_url).await?;
             return Ok(base_url);
         }
-        ExistingDaemon::LiveNotReady(message) => bail!(message),
+        ExistingDaemon::Starting(message) | ExistingDaemon::LiveNotReady(message) => {
+            bail!(message)
+        }
         ExistingDaemon::None => {}
     }
 
@@ -5264,6 +5569,51 @@ mod tests {
         (port, server)
     }
 
+    fn serve_repo_daemon_health(
+        listener: tokio::net::TcpListener,
+        repo_root: &Path,
+    ) -> tokio::task::JoinHandle<()> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let repo_root = strict_canonical_path(repo_root).unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buffer = [0_u8; 2048];
+                let Ok(read) = socket.read(&mut buffer).await else {
+                    continue;
+                };
+                let request = String::from_utf8_lossy(&buffer[..read]);
+                let body = if request.contains("/readiness") {
+                    r#"{"ready":true,"warming":false}"#.to_string()
+                } else if request.contains("/health") {
+                    serde_json::json!({
+                        "status": "ok",
+                        "version": "test",
+                        "uptime_seconds": 0,
+                        "graph_entity_count": 0,
+                        "graph_loaded": true,
+                        "reconciliation_status": "idle",
+                        "repo_root": repo_root,
+                        "pid": std::process::id(),
+                    })
+                    .to_string()
+                } else {
+                    continue;
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                     connection: close\r\ncontent-length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.flush().await;
+            }
+        })
+    }
+
     #[tokio::test]
     async fn a_health_probe_that_never_answers_is_not_evidence_against_the_daemon() {
         // Only an answer can identify a daemon, so only an answer can prove an
@@ -5479,8 +5829,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut launcher_a = try_acquire_supervisor_startup_lock_in_dir(dir.path()).unwrap();
         assert!(
-            startup_lock_is_stale(launcher_a.path(), Duration::ZERO),
-            "the test must make the former wall-clock lease look expired"
+            !startup_lock_is_stale(launcher_a.path(), Duration::ZERO),
+            "the permanent sentinel must keep immutable clients on their bounded deadline path"
         );
 
         let b_while_a =
@@ -5491,7 +5841,7 @@ mod tests {
             b_while_a
                 .to_string()
                 .contains("timed out waiting for supervisor startup lock"),
-            "B must not time-steal A even when the directory mtime looks expired: {b_while_a:#}"
+            "B must not time-steal A while its exact kernel authority is held: {b_while_a:#}"
         );
         assert!(launcher_a.authorizes(dir.path()));
         assert!(launcher_a.heartbeat().unwrap());
@@ -5535,7 +5885,7 @@ mod tests {
         let launcher = try_acquire_supervisor_startup_lock_in_dir(dir.path()).unwrap();
         let generation = launcher.generation().to_string();
         let runtime = SupervisorRuntimeStartup {
-            namespace: launcher.path().to_path_buf(),
+            records: launcher.records.clone(),
             generation: generation.clone(),
             authority: launcher.file_identity.clone(),
             supervisor: current_process_identity().unwrap(),
@@ -5543,7 +5893,7 @@ mod tests {
         runtime.acknowledge().unwrap();
         launcher.verify_adoption(std::process::id()).unwrap();
 
-        let adoption_path = supervisor_adoption_record_path(launcher.path(), &generation);
+        let adoption_path = supervisor_adoption_record_path(&launcher.records, &generation);
         let replacement = SupervisorAdoptionRecord {
             schema: "kin.supervisor.adoption.v2".to_string(),
             protocol: SUPERVISOR_STARTUP_PROTOCOL,
@@ -5685,6 +6035,7 @@ mod tests {
             "supervisor_startup_capabilities": [
                 SUPERVISOR_STARTUP_CAPABILITY,
                 SUPERVISOR_LEGACY_SENTINEL_CAPABILITY,
+                SUPERVISOR_BOUNDED_ROLLBACK_CAPABILITY,
             ],
         }))
         .unwrap();
@@ -5717,12 +6068,10 @@ mod tests {
         assert!(!process_identity_is_current(&rebooted).unwrap());
     }
 
-    async fn supervisor_health_server() -> (u16, tokio::task::JoinHandle<()>) {
+    fn serve_supervisor_health(listener: tokio::net::TcpListener) -> tokio::task::JoinHandle<()> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let server = tokio::spawn(async move {
+        tokio::spawn(async move {
             loop {
                 let Ok((mut socket, _)) = listener.accept().await else {
                     return;
@@ -5743,24 +6092,75 @@ mod tests {
                 let _ = socket.write_all(response.as_bytes()).await;
                 let _ = socket.flush().await;
             }
-        });
-        (port, server)
+        })
     }
 
     #[tokio::test]
-    async fn waiter_behind_live_startup_authority_follows_republished_discovery_promptly() {
+    async fn supervisor_waiter_follows_staged_publication_without_stealing_authority() {
         let dir = tempfile::tempdir().unwrap();
         let launcher = try_acquire_supervisor_startup_lock_in_dir(dir.path()).unwrap();
+        let singleton = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(dir.path().join(SUPERVISOR_SINGLETON_FILE))
+            .unwrap();
+        singleton.lock_exclusive().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let no_endpoint_fast_path = wait_for_existing_supervisor_in_dir(dir.path(), None).await;
+        assert!(
+            matches!(
+                no_endpoint_fast_path,
+                ExistingSupervisor::NeedsStartupAuthority
+            ),
+            "the public fast path must join startup authority before endpoint publication: \
+             {no_endpoint_fast_path:?}"
+        );
         let waiter_dir = dir.path().to_path_buf();
         let waiter = tokio::spawn(async move {
             acquire_supervisor_startup_lock_in_dir_with_timeout(&waiter_dir, Duration::from_secs(5))
                 .await
         });
         tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            !waiter.is_finished(),
+            "a waiter with no endpoint must remain behind the original startup generation"
+        );
 
-        let (port, server) = supervisor_health_server().await;
-        write_legacy_supervisor_endpoint_files(dir.path(), std::process::id(), port);
-        let outcome = tokio::time::timeout(Duration::from_secs(1), waiter)
+        std::fs::write(
+            dir.path().join(SUPERVISOR_PID_FILE),
+            std::process::id().to_string(),
+        )
+        .unwrap();
+        let fast_path = wait_for_existing_supervisor_in_dir(dir.path(), None).await;
+        assert!(
+            matches!(fast_path, ExistingSupervisor::Starting(_)),
+            "the public fast path must join PID-only publication: {fast_path:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            !waiter.is_finished(),
+            "PID-only publication must remain behind the original startup generation"
+        );
+        let port_tmp = dir.path().join(format!("{SUPERVISOR_PORT_FILE}.tmp"));
+        std::fs::write(&port_tmp, port.to_string()).unwrap();
+        std::fs::rename(port_tmp, dir.path().join(SUPERVISOR_PORT_FILE)).unwrap();
+        let unready_fast_path = wait_for_existing_supervisor_in_dir(dir.path(), None).await;
+        assert!(
+            matches!(unready_fast_path, ExistingSupervisor::Starting(_)),
+            "the public fast path must follow a complete endpoint until health is served: \
+             {unready_fast_path:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            !waiter.is_finished(),
+            "a complete endpoint that has not served health must remain with its original owner"
+        );
+        let server = serve_supervisor_health(listener);
+        let outcome = tokio::time::timeout(Duration::from_secs(3), waiter)
             .await
             .expect("waiter must follow repaired discovery promptly")
             .expect("waiter task")
@@ -5777,6 +6177,11 @@ mod tests {
             launcher.authorizes(dir.path()),
             "following discovery must not steal startup authority"
         );
+        assert!(
+            dir.path().join(SUPERVISOR_SINGLETON_FILE).exists(),
+            "following publication must not unlink lifetime authority"
+        );
+        drop(singleton);
         server.abort();
     }
 
@@ -5877,7 +6282,7 @@ mod tests {
             wait_for_existing_supervisor_in_dir(dir.path(), Some(&current_startup_authority)).await;
 
         assert!(
-            matches!(final_decision, ExistingSupervisor::LiveNotReady(_)),
+            matches!(final_decision, ExistingSupervisor::Starting(_)),
             "the final serialized check must follow/preserve the live legacy owner and forbid a \
              second spawn: {final_decision:?}"
         );
@@ -6173,6 +6578,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn daemon_waiter_follows_no_endpoint_pid_only_and_unready_publication() {
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path().join(".kin");
+        std::fs::create_dir(&root).unwrap();
+        let singleton = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(root.join("daemon.lock"))
+            .unwrap();
+        singleton.lock_exclusive().unwrap();
+
+        // Bind the final port without serving it yet. This gives the waiter a
+        // deterministic complete-but-not-yet-serving publication slice after
+        // the preceding no-endpoint and PID-only slices.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let waiter_root = root.clone();
+        let waiter = tokio::spawn(async move {
+            wait_for_existing_daemon_within(
+                &waiter_root,
+                Duration::from_millis(20),
+                Duration::from_secs(3),
+            )
+            .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !waiter.is_finished(),
+            "a held singleton with no endpoint must be followed, not rejected"
+        );
+        std::fs::write(root.join("daemon.pid"), std::process::id().to_string()).unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !waiter.is_finished(),
+            "PID-only publication must be followed, not rejected"
+        );
+        std::fs::write(root.join("daemon.port"), port.to_string()).unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !waiter.is_finished(),
+            "a complete endpoint that has not served yet must remain owned"
+        );
+
+        let server = serve_repo_daemon_health(listener, repo.path());
+        let outcome = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("waiter must follow endpoint publication")
+            .expect("waiter task");
+        assert!(
+            matches!(
+                outcome,
+                ExistingDaemon::Connected(ref url)
+                    if url == &format!("http://127.0.0.1:{port}")
+            ),
+            "the waiter must connect to the original serialized owner: {outcome:?}"
+        );
+        assert_eq!(read_pid_file(&root), Some(std::process::id()));
+        assert_eq!(read_port_file(&root), Some(port));
+        assert!(
+            root.join("daemon.lock").exists(),
+            "following publication must not unlink lifetime authority"
+        );
+        drop(singleton);
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn live_supervisor_health_failure_preserves_lifetime_owner_and_forbids_spawn() {
         let dir = tempfile::tempdir().unwrap();
         let startup_authority = try_acquire_supervisor_startup_lock_in_dir(dir.path()).unwrap();
@@ -6194,7 +6669,7 @@ mod tests {
 
         let verdict = wait_for_existing_supervisor_in_dir(dir.path(), None).await;
         assert!(
-            matches!(verdict, ExistingSupervisor::LiveNotReady(_)),
+            matches!(verdict, ExistingSupervisor::Starting(_)),
             "a health hiccup from a live owner must forbid spawning: {verdict:?}"
         );
         assert!(dir.path().join(SUPERVISOR_PID_FILE).exists());
@@ -6218,7 +6693,7 @@ mod tests {
         let unpublished_owner =
             wait_for_existing_supervisor_in_dir(dir.path(), Some(&startup_authority)).await;
         assert!(
-            matches!(unpublished_owner, ExistingSupervisor::LiveNotReady(_)),
+            matches!(unpublished_owner, ExistingSupervisor::Starting(_)),
             "a supervisor holding its lifetime singleton before publication must still forbid a \
              second spawn: {unpublished_owner:?}"
         );
@@ -6517,6 +6992,52 @@ mod tests {
         );
         assert_eq!(read_pid_file(root), Some(4242));
         assert_eq!(read_port_file(root), Some(51001));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_startup_file_identity_uses_the_exact_open_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let first_path = dir.path().join("first.lock");
+        let second_path = dir.path().join("second.lock");
+        std::fs::write(&first_path, "").unwrap();
+        std::fs::write(&second_path, "").unwrap();
+        let first = open_startup_regular_file(&first_path, false, false, false).unwrap();
+        let first_reopened = open_startup_regular_file(&first_path, false, false, false).unwrap();
+        let second = open_startup_regular_file(&second_path, false, false, false).unwrap();
+
+        assert_eq!(
+            startup_file_identity(&first).unwrap(),
+            startup_file_identity(&first_reopened).unwrap(),
+            "two handles to the same startup authority must report one identity"
+        );
+        assert_ne!(
+            startup_file_identity(&first).unwrap(),
+            startup_file_identity(&second).unwrap(),
+            "distinct startup authority files must not alias"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_directory_handle_can_preserve_bounded_rollback_timestamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let namespace = ensure_supervisor_startup_namespace(dir.path()).unwrap();
+        assert_eq!(
+            startup_file_identity(&namespace.sentinel_file).unwrap(),
+            namespace.sentinel_identity
+        );
+        assert!(
+            namespace
+                .sentinel_file
+                .metadata()
+                .unwrap()
+                .modified()
+                .unwrap()
+                .elapsed()
+                .is_err(),
+            "the exact Windows directory handle must retain a future mtime"
+        );
     }
 
     #[cfg(windows)]

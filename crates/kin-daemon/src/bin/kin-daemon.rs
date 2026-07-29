@@ -361,6 +361,7 @@ async fn async_main() -> i32 {
                 "supervisor_startup_capabilities": [
                     "generation-adoption-ack-v2",
                     "legacy-directory-sentinel-v1",
+                    "bounded-legacy-rollback-v1",
                 ],
                 "build": {
                     "sha": build.sha,
