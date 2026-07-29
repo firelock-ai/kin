@@ -68,6 +68,10 @@ impl ActiveApiRepositoryAuthority {
             .local_repository_authority_binding()
             .map_err(repository_authority_error)?;
         let manager = binding.open_manager().map_err(repository_authority_error)?;
+        state
+            .projection_authority
+            .loads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(Self {
             manager: Arc::new(manager),
             repository_id: binding.repository_id().clone(),
@@ -214,8 +218,11 @@ struct HeldProjectionAuthority {
 }
 
 impl ProjectionAuthorityCache {
-    /// Full authority loads paid since startup. One per publication, not one
-    /// per request, is what this cache exists to make true.
+    /// Complete durable-authority loads this daemon state has paid for.
+    ///
+    /// Every [`ActiveApiRepositoryAuthority::open`] counts, whichever route
+    /// asked for it. One load per publication rather than one per request is
+    /// the property this cache exists to make true.
     pub(crate) fn loads(&self) -> u64 {
         self.loads.load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -300,11 +307,15 @@ fn projection_repository_authority(
     let authority = ActiveApiRepositoryAuthority::open(state)?;
     state
         .projection_authority
-        .loads
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    state
-        .projection_authority
         .install(published, authority.clone());
+    // Whether reuse is actually holding is not visible from request latency
+    // alone, and a count that climbs with request volume rather than with
+    // publications is the signal that it is not.
+    tracing::debug!(
+        repository = %authority.repository_id,
+        loads = state.projection_authority.loads(),
+        "projection repository authority loaded"
+    );
     Ok(authority)
 }
 
@@ -19495,6 +19506,106 @@ mod tests {
         assert_eq!(json["error"], "graph_blob_missing");
         assert_eq!(json["hash"], unowned);
         assert_eq!(json["authority"], "repository_v6");
+    }
+
+    /// Repository paths the projection currently advertises.
+    async fn advertised_workspace_paths(app: Router) -> Vec<String> {
+        let response = app
+            .oneshot(Request::get("/vfs/tree").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let snapshot: WorkspaceTreeSnapshot = serde_json::from_slice(&body).unwrap();
+        snapshot
+            .artifacts
+            .iter()
+            .filter_map(|artifact| artifact.path.as_utf8().map(str::to_string))
+            .collect()
+    }
+
+    /// Opening repository authority reads, hashes, and deserializes the entire
+    /// durable snapshot under an exclusive repository lock. Paying that per
+    /// projected read makes every read cost whole-repository work, so reads
+    /// arriving at one publication have to share a single load.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_projected_reads_share_one_authority_load() {
+        const BODY: &[u8] = b"one authority serves many projected reads\n";
+        let state = test_state();
+        install_repository_file(&state, "src/shared.rs", BODY);
+        let digest = Hash256::from_bytes(state.blobs.write(BODY).unwrap().0);
+        let url = format!("/vfs/blob/{digest}");
+        let loads_before = state.projection_authority.loads();
+
+        let app = router(Arc::clone(&state));
+        let reads: Vec<_> = (0..8)
+            .map(|_| {
+                let app = app.clone();
+                let url = url.clone();
+                tokio::spawn(async move {
+                    app.oneshot(Request::get(url).body(Body::empty()).unwrap())
+                        .await
+                        .unwrap()
+                        .status()
+                })
+            })
+            .collect();
+        for read in reads {
+            assert_eq!(read.await.unwrap(), StatusCode::OK);
+        }
+
+        assert_eq!(
+            state.projection_authority.loads() - loads_before,
+            1,
+            "eight projected reads at one publication must load repository authority once"
+        );
+    }
+
+    /// A held authority may never outlive the publication it was loaded from.
+    ///
+    /// The commit here goes through the ordinary repository write path, which
+    /// opens its own authority exactly as a CLI ingest or commit running beside
+    /// the daemon does. The next projected read has to serve what that commit
+    /// published, not the publication the previous read loaded.
+    #[tokio::test]
+    async fn projected_reads_serve_a_publication_committed_while_serving() {
+        const FIRST: &[u8] = b"first published body\n";
+        const SECOND: &[u8] = b"second published body\n";
+        let state = test_state();
+        install_repository_file(&state, "src/first.rs", FIRST);
+        let app = router(Arc::clone(&state));
+
+        let advertised = advertised_workspace_paths(app.clone()).await;
+        assert!(advertised.contains(&"src/first.rs".to_string()));
+        assert!(!advertised.contains(&"src/second.rs".to_string()));
+        assert!(
+            state.projection_authority.loads() > 0,
+            "the first projected read must have loaded repository authority"
+        );
+
+        install_repository_file(&state, "src/second.rs", SECOND);
+
+        let advertised = advertised_workspace_paths(app.clone()).await;
+        assert!(
+            advertised.contains(&"src/second.rs".to_string()),
+            "a projected read must serve the publication that replaced the one it last loaded, got {advertised:?}"
+        );
+
+        let response = app
+            .oneshot(
+                Request::get("/vfs/read/src/second.rs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), SECOND);
     }
 
     #[tokio::test]
