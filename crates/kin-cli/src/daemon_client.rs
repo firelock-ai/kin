@@ -1747,17 +1747,10 @@ pub fn repo_daemon_port_path(kin_root: &Path) -> PathBuf {
 /// these itself on graceful shutdown; `kin daemon stop` also calls this after a
 /// confirmed stop so a later `status` never reports the dead endpoint as stale.
 pub fn remove_stale_daemon_files(kin_root: &Path) {
-    let Ok(_authority) = try_acquire_daemon_endpoint_authority(kin_root) else {
-        warn!(
-            repo = %kin_root.display(),
-            "preserving daemon endpoint because lifecycle authority is contended"
-        );
-        return;
-    };
-    let pid_path = repo_daemon_pid_path(kin_root);
-    match read_pid_file(kin_root) {
+    let recorded = daemon_endpoint_snapshot(kin_root);
+    match recorded.pid {
         Some(pid) if process_liveness(pid).authorizes_cleanup() => {
-            remove_stale_daemon_files_uncoordinated(kin_root);
+            let _ = retire_daemon_endpoint_if_unchanged(kin_root, recorded);
         }
         Some(pid) => {
             warn!(
@@ -1766,8 +1759,8 @@ pub fn remove_stale_daemon_files(kin_root: &Path) {
                 "preserving daemon endpoint because its recorded owner may still be alive"
             );
         }
-        None if !pid_path.exists() => {
-            let _ = std::fs::remove_file(repo_daemon_port_path(kin_root));
+        None if !recorded.pid_exists => {
+            let _ = retire_daemon_endpoint_if_unchanged(kin_root, recorded);
         }
         None => {
             warn!(
@@ -1782,13 +1775,14 @@ pub fn remove_stale_daemon_files(kin_root: &Path) {
 /// PID owner. Used before startup and by setup hygiene; a successor publishing
 /// its complete endpoint takes the same authority and therefore survives.
 pub fn remove_orphaned_daemon_port(kin_root: &Path) -> bool {
-    let Ok(_authority) = try_acquire_daemon_endpoint_authority(kin_root) else {
-        return false;
-    };
-    if repo_daemon_pid_path(kin_root).exists() {
+    let recorded = daemon_endpoint_snapshot(kin_root);
+    if recorded.pid_exists || !recorded.port_exists {
         return false;
     }
-    std::fs::remove_file(repo_daemon_port_path(kin_root)).is_ok()
+    matches!(
+        retire_daemon_endpoint_if_unchanged(kin_root, recorded),
+        DaemonEndpointRetirement::Retired
+    )
 }
 
 fn remove_stale_daemon_files_uncoordinated(kin_root: &Path) {
@@ -1805,6 +1799,61 @@ fn try_acquire_daemon_endpoint_authority(kin_root: &Path) -> std::io::Result<Fil
         .open(kin_root.join("daemon.lifecycle"))?;
     authority.try_lock_exclusive()?;
     Ok(authority)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DaemonEndpointSnapshot {
+    pid: Option<u32>,
+    port: Option<u16>,
+    pid_exists: bool,
+    port_exists: bool,
+}
+
+fn daemon_endpoint_snapshot(kin_root: &Path) -> DaemonEndpointSnapshot {
+    let pid_path = repo_daemon_pid_path(kin_root);
+    let port_path = repo_daemon_port_path(kin_root);
+    DaemonEndpointSnapshot {
+        pid: read_pid_file(kin_root),
+        port: read_port_file(kin_root),
+        pid_exists: pid_path.exists(),
+        port_exists: port_path.exists(),
+    }
+}
+
+/// Linearized outcome of a destructive endpoint-retirement attempt.
+///
+/// Only `Retired` authorizes a caller to start a replacement. Every other
+/// variant means the record was preserved and startup must follow the current
+/// generation or fail closed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DaemonEndpointRetirement {
+    Retired,
+    Changed { current: DaemonEndpointSnapshot },
+    LifecycleContended,
+    SingletonHeld,
+    CoordinationUnavailable(String),
+}
+
+impl DaemonEndpointRetirement {
+    fn preserved_reason(&self) -> String {
+        match self {
+            Self::Retired => "endpoint was retired".to_string(),
+            Self::Changed { current } => format!(
+                "endpoint changed during retirement (pid={:?}, port={:?})",
+                current.pid, current.port
+            ),
+            Self::LifecycleContended => {
+                "daemon lifecycle coordination is held by another participant".to_string()
+            }
+            Self::SingletonHeld => {
+                "the repository daemon singleton is still held by a current or legacy owner"
+                    .to_string()
+            }
+            Self::CoordinationUnavailable(detail) => {
+                format!("daemon retirement coordination is unavailable: {detail}")
+            }
+        }
+    }
 }
 
 /// Remove endpoint files only while they still name the exact endpoint a verdict
@@ -1826,21 +1875,53 @@ fn try_acquire_daemon_endpoint_authority(kin_root: &Path) -> std::io::Result<Fil
 /// `judged_port` is `None` when the verdict was reached before a port was ever
 /// published, which is the one case where the port file is legitimately absent.
 ///
-/// Returns whether the files were removed.
+/// Returns a typed decision. Only [`DaemonEndpointRetirement::Retired`] permits
+/// a caller to start a replacement.
 fn remove_daemon_files_if_unchanged(
     kin_root: &Path,
     judged_pid: u32,
     judged_port: Option<u16>,
-) -> bool {
-    remove_daemon_files_if_unchanged_with_hook(kin_root, judged_pid, judged_port, || {})
+) -> DaemonEndpointRetirement {
+    let judged = DaemonEndpointSnapshot {
+        pid: Some(judged_pid),
+        port: judged_port,
+        pid_exists: true,
+        port_exists: judged_port.is_some(),
+    };
+    retire_daemon_endpoint_if_unchanged(kin_root, judged)
 }
 
+#[cfg(test)]
 fn remove_daemon_files_if_unchanged_with_hook<F>(
     kin_root: &Path,
     judged_pid: u32,
     judged_port: Option<u16>,
     after_comparison: F,
-) -> bool
+) -> DaemonEndpointRetirement
+where
+    F: FnOnce(),
+{
+    let judged = DaemonEndpointSnapshot {
+        pid: Some(judged_pid),
+        port: judged_port,
+        pid_exists: true,
+        port_exists: judged_port.is_some(),
+    };
+    retire_daemon_endpoint_if_unchanged_with_hook(kin_root, judged, after_comparison)
+}
+
+fn retire_daemon_endpoint_if_unchanged(
+    kin_root: &Path,
+    judged: DaemonEndpointSnapshot,
+) -> DaemonEndpointRetirement {
+    retire_daemon_endpoint_if_unchanged_with_hook(kin_root, judged, || {})
+}
+
+fn retire_daemon_endpoint_if_unchanged_with_hook<F>(
+    kin_root: &Path,
+    judged: DaemonEndpointSnapshot,
+    after_comparison: F,
+) -> DaemonEndpointRetirement
 where
     F: FnOnce(),
 {
@@ -1848,36 +1929,83 @@ where
     // same never-unlinked authority. Holding it across the final comparison
     // and both unlinks makes the judgement linearizable: a successor either
     // publishes before the comparison (and is preserved) or after retirement.
-    let Ok(_authority) = try_acquire_daemon_endpoint_authority(kin_root) else {
-        warn!(
-            judged_pid,
-            ?judged_port,
-            repo = %kin_root.display(),
-            "preserving daemon endpoint because lifecycle authority is contended"
-        );
-        return false;
+    let _authority = match try_acquire_daemon_endpoint_authority(kin_root) {
+        Ok(authority) => authority,
+        Err(error) if error.kind() == fs2::lock_contended_error().kind() => {
+            warn!(
+                ?judged,
+                repo = %kin_root.display(),
+                "preserving daemon endpoint because lifecycle authority is contended"
+            );
+            return DaemonEndpointRetirement::LifecycleContended;
+        }
+        Err(error) => {
+            warn!(
+                ?judged,
+                repo = %kin_root.display(),
+                %error,
+                "preserving daemon endpoint because lifecycle authority is unavailable"
+            );
+            return DaemonEndpointRetirement::CoordinationUnavailable(error.to_string());
+        }
     };
-    let current_pid = read_pid_file(kin_root);
-    let current_port = read_port_file(kin_root);
-    let same_owner = current_pid == Some(judged_pid);
-    // An unchanged PID that gained or changed a port is a different endpoint
-    // generation (including PID reuse) and must survive. `None` means the
-    // judged endpoint had no port, not "ignore whichever port exists now."
-    let same_endpoint = current_port == judged_port;
-    if !(same_owner && same_endpoint) {
+
+    // Open the never-unlinked singleton pathname before the comparison. A
+    // compatible legacy publisher does not take daemon.lifecycle, but it does
+    // lock this inode for its process lifetime. Trying the already-opened inode
+    // after the comparison therefore closes the mixed-version
+    // compare-then-unlink window without ever replacing daemon.lock.
+    let singleton = match OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(kin_root.join("daemon.lock"))
+    {
+        Ok(singleton) => singleton,
+        Err(error) => {
+            return DaemonEndpointRetirement::CoordinationUnavailable(error.to_string());
+        }
+    };
+
+    let current = daemon_endpoint_snapshot(kin_root);
+    if current != judged {
         warn!(
-            judged_pid,
-            ?judged_port,
-            ?current_pid,
-            ?current_port,
+            ?judged,
+            ?current,
             "endpoint files changed while this daemon was being judged; \
              leaving the successor's endpoint intact"
         );
-        return false;
+        return DaemonEndpointRetirement::Changed { current };
     }
+
     after_comparison();
+
+    match singleton.try_lock_exclusive() {
+        Ok(()) => {}
+        Err(error) if error.kind() == fs2::lock_contended_error().kind() => {
+            warn!(
+                ?judged,
+                repo = %kin_root.display(),
+                "preserving daemon endpoint because the daemon singleton is held"
+            );
+            return DaemonEndpointRetirement::SingletonHeld;
+        }
+        Err(error) => {
+            return DaemonEndpointRetirement::CoordinationUnavailable(error.to_string());
+        }
+    }
+
+    // A legacy publisher may have completed and released its singleton between
+    // the first comparison and our nonblocking lock. Revalidate under both
+    // authorities so even that short-lived generation is preserved.
+    let current = daemon_endpoint_snapshot(kin_root);
+    if current != judged {
+        return DaemonEndpointRetirement::Changed { current };
+    }
+
     remove_stale_daemon_files_uncoordinated(kin_root);
-    true
+    DaemonEndpointRetirement::Retired
 }
 
 fn supervisor_dir() -> PathBuf {
@@ -1887,21 +2015,177 @@ fn supervisor_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".kin"))
 }
 
+const SUPERVISOR_PID_FILE: &str = "supervisor.pid";
+const SUPERVISOR_PORT_FILE: &str = "supervisor.port";
+const SUPERVISOR_LIFECYCLE_FILE: &str = "supervisor.lifecycle";
+const SUPERVISOR_SINGLETON_FILE: &str = "supervisor.lock";
+
 /// Path to the per-user supervisor pid file (under the Kin registry directory).
 pub fn supervisor_pid_path() -> PathBuf {
-    supervisor_dir().join("supervisor.pid")
+    supervisor_dir().join(SUPERVISOR_PID_FILE)
 }
 
 /// Path to the per-user supervisor port file (under the Kin registry directory).
 pub fn supervisor_port_path() -> PathBuf {
-    supervisor_dir().join("supervisor.port")
+    supervisor_dir().join(SUPERVISOR_PORT_FILE)
 }
 
 /// Remove the supervisor's pid/port endpoint files. Called after a confirmed
 /// supervisor stop so a later `status` never reports the dead endpoint as stale.
 pub fn remove_stale_supervisor_files() {
-    let _ = std::fs::remove_file(supervisor_pid_path());
-    let _ = std::fs::remove_file(supervisor_port_path());
+    let dir = supervisor_dir();
+    let recorded = supervisor_endpoint_snapshot(&dir);
+    match recorded.pid {
+        Some(pid) if process_liveness(pid).authorizes_cleanup() => {
+            let _ = retire_supervisor_endpoint_if_unchanged(&dir, recorded);
+        }
+        Some(_) => {
+            warn!(
+                ?recorded,
+                "preserving supervisor endpoint because its owner is live or indeterminate"
+            );
+        }
+        None if recorded.pid_exists => {
+            warn!(
+                ?recorded,
+                "preserving supervisor endpoint because its owner is live or indeterminate"
+            );
+        }
+        None => {
+            let _ = retire_supervisor_endpoint_if_unchanged(&dir, recorded);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SupervisorEndpointSnapshot {
+    pid: Option<u32>,
+    port: Option<u16>,
+    pid_exists: bool,
+    port_exists: bool,
+}
+
+fn supervisor_endpoint_snapshot(dir: &Path) -> SupervisorEndpointSnapshot {
+    let pid_path = dir.join(SUPERVISOR_PID_FILE);
+    let port_path = dir.join(SUPERVISOR_PORT_FILE);
+    SupervisorEndpointSnapshot {
+        pid: std::fs::read_to_string(&pid_path)
+            .ok()
+            .and_then(|value| value.trim().parse().ok()),
+        port: std::fs::read_to_string(&port_path)
+            .ok()
+            .and_then(|value| value.trim().parse().ok()),
+        pid_exists: pid_path.exists(),
+        port_exists: port_path.exists(),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SupervisorEndpointRetirement {
+    Retired,
+    Changed { current: SupervisorEndpointSnapshot },
+    LifecycleContended,
+    SingletonHeld,
+    CoordinationUnavailable(String),
+}
+
+impl SupervisorEndpointRetirement {
+    fn preserved_reason(&self) -> String {
+        match self {
+            Self::Retired => "endpoint was retired".to_string(),
+            Self::Changed { current } => format!(
+                "endpoint changed during retirement (pid={:?}, port={:?})",
+                current.pid, current.port
+            ),
+            Self::LifecycleContended => {
+                "supervisor lifecycle coordination is held by another participant".to_string()
+            }
+            Self::SingletonHeld => {
+                "the supervisor process-lifetime singleton is still held".to_string()
+            }
+            Self::CoordinationUnavailable(detail) => {
+                format!("supervisor retirement coordination is unavailable: {detail}")
+            }
+        }
+    }
+}
+
+fn retire_supervisor_endpoint_if_unchanged(
+    dir: &Path,
+    judged: SupervisorEndpointSnapshot,
+) -> SupervisorEndpointRetirement {
+    retire_supervisor_endpoint_if_unchanged_with_hook(dir, judged, || {})
+}
+
+fn retire_supervisor_endpoint_if_unchanged_with_hook<F>(
+    dir: &Path,
+    judged: SupervisorEndpointSnapshot,
+    after_comparison: F,
+) -> SupervisorEndpointRetirement
+where
+    F: FnOnce(),
+{
+    if let Err(error) = std::fs::create_dir_all(dir) {
+        return SupervisorEndpointRetirement::CoordinationUnavailable(error.to_string());
+    }
+    let lifecycle = match OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(dir.join(SUPERVISOR_LIFECYCLE_FILE))
+    {
+        Ok(lifecycle) => lifecycle,
+        Err(error) => {
+            return SupervisorEndpointRetirement::CoordinationUnavailable(error.to_string());
+        }
+    };
+    match lifecycle.try_lock_exclusive() {
+        Ok(()) => {}
+        Err(error) if error.kind() == fs2::lock_contended_error().kind() => {
+            return SupervisorEndpointRetirement::LifecycleContended;
+        }
+        Err(error) => {
+            return SupervisorEndpointRetirement::CoordinationUnavailable(error.to_string());
+        }
+    }
+
+    // The lifetime inode is opened before the comparison for the same reason as
+    // daemon.lock: current publishers hold it continuously, while a
+    // non-participating legacy endpoint is still protected by its live PID.
+    let singleton = match OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(dir.join(SUPERVISOR_SINGLETON_FILE))
+    {
+        Ok(singleton) => singleton,
+        Err(error) => {
+            return SupervisorEndpointRetirement::CoordinationUnavailable(error.to_string());
+        }
+    };
+    let current = supervisor_endpoint_snapshot(dir);
+    if current != judged {
+        return SupervisorEndpointRetirement::Changed { current };
+    }
+    after_comparison();
+    match singleton.try_lock_exclusive() {
+        Ok(()) => {}
+        Err(error) if error.kind() == fs2::lock_contended_error().kind() => {
+            return SupervisorEndpointRetirement::SingletonHeld;
+        }
+        Err(error) => {
+            return SupervisorEndpointRetirement::CoordinationUnavailable(error.to_string());
+        }
+    }
+    let current = supervisor_endpoint_snapshot(dir);
+    if current != judged {
+        return SupervisorEndpointRetirement::Changed { current };
+    }
+    let _ = std::fs::remove_file(dir.join(SUPERVISOR_PID_FILE));
+    let _ = std::fs::remove_file(dir.join(SUPERVISOR_PORT_FILE));
+    SupervisorEndpointRetirement::Retired
 }
 
 fn read_pid_file(kin_root: &Path) -> Option<u32> {
@@ -1928,13 +2212,8 @@ pub fn repo_daemon_recorded_endpoint(kin_root: &Path) -> (Option<u32>, Option<u1
 /// `supervisor.{pid,port}` files with no liveness probe. Either component is
 /// `None` when its file is absent or unparseable.
 pub fn supervisor_recorded_endpoint() -> (Option<u32>, Option<u16>) {
-    let pid = std::fs::read_to_string(supervisor_pid_path())
-        .ok()
-        .and_then(|s| s.trim().parse().ok());
-    let port = std::fs::read_to_string(supervisor_port_path())
-        .ok()
-        .and_then(|s| s.trim().parse().ok());
-    (pid, port)
+    let recorded = supervisor_endpoint_snapshot(&supervisor_dir());
+    (recorded.pid, recorded.port)
 }
 
 fn live_daemon_endpoint(kin_root: &Path) -> Option<LiveDaemonEndpoint> {
@@ -1945,39 +2224,44 @@ fn live_daemon_endpoint_with_probe(
     kin_root: &Path,
     probe: impl FnOnce(u32) -> ProcessLiveness,
 ) -> Option<LiveDaemonEndpoint> {
-    let pid = read_pid_file(kin_root)?;
+    let recorded = daemon_endpoint_snapshot(kin_root);
+    let pid = recorded.pid?;
     // Capture both components before forming the liveness verdict. Reading the
     // port afterward could bind a true "dead" result about the predecessor PID
     // to a same-PID successor's newly published port, making the final
     // compare-and-retire accept the wrong endpoint generation.
-    let port = read_port_file(kin_root);
+    let port = recorded.port;
     if probe(pid).authorizes_cleanup() {
         // Compare-and-delete even here, where the window is only as wide as this
         // function: a successor that republished between the read and the
         // liveness check would otherwise lose its endpoint to a true statement
         // about its predecessor.
-        remove_daemon_files_if_unchanged(kin_root, pid, port);
-        return None;
+        match retire_daemon_endpoint_if_unchanged(kin_root, recorded) {
+            DaemonEndpointRetirement::Retired => return None,
+            DaemonEndpointRetirement::Changed { current } => {
+                return Some(LiveDaemonEndpoint {
+                    pid: current.pid?,
+                    port: current.port?,
+                });
+            }
+            DaemonEndpointRetirement::LifecycleContended
+            | DaemonEndpointRetirement::SingletonHeld
+            | DaemonEndpointRetirement::CoordinationUnavailable(_) => {}
+        }
     }
     let port = port?;
     Some(LiveDaemonEndpoint { pid, port })
 }
 
 fn live_supervisor_endpoint() -> Option<LiveDaemonEndpoint> {
-    let pid = std::fs::read_to_string(supervisor_pid_path())
-        .ok()?
-        .trim()
-        .parse()
-        .ok()?;
-    if !is_process_alive(pid) {
-        remove_stale_supervisor_files();
+    let dir = supervisor_dir();
+    let recorded = supervisor_endpoint_snapshot(&dir);
+    let pid = recorded.pid?;
+    if process_liveness(pid).authorizes_cleanup() {
+        let _ = retire_supervisor_endpoint_if_unchanged(&dir, recorded);
         return None;
     }
-    let port = std::fs::read_to_string(supervisor_port_path())
-        .ok()?
-        .trim()
-        .parse()
-        .ok()?;
+    let port = recorded.port?;
     Some(LiveDaemonEndpoint { pid, port })
 }
 
@@ -2573,6 +2857,16 @@ async fn probe_daemon_endpoint(
     endpoint: LiveDaemonEndpoint,
     timeout: Duration,
 ) -> EndpointVerdict {
+    let warming = std::sync::Arc::new(AtomicBool::new(false));
+    probe_daemon_endpoint_with_warming_signal(kin_root, endpoint, timeout, warming).await
+}
+
+async fn probe_daemon_endpoint_with_warming_signal(
+    kin_root: &Path,
+    endpoint: LiveDaemonEndpoint,
+    timeout: Duration,
+    warming_signal: std::sync::Arc<AtomicBool>,
+) -> EndpointVerdict {
     let Some(working_dir) = kin_root.parent() else {
         return EndpointVerdict::Invalid("invalid .kin layout: no parent".to_string());
     };
@@ -2597,6 +2891,7 @@ async fn probe_daemon_endpoint(
                 // exactly when retaining "warming" makes the diagnostic honest.
                 if let Ok(readiness) = resp.json::<ReadinessResponse>().await {
                     warming = readiness.warming;
+                    warming_signal.store(warming, Ordering::Relaxed);
                 }
                 match probe_health_for_repo(&client, &base_url, kin_root, working_dir).await {
                     HealthProbe::Matches => return EndpointVerdict::Serving(base_url),
@@ -2617,6 +2912,7 @@ async fn probe_daemon_endpoint(
                 match resp.json::<ReadinessResponse>().await {
                     Ok(readiness) => {
                         warming = readiness.warming;
+                        warming_signal.store(warming, Ordering::Relaxed);
                         format!(
                             "readiness returned HTTP {status} (ready={}, warming={})",
                             readiness.ready, readiness.warming
@@ -2801,16 +3097,60 @@ async fn wait_for_existing_daemon_within(
     short: Duration,
     patience: Duration,
 ) -> ExistingDaemon {
-    let Some(existing) = live_daemon_endpoint(kin_root) else {
-        return ExistingDaemon::None;
+    let deadline = Instant::now() + patience;
+    let recorded = daemon_endpoint_snapshot(kin_root);
+    let Some(pid) = recorded.pid else {
+        if recorded.pid_exists {
+            return ExistingDaemon::LiveNotReady(
+                "the recorded daemon PID is unparseable; refusing to replace an owner whose \
+                 liveness cannot be established"
+                    .to_string(),
+            );
+        }
+        if !recorded.port_exists {
+            let retirement = retire_daemon_endpoint_if_unchanged(kin_root, recorded);
+            return match retirement {
+                DaemonEndpointRetirement::Retired => ExistingDaemon::None,
+                preserved => {
+                    follow_preserved_daemon_endpoint(kin_root, deadline, patience, preserved).await
+                }
+            };
+        }
+        let retirement = retire_daemon_endpoint_if_unchanged(kin_root, recorded);
+        return match retirement {
+            DaemonEndpointRetirement::Retired => ExistingDaemon::None,
+            preserved => {
+                follow_preserved_daemon_endpoint(kin_root, deadline, patience, preserved).await
+            }
+        };
     };
 
-    let mut verdict = probe_daemon_endpoint(kin_root, existing, short).await;
+    if process_liveness(pid).authorizes_cleanup() {
+        let retirement = retire_daemon_endpoint_if_unchanged(kin_root, recorded);
+        return match retirement {
+            DaemonEndpointRetirement::Retired => ExistingDaemon::None,
+            preserved => {
+                follow_preserved_daemon_endpoint(kin_root, deadline, patience, preserved).await
+            }
+        };
+    }
+
+    let Some(port) = recorded.port else {
+        return ExistingDaemon::LiveNotReady(format!(
+            "kin daemon pid {pid} may still own this repo, but its port record is absent or \
+             unparseable; refusing to start a second daemon"
+        ));
+    };
+    let existing = LiveDaemonEndpoint { pid, port };
+
+    let short_deadline = (Instant::now() + short).min(deadline);
+    let mut verdict = probe_daemon_endpoint_until(kin_root, existing, short_deadline, false).await;
 
     if let EndpointVerdict::LiveNotReady {
         pid, port, warming, ..
     } = &verdict
     {
+        let last_warming = *warming;
         warn!(
             pid = *pid,
             port = *port,
@@ -2819,7 +3159,7 @@ async fn wait_for_existing_daemon_within(
             "daemon for this repo is alive but not ready yet; waiting rather than \
              replacing a running daemon"
         );
-        verdict = probe_daemon_endpoint(kin_root, existing, patience.saturating_sub(short)).await;
+        verdict = probe_daemon_endpoint_until(kin_root, existing, deadline, last_warming).await;
     }
 
     match verdict {
@@ -2841,8 +3181,14 @@ async fn wait_for_existing_daemon_within(
             // The verdict is true about the endpoint that was probed, which may
             // no longer be the endpoint on disk — the probe deliberately runs
             // long enough for a successor to take over.
-            remove_daemon_files_if_unchanged(kin_root, existing.pid, Some(existing.port));
-            ExistingDaemon::None
+            let retirement =
+                remove_daemon_files_if_unchanged(kin_root, existing.pid, Some(existing.port));
+            match retirement {
+                DaemonEndpointRetirement::Retired => ExistingDaemon::None,
+                preserved => {
+                    follow_preserved_daemon_endpoint(kin_root, deadline, patience, preserved).await
+                }
+            }
         }
         EndpointVerdict::LiveNotReady {
             pid,
@@ -2855,6 +3201,77 @@ async fn wait_for_existing_daemon_within(
             &detail,
             warming,
             patience.as_secs(),
+        )),
+    }
+}
+
+async fn probe_daemon_endpoint_until(
+    kin_root: &Path,
+    endpoint: LiveDaemonEndpoint,
+    deadline: Instant,
+    last_warming: bool,
+) -> EndpointVerdict {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return EndpointVerdict::LiveNotReady {
+            pid: endpoint.pid,
+            port: endpoint.port,
+            detail: "the caller's daemon readiness deadline elapsed".to_string(),
+            warming: last_warming,
+        };
+    }
+    let warming_signal = std::sync::Arc::new(AtomicBool::new(last_warming));
+    match tokio::time::timeout(
+        remaining,
+        probe_daemon_endpoint_with_warming_signal(
+            kin_root,
+            endpoint,
+            remaining,
+            std::sync::Arc::clone(&warming_signal),
+        ),
+    )
+    .await
+    {
+        Ok(verdict) => verdict,
+        Err(_) => EndpointVerdict::LiveNotReady {
+            pid: endpoint.pid,
+            port: endpoint.port,
+            detail: "the caller's daemon readiness deadline elapsed".to_string(),
+            warming: warming_signal.load(Ordering::Relaxed),
+        },
+    }
+}
+
+async fn follow_preserved_daemon_endpoint(
+    kin_root: &Path,
+    deadline: Instant,
+    patience: Duration,
+    retirement: DaemonEndpointRetirement,
+) -> ExistingDaemon {
+    debug_assert!(!matches!(retirement, DaemonEndpointRetirement::Retired));
+    let reason = retirement.preserved_reason();
+    let current = daemon_endpoint_snapshot(kin_root);
+    let (Some(pid), Some(port)) = (current.pid, current.port) else {
+        return ExistingDaemon::LiveNotReady(format!(
+            "daemon endpoint retirement was refused because {reason}; the current endpoint is \
+             incomplete or indeterminate, so kin will not start a replacement"
+        ));
+    };
+    let endpoint = LiveDaemonEndpoint { pid, port };
+    match probe_daemon_endpoint_until(kin_root, endpoint, deadline, false).await {
+        EndpointVerdict::Serving(base_url) => ExistingDaemon::Connected(base_url),
+        EndpointVerdict::LiveNotReady {
+            pid,
+            port,
+            detail,
+            warming,
+        } => ExistingDaemon::LiveNotReady(format!(
+            "{} Retirement was refused because {reason}.",
+            live_daemon_not_ready_message(pid, port, &detail, warming, patience.as_secs(),)
+        )),
+        EndpointVerdict::Invalid(detail) => ExistingDaemon::LiveNotReady(format!(
+            "daemon endpoint retirement was refused because {reason}; the preserved endpoint \
+             (pid {pid}, port {port}) is not usable: {detail}. Kin will not start a second daemon"
         )),
     }
 }
@@ -2909,19 +3326,80 @@ async fn validate_supervisor_endpoint(endpoint: LiveDaemonEndpoint) -> Result<St
     Ok(base_url)
 }
 
-async fn wait_for_existing_supervisor() -> Option<String> {
-    let existing = live_supervisor_endpoint()?;
+#[derive(Debug)]
+enum ExistingSupervisor {
+    Connected(String),
+    None,
+    LiveNotReady(String),
+}
+
+async fn wait_for_existing_supervisor() -> ExistingSupervisor {
+    wait_for_existing_supervisor_in_dir(&supervisor_dir()).await
+}
+
+async fn wait_for_existing_supervisor_in_dir(dir: &Path) -> ExistingSupervisor {
+    let recorded = supervisor_endpoint_snapshot(dir);
+    let Some(pid) = recorded.pid else {
+        if recorded.pid_exists {
+            return ExistingSupervisor::LiveNotReady(
+                "the supervisor PID record is unparseable; refusing to replace an owner whose \
+                 liveness cannot be established"
+                    .to_string(),
+            );
+        }
+        if !recorded.port_exists {
+            return match retire_supervisor_endpoint_if_unchanged(dir, recorded) {
+                SupervisorEndpointRetirement::Retired => ExistingSupervisor::None,
+                preserved => ExistingSupervisor::LiveNotReady(format!(
+                    "supervisor startup authority is unavailable because {}; kin will not start \
+                     a replacement",
+                    preserved.preserved_reason()
+                )),
+            };
+        }
+        return match retire_supervisor_endpoint_if_unchanged(dir, recorded) {
+            SupervisorEndpointRetirement::Retired => ExistingSupervisor::None,
+            preserved => ExistingSupervisor::LiveNotReady(format!(
+                "supervisor endpoint retirement was refused because {}; kin will not start a \
+                 replacement",
+                preserved.preserved_reason()
+            )),
+        };
+    };
+
+    if process_liveness(pid).authorizes_cleanup() {
+        return match retire_supervisor_endpoint_if_unchanged(dir, recorded) {
+            SupervisorEndpointRetirement::Retired => ExistingSupervisor::None,
+            preserved => ExistingSupervisor::LiveNotReady(format!(
+                "supervisor endpoint retirement was refused because {}; kin will not start a \
+                 replacement",
+                preserved.preserved_reason()
+            )),
+        };
+    }
+
+    let Some(port) = recorded.port else {
+        return ExistingSupervisor::LiveNotReady(format!(
+            "kin supervisor pid {pid} may still own the per-user control plane, but its port \
+             record is absent or unparseable; refusing to start a second supervisor"
+        ));
+    };
+    let existing = LiveDaemonEndpoint { pid, port };
     match validate_supervisor_endpoint(existing).await {
-        Ok(base_url) => Some(base_url),
+        Ok(base_url) => ExistingSupervisor::Connected(base_url),
         Err(err) => {
             warn!(
                 pid = existing.pid,
                 port = existing.port,
                 error = %err,
-                "invalid supervisor endpoint; clearing stale endpoint files"
+                "supervisor owner is live or indeterminate but health is unavailable; \
+                 preserving endpoint and refusing replacement"
             );
-            remove_stale_supervisor_files();
-            None
+            ExistingSupervisor::LiveNotReady(format!(
+                "kin supervisor (pid {}, port {}) may still own the per-user control plane but \
+                 did not pass health: {err}. Kin will not replace a live or indeterminate owner",
+                existing.pid, existing.port
+            ))
         }
     }
 }
@@ -2994,21 +3472,26 @@ pub async fn ensure_supervisor_running() -> Result<String> {
         .map(|_| url);
     }
 
-    if let Some(base_url) = wait_for_existing_supervisor().await {
-        return Ok(base_url);
+    match wait_for_existing_supervisor().await {
+        ExistingSupervisor::Connected(base_url) => return Ok(base_url),
+        ExistingSupervisor::LiveNotReady(message) => bail!(message),
+        ExistingSupervisor::None => {}
     }
 
     let _startup_lock = acquire_supervisor_startup_lock().await?;
-    if let Some(base_url) = wait_for_existing_supervisor().await {
-        return Ok(base_url);
+    match wait_for_existing_supervisor().await {
+        ExistingSupervisor::Connected(base_url) => return Ok(base_url),
+        ExistingSupervisor::LiveNotReady(message) => bail!(message),
+        ExistingSupervisor::None => {}
     }
 
     let daemon_bin = find_daemon_binary()?;
     // The supervisor binds :0 and reports its real bound port via its endpoint
     // files; passing 0 (rather than a reserved port) removes the same
-    // reserve-release-rebind race the repo-daemon path had. Clear stale endpoint
-    // files so wait_for_supervisor_ready reads only this spawn's port.
-    remove_stale_supervisor_files();
+    // reserve-release-rebind race the repo-daemon path had. The prior
+    // ExistingSupervisor::None decision is the only spawn authorization; stale
+    // endpoint retirement has already completed under lifecycle + singleton
+    // authority, so this path never performs an unconditional unlink.
     info!(binary = %daemon_bin.display(), "starting supervisor (OS-assigned port)");
 
     let mut cmd = std::process::Command::new(&daemon_bin);
@@ -3872,6 +4355,11 @@ mod tests {
                 .await;
         handover.await.expect("handover task");
 
+        assert!(
+            matches!(verdict, ExistingDaemon::LiveNotReady(_)),
+            "a changed successor must forbid replacement even when it has not served yet: \
+             {verdict:?}"
+        );
         assert_eq!(
             read_pid_file(&root),
             Some(std::process::id()),
@@ -3891,23 +4379,35 @@ mod tests {
 
         // Same owner, same port: the judgement still describes what is on disk.
         write_endpoint_files(root, 4242, 51000);
-        assert!(remove_daemon_files_if_unchanged(root, 4242, Some(51000)));
+        assert_eq!(
+            remove_daemon_files_if_unchanged(root, 4242, Some(51000)),
+            DaemonEndpointRetirement::Retired
+        );
         assert!(!root.join("daemon.pid").exists());
 
         // A different owner republished.
         write_endpoint_files(root, 4243, 51000);
-        assert!(!remove_daemon_files_if_unchanged(root, 4242, Some(51000)));
+        assert!(matches!(
+            remove_daemon_files_if_unchanged(root, 4242, Some(51000)),
+            DaemonEndpointRetirement::Changed { .. }
+        ));
         assert!(root.join("daemon.pid").exists());
 
         // Same owner, but it rebound to a different port, so the endpoint the
         // verdict describes no longer exists either.
         write_endpoint_files(root, 4242, 51001);
-        assert!(!remove_daemon_files_if_unchanged(root, 4242, Some(51000)));
+        assert!(matches!(
+            remove_daemon_files_if_unchanged(root, 4242, Some(51000)),
+            DaemonEndpointRetirement::Changed { .. }
+        ));
         assert!(root.join("daemon.port").exists());
 
         // A judgement formed before any port existed must not match a
         // same-PID endpoint that has since published one.
-        assert!(!remove_daemon_files_if_unchanged(root, 4242, None));
+        assert!(matches!(
+            remove_daemon_files_if_unchanged(root, 4242, None),
+            DaemonEndpointRetirement::Changed { .. }
+        ));
         assert!(root.join("daemon.port").exists());
     }
 
@@ -3968,21 +4468,176 @@ mod tests {
             drop(authority);
         });
 
-        assert!(remove_daemon_files_if_unchanged_with_hook(
-            &root,
-            4242,
-            Some(51000),
-            || {
+        assert_eq!(
+            remove_daemon_files_if_unchanged_with_hook(&root, 4242, Some(51000), || {
                 comparison_tx.send(()).unwrap();
                 publication_started_rx
                     .recv_timeout(Duration::from_secs(5))
                     .expect("successor must attempt publication after comparison");
-            }
-        ));
+            }),
+            DaemonEndpointRetirement::Retired
+        );
         successor.join().expect("successor publisher");
 
         assert_eq!(read_pid_file(&root), Some(4243));
         assert_eq!(read_port_file(&root), Some(51001));
+    }
+
+    #[test]
+    fn legacy_singleton_publisher_after_comparison_is_preserved() {
+        use std::sync::mpsc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        write_endpoint_files(&root, 4242, 51000);
+
+        let (comparison_tx, comparison_rx) = mpsc::channel();
+        let (published_tx, published_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let legacy_root = root.clone();
+        let legacy = std::thread::spawn(move || {
+            comparison_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("retirement must reach its endpoint comparison");
+            let singleton = OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(false)
+                .open(legacy_root.join("daemon.lock"))
+                .unwrap();
+            singleton.lock_exclusive().unwrap();
+            // Model a compatible old publisher: it owns daemon.lock and writes
+            // endpoint files without participating in daemon.lifecycle.
+            write_endpoint_files(&legacy_root, 4243, 51001);
+            published_tx.send(()).unwrap();
+            release_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("test must retain the legacy lifetime lock");
+        });
+
+        let decision = remove_daemon_files_if_unchanged_with_hook(&root, 4242, Some(51000), || {
+            comparison_tx.send(()).unwrap();
+            published_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("legacy publisher must acquire and publish");
+        });
+
+        assert_eq!(decision, DaemonEndpointRetirement::SingletonHeld);
+        assert_eq!(read_pid_file(&root), Some(4243));
+        assert_eq!(read_port_file(&root), Some(51001));
+        assert!(
+            root.join("daemon.lock").exists(),
+            "endpoint retirement must never unlink the singleton pathname"
+        );
+
+        release_tx.send(()).unwrap();
+        legacy.join().expect("legacy publisher");
+    }
+
+    #[tokio::test]
+    async fn contended_retirement_never_becomes_start_authorization() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_endpoint_files(root, 999_999_999, closed_loopback_port());
+        let lifecycle = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(root.join("daemon.lifecycle"))
+            .unwrap();
+        lifecycle.lock_exclusive().unwrap();
+
+        let verdict = wait_for_existing_daemon_within(
+            root,
+            Duration::from_millis(20),
+            Duration::from_millis(50),
+        )
+        .await;
+
+        assert!(
+            matches!(verdict, ExistingDaemon::LiveNotReady(_)),
+            "coordination contention must fail closed rather than authorize a spawn: {verdict:?}"
+        );
+        assert!(root.join("daemon.pid").exists());
+        assert!(root.join("daemon.port").exists());
+    }
+
+    #[tokio::test]
+    async fn unpublished_daemon_singleton_owner_forbids_spawn() {
+        let dir = tempfile::tempdir().unwrap();
+        let singleton = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(dir.path().join("daemon.lock"))
+            .unwrap();
+        singleton.lock_exclusive().unwrap();
+
+        let verdict = wait_for_existing_daemon_within(
+            dir.path(),
+            Duration::from_millis(20),
+            Duration::from_millis(50),
+        )
+        .await;
+
+        assert!(
+            matches!(verdict, ExistingDaemon::LiveNotReady(_)),
+            "a process-lifetime singleton owner must forbid a loser spawn even before endpoint \
+             publication: {verdict:?}"
+        );
+        assert!(dir.path().join("daemon.lock").exists());
+    }
+
+    #[tokio::test]
+    async fn live_supervisor_health_failure_preserves_lifetime_owner_and_forbids_spawn() {
+        let dir = tempfile::tempdir().unwrap();
+        let singleton = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(dir.path().join(SUPERVISOR_SINGLETON_FILE))
+            .unwrap();
+        singleton.lock_exclusive().unwrap();
+        let port = closed_loopback_port();
+        std::fs::write(
+            dir.path().join(SUPERVISOR_PID_FILE),
+            std::process::id().to_string(),
+        )
+        .unwrap();
+        std::fs::write(dir.path().join(SUPERVISOR_PORT_FILE), port.to_string()).unwrap();
+
+        let verdict = wait_for_existing_supervisor_in_dir(dir.path()).await;
+        assert!(
+            matches!(verdict, ExistingSupervisor::LiveNotReady(_)),
+            "a health hiccup from a live owner must forbid spawning: {verdict:?}"
+        );
+        assert!(dir.path().join(SUPERVISOR_PID_FILE).exists());
+        assert!(dir.path().join(SUPERVISOR_PORT_FILE).exists());
+        assert_eq!(
+            retire_supervisor_endpoint_if_unchanged(
+                dir.path(),
+                supervisor_endpoint_snapshot(dir.path())
+            ),
+            SupervisorEndpointRetirement::SingletonHeld,
+            "the process-lifetime singleton must independently prevent retirement"
+        );
+        assert!(
+            dir.path().join(SUPERVISOR_SINGLETON_FILE).exists(),
+            "the supervisor singleton pathname is never unlinked"
+        );
+
+        std::fs::remove_file(dir.path().join(SUPERVISOR_PID_FILE)).unwrap();
+        std::fs::remove_file(dir.path().join(SUPERVISOR_PORT_FILE)).unwrap();
+        let unpublished_owner = wait_for_existing_supervisor_in_dir(dir.path()).await;
+        assert!(
+            matches!(unpublished_owner, ExistingSupervisor::LiveNotReady(_)),
+            "a supervisor holding its lifetime singleton before publication must still forbid a \
+             second spawn: {unpublished_owner:?}"
+        );
     }
 
     #[tokio::test]
@@ -4268,7 +4923,14 @@ mod tests {
             ProcessLiveness::Dead
         });
 
-        assert_eq!(endpoint, None);
+        assert_eq!(
+            endpoint,
+            Some(LiveDaemonEndpoint {
+                pid: 4242,
+                port: 51001,
+            }),
+            "a changed generation must be returned for follow-up, never collapsed into absence"
+        );
         assert_eq!(read_pid_file(root), Some(4242));
         assert_eq!(read_port_file(root), Some(51001));
     }
