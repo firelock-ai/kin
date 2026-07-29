@@ -325,14 +325,14 @@ jobs:
     outputs:
       docs_only: ${{ steps.classify.outputs.docs_only }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
       - name: Classify changed paths
         id: classify
         # This step gates release-critical jobs. Override workflow defaults and
         # shell startup injection rather than inheriting mutable semantics.
-        shell: /usr/bin/bash --noprofile --norc -e -u -o pipefail {0}
+        shell: /usr/bin/bash --noprofile --norc -p -e -u -o pipefail {0}
         env:
           BASH_ENV: ""
           EVENT_NAME: ${{ github.event_name }}

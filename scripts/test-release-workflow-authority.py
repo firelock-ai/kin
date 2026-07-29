@@ -69,12 +69,12 @@ DOCS_ONLY_CLASSIFIER_JOB = textwrap.dedent(
       outputs:
         docs_only: ${{ steps.classify.outputs.docs_only }}
       steps:
-        - uses: actions/checkout@v7
+        - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
           with:
             fetch-depth: 0
         - name: Classify changed paths
           id: classify
-          shell: /usr/bin/bash --noprofile --norc -e -u -o pipefail {0}
+          shell: /usr/bin/bash --noprofile --norc -p -e -u -o pipefail {0}
           env:
             BASH_ENV: ""
             EVENT_NAME: ${{ github.event_name }}
@@ -101,6 +101,49 @@ DOCS_ONLY_CLASSIFIER_JOB = textwrap.dedent(
             echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"
     """
 ).rstrip()
+DOCS_ONLY_CHECK_JOB = textwrap.dedent(
+    """\
+    check-docs-only:
+      name: Check & Test
+      needs: changes
+      if: ${{ !cancelled() && needs.changes.outputs.docs_only == 'true' }}
+      runs-on: ubuntu-latest
+      strategy:
+        matrix:
+          os: [ubuntu-latest, macos-latest]
+      steps:
+        - name: Report the documentation-only fast path
+          run: echo "documentation-only diff; build and test validation not applicable"
+    """
+).rstrip()
+REAL_CHECK_JOB_AUTHORITY = textwrap.dedent(
+    """\
+    check:
+      name: Check & Test
+      needs: changes
+      if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
+      runs-on: ${{ matrix.os }}
+      timeout-minutes: 60
+      env:
+        CARGO_INCREMENTAL: "0"
+        CARGO_PROFILE_DEV_DEBUG: "0"
+        CARGO_PROFILE_TEST_DEBUG: "0"
+      strategy:
+        matrix:
+          os: [ubuntu-latest, macos-latest]
+      steps:
+    """
+).rstrip()
+CI_JOB_DISPLAY_NAMES = {
+    "dco": "DCO Sign-off",
+    "npm-launchers": "npm launcher tests",
+    "windows-authority-tests": "Windows authority tests",
+    "windows-installer": "Windows installer + vector-free release build",
+    "changes": "Classify diff scope",
+    "check-docs-only": "Check & Test",
+    "check": "Check & Test",
+    "coverage": "Code Coverage",
+}
 
 
 def require(content: str, needle: str, context: str) -> None:
@@ -190,11 +233,93 @@ def assert_docs_only_classifier_guard(classifier: str) -> None:
         raise AssertionError("diff classifier shell extraction disagrees with its job")
 
 
+def workflow_job_blocks(workflow: str) -> dict[str, str]:
+    """Return every job block from a workflow, preserving declaration order."""
+
+    marker = "jobs:\n"
+    if workflow.count(marker) != 1:
+        raise AssertionError("workflow must contain exactly one jobs mapping")
+    jobs = workflow.split(marker, 1)[1]
+    matches = list(
+        re.finditer(r"^  (?P<job>[A-Za-z0-9_-]+):[ \t]*$", jobs, re.MULTILINE)
+    )
+    blocks: dict[str, str] = {}
+    for index, match in enumerate(matches):
+        job = match.group("job")
+        if job in blocks:
+            raise AssertionError(f"workflow declares duplicate job id: {job}")
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(jobs)
+        blocks[job] = jobs[match.start():end].rstrip()
+    return blocks
+
+
+def job_display_name(job: str) -> str:
+    """Return the exact one-line display name for a job block."""
+
+    active_lines = classifier_active_job_source(job).splitlines()
+    names = [
+        line.removeprefix("  name:").strip()
+        for line in active_lines[1:]
+        if line.startswith("  name:")
+    ]
+    if len(names) != 1:
+        raise AssertionError("every CI job must carry exactly one one-line display name")
+    return names[0]
+
+
+def real_check_job_authority_source(job: str) -> str:
+    """Return the real check job's admission fields and top-level controls."""
+
+    active_lines = classifier_active_job_source(job).splitlines()
+    try:
+        steps = active_lines.index("  steps:")
+    except ValueError as error:
+        raise AssertionError("real Check & Test job is missing its steps mapping") from error
+    authority = active_lines[: steps + 1]
+    authority.extend(
+        line
+        for line in active_lines[steps + 1 :]
+        if len(line) - len(line.lstrip()) == 2
+    )
+    return "\n".join(authority)
+
+
+def assert_check_consumer_authority(workflow: str) -> None:
+    """Pin both jobs that can emit the release-required Check & Test contexts."""
+
+    blocks = workflow_job_blocks(workflow)
+    actual_names = {job: job_display_name(block) for job, block in blocks.items()}
+    if actual_names != CI_JOB_DISPLAY_NAMES:
+        raise AssertionError(
+            "Check & Test consumer authority requires the exact reviewed CI job "
+            "identity and display-name map"
+        )
+
+    docs_only = blocks.get("check-docs-only")
+    real = blocks.get("check")
+    if (
+        docs_only is None
+        or classifier_active_job_source(docs_only) != DOCS_ONLY_CHECK_JOB
+    ):
+        raise AssertionError(
+            "Check & Test consumer authority requires the exact inert docs-only job"
+        )
+    if (
+        real is None
+        or real_check_job_authority_source(real) != REAL_CHECK_JOB_AUTHORITY
+    ):
+        raise AssertionError(
+            "Check & Test consumer authority requires the exact real check admission "
+            "and matrix contract"
+        )
+
+
 def execute_docs_only_classifier(
     classifier: str,
     *,
     cwd: Path = ROOT,
     environment_overrides: dict[str, str] | None = None,
+    privileged: bool = True,
     shell_wrapper: str | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
     """Execute a classifier mutant on a push and return its emitted outputs."""
@@ -216,7 +341,17 @@ def execute_docs_only_classifier(
         )
         if environment_overrides is not None:
             environment.update(environment_overrides)
-        command = ["bash", "--noprofile", "--norc", "-c", source]
+        command = [
+            "bash",
+            "--noprofile",
+            "--norc",
+            *(["-p"] if privileged else []),
+            "-e",
+            "-u",
+            "-o",
+            "pipefail",
+            str(source_path),
+        ]
         if shell_wrapper is not None:
             command = [
                 "bash",
@@ -287,6 +422,24 @@ def assert_classifier_execution_won(
         raise AssertionError(
             f"classifier falsification did not inspect {changed_path}: "
             f"{label}: {result.stdout}"
+        )
+
+
+def assert_classifier_execution_failed_closed(
+    label: str,
+    result: subprocess.CompletedProcess[str],
+    outputs: list[str],
+) -> None:
+    """Prove hostile inherited shell state leaves a push classified as code."""
+
+    if result.returncode != 0:
+        raise AssertionError(
+            f"classifier fail-closed proof did not execute: {label}: "
+            f"{result.stdout}{result.stderr}"
+        )
+    if outputs != ["docs_only=false"]:
+        raise AssertionError(
+            f"classifier did not fail closed: {label}: {outputs}"
         )
 
 
@@ -1330,6 +1483,147 @@ def main() -> None:
     classifier_end = ci_workflow.index("\n  check-docs-only:", classifier_start)
     classifier = ci_workflow[classifier_start:classifier_end]
     assert_docs_only_classifier_guard(classifier)
+    assert_check_consumer_authority(ci_workflow)
+    consumer_blocks = workflow_job_blocks(ci_workflow)
+    docs_only_check = consumer_blocks["check-docs-only"]
+    real_check = consumer_blocks["check"]
+
+    docs_only_condition = (
+        "    if: ${{ !cancelled() && "
+        "needs.changes.outputs.docs_only == 'true' }}"
+    )
+    real_check_condition = (
+        "    if: ${{ !cancelled() && "
+        "needs.changes.outputs.docs_only != 'true' }}"
+    )
+    swapped_docs_only_check = docs_only_check.replace(
+        docs_only_condition,
+        real_check_condition,
+        1,
+    )
+    swapped_real_check = real_check.replace(
+        real_check_condition,
+        docs_only_condition,
+        1,
+    )
+    swapped_consumers = ci_workflow.replace(
+        docs_only_check,
+        swapped_docs_only_check,
+        1,
+    ).replace(
+        real_check,
+        swapped_real_check,
+        1,
+    )
+    expect_assertion(
+        "stub and real Check & Test conditions swapped",
+        "Check & Test consumer authority",
+        lambda: assert_check_consumer_authority(swapped_consumers),
+    )
+
+    for label, old, new in (
+        (
+            "docs-only Check & Test job identity changed",
+            "  check-docs-only:",
+            "  check-context-spoof:",
+        ),
+        (
+            "docs-only Check & Test display name changed",
+            "    name: Check & Test",
+            "    name: Documentation shortcut",
+        ),
+        (
+            "docs-only Check & Test dependency changed",
+            "    needs: changes",
+            "    needs: dco",
+        ),
+        (
+            "docs-only Check & Test runner changed",
+            "    runs-on: ubuntu-latest",
+            "    runs-on: ${{ matrix.os }}",
+        ),
+        (
+            "docs-only Check & Test matrix changed",
+            "        os: [ubuntu-latest, macos-latest]",
+            "        os: [ubuntu-latest]",
+        ),
+        (
+            "docs-only Check & Test inert step changed",
+            '      run: echo "documentation-only diff; '
+            'build and test validation not applicable"',
+            '      run: echo "unreviewed shortcut"',
+        ),
+    ):
+        if docs_only_check.count(old) != 1:
+            raise AssertionError(
+                f"Check & Test consumer falsification could not identify {label}"
+            )
+        mutant_job = docs_only_check.replace(old, new, 1)
+        mutant_workflow = ci_workflow.replace(docs_only_check, mutant_job, 1)
+        expect_assertion(
+            label,
+            "Check & Test consumer authority",
+            lambda mutant_workflow=mutant_workflow: (
+                assert_check_consumer_authority(mutant_workflow)
+            ),
+        )
+
+    for label, old, new in (
+        (
+            "real Check & Test display name changed",
+            "    name: Check & Test",
+            "    name: Check & Test trusted",
+        ),
+        (
+            "real Check & Test dependency changed",
+            "    needs: changes",
+            "    needs: dco",
+        ),
+        (
+            "real Check & Test runner detached from its matrix",
+            "    runs-on: ${{ matrix.os }}",
+            "    runs-on: ubuntu-latest",
+        ),
+        (
+            "real Check & Test matrix changed",
+            "        os: [ubuntu-latest, macos-latest]",
+            "        os: [ubuntu-latest]",
+        ),
+    ):
+        if real_check.count(old) != 1:
+            raise AssertionError(
+                f"Check & Test consumer falsification could not identify {label}"
+            )
+        mutant_job = real_check.replace(old, new, 1)
+        mutant_workflow = ci_workflow.replace(real_check, mutant_job, 1)
+        expect_assertion(
+            label,
+            "Check & Test consumer authority",
+            lambda mutant_workflow=mutant_workflow: (
+                assert_check_consumer_authority(mutant_workflow)
+            ),
+        )
+
+    coverage_job = consumer_blocks["coverage"]
+    if coverage_job.count("    name: Code Coverage") != 1:
+        raise AssertionError(
+            "Check & Test consumer falsification could not identify coverage name"
+        )
+    duplicate_context = ci_workflow.replace(
+        coverage_job,
+        coverage_job.replace(
+            "    name: Code Coverage",
+            "    name: Check & Test",
+            1,
+        ),
+        1,
+    )
+    expect_assertion(
+        "unrelated job spoofs the Check & Test display context",
+        "Check & Test consumer authority",
+        lambda: assert_check_consumer_authority(duplicate_context),
+    )
+
     for label, old, new in (
         (
             "classifier job output remapped to a constant",
@@ -1337,9 +1631,10 @@ def main() -> None:
             '      docs_only: "true"',
         ),
         (
-            "classifier checkout ref changed",
+            "classifier checkout pin changed to a moving ref",
+            "      - uses: actions/checkout@"
+            "3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1",
             "      - uses: actions/checkout@v7",
-            "      - uses: actions/checkout@v6",
         ),
         (
             "classifier checkout depth changed",
@@ -1429,17 +1724,54 @@ def main() -> None:
             cwd=fixture,
             environment_overrides={"BASH_ENV": str(hostile_bash_env)},
         )
+        assert_classifier_execution_failed_closed(
+            "privileged classifier shell ignores BASH_ENV startup injection",
+            result,
+            outputs,
+        )
+
+        shell_line = (
+            "        shell: /usr/bin/bash --noprofile --norc "
+            "-p -e -u -o pipefail {0}"
+        )
+        unprivileged_shell = classifier.replace(
+            shell_line,
+            "        shell: /usr/bin/bash --noprofile --norc "
+            "-e -u -o pipefail {0}",
+            1,
+        )
+        expect_assertion(
+            "classifier shell drops privileged startup",
+            "exactly match the closed-form docs_only authority contract",
+            lambda: assert_docs_only_classifier_guard(unprivileged_shell),
+        )
+        hostile_functions = {
+            "BASH_FUNC_[%%": "() { return 0; }",
+            "BASH_FUNC_git%%": "() { printf 'docs/release-bot.md\\n'; }",
+        }
+        result, outputs = execute_docs_only_classifier(
+            classifier,
+            cwd=fixture,
+            environment_overrides=hostile_functions,
+        )
+        assert_classifier_execution_failed_closed(
+            "privileged classifier rejects inherited test and git functions",
+            result,
+            outputs,
+        )
+        result, outputs = execute_docs_only_classifier(
+            unprivileged_shell,
+            cwd=fixture,
+            environment_overrides=hostile_functions,
+            privileged=False,
+        )
         assert_classifier_execution_won(
-            "classifier shell startup overridden through BASH_ENV",
+            "unprivileged classifier imports hostile test and git functions",
             result,
             outputs,
             changed_path="docs/release-bot.md",
         )
 
-        shell_line = (
-            "        shell: /usr/bin/bash --noprofile --norc "
-            "-e -u -o pipefail {0}"
-        )
         hostile_shell = classifier.replace(
             shell_line,
             "        shell: bash --noprofile --norc -c "
