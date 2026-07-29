@@ -639,8 +639,24 @@ pub async fn run(state: DaemonState, config: DaemonConfig) -> Result<()> {
 pub async fn run_with_authority(
     mut state: DaemonState,
     config: DaemonConfig,
-    _daemon_lock: crate::lifecycle::DaemonLock,
+    daemon_lock: crate::lifecycle::DaemonLock,
 ) -> Result<()> {
+    // A singleton file handle is authority for one canonical repository, not a
+    // process-global permission to run any DaemonState. Validate the binding
+    // before migration, listener binding, or endpoint publication so a safe
+    // public API caller cannot replay repo A's capability against repo B.
+    let state_root = state
+        .layout
+        .root()
+        .canonicalize()
+        .map_err(DaemonError::Io)?;
+    if daemon_lock.canonical_kin_root() != state_root {
+        return Err(DaemonError::AuthorityMismatch {
+            authority_root: daemon_lock.canonical_kin_root().to_path_buf(),
+            state_root,
+        });
+    }
+
     // Refuse to serve an incompatible `.kin/` layout. We now hold the singleton
     // lock (sole writer for this repo) but have not bound a port, written
     // endpoint files, or touched graph/kindb state — the safe point to validate
@@ -2180,8 +2196,8 @@ mod tests {
     use super::{
         drain_pending_flush, format_singleton_contention, next_embed_error_backoff,
         parse_duration_secs, parse_owner_watch_pid, should_enable_lsp_enrichment, should_flush_now,
-        shutdown_signalled, watched_process_is_alive, DaemonConfig, DEFAULT_RUNTIME_SHUTDOWN_GRACE,
-        DEFAULT_SHUTDOWN_ESCALATION_GRACE,
+        shutdown_signalled, watched_process_is_alive, DaemonConfig, DaemonState,
+        DEFAULT_RUNTIME_SHUTDOWN_GRACE, DEFAULT_SHUTDOWN_ESCALATION_GRACE,
     };
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -2198,6 +2214,40 @@ mod tests {
         assert!(!should_enable_lsp_enrichment(true, true));
         assert!(!should_enable_lsp_enrichment(false, false));
         assert!(!should_enable_lsp_enrichment(false, true));
+    }
+
+    #[tokio::test]
+    async fn preacquired_authority_cannot_be_replayed_against_another_repo() {
+        let repo_a = tempfile::tempdir().unwrap();
+        let repo_b = tempfile::tempdir().unwrap();
+        let initialized_a = kin_core::init(repo_a.path()).unwrap();
+        let initialized_b = kin_core::init(repo_b.path()).unwrap();
+        let repo_b_kin_root = initialized_b.layout.root().to_path_buf();
+
+        let authority = super::acquire_daemon_authority(initialized_a.layout.root()).unwrap();
+        let state = DaemonState::open(initialized_b.layout).unwrap();
+        let result = super::run_with_authority(
+            state,
+            DaemonConfig {
+                api_port: 0,
+                ..DaemonConfig::default()
+            },
+            authority,
+        )
+        .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(crate::error::DaemonError::AuthorityMismatch { .. })
+            ),
+            "repo A authority must not authorize repo B state: {result:?}"
+        );
+        assert!(
+            !repo_b_kin_root.join("daemon.pid").exists()
+                && !repo_b_kin_root.join("daemon.port").exists(),
+            "authority mismatch must fail before endpoint publication"
+        );
     }
 
     #[test]

@@ -35,6 +35,18 @@ use tracing::info;
 #[derive(Debug)]
 pub struct DaemonLock {
     file: std::fs::File,
+    canonical_kin_root: PathBuf,
+}
+
+impl DaemonLock {
+    /// Canonical `.kin` root whose singleton this capability protects.
+    ///
+    /// Carrying the repository identity with the file handle prevents a caller
+    /// from replaying authority acquired for repo A while starting state opened
+    /// from repo B.
+    pub fn canonical_kin_root(&self) -> &Path {
+        &self.canonical_kin_root
+    }
 }
 
 impl Drop for DaemonLock {
@@ -140,12 +152,13 @@ fn acquire_singleton_lock_inner_until_with_coordination_hook<F>(
 where
     F: FnMut(),
 {
+    let canonical_kin_root = kin_root.canonicalize()?;
     let _coordination = acquire_singleton_coordination_guard_until_with_hook(
-        kin_root,
+        &canonical_kin_root,
         deadline,
         on_coordination_contention,
     )?;
-    let path = kin_root.join("daemon.lock");
+    let path = canonical_kin_root.join("daemon.lock");
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .read(true)
@@ -157,7 +170,10 @@ where
             // Record ownership while holding the lock, so a contender that
             // fails to acquire can always name the process it lost to.
             stamp_lock_owner(&mut file);
-            Ok(Some(DaemonLock { file }))
+            Ok(Some(DaemonLock {
+                file,
+                canonical_kin_root,
+            }))
         }
         // fs2 reports contention with the platform's "would block" error
         // (EWOULDBLOCK on Unix). Treat that — and only that — as "already
