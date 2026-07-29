@@ -1077,7 +1077,7 @@ pub fn agent_default_tool_names() -> &'static [&'static str] {
         "get_context_pack",
         // A profile carrying the transaction write surface must carry a direct
         // entity-body read. Staging a body update means restating the entity's
-        // current source, so an agent without a body read can only guess it —
+        // current source, so an agent without a body read can only guess it --
         // and a guessed body silently overwrites the real one on commit. The
         // discovery tools hand back ids and bounded snippets; this is the tool
         // that turns an id into the exact graph-owned body.

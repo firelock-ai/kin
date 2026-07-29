@@ -917,7 +917,7 @@ pub struct ReferenceRow {
     pub name: String,
     pub kind: Option<String>,
     pub file_path: Option<String>,
-    /// 1-based line where the REFERENCING ENTITY begins — the caller's
+    /// 1-based line where the REFERENCING ENTITY begins -- the caller's
     /// definition, not the reference itself. Useful for locating the caller;
     /// useless for locating the usage. See `reference_lines`.
     pub start_line: Option<u32>,
@@ -1146,8 +1146,8 @@ fn graph_source_gap(message: impl Into<String>) -> McpError {
 /// Which graph-owned repository state a source projection resolves against.
 ///
 /// `EntitySourceScope::WorkspaceHead` reads the workspace's exact graph-owned
-/// tree — `WorkspaceState::tree`, which kin-model defines as including
-/// uncommitted state — paired with the live entity's own span. This is the same
+/// tree -- `WorkspaceState::tree`, which kin-model defines as including
+/// uncommitted state -- paired with the live entity's own span. This is the same
 /// truth `get_entity_source`, `get_entity_body`, and `kin trace` read, so every
 /// HEAD-scoped agent surface answers from one state by construction.
 ///
@@ -1162,7 +1162,7 @@ fn graph_source_gap(message: impl Into<String>) -> McpError {
 /// is the change it was CREATED FROM, not its current state. Resolving a head
 /// read against the base and then requiring the live entity to be the active
 /// committed revision there rejects every workspace that has moved past its base
-/// — a fresh clone whose admission populated the live graph, a workspace holding
+/// -- a fresh clone whose admission populated the live graph, a workspace holding
 /// a semantic overlay, or any repository with a commit since. Those are normal
 /// states, not authority gaps.
 ///
@@ -1241,7 +1241,7 @@ fn resolve_entity_source_authority<G: GraphStore>(
     // than approximated by one path.
     let (source_change_id, current_artifact, span) = match scope {
         // HEAD: the workspace's exact graph-owned tree paired with the live
-        // entity's own span — byte-for-byte the pair `get_entity_source` reads, so
+        // entity's own span -- byte-for-byte the pair `get_entity_source` reads, so
         // the body-shaped surfaces cannot diverge on the same repository.
         //
         // What is NOT required here is that the live entity be byte-identical to
@@ -1271,8 +1271,8 @@ fn resolve_entity_source_authority<G: GraphStore>(
             // Bind the entity to the artifact identity that occupied its path when
             // its revision was introduced, so a path later reused by a DIFFERENT
             // artifact cannot feed an old entity's span someone else's bytes. The
-            // hazard is real even when the bytes are identical, because identity —
-            // not content — is what says these are the same artifact.
+            // hazard is real even when the bytes are identical, because identity --
+            // not content -- is what says these are the same artifact.
             //
             // Only committed history knows the introducing artifact, so the check
             // runs when history records a revision and is skipped when it does not.
