@@ -55,6 +55,13 @@ pub struct GraphHealthReport {
     pub repository_artifact_coverage: RepositoryArtifactCoverage,
     pub supported_entity_source_file_count: usize,
     pub supported_shallow_source_file_count: usize,
+    /// Whether supported sources were admitted while the graph derived neither
+    /// an entity layer nor a single facet.
+    ///
+    /// Informational and JSON-only by design: it moves no verdict, no note, and
+    /// no exit code. Every coverage level is a reachable healthy state under
+    /// the current substrate, so keying a verdict on this would fail closed on
+    /// repositories that are merely early. Consumers read it from the report.
     pub graph_empty_for_supported_inputs: bool,
     pub contaminated_entity_count: usize,
     pub contaminated_non_entity_count: usize,
