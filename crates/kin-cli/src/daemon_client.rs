@@ -1785,9 +1785,71 @@ pub fn remove_orphaned_daemon_port(kin_root: &Path) -> bool {
     )
 }
 
-fn remove_stale_daemon_files_uncoordinated(kin_root: &Path) {
-    let _ = std::fs::remove_file(repo_daemon_pid_path(kin_root));
-    let _ = std::fs::remove_file(repo_daemon_port_path(kin_root));
+fn remove_endpoint_files_with<F>(
+    pid_path: &Path,
+    port_path: &Path,
+    mut remove_file: F,
+) -> std::io::Result<()>
+where
+    F: FnMut(&Path) -> std::io::Result<()>,
+{
+    let paths = [pid_path, port_path];
+    let mut failure_kind = None;
+    let mut failures = Vec::new();
+
+    // Attempt both removals even when the first fails. A partial retirement must
+    // still fail closed, but clearing the other stale component leaves the next
+    // operator attempt with less ambiguous evidence.
+    for &path in &paths {
+        if let Err(error) = remove_file(path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                failure_kind.get_or_insert(error.kind());
+                failures.push(format!("remove {}: {error}", path.display()));
+            }
+        }
+    }
+
+    // `NotFound` is a successful removal result only when the path is actually
+    // absent. Re-check both components while the caller still holds lifecycle
+    // and singleton authority so `Retired` can remain a trustworthy capability
+    // to start a replacement.
+    for &path in &paths {
+        match std::fs::symlink_metadata(path) {
+            Ok(_) => {
+                failure_kind.get_or_insert(std::io::ErrorKind::Other);
+                failures.push(format!(
+                    "endpoint component {} still exists after retirement",
+                    path.display()
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                failure_kind.get_or_insert(error.kind());
+                failures.push(format!("verify retirement of {}: {error}", path.display()));
+            }
+        }
+    }
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            failure_kind.unwrap_or(std::io::ErrorKind::Other),
+            failures.join("; "),
+        ))
+    }
+}
+
+fn remove_stale_daemon_files_uncoordinated_with<F>(
+    kin_root: &Path,
+    remove_file: F,
+) -> std::io::Result<()>
+where
+    F: FnMut(&Path) -> std::io::Result<()>,
+{
+    let pid_path = repo_daemon_pid_path(kin_root);
+    let port_path = repo_daemon_port_path(kin_root);
+    remove_endpoint_files_with(&pid_path, &port_path, remove_file)
 }
 
 fn try_acquire_daemon_endpoint_authority(kin_root: &Path) -> std::io::Result<File> {
@@ -1907,23 +1969,32 @@ where
         pid_exists: true,
         port_exists: judged_port.is_some(),
     };
-    retire_daemon_endpoint_if_unchanged_with_hook(kin_root, judged, after_comparison)
+    retire_daemon_endpoint_if_unchanged_with_hooks(kin_root, judged, after_comparison, |path| {
+        std::fs::remove_file(path)
+    })
 }
 
 fn retire_daemon_endpoint_if_unchanged(
     kin_root: &Path,
     judged: DaemonEndpointSnapshot,
 ) -> DaemonEndpointRetirement {
-    retire_daemon_endpoint_if_unchanged_with_hook(kin_root, judged, || {})
+    retire_daemon_endpoint_if_unchanged_with_hooks(
+        kin_root,
+        judged,
+        || {},
+        |path| std::fs::remove_file(path),
+    )
 }
 
-fn retire_daemon_endpoint_if_unchanged_with_hook<F>(
+fn retire_daemon_endpoint_if_unchanged_with_hooks<F, G>(
     kin_root: &Path,
     judged: DaemonEndpointSnapshot,
     after_comparison: F,
+    remove_file: G,
 ) -> DaemonEndpointRetirement
 where
     F: FnOnce(),
+    G: FnMut(&Path) -> std::io::Result<()>,
 {
     // Current daemon publication and every current retirement path take this
     // same never-unlinked authority. Holding it across the final comparison
@@ -2004,8 +2075,18 @@ where
         return DaemonEndpointRetirement::Changed { current };
     }
 
-    remove_stale_daemon_files_uncoordinated(kin_root);
-    DaemonEndpointRetirement::Retired
+    match remove_stale_daemon_files_uncoordinated_with(kin_root, remove_file) {
+        Ok(()) => DaemonEndpointRetirement::Retired,
+        Err(error) => {
+            warn!(
+                ?judged,
+                repo = %kin_root.display(),
+                %error,
+                "preserving daemon startup authority because endpoint retirement failed"
+            );
+            DaemonEndpointRetirement::CoordinationUnavailable(error.to_string())
+        }
+    }
 }
 
 fn supervisor_dir() -> PathBuf {
@@ -2114,16 +2195,23 @@ fn retire_supervisor_endpoint_if_unchanged(
     dir: &Path,
     judged: SupervisorEndpointSnapshot,
 ) -> SupervisorEndpointRetirement {
-    retire_supervisor_endpoint_if_unchanged_with_hook(dir, judged, || {})
+    retire_supervisor_endpoint_if_unchanged_with_hooks(
+        dir,
+        judged,
+        || {},
+        |path| std::fs::remove_file(path),
+    )
 }
 
-fn retire_supervisor_endpoint_if_unchanged_with_hook<F>(
+fn retire_supervisor_endpoint_if_unchanged_with_hooks<F, G>(
     dir: &Path,
     judged: SupervisorEndpointSnapshot,
     after_comparison: F,
+    remove_file: G,
 ) -> SupervisorEndpointRetirement
 where
     F: FnOnce(),
+    G: FnMut(&Path) -> std::io::Result<()>,
 {
     if let Err(error) = std::fs::create_dir_all(dir) {
         return SupervisorEndpointRetirement::CoordinationUnavailable(error.to_string());
@@ -2183,9 +2271,20 @@ where
     if current != judged {
         return SupervisorEndpointRetirement::Changed { current };
     }
-    let _ = std::fs::remove_file(dir.join(SUPERVISOR_PID_FILE));
-    let _ = std::fs::remove_file(dir.join(SUPERVISOR_PORT_FILE));
-    SupervisorEndpointRetirement::Retired
+    let pid_path = dir.join(SUPERVISOR_PID_FILE);
+    let port_path = dir.join(SUPERVISOR_PORT_FILE);
+    match remove_endpoint_files_with(&pid_path, &port_path, remove_file) {
+        Ok(()) => SupervisorEndpointRetirement::Retired,
+        Err(error) => {
+            warn!(
+                ?judged,
+                dir = %dir.display(),
+                %error,
+                "preserving supervisor startup authority because endpoint retirement failed"
+            );
+            SupervisorEndpointRetirement::CoordinationUnavailable(error.to_string())
+        }
+    }
 }
 
 fn read_pid_file(kin_root: &Path) -> Option<u32> {
@@ -4409,6 +4508,159 @@ mod tests {
             DaemonEndpointRetirement::Changed { .. }
         ));
         assert!(root.join("daemon.port").exists());
+    }
+
+    #[tokio::test]
+    async fn daemon_retirement_permission_denial_never_authorizes_replacement() {
+        for denied_name in ["daemon.pid", "daemon.port"] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            write_endpoint_files(root, 999_999_999, 51000);
+            let judged = daemon_endpoint_snapshot(root);
+
+            let decision = retire_daemon_endpoint_if_unchanged_with_hooks(
+                root,
+                judged,
+                || {},
+                |path| {
+                    if path.file_name().and_then(|name| name.to_str()) == Some(denied_name) {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            format!("injected denial for {denied_name}"),
+                        ))
+                    } else {
+                        std::fs::remove_file(path)
+                    }
+                },
+            );
+
+            assert!(
+                matches!(
+                    &decision,
+                    DaemonEndpointRetirement::CoordinationUnavailable(detail)
+                        if detail.contains(denied_name)
+                ),
+                "a {denied_name} deletion error must fail closed: {decision:?}"
+            );
+            assert!(
+                root.join(denied_name).exists(),
+                "the injected failure must leave {denied_name} in place"
+            );
+            let removed_name = if denied_name == "daemon.pid" {
+                "daemon.port"
+            } else {
+                "daemon.pid"
+            };
+            assert!(
+                !root.join(removed_name).exists(),
+                "retirement must attempt the second component even after a first-component error"
+            );
+
+            let verdict =
+                follow_preserved_daemon_endpoint(root, Instant::now(), Duration::ZERO, decision)
+                    .await;
+            assert!(
+                matches!(verdict, ExistingDaemon::LiveNotReady(_)),
+                "a partial retirement must preserve startup authority, never authorize a \
+                 replacement: {verdict:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn supervisor_retirement_permission_denial_never_authorizes_replacement() {
+        for denied_name in [SUPERVISOR_PID_FILE, SUPERVISOR_PORT_FILE] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join(SUPERVISOR_PID_FILE), "999999999").unwrap();
+            std::fs::write(dir.path().join(SUPERVISOR_PORT_FILE), "51000").unwrap();
+            let judged = supervisor_endpoint_snapshot(dir.path());
+
+            let decision = retire_supervisor_endpoint_if_unchanged_with_hooks(
+                dir.path(),
+                judged,
+                || {},
+                |path| {
+                    if path.file_name().and_then(|name| name.to_str()) == Some(denied_name) {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            format!("injected denial for {denied_name}"),
+                        ))
+                    } else {
+                        std::fs::remove_file(path)
+                    }
+                },
+            );
+
+            assert!(
+                matches!(
+                    &decision,
+                    SupervisorEndpointRetirement::CoordinationUnavailable(detail)
+                        if detail.contains(denied_name)
+                ),
+                "a {denied_name} deletion error must fail closed, not authorize a supervisor \
+                 replacement: {decision:?}"
+            );
+            assert!(
+                dir.path().join(denied_name).exists(),
+                "the injected failure must leave {denied_name} in place"
+            );
+            let removed_name = if denied_name == SUPERVISOR_PID_FILE {
+                SUPERVISOR_PORT_FILE
+            } else {
+                SUPERVISOR_PID_FILE
+            };
+            assert!(
+                !dir.path().join(removed_name).exists(),
+                "retirement must attempt the second component even after a first-component error"
+            );
+        }
+    }
+
+    #[test]
+    fn retirement_treats_not_found_as_success_only_when_components_are_absent() {
+        let daemon_dir = tempfile::tempdir().unwrap();
+        let daemon_judged = daemon_endpoint_snapshot(daemon_dir.path());
+        assert_eq!(
+            retire_daemon_endpoint_if_unchanged_with_hooks(
+                daemon_dir.path(),
+                daemon_judged,
+                || {},
+                |_| Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+            ),
+            DaemonEndpointRetirement::Retired
+        );
+
+        let supervisor_dir = tempfile::tempdir().unwrap();
+        let supervisor_judged = supervisor_endpoint_snapshot(supervisor_dir.path());
+        assert_eq!(
+            retire_supervisor_endpoint_if_unchanged_with_hooks(
+                supervisor_dir.path(),
+                supervisor_judged,
+                || {},
+                |_| Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+            ),
+            SupervisorEndpointRetirement::Retired
+        );
+
+        let remaining_dir = tempfile::tempdir().unwrap();
+        write_endpoint_files(remaining_dir.path(), 999_999_999, 51000);
+        let remaining_judged = daemon_endpoint_snapshot(remaining_dir.path());
+        let decision = retire_daemon_endpoint_if_unchanged_with_hooks(
+            remaining_dir.path(),
+            remaining_judged,
+            || {},
+            |_| Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+        );
+        assert!(
+            matches!(
+                decision,
+                DaemonEndpointRetirement::CoordinationUnavailable(_)
+            ),
+            "`NotFound` cannot authorize replacement when post-removal verification still sees \
+             endpoint components"
+        );
+        assert!(remaining_dir.path().join("daemon.pid").exists());
+        assert!(remaining_dir.path().join("daemon.port").exists());
     }
 
     #[test]
