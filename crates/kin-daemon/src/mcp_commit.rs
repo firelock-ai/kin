@@ -572,6 +572,11 @@ fn plan_exact_transaction(
                 error.valid_up_to()
             )
         })?;
+        // `entity_body_splice`, not a raw span splice: an entity span opens at
+        // the entity's first token, so a nested entity's indentation sits in the
+        // file ahead of the span while the rest of its body carries indentation
+        // inside it. A caller that submits the entity as the file renders it
+        // would otherwise have line 1 indented twice.
         let splices = file_edits
             .iter()
             .map(|(entity, body)| {
@@ -579,10 +584,7 @@ fn plan_exact_transaction(
                     .span
                     .as_ref()
                     .expect("validated source edit always has a span");
-                kin_projection::Splice {
-                    byte_range: span.start_byte..span.end_byte,
-                    new_content: body.clone(),
-                }
+                kin_projection::entity_body_splice(&original, span.start_byte..span.end_byte, body)
             })
             .collect();
         let projected = kin_projection::apply_splices(&original, splices)
@@ -1595,6 +1597,441 @@ mod tests {
                 .unwrap(),
             b"pub fn value() -> u8 { 2 }\n"
         );
+    }
+
+    /// An ambiguous bare name must hand back the candidates it could not choose
+    /// between, and the corrected id must commit on the transaction the caller
+    /// already holds.
+    ///
+    /// Without the candidate list the advice ("use the entity id") names an id
+    /// the caller has no way to learn, and without the clear the corrected retry
+    /// re-plans the same ambiguity forever. Both halves are needed for an
+    /// unscripted agent to recover in-session.
+    #[test]
+    fn ambiguous_name_target_lists_candidates_and_the_id_retry_commits() {
+        let (_dir, state) = test_state();
+        let (left, _) = install_exact_source(
+            &state,
+            "src/left.rs",
+            b"pub fn shared() -> u8 { 1 }\n",
+            "shared",
+        );
+        let (right, _) = install_exact_source(
+            &state,
+            "src/right.rs",
+            b"pub fn shared() -> u8 { 10 }\n",
+            "shared",
+        );
+        let sessions = test_sessions();
+        let transaction = sessions
+            .begin_transaction(TEST_SESSION, "entity:shared")
+            .unwrap();
+        let arguments = HashMap::from([(
+            "transaction_id".to_string(),
+            serde_json::json!(transaction.transaction_id),
+        )]);
+        sessions
+            .stage_transaction(
+                &transaction.transaction_id,
+                vec![kin_mcp::McpMutationOperation {
+                    verb: "update".to_string(),
+                    target: "shared".to_string(),
+                    payload: None,
+                    body: Some("pub fn shared() -> u8 { 2 }".to_string()),
+                    description: "bare name an agent would reach for first".to_string(),
+                }],
+            )
+            .unwrap();
+
+        let ambiguous = commit_exact_transaction(&state, &sessions, &arguments, None);
+        assert_eq!(ambiguous.is_error, Some(true));
+        let message = result_text(&ambiguous);
+        assert!(
+            message.contains("is ambiguous (2 exact-name matches)"),
+            "the refusal must say what was ambiguous: {message}"
+        );
+        for candidate in [&left, &right] {
+            assert!(
+                message.contains(&candidate.id.to_string()),
+                "candidate id {} must be listed: {message}",
+                candidate.id
+            );
+        }
+        for path in ["src/left.rs", "src/right.rs"] {
+            assert!(
+                message.contains(path),
+                "candidate file path {path} must be listed: {message}"
+            );
+        }
+        assert!(
+            message.contains("pub fn shared() -> u8"),
+            "each candidate must carry its declaration so the caller can tell them apart: {message}"
+        );
+
+        // The id the refusal named, staged on the SAME transaction, commits.
+        sessions
+            .stage_transaction(
+                &transaction.transaction_id,
+                vec![kin_mcp::McpMutationOperation {
+                    verb: "update".to_string(),
+                    target: left.id.to_string(),
+                    payload: None,
+                    body: Some("pub fn shared() -> u8 { 2 }".to_string()),
+                    description: "corrected id retry".to_string(),
+                }],
+            )
+            .unwrap();
+        let committed = commit_exact_transaction(&state, &sessions, &arguments, None);
+        assert_ne!(
+            committed.is_error,
+            Some(true),
+            "the id retry must commit on the same transaction: {}",
+            result_text(&committed)
+        );
+        assert_eq!(
+            std::fs::read(state.layout.working_dir().join("src/left.rs")).unwrap(),
+            b"pub fn shared() -> u8 { 2 }\n"
+        );
+        assert_eq!(
+            std::fs::read(state.layout.working_dir().join("src/right.rs")).unwrap(),
+            b"pub fn shared() -> u8 { 10 }\n"
+        );
+    }
+
+    /// A nested entity submitted exactly as the file renders it lands at its own
+    /// indentation, not at twice it.
+    ///
+    /// An entity span opens at the entity's first token, so an impl method's
+    /// four spaces sit in the file ahead of the span while the rest of its body
+    /// carries indentation inside it. Splicing the caller's body verbatim put
+    /// its copy of line 1's indentation after the file's: the method compiled at
+    /// eight spaces and failed `cargo fmt`. Byte-exactness is the promise, so
+    /// this asserts the whole file byte-for-byte, for an impl method and a
+    /// module-nested function committed together, against a top-level function
+    /// that has no indentation to double.
+    #[test]
+    fn nested_entity_bodies_commit_at_their_own_indentation() {
+        let (_dir, state) = test_state();
+        let impl_source =
+            b"pub struct Builder;\n\nimpl Builder {\n    pub fn set(&mut self) -> u8 {\n        1\n    }\n}\n";
+        let (method, _) =
+            install_exact_source(&state, "src/builder.rs", impl_source, "Builder::set");
+        let module_source = b"pub mod inner {\n    pub fn nested() -> u8 {\n        1\n    }\n}\n";
+        let (nested, _) = install_exact_source(&state, "src/nested.rs", module_source, "nested");
+        let (top_level, _) = install_exact_source(
+            &state,
+            "src/plain.rs",
+            b"pub fn plain() -> u8 {\n    1\n}\n",
+            "plain",
+        );
+
+        let sessions = test_sessions();
+        let transaction = sessions
+            .begin_transaction(TEST_SESSION, "entity:set")
+            .unwrap();
+        sessions
+            .stage_transaction(
+                &transaction.transaction_id,
+                vec![
+                    // Each body is the entity exactly as the file renders it,
+                    // leading indentation included: what an agent writes back
+                    // after reading the source.
+                    kin_mcp::McpMutationOperation {
+                        verb: "update".to_string(),
+                        target: method.id.to_string(),
+                        payload: None,
+                        body: Some(
+                            "    pub fn set(&mut self) -> u8 {\n        2\n    }".to_string(),
+                        ),
+                        description: "impl-nested method".to_string(),
+                    },
+                    kin_mcp::McpMutationOperation {
+                        verb: "update".to_string(),
+                        target: nested.id.to_string(),
+                        payload: None,
+                        body: Some("    pub fn nested() -> u8 {\n        2\n    }".to_string()),
+                        description: "module-nested function".to_string(),
+                    },
+                    kin_mcp::McpMutationOperation {
+                        verb: "update".to_string(),
+                        target: top_level.id.to_string(),
+                        payload: None,
+                        body: Some("pub fn plain() -> u8 {\n    2\n}".to_string()),
+                        description: "top-level function".to_string(),
+                    },
+                ],
+            )
+            .unwrap();
+
+        let result = commit_exact_transaction(
+            &state,
+            &sessions,
+            &HashMap::from([(
+                "transaction_id".to_string(),
+                serde_json::json!(transaction.transaction_id),
+            )]),
+            None,
+        );
+        assert_ne!(
+            result.is_error,
+            Some(true),
+            "nested body commit failed: {}",
+            result_text(&result)
+        );
+
+        for (file, expected) in [
+            (
+                "src/builder.rs",
+                b"pub struct Builder;\n\nimpl Builder {\n    pub fn set(&mut self) -> u8 {\n        2\n    }\n}\n".to_vec(),
+            ),
+            (
+                "src/nested.rs",
+                b"pub mod inner {\n    pub fn nested() -> u8 {\n        2\n    }\n}\n".to_vec(),
+            ),
+            ("src/plain.rs", b"pub fn plain() -> u8 {\n    2\n}\n".to_vec()),
+        ] {
+            assert_eq!(
+                std::fs::read(state.layout.working_dir().join(file)).unwrap(),
+                expected,
+                "{file} is not byte-identical to the intended source"
+            );
+            let after = load_native_commit_base(&state.layout).unwrap();
+            let artifact = after
+                .tree
+                .artifact_at_path(&RepoPath::from_utf8(file).unwrap())
+                .unwrap();
+            assert_eq!(
+                load_native_source_blob(&state.layout, artifact.entry.blob_identity().unwrap())
+                    .unwrap(),
+                expected,
+                "{file} repository authority is not byte-identical either"
+            );
+        }
+    }
+
+    /// The exact bytes the read surface serves are the span slice, with no
+    /// leading indentation on line 1. Submitting those back unchanged has to
+    /// keep committing, or the indentation fix traded one break for another.
+    #[test]
+    fn span_slice_body_for_a_nested_entity_still_commits_exactly() {
+        let (_dir, state) = test_state();
+        let source =
+            b"pub struct Builder;\n\nimpl Builder {\n    pub fn set(&mut self) -> u8 {\n        1\n    }\n}\n";
+        let (method, _) = install_exact_source(&state, "src/builder.rs", source, "Builder::set");
+        let sessions = test_sessions();
+        let transaction = sessions
+            .begin_transaction(TEST_SESSION, "entity:set")
+            .unwrap();
+        sessions
+            .stage_transaction(
+                &transaction.transaction_id,
+                vec![kin_mcp::McpMutationOperation {
+                    verb: "update".to_string(),
+                    target: method.id.to_string(),
+                    payload: None,
+                    // No leading indentation: the span slice, verbatim.
+                    body: Some("pub fn set(&mut self) -> u8 {\n        2\n    }".to_string()),
+                    description: "span-slice body".to_string(),
+                }],
+            )
+            .unwrap();
+
+        let result = commit_exact_transaction(
+            &state,
+            &sessions,
+            &HashMap::from([(
+                "transaction_id".to_string(),
+                serde_json::json!(transaction.transaction_id),
+            )]),
+            None,
+        );
+        assert_ne!(
+            result.is_error,
+            Some(true),
+            "span-slice body commit failed: {}",
+            result_text(&result)
+        );
+        assert_eq!(
+            std::fs::read(state.layout.working_dir().join("src/builder.rs")).unwrap(),
+            b"pub struct Builder;\n\nimpl Builder {\n    pub fn set(&mut self) -> u8 {\n        2\n    }\n}\n"
+        );
+    }
+
+    /// The whole rehearsal, end to end: a three-file signature change staged on
+    /// one transaction, surviving a deliberate mid-flight staging error, landing
+    /// byte-identical.
+    ///
+    /// This is the shape an unscripted agent could not survive. It reaches for a
+    /// bare name, the name is ambiguous, and before the fixes the refusal named
+    /// an id it could not see while the failed operation stayed staged, so every
+    /// later commit on that transaction re-failed identically. Then the bodies it
+    /// wrote back carried the indentation the file showed it, and the nested ones
+    /// landed at twice it.
+    ///
+    /// The assertion is the whole file, byte for byte, for all three files, plus
+    /// `ops_applied` and the modified-file set from the commit receipt.
+    #[test]
+    fn three_file_signature_change_survives_a_mid_flight_staging_error() {
+        let (_dir, state) = test_state();
+
+        // The entity whose signature changes, plus a same-named `commands` that
+        // makes the bare name ambiguous the way `hostname` was in the rehearsal.
+        let cli_source = b"pub fn resolve_binary(prog: &str) -> String {\n    prog.to_string()\n}\n\npub mod compat {\n    pub fn commands() -> String {\n        String::new()\n    }\n}\n";
+        let (resolve_binary, _) =
+            install_exact_source(&state, "src/cli.rs", cli_source, "resolve_binary");
+        // Caller one: an impl-nested method.
+        let worker_source = b"pub struct Worker;\n\nimpl Worker {\n    pub fn preprocessor(&mut self) -> String {\n        crate::cli::resolve_binary(\"pre\")\n    }\n}\n";
+        let (preprocessor, _) = install_exact_source(
+            &state,
+            "src/worker.rs",
+            worker_source,
+            "Worker::preprocessor",
+        );
+        // Caller two: a module-nested function.
+        let defaults_source = b"pub mod defaults {\n    pub fn commands() -> String {\n        crate::cli::resolve_binary(\"cmd\")\n    }\n}\n";
+        let (commands, _) =
+            install_exact_source(&state, "src/defaults.rs", defaults_source, "commands");
+        let before = load_native_commit_base(&state.layout).unwrap();
+
+        const NEW_RESOLVE_BINARY: &str = "pub fn resolve_binary(prog: &str, search_dirs: Option<&[String]>) -> String {\n    let _ = search_dirs;\n    prog.to_string()\n}";
+        // Both caller bodies carry the indentation their files render, because
+        // that is what a caller reading the source writes back.
+        const NEW_PREPROCESSOR: &str = "    pub fn preprocessor(&mut self) -> String {\n        crate::cli::resolve_binary(\"pre\", None)\n    }";
+        const NEW_COMMANDS: &str = "    pub fn commands() -> String {\n        crate::cli::resolve_binary(\"cmd\", None)\n    }";
+
+        let sessions = test_sessions();
+        let transaction = sessions
+            .begin_transaction(TEST_SESSION, "entity:resolve_binary")
+            .unwrap();
+        let arguments = HashMap::from([(
+            "transaction_id".to_string(),
+            serde_json::json!(transaction.transaction_id),
+        )]);
+
+        // Attempt one: correct work alongside one bare name that cannot resolve.
+        sessions
+            .stage_transaction(
+                &transaction.transaction_id,
+                vec![
+                    kin_mcp::McpMutationOperation {
+                        verb: "update".to_string(),
+                        target: resolve_binary.id.to_string(),
+                        payload: None,
+                        body: Some(NEW_RESOLVE_BINARY.to_string()),
+                        description: "add the search_dirs parameter".to_string(),
+                    },
+                    kin_mcp::McpMutationOperation {
+                        verb: "update".to_string(),
+                        target: preprocessor.id.to_string(),
+                        payload: None,
+                        body: Some(NEW_PREPROCESSOR.to_string()),
+                        description: "pass None".to_string(),
+                    },
+                    kin_mcp::McpMutationOperation {
+                        verb: "update".to_string(),
+                        target: "commands".to_string(),
+                        payload: None,
+                        body: Some(NEW_COMMANDS.to_string()),
+                        description: "pass None, targeted by bare name".to_string(),
+                    },
+                ],
+            )
+            .unwrap();
+
+        let refused = commit_exact_transaction(&state, &sessions, &arguments, None);
+        assert_eq!(refused.is_error, Some(true));
+        let message = result_text(&refused);
+        assert!(
+            message.contains(&commands.id.to_string()),
+            "the refusal must name the id that resolves the ambiguity: {message}"
+        );
+        assert!(
+            message.contains("src/defaults.rs") && message.contains("src/cli.rs"),
+            "the refusal must locate every candidate: {message}"
+        );
+        assert!(
+            sessions
+                .get_transaction(&transaction.transaction_id)
+                .unwrap()
+                .staged_operations
+                .is_empty(),
+            "a refused attempt must leave the transaction editable"
+        );
+        assert_eq!(
+            load_native_commit_base(&state.layout)
+                .unwrap()
+                .roots
+                .generation,
+            before.roots.generation,
+            "a refused attempt must not move repository authority"
+        );
+
+        // Attempt two: the same transaction, every target an id.
+        sessions
+            .stage_transaction(
+                &transaction.transaction_id,
+                vec![
+                    kin_mcp::McpMutationOperation {
+                        verb: "update".to_string(),
+                        target: resolve_binary.id.to_string(),
+                        payload: None,
+                        body: Some(NEW_RESOLVE_BINARY.to_string()),
+                        description: "add the search_dirs parameter".to_string(),
+                    },
+                    kin_mcp::McpMutationOperation {
+                        verb: "update".to_string(),
+                        target: preprocessor.id.to_string(),
+                        payload: None,
+                        body: Some(NEW_PREPROCESSOR.to_string()),
+                        description: "pass None".to_string(),
+                    },
+                    kin_mcp::McpMutationOperation {
+                        verb: "update".to_string(),
+                        target: commands.id.to_string(),
+                        payload: None,
+                        body: Some(NEW_COMMANDS.to_string()),
+                        description: "pass None".to_string(),
+                    },
+                ],
+            )
+            .unwrap();
+        let committed = commit_exact_transaction(&state, &sessions, &arguments, None);
+        assert_ne!(
+            committed.is_error,
+            Some(true),
+            "the corrected three-file change must commit on the same transaction: {}",
+            result_text(&committed)
+        );
+        let receipt: serde_json::Value = serde_json::from_str(result_text(&committed)).unwrap();
+        assert_eq!(receipt["ops_applied"], 3);
+        assert_eq!(
+            receipt["modified_files"],
+            serde_json::json!(["src/cli.rs", "src/defaults.rs", "src/worker.rs"])
+        );
+
+        for (file, expected) in [
+            (
+                "src/cli.rs",
+                "pub fn resolve_binary(prog: &str, search_dirs: Option<&[String]>) -> String {\n    let _ = search_dirs;\n    prog.to_string()\n}\n\npub mod compat {\n    pub fn commands() -> String {\n        String::new()\n    }\n}\n",
+            ),
+            (
+                "src/worker.rs",
+                "pub struct Worker;\n\nimpl Worker {\n    pub fn preprocessor(&mut self) -> String {\n        crate::cli::resolve_binary(\"pre\", None)\n    }\n}\n",
+            ),
+            (
+                "src/defaults.rs",
+                "pub mod defaults {\n    pub fn commands() -> String {\n        crate::cli::resolve_binary(\"cmd\", None)\n    }\n}\n",
+            ),
+        ] {
+            assert_eq!(
+                String::from_utf8(
+                    std::fs::read(state.layout.working_dir().join(file)).unwrap()
+                )
+                .unwrap(),
+                expected,
+                "{file} is not byte-identical to the intended source"
+            );
+        }
     }
 
     /// A caller that guesses the operations shape gets the accepted shapes

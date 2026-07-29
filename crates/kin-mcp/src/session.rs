@@ -985,8 +985,15 @@ impl SessionRegistry {
         scope: &str,
     ) -> std::result::Result<McpTransaction, String> {
         if !self.has_session(session_id) {
+            // A well-formed id that names nothing is an ended or idle-reaped
+            // session, not a typo. Saying only "not found" sends an agent
+            // hunting for a bad argument; naming expiry sends it to the one
+            // call that recovers.
             return Err(format!(
-                "Session not found: {session_id}. Start a session with kin_session_start first."
+                "Session not found: {session_id}. It was ended or expired after its idle \
+                 timeout. Call kin_session_start for a new session id and begin the \
+                 transaction on that one; kin_session_heartbeat keeps a session alive \
+                 through a long read phase."
             ));
         }
         let transaction_id = EntityId::new().to_string();

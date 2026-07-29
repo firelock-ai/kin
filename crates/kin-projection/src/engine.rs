@@ -179,7 +179,11 @@ pub fn project_entity_mutations_with_policy(
                 } = region
                 {
                     if eid == entity_id {
-                        let splice = splice_entity(layout, entity_id, new_body)?;
+                        let original = state
+                            .file_contents
+                            .get(file_id)
+                            .ok_or_else(|| ProjectionError::LayoutNotFound(file_id.to_string()))?;
+                        let splice = splice_entity(original, layout, entity_id, new_body)?;
                         file_mutations
                             .entry(file_id.clone())
                             .or_default()

@@ -61,7 +61,11 @@ other agents, and gate collaboration features. It returns a session ID that the 
 the session lifecycle uses — keep it alive with kin_session_heartbeat, declare what \
 you'll touch via kin_register_intent (enabling collision detection against other \
 agents), and close out with kin_session_end. Prefer this over the legacy \
-register_session, which captures none of this context.";
+register_session, which captures none of this context. The response carries \
+idle_timeout_secs and expires_at: the session is reaped if it goes that long with no \
+call, so if your next step is a read phase that could outlast expires_at, send \
+kin_session_heartbeat (any session-bound call also refreshes the window). A call on an \
+expired session fails saying so and names kin_session_start as the recovery.";
 
 pub async fn handle_session_start(
     args: &HashMap<String, serde_json::Value>,
@@ -130,7 +134,9 @@ Send a heartbeat to keep an agent session marked alive. Reach for it periodicall
 during a long-running session so Kin doesn't treat it as stale and so the agent's \
 presence (and any held intents) stays visible to other agents. Pair it with \
 kin_session_start (which issues the session ID) and kin_session_end (which closes the \
-session and releases its intents).";
+session and releases its intents). Its response carries the refreshed idle_timeout_secs \
+and expires_at, so you always know how long the session is good for; heartbeating an \
+already-expired session fails saying so and names kin_session_start as the recovery.";
 
 pub async fn handle_session_heartbeat(
     args: &HashMap<String, serde_json::Value>,
@@ -523,10 +529,11 @@ pub fn resolve_target_entity<G: GraphStore>(
                 .iter()
                 .map(|entity| {
                     format!(
-                        "{} ({:?} at {})",
+                        "{} ({:?} at {}): {}",
                         entity.id,
                         entity.kind,
-                        candidate_location(entity)
+                        candidate_location(entity),
+                        candidate_declaration(entity)
                     )
                 })
                 .collect::<Vec<_>>()
@@ -547,6 +554,33 @@ fn candidate_location(entity: &kin_model::Entity) -> String {
         (Some(file), None) => file.0.clone(),
         (None, _) => "<no source origin>".to_string(),
     }
+}
+
+/// The one-line declaration that tells two same-named candidates apart.
+///
+/// A location says where a candidate lives; the declaration says what it is,
+/// which is what the caller is actually choosing between when the same name
+/// appears as several overloads or trait implementations. Bounded so one
+/// ambiguity refusal cannot carry an unbounded signature dump.
+fn candidate_declaration(entity: &kin_model::Entity) -> String {
+    /// Long enough for a real signature, short enough that a dozen candidates
+    /// stay readable.
+    const MAX_DECLARATION: usize = 160;
+
+    let declaration = entity
+        .signature
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or(entity.name.as_str());
+    if declaration.chars().count() <= MAX_DECLARATION {
+        return declaration.to_string();
+    }
+    let truncated = declaration
+        .chars()
+        .take(MAX_DECLARATION)
+        .collect::<String>();
+    format!("{truncated}...")
 }
 
 pub const TRANSACTION_BEGIN_DESC: &str = "\
