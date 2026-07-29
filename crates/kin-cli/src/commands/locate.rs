@@ -1272,7 +1272,7 @@ pub async fn run(
     // Persist the paging cursor so `kin locate --next` can fetch the next page
     // without the caller re-supplying the query. Best-effort; never fatal.
     super::locate_cursor::persist_locate_cursor(result.next_cursor.as_deref());
-    output_result(&result, json);
+    output_result(&result, json, explain);
     Ok(())
 }
 
@@ -1428,7 +1428,7 @@ pub fn run_with_graph(
     max_files_explicit: bool,
 ) -> Result<()> {
     let result = run_with_graph_capture(graph, text, explain, max_files, max_files_explicit)?;
-    output_result(&result, json);
+    output_result(&result, json, explain);
     Ok(())
 }
 
@@ -15756,18 +15756,37 @@ fn coverage_banner(coverage: &SemanticCoverage) -> Option<String> {
     }))
 }
 
-fn output_result(result: &LocateResult, json: bool) {
+fn output_result(result: &LocateResult, json: bool, explain: bool) {
     if json {
         println!(
             "{}",
             serde_json::to_string_pretty(result).unwrap_or_default()
         );
     } else {
-        output_text(result);
+        output_text(result, explain);
     }
 }
 
-fn output_text(result: &LocateResult) {
+/// Render the ranked file list for the human surface.
+///
+/// `result.files` order IS the ranking, and it is the same order the JSON
+/// surface serializes, so the two surfaces agree by construction. That order is
+/// composed, not score-sorted: `adaptive_cap` emits the score-ordered cluster
+/// prefix and then appends re-admission groups (corroborated-past-cap, then
+/// pre-compression readmits ranked by their *uncompressed* evidence), and
+/// `fuse_locate_results` orders by fused RRF score while each row keeps the
+/// composite score of its best-ranked variant. A row's `score` is therefore an
+/// artifact of the stage that admitted it and is not comparable against a row
+/// admitted by a different stage.
+///
+/// Printing that score beside every row implied a sort key the list does not
+/// use, so a higher-scored row appearing below a lower-scored one read as a
+/// sorting bug. Re-sorting by the printed score is not the fix: it would
+/// discard the composed ranking and split the human surface from JSON. Instead
+/// the emitted rank is explicit, and the per-row score is held back for
+/// `--explain`, where it is one diagnostic among the per-signal and per-stage
+/// breakdowns rather than an implied ordering.
+fn output_text(result: &LocateResult, explain: bool) {
     // 0.1-R5: surface degraded semantic coverage on the main path. Written to
     // stderr so the stdout file list stays clean for piping.
     if let Some(banner) = result.semantic_coverage.as_ref().and_then(coverage_banner) {
@@ -15797,19 +15816,44 @@ fn output_text(result: &LocateResult) {
         return;
     }
 
-    for entry in &result.files {
-        println!(
-            "  {:<50} (score: {:.2}, signals: {})",
-            entry.path,
-            entry.score,
-            entry.signals.join(", ")
+    if explain {
+        eprintln!(
+            "ℹ ranked order is authoritative; per-row scores are stage-composed \
+and are not comparable between rows"
         );
-        if !entry.explain.is_empty() {
-            for reason in &entry.explain {
-                println!("    - {}", reason);
-            }
+    }
+
+    for line in locate_text_lines(result, explain) {
+        println!("{}", line);
+    }
+}
+
+/// The stdout lines `output_text` prints for the ranked file list, in order.
+///
+/// Split out from the printing so the emitted order and row shape are directly
+/// testable. Rows keep `result.files` order; see [`output_text`] for why that
+/// order is authoritative and why the per-row score is `--explain` only.
+fn locate_text_lines(result: &LocateResult, explain: bool) -> Vec<String> {
+    let mut lines = Vec::new();
+    for (index, entry) in result.files.iter().enumerate() {
+        let rank = index + 1;
+        let signals = entry.signals.join(", ");
+        if explain {
+            lines.push(format!(
+                "  {:>3}. {:<50} (score: {:.2}, signals: {})",
+                rank, entry.path, entry.score, signals
+            ));
+        } else {
+            lines.push(format!(
+                "  {:>3}. {:<50} (signals: {})",
+                rank, entry.path, signals
+            ));
+        }
+        for reason in &entry.explain {
+            lines.push(format!("    - {}", reason));
         }
     }
+    lines
 }
 
 #[cfg(test)]
@@ -16380,6 +16424,121 @@ mod tests {
         );
         bound_fused_declaration_to_primary(&mut fused, 10, false);
         assert_eq!(fused.files.len(), 3, "larger budget is a no-op");
+    }
+
+    /// A ranking whose emitted order is deliberately not score-descending, the
+    /// shape `adaptive_cap` produces when it appends a pre-compression readmit
+    /// (strong uncompressed evidence, compressed live score) below a
+    /// corroborated row that scored lower.
+    fn non_monotonic_ranking() -> LocateResult {
+        let entry = |path: &str, score: f32| -> LocateFileEntry {
+            serde_json::from_value(serde_json::json!({
+                "path": path,
+                "score": score,
+                "signals": ["lexical", "graph"],
+            }))
+            .expect("minimal file entry deserializes")
+        };
+        let mut result = LocateResult::default();
+        result.files = vec![
+            entry("src/top.rs", 120.00),
+            entry("src/corroborated.rs", 45.79),
+            entry("src/readmitted.rs", 85.10),
+        ];
+        result
+    }
+
+    #[test]
+    fn locate_text_rows_keep_ranked_order_over_printed_score() {
+        let result = non_monotonic_ranking();
+        let lines = locate_text_lines(&result, false);
+        let paths: Vec<&str> = lines
+            .iter()
+            .map(|line| line.split_whitespace().nth(1).unwrap())
+            .collect();
+        assert_eq!(
+            paths,
+            vec!["src/top.rs", "src/corroborated.rs", "src/readmitted.rs"],
+            "rows follow the composed ranking, not the printed score: {lines:?}"
+        );
+        assert!(
+            lines[0].starts_with("    1. "),
+            "rank is explicit and 1-based: {:?}",
+            lines[0]
+        );
+        assert!(
+            lines[2].starts_with("    3. "),
+            "rank keeps counting with the emitted order: {:?}",
+            lines[2]
+        );
+    }
+
+    #[test]
+    fn locate_text_rows_omit_incomparable_score_by_default() {
+        let lines = locate_text_lines(&non_monotonic_ranking(), false);
+        for line in &lines {
+            assert!(
+                !line.contains("score:"),
+                "a cross-row-incomparable score must not imply a sort key: {line:?}"
+            );
+            assert!(
+                line.contains("(signals: lexical, graph)"),
+                "signals still explain why a row was admitted: {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn locate_text_rows_carry_score_under_explain() {
+        let lines = locate_text_lines(&non_monotonic_ranking(), true);
+        assert!(
+            lines[1].contains("(score: 45.79, signals: lexical, graph)"),
+            "explain keeps the score as a diagnostic: {:?}",
+            lines[1]
+        );
+        assert!(
+            lines[2].contains("(score: 85.10, signals: lexical, graph)"),
+            "explain keeps the score as a diagnostic: {:?}",
+            lines[2]
+        );
+    }
+
+    #[test]
+    fn locate_text_order_matches_json_order() {
+        let result = non_monotonic_ranking();
+        let json: serde_json::Value =
+            serde_json::to_value(&result).expect("locate result serializes");
+        let json_paths: Vec<String> = json["files"]
+            .as_array()
+            .expect("files array")
+            .iter()
+            .map(|f| f["path"].as_str().expect("path string").to_string())
+            .collect();
+        let text_paths: Vec<String> = locate_text_lines(&result, false)
+            .iter()
+            .map(|line| line.split_whitespace().nth(1).unwrap().to_string())
+            .collect();
+        assert_eq!(
+            text_paths, json_paths,
+            "the human and JSON surfaces must present one ranking"
+        );
+    }
+
+    #[test]
+    fn locate_text_indents_explain_reasons_under_their_row() {
+        let mut result = non_monotonic_ranking();
+        result.files[0].explain = vec!["seeded by entity resolve".to_string()];
+        let lines = locate_text_lines(&result, true);
+        assert!(lines[0].contains("src/top.rs"), "{:?}", lines[0]);
+        assert_eq!(
+            lines[1], "    - seeded by entity resolve",
+            "reasons stay attached to the row above them"
+        );
+        assert!(
+            lines[2].contains("src/corroborated.rs"),
+            "the next ranked row follows its predecessor's reasons: {:?}",
+            lines[2]
+        );
     }
 
     #[test]
