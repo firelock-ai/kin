@@ -874,6 +874,13 @@ pub struct DaemonState {
     pub layout: KinLayout,
     pub graph: Arc<kin_db::InMemoryGraph>,
     pub blobs: Arc<BlobStore>,
+    /// Why the derived ingestion CAS could not be hydrated from graph
+    /// authority when this state was opened, if it could not.
+    ///
+    /// Projection reads name this instead of surfacing a bare missing-blob
+    /// error, so an un-hydrated store is reported as the authority gap it is
+    /// rather than as a mysteriously absent object.
+    ingest_cas_hydration_gap: Option<String>,
     pub reconciler: RwLock<Reconciler>,
     /// Cached FileLayouts for all tracked files.
     /// Populated on init, updated on commits.
@@ -1427,7 +1434,43 @@ impl DaemonState {
                 )));
             }
         }
+        // Hydration is a bulk import: the store defers each blob's directory
+        // barrier and amortizes them across shards, so one commit point here
+        // makes every name it just installed durable for the cost of at most
+        // one barrier per shard touched.
+        blobs.sync().map_err(DaemonError::from)?;
         Ok(hydrated.len())
+    }
+
+    /// Hydrate the derived ingestion CAS for a graph opened through a storage
+    /// backend.
+    ///
+    /// The local path hydrates from repository authority so every blob the
+    /// projection later reads is present before the daemon serves anything.
+    /// The backend path reads the same store through `rebuild_projection` and
+    /// `refresh_projection` but used to open against whatever happened to be
+    /// on local disk, which on a fresh hosted instance is nothing.
+    ///
+    /// Returns the number of source bodies hydrated, or the reason the hosted
+    /// backend could not supply them. A graph with no resolved artifacts needs
+    /// no authority at all, which is the ordinary empty-hosted-graph case.
+    fn hydrate_backend_ingest_cas(
+        repo_id: &str,
+        backend: &Arc<dyn StorageBackend>,
+        graph: &kin_db::InMemoryGraph,
+        blobs: &BlobStore,
+    ) -> std::result::Result<usize, String> {
+        let tree = graph.resolved_tree();
+        if tree.is_empty() {
+            return Ok(0);
+        }
+        let repository_id = RepositoryId::new(repo_id.to_string())
+            .map_err(|error| format!("invalid repository identity {repo_id}: {error}"))?;
+        let authority = RepositoryAuthorityManager::open(repository_id, Arc::clone(backend))
+            .map_err(|error| {
+                format!("hosted backend carries no usable repository authority: {error}")
+            })?;
+        Self::hydrate_ingest_cas(&authority, &tree, blobs).map_err(|error| error.to_string())
     }
 
     /// Freeze local sibling authority capabilities before the daemon becomes
@@ -1724,6 +1767,7 @@ impl DaemonState {
             layout,
             graph,
             blobs: Arc::new(blobs),
+            ingest_cas_hydration_gap: None,
             reconciler: RwLock::new(reconciler),
             projection: RwLock::new(ProjectionState::new()),
             coordinator,
@@ -1867,6 +1911,33 @@ impl DaemonState {
             };
 
         let blobs = BlobStore::new(layout.ingest_cas_dir()).map_err(DaemonError::from)?;
+        let backend: Arc<dyn StorageBackend> = Arc::from(backend);
+        // Rehydrating the derived CAS on every open is what makes it safe to
+        // treat as a cache. That was true of the local path only; a hosted
+        // instance opened against an empty local disk and every projection read
+        // failed on a blob nothing had put there.
+        let ingest_cas_hydration_gap =
+            match Self::hydrate_backend_ingest_cas(repo_id, &backend, graph.as_ref(), &blobs) {
+                Ok(hydrated_source_bodies) => {
+                    info!(
+                        repo_id,
+                        hydrated_source_bodies,
+                        "hydrated derived ingestion CAS from hosted repository authority"
+                    );
+                    None
+                }
+                Err(reason) => {
+                    // Not fatal: a hosted graph whose backend carries no
+                    // repository authority still serves every query that does
+                    // not need source bodies. Recorded so the reads that DO
+                    // need them report this instead of a bare missing blob.
+                    warn!(
+                        repo_id,
+                        reason, "derived ingestion CAS was not hydrated on the backend open path"
+                    );
+                    Some(reason)
+                }
+            };
         // The backend path builds the graph via `from_snapshot_with_text_index`,
         // which does NOT load the vector-index sidecar — do the validated load
         // here (no-ops if no/stale sidecar).
@@ -1892,6 +1963,7 @@ impl DaemonState {
             layout,
             graph: Arc::clone(&graph),
             blobs: Arc::new(blobs),
+            ingest_cas_hydration_gap,
             reconciler: RwLock::new(reconciler),
             projection: RwLock::new(ProjectionState::new()),
             coordinator,
@@ -1907,7 +1979,7 @@ impl DaemonState {
             started_at: Instant::now(),
             is_initialized: AtomicBool::new(loaded_snapshot),
             reconciliation_status: AtomicU8::new(RECON_IDLE),
-            storage_backend: Some(Arc::from(backend)),
+            storage_backend: Some(backend),
             local_repository_backend: None,
             registered_local_repository_authorities: Vec::new(),
             registered_local_repository_authority_incomplete: false,
@@ -4107,6 +4179,35 @@ impl DaemonState {
             .unwrap_or(0)
     }
 
+    /// Name the open-path hydration gap on an error that a hydrated ingestion
+    /// CAS would not have produced.
+    ///
+    /// Without this a hosted daemon reports "cannot load graph-owned blob X",
+    /// which reads as graph corruption. The blob is fine; nothing ever put it
+    /// in this instance's derived store, and that is a different problem with a
+    /// different fix.
+    fn attribute_ingest_cas_gap(&self, error: DaemonError) -> DaemonError {
+        match &self.ingest_cas_hydration_gap {
+            Some(reason) => exact_source_storage_error(format!(
+                "{error}; the derived ingestion CAS was never hydrated on this open path: {reason}"
+            )),
+            None => error,
+        }
+    }
+
+    /// Issue the derived ingestion CAS's deferred directory barriers.
+    ///
+    /// The store defers the barrier that makes a blob's *name* durable and
+    /// amortizes it across shard directories, with three commit points:
+    /// an explicit sync, `Drop`, and a self-drain once enough renames pile up.
+    /// The daemon ends in `process::exit`, which runs no destructor, so without
+    /// an explicit call the only operative barrier is the self-drain — leaving
+    /// up to a full drain threshold of un-barriered renames behind every
+    /// shutdown, including clean ones.
+    pub fn sync_blob_store(&self) -> Result<()> {
+        self.blobs.sync().map_err(DaemonError::from)
+    }
+
     /// Rebuild projection state from the current graph.
     ///
     /// Loads every persisted [`FileLayout`] and its blob-backed base content
@@ -4121,7 +4222,7 @@ impl DaemonState {
         let tree = self.graph.resolved_tree();
         let state =
             ProjectionState::from_resolved_tree(self.graph.as_ref(), self.blobs.as_ref(), &tree)
-                .map_err(DaemonError::from)?;
+                .map_err(|error| self.attribute_ingest_cas_gap(DaemonError::from(error)))?;
         let registered = state.file_ids().len();
         *projection = state;
         info!(
@@ -4181,10 +4282,10 @@ impl DaemonState {
                 .blobs
                 .read(&kin_blobs::Hash256(*hash.as_bytes()))
                 .map_err(|error| {
-                    exact_source_storage_error(format!(
+                    self.attribute_ingest_cas_gap(exact_source_storage_error(format!(
                         "projection refresh for {file_id} cannot load graph-owned blob {}: {error}",
                         hash
-                    ))
+                    )))
                 })?;
             projection.register_file(layout, content);
             loaded += 1;

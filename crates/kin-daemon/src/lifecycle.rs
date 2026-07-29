@@ -625,6 +625,110 @@ where
 
 // ── Daemon State Files ──────────────────────────────────────────────────
 
+/// Name of the sidecar that attributes a published endpoint to one process
+/// incarnation.
+const ENDPOINT_OWNER_FILE: &str = "daemon.owner";
+
+/// Schema tag carried by [`ENDPOINT_OWNER_FILE`].
+const ENDPOINT_OWNER_SCHEMA: &str = "kin.daemon.endpoint-owner.v1";
+
+/// Who published the endpoint currently on disk.
+///
+/// `daemon.pid` holds a bare PID because every version of every Kin surface
+/// reads it that way, and a PID alone cannot survive reuse: after the recorded
+/// daemon exits, that number starts naming whatever the kernel handed it to
+/// next, and a reader comparing PIDs either preserves a dead endpoint forever
+/// or deletes a live one. This sidecar records the same process incarnation the
+/// singleton lock stamps, so ownership can be *proved* rather than inferred
+/// from a number.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct EndpointOwnerRecord {
+    schema: String,
+    identity: kin_cli::daemon_client::ProcessIdentity,
+    port: u16,
+}
+
+impl EndpointOwnerRecord {
+    fn current(port: u16) -> Option<Self> {
+        Some(Self {
+            schema: ENDPOINT_OWNER_SCHEMA.to_string(),
+            identity: kin_cli::daemon_client::current_process_identity().ok()?,
+            port,
+        })
+    }
+}
+
+/// What the on-disk endpoint says about its owner.
+///
+/// The distinction that matters is between an endpoint this process may
+/// destroy and one it may not. Only [`EndpointOwnership::CurrentProcess`]
+/// authorizes removal; every other variant means the files belong to somebody
+/// else, or to nobody this build can identify, and must be left alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndpointOwnership {
+    /// No endpoint is published: `daemon.pid` is absent.
+    Absent,
+    /// The endpoint names this exact process incarnation.
+    CurrentProcess,
+    /// The endpoint names a different owner. `live` is decided against the
+    /// recorded incarnation when an owner record exists, and against the bare
+    /// PID otherwise; an indeterminate probe reads as live, because an
+    /// uninspectable owner is not a dead one.
+    OtherProcess { pid: u32, live: bool },
+    /// An endpoint exists but names nobody: `daemon.pid` is unparseable and
+    /// there is no owner record to fall back on.
+    Unattributed,
+}
+
+impl EndpointOwnership {
+    /// Whether the calling process may delete these endpoint files.
+    pub fn authorizes_removal(self) -> bool {
+        matches!(self, Self::CurrentProcess)
+    }
+}
+
+fn read_endpoint_owner_record(kin_root: &Path) -> Option<EndpointOwnerRecord> {
+    let raw = std::fs::read_to_string(kin_root.join(ENDPOINT_OWNER_FILE)).ok()?;
+    let record: EndpointOwnerRecord = serde_json::from_str(&raw).ok()?;
+    (record.schema == ENDPOINT_OWNER_SCHEMA).then_some(record)
+}
+
+/// Classify the published endpoint's owner.
+///
+/// `daemon.pid` is what makes an endpoint *published*: a stray owner record
+/// with no PID file beside it attributes nothing, and the next publication
+/// overwrites it.
+pub fn endpoint_ownership(kin_root: &Path) -> EndpointOwnership {
+    if !kin_root.join("daemon.pid").exists() {
+        return EndpointOwnership::Absent;
+    }
+    if let Some(record) = read_endpoint_owner_record(kin_root) {
+        return match kin_cli::daemon_client::process_identity_is_current(&record.identity) {
+            Ok(true) if record.identity.pid() == std::process::id() => {
+                EndpointOwnership::CurrentProcess
+            }
+            Ok(is_current) => EndpointOwnership::OtherProcess {
+                pid: record.identity.pid(),
+                live: is_current,
+            },
+            // An identity that cannot be read at all (another user's process)
+            // is indeterminate, not dead.
+            Err(_) => EndpointOwnership::OtherProcess {
+                pid: record.identity.pid(),
+                live: true,
+            },
+        };
+    }
+    match recorded_daemon_pid(kin_root) {
+        Some(pid) if pid == std::process::id() => EndpointOwnership::CurrentProcess,
+        Some(pid) => EndpointOwnership::OtherProcess {
+            pid,
+            live: is_process_alive(pid),
+        },
+        None => EndpointOwnership::Unattributed,
+    }
+}
+
 fn write_atomic_endpoint_component(
     kin_root: &Path,
     name: &str,
@@ -636,32 +740,89 @@ fn write_atomic_endpoint_component(
     std::fs::rename(tmp, dst)
 }
 
+/// Remove every component of an endpoint the caller has already proved it may
+/// destroy — its own, or one whose recorded owner is verifiably gone.
+///
+/// Order matters on a crash: `daemon.pid` goes first because it is what makes
+/// an endpoint published, so an interrupted retirement leaves no record any
+/// reader will act on.
+fn remove_endpoint_components(kin_root: &Path) {
+    let _ = std::fs::remove_file(kin_root.join("daemon.pid"));
+    let _ = std::fs::remove_file(kin_root.join("daemon.port"));
+    let _ = std::fs::remove_file(kin_root.join(ENDPOINT_OWNER_FILE));
+}
+
 /// Publish the daemon's complete endpoint while holding lifecycle authority.
 ///
 /// Current endpoint retirement takes the same never-unlinked lock, so a
 /// successor publication cannot land between a predecessor comparison and
-/// deletion. Both temporary files are prepared before either visible component
-/// changes; on any publication failure the incomplete endpoint is removed
-/// before authority is released.
+/// deletion. Every temporary file is prepared before any visible component
+/// changes, and a failed publication rolls back only the components this call
+/// actually installed — an endpoint belonging to a process that is still
+/// running is never in that set.
 pub fn publish_daemon_endpoint(kin_root: &Path, port: u16) -> std::io::Result<()> {
     let _authority = acquire_singleton_coordination_guard(kin_root)?;
+    publish_daemon_endpoint_under_authority(kin_root, port)
+}
+
+fn publish_daemon_endpoint_under_authority(kin_root: &Path, port: u16) -> std::io::Result<()> {
+    // Port 0 means "the OS will pick one", never "connect here". Publishing it
+    // strands every reader on an endpoint nothing can dial, and the daemon that
+    // published it keeps refusing successors because it still owns the repo.
+    if port == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "refusing to publish an unbound daemon port",
+        ));
+    }
+    // A starter that lost the singleton must never reach this, but publication
+    // overwrites files by design, so the guarantee is asserted here rather than
+    // assumed from the call graph.
+    if let EndpointOwnership::OtherProcess { pid, live: true } = endpoint_ownership(kin_root) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("daemon endpoint for {} is owned by live pid {pid}", kin_root.display()),
+        ));
+    }
+
+    let owner = EndpointOwnerRecord::current(port)
+        .and_then(|record| serde_json::to_string(&record).ok());
     let pid = std::process::id().to_string();
     let port = port.to_string();
+
+    let mut installed: Vec<&str> = Vec::new();
     let result: std::io::Result<()> = (|| {
+        if let Some(owner) = &owner {
+            std::fs::write(kin_root.join("daemon.owner.tmp"), owner.as_bytes())?;
+        }
         std::fs::write(kin_root.join("daemon.pid.tmp"), pid.as_bytes())?;
         std::fs::write(kin_root.join("daemon.port.tmp"), port.as_bytes())?;
+        // Attribution lands before the endpoint it attributes, so the instant
+        // `daemon.pid` names this process the proof that it does is already
+        // readable.
+        if owner.is_some() {
+            std::fs::rename(
+                kin_root.join("daemon.owner.tmp"),
+                kin_root.join(ENDPOINT_OWNER_FILE),
+            )?;
+            installed.push(ENDPOINT_OWNER_FILE);
+        }
         std::fs::rename(kin_root.join("daemon.pid.tmp"), kin_root.join("daemon.pid"))?;
+        installed.push("daemon.pid");
         std::fs::rename(
             kin_root.join("daemon.port.tmp"),
             kin_root.join("daemon.port"),
         )?;
+        installed.push("daemon.port");
         Ok(())
     })();
     if result.is_err() {
+        let _ = std::fs::remove_file(kin_root.join("daemon.owner.tmp"));
         let _ = std::fs::remove_file(kin_root.join("daemon.pid.tmp"));
         let _ = std::fs::remove_file(kin_root.join("daemon.port.tmp"));
-        let _ = std::fs::remove_file(kin_root.join("daemon.pid"));
-        let _ = std::fs::remove_file(kin_root.join("daemon.port"));
+        for name in installed {
+            let _ = std::fs::remove_file(kin_root.join(name));
+        }
     }
     result
 }
@@ -672,6 +833,10 @@ pub fn publish_daemon_endpoint(kin_root: &Path, port: u16) -> std::io::Result<()
 /// PID and bound port together with [`publish_daemon_endpoint`].
 pub fn write_pid_file(kin_root: &Path) {
     if let Ok(_authority) = acquire_singleton_coordination_guard(kin_root) {
+        // A partial publication carries no port, so it cannot write an owner
+        // record. Drop any predecessor's record rather than let it attribute
+        // this PID to the wrong incarnation.
+        let _ = std::fs::remove_file(kin_root.join(ENDPOINT_OWNER_FILE));
         let _ =
             write_atomic_endpoint_component(kin_root, "daemon.pid", std::process::id().to_string());
     }
@@ -688,10 +853,15 @@ pub fn write_port_file(kin_root: &Path, port: u16) {
 }
 
 /// Read port from `.kin/daemon.port`.
+///
+/// Zero is not a port anything can connect to: it is the bind-time request for
+/// an OS-assigned port, and a record carrying it names no endpoint. Treated as
+/// unpublished, exactly as the shared spawn contract treats it.
 pub fn read_port_file(kin_root: &Path) -> Option<u16> {
     std::fs::read_to_string(kin_root.join("daemon.port"))
         .ok()
-        .and_then(|s| s.trim().parse().ok())
+        .and_then(|s| s.trim().parse::<u16>().ok())
+        .filter(|port| *port != 0)
 }
 
 /// Remove PID file, but only if it's ours (prevents removing a successor's).
@@ -699,18 +869,19 @@ pub fn remove_pid_file(kin_root: &Path) {
     let Ok(_authority) = acquire_singleton_coordination_guard(kin_root) else {
         return;
     };
-    let path = kin_root.join("daemon.pid");
-    if let Ok(content) = std::fs::read_to_string(&path) {
-        if content.trim().parse::<u32>().ok() == Some(std::process::id()) {
-            let _ = std::fs::remove_file(&path);
-        }
+    if endpoint_ownership(kin_root).authorizes_removal() {
+        let _ = std::fs::remove_file(kin_root.join("daemon.pid"));
+        let _ = std::fs::remove_file(kin_root.join(ENDPOINT_OWNER_FILE));
     }
 }
 
-/// Remove daemon endpoint files, but only if the recorded PID is this process.
+/// Remove daemon endpoint files, but only when this process can prove it
+/// published them.
 ///
-/// This avoids a shutdown race where an older daemon removes the port file for
-/// a newer successor that already replaced `daemon.pid`.
+/// Proof is the recorded process incarnation, not the PID: an endpoint whose
+/// number happens to match a recycled PID belongs to a daemon that already
+/// exited, and one whose number differs may belong to a successor that
+/// republished while this process was draining.
 pub fn remove_daemon_files_if_current_process(kin_root: &Path) {
     let Ok(_authority) = acquire_singleton_coordination_guard(kin_root) else {
         tracing::warn!(
@@ -719,17 +890,18 @@ pub fn remove_daemon_files_if_current_process(kin_root: &Path) {
         );
         return;
     };
-    let pid_path = kin_root.join("daemon.pid");
-    let belongs_to_current = std::fs::read_to_string(&pid_path)
-        .ok()
-        .and_then(|content| content.trim().parse::<u32>().ok())
-        == Some(std::process::id());
-    if !belongs_to_current {
+    let ownership = endpoint_ownership(kin_root);
+    if !ownership.authorizes_removal() {
+        if !matches!(ownership, EndpointOwnership::Absent) {
+            tracing::warn!(
+                repo = %kin_root.display(),
+                ?ownership,
+                "preserving daemon endpoint published by another process"
+            );
+        }
         return;
     }
-
-    let _ = std::fs::remove_file(pid_path);
-    let _ = std::fs::remove_file(kin_root.join("daemon.port"));
+    remove_endpoint_components(kin_root);
 }
 
 /// Is the process with this PID alive?
@@ -738,21 +910,25 @@ fn is_process_alive(pid: u32) -> bool {
 }
 
 /// Is the daemon running for this repo? Checks PID file + port reachable.
+///
+/// A dead owner's endpoint is cleared, but only against proof: the recorded
+/// incarnation is re-read under lifecycle authority and must still be the same
+/// dead owner the first read saw. A live owner — including one this process
+/// cannot inspect — keeps its files.
 pub fn daemon_is_up(kin_root: &Path) -> Option<u16> {
-    let pid: u32 = std::fs::read_to_string(kin_root.join("daemon.pid"))
-        .ok()?
-        .trim()
-        .parse()
-        .ok()?;
-    if !is_process_alive(pid) {
-        // Stale — clean up only while publication is excluded and this PID is
-        // still the endpoint owner.
-        let _authority = acquire_singleton_coordination_guard(kin_root).ok()?;
-        if recorded_daemon_pid(kin_root) == Some(pid) && !is_process_alive(pid) {
-            let _ = std::fs::remove_file(kin_root.join("daemon.pid"));
-            let _ = std::fs::remove_file(kin_root.join("daemon.port"));
+    match endpoint_ownership(kin_root) {
+        EndpointOwnership::Absent | EndpointOwnership::Unattributed => return None,
+        EndpointOwnership::CurrentProcess | EndpointOwnership::OtherProcess { live: true, .. } => {}
+        stale @ EndpointOwnership::OtherProcess { live: false, .. } => {
+            // Stale — clean up only while publication is excluded and the
+            // endpoint still names the same dead owner the verdict was formed
+            // about.
+            let _authority = acquire_singleton_coordination_guard(kin_root).ok()?;
+            if endpoint_ownership(kin_root) == stale {
+                remove_endpoint_components(kin_root);
+            }
+            return None;
         }
-        return None;
     }
     let port = read_port_file(kin_root)?;
     if is_port_open(port) {
