@@ -9,7 +9,7 @@
 //! merge-transaction record repository authority holds for this workspace.
 
 use anyhow::Result;
-use kin_model::{Hash256, MergeTransactionRecord, RepositoryId, WorkspaceId};
+use kin_model::{MergeTransactionRecord, RepositoryId, WorkspaceId};
 use serde::{Deserialize, Serialize};
 
 pub const CONFLICTS_REPORT_SCHEMA: &str = "kin.conflicts.v1";
@@ -30,10 +30,12 @@ pub struct ConflictsReport {
     /// the last merge, and "is a merge in progress" is a state check.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub record: Option<MergeTransactionRecord>,
-    /// Identity of `record`, repeated so a caller can pass it back as the lease
-    /// a later resolution is required to have been authored against.
+    /// Hex identity of `record`, repeated so a caller can pass it back as the
+    /// lease a later resolution is required to have been authored against. The
+    /// record carries the same value as bytes; this is the form `kin resolve
+    /// --expect` accepts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub record_hash: Option<Hash256>,
+    pub record_hash: Option<String>,
     pub unresolved_count: usize,
     pub resolved_count: usize,
 }

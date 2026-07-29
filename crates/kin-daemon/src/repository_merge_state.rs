@@ -134,7 +134,7 @@ fn read_conflicts(authority: &ActiveLocalRepositoryAuthority) -> Result<Conflict
             (lines, unresolved, resolved)
         }
     };
-    let record_hash = record.as_ref().map(|record| record.hash);
+    let record_hash = record.as_ref().map(|record| record.hash.to_string());
     Ok(ConflictsResponse {
         lines,
         report: Some(ConflictsReport {
