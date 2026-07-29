@@ -116,7 +116,9 @@ def load_allowlist():
     function bodies that are an IO boundary in whole, which is how a mixed
     file keeps every other line scanned even when it both answers queries and
     serves package registries and writes its own auth token. Each pin's
-    occurrence count is enforced exactly.
+    occurrence count is enforced exactly, and counted over the text the scan
+    actually reads rather than the raw file, so a pin can only ever license
+    sites the guard would otherwise report.
 
     When neither is present the whole file is exempt, which is only appropriate
     for files that are an IO boundary end to end.
@@ -170,31 +172,23 @@ def load_allowlist():
         raw_fns = item.get("allow_fn")
         policy.whole_file = raw_matches is None and raw_fns is None
 
-        source = None
+        lines = None
+        lexed = None
         if not policy.whole_file:
             try:
                 with open(source_path, "r", encoding="utf-8") as source_file:
-                    source = source_file.read()
+                    lines = source_file.readlines()
             except OSError as error:
                 errors.append(f"  entry {item['file']} could not be read: {error}")
+            else:
+                lexed = lex_lines(lines)
 
-        if raw_matches is not None and source is not None:
+        # `allow_fn` is validated first because the bodies it excuses decide
+        # which lines the scan reads, and those lines are what `allow_match`
+        # counts have to be measured against.
+        if raw_fns is not None and lexed is not None:
             try:
-                for expression, want in parse_pin_list(raw_matches, "expr").items():
-                    found = source.count(expression)
-                    if found != want:
-                        errors.append(
-                            f"  entry {item['file']} allow_match {expression!r} "
-                            f"occurs {found} times (want {want})"
-                        )
-                        continue
-                    policy.matches.add(expression)
-            except ValueError as error:
-                errors.append(f"  entry {item['file']} has an invalid allow_match: {error}")
-
-        if raw_fns is not None and source is not None:
-            try:
-                bodies = find_fn_body_ranges(source.splitlines(keepends=True))
+                bodies = find_fn_body_ranges(lines, None, lexed)
                 for name, want in parse_pin_list(raw_fns, "fn").items():
                     found = len(bodies.get(name, ()))
                     if found != want:
@@ -206,6 +200,23 @@ def load_allowlist():
                     policy.fns.add(name)
             except ValueError as error:
                 errors.append(f"  entry {item['file']} has an invalid allow_fn: {error}")
+
+        if raw_matches is not None and lexed is not None:
+            try:
+                pins = parse_pin_list(raw_matches, "expr")
+            except ValueError as error:
+                errors.append(f"  entry {item['file']} has an invalid allow_match: {error}")
+            else:
+                counts = count_pins_in_scan(lines, lexed, policy.fns, pins)
+                for expression, want in pins.items():
+                    found = counts[expression]
+                    if found != want:
+                        errors.append(
+                            f"  entry {item['file']} allow_match {expression!r} "
+                            f"occurs {found} times in scanned code (want {want})"
+                        )
+                        continue
+                    policy.matches.add(expression)
 
         try:
             exp_date = date.fromisoformat(item["expiration"])
@@ -338,16 +349,26 @@ QUERY_COMMANDS = {
 # was missing for as long as function scoping existed, and every miss was a
 # silent one in both directions: a `pub(crate)` handler named for scoping was
 # never found, and a `pub(crate)` body an allowlist entry means to excuse would
-# not resolve.
+# not resolve. The ABI string is optional inside `extern`, because bare
+# `extern fn` is valid Rust and defaults to "C".
 FN_DECL = re.compile(
     r"^\s*(?:pub(?:\s*\([^)]*\))?\s+)?(?:default\s+)?(?:const\s+)?(?:async\s+)?"
-    r"(?:unsafe\s+)?(?:extern\s+\"[^\"]*\"\s+)?fn\s+([A-Za-z0-9_]+)\s*[(<]"
+    r"(?:unsafe\s+)?(?:extern\s+(?:\"[^\"]*\"\s+)?)?fn\s+([A-Za-z0-9_]+)\s*[(<]"
 )
 
 
 def is_test_file(rel_path):
-    # Skip standalone test directories
-    if "tests/" in rel_path or "test_" in rel_path or rel_path.endswith("_test.rs"):
+    # Skip standalone test directories. Anchored to whole path segments: a
+    # substring test skipped any module whose name merely contained `test_`,
+    # so a `latest_authority.rs` would have been dropped from the scan
+    # entirely, and now that the daemon crate is scanned by default that would
+    # be silent loss of a new module rather than an exemption it already had.
+    segments = rel_path.split("/")
+    if (
+        "tests" in segments
+        or any(segment.startswith("test_") for segment in segments)
+        or rel_path.endswith("_test.rs")
+    ):
         return True
     # Skip ingestion/migration/projection boundary directories/files
     for bdir in BOUNDARY_DIRS:
@@ -404,69 +425,6 @@ PATTERNS = [
     (re.compile(r'\bstd::fs::[a-zA-Z0-9_]+'), "std::fs API usage"),
     (re.compile(r'(?<![_a-z])fs::(read|read_to_string|read_dir|metadata|write|copy|create_dir|create_dir_all|remove_file|remove_dir|remove_dir_all)\b'), "fs API usage"),
 ]
-
-
-def find_fn_body_ranges(lines, fn_names=None):
-    """Return {name: [(first_line, last_line), ...]} for function bodies.
-
-    Line numbers are inclusive and 0-based, and bounds are tracked by brace
-    depth from the function's opening brace to its matching close. With
-    `fn_names` only those names are collected; without it, every declaration is,
-    which is what validation counts.
-
-    A declaration with no body, a trait method or an `extern` signature ending
-    in `;`, is skipped. Brace counting alone would find no opening brace and
-    run the "body" to end of file, so a name that matched such a signature would
-    exempt everything after it. The terminating `;` is only recognised outside
-    parentheses and brackets, so a `[u8; 32]` parameter is not mistaken for one.
-    """
-    found = {}
-    n = len(lines)
-    i = 0
-    while i < n:
-        m = FN_DECL.match(lines[i])
-        if not m or (fn_names is not None and m.group(1) not in fn_names):
-            i += 1
-            continue
-
-        depth = 0
-        started = False
-        bodyless = False
-        nesting = 0
-        j = i
-        while j < n:
-            line = lines[j]
-            if not started:
-                stop = -1
-                for pos, ch in enumerate(line):
-                    if ch in "([":
-                        nesting += 1
-                    elif ch in ")]":
-                        nesting -= 1
-                    elif ch == "{" and nesting <= 0:
-                        break
-                    elif ch == ";" and nesting <= 0:
-                        stop = pos
-                        break
-                if stop >= 0:
-                    bodyless = True
-                    break
-            opens = line.count("{")
-            closes = line.count("}")
-            if opens > 0:
-                started = True
-            if started:
-                depth += opens - closes
-                if depth <= 0:
-                    break
-            j += 1
-
-        if bodyless:
-            i = j + 1
-            continue
-        found.setdefault(m.group(1), []).append((i, j))
-        i = j + 1
-    return found
 
 
 class LexState:
@@ -595,32 +553,136 @@ def split_code(line, st):
     return "".join(structure), "".join(code)
 
 
-def scan_file(filepath, rel_path, exempt_fn_names=None, allowed_matches=None):
-    violations = []
+def lex_lines(lines):
+    """Return [(structure, code), ...]: one lexer pass over a whole file.
 
-    with open(filepath, "r", encoding="utf-8") as f:
-        lines = f.readlines()
-
-    # Function scoping is an opt-out, not an opt-in. Every line is scanned
-    # except the bodies the allowlist declares to be a boundary, so a handler
-    # added to a mixed file is covered without anyone remembering to list it.
-    exempt_ranges = []
-    if exempt_fn_names:
-        for ranges in find_fn_body_ranges(lines, exempt_fn_names).values():
-            exempt_ranges.extend(ranges)
-
+    Everything that needs a file's lexical form shares this pass — brace depth
+    for function bodies, the scan's own structure tracking, and the projection
+    allowlist counts are measured against — so the three cannot disagree about
+    where a string literal ends.
+    """
     lex = LexState()
+    return [split_code(line, lex) for line in lines]
+
+
+# The declaration as it survives comment and literal stripping. `structure`
+# drops the ABI string from `extern "C" fn`, so FN_DECL is matched against the
+# raw line and this against the stripped one: the raw match reads the shape, and
+# this confirms the shape is code rather than prose.
+FN_IN_STRUCTURE = re.compile(r"\bfn\s+([A-Za-z0-9_]+)")
+
+
+def find_fn_body_ranges(lines, fn_names=None, lexed=None):
+    """Return {name: [(first_line, last_line), ...]} for function bodies.
+
+    Line numbers are inclusive and 0-based, and bounds are tracked by brace
+    depth from the function's opening brace to its matching close. With
+    `fn_names` only those names are collected; without it, every declaration is,
+    which is what validation counts.
+
+    Depth is counted on the lexically stripped `structure`, never on the raw
+    line. Braces inside string literals, char literals, raw strings, and
+    comments used to count, and the failure direction was silent
+    over-exemption: one `{` that never closed walked the range to `len(lines)`,
+    so a body's exemption covered every line after its declaration while the
+    summary line and the exit status stayed identical to a clean run. `scan_file`
+    already read `structure` for exactly this reason. This counter did not, and
+    it is the one function scoping resolves exemptions with, which is the whole
+    of an `allow_fn` entry's meaning.
+
+    A declaration only counts if it survives the strip. `fn foo() {` inside a
+    block comment or a raw string is prose, and counting it as a body measured
+    the exact-count property over non-code.
+
+    A body whose closing brace is never found is dropped rather than returned as
+    a range reaching end of file. Dropping is the loud direction: an `allow_fn`
+    pin then resolves to zero bodies and fails validation, and the scan applies
+    no exemption at all, so the file is reported in full.
+    """
+    if lexed is None:
+        lexed = lex_lines(lines)
+    found = {}
+    n = len(lines)
+    i = 0
+    while i < n:
+        m = FN_DECL.match(lines[i])
+        if not m or (fn_names is not None and m.group(1) not in fn_names):
+            i += 1
+            continue
+        in_code = FN_IN_STRUCTURE.search(lexed[i][0])
+        if in_code is None or in_code.group(1) != m.group(1):
+            i += 1
+            continue
+
+        depth = 0
+        started = False
+        closed = False
+        bodyless = False
+        nesting = 0
+        j = i
+        while j < n:
+            structure = lexed[j][0]
+            if not started:
+                # A declaration with no body, a trait method or an `extern`
+                # signature ending in `;`, is skipped. Brace counting alone
+                # would find no opening brace and run the "body" to end of
+                # file, so a name that matched such a signature would exempt
+                # everything after it. The terminating `;` is only recognised
+                # outside parentheses and brackets, so a `[u8; 32]` parameter is
+                # not mistaken for one.
+                stop = -1
+                for pos, ch in enumerate(structure):
+                    if ch in "([":
+                        nesting += 1
+                    elif ch in ")]":
+                        nesting -= 1
+                    elif ch == "{" and nesting <= 0:
+                        break
+                    elif ch == ";" and nesting <= 0:
+                        stop = pos
+                        break
+                if stop >= 0:
+                    bodyless = True
+                    break
+            opens = structure.count("{")
+            closes = structure.count("}")
+            if opens > 0:
+                started = True
+            if started:
+                depth += opens - closes
+                if depth <= 0:
+                    closed = True
+                    break
+            j += 1
+
+        if bodyless:
+            i = j + 1
+            continue
+        if not closed:
+            # Malformed input rather than a body. Resume at the next line so
+            # every other declaration in the file still resolves and reports.
+            i += 1
+            continue
+        found.setdefault(m.group(1), []).append((i, j))
+        i = j + 1
+    return found
+
+
+def scannable_lines(lexed):
+    """Yield (index, code) for every line the scan reads, index 0-based.
+
+    Test modules and `#[test]` attributes are skipped here rather than in the
+    caller so that allowlist pin counts and the scan itself are measured over
+    exactly the same text. A count taken over the raw file measured a superset:
+    test-module and commented-out occurrences counted toward a pin's budget
+    without ever being sites the pin could license, and removing one from a test
+    then silently released budget for a real filesystem probe in a scanned path.
+    """
     in_test_module = False
     brace_depth = 0
     test_module_brace_depth = -1
 
-    for idx, line in enumerate(lines, 1):
-        # Comments and literals are removed lexically rather than by substring
-        # search. A `//` or `/*` inside a string literal used to truncate the
-        # line or latch block-comment mode on to EOF, desynchronising brace
-        # depth so the scanner believed it had entered `mod tests` and quietly
-        # stopped enforcing for the rest of the file.
-        structure, line = split_code(line, lex)
+    for idx, (structure, code) in enumerate(lexed):
         stripped = structure.strip()
 
         # Track test module to ignore test code inside source files
@@ -642,28 +704,88 @@ def scan_file(filepath, rel_path, exempt_fn_names=None, allowed_matches=None):
         if stripped.startswith("#[test]"):
             continue
 
-        # Skip the function bodies the allowlist declares to be a boundary.
-        if any(lo <= (idx - 1) <= hi for lo, hi in exempt_ranges):
+        yield idx, code
+
+
+def mask_pins(line, pins):
+    """Blank every pinned expression out of one line, returning (line, hits).
+
+    Only the exact, count-validated boundary expression is masked. The remainder
+    of the line stays authoritative: a second filesystem read beside an allowed
+    one must still fail rather than inheriting a whole-line exemption.
+
+    Longest first, so a pin that is a substring of another cannot mask the
+    shorter one's bytes out from under it and leave the longer pin unmatched,
+    which also makes the result independent of set iteration order. Counting and
+    scanning both go through here, so a pin can never be counted at a site the
+    scan would not have masked.
+    """
+    hits = {}
+    if not pins:
+        return line, hits
+    for pin in sorted(pins, key=len, reverse=True):
+        offset = line.find(pin)
+        while offset >= 0:
+            line = line[:offset] + (" " * len(pin)) + line[offset + len(pin) :]
+            hits[pin] = hits.get(pin, 0) + 1
+            offset = line.find(pin, offset + len(pin))
+    return line, hits
+
+
+def exempt_body_ranges(lines, exempt_fn_names, lexed):
+    """Line ranges the allowlist declares to be a boundary in whole.
+
+    Function scoping is an opt-out, not an opt-in. Every line is scanned except
+    these, so a handler added to a mixed file is covered without anyone
+    remembering to list it.
+    """
+    ranges = []
+    if exempt_fn_names:
+        for spans in find_fn_body_ranges(lines, exempt_fn_names, lexed).values():
+            ranges.extend(spans)
+    return ranges
+
+
+def count_pins_in_scan(lines, lexed, exempt_fn_names, pins):
+    """Count each pin at the sites the scan would actually mask.
+
+    The scan reads neither test modules nor comments, and never reads a body
+    `allow_fn` excused, so a count taken over the raw file measures a superset
+    of what the pin licenses. That difference is not cosmetic, it is budget: a
+    `.metadata()` pin declaring 19 while the scan read only 6 of those sites
+    carried thirteen occurrences of slack, so deleting one from a test module
+    could be offset by adding a genuine filesystem probe to a scanned planning
+    path with the declared count unchanged and the guard green.
+    """
+    ranges = exempt_body_ranges(lines, exempt_fn_names, lexed)
+    counts = {pin: 0 for pin in pins}
+    for idx, code in scannable_lines(lexed):
+        if any(lo <= idx <= hi for lo, hi in ranges):
+            continue
+        for pin, hits in mask_pins(code, pins)[1].items():
+            counts[pin] += hits
+    return counts
+
+
+def scan_file(filepath, rel_path, exempt_fn_names=None, allowed_matches=None):
+    violations = []
+
+    with open(filepath, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+
+    # Comments and literals are removed lexically rather than by substring
+    # search. A `//` or `/*` inside a string literal used to truncate the line
+    # or latch block-comment mode on to EOF, desynchronising brace depth so the
+    # scanner believed it had entered `mod tests` and quietly stopped enforcing
+    # for the rest of the file.
+    lexed = lex_lines(lines)
+    ranges = exempt_body_ranges(lines, exempt_fn_names, lexed)
+
+    for idx, line in scannable_lines(lexed):
+        if any(lo <= idx <= hi for lo, hi in ranges):
             continue
 
-        # Mask only the exact, count-validated boundary expression. The
-        # remainder of the line stays authoritative: a second filesystem read
-        # beside an allowed one must still fail rather than inheriting a
-        # whole-line exemption.
-        scan_line = line
-        if allowed_matches:
-            # Longest first, so a pin that is a substring of another cannot mask
-            # the shorter one's bytes out from under it and leave the longer pin
-            # unmatched. Also makes the result independent of set iteration order.
-            for match in sorted(allowed_matches, key=len, reverse=True):
-                offset = scan_line.find(match)
-                while offset >= 0:
-                    scan_line = (
-                        scan_line[:offset]
-                        + (" " * len(match))
-                        + scan_line[offset + len(match) :]
-                    )
-                    offset = scan_line.find(match, offset + len(match))
+        scan_line = mask_pins(line, allowed_matches)[0]
 
         # Scan for patterns. A line can match several primitives at once
         # (`std::fs::read_dir` is both an fs call and a traversal); report the
@@ -671,7 +793,7 @@ def scan_file(filepath, rel_path, exempt_fn_names=None, allowed_matches=None):
         # tracks offending lines rather than pattern hits.
         descs = [desc for pattern, desc in PATTERNS if pattern.search(scan_line)]
         if descs:
-            violations.append((idx, line.strip(), ", ".join(dict.fromkeys(descs))))
+            violations.append((idx + 1, line.strip(), ", ".join(dict.fromkeys(descs))))
 
     return violations
 

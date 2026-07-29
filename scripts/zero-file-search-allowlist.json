@@ -174,15 +174,17 @@
     },
     {
       "file": "crates/kin-daemon/src/api.rs",
-      "reason": "Daemon RPC surface. This file is the answer authority every agent, editor, and CLI reaches Kin through, so it is scanned in full and only these five function bodies are excused, each an explicit IO boundary that produces no query answer. (1) npm_registry_routes and (2) router_with_auth create the package-registry cache directories (npm, packages, crates, oci, go) the daemon then serves from; directory creation is materialization, not answer-by-search. (3) health canonicalizes the bound repository root and reports the daemon pid for the status payload, a diagnostic whose subject is the local install rather than the repository. (4) ensure_loopback_token reads, creates, and chmods the loopback bearer token so a local client can authenticate before any graph consult. (5) attach_search_bodies trips only on the authority lease's metadata accessor: the entity bodies it attaches resolve through the graph-owned workspace tree to a blob digest and load from the blob store, never from the working tree. Function-scoped rather than whole-file, which is the point of the entry: the locate, search, context, trace, impact, review, verify, and MCP handler bodies, and any handler added later, are scanned by default.",
+      "reason": "Daemon RPC surface. This file is the answer authority every agent, editor, and CLI reaches Kin through, so it is scanned in full and only these four function bodies are excused, each an explicit IO boundary that produces no query answer. (1) npm_registry_routes and (2) router_with_auth create the package-registry cache directories (npm, packages, crates, oci, go) the daemon then serves from; directory creation is materialization, not answer-by-search. (3) health canonicalizes the bound repository root and reports the daemon pid for the status payload, a diagnostic whose subject is the local install rather than the repository. (4) ensure_loopback_token reads, creates, and chmods the loopback bearer token so a local client can authenticate before any graph consult. The single expression pin is the one `.metadata()` in scanned code, the authority lease accessor in attach_search_bodies, reached as `lease` broken across lines by rustfmt so the receiver cannot be written into the pin: the entity bodies that function attaches resolve through the graph-owned workspace tree to a blob digest and load from the blob store, never from the working tree. It is pinned rather than exempted by body deliberately, because a search answer path is the most sensitive site in this policy and must not have twenty-nine lines excused from every primitive to license one method call whose name the deny set matches by accident. Function-scoped rather than whole-file, which is the point of the entry: the locate, search, context, trace, impact, review, verify, and MCP handler bodies, and any handler added later, are scanned by default.",
       "owner": "kin-daemon",
       "expiration": "2026-12-31",
       "allow_fn": [
         "npm_registry_routes",
         "router_with_auth",
         "health",
-        "ensure_loopback_token",
-        "attach_search_bodies"
+        "ensure_loopback_token"
+      ],
+      "allow_match": [
+        ".metadata()"
       ]
     },
     {
@@ -361,13 +363,13 @@
     },
     {
       "file": "crates/kin-daemon/src/repository_commit.rs",
-      "reason": "Repository authority lease accessor, not a filesystem probe. Every `.metadata()` in this module is called on a repository-v6 authority lease and returns graph-owned authority metadata: the workspace set, ref state, and operation receipts. It shares a method name with the filesystem metadata probe in the shared deny set, which is the only reason it appears here. The module carries no raw filesystem primitive at all: no read, open, traversal, existence probe, or subprocess. Pinned by exact occurrence count instead of exempting the surrounding function bodies, so every planning and replay path in the module stays scanned and any new `.metadata()` call, filesystem or not, fails the guard until it is re-justified. The count covers the module's test paths as well as its planning and recovery paths, so a new call in either fails the guard.",
+      "reason": "Repository authority lease accessor, not a filesystem probe. Every `.metadata()` in this module is called on a repository-v6 authority lease and returns graph-owned authority metadata: the workspace set, ref state, and operation receipts. It shares a method name with the filesystem metadata probe in the shared deny set, which is the only reason it appears here. The module carries no raw filesystem primitive at all: no read, open, traversal, existence probe, or subprocess. Pinned by exact occurrence count instead of exempting the surrounding function bodies, so every planning and replay path in the module stays scanned and any new `.metadata()` call, filesystem or not, fails the guard until it is re-justified. The count is the six occurrences in scanned code. It deliberately does not cover the module's test paths, which the guard never reads: counting those too would have let a routine test refactor release budget for a real filesystem probe in a scanned path without changing the declared number.",
       "owner": "kin-daemon",
       "expiration": "2026-12-31",
       "allow_match": [
         {
           "expr": ".metadata()",
-          "count": 19
+          "count": 6
         }
       ]
     },
