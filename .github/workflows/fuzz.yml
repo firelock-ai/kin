@@ -10,13 +10,24 @@
 # The invariant under test is that the parser is total on arbitrary input -- it
 # returns a value or a handled error and never panics, crashes, or hits UB.
 #
-# Triggers:
-#   - pull_request touching the parser crate or the harness: a short smoke per
-#     target keeps regressions out of `main` without slowing every PR.
-#   - schedule (weekly): a longer bounded campaign for drift detection.
-#   - workflow_dispatch: on-demand runs.
+# Triggers, and what each one is for:
+#   - pull_request: BUILD ONLY, no campaign. The fuzz package is a detached
+#     workspace, so nothing in the ordinary `cargo build --workspace` / clippy
+#     gate ever compiles these targets; this is the only pre-merge check that
+#     they still match the surface they exercise. Compiling is cheap and
+#     deterministic, whereas a timed campaign on a PR spends minutes to sample a
+#     little entropy and can fail for reasons the PR did not cause.
+#   - schedule (weekly) and workflow_dispatch: build plus a bounded campaign,
+#     which is where actually looking for crashes belongs.
 #
-# Every run has a hard `-max_total_time` wall-clock cap plus a per-input
+# The pull_request paths deliberately include the dependency-pin surface and not
+# just the harness. The build last broke because a kin-model major bump in the
+# root manifest desynchronized the versions this package resolved -- a change
+# touching neither `crates/kin-parser/**` nor `fuzz/**`, so no PR run fired and
+# the breakage sat until the following weekly run. Watching the pins that the
+# harness compiles against is what puts that class of drift in front of a PR.
+#
+# Every campaign has a hard `-max_total_time` wall-clock cap plus a per-input
 # `-timeout`, so neither a single pathological input nor the campaign as a whole
 # can hang the runner.
 
@@ -29,6 +40,10 @@ on:
       - "crates/kin-parser/**"
       - "fuzz/**"
       - ".github/workflows/fuzz.yml"
+      # Root manifest carries the kin-model / tree-sitter pins kin-parser
+      # inherits; .cargo/config.toml carries the registry they resolve through.
+      - "Cargo.toml"
+      - ".cargo/config.toml"
   schedule:
     # Mondays 06:00 UTC.
     - cron: "0 6 * * 1"
@@ -54,18 +69,25 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # kin-model resolves from the Kin sparse registry ([registries.kin]). The
-      # fuzz crate is detached from the kin workspace, but Cargo still discovers
-      # the tracked .cargo/config.toml by walking up from fuzz/, so the registry
-      # is configured exactly as for a normal kin build.
+      # kin-parser's transitive kin-model resolves from the Kin sparse registry
+      # ([registries.kin]). The fuzz crate is detached from the kin workspace,
+      # but Cargo still discovers the tracked .cargo/config.toml by walking up
+      # from fuzz/, so the registry is configured exactly as for a normal kin
+      # build.
       - name: Verify kin cargo registry config
         run: |
           test -f .cargo/config.toml
           grep -q '^\[registries\.kin\]' .cargo/config.toml
 
-      # cargo-fuzz requires nightly (libFuzzer + -Zsanitizer).
+      # cargo-fuzz requires nightly (libFuzzer + -Zsanitizer), so this job cannot
+      # use the repo's pinned stable from rust-toolchain.toml. Pin a dated
+      # nightly for the same reason that file pins stable: an unpinned @nightly
+      # lets a green build turn red with no change to this repository, and the
+      # failure then has to be told apart from a real one. Bump DELIBERATELY.
       - name: Install nightly toolchain
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-06-17
 
       - name: Cache cargo registry and fuzz build
         uses: actions/cache@v6
@@ -74,29 +96,40 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             fuzz/target
-          key: ${{ runner.os }}-parser-fuzz-${{ hashFiles('fuzz/Cargo.toml', 'crates/kin-parser/**') }}
+          # Keyed on the toolchain pin as well as the sources, so bumping the
+          # nightly cannot restore objects built by the previous one. The root
+          # manifest is in the hash because it carries the dependency pins
+          # kin-parser inherits.
+          key: ${{ runner.os }}-parser-fuzz-nightly-2026-06-17-${{ hashFiles('fuzz/Cargo.toml', 'Cargo.toml', 'crates/kin-parser/**') }}
           restore-keys: |
-            ${{ runner.os }}-parser-fuzz-
+            ${{ runner.os }}-parser-fuzz-nightly-2026-06-17-
 
+      # Version-pinned alongside the toolchain: an unpinned cargo-fuzz is the
+      # same reproducibility hole as an unpinned toolchain. `--locked` pins its
+      # own dependency versions too. Deliberately still `cargo install` rather
+      # than taiki-e/install-action, which does not carry cargo-fuzz and would
+      # quietly fall back to cargo-binstall.
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
+        run: cargo install cargo-fuzz --version 0.13.1 --locked
 
       - name: Build fuzz target
-        run: cargo +nightly fuzz build ${{ matrix.target }}
+        run: cargo +nightly-2026-06-17 fuzz build ${{ matrix.target }}
 
-      # Bounded campaign: 300s/target on the weekly schedule, 60s on PRs/dispatch.
+      # Bounded campaign: 300s/target on the weekly schedule, 60s on dispatch.
+      # Skipped on pull_request, where the build step above is the whole gate.
       # `-timeout` caps any single input; `-rss_limit_mb` guards against a runaway
       # allocation aborting the runner. EVENT_NAME / TARGET are mapped through env
       # (not interpolated into the shell) per GitHub Actions injection-hardening
       # guidance.
       - name: Run bounded fuzz campaign
+        if: github.event_name != 'pull_request'
         env:
           EVENT_NAME: ${{ github.event_name }}
           TARGET: ${{ matrix.target }}
         run: |
           DURATION=60
           if [ "$EVENT_NAME" = "schedule" ]; then DURATION=300; fi
-          cargo +nightly fuzz run "$TARGET" -- \
+          cargo +nightly-2026-06-17 fuzz run "$TARGET" -- \
             -max_total_time="$DURATION" -timeout=25 -rss_limit_mb=2048
 
       - name: Upload crash artifacts on failure
