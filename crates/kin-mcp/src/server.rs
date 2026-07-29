@@ -1037,7 +1037,7 @@ async fn handle_tools_call_daemon(
 }
 
 fn finalize_daemon_graph_status(result: ToolCallResult, base_env: Envelope) -> ToolCallResult {
-    let report = match daemon_delegate::parse_graph_status_report(&result) {
+    let mut report = match daemon_delegate::parse_graph_status_report(&result) {
         Ok(Some(report)) => report,
         Ok(None) => return envelope::finalize(result, base_env, "kin_graph_status"),
         Err(error) => {
@@ -1061,6 +1061,24 @@ fn finalize_daemon_graph_status(result: ToolCallResult, base_env: Envelope) -> T
         );
     };
 
+    // A daemon owns the selected-graph report, but the stdio boundary owns
+    // `_kin`. Rebuild the successful result from the strict typed report after
+    // stripping any daemon-supplied envelope, so generic annotation cannot
+    // preserve additive or unscoped metadata from a drifted daemon.
+    report.response_envelope = None;
+    let result = match serde_json::to_string_pretty(&report) {
+        Ok(text) => ToolCallResult::text(text),
+        Err(error) => {
+            return envelope::finalize(
+                ToolCallResult::error(format!(
+                    "stdio kin_graph_status could not serialize the validated daemon report: \
+                     {error}"
+                )),
+                base_env,
+                "kin_graph_status",
+            );
+        }
+    };
     let selected_env =
         base_env.with_selected_graph_observation(entity_count, indexed, pending, total);
     let enveloped = envelope::finalize(result, selected_env, "kin_graph_status");
@@ -1263,6 +1281,46 @@ mod tests {
         assert!(
             error.to_string().contains("_kin graph_as_of")
                 || error.to_string().contains("_kin graph_state"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn graph_status_stdio_replaces_daemon_supplied_envelope_and_validates_coverage_note() {
+        let enveloped =
+            finalize_daemon_graph_status(direct_graph_status_result(), Envelope::daemon());
+        let ContentBlock::Text { text } = &enveloped.content[0];
+        let mut payload: serde_json::Value = serde_json::from_str(text).unwrap();
+        payload["_kin"]["graph_state"]["head_generation"] = serde_json::json!(77);
+
+        let sanitized = finalize_daemon_graph_status(
+            ToolCallResult::text(payload.to_string()),
+            Envelope::daemon(),
+        );
+        let ContentBlock::Text { text } = &sanitized.content[0];
+        let sanitized_payload: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert!(
+            sanitized_payload["_kin"]["graph_state"]
+                .get("head_generation")
+                .is_none(),
+            "daemon-supplied additive envelope metadata must be stripped"
+        );
+        daemon_delegate::parse_graph_status_report(&sanitized)
+            .expect("sanitized stdio report must validate")
+            .expect("sanitized stdio report remains a success");
+
+        let mut missing_note = sanitized_payload;
+        missing_note["_kin"]["semantic_coverage"]
+            .as_object_mut()
+            .unwrap()
+            .remove("note");
+        let error =
+            serde_json::from_value::<crate::handlers::entities::GraphStatusReport>(missing_note)
+                .expect_err("incomplete coverage must carry its selected-graph note");
+        assert!(
+            error
+                .to_string()
+                .contains("note must be present exactly when coverage is incomplete"),
             "{error}"
         );
     }

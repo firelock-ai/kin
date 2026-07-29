@@ -263,6 +263,16 @@ impl<'de> Deserialize<'de> for StatusReport {
 
 impl StatusReport {
     fn validate(&self) -> std::result::Result<(), String> {
+        if self.repository.generation != self.repository.roots.generation {
+            return Err(format!(
+                "repository.generation ({}) does not match repository.roots.generation ({})",
+                self.repository.generation, self.repository.roots.generation
+            ));
+        }
+        self.repository
+            .roots
+            .validate()
+            .map_err(|error| format!("repository.roots is invalid: {error}"))?;
         if self.semantic_enrichment.authority_generation != self.repository.generation {
             return Err(format!(
                 "semantic_enrichment.authority_generation ({}) does not match \
@@ -563,9 +573,22 @@ mod tests {
         let mut wrong_authority_generation = valid.clone();
         wrong_authority_generation["semantic_enrichment"]["authority_generation"] =
             serde_json::json!(99);
-        let mut wrong_workspace_generation = valid;
+        let mut wrong_workspace_generation = valid.clone();
         wrong_workspace_generation["semantic_enrichment"]["workspace_generation"] =
             serde_json::json!(99);
+        let mut wrong_root_generation = valid.clone();
+        wrong_root_generation["repository"]["roots"]["generation"] = serde_json::json!(99);
+        let mut wrong_root_version = valid.clone();
+        wrong_root_version["repository"]["roots"]["version"] = serde_json::json!(99);
+        let mut contradictory_presence = valid.clone();
+        contradictory_presence["semantic_enrichment"]["presence"] = serde_json::json!("present");
+        contradictory_presence["semantic_enrichment"]["entity_count"] = serde_json::json!(0);
+        contradictory_presence["semantic_enrichment"]["relation_count"] = serde_json::json!(0);
+        let mut unknown_report_field = valid.clone();
+        unknown_report_field["unversioned_extension"] = serde_json::json!(true);
+        let mut unknown_enrichment_field = valid;
+        unknown_enrichment_field["semantic_enrichment"]["unversioned_extension"] =
+            serde_json::json!(true);
 
         for (payload, expected) in [
             (wrong_authority, "unsupported status authority"),
@@ -580,6 +603,23 @@ mod tests {
             (
                 wrong_workspace_generation,
                 "does not match workspace.generation",
+            ),
+            (
+                wrong_root_generation,
+                "does not match repository.roots.generation",
+            ),
+            (wrong_root_version, "repository.roots is invalid"),
+            (
+                contradictory_presence,
+                "presence is present despite zero entity/relation counts",
+            ),
+            (
+                unknown_report_field,
+                "unknown field `unversioned_extension`",
+            ),
+            (
+                unknown_enrichment_field,
+                "unknown field `unversioned_extension`",
             ),
         ] {
             let error = serde_json::from_value::<StatusReport>(payload)

@@ -2737,6 +2737,12 @@ impl GraphStatusReport {
         {
             return Err("_kin semantic_coverage disagrees with selected-graph status".to_string());
         }
+        if coverage.note.is_some() == complete {
+            return Err(
+                "_kin semantic_coverage.note must be present exactly when coverage is incomplete"
+                    .to_string(),
+            );
+        }
         Ok(())
     }
 }
@@ -2787,6 +2793,7 @@ pub fn handle_daemon_graph_status_observation(
         completion_attested: false,
         response_envelope: None,
     };
+    report.validate().map_err(crate::McpError::Other)?;
     Ok(ToolCallResult::text(serde_json::to_string_pretty(&report)?))
 }
 
@@ -3992,6 +3999,28 @@ mod tests {
         assert_eq!(report.embeddings_total, embeddings.total);
         assert!(!report.completion_attested);
         assert!(report.response_envelope.is_none());
+    }
+
+    #[test]
+    fn daemon_graph_status_rejects_an_impossible_observation_before_serializing() {
+        let error = handle_daemon_graph_status_observation(
+            GraphStatusScope::Head,
+            GraphStatusObservation {
+                authority_epoch: 42,
+                entity_count: 2,
+                relation_count: 1,
+                embeddings_indexed: 3,
+                embeddings_pending: 0,
+                embeddings_total: 2,
+            },
+        )
+        .expect_err("the direct daemon boundary must reject impossible coverage");
+        assert!(
+            error
+                .to_string()
+                .contains("embeddings_indexed (3) exceeds embeddings_total (2)"),
+            "{error}"
+        );
     }
 
     #[test]

@@ -1416,10 +1416,12 @@ const GRAPH_STATUS_STABLE_READ_ATTEMPTS: usize = 3;
 /// request.
 ///
 /// Entity/relation mutations participate in the daemon's graph-authority
-/// seqlock. Embedding queue/vector mutations use `embedding_work`. Holding the
-/// latter while reading all counters, then revalidating the former and the
-/// selected HEAD/session graph, gives the MCP layer one coherent observation
-/// without asking kin-mcp to reread a mutable graph.
+/// seqlock. Normal foreground/background embedding passes use
+/// `embedding_work`; kin-db's own queue/vector locks keep reset and startup
+/// requeue transitions structurally valid. Holding the outer lock while reading
+/// all counters, then revalidating the graph epoch and selected HEAD/session
+/// graph, prevents a normal embedding pass or graph mutation from spanning the
+/// published observation without asking kin-mcp to reread a mutable graph.
 async fn mcp_graph_status_with_stable_authority(
     state: &DaemonState,
     session_id: Option<&SessionId>,
