@@ -6,7 +6,7 @@ mod error;
 pub use error::BlobError;
 
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -118,13 +118,17 @@ pub struct BlobStore {
 /// barrier no matter how many renames landed in it since the last one.
 #[derive(Default)]
 struct PendingDirSyncs {
-    /// Two-hex-character shard directory names holding a pending rename.
-    shards: BTreeSet<String>,
+    /// Two-hex-character shard directory names holding pending renames, each
+    /// mapped to how many renames are waiting on that shard's barrier. The
+    /// per-shard count is what lets a failed barrier put back exactly the
+    /// renames it did not make durable.
+    shards: BTreeMap<String, usize>,
     /// Whether the store root holds a shard directory creation that is not yet
     /// durable. A lost shard directory loses every blob beneath it the same way
     /// a lost rename loses one, so the root drains on the same schedule.
     root: bool,
-    /// Renames recorded since the last drain.
+    /// Renames awaiting a barrier: the sum of `shards`' counts, cached here so
+    /// the drain check stays O(1) per write.
     renames: usize,
 }
 
@@ -132,10 +136,25 @@ impl PendingDirSyncs {
     /// Record one rename into `shard`, reporting whether the caller should
     /// drain now.
     fn record(&mut self, shard: &str, created_shard_dir: bool, threshold: usize) -> bool {
-        self.shards.insert(shard.to_string());
+        match self.shards.get_mut(shard) {
+            Some(renames) => *renames += 1,
+            None => {
+                self.shards.insert(shard.to_string(), 1);
+            }
+        }
         self.root |= created_shard_dir;
         self.renames += 1;
         self.renames >= threshold
+    }
+
+    /// Put `renames` renames on `shard` back after its barrier failed.
+    ///
+    /// Adds rather than overwrites: a concurrent [`BlobStore::write`] may have
+    /// recorded more renames into the same shard while the barrier was in
+    /// flight, and those are still awaiting one too.
+    fn restore(&mut self, shard: String, renames: usize) {
+        *self.shards.entry(shard).or_insert(0) += renames;
+        self.renames += renames;
     }
 }
 
@@ -258,8 +277,17 @@ impl BlobStore {
         if drain_now {
             // Bounded backstop only. The blob's bytes are already durable, so a
             // failed directory barrier does not make this write unsuccessful;
-            // the shard stays pending and a later `sync`/`drop` retries it.
-            let _ = self.sync();
+            // the shard stays pending and a later `sync`/`drop` retries it. It
+            // is still worth surfacing: a barrier failing here is the signal
+            // that names are not becoming durable on schedule.
+            if let Err(e) = self.sync() {
+                warn!(
+                    root = %self.root.display(),
+                    error = %e,
+                    "deferred directory barrier failed on the write drain; \
+                     affected directories stay pending for a later sync"
+                );
+            }
         }
 
         debug!(hash = %hash, bytes = data.len(), "wrote blob");
@@ -285,8 +313,10 @@ impl BlobStore {
     /// A directory that no longer exists, pruned by [`gc`](Self::gc)
     /// compaction or removed along with the store root, has no entry left to
     /// make durable and is not an error. Any other failure is returned, and the
-    /// directories it affected stay pending so a later `sync` or the `drop`
-    /// drain retries them.
+    /// directories it affected stay pending, along with the renames counted
+    /// against them, so a later `sync` or the `drop` drain retries them and the
+    /// self-drain bound keeps counting the renames that are genuinely still
+    /// awaiting a barrier.
     pub fn sync(&self) -> Result<()> {
         let (shards, root) = {
             let mut pending = self.lock_pending();
@@ -302,7 +332,7 @@ impl BlobStore {
         let _span = tracing::info_span!("kin_blobs.sync", shards = shards.len()).entered();
 
         let mut first_error: Option<BlobError> = None;
-        let mut unsynced = BTreeSet::new();
+        let mut unsynced = Vec::new();
         let mut root_unsynced = false;
 
         if root {
@@ -314,7 +344,7 @@ impl BlobStore {
                 }
             }
         }
-        for shard in shards {
+        for (shard, renames) in shards {
             let shard_dir = self.root.join(&shard);
             match sync_dir(&shard_dir) {
                 Ok(()) => {}
@@ -324,7 +354,7 @@ impl BlobStore {
                     if first_error.is_none() {
                         first_error = Some(BlobError::io(&shard_dir, e));
                     }
-                    unsynced.insert(shard);
+                    unsynced.push((shard, renames));
                 }
             }
         }
@@ -332,7 +362,9 @@ impl BlobStore {
         if root_unsynced || !unsynced.is_empty() {
             let mut pending = self.lock_pending();
             pending.root |= root_unsynced;
-            pending.shards.extend(unsynced);
+            for (shard, renames) in unsynced {
+                pending.restore(shard, renames);
+            }
         }
         match first_error {
             Some(e) => Err(e),
@@ -675,11 +707,20 @@ impl Drop for BlobStore {
     /// Drain any deferred directory barriers.
     ///
     /// Dropping the handle is the last commit point a caller that never called
-    /// [`sync`](BlobStore::sync) will get. Failures are swallowed because
-    /// `drop` cannot report them, which matches the best-effort directory
-    /// barrier policy this store has always had.
+    /// [`sync`](BlobStore::sync) will get. Failures cannot be returned because
+    /// `drop` has nowhere to report them, which matches the best-effort
+    /// directory barrier policy this store has always had. They are logged at
+    /// `warn` regardless, because this drain has no later retry behind it and a
+    /// silent failure here is a rename that never became durable at all.
     fn drop(&mut self) {
-        let _ = self.sync();
+        if let Err(e) = self.sync() {
+            warn!(
+                root = %self.root.display(),
+                error = %e,
+                "deferred directory barrier failed on the drop drain; \
+                 renames in the affected directories may not be durable"
+            );
+        }
     }
 }
 
@@ -1745,6 +1786,88 @@ mod tests {
         store.sync().unwrap();
         assert_eq!(store.pending_snapshot(), (0, false, 0));
         drop(store); // must not panic
+    }
+
+    /// Replace the store root with a plain file, so every shard barrier fails
+    /// with `ENOTDIR`, a real failure unlike the "directory is gone" case that
+    /// `sync` forgives.
+    fn break_barriers_under(root: &Path) {
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::write(root, b"not a directory").unwrap();
+    }
+
+    /// A failed barrier must put back the *renames* it did not make durable, not
+    /// just the shard names. The self-drain bound is stated in renames, so a
+    /// counter left at zero would under-count exactly when barriers are failing:
+    /// the store would wait a further full threshold before retrying, and more
+    /// than `threshold` renames would sit unbarriered.
+    #[test]
+    fn failed_sync_restores_pending_renames_not_just_shards() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("objects");
+        // A threshold no test write can reach, so the only drain is the explicit
+        // `sync` below.
+        let store = BlobStore::with_drain_threshold(root.clone(), usize::MAX).unwrap();
+
+        for i in 0..3 {
+            store.write(format!("restore me {i}").as_bytes()).unwrap();
+        }
+        let (shards_before, _, renames_before) = store.pending_snapshot();
+        assert_eq!(renames_before, 3, "three renames await a barrier");
+        assert!(shards_before > 0);
+
+        break_barriers_under(&root);
+
+        let err = store.sync().unwrap_err();
+        assert!(
+            matches!(err, BlobError::Io { .. }),
+            "expected the barrier failure to be reported, got {err:?}"
+        );
+
+        let (shards_after, _, renames_after) = store.pending_snapshot();
+        assert_eq!(
+            shards_after, shards_before,
+            "every failed shard must stay pending"
+        );
+        assert_eq!(
+            renames_after, renames_before,
+            "and so must the renames counted against them"
+        );
+    }
+
+    /// The `drop` drain is best-effort: a failing barrier is logged, never
+    /// panicked or propagated, because `drop` has nowhere to report it.
+    #[test]
+    fn drop_drains_best_effort_when_the_barrier_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("objects");
+        let store = BlobStore::with_drain_threshold(root.clone(), usize::MAX).unwrap();
+        store.write(b"dropped with a broken barrier").unwrap();
+        assert!(store.pending_snapshot().2 > 0, "a rename is pending");
+
+        break_barriers_under(&root);
+        drop(store); // must not panic
+    }
+
+    /// Restoration adds to the pending state rather than overwriting it: `sync`
+    /// releases the lock while its barriers are in flight, so a concurrent
+    /// `write` may have recorded more renames into the very shard being put
+    /// back, and those are still awaiting a barrier too.
+    #[test]
+    fn restoring_a_failed_shard_adds_to_renames_recorded_meanwhile() {
+        let mut pending = PendingDirSyncs::default();
+        // Stands in for the write that landed while the failing barrier ran.
+        pending.record("ab", false, usize::MAX);
+        assert_eq!(pending.renames, 1);
+
+        // Two renames the failed barrier is handing back.
+        pending.restore("ab".to_string(), 2);
+
+        assert_eq!(
+            pending.renames, 3,
+            "restored renames add to the one recorded meanwhile"
+        );
+        assert_eq!(pending.shards.get("ab").copied(), Some(3));
     }
 
     // -----------------------------------------------------------------------
