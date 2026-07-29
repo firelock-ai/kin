@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -144,6 +145,174 @@ CI_JOB_DISPLAY_NAMES = {
     "check": "Check & Test",
     "coverage": "Code Coverage",
 }
+EXPECTED_WORKFLOW_JOB_DISPLAY_NAMES: dict[str, dict[str, str | None]] = {
+    ".github/workflows/approve-to-merge.yml": {
+        "gate": None,
+    },
+    ".github/workflows/ci.yml": CI_JOB_DISPLAY_NAMES,
+    ".github/workflows/daemon-smoke.yml": {
+        "daemon-smoke": "Linux Daemon Smoke + MCP Headless",
+    },
+    ".github/workflows/dco.yml": {
+        # This pull_request_target check is deliberately distinct from the
+        # release-required CI job. GitHub check names are case-sensitive:
+        # lowercase "sign-off" is extra PR evidence, never release evidence.
+        "dco": "DCO sign-off",
+    },
+    ".github/workflows/docker.yml": {
+        "build-image": "Docker Image Build (no push)",
+    },
+    ".github/workflows/fuzz.yml": {
+        "fuzz": "cargo-fuzz (${{ matrix.target }})",
+    },
+    ".github/workflows/install-proof.yml": {
+        "install-proof": "${{ matrix.os }}",
+    },
+    ".github/workflows/link-check.yml": {
+        "link-check": "Check public documentation links",
+    },
+    ".github/workflows/notify-approver.yml": {
+        "notify": None,
+    },
+    ".github/workflows/publish-release-installers.yml": {
+        "dispatch": None,
+    },
+    ".github/workflows/registry-index-migrate.yml": {
+        "migrate": None,
+    },
+    ".github/workflows/release-tag.yml": {
+        "mint-release-tag": "Mint release tag",
+    },
+    ".github/workflows/release.yml": {
+        "config": "Resolve release config",
+        "build_daemon_image": "Build immutable daemon image",
+        "attest_daemon_image": "Attest immutable daemon image",
+        "build": "Build (${{ matrix.artifact }})",
+        "notarize_linux": "Notarize macOS binaries (Linux / rcodesign)",
+        "publish": "Publish Release",
+        "install_proof": "Public Install Proof",
+        "npm_publish_preflight": "Preflight Both npm Packages",
+        "publish_npm_compatibility": (
+            "Publish npm Compatibility Wrapper (@kinlab/kin-mcp)"
+        ),
+        "publish_npm_canonical": "Publish npm Canonical Package (@kinlab/kin)",
+        "verify_npm_published": (
+            "Verify Published npm Provenance (${{ matrix.package }})"
+        ),
+        "smoke_npm_published": (
+            "Anonymous Published npm Smoke (${{ matrix.package }})"
+        ),
+        "finalize_release": "Promote Proven Release",
+        "promote_ghcr_latest": "Promote stable ghcr latest",
+        "publish_boundary_contracts": "Post-release boundary contracts publish",
+        "version_tag_image": "Version-tag ghcr image",
+    },
+    ".github/workflows/sast.yml": {
+        "changes": "Classify diff scope",
+        "cargo-deny": "cargo-deny",
+    },
+    ".github/workflows/secret-scan.yml": {
+        "gitleaks": "gitleaks (full history)",
+    },
+}
+EXPECTED_DYNAMIC_JOB_CONTEXT_SHA256 = {
+    (
+        ".github/workflows/fuzz.yml",
+        "fuzz",
+    ): "aa645addde738ea8f1fac9c70071ac0f603fd0030602f15d013535abf9a32443",
+    (
+        ".github/workflows/install-proof.yml",
+        "install-proof",
+    ): "c5cd6bbfa99f45c84084d22aafe5e0bb038c2ee006404a58d72e19a0db69b46e",
+    (
+        ".github/workflows/release.yml",
+        "build",
+    ): "4708a5968103aa4c624423fd5a67c5c183969919773e52c9cc204b2c9983c90b",
+    (
+        ".github/workflows/release.yml",
+        "verify_npm_published",
+    ): "be398c786bc9f4a31e8a4196076f707a93b33b70c0ec9b4a0ea5e87f3e84c314",
+    (
+        ".github/workflows/release.yml",
+        "smoke_npm_published",
+    ): "495829aee07c97dfd59924fcac7ff3ddb57be574ffd0bf741adc93a37425b492",
+}
+REQUIRED_CHECK_JOB_PRODUCERS = {
+    "Check & Test": {
+        (".github/workflows/ci.yml", "check-docs-only"),
+        (".github/workflows/ci.yml", "check"),
+    },
+    "DCO Sign-off": {
+        (".github/workflows/ci.yml", "dco"),
+    },
+    "cargo-deny": {
+        (".github/workflows/sast.yml", "cargo-deny"),
+    },
+    "gitleaks (full history)": {
+        (".github/workflows/secret-scan.yml", "gitleaks"),
+    },
+    "Windows installer + vector-free release build": {
+        (".github/workflows/ci.yml", "windows-installer"),
+    },
+}
+# Durable workflow IDs are GitHub's repository-scoped identity, while `path`
+# makes that identity reviewable in source. These values are also exercised
+# against the current REST response shape by the positive fixture below.
+REQUIRED_RELEASE_CHECK_PROVENANCE = {
+    "Check & Test (ubuntu-latest)": (
+        245_803_170,
+        ".github/workflows/ci.yml",
+        "push",
+    ),
+    "Check & Test (macos-latest)": (
+        245_803_170,
+        ".github/workflows/ci.yml",
+        "push",
+    ),
+    "DCO Sign-off": (245_803_170, ".github/workflows/ci.yml", "push"),
+    "cargo-deny": (251_549_972, ".github/workflows/sast.yml", "push"),
+    "gitleaks (full history)": (
+        293_452_372,
+        ".github/workflows/secret-scan.yml",
+        "push",
+    ),
+    "Windows installer + vector-free release build": (
+        245_803_170,
+        ".github/workflows/ci.yml",
+        "push",
+    ),
+}
+RELEASE_TAG_WORKFLOW_ID = 318_521_292
+RELEASE_GATE_FIXTURE_SHA = "1" * 40
+RELEASE_GATE_CURRENT_RUN_ID = 9000
+EXTERNAL_REQUIRED_CONTEXT_SPOOF = textwrap.dedent(
+    """\
+    name: Required Context Spoof
+
+    on:
+      push:
+        branches: [main]
+
+    permissions:
+      contents: read
+
+    jobs:
+      delay:
+        name: Delay context creation
+        runs-on: ubuntu-latest
+        steps:
+          - run: sleep 1
+      spoof:
+        name: Check & Test
+        needs: delay
+        runs-on: ubuntu-latest
+        strategy:
+          matrix:
+            os: [ubuntu-latest, macos-latest]
+        steps:
+          - run: echo success
+    """
+)
 
 
 def require(content: str, needle: str, context: str) -> None:
@@ -240,21 +409,37 @@ def workflow_job_blocks(workflow: str) -> dict[str, str]:
     if workflow.count(marker) != 1:
         raise AssertionError("workflow must contain exactly one jobs mapping")
     jobs = workflow.split(marker, 1)[1]
+    top_level_job_lines = [
+        line
+        for line in jobs.splitlines()
+        if line.startswith("  ")
+        and not line.startswith(("   ", "\t"))
+        and line.strip()
+        and not line.lstrip().startswith("#")
+    ]
+    for line in top_level_job_lines:
+        if re.fullmatch(r"  [A-Za-z0-9_-]+:[ \t]*", line) is None:
+            raise AssertionError(
+                "workflow job ids must use one canonical unquoted scalar line: "
+                f"{line.strip()}"
+            )
     matches = list(
         re.finditer(r"^  (?P<job>[A-Za-z0-9_-]+):[ \t]*$", jobs, re.MULTILINE)
     )
+    if len(matches) != len(top_level_job_lines):
+        raise AssertionError("workflow job census did not account for every job key")
     blocks: dict[str, str] = {}
     for index, match in enumerate(matches):
         job = match.group("job")
         if job in blocks:
             raise AssertionError(f"workflow declares duplicate job id: {job}")
         end = matches[index + 1].start() if index + 1 < len(matches) else len(jobs)
-        blocks[job] = jobs[match.start():end].rstrip()
+        blocks[job] = jobs[match.start() : end].rstrip()
     return blocks
 
 
-def job_display_name(job: str) -> str:
-    """Return the exact one-line display name for a job block."""
+def optional_job_display_name(job: str) -> str | None:
+    """Return a job's exact top-level display name, if it declares one."""
 
     active_lines = classifier_active_job_source(job).splitlines()
     names = [
@@ -262,9 +447,97 @@ def job_display_name(job: str) -> str:
         for line in active_lines[1:]
         if line.startswith("  name:")
     ]
-    if len(names) != 1:
-        raise AssertionError("every CI job must carry exactly one one-line display name")
-    return names[0]
+    if len(names) > 1:
+        raise AssertionError(
+            "workflow jobs may carry at most one one-line display name"
+        )
+    return names[0] if names else None
+
+
+def job_display_name(job: str) -> str:
+    """Return the required exact one-line display name for a CI job block."""
+
+    name = optional_job_display_name(job)
+    if name is None:
+        raise AssertionError(
+            "every CI job must carry exactly one one-line display name"
+        )
+    return name
+
+
+def dynamic_job_context_source(job: str) -> str:
+    """Return the name-bearing matrix contract for a dynamic job display name."""
+
+    active_lines = classifier_active_job_source(job).splitlines()
+    try:
+        strategy_start = active_lines.index("  strategy:")
+    except ValueError as error:
+        raise AssertionError(
+            "a matrix-derived workflow job name requires an explicit strategy"
+        ) from error
+    strategy_end = len(active_lines)
+    for index in range(strategy_start + 1, len(active_lines)):
+        line = active_lines[index]
+        if len(line) - len(line.lstrip()) <= 2:
+            strategy_end = index
+            break
+    return "\n".join(active_lines[strategy_start:strategy_end])
+
+
+def assert_workflow_job_census(workflows: dict[Path, str]) -> None:
+    """Pin every workflow job so no second required-context producer can appear."""
+
+    actual: dict[str, dict[str, str | None]] = {}
+    dynamic_contexts: dict[tuple[str, str], str] = {}
+    for workflow, content in sorted(workflows.items()):
+        path = workflow.relative_to(ROOT).as_posix()
+        actual[path] = {}
+        for job_id, block in workflow_job_blocks(content).items():
+            display_name = optional_job_display_name(block)
+            actual[path][job_id] = display_name
+            if display_name is None or "${{" not in display_name:
+                continue
+            if "${{ matrix." not in display_name:
+                raise AssertionError(
+                    "dynamic workflow job display names must derive only from "
+                    f"their reviewed matrix contract: {path}:{job_id}"
+                )
+            authority = (
+                f"{display_name}\n{dynamic_job_context_source(block)}"
+            ).encode()
+            dynamic_contexts[(path, job_id)] = hashlib.sha256(authority).hexdigest()
+
+    if actual != EXPECTED_WORKFLOW_JOB_DISPLAY_NAMES:
+        raise AssertionError(
+            "workflow-wide required-check producer census requires the exact "
+            "reviewed workflow paths, job ids, and display names"
+        )
+    if dynamic_contexts != EXPECTED_DYNAMIC_JOB_CONTEXT_SHA256:
+        raise AssertionError(
+            "workflow-wide required-check producer census requires the exact "
+            "reviewed matrix expansions for dynamic job display names"
+        )
+
+    actual_producers = {name: set() for name in REQUIRED_CHECK_JOB_PRODUCERS}
+    reserved_expanded_names = set(REQUIRED_RELEASE_CHECKS) - set(
+        REQUIRED_CHECK_JOB_PRODUCERS
+    )
+    for path, jobs in actual.items():
+        for job_id, display_name in jobs.items():
+            if display_name in actual_producers:
+                actual_producers[display_name].add((path, job_id))
+            if display_name in reserved_expanded_names:
+                raise AssertionError(
+                    "workflow job directly claims a release-required expanded "
+                    f"context outside its reviewed producer: {path}:{job_id}: "
+                    f"{display_name}"
+                )
+
+    if actual_producers != REQUIRED_CHECK_JOB_PRODUCERS:
+        raise AssertionError(
+            "workflow-wide release-required check producers do not match the "
+            "reviewed workflow/job authority map"
+        )
 
 
 def real_check_job_authority_source(job: str) -> str:
@@ -274,7 +547,9 @@ def real_check_job_authority_source(job: str) -> str:
     try:
         steps = active_lines.index("  steps:")
     except ValueError as error:
-        raise AssertionError("real Check & Test job is missing its steps mapping") from error
+        raise AssertionError(
+            "real Check & Test job is missing its steps mapping"
+        ) from error
     authority = active_lines[: steps + 1]
     authority.extend(
         line
@@ -372,9 +647,7 @@ def execute_docs_only_classifier(
             check=False,
         )
         outputs = (
-            output.read_text(encoding="utf-8").splitlines()
-            if output.exists()
-            else []
+            output.read_text(encoding="utf-8").splitlines() if output.exists() else []
         )
     return result, outputs
 
@@ -415,8 +688,7 @@ def assert_classifier_execution_won(
         )
     if not outputs or outputs[-1] != "docs_only=true":
         raise AssertionError(
-            f"classifier falsification did not override push output: {label}: "
-            f"{outputs}"
+            f"classifier falsification did not override push output: {label}: {outputs}"
         )
     if changed_path is not None and changed_path not in result.stdout.splitlines():
         raise AssertionError(
@@ -438,9 +710,7 @@ def assert_classifier_execution_failed_closed(
             f"{result.stdout}{result.stderr}"
         )
     if outputs != ["docs_only=false"]:
-        raise AssertionError(
-            f"classifier did not fail closed: {label}: {outputs}"
-        )
+        raise AssertionError(f"classifier did not fail closed: {label}: {outputs}")
 
 
 def bash_supports_nameref() -> bool:
@@ -452,8 +722,8 @@ def bash_supports_nameref() -> bool:
             "--noprofile",
             "--norc",
             "-c",
-            "target=original; original=false; declare -n ref=\"$target\"; "
-            "ref=true; [ \"$original\" = true ]",
+            'target=original; original=false; declare -n ref="$target"; '
+            'ref=true; [ "$original" = true ]',
         ],
         capture_output=True,
         text=True,
@@ -680,34 +950,150 @@ def release_check_gate_source(release_tag: str) -> str:
 def execute_release_check_gate(
     source: str,
     conclusions: dict[str, str],
-) -> subprocess.CompletedProcess[str]:
-    """Execute the workflow's real admission code against synthetic check runs."""
-
-    runs = [
-        {
-            "name": name,
-            "status": "completed",
-            "conclusion": conclusions.get(name, "success"),
-            "id": index,
-        }
-        for index, name in enumerate(REQUIRED_RELEASE_CHECKS, start=1)
+    *,
+    mutate_fixture: Callable[
+        [
+            list[dict[str, object]],
+            list[dict[str, object]],
+            dict[str, object],
+        ],
+        None,
     ]
+    | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Execute the real gate against a current-API-shaped provenance fixture."""
+
+    workflow_specs = {
+        ".github/workflows/ci.yml": {
+            "id": 1001,
+            "workflow_id": 245_803_170,
+            "path": ".github/workflows/ci.yml",
+            "event": "push",
+            "head_sha": RELEASE_GATE_FIXTURE_SHA,
+            "status": "completed",
+            "conclusion": "success",
+            "check_suite_id": 101,
+        },
+        ".github/workflows/sast.yml": {
+            "id": 1002,
+            "workflow_id": 251_549_972,
+            "path": ".github/workflows/sast.yml",
+            "event": "push",
+            "head_sha": RELEASE_GATE_FIXTURE_SHA,
+            "status": "completed",
+            "conclusion": "success",
+            "check_suite_id": 102,
+        },
+        ".github/workflows/secret-scan.yml": {
+            "id": 1003,
+            "workflow_id": 293_452_372,
+            "path": ".github/workflows/secret-scan.yml",
+            "event": "push",
+            "head_sha": RELEASE_GATE_FIXTURE_SHA,
+            "status": "completed",
+            "conclusion": "success",
+            "check_suite_id": 103,
+        },
+    }
+    workflow_runs = list(workflow_specs.values())
+    current_run: dict[str, object] = {
+        "id": RELEASE_GATE_CURRENT_RUN_ID,
+        "workflow_id": RELEASE_TAG_WORKFLOW_ID,
+        "path": ".github/workflows/release-tag.yml",
+        "event": "workflow_dispatch",
+        "head_sha": RELEASE_GATE_FIXTURE_SHA,
+        "status": "in_progress",
+        "conclusion": None,
+        "check_suite_id": 104,
+    }
+    workflow_runs.append(current_run.copy())
+    check_runs = []
+    for index, name in enumerate(REQUIRED_RELEASE_CHECKS, start=1):
+        _, workflow_path, _ = REQUIRED_RELEASE_CHECK_PROVENANCE[name]
+        check_runs.append(
+            {
+                "name": name,
+                "status": "completed",
+                "conclusion": conclusions.get(name, "success"),
+                "id": index,
+                "app_slug": "github-actions",
+                "check_suite_id": workflow_specs[workflow_path]["check_suite_id"],
+                "head_sha": RELEASE_GATE_FIXTURE_SHA,
+            }
+        )
+    check_runs.append(
+        {
+            "name": "Mint release tag",
+            "status": "in_progress",
+            "conclusion": None,
+            "id": len(check_runs) + 1,
+            "app_slug": "github-actions",
+            "check_suite_id": current_run["check_suite_id"],
+            "head_sha": RELEASE_GATE_FIXTURE_SHA,
+        }
+    )
+    if mutate_fixture is not None:
+        mutate_fixture(check_runs, workflow_runs, current_run)
+
     with tempfile.TemporaryDirectory() as directory:
-        evidence = Path(directory) / "check_runs.ndjson"
-        evidence.write_text(
-            "".join(f"{json.dumps(run)}\n" for run in runs),
+        fixture = Path(directory)
+        (fixture / "check_runs.ndjson").write_text(
+            "".join(f"{json.dumps(run)}\n" for run in check_runs),
+            encoding="utf-8",
+        )
+        (fixture / "workflow_runs.ndjson").write_text(
+            "".join(f"{json.dumps(run)}\n" for run in workflow_runs),
+            encoding="utf-8",
+        )
+        (fixture / "current_run.json").write_text(
+            json.dumps(current_run),
             encoding="utf-8",
         )
         environment = os.environ.copy()
-        environment["REQUIRED_CHECKS"] = "\n".join(REQUIRED_RELEASE_CHECKS)
+        environment.update(
+            {
+                "CURRENT_RUN_ID": str(RELEASE_GATE_CURRENT_RUN_ID),
+                "REQUIRED_CHECKS": "\n".join(REQUIRED_RELEASE_CHECKS),
+                "SHA": RELEASE_GATE_FIXTURE_SHA,
+            }
+        )
         return subprocess.run(
             [sys.executable, "-c", source],
-            cwd=directory,
+            cwd=fixture,
             env=environment,
             capture_output=True,
             text=True,
             timeout=10,
             check=False,
+        )
+
+
+def assert_release_gate_fixture_rejected(
+    source: str,
+    label: str,
+    expected_error: str,
+    mutate_fixture: Callable[
+        [
+            list[dict[str, object]],
+            list[dict[str, object]],
+            dict[str, object],
+        ],
+        None,
+    ],
+) -> None:
+    """Require a provenance/collision fixture to fail for the expected reason."""
+
+    result = execute_release_check_gate(
+        source,
+        {},
+        mutate_fixture=mutate_fixture,
+    )
+    output = result.stdout + result.stderr
+    if result.returncode == 0:
+        raise AssertionError(f"release gate falsification was admitted: {label}")
+    if expected_error not in output:
+        raise AssertionError(
+            f"release gate falsification failed for the wrong reason: {label}: {output}"
         )
 
 
@@ -766,6 +1152,80 @@ def main() -> None:
     install_ps1 = INSTALL_PS1.read_text(encoding="utf-8")
     health = HEALTH.read_text(encoding="utf-8")
     docker_workflow = (WORKFLOWS / "docker.yml").read_text(encoding="utf-8")
+    workflow_sources = {
+        workflow: workflow.read_text(encoding="utf-8") for workflow in workflow_paths()
+    }
+    assert_workflow_job_census(workflow_sources)
+
+    external_context_spoof = dict(workflow_sources)
+    external_context_spoof[WORKFLOWS / "required-context-spoof.yaml"] = (
+        EXTERNAL_REQUIRED_CONTEXT_SPOOF
+    )
+    expect_assertion(
+        "external workflow emits the release-required Check & Test matrix contexts",
+        "workflow-wide required-check producer census",
+        lambda: assert_workflow_job_census(external_context_spoof),
+    )
+
+    quoted_job_spoof = dict(workflow_sources)
+    quoted_job_spoof[WORKFLOWS / "ci.yml"] = quoted_job_spoof[
+        WORKFLOWS / "ci.yml"
+    ].replace(
+        "jobs:\n",
+        'jobs:\n  "context-spoof":\n'
+        "    name: Check & Test\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - run: echo success\n",
+        1,
+    )
+    expect_assertion(
+        "quoted job id hides a required-context producer before the first job",
+        "canonical unquoted scalar",
+        lambda: assert_workflow_job_census(quoted_job_spoof),
+    )
+
+    auxiliary_dco = WORKFLOWS / "dco.yml"
+    promoted_dco = dict(workflow_sources)
+    if promoted_dco[auxiliary_dco].count("    name: DCO sign-off") != 1:
+        raise AssertionError(
+            "workflow census falsification could not identify auxiliary DCO name"
+        )
+    promoted_dco[auxiliary_dco] = promoted_dco[auxiliary_dco].replace(
+        "    name: DCO sign-off",
+        "    name: DCO Sign-off",
+        1,
+    )
+    expect_assertion(
+        "auxiliary DCO workflow claims the release-required DCO context",
+        "workflow-wide required-check producer census",
+        lambda: assert_workflow_job_census(promoted_dco),
+    )
+
+    install_proof_workflow = WORKFLOWS / "install-proof.yml"
+    dynamic_context_spoof = dict(workflow_sources)
+    if (
+        dynamic_context_spoof[install_proof_workflow].count(
+            "          - os: ubuntu-latest"
+        )
+        != 1
+    ):
+        raise AssertionError(
+            "workflow census falsification could not identify install-proof matrix"
+        )
+    dynamic_context_spoof[install_proof_workflow] = dynamic_context_spoof[
+        install_proof_workflow
+    ].replace(
+        "          - os: ubuntu-latest",
+        "          - os: Check & Test (ubuntu-latest)",
+        1,
+    )
+    expect_assertion(
+        "dynamic matrix-only job resolves to a release-required context",
+        "exact reviewed matrix expansions",
+        lambda: assert_workflow_job_census(dynamic_context_spoof),
+    )
+
     require(
         install_sh,
         '"$EXTRACT_DIR/kin" registry authority --initialize',
@@ -1489,12 +1949,10 @@ def main() -> None:
     real_check = consumer_blocks["check"]
 
     docs_only_condition = (
-        "    if: ${{ !cancelled() && "
-        "needs.changes.outputs.docs_only == 'true' }}"
+        "    if: ${{ !cancelled() && needs.changes.outputs.docs_only == 'true' }}"
     )
     real_check_condition = (
-        "    if: ${{ !cancelled() && "
-        "needs.changes.outputs.docs_only != 'true' }}"
+        "    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}"
     )
     swapped_docs_only_check = docs_only_check.replace(
         docs_only_condition,
@@ -1563,8 +2021,8 @@ def main() -> None:
         expect_assertion(
             label,
             "Check & Test consumer authority",
-            lambda mutant_workflow=mutant_workflow: (
-                assert_check_consumer_authority(mutant_workflow)
+            lambda mutant_workflow=mutant_workflow: assert_check_consumer_authority(
+                mutant_workflow
             ),
         )
 
@@ -1599,8 +2057,8 @@ def main() -> None:
         expect_assertion(
             label,
             "Check & Test consumer authority",
-            lambda mutant_workflow=mutant_workflow: (
-                assert_check_consumer_authority(mutant_workflow)
+            lambda mutant_workflow=mutant_workflow: assert_check_consumer_authority(
+                mutant_workflow
             ),
         )
 
@@ -1704,9 +2162,7 @@ def main() -> None:
 
         hostile_bash_env = Path(directory) / "hostile-bash-env"
         hostile_bash_env.write_text(
-            "EVENT_NAME=pull_request\n"
-            f"BASE_SHA={base_sha}\n"
-            f"HEAD_SHA={head_sha}\n",
+            f"EVENT_NAME=pull_request\nBASE_SHA={base_sha}\nHEAD_SHA={head_sha}\n",
             encoding="utf-8",
         )
         bash_env_mutant = classifier.replace(
@@ -1731,13 +2187,11 @@ def main() -> None:
         )
 
         shell_line = (
-            "        shell: /usr/bin/bash --noprofile --norc "
-            "-p -e -u -o pipefail {0}"
+            "        shell: /usr/bin/bash --noprofile --norc -p -e -u -o pipefail {0}"
         )
         unprivileged_shell = classifier.replace(
             shell_line,
-            "        shell: /usr/bin/bash --noprofile --norc "
-            "-e -u -o pipefail {0}",
+            "        shell: /usr/bin/bash --noprofile --norc -e -u -o pipefail {0}",
             1,
         )
         expect_assertion(
@@ -1861,7 +2315,7 @@ def main() -> None:
         "          fi\n"
         '          echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"\n'
         "          name=docs_$(printf only); "
-        "printf '%s=true\\n' \"$name\" >> \"$GITHUB_OUTPUT\"",
+        'printf \'%s=true\\n\' "$name" >> "$GITHUB_OUTPUT"',
         1,
     )
     assert_classifier_bypass_rejected(
@@ -1878,6 +2332,22 @@ def main() -> None:
     assert_docs_only_classifier_guard(comment_only)
 
     release_tag = RELEASE_TAG.read_text(encoding="utf-8")
+    release_tag_header = release_tag.split("\njobs:", 1)[0]
+    require(
+        release_tag_header,
+        "permissions:\n  contents: read\n  checks: read\n  actions: read",
+        "release-tag read-only check and workflow provenance access",
+    )
+    for forbidden_permission in (
+        "contents: write",
+        "checks: write",
+        "actions: write",
+    ):
+        if forbidden_permission in release_tag_header:
+            raise AssertionError(
+                "release-tag workflow token must remain read-only: "
+                f"{forbidden_permission}"
+            )
     for policy in (
         "REQUIRED_CHECKS: |",
         "Check & Test (ubuntu-latest)",
@@ -1888,6 +2358,16 @@ def main() -> None:
         "Windows installer + vector-free release build",
         "missing required check: {name}",
         "required check not green: {name}",
+        "ambiguous required check: {name}",
+        "required check workflow provenance mismatch: {name}",
+        "actions: read",
+        "filter=all",
+        "app_slug: .app.slug",
+        "check_suite_id: .check_suite.id",
+        "workflow_id: .workflow_id",
+        "head_sha: .head_sha",
+        "workflow_runs.ndjson",
+        "current_run.json",
     ):
         require(release_tag, policy, "release tag required-check gate")
     for policy in (
@@ -1900,6 +2380,12 @@ def main() -> None:
         require(release_tag, policy, "per-check release conclusion policy")
 
     release_gate = release_check_gate_source(release_tag)
+    positive_fixture = execute_release_check_gate(release_gate, {})
+    if positive_fixture.returncode != 0:
+        raise AssertionError(
+            "current release check provenance fixture was rejected: "
+            f"{positive_fixture.stdout}{positive_fixture.stderr}"
+        )
     for accepted_conclusion in ("success", "skipped"):
         assert_release_check_accepted(
             release_gate,
@@ -1921,6 +2407,266 @@ def main() -> None:
         "neutral",
     )
 
+    def required_check_fixture(
+        check_runs: list[dict[str, object]],
+        name: str,
+    ) -> dict[str, object]:
+        matches = [run for run in check_runs if run["name"] == name]
+        if len(matches) != 1:
+            raise AssertionError(
+                f"release gate fixture requires one {name} check, got {len(matches)}"
+            )
+        return matches[0]
+
+    def workflow_fixture(
+        workflow_runs: list[dict[str, object]],
+        suite_id: object,
+    ) -> dict[str, object]:
+        matches = [run for run in workflow_runs if run["check_suite_id"] == suite_id]
+        if len(matches) != 1:
+            raise AssertionError(
+                "release gate fixture requires one workflow for suite "
+                f"{suite_id}, got {len(matches)}"
+            )
+        return matches[0]
+
+    def add_prior_release_tag_refusal(
+        check_runs: list[dict[str, object]],
+        workflow_runs: list[dict[str, object]],
+        _current_run: dict[str, object],
+    ) -> None:
+        workflow_runs.append(
+            {
+                "id": 8_000,
+                "workflow_id": RELEASE_TAG_WORKFLOW_ID,
+                "path": ".github/workflows/release-tag.yml",
+                "event": "workflow_dispatch",
+                "head_sha": RELEASE_GATE_FIXTURE_SHA,
+                "status": "completed",
+                "conclusion": "failure",
+                "check_suite_id": 105,
+            }
+        )
+        check_runs.append(
+            {
+                "name": "Mint release tag",
+                "status": "completed",
+                "conclusion": "failure",
+                "id": 8_001,
+                "app_slug": "github-actions",
+                "check_suite_id": 105,
+                "head_sha": RELEASE_GATE_FIXTURE_SHA,
+            }
+        )
+
+    retry_fixture = execute_release_check_gate(
+        release_gate,
+        {},
+        mutate_fixture=add_prior_release_tag_refusal,
+    )
+    if retry_fixture.returncode != 0:
+        raise AssertionError(
+            "prior refusal from the exact release-tag workflow blocked a retry: "
+            f"{retry_fixture.stdout}{retry_fixture.stderr}"
+        )
+
+    def add_external_mint_failure(
+        check_runs: list[dict[str, object]],
+        workflow_runs: list[dict[str, object]],
+        _current_run: dict[str, object],
+    ) -> None:
+        workflow_runs.append(
+            {
+                "id": 8_100,
+                "workflow_id": 999,
+                "path": ".github/workflows/mint-name-spoof.yml",
+                "event": "push",
+                "head_sha": RELEASE_GATE_FIXTURE_SHA,
+                "status": "completed",
+                "conclusion": "failure",
+                "check_suite_id": 106,
+            }
+        )
+        check_runs.append(
+            {
+                "name": "Mint release tag",
+                "status": "completed",
+                "conclusion": "failure",
+                "id": 8_101,
+                "app_slug": "github-actions",
+                "check_suite_id": 106,
+                "head_sha": RELEASE_GATE_FIXTURE_SHA,
+            }
+        )
+
+    assert_release_gate_fixture_rejected(
+        release_gate,
+        "same-name tag check from another workflow is not self-excluded",
+        "check not green: Mint release tag (conclusion=failure)",
+        add_external_mint_failure,
+    )
+
+    def add_higher_id_success_collision(
+        check_runs: list[dict[str, object]],
+        workflow_runs: list[dict[str, object]],
+        _current_run: dict[str, object],
+    ) -> None:
+        real = required_check_fixture(
+            check_runs,
+            "Check & Test (ubuntu-latest)",
+        )
+        real["conclusion"] = "failure"
+        spoof = real.copy()
+        spoof.update(
+            {
+                "id": 10_000,
+                "conclusion": "success",
+                "check_suite_id": 999,
+            }
+        )
+        check_runs.append(spoof)
+        workflow_runs.append(
+            {
+                "id": 9_999,
+                "workflow_id": 999,
+                "path": ".github/workflows/required-context-spoof.yaml",
+                "event": "push",
+                "head_sha": RELEASE_GATE_FIXTURE_SHA,
+                "status": "completed",
+                "conclusion": "success",
+                "check_suite_id": 999,
+            }
+        )
+
+    assert_release_gate_fixture_rejected(
+        release_gate,
+        "higher-ID same-name success masks a failed required producer",
+        "ambiguous required check: Check & Test (ubuntu-latest) (2 check-runs)",
+        add_higher_id_success_collision,
+    )
+
+    def add_duplicate_success(
+        check_runs: list[dict[str, object]],
+        _workflow_runs: list[dict[str, object]],
+        _current_run: dict[str, object],
+    ) -> None:
+        duplicate = required_check_fixture(check_runs, "cargo-deny").copy()
+        duplicate["id"] = 10_001
+        check_runs.append(duplicate)
+
+    assert_release_gate_fixture_rejected(
+        release_gate,
+        "two successful check-runs claim one required context",
+        "ambiguous required check: cargo-deny (2 check-runs)",
+        add_duplicate_success,
+    )
+
+    def change_required_workflow_path(
+        check_runs: list[dict[str, object]],
+        workflow_runs: list[dict[str, object]],
+        _current_run: dict[str, object],
+    ) -> None:
+        check = required_check_fixture(check_runs, "cargo-deny")
+        workflow = workflow_fixture(workflow_runs, check["check_suite_id"])
+        workflow["path"] = ".github/workflows/required-context-spoof.yaml"
+
+    assert_release_gate_fixture_rejected(
+        release_gate,
+        "required check comes from the wrong workflow path",
+        "required check workflow provenance mismatch: cargo-deny",
+        change_required_workflow_path,
+    )
+
+    def change_required_workflow_id(
+        check_runs: list[dict[str, object]],
+        workflow_runs: list[dict[str, object]],
+        _current_run: dict[str, object],
+    ) -> None:
+        check = required_check_fixture(check_runs, "cargo-deny")
+        workflow = workflow_fixture(workflow_runs, check["check_suite_id"])
+        workflow["workflow_id"] = 999
+
+    assert_release_gate_fixture_rejected(
+        release_gate,
+        "required check comes from the wrong workflow identity",
+        "required check workflow provenance mismatch: cargo-deny",
+        change_required_workflow_id,
+    )
+
+    def change_required_workflow_event(
+        check_runs: list[dict[str, object]],
+        workflow_runs: list[dict[str, object]],
+        _current_run: dict[str, object],
+    ) -> None:
+        check = required_check_fixture(
+            check_runs,
+            "gitleaks (full history)",
+        )
+        workflow = workflow_fixture(workflow_runs, check["check_suite_id"])
+        workflow["event"] = "workflow_run"
+
+    assert_release_gate_fixture_rejected(
+        release_gate,
+        "required check comes from the wrong workflow event",
+        "required check workflow provenance mismatch: gitleaks (full history)",
+        change_required_workflow_event,
+    )
+
+    def change_required_check_head(
+        check_runs: list[dict[str, object]],
+        _workflow_runs: list[dict[str, object]],
+        _current_run: dict[str, object],
+    ) -> None:
+        check = required_check_fixture(
+            check_runs,
+            "Windows installer + vector-free release build",
+        )
+        check["head_sha"] = "2" * 40
+
+    assert_release_gate_fixture_rejected(
+        release_gate,
+        "required check is attached to the wrong head sha",
+        (
+            "required check has wrong head sha: "
+            "Windows installer + vector-free release build"
+        ),
+        change_required_check_head,
+    )
+
+    def change_required_workflow_head(
+        check_runs: list[dict[str, object]],
+        workflow_runs: list[dict[str, object]],
+        _current_run: dict[str, object],
+    ) -> None:
+        check = required_check_fixture(
+            check_runs,
+            "Check & Test (macos-latest)",
+        )
+        workflow = workflow_fixture(workflow_runs, check["check_suite_id"])
+        workflow["head_sha"] = "3" * 40
+
+    assert_release_gate_fixture_rejected(
+        release_gate,
+        "required workflow run is attached to the wrong head sha",
+        "required check workflow provenance mismatch: Check & Test (macos-latest)",
+        change_required_workflow_head,
+    )
+
+    def change_required_check_app(
+        check_runs: list[dict[str, object]],
+        _workflow_runs: list[dict[str, object]],
+        _current_run: dict[str, object],
+    ) -> None:
+        check = required_check_fixture(check_runs, "DCO Sign-off")
+        check["app_slug"] = "unreviewed-checks-app"
+
+    assert_release_gate_fixture_rejected(
+        release_gate,
+        "required check comes from a different checks app",
+        "required check has wrong app authority: DCO Sign-off",
+        change_required_check_app,
+    )
+
     # Cargo caches are restore-anywhere, save-from-main-only, so one reusable
     # warm entry per job stays alive under the repository cache budget instead
     # of being evicted by per-pull-request entries no other run can read.
@@ -1936,9 +2682,6 @@ def main() -> None:
     # jobs are admitted only from main, while fuzz may still write a cache on a
     # qualifying pull request. This is not a repository-wide no-PR-writes
     # invariant.
-    workflow_sources = {
-        workflow: workflow.read_text(encoding="utf-8") for workflow in workflow_paths()
-    }
     assert_rust_cache_steps(workflow_sources)
 
     with tempfile.TemporaryDirectory() as directory:

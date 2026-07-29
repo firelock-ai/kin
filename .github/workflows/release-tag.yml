@@ -30,10 +30,12 @@ on:
 
 # The App installation token carries the only write capability (creating the
 # tag ref). The workflow's own GITHUB_TOKEN stays read-only: contents:read for
-# checkout and ref reads, checks:read to inspect the commit's check-runs.
+# checkout and ref reads, checks:read for check-runs, and actions:read to bind
+# each required check suite to its exact workflow path, event, and head SHA.
 permissions:
   contents: read
   checks: read
+  actions: read
 
 # Never run two tag mints at once, and never cancel one mid-flight.
 concurrency:
@@ -153,6 +155,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
+          CURRENT_RUN_ID: ${{ github.run_id }}
           REQUIRED_CHECKS: |
             Check & Test (ubuntu-latest)
             Check & Test (macos-latest)
@@ -162,63 +165,269 @@ jobs:
             Windows installer + vector-free release build
         run: |
           set -euo pipefail
-          gh api "repos/$REPO/commits/$SHA/check-runs?per_page=100" --paginate \
-            -q '.check_runs[] | {name: .name, status: .status, conclusion: .conclusion, id: .id}' \
+          # `filter=all` is deliberate: a rerun or second workflow that claims
+          # one required name is ambiguous authority, not evidence to collapse
+          # by recency. Release from a fresh main commit with one producer.
+          gh api "repos/$REPO/commits/$SHA/check-runs?per_page=100&filter=all" --paginate \
+            -q '.check_runs[] | {
+              name: .name,
+              status: .status,
+              conclusion: .conclusion,
+              id: .id,
+              app_slug: .app.slug,
+              check_suite_id: .check_suite.id,
+              head_sha: .head_sha
+            }' \
             > check_runs.ndjson || { echo "::error::failed to fetch check-runs for $SHA"; exit 1; }
+          gh api "repos/$REPO/actions/runs?head_sha=$SHA&per_page=100" --paginate \
+            -q '.workflow_runs[] | {
+              id: .id,
+              workflow_id: .workflow_id,
+              path: .path,
+              event: .event,
+              head_sha: .head_sha,
+              status: .status,
+              conclusion: .conclusion,
+              check_suite_id: .check_suite_id
+            }' \
+            > workflow_runs.ndjson || { echo "::error::failed to fetch workflow runs for $SHA"; exit 1; }
+          gh api "repos/$REPO/actions/runs/$CURRENT_RUN_ID" \
+            -q '{
+              id: .id,
+              workflow_id: .workflow_id,
+              path: .path,
+              event: .event,
+              head_sha: .head_sha,
+              status: .status,
+              conclusion: .conclusion,
+              check_suite_id: .check_suite_id
+            }' \
+            > current_run.json || { echo "::error::failed to fetch current release-tag run"; exit 1; }
           python3 - <<'PY'
           import json, os, sys
 
-          runs = {}
-          with open("check_runs.ndjson") as handle:
-              for line in handle:
-                  line = line.strip()
-                  if not line:
-                      continue
-                  run = json.loads(line)
-                  name = run["name"]
-                  # Keep only the latest attempt per check name (highest id).
-                  if name not in runs or run["id"] > runs[name]["id"]:
-                      runs[name] = run
+          def read_ndjson(path):
+              records = []
+              with open(path) as handle:
+                  for line in handle:
+                      line = line.strip()
+                      if line:
+                          records.append(json.loads(line))
+              return records
 
-          required = [c.strip() for c in os.environ["REQUIRED_CHECKS"].splitlines() if c.strip()]
+          check_runs = read_ndjson("check_runs.ndjson")
+          workflow_runs = read_ndjson("workflow_runs.ndjson")
+          with open("current_run.json") as handle:
+              current_run = json.load(handle)
+
+          runs_by_name = {}
+          for run in check_runs:
+              runs_by_name.setdefault(run["name"], []).append(run)
+
+          workflows_by_suite = {}
+          for run in workflow_runs:
+              workflows_by_suite.setdefault(run["check_suite_id"], []).append(run)
+
+          required = [
+              check.strip()
+              for check in os.environ["REQUIRED_CHECKS"].splitlines()
+              if check.strip()
+          ]
+          expected_provenance = {
+              "Check & Test (ubuntu-latest)": (
+                  245803170,
+                  ".github/workflows/ci.yml",
+                  "push",
+              ),
+              "Check & Test (macos-latest)": (
+                  245803170,
+                  ".github/workflows/ci.yml",
+                  "push",
+              ),
+              # Uppercase `Sign-off` is the skipped-on-push CI job. The
+              # pull_request_target DCO workflow emits lowercase `sign-off`
+              # and is deliberately not release evidence.
+              "DCO Sign-off": (245803170, ".github/workflows/ci.yml", "push"),
+              "cargo-deny": (251549972, ".github/workflows/sast.yml", "push"),
+              "gitleaks (full history)": (
+                  293452372,
+                  ".github/workflows/secret-scan.yml",
+                  "push",
+              ),
+              "Windows installer + vector-free release build": (
+                  245803170,
+                  ".github/workflows/ci.yml",
+                  "push",
+              ),
+          }
+          expected_sha = os.environ["SHA"]
+          current_run_id = int(os.environ["CURRENT_RUN_ID"])
           skippable_required = {"DCO Sign-off"}
           non_failing_optional = {"success", "skipped", "neutral"}
           errors = []
 
-          if not runs:
+          if required != list(expected_provenance):
+              errors.append("required check order does not match its provenance contract")
+          if not check_runs:
               errors.append("no check-runs found on sha")
 
+          current_suite_id = current_run.get("check_suite_id")
+          current_identity = (
+              current_run.get("id"),
+              current_run.get("workflow_id"),
+              current_run.get("path"),
+              current_run.get("event"),
+              current_run.get("head_sha"),
+          )
+          expected_current_identity = (
+              current_run_id,
+              318521292,
+              ".github/workflows/release-tag.yml",
+              "workflow_dispatch",
+              expected_sha,
+          )
+          if current_identity != expected_current_identity:
+              errors.append(
+                  "current release-tag workflow provenance mismatch: "
+                  f"expected={expected_current_identity} actual={current_identity}"
+              )
+          release_tag_suite_ids = set()
+          if not isinstance(current_suite_id, int):
+              errors.append("current release-tag workflow has no check suite id")
+          else:
+              release_tag_suite_ids.add(current_suite_id)
+          expected_release_tag_run = (
+              318521292,
+              ".github/workflows/release-tag.yml",
+              "workflow_dispatch",
+              expected_sha,
+          )
+          for workflow in workflow_runs:
+              identity = (
+                  workflow.get("workflow_id"),
+                  workflow.get("path"),
+                  workflow.get("event"),
+                  workflow.get("head_sha"),
+              )
+              if identity == expected_release_tag_run:
+                  suite_id = workflow.get("check_suite_id")
+                  if isinstance(suite_id, int):
+                      release_tag_suite_ids.add(suite_id)
+                  else:
+                      errors.append(
+                          "release-tag workflow run has no check suite id: "
+                          f"{workflow.get('id')}"
+                      )
+
           for name in required:
-              run = runs.get(name)
+              matching_runs = runs_by_name.get(name, [])
+              if not matching_runs:
+                  errors.append(f"missing required check: {name}")
+                  continue
+              if len(matching_runs) != 1:
+                  errors.append(
+                      f"ambiguous required check: {name} "
+                      f"({len(matching_runs)} check-runs)"
+                  )
+                  continue
+
+              run = matching_runs[0]
               allowed_conclusions = (
                   {"success", "skipped"}
                   if name in skippable_required
                   else {"success"}
               )
-              if run is None:
-                  errors.append(f"missing required check: {name}")
-              elif run["status"] != "completed":
-                  errors.append(f"required check not completed: {name} (status={run['status']})")
+              if run["status"] != "completed":
+                  errors.append(
+                      f"required check not completed: {name} "
+                      f"(status={run['status']})"
+                  )
               elif run["conclusion"] not in allowed_conclusions:
-                  errors.append(f"required check not green: {name} (conclusion={run['conclusion']})")
+                  errors.append(
+                      f"required check not green: {name} "
+                      f"(conclusion={run['conclusion']})"
+                  )
+              if run.get("app_slug") != "github-actions":
+                  errors.append(
+                      f"required check has wrong app authority: {name} "
+                      f"(app={run.get('app_slug')})"
+                  )
+              if run.get("head_sha") != expected_sha:
+                  errors.append(
+                      f"required check has wrong head sha: {name} "
+                      f"(head={run.get('head_sha')})"
+                  )
 
-          for name, run in runs.items():
-              # Self-exclude this workflow's own job ("Mint release tag") — a gate must not read its own refusals as evidence.
-              if name == "Mint release tag":
+              suite_id = run.get("check_suite_id")
+              matching_workflows = workflows_by_suite.get(suite_id, [])
+              if len(matching_workflows) != 1:
+                  errors.append(
+                      f"required check has ambiguous workflow provenance: {name} "
+                      f"(suite={suite_id}, workflow-runs={len(matching_workflows)})"
+                  )
+                  continue
+              workflow = matching_workflows[0]
+              expected_workflow_id, expected_path, expected_event = (
+                  expected_provenance[name]
+              )
+              actual_identity = (
+                  workflow.get("workflow_id"),
+                  workflow.get("path"),
+                  workflow.get("event"),
+                  workflow.get("head_sha"),
+              )
+              expected_identity = (
+                  expected_workflow_id,
+                  expected_path,
+                  expected_event,
+                  expected_sha,
+              )
+              if actual_identity != expected_identity:
+                  errors.append(
+                      f"required check workflow provenance mismatch: {name} "
+                      f"expected={expected_identity} actual={actual_identity}"
+                  )
+              if (
+                  workflow.get("status") != "completed"
+                  or workflow.get("conclusion") != "success"
+              ):
+                  errors.append(
+                      f"required check workflow not green: {name} "
+                      f"(status={workflow.get('status')}, "
+                      f"conclusion={workflow.get('conclusion')})"
+                  )
+
+          for run in check_runs:
+              name = run["name"]
+              # Exclude only this exact workflow identity's tag-mint attempts,
+              # including a prior refusal on the same SHA. A same-name check
+              # from another workflow remains visible and must be green.
+              if (
+                  name == "Mint release tag"
+                  and run.get("check_suite_id") in release_tag_suite_ids
+              ):
                   continue
               if run["status"] != "completed":
-                  errors.append(f"check still in progress: {name} (status={run['status']})")
+                  errors.append(
+                      f"check still in progress: {name} (status={run['status']})"
+                  )
               elif run["conclusion"] not in non_failing_optional:
-                  errors.append(f"check not green: {name} (conclusion={run['conclusion']})")
+                  errors.append(
+                      f"check not green: {name} "
+                      f"(conclusion={run['conclusion']})"
+                  )
 
           if errors:
               print("::error::refusing — check verification failed:")
-              for err in errors:
-                  print(f"  - {err}")
+              for error in errors:
+                  print(f"  - {error}")
               sys.exit(1)
 
-          print(f"verified {len(required)} required checks green; "
-                f"{len(runs)} total checks, none failing or in progress")
+          print(
+              f"verified {len(required)} uniquely named required checks with "
+              f"workflow provenance; {len(check_runs)} total checks, none "
+              "failing or in progress"
+          )
           PY
 
       - name: Verify tag does not already exist
