@@ -1391,29 +1391,35 @@ impl DaemonState {
             if !hydrated.insert(hash) {
                 continue;
             }
+            // Consult the local cache before reaching for authority. Both sides
+            // verify content addresses -- `BlobStore::read` re-digests what it
+            // read and `load_source_blob` verifies what it fetched -- so a
+            // successful local read already proves the cached bytes are the
+            // authoritative bytes, and comparing them would only be comparing a
+            // value to itself.
+            //
+            // The ordering is not a micro-optimization. On a hosted backend
+            // every `load_source_blob` is a HEAD plus a GET, serialized, and
+            // this runs before the listener binds, so fetching first cost two
+            // round trips per blob on every open even when the cache was
+            // already complete. At ten thousand bodies that is long enough for
+            // a readiness probe to kill a daemon that is working correctly, and
+            // the restart repeats it: a crash loop that never converges.
+            match blobs.read(&hash) {
+                Ok(_) => continue,
+                Err(BlobError::NotFound { .. } | BlobError::HashMismatch { .. }) => {
+                    // HashMismatch quarantines the corrupt derived object, so
+                    // the write below can atomically heal it from authority.
+                }
+                Err(error) => return Err(DaemonError::Blob(error)),
+            }
+
             let authoritative = authority.load_source_blob(hash)?.ok_or_else(|| {
                 DaemonError::Graph(kin_db::KinDbError::StorageError(format!(
                     "workspace artifact {} references source body {} absent from repository authority",
                     artifact.path, hash
                 )))
             })?;
-
-            match blobs.read(&hash) {
-                Ok(cached) if cached == authoritative => continue,
-                Ok(_) => {
-                    return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
-                        format!(
-                            "derived ingestion CAS body {} differs from repository authority despite matching its content address",
-                            hash
-                        ),
-                    )))
-                }
-                Err(BlobError::NotFound { .. } | BlobError::HashMismatch { .. }) => {
-                    // HashMismatch quarantines the corrupt derived object, so
-                    // this write can atomically heal it from authority.
-                }
-                Err(error) => return Err(DaemonError::Blob(error)),
-            }
 
             let installed_hash = blobs.write(&authoritative)?;
             if installed_hash != hash {
@@ -1454,6 +1460,12 @@ impl DaemonState {
     /// Returns the number of source bodies hydrated, or the reason the hosted
     /// backend could not supply them. A graph with no resolved artifacts needs
     /// no authority at all, which is the ordinary empty-hosted-graph case.
+    ///
+    /// Opening the authority is itself expensive on a hosted backend: it
+    /// re-downloads the repository snapshot that `open_with_backend` has
+    /// already loaded, and kin-db may replay the whole history to validate it.
+    /// So the cheap local question is asked first, and an instance whose
+    /// derived cache already covers the tree never opens authority at all.
     fn hydrate_backend_ingest_cas(
         repo_id: &str,
         backend: &Arc<dyn StorageBackend>,
@@ -1464,6 +1476,9 @@ impl DaemonState {
         if tree.is_empty() {
             return Ok(0);
         }
+        if Self::ingest_cas_covers_tree(&tree, blobs).map_err(|error| error.to_string())? {
+            return Ok(0);
+        }
         let repository_id = RepositoryId::new(repo_id.to_string())
             .map_err(|error| format!("invalid repository identity {repo_id}: {error}"))?;
         let authority = RepositoryAuthorityManager::open(repository_id, Arc::clone(backend))
@@ -1471,6 +1486,26 @@ impl DaemonState {
                 format!("hosted backend carries no usable repository authority: {error}")
             })?;
         Self::hydrate_ingest_cas(&authority, &tree, blobs).map_err(|error| error.to_string())
+    }
+
+    /// Whether every source body the tree names is already readable from the
+    /// derived cache. Purely local: `BlobStore::read` verifies what it read
+    /// against the requested content address, so a clean pass is proof the
+    /// cache holds the authoritative bodies and no authority is needed.
+    fn ingest_cas_covers_tree(tree: &ResolvedTree, blobs: &BlobStore) -> Result<bool> {
+        for artifact in tree.artifacts() {
+            let Some(hash) = artifact.entry.blob_identity() else {
+                continue;
+            };
+            match blobs.read(&hash) {
+                Ok(_) => {}
+                Err(BlobError::NotFound { .. } | BlobError::HashMismatch { .. }) => {
+                    return Ok(false)
+                }
+                Err(error) => return Err(DaemonError::Blob(error)),
+            }
+        }
+        Ok(true)
     }
 
     /// Freeze local sibling authority capabilities before the daemon becomes
@@ -3757,6 +3792,23 @@ impl DaemonState {
             .persist_lock
             .lock()
             .map_err(|_| DaemonError::Io(std::io::Error::other("persist lock poisoned")))?;
+
+        // Make the derived CAS names durable before persisting a graph that
+        // references them.
+        //
+        // kin-blobs defers the directory barrier that makes a blob's *name*
+        // durable and amortizes it across shards, so a write returning Ok does
+        // not yet mean the rename survives a crash. Its contract puts the
+        // obligation on the caller: sync is the commit point for anyone about
+        // to record those names somewhere that outlives a crash. This is that
+        // point. Skipping it would let a snapshot name bodies whose renames are
+        // still only in the page cache.
+        //
+        // Cheap in the steady state: sync returns immediately when nothing is
+        // pending, and otherwise costs one fsync per shard directory touched
+        // since the last barrier, which two-hex sharding caps at 256 no matter
+        // how many blobs were written.
+        self.blobs.sync().map_err(DaemonError::from)?;
 
         let force_full = mode == SnapshotSaveMode::Full;
 
@@ -7301,6 +7353,39 @@ mod ingest_cas_tests {
             blobs.read(&hash).unwrap(),
             body,
             "hydration must install the exact repository-authority body"
+        );
+    }
+
+    #[test]
+    fn a_covered_cache_needs_no_authority_at_all() {
+        // The hosted cost this closes: opening authority re-downloads the
+        // repository snapshot and can replay the whole history, and the old
+        // ordering fetched every body before consulting the cache, so a warm
+        // instance paid the full price on every open. Point the backend at a
+        // directory holding no authority whatsoever: hydration must still
+        // succeed, which is only possible if it never opened one.
+        let repo_dir = tempfile::tempdir().unwrap();
+        let body = b"already cached\n";
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        publish_single_blob_workspace(&init.layout, body);
+
+        let repo_id = kin_core::manifest::resolve_repo_id(&init.layout, None).unwrap();
+        let graph = {
+            let local = DaemonState::open(init.layout).expect("local open");
+            Arc::clone(&local.graph)
+        };
+        let cache_dir = tempfile::tempdir().unwrap();
+        let blobs = BlobStore::new(cache_dir.path().to_path_buf()).unwrap();
+        blobs.write(body).unwrap();
+
+        let empty = tempfile::tempdir().unwrap();
+        let backend: Arc<dyn StorageBackend> =
+            Arc::new(LocalFileBackend::new(empty.path().to_path_buf()));
+
+        assert_eq!(
+            DaemonState::hydrate_backend_ingest_cas(&repo_id, &backend, graph.as_ref(), &blobs),
+            Ok(0),
+            "a cache that already covers the tree must not open repository authority"
         );
     }
 

@@ -38,7 +38,13 @@ fn assert_child_alive(child: &mut Child, port: u16, what: &str) {
 /// so a kill/restart never depends on reusing one port's teardown timing.
 async fn read_published_port(child: &mut Child, repo_root: &Path) -> u16 {
     let port_file = repo_root.join(".kin/daemon.port");
-    let deadline = Instant::now() + Duration::from_secs(30);
+    // Share the readiness budget rather than keeping a tighter one of its own.
+    // Publishing the port is part of the same startup this file already grants
+    // READINESS_TIMEOUT for, and a 30s cap here made a healthy daemon on a
+    // loaded machine indistinguishable from a broken one. A daemon that dies is
+    // still caught eagerly through its child handle, so a generous budget only
+    // ever bounds a slow-but-live startup.
+    let deadline = Instant::now() + READINESS_TIMEOUT;
     let mut backoff = Duration::from_millis(20);
 
     loop {
@@ -54,7 +60,26 @@ async fn read_published_port(child: &mut Child, repo_root: &Path) -> u16 {
             panic!("daemon exited before publishing its port: {status}");
         }
         if Instant::now() >= deadline {
-            panic!("daemon never published its port to {}", port_file.display());
+            // Say which of the two it is. A deadline measures this test's
+            // patience, not the daemon's health, and reporting "never
+            // published" for a process that is still running sends the reader
+            // hunting a startup bug that is not there. This is the same
+            // distinction the production spawn contract draws between
+            // `ChildExited` and `StillStarting`.
+            let fate = match child.try_wait() {
+                Ok(Some(status)) => format!("it exited with {status}"),
+                Ok(None) => {
+                    "it is still running, so this is a slow start rather than a failed one \
+                     (the machine is likely loaded)"
+                        .to_string()
+                }
+                Err(error) => format!("its state could not be read: {error}"),
+            };
+            panic!(
+                "daemon did not publish a port to {} within {:.0}s; {fate}",
+                port_file.display(),
+                READINESS_TIMEOUT.as_secs_f64()
+            );
         }
 
         tokio::time::sleep(backoff).await;

@@ -254,15 +254,20 @@ async fn drain_pending_flush(pending: &mut Option<tokio::task::JoinHandle<Result
 //    hydration is a blocking task rather than a drained handle, but the API
 //    server's graceful shutdown waits on in-flight requests, so a hydrating
 //    daemon rides this full 10s;
-// 3. the final storage flush and endpoint-file removal run (fast on the local
-//    backend);
+// 3. the final storage flush, the derived-CAS directory barrier, and
+//    endpoint-file removal run (all fast on the local backend; the barrier is
+//    bounded at one fsync per shard directory touched, so at most 256);
 // 4. `runtime.shutdown_timeout(runtime_shutdown_grace())` waits up to 8s for
 //    the blocking pool, then abandons whatever is still running;
 // 5. the process exits.
 //
 // That normal path is ~18s. Independently, the escalation watchdog force-exits
 // DEFAULT_SHUTDOWN_ESCALATION_GRACE after shutdown is signalled, so the hard
-// bound is ~25s. Owner death costs at most one OWNER_WATCH_CHECK_INTERVAL of
+// bound is ~25s. A force-escalated exit skips step 3 entirely: neither the
+// barrier nor endpoint retirement runs, which is the deliberate trade of a
+// backstop that exists to end a wedged process. Both are recoverable, since
+// the derived CAS re-hydrates on open and a stale endpoint is swept by the
+// next liveness probe. Owner death costs at most one OWNER_WATCH_CHECK_INTERVAL of
 // detection on top of the same bound: ~27s from owner exit to process gone,
 // with no signal ever sent.
 //
@@ -411,8 +416,12 @@ fn ready_for_idle_shutdown(
         return false;
     }
     if control_plane == ControlPlane::EndpointLost {
-        // Unreachable by new clients until the endpoint is republished, so the
-        // usual initialization and session gates cannot be waiting on anything.
+        // Rare by construction: the control-plane check earlier in this same
+        // tick repairs a lost endpoint, so reaching here means republication
+        // itself failed. Kept because that is exactly when it matters: the
+        // daemon is unreachable by new clients, so the usual initialization and
+        // session gates cannot be waiting on anything, and it should be allowed
+        // to idle out rather than linger unreachable.
         return state.idle_duration() >= idle_timeout;
     }
     if !state
@@ -534,7 +543,11 @@ fn watched_process_is_alive(_pid: i32) -> bool {
 /// truth rather than a guess. Republication also makes the failure
 /// self-healing, because the clients that lost the endpoint find it again on
 /// their next poll.
-fn control_plane_demands_shutdown(state: &DaemonState, bound_port: u16) -> bool {
+fn control_plane_demands_shutdown(
+    state: &DaemonState,
+    bound_port: u16,
+    shutting_down: bool,
+) -> bool {
     match classify_control_plane(state) {
         ControlPlane::Ours => false,
         ControlPlane::RootGone => {
@@ -551,6 +564,14 @@ fn control_plane_demands_shutdown(state: &DaemonState, bound_port: u16) -> bool 
                 "another daemon now owns this repository endpoint; shutting down"
             );
             true
+        }
+        ControlPlane::EndpointLost if shutting_down => {
+            // Retirement is already running or about to. Republishing now
+            // would race it and could land after it, leaving an endpoint
+            // advertising a daemon that is about to exit. Task drain is
+            // bounded and does not abort this monitor, and publication can
+            // block on the coordination lock, so the window is real.
+            false
         }
         ControlPlane::EndpointLost => {
             match crate::lifecycle::publish_daemon_endpoint(state.layout.root(), bound_port) {
@@ -589,7 +610,7 @@ async fn run_idle_monitor(
             if *cancel_rx.borrow() {
                 return;
             }
-            if control_plane_demands_shutdown(&state, bound_port) {
+            if control_plane_demands_shutdown(&state, bound_port, *cancel_rx.borrow()) {
                 let _ = cancel_tx.send(true);
                 return;
             }
@@ -616,7 +637,7 @@ async fn run_idle_monitor(
         if *cancel_rx.borrow() {
             return;
         }
-        if control_plane_demands_shutdown(&state, bound_port) {
+        if control_plane_demands_shutdown(&state, bound_port, *cancel_rx.borrow()) {
             let _ = cancel_tx.send(true);
             return;
         }
@@ -2429,7 +2450,7 @@ mod tests {
             ControlPlane::EndpointLost
         );
         assert!(
-            !super::control_plane_demands_shutdown(&state, 51234),
+            !super::control_plane_demands_shutdown(&state, 51234, false),
             "a daemon that still owns the repo must repair its endpoint, not exit"
         );
         assert_eq!(
@@ -2441,6 +2462,31 @@ mod tests {
             crate::lifecycle::read_port_file(&kin_root),
             Some(51234),
             "republication must restore the port this daemon actually bound"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lost_endpoint_is_not_republished_once_shutdown_is_signalled() {
+        // Task drain is bounded and does not abort this monitor, and
+        // publication can block on the coordination lock, so a repair that
+        // started late could land after retirement and advertise an endpoint
+        // for a process that is exiting.
+        let repo = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let kin_root = initialized.layout.root().to_path_buf();
+        let state = DaemonState::open(initialized.layout).unwrap();
+        crate::lifecycle::publish_daemon_endpoint(&kin_root, 51234).unwrap();
+        std::fs::remove_file(kin_root.join("daemon.pid")).unwrap();
+        std::fs::remove_file(kin_root.join("daemon.port")).unwrap();
+
+        assert!(
+            !super::control_plane_demands_shutdown(&state, 51234, true),
+            "a lost endpoint is still not a reason to shut down"
+        );
+        assert_eq!(
+            super::classify_control_plane(&state),
+            ControlPlane::EndpointLost,
+            "a shutting-down daemon must not republish an endpoint it is about to retire"
         );
     }
 
@@ -2458,7 +2504,7 @@ mod tests {
             super::classify_control_plane(&state),
             ControlPlane::RootGone
         );
-        assert!(super::control_plane_demands_shutdown(&state, 51234));
+        assert!(super::control_plane_demands_shutdown(&state, 51234, false));
     }
 
     #[tokio::test]
@@ -2483,7 +2529,7 @@ mod tests {
                 pid: successor.id()
             }
         );
-        assert!(super::control_plane_demands_shutdown(&state, 4219));
+        assert!(super::control_plane_demands_shutdown(&state, 4219, false));
         assert_eq!(
             std::fs::read_to_string(kin_root.join("daemon.port")).unwrap(),
             "51234",
@@ -2511,7 +2557,7 @@ mod tests {
             super::classify_control_plane(&state),
             ControlPlane::EndpointLost
         );
-        assert!(!super::control_plane_demands_shutdown(&state, 4219));
+        assert!(!super::control_plane_demands_shutdown(&state, 4219, false));
         assert_eq!(super::classify_control_plane(&state), ControlPlane::Ours);
         assert_eq!(crate::lifecycle::read_port_file(&kin_root), Some(4219));
     }
