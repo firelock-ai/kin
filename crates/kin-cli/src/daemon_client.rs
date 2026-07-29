@@ -7367,6 +7367,8 @@ mod tests {
     // graph was killed for being slow, and its replacement started cold and hit
     // the same deadline.
 
+    // Both drive a real child process and need the POSIX stand-in binaries.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_daemon_still_running_at_the_deadline_is_not_killed() {
         let mut child = std::process::Command::new("sleep")
@@ -7390,6 +7392,7 @@ mod tests {
         let _ = child.wait();
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_daemon_that_already_exited_is_reaped() {
         let mut child = std::process::Command::new("true")

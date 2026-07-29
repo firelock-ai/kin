@@ -509,6 +509,9 @@ mod tests {
         assert!(!dir.path().join(PORT_FILE_NAME).exists());
     }
 
+    // These three drive a real child process, so they need the POSIX stand-in
+    // binaries. The contract itself is platform-neutral.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_live_child_that_never_reports_a_port_is_left_running() {
         let dir = tempfile::tempdir().unwrap();
@@ -536,6 +539,7 @@ mod tests {
         let _ = child.wait();
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_child_that_exits_before_publishing_is_reported_as_exited() {
         let dir = tempfile::tempdir().unwrap();
@@ -552,6 +556,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_published_port_is_returned_as_soon_as_it_appears() {
         let dir = tempfile::tempdir().unwrap();
