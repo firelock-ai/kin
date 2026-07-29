@@ -271,6 +271,7 @@ pub fn terminate_if_proven_dead(
 
 /// Coarse process liveness, fail-closed on anything indeterminate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(unix), allow(dead_code))]
 enum Liveness {
     Alive,
     Dead,
