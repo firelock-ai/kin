@@ -756,6 +756,11 @@ impl IsolatedDaemonRuntime {
     }
 
     #[cfg(unix)]
+    pub fn process_group_for_test(&self) -> libc::pid_t {
+        self.containment.process_group
+    }
+
+    #[cfg(unix)]
     pub fn mark_owned_process_for_test(&self, command: &mut std::process::Command) {
         command.env(RUNTIME_OWNER_ENV, &self.owner_token).env(
             RUNTIME_CONTAINMENT_GROUP_ENV,

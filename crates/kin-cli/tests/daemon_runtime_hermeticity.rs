@@ -421,6 +421,15 @@ fn isolated_runtime_scrubs_ambient_authority_and_reaps_every_process() {
         process_alive(supervisor_pid),
         "fixture supervisor never became live"
     );
+    let expected_group = runtime.process_group_for_test();
+    for (label, pid) in [("worker", worker_pid), ("supervisor", supervisor_pid)] {
+        let pid = libc::pid_t::try_from(pid).expect("fixture pid fits pid_t");
+        assert_eq!(
+            unsafe { libc::getpgid(pid) },
+            expected_group,
+            "fixture {label} escaped runtime containment before cleanup"
+        );
+    }
 
     drop(runtime);
 
