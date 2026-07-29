@@ -15,10 +15,13 @@ use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
+use kin_model::graph::ProvenanceStore;
+use kin_model::provenance::{Actor, ActorId, ActorKind, AuditEvent, AuditEventId};
+use kin_model::work::WorkScope;
 use kin_model::{
-    Entity, EntityDelta, EntityStore, FileLayout, FilePathId, GraphNodeId, Hash256, LocatedEntry,
-    OperationId, Relation, RelationDelta, RelationOrigin, RepoPath, SourceRegion, TransactionDelta,
-    TreeDelta, TreeEntry,
+    Entity, EntityDelta, EntityId, EntityStore, FileLayout, FilePathId, GraphNodeId, Hash256,
+    LocatedEntry, OperationId, Relation, RelationDelta, RelationOrigin, RepoPath, SemanticChangeId,
+    SourceRegion, TransactionDelta, TreeDelta, TreeEntry,
 };
 use sha2::{Digest, Sha256};
 
@@ -142,6 +145,10 @@ fn commit_exact_transaction_inner(
     let operation_id = OperationId::from_uuid(operation_uuid);
     let payload_hash = transaction_payload_hash(&transaction)?;
     let authority_context = authority_context(state)?;
+    // Resolved once, from the live registry, and used for both the change
+    // author and the durable attribution record. Resolving it twice could
+    // straddle the session ending and attribute one commit two ways.
+    let actor = resolve_commit_actor(sessions, &transaction.session_id);
 
     // A non-terminal committing marker means authority may already have moved.
     // Recover by the caller-stable operation ID before attempting any new plan.
@@ -158,6 +165,7 @@ fn commit_exact_transaction_inner(
                 state,
                 sessions,
                 transaction,
+                &actor,
                 recovered,
                 Vec::new(),
                 coordination,
@@ -187,6 +195,7 @@ fn commit_exact_transaction_inner(
         state,
         &authority_context,
         &transaction,
+        &actor,
         operation_id,
         &base,
     ) {
@@ -261,6 +270,7 @@ fn commit_exact_transaction_inner(
         state,
         sessions,
         transaction,
+        &actor,
         committed,
         plan.layouts,
         coordination,
@@ -345,6 +355,185 @@ fn describe_cleared_operation(operation: &kin_mcp::McpMutationOperation) -> Stri
         ("", _) => format!("{verb} (unnamed target)"),
         (target, _) => format!("{verb} {target}"),
     }
+}
+
+/// Who a committed MCP transaction is attributed to.
+///
+/// The actor is the agent session that opened the transaction. A raw session id
+/// identifies nobody once that session ends, and the session registry is
+/// in-memory, so the vendor and client name the session registered with are
+/// copied into the commit author and into a durable actor record at commit
+/// time. The session id stays inside the author so a live coordination lookup
+/// remains possible while the session is running, and so the two records can be
+/// tied together afterwards.
+struct CommitActor {
+    author: kin_model::AuthorId,
+    actor: Actor,
+    session_id: String,
+}
+
+fn resolve_commit_actor(sessions: &kin_mcp::SessionRegistry, session_id: &str) -> CommitActor {
+    let agent = uuid::Uuid::parse_str(session_id)
+        .ok()
+        .map(kin_model::SessionId)
+        .and_then(|id| sessions.get_agent_session(&id));
+    let display_name = match agent {
+        Some(agent) => format!(
+            "{}/{}",
+            provenance_label(&agent.vendor),
+            provenance_label(&agent.client_name)
+        ),
+        // A session registered through the legacy compatibility surface, or one
+        // that has already ended, has no vendor to name. The id it committed
+        // under is still an identity, and is better than an empty author.
+        None => provenance_label(session_id),
+    };
+    CommitActor {
+        author: kin_model::AuthorId::new(format!("{display_name} <mcp-agent:{session_id}>")),
+        actor: Actor {
+            actor_id: mcp_actor_id(session_id),
+            kind: ActorKind::Assistant,
+            display_name,
+            external_refs: Vec::new(),
+        },
+        session_id: session_id.to_string(),
+    }
+}
+
+/// One field of a provenance display name, made safe to render.
+///
+/// `kin history` reads everything before the first `<` as the author's name and
+/// prints one row per revision, so an angle bracket or a newline arriving from a
+/// client-supplied session name would truncate or break the row it appears in.
+fn provenance_label(raw: &str) -> String {
+    /// Long enough for a real vendor and session name, short enough that a
+    /// pathological one cannot dominate a change record.
+    const MAX_LABEL: usize = 64;
+
+    let collapsed = raw
+        .chars()
+        .map(|character| {
+            if character.is_control() || matches!(character, '<' | '>') {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if collapsed.is_empty() {
+        return "unknown".to_string();
+    }
+    collapsed.chars().take(MAX_LABEL).collect()
+}
+
+/// A stable actor identity for one MCP session.
+///
+/// Derived rather than random so every commit a session makes resolves to the
+/// same actor, which is what lets `query_audit_events` filter by actor and what
+/// keeps a session's writes from reading as a crowd of one-commit strangers.
+fn mcp_actor_id(session_id: &str) -> ActorId {
+    let mut hasher = Sha256::new();
+    hasher.update(b"kin-mcp-session-actor-v1\0");
+    hasher.update(session_id.as_bytes());
+    ActorId::from_hash(Hash256::from_bytes(hasher.finalize().into()))
+}
+
+/// A stable audit-event identity for one entity within one committed change.
+///
+/// Derived so a commit that is resumed after a crash re-derives the identifiers
+/// it already wrote instead of appending a second attribution record for a
+/// single write.
+fn mcp_audit_event_id(change: &SemanticChangeId, entity: &EntityId) -> AuditEventId {
+    let mut hasher = Sha256::new();
+    hasher.update(b"kin-mcp-commit-audit-v1\0");
+    hasher.update(change.to_string().as_bytes());
+    hasher.update([0]);
+    hasher.update(entity.to_string().as_bytes());
+    AuditEventId::from_hash(Hash256::from_bytes(hasher.finalize().into()))
+}
+
+/// Record who committed, and what they touched, into the provenance surfaces.
+///
+/// Without this an MCP write is anonymous to every read surface that answers
+/// "who changed this": `kin_provenance_query` returns no audit context, and
+/// `kin-review`'s impact analysis, which resolves attribution and its
+/// unreviewed-agent-change signal entirely from audit events and the actor they
+/// name, treats an agent's commit as if nobody made it. The change author alone
+/// does not reach either, because both read the audit trail.
+///
+/// One event per changed entity, because that is the scope the review layer
+/// matches on. Called only after the repository receipt exists, so nothing is
+/// attributed to a commit that did not land.
+fn record_commit_provenance(
+    graph: &kin_db::InMemoryGraph,
+    actor: &CommitActor,
+    transaction: &kin_mcp::McpTransaction,
+    committed: &NativeCommitResult,
+) -> Result<(), String> {
+    /// How far back a resume looks for the attribution it may already have
+    /// written. MCP commits are serialized behind the coordination gate, so a
+    /// resume sits within a handful of events of the attempt it is resuming;
+    /// the window is wide enough to absorb an interleaved restart and bounded
+    /// so the scan does not grow with the audit log.
+    const DEDUP_WINDOW: usize = 1024;
+
+    graph
+        .create_actor(&actor.actor)
+        .map_err(|error| format!("record committing agent actor: {error}"))?;
+
+    let mut entities = committed
+        .change
+        .entity_deltas
+        .iter()
+        .map(|delta| match delta {
+            EntityDelta::Added { new } | EntityDelta::Modified { new, .. } => new.id,
+            EntityDelta::Removed { old } => old.id,
+        })
+        .collect::<Vec<_>>();
+    entities.sort_unstable();
+    entities.dedup();
+    if entities.is_empty() {
+        return Ok(());
+    }
+
+    let already_recorded = graph
+        .query_audit_events(Some(&actor.actor.actor_id), DEDUP_WINDOW)
+        .map_err(|error| format!("read existing commit attribution: {error}"))?
+        .into_iter()
+        .map(|event| event.event_id)
+        .collect::<HashSet<_>>();
+
+    let details = serde_json::json!({
+        "schema": "kin.mcp.commit_audit.v1",
+        "transaction_id": transaction.transaction_id,
+        "session_id": actor.session_id,
+        "actor": actor.actor.display_name,
+        "change_id": committed.change.id.to_string(),
+        "repository_generation": committed.receipt.generation,
+        "repository_operation_id": committed.receipt.operation_id.to_string(),
+    })
+    .to_string();
+
+    for entity in entities {
+        let event_id = mcp_audit_event_id(&committed.change.id, &entity);
+        if already_recorded.contains(&event_id) {
+            continue;
+        }
+        graph
+            .record_audit_event(&AuditEvent {
+                event_id,
+                actor_id: actor.actor.actor_id,
+                action: "kin_transaction_commit".to_string(),
+                target_scope: Some(WorkScope::Entity(entity)),
+                timestamp: committed.change.timestamp.clone(),
+                details: Some(details.clone()),
+            })
+            .map_err(|error| format!("record commit attribution for entity {entity}: {error}"))?;
+    }
+    Ok(())
 }
 
 fn transaction_payload_hash(transaction: &kin_mcp::McpTransaction) -> Result<String, String> {
@@ -438,6 +627,7 @@ fn plan_exact_transaction(
     state: &DaemonState,
     authority_context: &LocalRepositoryAuthorityContext,
     transaction: &kin_mcp::McpTransaction,
+    actor: &CommitActor,
     operation_id: OperationId,
     base: &NativeCommitBase,
 ) -> Result<ExactMcpPlan, String> {
@@ -697,7 +887,7 @@ fn plan_exact_transaction(
         authority_context,
         operation_id,
         kin_model::Timestamp::now(),
-        kin_model::AuthorId::new(format!("mcp:{}", transaction.session_id)),
+        actor.author.clone(),
         message,
         base,
     )
@@ -882,6 +1072,7 @@ fn finalize_committed_transaction(
     state: &Arc<DaemonState>,
     sessions: &kin_mcp::SessionRegistry,
     transaction: kin_mcp::McpTransaction,
+    actor: &CommitActor,
     committed: NativeCommitResult,
     planned_layouts: Vec<FileLayout>,
     coordination: Option<&kin_mcp::CoordinationWritePreflight>,
@@ -913,6 +1104,7 @@ fn finalize_committed_transaction(
             transaction.transaction_id
         ));
     }
+    record_commit_provenance(state.graph.as_ref(), actor, &transaction, &committed)?;
 
     let observed_generation = state.snapshot_generation.load(Ordering::SeqCst);
     if observed_generation < committed.receipt.generation {
@@ -1765,6 +1957,325 @@ mod tests {
             std::fs::read(state.layout.working_dir().join("src/lib.rs")).unwrap(),
             b"pub fn value() -> u8 { 2 }\n",
             "the fenced body, not the divergent one, is what authority holds"
+        );
+    }
+
+    /// A live agent session, the way `kin_session_start` registers one.
+    fn start_agent_session(
+        sessions: &kin_mcp::SessionRegistry,
+        vendor: &str,
+        client_name: &str,
+    ) -> kin_model::session::AgentSession {
+        sessions.start_agent_session(
+            vendor,
+            client_name,
+            kin_model::session::SessionTransport::Mcp,
+            None,
+            PathBuf::from("/tmp"),
+            kin_model::session::SessionCapabilities {
+                can_write: true,
+                can_commit: true,
+                ..kin_model::session::SessionCapabilities::default()
+            },
+        )
+    }
+
+    fn commit_one_entity_edit(
+        state: &Arc<DaemonState>,
+        sessions: &kin_mcp::SessionRegistry,
+        session_id: &str,
+        entity: &Entity,
+        body: &str,
+    ) -> kin_mcp::ToolCallResult {
+        let transaction = sessions
+            .begin_transaction(session_id, "file:src/lib.rs")
+            .unwrap();
+        sessions
+            .stage_transaction(
+                &transaction.transaction_id,
+                vec![kin_mcp::McpMutationOperation {
+                    verb: "update".to_string(),
+                    target: entity.id.to_string(),
+                    payload: None,
+                    body: Some(body.to_string()),
+                    description: "attributed body update".to_string(),
+                }],
+            )
+            .unwrap();
+        commit_exact_transaction(
+            state,
+            sessions,
+            &HashMap::from([(
+                "transaction_id".to_string(),
+                serde_json::json!(transaction.transaction_id),
+            )]),
+            None,
+        )
+    }
+
+    /// An agent's commit has to be attributable afterwards, by name.
+    ///
+    /// The pitch is that the graph knows who changed what, and an MCP write
+    /// used to leave nothing any read surface could answer that with: the audit
+    /// trail was empty, no actor existed, and the only identity anywhere was a
+    /// session id that lived in the live response and nowhere else. Sealing the
+    /// change later with `kin commit` then attributed the operator who ran the
+    /// CLI, not the agent that wrote the code. This asserts every surface an
+    /// operator would actually reach for.
+    #[test]
+    fn a_committed_transaction_is_attributable_to_the_agent_that_made_it() {
+        let (_dir, state) = test_state();
+        let (entity, _) = install_exact_source(
+            &state,
+            "src/lib.rs",
+            b"pub fn value() -> u8 { 1 }\n",
+            "value",
+        );
+        let sessions = kin_mcp::SessionRegistry::new();
+        let session = start_agent_session(&sessions, "claude-code", "one-change-demo");
+        let session_id = session.session_id.to_string();
+
+        let result = commit_one_entity_edit(
+            &state,
+            &sessions,
+            &session_id,
+            &entity,
+            "pub fn value() -> u8 { 2 }",
+        );
+        assert_ne!(
+            result.is_error,
+            Some(true),
+            "attributed commit failed: {}",
+            result_text(&result)
+        );
+
+        // kin history: the agent's name, not an opaque id and not the operator.
+        let binding = state.local_repository_authority_binding().unwrap();
+        let history = kin_cli::commands::history::execute_history_request(
+            &binding,
+            state.graph.as_ref(),
+            &kin_cli::commands::history::HistoryRequest {
+                entity: "value".to_string(),
+                reference: None,
+            },
+        )
+        .unwrap();
+        assert!(
+            history
+                .lines
+                .iter()
+                .any(|line| line.contains("claude-code/one-c")),
+            "history must name the committing agent: {:#?}",
+            history.lines
+        );
+
+        // kin blame: the full author, so the session id is recoverable from a
+        // read surface after the session itself is gone.
+        let blame = kin_cli::commands::blame::execute_blame_request(
+            &binding,
+            state.graph.as_ref(),
+            &kin_cli::commands::blame::BlameRequest {
+                entity: "value".to_string(),
+                reference: None,
+            },
+        )
+        .unwrap();
+        assert!(
+            blame
+                .lines
+                .iter()
+                .any(|line| line.contains(&format!("mcp-agent:{session_id}"))),
+            "blame must carry the committing session id: {:#?}",
+            blame.lines
+        );
+
+        // kin_provenance_query: change count, latest change, and audit context.
+        let provenance = kin_mcp::handlers::provenance::handle_provenance_query(
+            &HashMap::from([(
+                "entity_id".to_string(),
+                serde_json::json!(entity.id.to_string()),
+            )]),
+            state.graph.as_ref(),
+        )
+        .unwrap();
+        let provenance: serde_json::Value =
+            serde_json::from_str(result_text(&provenance)).unwrap();
+        assert!(
+            provenance["change_count"].as_u64().unwrap() >= 1,
+            "provenance must count the MCP change: {provenance}"
+        );
+        assert!(!provenance["latest_change"].is_null());
+        let events = provenance["recent_audit_events"].as_array().unwrap();
+        assert_eq!(
+            events.len(),
+            1,
+            "one commit of one entity is one attribution record: {provenance}"
+        );
+        assert_eq!(events[0]["action"], "kin_transaction_commit");
+        let details: serde_json::Value =
+            serde_json::from_str(events[0]["details"].as_str().unwrap()).unwrap();
+        assert_eq!(details["session_id"], session_id);
+        assert_eq!(details["actor"], "claude-code/one-change-demo");
+
+        // The actor the audit event names resolves, and resolves as an agent:
+        // this is what kin-review's impact analysis reads to decide an agent
+        // change went in unreviewed.
+        let actor_id = mcp_actor_id(&session_id);
+        let actor = state.graph.get_actor(&actor_id).unwrap().unwrap();
+        assert_eq!(actor.kind, ActorKind::Assistant);
+        assert_eq!(actor.display_name, "claude-code/one-change-demo");
+        assert_eq!(
+            state
+                .graph
+                .query_audit_events(Some(&actor_id), 16)
+                .unwrap()
+                .len(),
+            1,
+            "the audit trail must be queryable by the agent that wrote it"
+        );
+    }
+
+    /// Two commits by one session are two records by one actor.
+    #[test]
+    fn one_agent_session_keeps_one_actor_identity_across_commits() {
+        let (_dir, state) = test_state();
+        let (entity, _) = install_exact_source(
+            &state,
+            "src/lib.rs",
+            b"pub fn value() -> u8 { 1 }\n",
+            "value",
+        );
+        let sessions = kin_mcp::SessionRegistry::new();
+        let session = start_agent_session(&sessions, "codex", "repeat-writer");
+        let session_id = session.session_id.to_string();
+
+        for body in ["pub fn value() -> u8 { 2 }", "pub fn value() -> u8 { 3 }"] {
+            let result =
+                commit_one_entity_edit(&state, &sessions, &session_id, &entity, body);
+            assert_ne!(
+                result.is_error,
+                Some(true),
+                "commit failed: {}",
+                result_text(&result)
+            );
+        }
+
+        let actor_id = mcp_actor_id(&session_id);
+        assert_eq!(
+            state.graph.list_actors().unwrap().len(),
+            1,
+            "a session is one actor, not one per commit"
+        );
+        assert_eq!(
+            state
+                .graph
+                .query_audit_events(Some(&actor_id), 16)
+                .unwrap()
+                .len(),
+            2,
+            "each commit contributes its own attribution record"
+        );
+    }
+
+    /// A resumed commit must not double-count itself in the audit trail.
+    ///
+    /// Attribution is written after the repository receipt exists, and the
+    /// receipt path is re-entered on resume. A second record for one write
+    /// would read as an agent that committed twice.
+    #[test]
+    fn a_resumed_commit_records_its_attribution_once() {
+        let (_dir, state) = test_state();
+        let (entity, _) = install_exact_source(
+            &state,
+            "src/lib.rs",
+            b"pub fn value() -> u8 { 1 }\n",
+            "value",
+        );
+        let sessions = kin_mcp::SessionRegistry::new();
+        let session = start_agent_session(&sessions, "claude-code", "resumed-writer");
+        let session_id = session.session_id.to_string();
+        let transaction = sessions
+            .begin_transaction(&session_id, "file:src/lib.rs")
+            .unwrap();
+        sessions
+            .stage_transaction(
+                &transaction.transaction_id,
+                vec![kin_mcp::McpMutationOperation {
+                    verb: "update".to_string(),
+                    target: entity.id.to_string(),
+                    payload: None,
+                    body: Some("pub fn value() -> u8 { 2 }".to_string()),
+                    description: "attributed body update".to_string(),
+                }],
+            )
+            .unwrap();
+        let arguments = HashMap::from([(
+            "transaction_id".to_string(),
+            serde_json::json!(transaction.transaction_id),
+        )]);
+
+        state
+            .mcp_fail_after_authority_once
+            .store(true, Ordering::SeqCst);
+        let crashed = commit_exact_transaction(&state, &sessions, &arguments, None);
+        assert_eq!(crashed.is_error, Some(true));
+
+        let resumed = commit_exact_transaction(&state, &sessions, &arguments, None);
+        assert_ne!(
+            resumed.is_error,
+            Some(true),
+            "resume failed: {}",
+            result_text(&resumed)
+        );
+
+        assert_eq!(
+            state
+                .graph
+                .query_audit_events(Some(&mcp_actor_id(&session_id)), 16)
+                .unwrap()
+                .len(),
+            1,
+            "one write is one attribution record, however many attempts it took"
+        );
+    }
+
+    /// A session with no registration still commits under an identity.
+    #[test]
+    fn a_session_without_an_agent_registration_still_names_an_author() {
+        let (_dir, state) = test_state();
+        let (entity, _) = install_exact_source(
+            &state,
+            "src/lib.rs",
+            b"pub fn value() -> u8 { 1 }\n",
+            "value",
+        );
+        let sessions = test_sessions();
+        let (_tx, arguments) = stage_entity_edit(&sessions, &entity, "pub fn value() -> u8 { 2 }");
+        let result = commit_exact_transaction(&state, &sessions, &arguments, None);
+        assert_ne!(result.is_error, Some(true), "{}", result_text(&result));
+
+        let binding = state.local_repository_authority_binding().unwrap();
+        let history = kin_cli::commands::history::execute_history_request(
+            &binding,
+            state.graph.as_ref(),
+            &kin_cli::commands::history::HistoryRequest {
+                entity: "value".to_string(),
+                reference: None,
+            },
+        )
+        .unwrap();
+        assert!(
+            history.lines.iter().any(|line| line.contains(TEST_SESSION)),
+            "an unregistered session still commits under the id it used: {:#?}",
+            history.lines
+        );
+        assert_eq!(
+            state
+                .graph
+                .query_audit_events(Some(&mcp_actor_id(TEST_SESSION)), 16)
+                .unwrap()
+                .len(),
+            1
         );
     }
 
