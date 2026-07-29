@@ -3017,6 +3017,10 @@ mod tests {
 
     fn clean_git_command() -> Command {
         let mut command = Command::new("git");
+        command.env("GIT_CONFIG_NOSYSTEM", "1").env(
+            "GIT_CONFIG_GLOBAL",
+            if cfg!(windows) { "NUL" } else { "/dev/null" },
+        );
         for variable in [
             "GIT_DIR",
             "GIT_WORK_TREE",
