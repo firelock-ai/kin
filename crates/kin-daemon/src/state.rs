@@ -2860,6 +2860,25 @@ impl DaemonState {
         Arc::clone(graphs.entry(repo_id.to_string()).or_insert(loaded))
     }
 
+    /// Whether `repo_id` belongs to the key space this daemon serves.
+    ///
+    /// Addressability is a separate question from whether a load succeeds, and
+    /// only this one can be answered without touching storage. When an
+    /// allowlist is configured it *is* the served key space, which is why
+    /// [`Self::list_available_repos`] filters by the same set. Without one, a
+    /// storage backend serves every repository it can load, and a local daemon
+    /// serves exactly the repository authority it opened.
+    ///
+    /// Callers decide addressability with this before attempting a load so a
+    /// backend fault on a served repository is never reported as a request
+    /// addressed to the wrong repository.
+    pub fn serves_repo_id(&self, repo_id: &str) -> bool {
+        match &self.allowed_repo_ids {
+            Some(allowed_repo_ids) => allowed_repo_ids.contains(repo_id),
+            None => self.storage_backend.is_some() || repo_id == self.cached_repo_id,
+        }
+    }
+
     /// Get or lazy-load a repo's graph from the storage backend.
     ///
     /// Returns the cached graph if already loaded, otherwise loads from
@@ -2899,17 +2918,15 @@ impl DaemonState {
     /// When a storage backend is configured, discovers repos directly from
     /// storage — no env vars needed. Falls back to loaded repo keys in
     /// local mode.
-    pub fn list_available_repos(&self) -> Result<Vec<String>> {
+    pub async fn list_available_repos(&self) -> Result<Vec<String>> {
         let mut repos = if let Some(backend) = &self.storage_backend {
             backend.list_repos().map_err(DaemonError::from)?
         } else {
-            // Local mode: return the loaded repo_graphs keys.
-            let graphs = self
-                .repo_graphs
-                .try_read()
-                .map(|g| g.keys().cloned().collect())
-                .unwrap_or_default();
-            graphs
+            // Local mode: return the loaded repo_graphs keys. This awaits the
+            // read rather than falling back to an empty listing on a contended
+            // lock, which reported "this daemon serves no repositories" for
+            // what was only a concurrent writer.
+            self.repo_graphs.read().await.keys().cloned().collect()
         };
         if let Some(allowed_repo_ids) = &self.allowed_repo_ids {
             repos.retain(|repo_id| allowed_repo_ids.contains(repo_id));
