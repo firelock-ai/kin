@@ -2331,6 +2331,84 @@ mod tests {
         );
     }
 
+    fn entity_span_by_name(state: &Arc<DaemonState>, name: &str) -> kin_model::SourceSpan {
+        state
+            .graph
+            .query_entities(&EntityFilter {
+                name_pattern: Some(name.to_string()),
+                ..EntityFilter::default()
+            })
+            .unwrap()
+            .into_iter()
+            .find(|entity| entity.name == name)
+            .unwrap_or_else(|| panic!("graph must contain {name}"))
+            .span
+            .unwrap_or_else(|| panic!("{name} must carry a source span"))
+    }
+
+    /// A commit moves the positions of entities it did not edit.
+    ///
+    /// An edit that makes one entity taller pushes everything below it down. If
+    /// the graph keeps the pre-commit position for those neighbours, then a
+    /// graph-native read after a graph-native write hands back line anchors that
+    /// no longer describe the file, and an agent deriving anything from them
+    /// derives it wrong. Positions have to move with the bytes or not be served
+    /// at all.
+    ///
+    /// Asserted against the file rather than against a constant, and accepting
+    /// either line-numbering base, so this measures freshness only. Which base
+    /// `start_line` counts from is a separate question about the read boundary
+    /// and is not what this test pins.
+    #[test]
+    fn a_commit_repositions_the_entities_it_pushed_down() {
+        let (_dir, state) = test_state();
+        let (first, _) = install_exact_source(
+            &state,
+            "src/lib.rs",
+            b"pub fn first() -> u8 { 1 }\n\npub fn second() -> u8 { 2 }\n",
+            "first",
+        );
+        let before = entity_span_by_name(&state, "second");
+
+        // Two lines taller than what it replaces.
+        let sessions = test_sessions();
+        let (_tx, arguments) =
+            stage_entity_edit(&sessions, &first, "pub fn first() -> u8 {\n    1\n}");
+        let result = commit_exact_transaction(&state, &sessions, &arguments, None);
+        assert_ne!(
+            result.is_error,
+            Some(true),
+            "commit failed: {}",
+            result_text(&result)
+        );
+
+        let after = entity_span_by_name(&state, "second");
+        assert_eq!(
+            after.start_line - before.start_line,
+            2,
+            "an untouched neighbour must move by exactly the lines inserted above it"
+        );
+
+        let file = std::fs::read_to_string(state.layout.working_dir().join("src/lib.rs")).unwrap();
+        let lines = file.lines().collect::<Vec<_>>();
+        let named = |index: u32| {
+            usize::try_from(index)
+                .ok()
+                .and_then(|index| lines.get(index))
+                .is_some_and(|line| line.contains("fn second"))
+        };
+        assert!(
+            named(after.start_line) || named(after.start_line.saturating_sub(1)),
+            "start_line {} does not land on 'fn second' under either base:\n{file}",
+            after.start_line
+        );
+        assert!(
+            file[after.start_byte..].starts_with("pub fn second"),
+            "start_byte {} must index the post-commit bytes of the entity it names",
+            after.start_byte
+        );
+    }
+
     /// A session with no registration still commits under an identity.
     #[test]
     fn a_session_without_an_agent_registration_still_names_an_author() {
