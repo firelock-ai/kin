@@ -6,10 +6,12 @@ mod error;
 pub use error::BlobError;
 
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard};
 use tracing::{debug, warn};
 
 /// Content-addressed 256-bit hash.
@@ -50,6 +52,20 @@ impl std::fmt::Debug for Hash256 {
 /// Monotonic counter for unique temp file names within a process.
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Number of renames after which [`BlobStore::write`] drains pending
+/// directory barriers on its own.
+///
+/// This is a backstop, not a tuning knob: it exists so a caller that never
+/// calls [`BlobStore::sync`] and holds its store for the life of the process
+/// still cannot accumulate an unbounded set of renames awaiting a barrier.
+///
+/// A drain costs one barrier per shard directory touched since the previous
+/// drain, which two-hex-character sharding caps at 256. Draining every 4096
+/// renames therefore holds the amortized directory cost below 0.07 barriers
+/// per blob, against exactly 1.0 when every write barriered its own shard,
+/// while bounding the un-barriered renames at 4096.
+const PENDING_RENAME_DRAIN_THRESHOLD: usize = 4096;
+
 pub type Result<T> = std::result::Result<T, BlobError>;
 
 /// Compute the SHA-256 hash of the given data.
@@ -78,8 +94,49 @@ pub fn digest_bytes(data: &[u8]) -> [u8; 32] {
 /// Blobs are stored at `{root}/{hash[0..2]}/{hash[2..]}` where the hash is
 /// hex-encoded. This provides directory-level sharding to avoid filesystem
 /// bottlenecks with large numbers of objects.
+///
+/// # Durability model
+///
+/// A blob's *bytes* are durable when [`write`](Self::write) returns. The
+/// barrier that makes the blob's *name* durable is deferred and amortized
+/// across a shard directory, and is issued by [`sync`](Self::sync), by the
+/// [`Drop`] drain, or by `write` itself once enough renames accumulate. See
+/// [`write`](Self::write) for the crash states this does and does not admit.
 pub struct BlobStore {
     root: PathBuf,
+    pending: Mutex<PendingDirSyncs>,
+    /// Renames after which [`BlobStore::write`] drains on its own. Always
+    /// [`PENDING_RENAME_DRAIN_THRESHOLD`] outside this crate's own tests, which
+    /// lower it so the drain path is exercised without writing thousands of
+    /// blobs.
+    drain_threshold: usize,
+}
+
+/// Directory entries this store has created but not yet made durable.
+///
+/// Tracked per shard rather than per blob: a shard directory needs exactly one
+/// barrier no matter how many renames landed in it since the last one.
+#[derive(Default)]
+struct PendingDirSyncs {
+    /// Two-hex-character shard directory names holding a pending rename.
+    shards: BTreeSet<String>,
+    /// Whether the store root holds a shard directory creation that is not yet
+    /// durable. A lost shard directory loses every blob beneath it the same way
+    /// a lost rename loses one, so the root drains on the same schedule.
+    root: bool,
+    /// Renames recorded since the last drain.
+    renames: usize,
+}
+
+impl PendingDirSyncs {
+    /// Record one rename into `shard`, reporting whether the caller should
+    /// drain now.
+    fn record(&mut self, shard: &str, created_shard_dir: bool, threshold: usize) -> bool {
+        self.shards.insert(shard.to_string());
+        self.root |= created_shard_dir;
+        self.renames += 1;
+        self.renames >= threshold
+    }
 }
 
 /// Summary of a single [`gc`](BlobStore::gc) pass over the store.
@@ -106,20 +163,49 @@ impl BlobStore {
     ///
     /// Creates the root directory if it does not exist.
     pub fn new(root: PathBuf) -> Result<Self> {
+        Self::with_drain_threshold(root, PENDING_RENAME_DRAIN_THRESHOLD)
+    }
+
+    fn with_drain_threshold(root: PathBuf, drain_threshold: usize) -> Result<Self> {
         fs::create_dir_all(&root).map_err(|e| BlobError::io(&root, e))?;
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            pending: Mutex::new(PendingDirSyncs::default()),
+            drain_threshold,
+        })
     }
 
     /// Write data to the blob store, returning its content hash.
     ///
     /// If a blob with the same hash already exists, this is a no-op (content
-    /// deduplication). Writes are atomic AND durable: data is written to a
-    /// unique temporary file in the shard directory, the file's bytes are
-    /// `fsync`ed, it is renamed into place, and the directory entry is `fsync`ed
-    /// so the rename itself survives a crash. Without the fsyncs a power loss
-    /// after `rename` could leave a zero-length or torn object that the content
-    /// address now vouches for — and because [`write`](Self::write) dedup-skips
-    /// on existence, that corrupt object would be trusted forever.
+    /// deduplication).
+    ///
+    /// # Durability
+    ///
+    /// Writes are atomic, and a blob's **contents** are durable when `write`
+    /// returns: data goes to a unique temporary file in the shard directory,
+    /// the file's bytes are `fsync`ed, and only then is it renamed into place.
+    /// That ordering is what stops a power loss after `rename` from leaving a
+    /// zero-length or torn object that the content address now vouches for.
+    /// Because `write` dedup-skips on existence, such an object would be
+    /// trusted forever.
+    ///
+    /// The **directory** barrier that makes the rename itself durable is
+    /// deferred and amortized: `write` records the shard as pending, and
+    /// [`sync`](Self::sync) issues one barrier per shard directory rather than
+    /// one per blob. A store dropped without an explicit `sync` drains on
+    /// `drop`, and `write` drains on its own once enough renames accumulate, so
+    /// the set of renames awaiting a barrier is always bounded.
+    ///
+    /// The one crash state this defers into is a blob whose bytes reached the
+    /// device but whose name did not: the blob is **absent**, never
+    /// present-but-corrupt, because its content barrier strictly precedes the
+    /// rename that publishes the name. An absent blob is what dedup already
+    /// treats as "not written yet", so it is re-writable byte for byte from the
+    /// same content, the property content addressing exists to provide.
+    /// Callers that must know a set of names is durable before recording
+    /// references that outlive a crash should call [`sync`](Self::sync) as their
+    /// commit point.
     ///
     /// # Self-healing precondition for write-only callers
     ///
@@ -139,7 +225,10 @@ impl BlobStore {
     pub fn write(&self, data: &[u8]) -> Result<Hash256> {
         let _span = tracing::info_span!("kin_blobs.write", bytes = data.len()).entered();
         let hash = digest(data);
-        let blob_path = self.blob_path(&hash);
+        let hex = hash.to_string();
+        let shard_name = &hex[..2];
+        let shard_dir = self.root.join(shard_name);
+        let blob_path = shard_dir.join(&hex[2..]);
 
         // Deduplication: if the blob already exists, skip writing.
         if blob_path.exists() {
@@ -147,12 +236,11 @@ impl BlobStore {
             return Ok(hash);
         }
 
-        // Ensure the shard directory exists.
-        let shard_dir = blob_path.parent().expect("blob path always has a parent");
-        fs::create_dir_all(shard_dir).map_err(|e| BlobError::io(shard_dir, e))?;
+        let created_shard_dir = self.ensure_shard_dir(&shard_dir)?;
 
         // Atomic-durable write: write to a unique temp file in the shard dir,
-        // fsync its contents, rename into place, then fsync the directory.
+        // fsync its contents, then rename into place. The shard directory's own
+        // barrier is deferred to `sync`.
         let seq = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let temp_path = shard_dir.join(format!(".tmp-{}-{}-{}", hash, std::process::id(), seq));
         write_file_durably(&temp_path, data).map_err(|e| BlobError::io(&temp_path, e))?;
@@ -161,10 +249,124 @@ impl BlobStore {
             let _ = fs::remove_file(&temp_path);
             BlobError::io(&blob_path, e)
         })?;
-        sync_dir(shard_dir);
+
+        // Bound the guard to a `let` so it is unmistakably released before the
+        // drain below reacquires it.
+        let drain_now =
+            self.lock_pending()
+                .record(shard_name, created_shard_dir, self.drain_threshold);
+        if drain_now {
+            // Bounded backstop only. The blob's bytes are already durable, so a
+            // failed directory barrier does not make this write unsuccessful;
+            // the shard stays pending and a later `sync`/`drop` retries it.
+            let _ = self.sync();
+        }
 
         debug!(hash = %hash, bytes = data.len(), "wrote blob");
         Ok(hash)
+    }
+
+    /// Issue the deferred directory barriers, making every rename and shard
+    /// directory this store has created durable.
+    ///
+    /// This is the store's commit point. [`write`](Self::write) makes a blob's
+    /// *bytes* durable before renaming the blob into place but leaves the
+    /// barrier that makes the *name* durable to this call, so a bulk import
+    /// pays one barrier per shard directory touched (at most 256, given
+    /// two-hex-character sharding) instead of one per blob. A newly created
+    /// shard directory is itself an entry in the store root, so the root is
+    /// barriered here too.
+    ///
+    /// Calling `sync` is optional: dropping the store drains, and `write`
+    /// drains on its own once enough renames accumulate. Call it explicitly
+    /// when about to record blob references somewhere that outlives a crash and
+    /// those names must be durable first.
+    ///
+    /// A directory that no longer exists, pruned by [`gc`](Self::gc)
+    /// compaction or removed along with the store root, has no entry left to
+    /// make durable and is not an error. Any other failure is returned, and the
+    /// directories it affected stay pending so a later `sync` or the `drop`
+    /// drain retries them.
+    pub fn sync(&self) -> Result<()> {
+        let (shards, root) = {
+            let mut pending = self.lock_pending();
+            pending.renames = 0;
+            (
+                std::mem::take(&mut pending.shards),
+                std::mem::take(&mut pending.root),
+            )
+        };
+        if shards.is_empty() && !root {
+            return Ok(());
+        }
+        let _span = tracing::info_span!("kin_blobs.sync", shards = shards.len()).entered();
+
+        let mut first_error: Option<BlobError> = None;
+        let mut unsynced = BTreeSet::new();
+        let mut root_unsynced = false;
+
+        if root {
+            if let Err(e) = sync_dir(&self.root) {
+                // A removed root has no entry left to make durable.
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    first_error = Some(BlobError::io(&self.root, e));
+                    root_unsynced = true;
+                }
+            }
+        }
+        for shard in shards {
+            let shard_dir = self.root.join(&shard);
+            match sync_dir(&shard_dir) {
+                Ok(()) => {}
+                // Pruned by compaction, or removed with the store root.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    if first_error.is_none() {
+                        first_error = Some(BlobError::io(&shard_dir, e));
+                    }
+                    unsynced.insert(shard);
+                }
+            }
+        }
+
+        if root_unsynced || !unsynced.is_empty() {
+            let mut pending = self.lock_pending();
+            pending.root |= root_unsynced;
+            pending.shards.extend(unsynced);
+        }
+        match first_error {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    /// Create `shard_dir` if absent, reporting whether this call created it.
+    ///
+    /// A newly created shard directory is a new entry in the store root, so the
+    /// root needs a barrier of its own before that directory is durable.
+    fn ensure_shard_dir(&self, shard_dir: &Path) -> Result<bool> {
+        match fs::create_dir(shard_dir) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+            // The root itself was removed underneath us: rebuild the chain.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir_all(shard_dir).map_err(|e| BlobError::io(shard_dir, e))?;
+                Ok(true)
+            }
+            Err(e) => Err(BlobError::io(shard_dir, e)),
+        }
+    }
+
+    /// Lock the pending-barrier state, recovering from poisoning.
+    ///
+    /// The state is a plain set of shard names and two counters: a panic
+    /// elsewhere in the process cannot leave it structurally invalid, so
+    /// refusing to sync after an unrelated panic would turn that panic into a
+    /// durability outage for the whole store.
+    fn lock_pending(&self) -> MutexGuard<'_, PendingDirSyncs> {
+        self.pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Read a blob by its hash, verifying that the stored bytes still hash to
@@ -426,10 +628,15 @@ impl BlobStore {
         match fs::rename(&blob_path, &dest) {
             Ok(()) => {
                 // Make the quarantine move durable so a crash can't resurrect the
-                // corrupt object back into the dedup path.
-                sync_dir(&corrupt_dir);
+                // corrupt object back into the dedup path. Unlike the write path
+                // this barrier is not amortized: quarantine runs only on detected
+                // corruption, so it is never hot, and deferring it would leave the
+                // corrupt object dedup-trusted for the length of the deferral.
+                // Failures stay swallowed: a resurrected corrupt object is
+                // re-detected and re-quarantined by the next `read`.
+                let _ = sync_dir(&corrupt_dir);
                 if let Some(parent) = blob_path.parent() {
-                    sync_dir(parent);
+                    let _ = sync_dir(parent);
                 }
                 debug!(hash = %hash, dest = %dest.display(), "quarantined corrupt blob");
                 Ok(Some(dest))
@@ -452,6 +659,28 @@ impl BlobStore {
         let hex = hash.to_string();
         self.root.join(&hex[..2]).join(&hex[2..])
     }
+
+    /// Directory barriers this store still owes: `(shards, root, renames)`.
+    ///
+    /// Test-only window onto the deferral itself, so the amortization can be
+    /// asserted rather than inferred from timings.
+    #[cfg(test)]
+    fn pending_snapshot(&self) -> (usize, bool, usize) {
+        let pending = self.lock_pending();
+        (pending.shards.len(), pending.root, pending.renames)
+    }
+}
+
+impl Drop for BlobStore {
+    /// Drain any deferred directory barriers.
+    ///
+    /// Dropping the handle is the last commit point a caller that never called
+    /// [`sync`](BlobStore::sync) will get. Failures are swallowed because
+    /// `drop` cannot report them, which matches the best-effort directory
+    /// barrier policy this store has always had.
+    fn drop(&mut self) {
+        let _ = self.sync();
+    }
 }
 
 /// Whether every character in `s` is an ASCII hex digit (`0-9`, `a-f`, `A-F`).
@@ -471,15 +700,14 @@ fn write_file_durably(path: &Path, data: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Best-effort `fsync` of a directory so a `rename`/`create` within it is
-/// durable. Directory fsync is not guaranteed on every platform (and is a no-op
-/// on some); failures are intentionally swallowed because the object file itself
-/// was already fsynced — the worst case is a crash window where the rename is
-/// not yet durable, recoverable by re-writing the (idempotent) blob.
-fn sync_dir(dir: &Path) {
-    if let Ok(handle) = File::open(dir) {
-        let _ = handle.sync_all();
-    }
+/// `fsync` a directory so a `rename`/`create` within it is durable.
+///
+/// Directory fsync is not guaranteed on every platform (and is a no-op on
+/// some). The error is returned rather than swallowed so [`BlobStore::sync`]
+/// can distinguish "nothing left to make durable" (the directory is gone) from
+/// a real failure it must keep pending and report.
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    File::open(dir)?.sync_all()
 }
 
 #[cfg(test)]
@@ -1328,6 +1556,324 @@ mod tests {
         let hash3 = store.write(correct).unwrap();
         assert_eq!(hash, hash3);
         assert_eq!(store.read(&hash).unwrap(), correct);
+    }
+
+    // -----------------------------------------------------------------------
+    // Amortized directory-barrier tests
+    // -----------------------------------------------------------------------
+
+    /// Find `count` distinct payloads whose content addresses share one shard,
+    /// so a test can drive many renames into a single directory.
+    fn payloads_in_one_shard(count: usize) -> Vec<Vec<u8>> {
+        let mut by_shard: std::collections::HashMap<String, Vec<Vec<u8>>> =
+            std::collections::HashMap::new();
+        for i in 0..1_000_000u32 {
+            let payload = format!("shard-collision-{i}").into_bytes();
+            let hex = digest(&payload).to_string();
+            let bucket = by_shard.entry(hex[..2].to_string()).or_default();
+            bucket.push(payload);
+            if bucket.len() >= count {
+                return std::mem::take(bucket);
+            }
+        }
+        panic!("no shard accumulated {count} payloads within the search bound");
+    }
+
+    /// The mechanism under test: many renames into one shard leave exactly one
+    /// directory barrier outstanding, not one per blob.
+    #[test]
+    fn renames_into_one_shard_leave_one_pending_barrier() {
+        let (_dir, store) = make_store();
+        let payloads = payloads_in_one_shard(16);
+        for payload in &payloads {
+            store.write(payload).unwrap();
+        }
+
+        let (shards, root, renames) = store.pending_snapshot();
+        assert_eq!(renames, payloads.len(), "every write records a rename");
+        assert_eq!(shards, 1, "16 renames into one shard owe one barrier");
+        assert!(
+            root,
+            "the shard directory was created, so the root owes one"
+        );
+
+        // Draining clears the debt.
+        store.sync().unwrap();
+        assert_eq!(store.pending_snapshot(), (0, false, 0));
+    }
+
+    /// The root barrier is owed only when a write actually creates a shard
+    /// directory, not on every write into an existing one.
+    #[test]
+    fn root_barrier_owed_only_when_a_shard_is_created() {
+        let (_dir, store) = make_store();
+        let payloads = payloads_in_one_shard(2);
+
+        store.write(&payloads[0]).unwrap();
+        assert!(store.pending_snapshot().1, "first write created the shard");
+        store.sync().unwrap();
+
+        store.write(&payloads[1]).unwrap();
+        let (shards, root, renames) = store.pending_snapshot();
+        assert_eq!((shards, renames), (1, 1));
+        assert!(!root, "writing into an existing shard owes no root barrier");
+    }
+
+    /// A store's pending set can never exceed the 256 possible shards, however
+    /// many blobs were written: that ceiling is the amortization.
+    #[test]
+    fn pending_barriers_are_bounded_by_the_shard_count() {
+        let (_dir, store) = make_store();
+        for i in 0..400 {
+            store
+                .write(format!("bounded barrier blob {i}").as_bytes())
+                .unwrap();
+        }
+        let (shards, _, renames) = store.pending_snapshot();
+        assert_eq!(renames, 400);
+        assert!(
+            shards <= 256 && shards < renames,
+            "{shards} pending barriers for {renames} renames must be capped by the shard count"
+        );
+    }
+
+    /// The auto-drain backstop trips exactly at the bound, so a caller that
+    /// never syncs still cannot accumulate renames without limit.
+    #[test]
+    fn pending_state_drains_at_the_rename_bound() {
+        let bound = PENDING_RENAME_DRAIN_THRESHOLD;
+        let mut pending = PendingDirSyncs::default();
+        for i in 1..bound {
+            assert!(
+                !pending.record("ab", false, bound),
+                "rename {i} must not trip the drain"
+            );
+        }
+        assert!(
+            pending.record("ab", false, bound),
+            "rename {bound} must trip the drain"
+        );
+        assert_eq!(pending.shards.len(), 1, "one shard, however many renames");
+    }
+
+    /// `write` must drain on its own at the bound. Exercised with a lowered
+    /// threshold so the path, including releasing the pending lock before the
+    /// drain reacquires it, is covered without writing thousands of blobs.
+    #[test]
+    fn write_drains_itself_at_the_rename_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlobStore::with_drain_threshold(dir.path().join("objects"), 4).unwrap();
+
+        let mut written = Vec::new();
+        for i in 0..3 {
+            let data = format!("self-draining blob {i}").into_bytes();
+            written.push((store.write(&data).unwrap(), data));
+            assert_eq!(
+                store.pending_snapshot().2,
+                i + 1,
+                "renames accumulate below the bound"
+            );
+        }
+
+        // The 4th rename trips the drain inside `write` itself.
+        let data = b"self-draining blob 3".to_vec();
+        written.push((store.write(&data).unwrap(), data));
+        assert_eq!(
+            store.pending_snapshot(),
+            (0, false, 0),
+            "write must have drained at the bound"
+        );
+
+        // And it keeps draining, without losing anything, across many bounds.
+        for i in 4..40 {
+            let data = format!("self-draining blob {i}").into_bytes();
+            written.push((store.write(&data).unwrap(), data));
+        }
+        assert!(
+            store.pending_snapshot().2 < 4,
+            "renames never exceed the bound"
+        );
+        for (hash, data) in &written {
+            assert_eq!(&store.read(hash).unwrap(), data);
+        }
+    }
+
+    #[test]
+    fn sync_on_untouched_store_is_ok() {
+        let (_dir, store) = make_store();
+        store.sync().unwrap();
+        assert_eq!(store.pending_snapshot(), (0, false, 0));
+    }
+
+    #[test]
+    fn sync_is_idempotent() {
+        let (_dir, store) = make_store();
+        store.write(b"sync twice").unwrap();
+        store.sync().unwrap();
+        store.sync().unwrap();
+        assert_eq!(store.pending_snapshot(), (0, false, 0));
+    }
+
+    /// GC compaction removes shard directories. A pending barrier for a
+    /// directory that no longer exists has nothing to make durable and must not
+    /// be reported as a failure.
+    #[test]
+    fn sync_after_gc_pruned_shards_is_ok() {
+        let (_dir, store) = make_store();
+        for i in 0..8 {
+            store
+                .write(format!("pruned shard blob {i}").as_bytes())
+                .unwrap();
+        }
+        let report = store.gc(&HashSet::new()).unwrap();
+        assert_eq!(report.reclaimed, 8);
+        assert_eq!(shard_dir_count(&store), 0, "shards should be pruned");
+
+        store.sync().unwrap();
+        assert_eq!(store.pending_snapshot(), (0, false, 0));
+    }
+
+    /// A store whose root was removed underneath it must sync and drop cleanly:
+    /// there is no directory left to barrier.
+    #[test]
+    fn sync_and_drop_after_root_removal_are_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlobStore::new(dir.path().join("objects")).unwrap();
+        store.write(b"root goes away").unwrap();
+        std::fs::remove_dir_all(store.root()).unwrap();
+
+        store.sync().unwrap();
+        assert_eq!(store.pending_snapshot(), (0, false, 0));
+        drop(store); // must not panic
+    }
+
+    // -----------------------------------------------------------------------
+    // Crash-semantics tests for the deferred directory barrier
+    // -----------------------------------------------------------------------
+
+    /// Deferring the directory barrier must not defer visibility: every blob
+    /// written since the last sync reads back, hash-verified, with no sync.
+    #[test]
+    fn blobs_verify_before_any_sync() {
+        let (_dir, store) = make_store();
+        let mut written = Vec::new();
+        for i in 0..64 {
+            let data = format!("unsynced blob {i}").into_bytes();
+            written.push((store.write(&data).unwrap(), data));
+        }
+        assert!(store.pending_snapshot().0 > 0, "barriers are still pending");
+        for (hash, data) in &written {
+            assert_eq!(&store.read(hash).unwrap(), data);
+        }
+    }
+
+    /// The drop drain is the commit point for a caller that never syncs: a
+    /// reopened store sees every blob, hash-verified.
+    #[test]
+    fn reopen_after_drop_sees_every_blob_without_explicit_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("objects");
+        let mut written = Vec::new();
+        {
+            let store = BlobStore::new(root.clone()).unwrap();
+            for i in 0..32 {
+                let data = format!("reopen blob {i}").into_bytes();
+                written.push((store.write(&data).unwrap(), data));
+            }
+            assert!(store.pending_snapshot().0 > 0, "drop must do the draining");
+        }
+
+        let reopened = BlobStore::new(root).unwrap();
+        for (hash, data) in &written {
+            assert_eq!(&reopened.read(hash).unwrap(), data);
+        }
+        assert_eq!(reopened.list_hashes().unwrap().len(), written.len());
+    }
+
+    /// The crash state the deferred barrier admits: a blob whose bytes reached
+    /// the device but whose name did not.
+    ///
+    /// Simulated by removing the directory entry after the write, then dropping
+    /// and reopening the store. The blob must be **absent**, never
+    /// present-but-corrupt, and re-writable byte for byte, which is exactly
+    /// what dedup already treats as "not written yet".
+    #[test]
+    fn lost_directory_entry_is_absent_and_rewritable_with_identical_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("objects");
+        let data = b"a name that never reached the device".to_vec();
+
+        let hash = {
+            let store = BlobStore::new(root.clone()).unwrap();
+            let hash = store.write(&data).unwrap();
+            // The rename is lost: the entry publishing the name never landed.
+            std::fs::remove_file(on_disk_path(&store, &hash)).unwrap();
+            hash
+        };
+
+        let reopened = BlobStore::new(root).unwrap();
+        // Absent, and reported as absent: never silently missing while
+        // enumeration or dedup claims it is there.
+        assert!(!reopened.exists(&hash).unwrap());
+        assert!(reopened.list_hashes().unwrap().is_empty());
+        assert!(
+            matches!(
+                reopened.read(&hash).unwrap_err(),
+                BlobError::NotFound { .. }
+            ),
+            "a lost name must read as absent, never as corrupt content"
+        );
+        // And re-writable to the identical address and bytes.
+        assert_eq!(reopened.write(&data).unwrap(), hash);
+        assert_eq!(reopened.read(&hash).unwrap(), data);
+    }
+
+    /// The content barrier still precedes the rename, so the dedup-corruption
+    /// trap stays closed: whenever the name is present, the bytes behind it
+    /// verify against it.
+    #[test]
+    fn a_present_name_always_verifies_against_its_content() {
+        let (_dir, store) = make_store();
+        let payloads = payloads_in_one_shard(12);
+        for payload in &payloads {
+            let hash = store.write(payload).unwrap();
+            assert!(store.exists(&hash).unwrap());
+            // No sync yet: the name is published, so the bytes must verify.
+            assert_eq!(&store.read(&hash).unwrap(), payload);
+        }
+    }
+
+    /// A lost shard directory loses everything beneath it exactly the way a
+    /// lost rename loses one blob: absent, and re-writable.
+    #[test]
+    fn lost_shard_directory_is_absent_and_rewritable() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("objects");
+        let payloads = payloads_in_one_shard(6);
+
+        let hashes: Vec<Hash256> = {
+            let store = BlobStore::new(root.clone()).unwrap();
+            let hashes: Vec<Hash256> = payloads.iter().map(|p| store.write(p).unwrap()).collect();
+            let shard_dir = on_disk_path(&store, &hashes[0])
+                .parent()
+                .unwrap()
+                .to_path_buf();
+            std::fs::remove_dir_all(&shard_dir).unwrap();
+            hashes
+        };
+
+        let reopened = BlobStore::new(root).unwrap();
+        assert!(reopened.list_hashes().unwrap().is_empty());
+        for hash in &hashes {
+            assert!(matches!(
+                reopened.read(hash).unwrap_err(),
+                BlobError::NotFound { .. }
+            ));
+        }
+        for (payload, hash) in payloads.iter().zip(&hashes) {
+            assert_eq!(&reopened.write(payload).unwrap(), hash);
+            assert_eq!(&reopened.read(hash).unwrap(), payload);
+        }
     }
 
     #[test]
