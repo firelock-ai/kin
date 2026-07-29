@@ -441,17 +441,21 @@ fn mcp_actor_id(session_id: &str) -> ActorId {
     ActorId::from_hash(Hash256::from_bytes(hasher.finalize().into()))
 }
 
-/// A stable audit-event identity for one entity within one committed change.
+/// A stable audit-event identity for one scope within one committed change.
 ///
 /// Derived so a commit that is resumed after a crash re-derives the identifiers
 /// it already wrote instead of appending a second attribution record for a
-/// single write.
-fn mcp_audit_event_id(change: &SemanticChangeId, entity: &EntityId) -> AuditEventId {
+/// single write. `None` names the change itself, which is what a commit that
+/// touched no entity is attributed to.
+fn mcp_audit_event_id(change: &SemanticChangeId, entity: Option<&EntityId>) -> AuditEventId {
     let mut hasher = Sha256::new();
     hasher.update(b"kin-mcp-commit-audit-v1\0");
     hasher.update(change.to_string().as_bytes());
     hasher.update([0]);
-    hasher.update(entity.to_string().as_bytes());
+    match entity {
+        Some(entity) => hasher.update(entity.to_string().as_bytes()),
+        None => hasher.update(b"change"),
+    }
     AuditEventId::from_hash(Hash256::from_bytes(hasher.finalize().into()))
 }
 
@@ -465,8 +469,11 @@ fn mcp_audit_event_id(change: &SemanticChangeId, entity: &EntityId) -> AuditEven
 /// does not reach either, because both read the audit trail.
 ///
 /// One event per changed entity, because that is the scope the review layer
-/// matches on. Called only after the repository receipt exists, so nothing is
-/// attributed to a commit that did not land.
+/// matches on, and one event scoped to the change itself when a transaction
+/// changed no entity at all: a relation-only commit is still an agent write,
+/// and leaving it out of the audit trail is the same silence this closes.
+/// Called only after the repository receipt exists, so nothing is attributed to
+/// a commit that did not land.
 fn record_commit_provenance(
     graph: &kin_db::InMemoryGraph,
     actor: &CommitActor,
@@ -495,9 +502,22 @@ fn record_commit_provenance(
         .collect::<Vec<_>>();
     entities.sort_unstable();
     entities.dedup();
-    if entities.is_empty() {
-        return Ok(());
-    }
+    let scopes = if entities.is_empty() {
+        vec![(
+            mcp_audit_event_id(&committed.change.id, None),
+            WorkScope::Change(committed.change.id),
+        )]
+    } else {
+        entities
+            .into_iter()
+            .map(|entity| {
+                (
+                    mcp_audit_event_id(&committed.change.id, Some(&entity)),
+                    WorkScope::Entity(entity),
+                )
+            })
+            .collect()
+    };
 
     let already_recorded = graph
         .query_audit_events(Some(&actor.actor.actor_id), DEDUP_WINDOW)
@@ -517,8 +537,7 @@ fn record_commit_provenance(
     })
     .to_string();
 
-    for entity in entities {
-        let event_id = mcp_audit_event_id(&committed.change.id, &entity);
+    for (event_id, scope) in scopes {
         if already_recorded.contains(&event_id) {
             continue;
         }
@@ -527,11 +546,11 @@ fn record_commit_provenance(
                 event_id,
                 actor_id: actor.actor.actor_id,
                 action: "kin_transaction_commit".to_string(),
-                target_scope: Some(WorkScope::Entity(entity)),
+                target_scope: Some(scope.clone()),
                 timestamp: committed.change.timestamp.clone(),
                 details: Some(details.clone()),
             })
-            .map_err(|error| format!("record commit attribution for entity {entity}: {error}"))?;
+            .map_err(|error| format!("record commit attribution for {scope}: {error}"))?;
     }
     Ok(())
 }
@@ -2234,6 +2253,81 @@ mod tests {
                 .len(),
             1,
             "one write is one attribution record, however many attempts it took"
+        );
+    }
+
+    /// A commit that changed no entity is still an agent write.
+    ///
+    /// Attribution keyed only to changed entities would leave a relation-only
+    /// transaction out of the audit trail entirely, which is the same silence
+    /// this whole surface exists to end. It is attributed to the change itself.
+    #[test]
+    fn a_relation_only_commit_is_attributed_to_the_change_it_published() {
+        let (_dir, state) = test_state();
+        let (caller, _) = install_exact_source(
+            &state,
+            "src/caller.rs",
+            b"pub fn caller() -> u8 { 1 }\n",
+            "caller",
+        );
+        let (callee, _) = install_exact_source(
+            &state,
+            "src/callee.rs",
+            b"pub fn callee() -> u8 { 2 }\n",
+            "callee",
+        );
+        let sessions = kin_mcp::SessionRegistry::new();
+        let session = start_agent_session(&sessions, "gemini-cli", "relation-writer");
+        let session_id = session.session_id.to_string();
+        let transaction = sessions
+            .begin_transaction(&session_id, "relations")
+            .unwrap();
+        sessions
+            .stage_transaction(
+                &transaction.transaction_id,
+                vec![kin_mcp::McpMutationOperation {
+                    verb: "create".to_string(),
+                    target: String::new(),
+                    payload: Some(kin_mcp::McpMutationPayload::Relation {
+                        from: caller.id,
+                        to: callee.id,
+                        kind: kin_model::relation::RelationKind::Calls,
+                    }),
+                    body: None,
+                    description: "link the call".to_string(),
+                }],
+            )
+            .unwrap();
+
+        let result = commit_exact_transaction(
+            &state,
+            &sessions,
+            &HashMap::from([(
+                "transaction_id".to_string(),
+                serde_json::json!(transaction.transaction_id),
+            )]),
+            None,
+        );
+        assert_ne!(
+            result.is_error,
+            Some(true),
+            "relation-only commit failed: {}",
+            result_text(&result)
+        );
+
+        let events = state
+            .graph
+            .query_audit_events(Some(&mcp_actor_id(&session_id)), 16)
+            .unwrap();
+        assert_eq!(
+            events.len(),
+            1,
+            "a relation-only commit must still leave an attribution record"
+        );
+        assert!(
+            matches!(events[0].target_scope, Some(WorkScope::Change(_))),
+            "with no entity to scope to, the change itself is the scope: {:?}",
+            events[0].target_scope
         );
     }
 
