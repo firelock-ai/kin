@@ -61,6 +61,46 @@ DOCS_ONLY_CLASSIFIER_SHELL = textwrap.dedent(
     echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"
     """
 ).rstrip()
+DOCS_ONLY_CLASSIFIER_JOB = textwrap.dedent(
+    """\
+    changes:
+      name: Classify diff scope
+      runs-on: ubuntu-latest
+      outputs:
+        docs_only: ${{ steps.classify.outputs.docs_only }}
+      steps:
+        - uses: actions/checkout@v7
+          with:
+            fetch-depth: 0
+        - name: Classify changed paths
+          id: classify
+          shell: /usr/bin/bash --noprofile --norc -e -u -o pipefail {0}
+          env:
+            BASH_ENV: ""
+            EVENT_NAME: ${{ github.event_name }}
+            BASE_SHA: ${{ github.event.pull_request.base.sha }}
+            HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          run: |
+            set -euo pipefail
+            docs_only=false
+            if [ "$EVENT_NAME" = "pull_request" ]; then
+              changed="$(git diff --name-only "$BASE_SHA...$HEAD_SHA")"
+              if [ -n "$changed" ]; then
+                docs_only=true
+                while IFS= read -r path; do
+                  case "$path" in
+                    .github/workflows/ci.yml) docs_only=false; break ;;
+                    *.md | docs/*) ;;
+                    .github/workflows/*) ;;
+                    *) docs_only=false; break ;;
+                  esac
+                done <<< "$changed"
+              fi
+              printf '%s\\n' "$changed"
+            fi
+            echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"
+    """
+).rstrip()
 
 
 def require(content: str, needle: str, context: str) -> None:
@@ -125,37 +165,71 @@ def classifier_shell_source(classifier: str) -> str:
     return "\n".join(active_lines)
 
 
-def assert_docs_only_classifier_guard(classifier: str) -> None:
-    """Require the exact reviewed shell program, with comments as the only slack."""
+def classifier_active_job_source(classifier: str) -> str:
+    """Return the complete active YAML contract for the classifier job."""
 
-    source = classifier_shell_source(classifier)
-    if source != DOCS_ONLY_CLASSIFIER_SHELL:
+    source = textwrap.dedent(classifier).strip()
+    active_lines = [
+        line.rstrip()
+        for line in source.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    return "\n".join(active_lines)
+
+
+def assert_docs_only_classifier_guard(classifier: str) -> None:
+    """Require the exact reviewed job and shell, with comments as the only slack."""
+
+    job_source = classifier_active_job_source(classifier)
+    if job_source != DOCS_ONLY_CLASSIFIER_JOB:
         raise AssertionError(
-            "diff classifier active shell must exactly match the closed-form "
-            "docs_only program"
+            "diff classifier active job must exactly match the closed-form "
+            "docs_only authority contract"
         )
+    if classifier_shell_source(classifier) != DOCS_ONLY_CLASSIFIER_SHELL:
+        raise AssertionError("diff classifier shell extraction disagrees with its job")
 
 
 def execute_docs_only_classifier(
     classifier: str,
+    *,
+    cwd: Path = ROOT,
+    environment_overrides: dict[str, str] | None = None,
+    shell_wrapper: str | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
     """Execute a classifier mutant on a push and return its emitted outputs."""
 
     source = classifier_shell_source(classifier)
     with tempfile.TemporaryDirectory() as directory:
         output = Path(directory) / "github-output"
+        source_path = Path(directory) / "classifier.sh"
+        source_path.write_text(source, encoding="utf-8")
         environment = os.environ.copy()
         environment.update(
             {
+                "BASH_ENV": "",
                 "EVENT_NAME": "push",
                 "BASE_SHA": "unused-on-push",
                 "HEAD_SHA": "unused-on-push",
                 "GITHUB_OUTPUT": str(output),
             }
         )
+        if environment_overrides is not None:
+            environment.update(environment_overrides)
+        command = ["bash", "--noprofile", "--norc", "-c", source]
+        if shell_wrapper is not None:
+            command = [
+                "bash",
+                "--noprofile",
+                "--norc",
+                "-c",
+                shell_wrapper,
+                "classifier-wrapper",
+                str(source_path),
+            ]
         result = subprocess.run(
-            ["bash", "--noprofile", "--norc", "-c", source],
-            cwd=ROOT,
+            command,
+            cwd=cwd,
             env=environment,
             capture_output=True,
             text=True,
@@ -180,13 +254,25 @@ def assert_classifier_bypass_rejected(
 
     expect_assertion(
         label,
-        "exactly match the closed-form docs_only program",
+        "exactly match the closed-form docs_only authority contract",
         lambda: assert_docs_only_classifier_guard(classifier),
     )
     if not execute:
         return
 
     result, outputs = execute_docs_only_classifier(classifier)
+    assert_classifier_execution_won(label, result, outputs)
+
+
+def assert_classifier_execution_won(
+    label: str,
+    result: subprocess.CompletedProcess[str],
+    outputs: list[str],
+    *,
+    changed_path: str | None = None,
+) -> None:
+    """Prove a rejected authority mutation would report a docs-only push."""
+
     if result.returncode != 0:
         raise AssertionError(
             f"classifier falsification did not execute: {label}: "
@@ -196,6 +282,11 @@ def assert_classifier_bypass_rejected(
         raise AssertionError(
             f"classifier falsification did not override push output: {label}: "
             f"{outputs}"
+        )
+    if changed_path is not None and changed_path not in result.stdout.splitlines():
+        raise AssertionError(
+            f"classifier falsification did not inspect {changed_path}: "
+            f"{label}: {result.stdout}"
         )
 
 
@@ -217,6 +308,64 @@ def bash_supports_nameref() -> bool:
         check=False,
     )
     return probe.returncode == 0
+
+
+def create_docs_only_git_fixture(directory: Path) -> tuple[Path, str, str]:
+    """Create a hermetic two-commit repository with one docs-only change."""
+
+    repository = directory / "repository"
+    repository.mkdir()
+    global_config = directory / "git-global-config"
+    global_config.write_text("", encoding="utf-8")
+    environment = {
+        key: value for key, value in os.environ.items() if not key.startswith("GIT_")
+    }
+    environment.update(
+        {
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": str(global_config),
+        }
+    )
+
+    def git(*args: str) -> str:
+        result = subprocess.run(
+            [
+                "git",
+                "-c",
+                "maintenance.auto=false",
+                "-c",
+                "gc.auto=0",
+                *args,
+            ],
+            cwd=repository,
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise AssertionError(
+                f"docs-only Git fixture failed: git {args}: "
+                f"{result.stdout}{result.stderr}"
+            )
+        return result.stdout.strip()
+
+    git("init", "--initial-branch=main")
+    git("config", "user.email", "kin@example.invalid")
+    git("config", "user.name", "Kin")
+    (repository / "README.md").write_text("base\n", encoding="utf-8")
+    git("add", "--all")
+    git("commit", "-m", "seed")
+    base_sha = git("rev-parse", "HEAD")
+
+    docs = repository / "docs"
+    docs.mkdir()
+    (docs / "release-bot.md").write_text("docs-only\n", encoding="utf-8")
+    git("add", "--all")
+    git("commit", "-m", "docs only")
+    head_sha = git("rev-parse", "HEAD")
+    return repository, base_sha, head_sha
 
 
 def yaml_uses_scalar(line: str) -> str | None:
@@ -1173,14 +1322,157 @@ def main() -> None:
     # installer actually runs. The release-tag gate independently requires an
     # exact success conclusion, but preserving both controls keeps a main push
     # from silently losing the proof and discovering that only at tag time.
-    # Enforce the classifier as a closed form: one false default, exact false
-    # downgrade arms, one true write inside the structurally matched PR guard,
-    # and one output write. That rejects shell-equivalent quoted or indirect
-    # assignments outside the guard.
+    # Enforce the classifier as a closed form at the whole-job boundary. The
+    # reviewed shell is meaningless without its checkout, output, id, event,
+    # SHA, shell, and startup-environment bindings, so those are one authority
+    # contract rather than independently mutable text.
     classifier_start = ci_workflow.index("  changes:")
     classifier_end = ci_workflow.index("\n  check-docs-only:", classifier_start)
     classifier = ci_workflow[classifier_start:classifier_end]
     assert_docs_only_classifier_guard(classifier)
+    for label, old, new in (
+        (
+            "classifier job output remapped to a constant",
+            "      docs_only: ${{ steps.classify.outputs.docs_only }}",
+            '      docs_only: "true"',
+        ),
+        (
+            "classifier checkout ref changed",
+            "      - uses: actions/checkout@v7",
+            "      - uses: actions/checkout@v6",
+        ),
+        (
+            "classifier checkout depth changed",
+            "          fetch-depth: 0",
+            "          fetch-depth: 1",
+        ),
+        (
+            "classifier step id changed",
+            "        id: classify",
+            "        id: classify_mutant",
+        ),
+    ):
+        if classifier.count(old) != 1:
+            raise AssertionError(
+                f"diff classifier falsification could not identify {label}"
+            )
+        mutant = classifier.replace(old, new, 1)
+        expect_assertion(
+            label,
+            "exactly match the closed-form docs_only authority contract",
+            lambda mutant=mutant: assert_docs_only_classifier_guard(mutant),
+        )
+
+    environment_binding = (
+        '          BASH_ENV: ""\n'
+        "          EVENT_NAME: ${{ github.event_name }}\n"
+        "          BASE_SHA: ${{ github.event.pull_request.base.sha }}\n"
+        "          HEAD_SHA: ${{ github.event.pull_request.head.sha }}"
+    )
+    if classifier.count(environment_binding) != 1:
+        raise AssertionError(
+            "diff classifier falsification could not identify its environment binding"
+        )
+    with tempfile.TemporaryDirectory() as directory:
+        fixture, base_sha, head_sha = create_docs_only_git_fixture(Path(directory))
+        fixed_range_binding = (
+            '          BASH_ENV: ""\n'
+            "          EVENT_NAME: pull_request\n"
+            f"          BASE_SHA: {base_sha}\n"
+            f"          HEAD_SHA: {head_sha}"
+        )
+        fixed_range = classifier.replace(
+            environment_binding,
+            fixed_range_binding,
+            1,
+        )
+        expect_assertion(
+            "push classifier bound to a fixed historical docs-only range",
+            "exactly match the closed-form docs_only authority contract",
+            lambda: assert_docs_only_classifier_guard(fixed_range),
+        )
+        result, outputs = execute_docs_only_classifier(
+            fixed_range,
+            cwd=fixture,
+            environment_overrides={
+                "EVENT_NAME": "pull_request",
+                "BASE_SHA": base_sha,
+                "HEAD_SHA": head_sha,
+            },
+        )
+        assert_classifier_execution_won(
+            "push classifier bound to a fixed historical docs-only range",
+            result,
+            outputs,
+            changed_path="docs/release-bot.md",
+        )
+
+        hostile_bash_env = Path(directory) / "hostile-bash-env"
+        hostile_bash_env.write_text(
+            "EVENT_NAME=pull_request\n"
+            f"BASE_SHA={base_sha}\n"
+            f"HEAD_SHA={head_sha}\n",
+            encoding="utf-8",
+        )
+        bash_env_mutant = classifier.replace(
+            '          BASH_ENV: ""',
+            f'          BASH_ENV: "{hostile_bash_env}"',
+            1,
+        )
+        expect_assertion(
+            "classifier shell startup overridden through BASH_ENV",
+            "exactly match the closed-form docs_only authority contract",
+            lambda: assert_docs_only_classifier_guard(bash_env_mutant),
+        )
+        result, outputs = execute_docs_only_classifier(
+            bash_env_mutant,
+            cwd=fixture,
+            environment_overrides={"BASH_ENV": str(hostile_bash_env)},
+        )
+        assert_classifier_execution_won(
+            "classifier shell startup overridden through BASH_ENV",
+            result,
+            outputs,
+            changed_path="docs/release-bot.md",
+        )
+
+        shell_line = (
+            "        shell: /usr/bin/bash --noprofile --norc "
+            "-e -u -o pipefail {0}"
+        )
+        hostile_shell = classifier.replace(
+            shell_line,
+            "        shell: bash --noprofile --norc -c "
+            "'exec env EVENT_NAME=pull_request "
+            f"BASE_SHA={base_sha} HEAD_SHA={head_sha} BASH_ENV= "
+            '/usr/bin/bash --noprofile --norc "$1"\' wrapper {0}',
+            1,
+        )
+        expect_assertion(
+            "classifier custom shell overrides event and SHA authority",
+            "exactly match the closed-form docs_only authority contract",
+            lambda: assert_docs_only_classifier_guard(hostile_shell),
+        )
+        result, outputs = execute_docs_only_classifier(
+            hostile_shell,
+            cwd=fixture,
+            environment_overrides={
+                "FIXED_BASE_SHA": base_sha,
+                "FIXED_HEAD_SHA": head_sha,
+            },
+            shell_wrapper=(
+                'exec env EVENT_NAME=pull_request BASE_SHA="$FIXED_BASE_SHA" '
+                'HEAD_SHA="$FIXED_HEAD_SHA" BASH_ENV= '
+                'bash --noprofile --norc "$1"'
+            ),
+        )
+        assert_classifier_execution_won(
+            "classifier custom shell overrides event and SHA authority",
+            result,
+            outputs,
+            changed_path="docs/release-bot.md",
+        )
+
     classifier_falsification_needle = (
         '          fi\n          echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"'
     )

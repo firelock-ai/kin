@@ -330,7 +330,11 @@ jobs:
           fetch-depth: 0
       - name: Classify changed paths
         id: classify
+        # This step gates release-critical jobs. Override workflow defaults and
+        # shell startup injection rather than inheriting mutable semantics.
+        shell: /usr/bin/bash --noprofile --norc -e -u -o pipefail {0}
         env:
+          BASH_ENV: ""
           EVENT_NAME: ${{ github.event_name }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
