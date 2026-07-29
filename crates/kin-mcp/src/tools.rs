@@ -457,7 +457,8 @@ pub fn tool_definitions() -> ToolsListResult {
                     "properties": {
                         "entity_id": { "type": "string", "description": "Entity UUID" },
                         "depth": { "type": "integer", "description": "Traversal depth", "default": 2 },
-                        "limit": { "type": "integer", "description": "Max entities to return (default 30)", "default": 30 }
+                        "limit": { "type": "integer", "description": "Max entities to return (default 30)", "default": 30 },
+                        "direction": { "type": "string", "description": "Direction of traversal: 'out' walks what the focal depends on, 'in' walks what depends on the focal (dependents / blast radius), 'both' merges. Default 'both'.", "default": "both" }
                     },
                     "required": ["entity_id"]
                 }),

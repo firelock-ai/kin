@@ -956,6 +956,7 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route("/vfs/tree", get(vfs_tree))
         .route("/vfs/stat/{*path}", get(vfs_stat))
         .route("/vfs/read/{*path}", get(vfs_read))
+        .route("/vfs/blob/{hash}", get(vfs_blob))
         .route("/vfs/readdir/{*path}", get(vfs_readdir))
         .route("/vfs/subscribe", get(vfs_subscribe))
         // Spine endpoints — cross-repo federation queries
@@ -7873,6 +7874,95 @@ async fn vfs_read(
         );
     }
 
+    Ok(response)
+}
+
+fn vfs_blob_error(
+    status: StatusCode,
+    error: &str,
+    hash: &str,
+    detail: Option<String>,
+) -> (StatusCode, String) {
+    let mut body = json!({
+        "error": error,
+        "hash": hash,
+        "authority": "repository_v6",
+    });
+    if let Some(detail) = detail {
+        body["detail"] = json!(detail);
+    }
+    (status, body.to_string())
+}
+
+/// GET /vfs/blob/{hash} — return exact repository-owned CAS bytes for one
+/// content address.
+///
+/// This is the read half of the `/vfs/tree` contract. The tree mints every
+/// advertised hash from repository-v6 immutable source CAS and reads each
+/// artifact size from that same store, so a served tree already proves each
+/// body is present. This route answers from that one authority: the manager
+/// re-verifies the digest of the bytes it returns, so the response is exactly
+/// the content named by the address.
+///
+/// The whole body is always returned. A client verifies it against the hash
+/// the tree advertised, which a partial response could not satisfy, so `Range`
+/// carries no meaning here and is ignored.
+///
+/// An address the repository authority does not own is reported as a named
+/// graph gap. It is never repaired from the working copy or a Git object
+/// database.
+async fn vfs_blob(
+    Path(hash): Path<String>,
+    State(state): State<Arc<DaemonState>>,
+) -> Result<Response, (StatusCode, String)> {
+    let digest = kin_model::Hash256::from_hex(&hash).map_err(|error| {
+        vfs_blob_error(
+            StatusCode::BAD_REQUEST,
+            "malformed_content_address",
+            &hash,
+            Some(error.to_string()),
+        )
+    })?;
+    let authority = ActiveApiRepositoryAuthority::open(&state)?;
+    let blob_data = authority
+        .manager
+        .load_source_blob(digest)
+        .map_err(|error| {
+            vfs_blob_error(
+                StatusCode::FAILED_DEPENDENCY,
+                "repository_cas_read_failed",
+                &hash,
+                Some(error.to_string()),
+            )
+        })?
+        .ok_or_else(|| {
+            vfs_blob_error(
+                StatusCode::NOT_FOUND,
+                "graph_blob_missing",
+                &hash,
+                Some(format!(
+                    "repository {} owns no immutable source body at this content address",
+                    authority.repository_id
+                )),
+            )
+        })?;
+
+    let mut response = blob_data.into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("x-kin-blob-hash"),
+        HeaderValue::from_str(&digest.to_string()).map_err(|error| {
+            vfs_blob_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "invalid_content_address_header",
+                &hash,
+                Some(error.to_string()),
+            )
+        })?,
+    );
     Ok(response)
 }
 
@@ -18038,6 +18128,113 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Every content address `/vfs/tree` advertises must be readable from the
+    /// same daemon. The tree cannot be built at all unless each body is
+    /// present in repository-owned immutable CAS, so an unreadable advertised
+    /// hash is a broken projection contract, not a missing body.
+    #[tokio::test]
+    async fn vfs_blob_serves_every_content_address_the_tree_advertises() {
+        const BODY: &[u8] = b"content addressed projection body\n";
+        let initial = test_state();
+        let layout = initial.layout.clone();
+        install_repository_file(&initial, "src/probe.rs", BODY);
+        drop(initial);
+        let state = Arc::new(DaemonState::open(layout).unwrap());
+        let app = router(state);
+
+        let response = app
+            .clone()
+            .oneshot(Request::get("/vfs/tree").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let snapshot: WorkspaceTreeSnapshot = serde_json::from_slice(&body).unwrap();
+        let artifact = snapshot
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.path.as_utf8() == Some("src/probe.rs"))
+            .expect("the committed artifact must appear in the workspace tree");
+        let advertised = artifact
+            .entry
+            .blob_identity()
+            .expect("a blob entry carries a content address");
+        assert_eq!(artifact.size, BODY.len() as u64);
+
+        let response = app
+            .oneshot(
+                Request::get(format!("/vfs/blob/{advertised}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "/vfs/tree advertised {advertised} so /vfs/blob must serve it"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("x-kin-blob-hash")
+                .and_then(|value| value.to_str().ok()),
+            Some(advertised.to_string().as_str())
+        );
+        let served = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        assert_eq!(served.as_ref(), BODY);
+    }
+
+    #[tokio::test]
+    async fn vfs_blob_names_the_graph_gap_for_an_unowned_content_address() {
+        let state = test_state();
+        let app = router(state);
+        let unowned = "5a".repeat(32);
+        let response = app
+            .oneshot(
+                Request::get(format!("/vfs/blob/{unowned}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body)
+            .expect("an absent content address reports a typed graph gap");
+        assert_eq!(json["error"], "graph_blob_missing");
+        assert_eq!(json["hash"], unowned);
+        assert_eq!(json["authority"], "repository_v6");
+    }
+
+    #[tokio::test]
+    async fn vfs_blob_rejects_a_content_address_that_is_not_a_sha256() {
+        let state = test_state();
+        let app = router(state);
+        for malformed in ["not-a-hash", "5a", &"5a".repeat(33)] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::get(format!("/vfs/blob/{malformed}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "{malformed:?} is not a content address"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

@@ -2345,84 +2345,186 @@ Get the dependency neighborhood of an entity — both what it depends on and wha
 on it — as a compact graph. Starting from an entity ID, Kin traverses the semantic \
 relations (calls, imports, implements, …) out to the depth you specify and returns the \
 reachable entities as lightweight summaries (id, name, kind, file, signature) plus the \
-edges connecting them, along with total counts and a truncation flag. Reach for it when \
-you want the structural shape around a symbol — its blast radius and its supports — \
-rather than full source bodies: impact-scoping a change, understanding coupling, or \
-mapping how a module hangs together. It returns summaries rather than code precisely so \
-the neighborhood stays within token budgets even at depth; when you then want to read a \
+edges connecting them, along with total counts and a truncation flag. Traversal follows \
+edges in both directions by default: direction='out' walks only what the focal depends \
+on, 'in' walks only what depends on the focal (its dependents — this is the blast-radius \
+direction), and 'both' merges them. Every returned edge carries the direction it was \
+traversed in, so dependencies and dependents are never conflated. Reach for it when you \
+want the structural shape around a symbol — its blast radius and its supports — rather \
+than full source bodies: impact-scoping a change, understanding coupling, or mapping how \
+a module hangs together. It returns summaries rather than code precisely so the \
+neighborhood stays within token budgets even at depth; when you then want to read a \
 specific neighbor's implementation, follow up with get_entity_source, and when you want \
 a directional ordered chain with bodies inlined, use trace_data_flow. \
 When no neighbors come back, the additive `negative` object's `safe_to_conclude_absent` \
 flag says whether \"isolated, no dependencies\" is authoritative or merely \"not indexed yet\".";
 
+/// Traverse the neighborhood around a focal entity in the requested direction.
+///
+/// Walks the relation table with [`GraphStore::get_all_relations_for_entity`],
+/// which returns an entity's outgoing *and* incoming edges from two separate
+/// adjacency indexes at the same cost. This deliberately does not use
+/// `get_dependency_neighborhood`: that traversal is fed only the outgoing index,
+/// so it returns what the focal depends on and never what depends on it. This
+/// tool has always described itself as answering both, which meant an agent
+/// asking for blast radius was handed the focal's dependencies and told they
+/// were its dependents — the one error a caller cannot detect from the output.
+/// Direction is now traversed as described and tagged per edge.
 pub fn handle_graph_neighborhood<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
 ) -> Result<ToolCallResult> {
+    // Bidirectional traversal widens the frontier: a hot callee's incoming edge
+    // set is unbounded in a way its outgoing set is not, so the walk is capped
+    // and reports the cap through `truncated` rather than returning a partial
+    // neighborhood that looks complete.
+    const MAX_VISITED_ENTITIES: usize = 2_000;
+
     let id_str = get_string_param(args, "entity_id")?;
     let entity_id = parse_entity_id(&id_str)?;
     let depth = get_optional_u64(args, "depth", 2) as u32;
     let limit = get_optional_u64(args, "limit", 30) as usize;
+    let direction = match get_optional_string_param(args, "direction") {
+        Some(value) => match value.trim().to_lowercase().as_str() {
+            "out" | "outgoing" | "dependencies" | "depends_on" | "calls" => "out",
+            "in" | "incoming" | "dependents" | "callers" | "impact" => "in",
+            "both" | "all" | "" => "both",
+            other => {
+                return Err(McpError::InvalidParams(format!(
+                    "invalid direction '{other}': expected out, in, or both"
+                )));
+            }
+        },
+        None => "both",
+    };
+    let want_outgoing = matches!(direction, "out" | "both");
+    let want_incoming = matches!(direction, "in" | "both");
 
-    let neighborhood = store
-        .get_dependency_neighborhood(&entity_id, depth)
-        .map_err(McpError::graph)?;
+    let mut visited: std::collections::HashSet<kin_model::ids::EntityId> =
+        std::collections::HashSet::new();
+    let mut entities: Vec<serde_json::Value> = Vec::new();
+    let mut relations: Vec<serde_json::Value> = Vec::new();
+    let mut seen_relations: std::collections::HashSet<kin_model::ids::RelationId> =
+        std::collections::HashSet::new();
+    let mut truncated = false;
 
-    let total_entities = neighborhood.entities.len();
-    let total_relations = neighborhood.relations.len();
+    // The focal itself is part of its own neighborhood, matching what the
+    // previous traversal returned so counts stay comparable across the change.
+    if let Some(focal) = store.get_entity(&entity_id).map_err(McpError::graph)? {
+        visited.insert(entity_id);
+        entities.push(compact_entity_summary(&focal));
+    }
+
+    let mut frontier: Vec<(kin_model::ids::EntityId, u32)> = vec![(entity_id, 0)];
+    while !frontier.is_empty() && !truncated {
+        let mut next_frontier: Vec<(kin_model::ids::EntityId, u32)> = Vec::new();
+        for (current, current_depth) in frontier.drain(..) {
+            if current_depth >= depth {
+                continue;
+            }
+            let edges = store
+                .get_all_relations_for_entity(&current)
+                .map_err(McpError::graph)?;
+            for rel in &edges {
+                let src_entity = rel.src.as_entity();
+                let dst_entity = rel.dst.as_entity();
+                // Classify by which endpoint is the node being expanded, so the
+                // tag names the direction actually traversed rather than a
+                // direction assumed from the focal.
+                let (neighbor, edge_direction) = if want_outgoing
+                    && src_entity == Some(current)
+                    && dst_entity.is_some_and(|id| id != current)
+                {
+                    (dst_entity.unwrap(), "outgoing")
+                } else if want_incoming
+                    && dst_entity == Some(current)
+                    && src_entity.is_some_and(|id| id != current)
+                {
+                    (src_entity.unwrap(), "incoming")
+                } else {
+                    continue;
+                };
+
+                // An edge is reachable from both endpoints; emit it once.
+                if seen_relations.insert(rel.id) {
+                    relations.push(serde_json::json!({
+                        "src": rel.src,
+                        "dst": rel.dst,
+                        "kind": format!("{:?}", rel.kind),
+                        "direction": edge_direction,
+                        "from": current.to_string(),
+                    }));
+                }
+
+                if !visited.insert(neighbor) {
+                    continue;
+                }
+                if visited.len() > MAX_VISITED_ENTITIES {
+                    truncated = true;
+                    break;
+                }
+                if let Some(entity) = store.get_entity(&neighbor).map_err(McpError::graph)? {
+                    entities.push(compact_entity_summary(&entity));
+                }
+                next_frontier.push((neighbor, current_depth + 1));
+            }
+            if truncated {
+                break;
+            }
+        }
+        frontier = next_frontier;
+    }
+
+    let total_entities = entities.len();
+    let total_relations = relations.len();
 
     // Return compact entity summaries (name, kind, file, id) instead of full
     // entity objects to keep response sizes bounded.
-    let compact_entities: Vec<_> = neighborhood
-        .entities
-        .values()
-        .take(limit)
-        .map(|e| {
-            serde_json::json!({
-                "id": e.id,
-                "name": e.name,
-                "kind": format!("{:?}", e.kind),
-                "file_path": e.file_origin.as_ref().map(|p| p.to_string()),
-                "signature": e.signature,
-            })
-        })
-        .collect();
-
+    entities.truncate(limit);
     // Cap relations to match the entity limit to avoid unbounded output.
-    let compact_relations: Vec<_> = neighborhood
-        .relations
-        .iter()
-        .take(limit * 3)
-        .map(|r| {
-            serde_json::json!({
-                "src": r.src,
-                "dst": r.dst,
-                "kind": format!("{:?}", r.kind),
-            })
-        })
-        .collect();
+    relations.truncate(limit * 3);
 
     let result = serde_json::json!({
+        "focal_id": entity_id.to_string(),
+        "direction": direction,
+        "depth": depth,
         "entity_count": total_entities,
         "relation_count": total_relations,
-        "truncated": total_entities > limit,
-        "entities": compact_entities,
-        "relations": compact_relations,
+        "truncated": truncated || total_entities > limit,
+        "entities": entities,
+        "relations": relations,
     });
 
     let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
     Ok(ToolCallResult::text(json))
 }
 
+/// The lightweight per-entity row the neighborhood returns in place of a full
+/// entity object, so a deep walk stays within an agent's token budget.
+fn compact_entity_summary(entity: &kin_model::Entity) -> serde_json::Value {
+    serde_json::json!({
+        "id": entity.id,
+        "name": entity.name,
+        "kind": format!("{:?}", entity.kind),
+        "file_path": entity.file_origin.as_ref().map(|p| p.to_string()),
+        "signature": entity.signature,
+    })
+}
+
 pub const GRAPH_STATUS_DESC: &str = "\
-Report the status of the semantic graph that MCP is serving from — the live entity \
-count, embedding-index coverage (embeddings_indexed / embeddings_total / \
-embeddings_pending), and the authority backing it. In product mode this is answered by \
-the repo daemon, so it reflects the daemon-owned, live graph state rather than a stale \
-MCP-local snapshot. Reach for it as a quick health/readiness check: confirm the graph \
-is populated, check how much of it has embeddings indexed (so you know whether \
-semantic_locate / vector retrieval will be complete or still warming up), and verify \
-you're talking to graph-owned truth before relying on the other tools.";
+Report the status of the semantic graph that MCP is serving from — the live entity, \
+relation and semantic-change counts, embedding-index coverage (embeddings_indexed / \
+embeddings_total / embeddings_pending), and the authority backing it. In product mode \
+this is answered by the repo daemon, so it reflects the daemon-owned, live graph state \
+rather than a stale MCP-local snapshot. Reach for it as a quick health/readiness check: \
+confirm the graph is populated, check how much of it has embeddings indexed (so you know \
+whether semantic_locate / vector retrieval will be complete or still warming up), and \
+verify you're talking to graph-owned truth before relying on the other tools. \
+Counts are exact but enrichment completeness is not attested (completion_attested), so a \
+populated graph is not by itself a complete one. Embedding coverage is measured on a \
+separate daemon surface: when it cannot be read, embeddings_available is false and the \
+numeric embedding fields are absent rather than zero — absent means not measured, never \
+measured-as-empty.";
 
 /// Report the health of the graph visible to this dispatcher.
 ///
@@ -2439,6 +2541,12 @@ pub fn handle_graph_status<G: GraphStore>(
     let result = serde_json::json!({
         "entity_count": entity_count,
         "authority": "repo-daemon",
+        // Embedding coverage is computed by the daemon from its live graph and
+        // is not reachable from a bare `GraphStore`. Marked unavailable rather
+        // than omitted silently, so this path cannot be read as a measurement
+        // of an unembedded graph.
+        "embeddings_available": false,
+        "embeddings_unavailable_reason": "in-process dispatch has no daemon embedding surface",
         "note": "Product MCP calls are served by the repo daemon. Offline in-process dispatch is test-only."
     });
 
@@ -3348,5 +3456,244 @@ mod tests {
         args.insert("granularity".to_string(), serde_json::json!("module"));
         let err = handle_semantic_locate(&args, &store).unwrap_err();
         assert!(matches!(err, McpError::InvalidParams(_)));
+    }
+
+    /// `caller -> focal -> callee`: the focal has exactly one dependent and one
+    /// dependency, on opposite sides of the relation table.
+    fn neighborhood_fixture() -> (InMemoryGraph, EntityId, EntityId, EntityId) {
+        let store = InMemoryGraph::new();
+        let caller = make_entity("caller", "src/caller.rs");
+        let focal = make_entity("focal", "src/focal.rs");
+        let callee = make_entity("callee", "src/callee.rs");
+        let (caller_id, focal_id, callee_id) = (caller.id, focal.id, callee.id);
+        store.upsert_entity(&caller).unwrap();
+        store.upsert_entity(&focal).unwrap();
+        store.upsert_entity(&callee).unwrap();
+        store
+            .upsert_relation(&make_relation(caller_id, focal_id, RelationKind::Calls))
+            .unwrap();
+        store
+            .upsert_relation(&make_relation(focal_id, callee_id, RelationKind::Calls))
+            .unwrap();
+        (store, caller_id, focal_id, callee_id)
+    }
+
+    fn neighborhood_names(response: &serde_json::Value) -> Vec<String> {
+        let mut names: Vec<String> = response["entities"]
+            .as_array()
+            .expect("entities must be an array")
+            .iter()
+            .map(|e| {
+                e["name"]
+                    .as_str()
+                    .expect("name must be a string")
+                    .to_string()
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn neighborhood_response_in(
+        store: &InMemoryGraph,
+        focal: EntityId,
+        direction: Option<&str>,
+    ) -> serde_json::Value {
+        let mut args = HashMap::new();
+        args.insert(
+            "entity_id".to_string(),
+            serde_json::json!(focal.to_string()),
+        );
+        if let Some(direction) = direction {
+            args.insert("direction".to_string(), serde_json::json!(direction));
+        }
+        parsed_response(&handle_graph_neighborhood(&args, store).unwrap())
+    }
+
+    /// The FIR-1595 regression. The tool has always described itself as
+    /// returning "both what it depends on and what depends on it", but traversed
+    /// the outgoing index alone, so `caller` — the only entity whose behavior a
+    /// change to `focal` can break — was never in the answer. An agent asking
+    /// this tool for blast radius got the focal's dependencies instead, with
+    /// nothing in the output to reveal the substitution.
+    #[test]
+    fn graph_neighborhood_returns_dependents_not_only_dependencies() {
+        let (store, _, focal_id, _) = neighborhood_fixture();
+        let response = neighborhood_response_in(&store, focal_id, None);
+        assert_eq!(response["direction"], "both");
+        assert_eq!(
+            neighborhood_names(&response),
+            vec!["callee", "caller", "focal"],
+            "the default neighborhood must carry the dependent as well as the dependency"
+        );
+        assert_eq!(response["entity_count"], 3);
+        assert_eq!(response["relation_count"], 2);
+        assert_eq!(response["truncated"], false);
+    }
+
+    /// Direction is not just a filter on a merged walk: asking for dependents
+    /// alone must return the dependent alone.
+    #[test]
+    fn graph_neighborhood_direction_in_returns_only_dependents() {
+        let (store, caller_id, focal_id, _) = neighborhood_fixture();
+        let response = neighborhood_response_in(&store, focal_id, Some("in"));
+        assert_eq!(response["direction"], "in");
+        assert_eq!(neighborhood_names(&response), vec!["caller", "focal"]);
+        let edges = response["relations"].as_array().unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0]["direction"], "incoming");
+        assert_eq!(edges[0]["src"]["Entity"], serde_json::json!(caller_id));
+        assert_eq!(edges[0]["dst"]["Entity"], serde_json::json!(focal_id));
+    }
+
+    /// The previous behavior stays reachable by name, so a caller that really
+    /// wants dependencies can ask for them and know that is what it got.
+    #[test]
+    fn graph_neighborhood_direction_out_returns_only_dependencies() {
+        let (store, _, focal_id, callee_id) = neighborhood_fixture();
+        let response = neighborhood_response_in(&store, focal_id, Some("out"));
+        assert_eq!(response["direction"], "out");
+        assert_eq!(neighborhood_names(&response), vec!["callee", "focal"]);
+        let edges = response["relations"].as_array().unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0]["direction"], "outgoing");
+        assert_eq!(edges[0]["dst"]["Entity"], serde_json::json!(callee_id));
+    }
+
+    /// Direction aliases exist because agents phrase this as "callers" or
+    /// "dependents" far more often than as "in".
+    #[test]
+    fn graph_neighborhood_accepts_direction_aliases() {
+        let (store, _, focal_id, _) = neighborhood_fixture();
+        for alias in ["in", "incoming", "dependents", "callers", "impact"] {
+            let response = neighborhood_response_in(&store, focal_id, Some(alias));
+            assert_eq!(response["direction"], "in", "alias {alias} must map to in");
+        }
+        for alias in ["out", "outgoing", "dependencies", "depends_on", "calls"] {
+            let response = neighborhood_response_in(&store, focal_id, Some(alias));
+            assert_eq!(
+                response["direction"], "out",
+                "alias {alias} must map to out"
+            );
+        }
+    }
+
+    #[test]
+    fn graph_neighborhood_rejects_an_unknown_direction() {
+        let (store, _, focal_id, _) = neighborhood_fixture();
+        let mut args = HashMap::new();
+        args.insert(
+            "entity_id".to_string(),
+            serde_json::json!(focal_id.to_string()),
+        );
+        args.insert("direction".to_string(), serde_json::json!("sideways"));
+        let err = handle_graph_neighborhood(&args, &store).unwrap_err();
+        assert!(matches!(err, McpError::InvalidParams(_)), "{err:?}");
+    }
+
+    /// Depth must walk dependents transitively, not just one hop back: the
+    /// grandparent of a focal is inside its blast radius at depth 2.
+    #[test]
+    fn graph_neighborhood_walks_dependents_transitively() {
+        let (store, caller_id, focal_id, _) = neighborhood_fixture();
+        let grandparent = make_entity("grandparent", "src/grandparent.rs");
+        let grandparent_id = grandparent.id;
+        store.upsert_entity(&grandparent).unwrap();
+        store
+            .upsert_relation(&make_relation(
+                grandparent_id,
+                caller_id,
+                RelationKind::Calls,
+            ))
+            .unwrap();
+
+        let mut args = HashMap::new();
+        args.insert(
+            "entity_id".to_string(),
+            serde_json::json!(focal_id.to_string()),
+        );
+        args.insert("direction".to_string(), serde_json::json!("in"));
+        args.insert("depth".to_string(), serde_json::json!(2));
+        let response = parsed_response(&handle_graph_neighborhood(&args, &store).unwrap());
+        assert_eq!(
+            neighborhood_names(&response),
+            vec!["caller", "focal", "grandparent"]
+        );
+    }
+
+    /// An edge reachable from both of its endpoints is still one edge. Walking
+    /// both directions must not double-count the relation table.
+    #[test]
+    fn graph_neighborhood_emits_each_edge_once() {
+        let (store, _, focal_id, callee_id) = neighborhood_fixture();
+        // focal -> callee and callee -> focal: a cycle whose single pair of
+        // edges is reachable from either side in `both` mode.
+        store
+            .upsert_relation(&make_relation(callee_id, focal_id, RelationKind::Calls))
+            .unwrap();
+        let response = neighborhood_response_in(&store, focal_id, Some("both"));
+        let edges = response["relations"].as_array().unwrap();
+        let mut ids: Vec<String> = edges
+            .iter()
+            .map(|e| format!("{}->{}", e["src"], e["dst"]))
+            .collect();
+        ids.sort();
+        let unique: std::collections::HashSet<&String> = ids.iter().collect();
+        assert_eq!(
+            unique.len(),
+            ids.len(),
+            "each relation must appear once: {ids:?}"
+        );
+    }
+
+    /// A focal with no edges at all still reports itself, and reports honestly
+    /// that nothing else is there.
+    #[test]
+    fn graph_neighborhood_on_an_isolated_entity_reports_only_the_focal() {
+        let store = InMemoryGraph::new();
+        let lonely = make_entity("lonely", "src/lonely.rs");
+        let lonely_id = lonely.id;
+        store.upsert_entity(&lonely).unwrap();
+        let response = neighborhood_response_in(&store, lonely_id, None);
+        assert_eq!(neighborhood_names(&response), vec!["lonely"]);
+        assert_eq!(response["relation_count"], 0);
+        assert_eq!(response["truncated"], false);
+    }
+
+    /// The declared tool schema must offer the parameter the handler honors,
+    /// and the description must claim the direction the traversal delivers.
+    #[test]
+    fn graph_neighborhood_schema_and_description_match_the_behavior() {
+        let tools = crate::tools::tool_definitions();
+        let tool = tools
+            .tools
+            .iter()
+            .find(|t| t.name == "graph_neighborhood")
+            .expect("graph_neighborhood must be registered");
+        assert!(
+            tool.input_schema["properties"]["direction"].is_object(),
+            "the direction parameter must be declared: {}",
+            tool.input_schema
+        );
+        assert!(
+            tool.description.contains("both directions"),
+            "the description must state that traversal is bidirectional"
+        );
+    }
+
+    /// Nothing in this crate may quietly go back to the outgoing-only
+    /// traversal: `get_dependency_neighborhood` is fed only the outgoing index
+    /// in kin-db, which is what made this tool answer dependencies when it was
+    /// asked for dependents.
+    #[test]
+    fn graph_neighborhood_does_not_use_the_outgoing_only_traversal() {
+        // Split so this guard's own source line is not a match for itself.
+        let needle = concat!(".get_dependency_", "neighborhood(");
+        let source = include_str!("entities.rs");
+        let call_site = source.lines().find(|line| line.contains(needle));
+        assert!(
+            call_site.is_none(),
+            "outgoing-only neighborhood traversal reintroduced: {call_site:?}"
+        );
     }
 }
