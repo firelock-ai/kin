@@ -3,6 +3,78 @@
 
 use crate::types::{ToolDefinition, ToolsListResult};
 
+/// Honest JSON Schema for one transaction operation.
+///
+/// The product daemon accepts two materially different shapes. A source-body
+/// edit is intentionally payload-less; structured entity/relation mutations
+/// require `payload`. Keeping these as disjoint `oneOf` branches prevents MCP
+/// clients from being told that the preferred source-edit form is invalid.
+fn transaction_operation_schema() -> serde_json::Value {
+    serde_json::json!({
+        "oneOf": [
+            {
+                "title": "Entity source body edit",
+                "type": "object",
+                "properties": {
+                    "verb": {
+                        "type": "string",
+                        "enum": ["update", "modify"],
+                        "description": "Update an existing source entity."
+                    },
+                    "target": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Exact repository entity UUID or unambiguous exact entity name."
+                    },
+                    "body": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "The entity's complete new UTF-8 source text, including its own leading indentation. Do not submit a truncated retrieval body."
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Human-readable explanation of this change."
+                    }
+                },
+                "required": ["verb", "target", "body", "description"],
+                "additionalProperties": false
+            },
+            {
+                "title": "Structured entity or relation mutation",
+                "type": "object",
+                "properties": {
+                    "verb": {
+                        "type": "string",
+                        "enum": [
+                            "create", "add", "upsert", "insert",
+                            "update", "modify", "delete", "remove"
+                        ],
+                        "description": "Entity or relation mutation verb."
+                    },
+                    "target": {
+                        "type": "string",
+                        "description": "Exact repository entity UUID for an Entity payload; empty string for a Relation payload."
+                    },
+                    "payload": {
+                        "type": "object",
+                        "description": "Exact mutation payload: {\"Entity\": { ...existing entity identity... }} or {\"Relation\": {\"from\": \"...\", \"to\": \"...\", \"kind\": \"...\"}}."
+                    },
+                    "body": {
+                        "type": "string",
+                        "description": "Full new UTF-8 source text for a source-bound Entity update. Omit for Relation operations."
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Human-readable explanation of this change."
+                    }
+                },
+                "required": ["verb", "target", "payload", "description"],
+                "additionalProperties": false
+            }
+        ]
+    })
+}
+
 /// Build the list of all MCP tools that Kin exposes.
 pub fn tool_definitions() -> ToolsListResult {
     ToolsListResult {
@@ -522,7 +594,7 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "kin_transaction_stage".into(),
-                description: "Stage one or more exact repository mutation operations onto an active transaction. Existing source entity edits require the exact entity ID as target plus a full UTF-8 replacement body. Relation operations use an empty target and omit body.".into(),
+                description: crate::handlers::sessions::TRANSACTION_STAGE_DESC.into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -531,23 +603,7 @@ pub fn tool_definitions() -> ToolsListResult {
                         "operations": {
                             "type": "array",
                             "description": "Array of mutation operations to stage",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "verb": { "type": "string", "description": "Entity: update or modify. Relation: create/add/upsert/insert or delete/remove." },
-                                    "target": { "type": "string", "description": "Exact repository entity UUID for an Entity payload; empty string for a Relation payload." },
-                                    "payload": {
-                                        "type": "object",
-                                        "description": "Exact mutation payload: {\"Entity\": { ...existing entity identity... }} or {\"Relation\": {\"from\": \"...\", \"to\": \"...\", \"kind\": \"...\"}}"
-                                    },
-                                    "body": {
-                                        "type": "string",
-                                        "description": "Required full UTF-8 replacement source text for an existing Entity body. Omit only for Relation operations; metadata-only source edits are rejected."
-                                    },
-                                    "description": { "type": "string", "description": "Human-readable explanation of this change" }
-                                },
-                                "required": ["verb", "target", "payload", "description"]
-                            }
+                            "items": transaction_operation_schema()
                         }
                     },
                     "required": ["transaction_id", "operations"]
@@ -567,7 +623,7 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "kin_transaction_commit".into(),
-                description: "Publish staged mutations through exact repository authority. The daemon requires a clean exact workspace, loads source from repository CAS, splices existing entity body edits in memory, reparses final bytes, and journals exact working-tree projection with semantic change + workspace + ref publication. Relation-only transactions are supported. New/source-deleted entities, metadata-only source edits, ambiguous or overlapping spans, non-UTF-8 source, gitlinks, and dirty/mismatched authority fail before mutation. On success returns `status`, `ops_applied`, `change_id`, `repository_generation`, `new_root_hash`, and `modified_files`. An optional `operations` array may be staged and committed in one call.".into(),
+                description: crate::handlers::sessions::TRANSACTION_COMMIT_DESC.into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -576,23 +632,7 @@ pub fn tool_definitions() -> ToolsListResult {
                         "operations": {
                             "type": "array",
                             "description": "Optional exact mutation operations to stage atomically in this commit request",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "verb": { "type": "string", "description": "Entity: update or modify. Relation: create/add/upsert/insert or delete/remove." },
-                                    "target": { "type": "string", "description": "Exact repository entity UUID for an Entity payload; empty string for a Relation payload." },
-                                    "payload": {
-                                        "type": "object",
-                                        "description": "Exact mutation payload: {\"Entity\": { ...existing entity identity... }} or {\"Relation\": {\"from\": \"...\", \"to\": \"...\", \"kind\": \"...\"}}"
-                                    },
-                                    "body": {
-                                        "type": "string",
-                                        "description": "Required full UTF-8 replacement source text for an existing Entity body; omit for Relation operations."
-                                    },
-                                    "description": { "type": "string", "description": "Human-readable explanation of this change" }
-                                },
-                                "required": ["verb", "target", "payload", "description"]
-                            }
+                            "items": transaction_operation_schema()
                         }
                     },
                     "required": ["transaction_id"]
@@ -1118,6 +1158,99 @@ mod tests {
         assert!(json.contains("kin_transaction_validate"));
         assert!(json.contains("kin_transaction_commit"));
         assert!(json.contains("kin_transaction_abort"));
+    }
+
+    #[test]
+    fn serialized_tools_list_exposes_the_real_transaction_operation_contract() {
+        fn required_set(schema: &serde_json::Value) -> std::collections::BTreeSet<String> {
+            schema["required"]
+                .as_array()
+                .expect("schema branch must declare required fields")
+                .iter()
+                .map(|field| {
+                    field
+                        .as_str()
+                        .expect("required field must be a string")
+                        .to_string()
+                })
+                .collect()
+        }
+
+        let serialized =
+            serde_json::to_value(tool_definitions()).expect("tools/list must serialize");
+        let tools = serialized["tools"]
+            .as_array()
+            .expect("serialized tools/list must contain a tools array");
+
+        for (tool_name, expected_description, expected_top_required) in [
+            (
+                "kin_transaction_stage",
+                crate::handlers::sessions::TRANSACTION_STAGE_DESC,
+                ["operations", "transaction_id"].as_slice(),
+            ),
+            (
+                "kin_transaction_commit",
+                crate::handlers::sessions::TRANSACTION_COMMIT_DESC,
+                ["transaction_id"].as_slice(),
+            ),
+        ] {
+            let tool = tools
+                .iter()
+                .find(|tool| tool["name"] == tool_name)
+                .unwrap_or_else(|| panic!("{tool_name} must be exposed by tools/list"));
+            assert_eq!(tool["description"], expected_description);
+            assert!(
+                tool["description"]
+                    .as_str()
+                    .is_some_and(|description| description.contains("payload-less")),
+                "{tool_name} must advertise the preferred payload-less source-edit form"
+            );
+            if tool_name == "kin_transaction_stage" {
+                let description = tool["description"].as_str().unwrap();
+                assert!(description.contains("indentation"), "{description}");
+                assert!(description.contains("[truncated]"), "{description}");
+            }
+
+            let top_required = required_set(&tool["inputSchema"]);
+            let expected_top_required: std::collections::BTreeSet<String> = expected_top_required
+                .iter()
+                .map(|field| (*field).into())
+                .collect();
+            assert_eq!(top_required, expected_top_required, "{tool_name}");
+
+            let variants = tool["inputSchema"]["properties"]["operations"]["items"]["oneOf"]
+                .as_array()
+                .expect("transaction operations must be disjoint oneOf variants");
+            assert_eq!(variants.len(), 2, "{tool_name}");
+
+            let body_edit = variants
+                .iter()
+                .find(|variant| variant["title"] == "Entity source body edit")
+                .expect("payload-less body-edit branch");
+            assert_eq!(
+                required_set(body_edit),
+                ["body", "description", "target", "verb"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect()
+            );
+            assert!(
+                body_edit["properties"].get("payload").is_none(),
+                "payload-less body-edit branch must reject payload"
+            );
+
+            let structured = variants
+                .iter()
+                .find(|variant| variant["title"] == "Structured entity or relation mutation")
+                .expect("structured payload branch");
+            assert_eq!(
+                required_set(structured),
+                ["description", "payload", "target", "verb"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect()
+            );
+        }
     }
 
     #[test]

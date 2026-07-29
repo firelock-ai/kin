@@ -555,10 +555,7 @@ impl DaemonCallSeam for RealDaemonSeam {
             .await
             .map_err(|e| classify_send_error("MCP tool call", e))?;
         if !resp.status().is_success() {
-            return Err(DaemonCallError::DaemonError(format!(
-                "daemon MCP tool call failed: HTTP {}",
-                resp.status()
-            )));
+            return Err(daemon_http_error("MCP tool call", resp).await);
         }
         let result = resp.json::<ToolCallResult>().await.map_err(|e| {
             DaemonCallError::DaemonError(format!("daemon MCP tool call response parse failed: {e}"))
@@ -850,6 +847,68 @@ where
     .await
 }
 
+/// Maximum daemon error-body bytes preserved in an MCP-facing error.
+///
+/// The daemon is a loopback peer, but an accidental HTML/proxy response or a
+/// pathological route body must not turn one rejected tool call into an
+/// unbounded MCP response.
+const MAX_DAEMON_ERROR_BODY_BYTES: usize = 8 * 1024;
+
+/// Preserve an actionable, bounded response body from a daemon HTTP error.
+///
+/// Reading by chunks enforces the bound while the response is in flight rather
+/// than collecting an arbitrarily large body and truncating only afterward.
+async fn daemon_http_error(operation: &str, mut response: reqwest::Response) -> DaemonCallError {
+    let status = response.status();
+    let mut body = Vec::with_capacity(MAX_DAEMON_ERROR_BODY_BYTES);
+    let mut truncated = false;
+
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                let remaining = MAX_DAEMON_ERROR_BODY_BYTES.saturating_sub(body.len());
+                if chunk.len() > remaining {
+                    body.extend_from_slice(&chunk[..remaining]);
+                    truncated = true;
+                    break;
+                }
+                body.extend_from_slice(&chunk);
+                if body.len() == MAX_DAEMON_ERROR_BODY_BYTES {
+                    match response.chunk().await {
+                        Ok(Some(_)) => truncated = true,
+                        Ok(None) => {}
+                        Err(error) => {
+                            return DaemonCallError::DaemonError(format!(
+                                "daemon {operation} failed: HTTP {status}; error response read \
+                                 failed after {} bytes: {error}",
+                                body.len()
+                            ));
+                        }
+                    }
+                    break;
+                }
+            }
+            Ok(None) => break,
+            Err(error) => {
+                return DaemonCallError::DaemonError(format!(
+                    "daemon {operation} failed: HTTP {status}; error response read failed: {error}"
+                ));
+            }
+        }
+    }
+
+    let detail = String::from_utf8_lossy(&body);
+    let detail = detail.trim();
+    let truncation = if truncated { " … [truncated]" } else { "" };
+    if detail.is_empty() {
+        DaemonCallError::DaemonError(format!("daemon {operation} failed: HTTP {status}"))
+    } else {
+        DaemonCallError::DaemonError(format!(
+            "daemon {operation} failed: HTTP {status}: {detail}{truncation}"
+        ))
+    }
+}
+
 /// Send one already-built daemon request and read its JSON body.
 ///
 /// Split out of [`daemon_json_request`] so the response handling is testable
@@ -869,10 +928,7 @@ async fn send_daemon_json(
         .await
         .map_err(|e| classify_send_error(operation, e))?;
     if !resp.status().is_success() {
-        return Err(DaemonCallError::DaemonError(format!(
-            "daemon {operation} failed: HTTP {}",
-            resp.status()
-        )));
+        return Err(daemon_http_error(operation, resp).await);
     }
     let body = resp.text().await.map_err(|e| {
         DaemonCallError::DaemonError(format!("daemon {operation} response read failed: {e}"))
@@ -1184,11 +1240,18 @@ pub async fn forward_session_heartbeat(
     let Some(base) = daemon_base_url() else {
         return Ok(None);
     };
-    let value = daemon_json_request("heartbeat", &base, |client, base| {
+    session_heartbeat_request(&base, session_id).await.map(Some)
+}
+
+async fn session_heartbeat_request(
+    base: &str,
+    session_id: &str,
+) -> Result<serde_json::Value, String> {
+    let value = daemon_json_request("heartbeat", base, |client, base| {
         with_auth(client.post(format!("{base}/session/{session_id}/heartbeat")))
     })
     .await?;
-    Ok(Some(value))
+    Ok(value)
 }
 
 /// Forward a session end to the daemon.
@@ -1508,6 +1571,69 @@ mod tests {
         assert!(
             matches!(err, DaemonCallError::DaemonError(ref m) if m.contains("HTTP 500")),
             "expected a DaemonError naming the status, got: {err:?}"
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn daemon_error_body_is_preserved_but_bounded() {
+        let oversized: &'static str = Box::leak(
+            "actionable "
+                .repeat(MAX_DAEMON_ERROR_BODY_BYTES)
+                .into_boxed_str(),
+        );
+        let (base, handle) = stub_daemon_raw(400, "Bad Request", oversized).await;
+        let client = probe_client();
+        let error = send_daemon_json("transaction", client.post(format!("{base}/transaction")))
+            .await
+            .expect_err("HTTP 400 must fail");
+        let DaemonCallError::DaemonError(message) = error else {
+            panic!("an HTTP response must not be classified as a connection loss");
+        };
+
+        assert!(
+            message.contains("actionable"),
+            "the daemon's diagnostic body must survive: {message}"
+        );
+        assert!(
+            message.contains("[truncated]"),
+            "an oversized diagnostic must say it was truncated: {message}"
+        );
+        assert!(
+            message.len() <= MAX_DAEMON_ERROR_BODY_BYTES + 128,
+            "bounded error body grew to {} bytes",
+            message.len()
+        );
+        handle.abort();
+    }
+
+    /// Drive the real heartbeat delegate response reader and the same final
+    /// ToolCallResult adapter used by the product handler. This is the boundary
+    /// the direct Axum route test cannot cover.
+    #[tokio::test]
+    async fn expired_session_404_reaches_the_final_mcp_tool_result() {
+        let body = "session not found: dead-session. It expired after its idle timeout. \
+                    Call kin_session_start for a new session id.";
+        let (base, handle) = stub_daemon_raw(404, "Not Found", body).await;
+
+        let forwarded = session_heartbeat_request(&base, "dead-session")
+            .await
+            .map(Some);
+        let result = crate::handlers::sessions::delegated_session_heartbeat_result(
+            forwarded,
+            crate::server::SessionAuthorityMode::DaemonRequired,
+        )
+        .expect("delegate adaptation must succeed")
+        .expect("daemon-required mode must produce a result");
+
+        assert_eq!(result.is_error, Some(true));
+        let ContentBlock::Text { text } = result
+            .content
+            .first()
+            .expect("error ToolCallResult must carry text");
+        assert!(
+            text.contains("expired") && text.contains("kin_session_start"),
+            "final MCP error lost the daemon recovery diagnosis: {text}"
         );
         handle.abort();
     }

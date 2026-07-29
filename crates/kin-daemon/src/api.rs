@@ -342,12 +342,11 @@ struct SessionStartResponse {
     status: String,
     /// How long the session may go idle before the sweeper may reap it.
     idle_timeout_secs: u64,
-    /// When that window closes if nothing refreshes it. Every session-bound
-    /// daemon call refreshes the heartbeat, so this only arrives on a genuinely
-    /// silent agent — but an agent that cannot see the deadline cannot decide to
-    /// send `kin_session_heartbeat` before it, which is how a long read phase
-    /// silently stranded a transaction.
-    expires_at: kin_model::timestamp::Timestamp,
+    /// When the current idle window becomes eligible for reaping if no call
+    /// refreshes it. A live registered PID is stronger liveness evidence and
+    /// can keep the session past this boundary, so this is deliberately not
+    /// named `expires_at`.
+    idle_reap_eligible_at: kin_model::timestamp::Timestamp,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -355,10 +354,10 @@ struct SessionHeartbeatResponse {
     session_id: String,
     status: String,
     heartbeat_at: kin_model::timestamp::Timestamp,
-    /// Same contract as on [`SessionStartResponse`]: the refreshed window, and
-    /// the deadline it now runs to.
+    /// Same contract as on [`SessionStartResponse`]: the refreshed idle window
+    /// and its next reaping-eligibility boundary.
     idle_timeout_secs: u64,
-    expires_at: kin_model::timestamp::Timestamp,
+    idle_reap_eligible_at: kin_model::timestamp::Timestamp,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1869,7 +1868,7 @@ async fn start_session(
         })?;
 
     let idle_ttl = state.coordinator.session_idle_ttl();
-    let expires_at = session_expiry(&session.last_heartbeat, idle_ttl);
+    let idle_reap_eligible_at = session_idle_reap_eligibility(&session.last_heartbeat, idle_ttl);
     Ok(Json(SessionStartResponse {
         session_id: session.session_id.to_string(),
         vendor: session.vendor,
@@ -1879,7 +1878,7 @@ async fn start_session(
         capabilities: session.capabilities,
         status: "active".to_string(),
         idle_timeout_secs: idle_ttl.as_secs(),
-        expires_at,
+        idle_reap_eligible_at,
     }))
 }
 
@@ -1898,13 +1897,16 @@ fn expired_session_message(session_id: &SessionId) -> String {
     )
 }
 
-/// The instant an idle session stops being refreshable, from the heartbeat it
-/// last recorded.
+/// The instant the current idle window becomes eligible for reaping, measured
+/// from the last recorded heartbeat.
+///
+/// A registered PID that is still alive is stronger liveness evidence and can
+/// keep the session active beyond this boundary.
 ///
 /// Saturates rather than wrapping: a TTL large enough to overflow the calendar
 /// means "not reachable from here", and reporting the heartbeat itself as the
 /// deadline would tell an agent its live session had already expired.
-fn session_expiry(
+fn session_idle_reap_eligibility(
     last_heartbeat: &kin_model::timestamp::Timestamp,
     idle_ttl: Duration,
 ) -> kin_model::timestamp::Timestamp {
@@ -1945,37 +1947,25 @@ async fn session_heartbeat(
     State(state): State<Arc<DaemonState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let session_id = parse_session_id(&session_id)?;
-    // A heartbeat against a session the sweeper already reaped is the one call
-    // guaranteed to be in flight when a long-lived agent loses its session. It
-    // must come back as an actionable 404 naming the restart, not as a 500 that
-    // reads like a daemon fault.
-    if state
-        .coordinator
-        .get_session(&session_id)
-        .map_err(internal_error)?
-        .is_none()
-    {
-        return Err((StatusCode::NOT_FOUND, expired_session_message(&session_id)));
-    }
-    state
-        .coordinator
-        .heartbeat(&session_id)
-        .map_err(internal_error)?;
-
+    // Existence and refresh are one coordinator operation under the same
+    // arbitration guard as stale-session sweeping. A heartbeat against a
+    // session the sweeper already reaped is the one call guaranteed to be in
+    // flight when a long-lived agent loses its session; it must come back as an
+    // actionable 404, never a precheck/update race reported as HTTP 500.
     let session = state
         .coordinator
-        .get_session(&session_id)
+        .heartbeat_session(&session_id)
         .map_err(internal_error)?
         .ok_or_else(|| (StatusCode::NOT_FOUND, expired_session_message(&session_id)))?;
 
     let idle_ttl = state.coordinator.session_idle_ttl();
-    let expires_at = session_expiry(&session.last_heartbeat, idle_ttl);
+    let idle_reap_eligible_at = session_idle_reap_eligibility(&session.last_heartbeat, idle_ttl);
     Ok(Json(SessionHeartbeatResponse {
         session_id: session.session_id.to_string(),
         status: "active".to_string(),
         heartbeat_at: session.last_heartbeat,
         idle_timeout_secs: idle_ttl.as_secs(),
-        expires_at,
+        idle_reap_eligible_at,
     }))
 }
 
@@ -17562,9 +17552,9 @@ mod tests {
         assert_eq!(end_json.status, "ended");
     }
 
-    /// Session start and heartbeat must both say how long the session is good
-    /// for, and a call on a dead session must say it expired and name the
-    /// restart.
+    /// Session start and heartbeat must both expose the next idle-reaping
+    /// eligibility boundary, and a call on a dead session must say it expired
+    /// and name the restart.
     ///
     /// An agent cannot decide to heartbeat before a deadline it cannot see, and
     /// a bare "not found" reads like a bad argument rather than an expiry, so a
@@ -17600,9 +17590,9 @@ mod tests {
         let start_json: SessionStartResponse = serde_json::from_slice(&start_body).unwrap();
         assert_eq!(start_json.idle_timeout_secs, idle_ttl.as_secs());
         assert!(
-            start_json.expires_at.0 > start_json.started_at.0,
-            "the expiry must be ahead of the session it belongs to: {:?} vs {:?}",
-            start_json.expires_at,
+            start_json.idle_reap_eligible_at.0 > start_json.started_at.0,
+            "the idle-reaping boundary must be ahead of the session it belongs to: {:?} vs {:?}",
+            start_json.idle_reap_eligible_at,
             start_json.started_at
         );
 
@@ -17623,8 +17613,8 @@ mod tests {
             serde_json::from_slice(&heartbeat_body).unwrap();
         assert_eq!(heartbeat_json.idle_timeout_secs, idle_ttl.as_secs());
         assert!(
-            heartbeat_json.expires_at.0 >= start_json.expires_at.0,
-            "a heartbeat must not move the deadline backwards"
+            heartbeat_json.idle_reap_eligible_at.0 >= start_json.idle_reap_eligible_at.0,
+            "a heartbeat must not move the idle-reaping boundary backwards"
         );
 
         // End the session, then heartbeat it: the shape an agent hits after the

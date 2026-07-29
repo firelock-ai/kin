@@ -62,12 +62,13 @@ the session lifecycle uses — keep it alive with kin_session_heartbeat, declare
 you'll touch via kin_register_intent (enabling collision detection against other \
 agents), and close out with kin_session_end. Prefer this over the legacy \
 register_session, which captures none of this context. When the session is daemon-backed \
-the response also carries idle_timeout_secs and expires_at: the session is reaped if it \
-goes that long with no call, so if your next step is a read phase that could outlast \
-expires_at, send kin_session_heartbeat (any session-bound call also refreshes the \
-window), and a call on an expired session fails saying so and names kin_session_start as \
-the recovery. An in-process session returns neither field; heartbeat it on the same \
-cadence rather than reading a deadline off the response.";
+the response also carries idle_timeout_secs and idle_reap_eligible_at: the latter is the \
+next boundary at which an idle PID-less session may be reaped, not an unconditional \
+expiry (a live registered PID is stronger liveness evidence). If your next step is a read \
+phase that could outlast that boundary, send kin_session_heartbeat; any session-bound call \
+also refreshes the window. A call on an already-reaped session fails saying so and names \
+kin_session_start as the recovery. An in-process session returns neither field; heartbeat \
+it on the same cadence rather than reading a boundary off the response.";
 
 pub async fn handle_session_start(
     args: &HashMap<String, serde_json::Value>,
@@ -137,10 +138,29 @@ during a long-running session so Kin doesn't treat it as stale and so the agent'
 presence (and any held intents) stays visible to other agents. Pair it with \
 kin_session_start (which issues the session ID) and kin_session_end (which closes the \
 session and releases its intents). A daemon-backed response carries the refreshed \
-idle_timeout_secs and expires_at, so you know how long the session is good for, and \
-heartbeating an already-expired session fails saying so and names kin_session_start as \
-the recovery. An in-process response carries neither field and reports only that the \
-session is alive.";
+idle_timeout_secs and idle_reap_eligible_at, the next boundary at which an idle PID-less \
+session may be reaped; a live registered PID can keep it active beyond that boundary. \
+Heartbeating an already-reaped session fails saying so and names kin_session_start as the \
+recovery. An in-process response carries neither field and reports only that the session \
+is alive.";
+
+pub(crate) fn delegated_session_heartbeat_result(
+    daemon_result: std::result::Result<Option<serde_json::Value>, String>,
+    session_authority_mode: SessionAuthorityMode,
+) -> Result<Option<ToolCallResult>> {
+    match daemon_result {
+        Ok(Some(value)) => {
+            let json =
+                serde_json::to_string_pretty(&value).map_err(crate::error::McpError::Json)?;
+            Ok(Some(ToolCallResult::text(json)))
+        }
+        Ok(None) if session_authority_mode.requires_daemon() => {
+            Ok(Some(daemon_required_unavailable("session heartbeat")))
+        }
+        Ok(None) => Ok(None),
+        Err(error) => Ok(Some(ToolCallResult::error(error))),
+    }
+}
 
 pub async fn handle_session_heartbeat(
     args: &HashMap<String, serde_json::Value>,
@@ -151,19 +171,11 @@ pub async fn handle_session_heartbeat(
     let session_id = parse_session_id(&id_str)?;
 
     if session_authority_mode.uses_daemon() {
-        match crate::daemon_delegate::forward_session_heartbeat(&id_str).await {
-            Ok(Some(value)) => {
-                let json =
-                    serde_json::to_string_pretty(&value).map_err(crate::error::McpError::Json)?;
-                return Ok(ToolCallResult::text(json));
-            }
-            Ok(None) if session_authority_mode.requires_daemon() => {
-                return Ok(daemon_required_unavailable("session heartbeat"));
-            }
-            Ok(None) => {}
-            Err(err) => {
-                return Ok(ToolCallResult::error(err));
-            }
+        if let Some(result) = delegated_session_heartbeat_result(
+            crate::daemon_delegate::forward_session_heartbeat(&id_str).await,
+            session_authority_mode,
+        )? {
+            return Ok(result);
         }
     }
 
@@ -648,8 +660,8 @@ resolved fail-closed server-side and on \
 commit the graph-to-file projection writes the body into the entity's working-directory \
 file. Structured payloads (full entity, relation add/remove) are also accepted. Each \
 operation is validated at stage time: anything the commit path would silently drop (a \
-missing or unknown verb, a missing payload, a nameless entity, a relation \
-update/modify, or a blob payload) is rejected immediately with an actionable error \
+missing or unknown verb, a missing payload outside the target/body source-edit form, a \
+nameless entity, a relation update/modify, or a blob payload) is rejected immediately with an actionable error \
 instead of vanishing at commit. This rejection is identical in daemon and in-process \
 modes. Accepted operations are queued and can be validated or committed together.";
 
@@ -740,18 +752,21 @@ pub async fn handle_transaction_validate(
 }
 
 pub const TRANSACTION_COMMIT_DESC: &str = "\
-Commit all staged mutations in the transaction atomically to the graph. On success \
-returns status, ops_applied (entity+relation deltas applied), empty (true for a \
-no-op commit), new_root_hash (graph Merkle root after the commit), modified_files \
-(working-directory files the projection wrote — entity-body edits reach disk here), \
-collision_warnings, and conflicts (entities skipped due to a concurrent file edit; a \
-non-empty set is surfaced as an error instead). Before graph application, exact entity/artifact \
-intent conflicts and session write/commit capabilities are attested; enforce mode rejects \
-before graph truth changes. Contract-scope coverage remains explicitly false until touched \
-contracts can be derived from the semantic delta. A commit that is refused before anything \
-is published leaves the transaction usable: its staged operations are cleared and named in \
-the refusal, so you re-stage corrected ones on the SAME transaction and commit again, and \
-kin_transaction_abort is the clean exit if you would rather abandon it.";
+Publish all staged mutations atomically through exact repository authority. The daemon \
+requires a clean exact workspace, loads source from repository CAS, splices existing entity \
+body edits in memory, reparses the final bytes, and journals semantic change, exact workspace \
+tree, and ref publication together. Relation-only transactions are supported. New or deleted \
+source entities, metadata-only source edits, ambiguous or overlapping spans, non-UTF-8 source, \
+gitlinks, and dirty or mismatched authority fail before mutation. On success the result names \
+status, ops_applied, empty, change_id, repository_generation, new_root_hash, and modified_files. \
+Before graph application, exact entity/artifact intent conflicts and session write/commit \
+capabilities are attested; enforce mode rejects before graph truth changes. Contract-scope \
+coverage remains explicitly false until touched contracts can be derived from the semantic \
+delta. A commit refused before anything is published leaves the transaction usable: its staged \
+operations are cleared and named in the refusal, so re-stage corrected ones on the SAME \
+transaction and commit again; kin_transaction_abort is the clean exit if you would rather \
+abandon it. An optional operations array may stage and commit in one call and uses the same \
+payload-less source-edit or structured payload operation shapes as kin_transaction_stage.";
 
 fn push_scope_once(scopes: &mut Vec<kin_model::IntentScope>, scope: kin_model::IntentScope) {
     if !scopes.contains(&scope) {
