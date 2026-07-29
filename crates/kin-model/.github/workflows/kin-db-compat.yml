@@ -1,0 +1,172 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+
+# Downstream schema-compatibility gate.
+#
+# kin-model's own suite cannot observe the failure that matters here. kin-db
+# persists these types through a compact MessagePack encoding that writes a
+# struct as an array, so a field is addressed by position. A field inserted
+# anywhere but the end shifts every following value into the wrong slot, which
+# is green in kin-model (its round-trips encode and decode with the same
+# layout) and corrupts every existing kin-db store. That is the 0.6.2/0.6.3
+# class, and it can only be caught by building the actual consumer against the
+# proposed types.
+#
+# So: check out kin-db at main, point its kin-model dependency at this PR head,
+# and run kin-db's suite. Both repos are public and the kin registry index is
+# anonymously readable, so kin-db's other registry dependencies resolve with no
+# credentials and this workflow needs no secrets.
+
+name: kin-db Compatibility
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      # Any type change at all, rather than an enumerated list of the files
+      # that happen to hold persisted types today. A list would have to be
+      # updated by the same change that adds a new persisted type, which is
+      # precisely the change that must not be trusted to remember.
+      - "src/**"
+      - "Cargo.toml"
+      - ".github/workflows/kin-db-compat.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  kin-db:
+    name: kin-db suite against this kin-model
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out kin-model at the PR head
+        uses: actions/checkout@v6
+        with:
+          path: kin-model
+
+      - name: Check out kin-db at main
+        uses: actions/checkout@v6
+        with:
+          repository: firelock-ai/kin-db
+          ref: main
+          path: kin-db
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.96.0
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            kin-db/target
+          key: ${{ runner.os }}-kindbcompat-${{ hashFiles('kin-db/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-kindbcompat-
+
+      # kin-db pins kin-model exactly (`=0.7.0`), and a release-affecting
+      # kin-model PR must bump its version, so the PR head version essentially
+      # never satisfies that pin. A `[patch]` entry cannot help: a patch still
+      # has to satisfy the original requirement. Replacing the dependency with
+      # a path dependency drops the version requirement entirely and leaves
+      # every other kin-db dependency resolving from the registry.
+      - name: Point kin-db at this kin-model
+        env:
+          KIN_MODEL_PATH: ${{ github.workspace }}/kin-model
+        run: |
+          python3 - <<'PY'
+          import os
+          import pathlib
+          import re
+
+          root = pathlib.Path("kin-db")
+          target = os.environ["KIN_MODEL_PATH"]
+          pattern = re.compile(r'^\s*kin-model\s*=.*$', re.MULTILINE)
+          replacement = f'kin-model = {{ path = "{target}" }}'
+
+          rewritten = []
+          for manifest in sorted(root.rglob("Cargo.toml")):
+              # `.kin/` holds a snapshot of the repo, not a build input.
+              if ".kin" in manifest.parts or "target" in manifest.parts:
+                  continue
+              text = manifest.read_text()
+              patched, count = pattern.subn(replacement, text)
+              if count:
+                  manifest.write_text(patched)
+                  rewritten.append(f"{manifest} ({count})")
+
+          # A rewrite that silently matches nothing would turn this whole gate
+          # into a run of kin-db against the PUBLISHED kin-model, which always
+          # passes and proves nothing about the PR.
+          if not rewritten:
+              raise SystemExit(
+                  "no kin-model dependency found in any kin-db manifest; the gate "
+                  "would have tested the published kin-model instead of this PR"
+              )
+          print("rewritten:", ", ".join(rewritten))
+          PY
+
+      # The rewrite above edits text; this proves cargo actually resolved to it.
+      # Without this, a manifest refactor that moved the dependency into a
+      # workspace table would leave the gate green against the wrong source.
+      - name: Verify kin-db resolved this kin-model
+        working-directory: kin-db
+        env:
+          KIN_MODEL_PATH: ${{ github.workspace }}/kin-model
+        run: |
+          cargo metadata --format-version 1 > metadata.json
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+
+          expected = pathlib.Path(os.environ["KIN_MODEL_PATH"]).resolve()
+          data = json.loads(pathlib.Path("metadata.json").read_text())
+          packages = [p for p in data["packages"] if p["name"] == "kin-model"]
+          if not packages:
+              raise SystemExit("kin-db does not depend on kin-model at all")
+          for package in packages:
+              # A path dependency has a null source; a registry one names it.
+              if package["source"] is not None:
+                  raise SystemExit(
+                      f"kin-model resolved from {package['source']}, not this PR"
+                  )
+              resolved = pathlib.Path(package["manifest_path"]).resolve().parent
+              if resolved != expected:
+                  raise SystemExit(f"kin-model resolved to {resolved}, expected {expected}")
+              print(f"kin-model {package['version']} resolved from {resolved}")
+          PY
+          rm -f metadata.json
+
+      # Deliberately without kin-db's `RUSTFLAGS: -Dwarnings`. This gate answers
+      # one question, whether kin-db still builds and passes against these
+      # types, and denying warnings would also fail it for lint drift on kin-db
+      # main that no kin-model author can fix. kin-db's own CI keeps that gate.
+      - name: Build kin-db
+        working-directory: kin-db
+        run: cargo build --all-targets
+
+      # kin-db's CI test invocation, with its skip list. The skips are the
+      # tests that need HF network access or carry a known-stale fixture; they
+      # are unrelated to serialization, so mirroring the list keeps this gate
+      # failing only for real compatibility breaks.
+      #
+      # The separate 100K hydration smoke from kin-db's CI is not mirrored: it
+      # is an `--ignored` wall-clock guard, and the snapshot round-trips inside
+      # the standard suite already exercise the encode/decode path this gate
+      # exists to protect.
+      - name: Run the kin-db suite
+        working-directory: kin-db
+        env:
+          HF_HUB_OFFLINE: "1"
+        run: >-
+          cargo test --
+          --skip process_embedding_queue_without_embeddings_is_noop
+          --skip default_dimensions_match_default_model
+          --skip test_vector_index_dimension_mismatch_auto_recovery
+          --skip many_vectors_search_quality

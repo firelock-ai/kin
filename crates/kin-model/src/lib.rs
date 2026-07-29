@@ -6,6 +6,33 @@
 //! This crate defines all shared types used across the Kin codebase:
 //! entities, relations, exact repository trees, semantic changes, refs,
 //! contracts, and more.
+//!
+//! # Positional-wire rule for persisted types
+//!
+//! Types reachable from a snapshot, delta, or operation record are persisted
+//! by `kin-db` through a compact MessagePack encoding. That encoding writes a
+//! struct as an **array**, so a field is identified by its position and never
+//! by its name. Two rules follow, and both are enforced rather than trusted:
+//!
+//! 1. **A new field goes last.** Appending is additive: a record written by an
+//!    older version simply runs out of array elements, and the trailing field
+//!    takes its `#[serde(default)]`. Inserting a field anywhere else shifts
+//!    every following value into the wrong slot, which decodes as the wrong
+//!    type or, worse, as a plausible wrong value.
+//! 2. **`skip_serializing_if` belongs only on trailing fields.** A skipped
+//!    field shortens the array, so a skip on a non-trailing field moves every
+//!    field after it whenever the predicate fires. The result is a type that
+//!    round-trips in the common case and fails only for the values that skip.
+//!
+//! A field carrying `skip_serializing_if` must also carry `#[serde(default)]`,
+//! otherwise the shortened array fails to decode instead of filling the gap.
+//!
+//! Both rules are checked by `tests/persisted_schema.rs`: a source scan denies
+//! a non-trailing `skip_serializing_if`, and per-type round-trips exercise the
+//! skipping values themselves. Changing a persisted type additionally runs the
+//! downstream `kin-db` suite against the change (`.github/workflows/kin-db-compat.yml`),
+//! because kin-model's own suite cannot observe an existing store decoding
+//! wrongly.
 
 pub mod admission;
 pub mod branch;

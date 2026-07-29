@@ -734,6 +734,9 @@ pub struct SubGraph {
 }
 
 /// Immutable committed graph state resolved at a specific semantic ref.
+///
+/// Persisted positionally, so the crate-level positional-wire rule applies: a
+/// new field goes last, and only a trailing field may skip serialization.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ResolvedGraphState {
     pub entities: HashMap<EntityId, Entity>,

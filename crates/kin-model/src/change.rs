@@ -14,7 +14,11 @@ use crate::retrieval::ArtifactId;
 use crate::review::RiskSummary;
 use crate::timestamp::Timestamp;
 
-/// Kin's native commit — the unit of semantic history.
+/// Kin's native commit, the unit of semantic history.
+///
+/// Persisted positionally in every snapshot that carries history, so the
+/// crate-level positional-wire rule applies: a new field goes last, and only a
+/// trailing field may skip serialization.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SemanticChange {
@@ -158,6 +162,9 @@ impl RelationDelta {
 }
 
 /// Delta for a batch of transactional graph changes.
+///
+/// Persisted positionally, so the crate-level positional-wire rule applies: a
+/// new field goes last, and only a trailing field may skip serialization.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TransactionDelta {

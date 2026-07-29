@@ -241,6 +241,10 @@ impl MergeEntryResolution {
 }
 
 /// One conflicting identity, its three inputs, and its resolution.
+///
+/// Persisted positionally inside [`MergeTransactionRecord`], so the crate-level
+/// positional-wire rule applies: a new field goes last, and only a trailing
+/// field may skip serialization.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct MergeConflictEntry {
@@ -251,7 +255,11 @@ pub struct MergeConflictEntry {
     pub theirs: MergeSideValue,
     /// Qualified name, file, or path at whichever side still carries the
     /// identity, so a listing is actionable. Identity stays the subject.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ///
+    /// Always serialized, including as null. `resolution` follows this field,
+    /// so omitting an absent label would shorten the array and decode the
+    /// resolution into this slot.
+    #[serde(default)]
     pub label: Option<String>,
     pub resolution: MergeEntryResolution,
 }
@@ -580,6 +588,10 @@ impl MergeTransactionState {
 /// the durable account of the last merge on that workspace and is replaced when
 /// the next merge opens, so "is a merge in progress" is a state check rather
 /// than an existence check.
+///
+/// Reached from a repository operation record and persisted positionally, so
+/// the crate-level positional-wire rule applies: a new field goes last, and
+/// only a trailing field may skip serialization.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct MergeTransactionRecord {
