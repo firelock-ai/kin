@@ -10,9 +10,11 @@
 use anyhow::{anyhow, bail, Context, Result};
 use fs2::FileExt;
 use kin_core::KinLayout;
+use kin_model::OperationId;
 use serde::Deserialize;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -220,7 +222,47 @@ pub struct ScopeResponse {
 pub struct DaemonClient {
     base_url: String,
     client: reqwest::Client,
+    /// Carries the same endpoint authority as `client`, but never follows an
+    /// HTTP redirect that could redispatch a non-idempotent mutation.
+    one_dispatch_client: reqwest::Client,
 }
+
+/// A mutating daemon command was dispatched, but its committed outcome could
+/// not be established from the acknowledgement.
+///
+/// The operation identity remains available to future command-level recovery,
+/// but this transport layer deliberately does not claim that a durable receipt
+/// exists or retry a request whose first dispatch may already have committed.
+#[derive(Debug)]
+pub(crate) struct IndeterminateDaemonCommandError {
+    pub(crate) operation_id: OperationId,
+    path: String,
+    detail: String,
+}
+
+impl IndeterminateDaemonCommandError {
+    fn new(operation_id: OperationId, path: &str, detail: impl Into<String>) -> Self {
+        Self {
+            operation_id,
+            path: path.to_string(),
+            detail: detail.into(),
+        }
+    }
+}
+
+impl fmt::Display for IndeterminateDaemonCommandError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "daemon command outcome is indeterminate for operation {} at {}: {}; \
+             the daemon may already have committed it, so do not retry automatically \
+             without reconciling repository state",
+            self.operation_id, self.path, self.detail
+        )
+    }
+}
+
+impl std::error::Error for IndeterminateDaemonCommandError {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocateRequest {
@@ -375,10 +417,21 @@ impl DaemonClient {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(request_timeout))
             .connect_timeout(Duration::from_secs(2))
-            .default_headers(headers)
+            .default_headers(headers.clone())
             .build()
             .context("build daemon client")?;
-        Ok(Self { base_url, client })
+        let one_dispatch_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(request_timeout))
+            .connect_timeout(Duration::from_secs(2))
+            .redirect(reqwest::redirect::Policy::none())
+            .default_headers(headers)
+            .build()
+            .context("build one-dispatch daemon client")?;
+        Ok(Self {
+            base_url,
+            client,
+            one_dispatch_client,
+        })
     }
 
     async fn send(
@@ -398,16 +451,18 @@ impl DaemonClient {
             .ok()
             .filter(|value| !value.trim().is_empty())?;
 
-        let client = Self::from_base_url(base.clone()).ok()?.client;
+        let client = Self::from_base_url(base.clone()).ok()?;
 
         // Probe health endpoint
-        let resp = client.get(format!("{}/health", base)).send().await.ok()?;
+        let resp = client
+            .client
+            .get(format!("{}/health", base))
+            .send()
+            .await
+            .ok()?;
 
         if resp.status().is_success() {
-            Some(Self {
-                base_url: base,
-                client,
-            })
+            Some(client)
         } else {
             None
         }
@@ -577,6 +632,81 @@ impl DaemonClient {
             anyhow::bail!("daemon command failed (HTTP {status}): {body}");
         }
         Err(last_error.unwrap_or_else(|| anyhow::anyhow!("daemon command produced no response")))
+    }
+
+    /// POST one non-idempotent JSON command exactly once.
+    ///
+    /// Once dispatch begins, transport failures, response-body failures,
+    /// successful-but-undecodable responses, and server errors cannot prove
+    /// whether the daemon committed the operation. They therefore return a
+    /// typed indeterminate error carrying the caller-stable operation identity
+    /// instead of transparently sending the mutation again. Ordinary 4xx
+    /// responses are direct rejections and remain ordinary command errors.
+    async fn post_non_idempotent_json<Req, Resp>(
+        &self,
+        path: &str,
+        payload: &Req,
+        operation_id: OperationId,
+        context: &'static str,
+    ) -> Result<Resp>
+    where
+        Req: serde::Serialize + ?Sized,
+        Resp: serde::de::DeserializeOwned,
+    {
+        let url = format!(
+            "{}/{}",
+            self.base_url.trim_end_matches('/'),
+            path.trim_start_matches('/')
+        );
+        let payload = serde_json::to_vec(payload)
+            .with_context(|| format!("encode non-idempotent daemon request for {path}"))?;
+        let response = self
+            .send(
+                self.one_dispatch_client
+                    .post(&url)
+                    .header(reqwest::header::CONTENT_TYPE, "application/json")
+                    .body(payload),
+                context,
+            )
+            .await
+            .map_err(|error| {
+                anyhow::Error::new(IndeterminateDaemonCommandError::new(
+                    operation_id,
+                    path,
+                    format!("request dispatch or acknowledgement failed: {error:#}"),
+                ))
+            })?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|error| format!("<response body unavailable: {error}>"));
+            if status.is_server_error() {
+                return Err(anyhow::Error::new(IndeterminateDaemonCommandError::new(
+                    operation_id,
+                    path,
+                    format!("daemon returned HTTP {status}: {body}"),
+                )));
+            }
+            bail!("daemon command failed (HTTP {status}): {body}");
+        }
+
+        let body = response.bytes().await.map_err(|error| {
+            anyhow::Error::new(IndeterminateDaemonCommandError::new(
+                operation_id,
+                path,
+                format!("read daemon response body failed: {error}"),
+            ))
+        })?;
+        serde_json::from_slice(&body).map_err(|error| {
+            anyhow::Error::new(IndeterminateDaemonCommandError::new(
+                operation_id,
+                path,
+                format!("decode daemon response failed: {error}"),
+            ))
+        })
     }
 
     pub async fn locate(
@@ -1234,9 +1364,10 @@ impl DaemonClient {
         &self,
         request: &crate::commands::merge::MergeRequest,
     ) -> Result<crate::commands::merge::MergeResponse> {
-        self.post_idempotent_json(
+        self.post_non_idempotent_json(
             "/commands/merge",
             request,
+            request.operation_id,
             "send daemon-owned repository merge request",
         )
         .await
@@ -1258,9 +1389,10 @@ impl DaemonClient {
         &self,
         request: &crate::commands::resolve::ResolveRequest,
     ) -> Result<crate::commands::resolve::ResolveResponse> {
-        self.post_idempotent_json(
+        self.post_non_idempotent_json(
             "/commands/resolve",
             request,
+            request.operation_id,
             "send daemon-owned merge resolution request",
         )
         .await
@@ -5312,6 +5444,339 @@ mod urlencoding {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn spawn_fixed_response_server(
+        status: axum::http::StatusCode,
+        body: &'static str,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use axum::{routing::post, Router};
+
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handler_requests = requests.clone();
+        let app = Router::new().route(
+            "/commands/test",
+            post(move || {
+                let requests = handler_requests.clone();
+                async move {
+                    requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    (status, body)
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}"), requests, server)
+    }
+
+    async fn read_complete_http_request(stream: &mut tokio::net::TcpStream) -> std::io::Result<()> {
+        use tokio::io::AsyncReadExt;
+
+        let mut request = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        loop {
+            let read = stream.read(&mut chunk).await?;
+            if read == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "connection closed before a complete HTTP request arrived",
+                ));
+            }
+            request.extend_from_slice(&chunk[..read]);
+            let Some(header_end) = request
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .map(|position| position + 4)
+            else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            if request.len() >= header_end + content_length {
+                return Ok(());
+            }
+        }
+    }
+
+    async fn spawn_dropped_ack_server() -> (
+        String,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server_requests = requests.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                if read_complete_http_request(&mut stream).await.is_ok() {
+                    server_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                drop(stream);
+            }
+        });
+        (format!("http://{address}"), requests, server)
+    }
+
+    async fn spawn_truncated_ack_server() -> (
+        String,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use tokio::io::AsyncWriteExt;
+
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server_requests = requests.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                if read_complete_http_request(&mut stream).await.is_ok() {
+                    server_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let _ = stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                              Content-Length: 64\r\nConnection: close\r\n\r\n{",
+                        )
+                        .await;
+                }
+                drop(stream);
+            }
+        });
+        (format!("http://{address}"), requests, server)
+    }
+
+    async fn spawn_redirect_server() -> (
+        String,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use axum::{http::header, routing::post, Router};
+
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let first_requests = requests.clone();
+        let replayed_requests = requests.clone();
+        let app = Router::new()
+            .route(
+                "/commands/test",
+                post(move || {
+                    let requests = first_requests.clone();
+                    async move {
+                        requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        (
+                            axum::http::StatusCode::TEMPORARY_REDIRECT,
+                            [(header::LOCATION, "/commands/replayed")],
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/commands/replayed",
+                post(move || {
+                    let requests = replayed_requests.clone();
+                    async move {
+                        requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        axum::Json(serde_json::json!({"accepted": true}))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}"), requests, server)
+    }
+
+    fn stable_test_operation_id() -> OperationId {
+        OperationId::from_uuid(Uuid::from_u128(0x12345678_90ab_cdef_0123_456789abcdef))
+    }
+
+    fn assert_indeterminate(error: &anyhow::Error, operation_id: OperationId) {
+        let indeterminate = error
+            .downcast_ref::<IndeterminateDaemonCommandError>()
+            .expect("failure must retain the typed indeterminate outcome");
+        assert_eq!(indeterminate.operation_id, operation_id);
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("outcome is indeterminate"));
+        assert!(rendered.contains(&operation_id.to_string()));
+        assert!(rendered.contains("do not retry automatically"));
+    }
+
+    #[tokio::test]
+    async fn non_idempotent_post_dropped_ack_is_indeterminate_and_dispatched_once() {
+        let (base_url, requests, server) = spawn_dropped_ack_server().await;
+        let client =
+            DaemonClient::from_base_url_with_explicit_authority(base_url, None, None).unwrap();
+        let operation_id = stable_test_operation_id();
+
+        let error = client
+            .post_non_idempotent_json::<_, serde_json::Value>(
+                "/commands/test",
+                &serde_json::json!({"operation_id": operation_id}),
+                operation_id,
+                "test one-dispatch post",
+            )
+            .await
+            .expect_err("a dropped acknowledgement must be indeterminate");
+        server.abort();
+
+        assert_indeterminate(&error, operation_id);
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn non_idempotent_post_truncated_body_is_indeterminate_and_dispatched_once() {
+        let (base_url, requests, server) = spawn_truncated_ack_server().await;
+        let client =
+            DaemonClient::from_base_url_with_explicit_authority(base_url, None, None).unwrap();
+        let operation_id = stable_test_operation_id();
+
+        let error = client
+            .post_non_idempotent_json::<_, serde_json::Value>(
+                "/commands/test",
+                &serde_json::json!({"operation_id": operation_id}),
+                operation_id,
+                "test one-dispatch post",
+            )
+            .await
+            .expect_err("a truncated acknowledgement body must be indeterminate");
+        server.abort();
+
+        assert_indeterminate(&error, operation_id);
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(format!("{error:#}").contains("read daemon response body failed"));
+    }
+
+    #[tokio::test]
+    async fn non_idempotent_post_server_error_is_indeterminate_and_dispatched_once() {
+        let (base_url, requests, server) =
+            spawn_fixed_response_server(axum::http::StatusCode::SERVICE_UNAVAILABLE, "try later")
+                .await;
+        let client =
+            DaemonClient::from_base_url_with_explicit_authority(base_url, None, None).unwrap();
+        let operation_id = stable_test_operation_id();
+
+        let error = client
+            .post_non_idempotent_json::<_, serde_json::Value>(
+                "/commands/test",
+                &serde_json::json!({"operation_id": operation_id}),
+                operation_id,
+                "test one-dispatch post",
+            )
+            .await
+            .expect_err("a server error must be indeterminate");
+        server.abort();
+
+        assert_indeterminate(&error, operation_id);
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(format!("{error:#}").contains("503 Service Unavailable"));
+    }
+
+    #[tokio::test]
+    async fn non_idempotent_post_malformed_success_is_indeterminate_and_dispatched_once() {
+        let (base_url, requests, server) =
+            spawn_fixed_response_server(axum::http::StatusCode::OK, "not-json").await;
+        let client =
+            DaemonClient::from_base_url_with_explicit_authority(base_url, None, None).unwrap();
+        let operation_id = stable_test_operation_id();
+
+        let error = client
+            .post_non_idempotent_json::<_, serde_json::Value>(
+                "/commands/test",
+                &serde_json::json!({"operation_id": operation_id}),
+                operation_id,
+                "test one-dispatch post",
+            )
+            .await
+            .expect_err("an undecodable success acknowledgement must be indeterminate");
+        server.abort();
+
+        assert_indeterminate(&error, operation_id);
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(format!("{error:#}").contains("decode daemon response failed"));
+    }
+
+    #[tokio::test]
+    async fn non_idempotent_post_client_rejection_is_direct_and_dispatched_once() {
+        let (base_url, requests, server) =
+            spawn_fixed_response_server(axum::http::StatusCode::CONFLICT, "stale merge record")
+                .await;
+        let client =
+            DaemonClient::from_base_url_with_explicit_authority(base_url, None, None).unwrap();
+        let operation_id = stable_test_operation_id();
+
+        let error = client
+            .post_non_idempotent_json::<_, serde_json::Value>(
+                "/commands/test",
+                &serde_json::json!({"operation_id": operation_id}),
+                operation_id,
+                "test one-dispatch post",
+            )
+            .await
+            .expect_err("a 4xx response must be a direct rejection");
+        server.abort();
+
+        assert!(
+            error
+                .downcast_ref::<IndeterminateDaemonCommandError>()
+                .is_none(),
+            "a direct daemon rejection must not be reported as an ambiguous commit"
+        );
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            format!("{error:#}"),
+            "daemon command failed (HTTP 409 Conflict): stale merge record"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_idempotent_post_does_not_redispatch_through_redirects() {
+        let (base_url, requests, server) = spawn_redirect_server().await;
+        let client =
+            DaemonClient::from_base_url_with_explicit_authority(base_url, None, None).unwrap();
+        let operation_id = stable_test_operation_id();
+
+        let error = client
+            .post_non_idempotent_json::<_, serde_json::Value>(
+                "/commands/test",
+                &serde_json::json!({"operation_id": operation_id}),
+                operation_id,
+                "test one-dispatch post",
+            )
+            .await
+            .expect_err("a redirect is not authority to redispatch a mutation");
+        server.abort();
+
+        assert!(
+            error
+                .downcast_ref::<IndeterminateDaemonCommandError>()
+                .is_none(),
+            "a received redirect is a direct protocol rejection, not an ambiguous acknowledgement"
+        );
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(format!("{error:#}").contains("307 Temporary Redirect"));
+    }
 
     #[tokio::test]
     async fn idempotent_post_retries_exact_body_with_same_session_authority() {
