@@ -221,6 +221,21 @@ QUERY_COMMANDS = {
     # health reports on the local install and graph state. Environment probes
     # here are a diagnostic boundary, but repo-content reads would not be.
     "health.rs",
+    # `kin graph validate`/`inspect`/`stats` report on graph integrity itself.
+    # A validation surface that decides its answer from the working tree states
+    # the filesystem's opinion of the graph rather than the graph's own, which
+    # is how the orphan count came to be computed by probing each entity's
+    # file_origin with `.exists()`. Orphan status now resolves against the
+    # graph-owned exact tree, and scanning this module is what keeps it there.
+    "graph.rs",
+    # The same graph data, rendered. A visualization that reads the tree would
+    # draw a picture of the projection while claiming to draw the graph.
+    "graph_viz.rs",
+    # Co-change answers from graph-owned CoChanges relations; the Git-format
+    # boundary that captures them lives in kin-git, not here.
+    "cochange.rs",
+    # History answers from recorded commits, not from re-reading the tree.
+    "history.rs",
     # `kin mcp` is how agents reach Kin. It is a launcher today and carries no
     # filesystem primitive at all, which is exactly why it belongs here: the
     # agent-facing entry point should never become the one answer surface that
