@@ -1722,4 +1722,84 @@ mod tests {
         let error = response.error.expect("not-found must populate error");
         assert!(error.contains(&invented.to_string()), "{error}");
     }
+
+    /// Build a validate fixture whose graph carries exactly `tree_paths` in its
+    /// resolved tree, independent of what the working directory holds.
+    fn orphan_fixture(
+        tree_paths: &[&str],
+    ) -> (
+        tempfile::TempDir,
+        kin_core::KinLayout,
+        kin_core::LocalRepositoryAuthorityBinding,
+        kin_db::InMemoryGraph,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = kin_core::init(temp.path()).unwrap().layout;
+        let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&layout).unwrap();
+        let artifacts: Vec<_> = tree_paths
+            .iter()
+            .map(|path| {
+                ResolvedArtifact::new(
+                    ArtifactId::new(),
+                    RepoPath::from_utf8((*path).to_string()).unwrap(),
+                    TreeEntry::blob(Hash256::from_bytes([0x99; 32]), false),
+                )
+            })
+            .collect();
+        let mut snapshot = kin_db::GraphSnapshot::empty();
+        snapshot.resolved_tree = ResolvedTree::from_artifacts(artifacts).unwrap();
+        let graph = kin_db::InMemoryGraph::from_snapshot(snapshot).unwrap();
+        (temp, layout, binding, graph)
+    }
+
+    fn orphan_line(response: &GraphCommandResponse) -> Option<&String> {
+        response.lines.iter().find(|line| line.contains("orphaned"))
+    }
+
+    /// A file present in the working tree but absent from the graph's exact
+    /// tree is still an orphan. Deciding orphan status by probing the working
+    /// directory reports zero here, which is what this asserts against: the
+    /// projection cannot vouch for an entity the graph does not carry.
+    #[test]
+    fn graph_validate_counts_orphans_absent_from_the_graph_tree_despite_the_file_on_disk() {
+        let (_temp, layout, binding, graph) = orphan_fixture(&[]);
+        let on_disk = layout.working_dir().join("src/present.rs");
+        fs::create_dir_all(on_disk.parent().unwrap()).unwrap();
+        fs::write(&on_disk, b"fn present() {}\n").unwrap();
+        assert!(on_disk.exists(), "fixture must put the file on disk");
+
+        let mut entity = test_entity("present");
+        entity.file_origin = Some(FilePathId::new("src/present.rs"));
+        graph.upsert_entity(&entity).unwrap();
+
+        let response = build_graph_validate_response(&binding, &graph).unwrap();
+
+        let line = orphan_line(&response).expect("graph tree lacks the file, so it is orphaned");
+        assert!(line.contains('1'), "{line}");
+    }
+
+    /// The converse: a file the graph's exact tree carries is not an orphan
+    /// even though nothing was ever written to the working directory. Together
+    /// with the test above this pins the authority — the filesystem is neither
+    /// necessary nor sufficient to decide orphan status.
+    #[test]
+    fn graph_validate_clears_orphans_carried_by_the_graph_tree_with_no_file_on_disk() {
+        let (_temp, layout, binding, graph) = orphan_fixture(&["src/tracked.rs"]);
+        assert!(
+            !layout.working_dir().join("src/tracked.rs").exists(),
+            "fixture must leave the working tree empty"
+        );
+
+        let mut entity = test_entity("tracked");
+        entity.file_origin = Some(FilePathId::new("src/tracked.rs"));
+        graph.upsert_entity(&entity).unwrap();
+
+        let response = build_graph_validate_response(&binding, &graph).unwrap();
+
+        assert!(
+            orphan_line(&response).is_none(),
+            "graph tree carries the file: {:?}",
+            response.lines
+        );
+    }
 }
