@@ -57,7 +57,20 @@ pub struct Command(std::process::Command);
 
 impl Command {
     pub fn new<S: AsRef<OsStr>>(program: S) -> Self {
-        Self(std::process::Command::new(program))
+        let is_git = program.as_ref() == OsStr::new("git");
+        let mut command = std::process::Command::new(program);
+        if is_git {
+            // Fixture repositories must not inherit aliases, hooks, signing,
+            // excludes, or other machine-global Git policy. Tests that need a
+            // hostile config set an explicit command-scoped replacement after
+            // construction.
+            command.env("GIT_CONFIG_NOSYSTEM", "1");
+            command.env(
+                "GIT_CONFIG_GLOBAL",
+                if cfg!(windows) { "NUL" } else { "/dev/null" },
+            );
+        }
+        Self(command)
     }
 
     pub fn arg<S: AsRef<OsStr>>(&mut self, arg: S) -> &mut Self {
