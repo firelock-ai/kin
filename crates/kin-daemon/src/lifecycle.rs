@@ -73,17 +73,76 @@ impl Drop for DaemonLock {
 /// removed by any other participant, while this stamp is written under the
 /// lock by the only process that could have taken it.
 fn stamp_lock_owner(file: &mut std::fs::File) {
-    let pid = std::process::id();
+    let stamp = current_owner_stamp();
     if file.set_len(0).is_err() {
         return;
     }
     if file.seek(SeekFrom::Start(0)).is_err() {
         return;
     }
-    if write!(file, "{pid}").is_err() {
+    if write!(file, "{stamp}").is_err() {
         return;
     }
     let _ = file.flush();
+}
+
+/// Marker introducing an owner stamp that carries process identity rather than
+/// a bare PID.
+const OWNER_STAMP_V2: &str = "kin-daemon-owner-v2";
+
+/// Render this process's owner stamp.
+///
+/// A PID alone cannot identify a process incarnation: PIDs are reused, so a
+/// stamp naming a dead daemon's PID starts describing whatever unrelated
+/// process the kernel handed that number to next, and every reader then reports
+/// a live daemon owning a repo it has never heard of. Binding the boot and the
+/// process creation instant makes the record false for an impostor.
+///
+/// Falls back to the bare-PID form when identity cannot be read at all, which
+/// is the same evidence the previous format carried and never less.
+fn current_owner_stamp() -> String {
+    match kin_cli::daemon_client::current_process_identity() {
+        Ok(identity) => match serde_json::to_string(&identity) {
+            Ok(encoded) => format!("{OWNER_STAMP_V2} {encoded}"),
+            Err(_) => std::process::id().to_string(),
+        },
+        Err(_) => std::process::id().to_string(),
+    }
+}
+
+/// What a lock file's owner stamp records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LockOwnerStamp {
+    pid: u32,
+    /// Present only for stamps written by a daemon that could read its own
+    /// identity. Absent for the legacy bare-PID form, where a recycled PID
+    /// remains indistinguishable from the original owner.
+    identity: Option<kin_cli::daemon_client::ProcessIdentity>,
+}
+
+/// Parse either stamp form.
+///
+/// The legacy bare-PID form is still accepted: a mixed-version repo can have a
+/// stamp written by an older daemon, and refusing to read it would discard the
+/// only owner evidence that survives endpoint-file deletion.
+fn parse_lock_owner_stamp(body: &str) -> Option<LockOwnerStamp> {
+    let body = body.trim();
+    if let Some(encoded) = body.strip_prefix(OWNER_STAMP_V2) {
+        let identity: kin_cli::daemon_client::ProcessIdentity =
+            serde_json::from_str(encoded.trim()).ok()?;
+        return Some(LockOwnerStamp {
+            pid: identity.pid(),
+            identity: Some(identity),
+        });
+    }
+    Some(LockOwnerStamp {
+        pid: body.parse::<u32>().ok()?,
+        identity: None,
+    })
+}
+
+fn read_lock_owner_stamp(kin_root: &Path) -> Option<LockOwnerStamp> {
+    parse_lock_owner_stamp(&std::fs::read_to_string(kin_root.join("daemon.lock")).ok()?)
 }
 
 /// Owner PID recorded inside `.kin/daemon.lock` by whichever process last
@@ -93,9 +152,7 @@ fn stamp_lock_owner(file: &mut std::fs::File) {
 /// clearing endpoint files, so it stays available exactly when `daemon.pid` is
 /// missing.
 pub fn lock_owner_pid(kin_root: &Path) -> Option<u32> {
-    std::fs::read_to_string(kin_root.join("daemon.lock"))
-        .ok()
-        .and_then(|content| content.trim().parse::<u32>().ok())
+    read_lock_owner_stamp(kin_root).map(|stamp| stamp.pid)
 }
 
 /// Who currently owns this repo's daemon lock, as far as on-disk evidence can
@@ -104,17 +161,48 @@ pub fn lock_owner_pid(kin_root: &Path) -> Option<u32> {
 pub struct SingletonLockHolder {
     pub pid: u32,
     pub alive: bool,
+    /// Whether `alive` was decided against the recorded process incarnation
+    /// rather than the PID alone.
+    ///
+    /// False means the stamp predates identity-bound ownership, so `alive`
+    /// cannot rule out a PID that has been reused since the daemon exited.
+    pub identity_verified: bool,
 }
 
 /// Resolve the recorded owner of the repo daemon lock from real process
 /// evidence: the lock file's own owner stamp first (it survives endpoint-file
 /// deletion), then `daemon.pid`. Returns `None` only when neither record
 /// exists.
+///
+/// When the stamp carries a process identity, liveness means *that* incarnation
+/// is still running. A PID the kernel has since handed to something else reads
+/// as dead, which is the honest answer: the daemon that took the lock is gone,
+/// and reporting the impostor as a running daemon sent operators to stop a
+/// process that had nothing to do with Kin.
 pub fn singleton_lock_holder(kin_root: &Path) -> Option<SingletonLockHolder> {
-    let pid = lock_owner_pid(kin_root).or_else(|| recorded_daemon_pid(kin_root))?;
+    if let Some(stamp) = read_lock_owner_stamp(kin_root) {
+        if let Some(identity) = stamp.identity {
+            return Some(SingletonLockHolder {
+                pid: stamp.pid,
+                // An identity that cannot be read at all (permission denied on
+                // another user's process) is indeterminate, not dead: fail
+                // closed and treat the owner as live.
+                alive: kin_cli::daemon_client::process_identity_is_current(&identity)
+                    .unwrap_or(true),
+                identity_verified: true,
+            });
+        }
+        return Some(SingletonLockHolder {
+            pid: stamp.pid,
+            alive: is_process_alive(stamp.pid),
+            identity_verified: false,
+        });
+    }
+    let pid = recorded_daemon_pid(kin_root)?;
     Some(SingletonLockHolder {
         pid,
         alive: is_process_alive(pid),
+        identity_verified: false,
     })
 }
 
@@ -732,7 +820,10 @@ fn default_idle_timeout_secs() -> &'static str {
 /// Interactive MCP agent loops routinely pause longer than the 60-second CLI
 /// default between tool calls, so MCP-path spawns use this larger window.  An
 /// explicit `KIN_DAEMON_IDLE_TIMEOUT_SECS` env var always overrides both.
-pub const MCP_IDLE_TIMEOUT_SECS: &str = "1800";
+///
+/// Defined once in the shared spawn contract that both daemon-start paths build
+/// their command through, rather than repeated per crate.
+pub const MCP_IDLE_TIMEOUT_SECS: &str = kin_daemon_spawn::MCP_IDLE_TIMEOUT_SECS;
 
 /// Pure resolution of the idle-timeout value to inject into a spawned daemon.
 ///
@@ -1420,6 +1511,67 @@ mod tests {
         let dead = singleton_lock_holder(root).expect("stamp identifies the holder");
         assert_eq!(dead.pid, 999999999);
         assert!(!dead.alive);
+        assert!(
+            !dead.identity_verified,
+            "a bare-PID stamp cannot rule out PID reuse and must not claim it did"
+        );
+    }
+
+    #[test]
+    fn a_recycled_pid_cannot_impersonate_the_daemon_that_took_the_lock() {
+        // The stamp names a process incarnation, and this process is not it.
+        // A bare PID here would report a live daemon owning the repo, because
+        // the PID resolves to something alive: this very test.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        let impostor = current_owner_stamp();
+        assert!(
+            impostor.starts_with(OWNER_STAMP_V2),
+            "this platform must stamp identity, not a bare pid: {impostor}"
+        );
+        // Rewrite the birth token so the record names a different incarnation
+        // of the same live PID — exactly the shape PID reuse produces.
+        let forged = impostor.replace("start-time:", "start-time:9");
+        let forged = forged.replace("start-ticks:", "start-ticks:9");
+        let forged = forged.replace("created-100ns:", "created-100ns:9");
+        assert_ne!(forged, impostor, "the birth token must have been altered");
+        std::fs::write(root.join("daemon.lock"), &forged).unwrap();
+
+        let holder = singleton_lock_holder(root).expect("stamp identifies the holder");
+        assert_eq!(holder.pid, std::process::id());
+        assert!(holder.identity_verified);
+        assert!(
+            !holder.alive,
+            "a live PID whose recorded incarnation is gone is not the daemon that took the lock"
+        );
+    }
+
+    #[test]
+    fn an_identity_stamp_recognizes_its_own_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("daemon.lock"), current_owner_stamp()).unwrap();
+
+        let holder = singleton_lock_holder(root).expect("stamp identifies the holder");
+        assert_eq!(holder.pid, std::process::id());
+        assert!(holder.alive, "the writing process is still running");
+        assert!(holder.identity_verified);
+    }
+
+    #[test]
+    fn a_legacy_bare_pid_stamp_is_still_read() {
+        // A repo whose lock was stamped by an older daemon must not lose its
+        // only owner evidence to a format it does not recognize.
+        assert_eq!(
+            parse_lock_owner_stamp("4242"),
+            Some(LockOwnerStamp {
+                pid: 4242,
+                identity: None
+            })
+        );
+        assert_eq!(parse_lock_owner_stamp(""), None);
+        assert_eq!(parse_lock_owner_stamp("not-a-pid"), None);
     }
 
     #[test]

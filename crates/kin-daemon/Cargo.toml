@@ -27,6 +27,7 @@ firestore = ["kin-spine/firestore"]
 mimalloc = { version = "0.1", default-features = false }
 kin-model = { workspace = true }
 kin-core = { workspace = true }
+kin-daemon-spawn = { workspace = true }
 kin-db = { workspace = true }
 kin-infer = { version = ">=0.2.1", registry = "kin", default-features = false }
 kin-blobs = { workspace = true }

@@ -132,6 +132,14 @@ fn format_singleton_contention(
             "another kin daemon (pid {}) already owns {repo} and is still running",
             holder.pid
         ),
+        // An identity-verified stamp can say the owning incarnation is gone
+        // without implying anything about whoever holds that PID now.
+        Some(holder) if holder.identity_verified => format!(
+            "the daemon lock for {repo} is still held after the process that took it (pid {}) \
+             exited, so a leaked lock fd is keeping it alive; pid {} no longer identifies that \
+             daemon and may since have been reused",
+            holder.pid, holder.pid
+        ),
         Some(holder) => format!(
             "the daemon lock for {repo} is still held after its recorded owner (pid {}) exited, \
              so a leaked lock fd is keeping it alive",
@@ -2515,6 +2523,7 @@ mod tests {
             Some(crate::lifecycle::SingletonLockHolder {
                 pid: 4242,
                 alive: true,
+                identity_verified: true,
             }),
             &crate::lifecycle::StaleLockReclaim::OwnerAlive(4242),
         );
@@ -2536,6 +2545,7 @@ mod tests {
             Some(crate::lifecycle::SingletonLockHolder {
                 pid: 4242,
                 alive: false,
+                identity_verified: false,
             }),
             &crate::lifecycle::StaleLockReclaim::Cleared(vec![std::path::PathBuf::from(
                 "/repo/.kin/daemon.lock",
@@ -2565,6 +2575,7 @@ mod tests {
             Some(crate::lifecycle::SingletonLockHolder {
                 pid: 4242,
                 alive: false,
+                identity_verified: false,
             }),
             &crate::lifecycle::StaleLockReclaim::CoordinationUnavailable(
                 "recorded owner pid 4242 is dead, but compatible older daemons do not participate"
@@ -2579,6 +2590,24 @@ mod tests {
         assert!(
             compatibility_boundary.contains("cannot be proven safe"),
             "the message must not claim exclusion it cannot enforce: {compatibility_boundary}"
+        );
+    }
+
+    #[test]
+    fn an_identity_verified_dead_owner_does_not_vouch_for_whoever_holds_its_pid_now() {
+        let message = format_singleton_contention(
+            "/repo/.kin",
+            Some(crate::lifecycle::SingletonLockHolder {
+                pid: 4242,
+                alive: false,
+                identity_verified: true,
+            }),
+            &crate::lifecycle::StaleLockReclaim::OwnerUnknown,
+        );
+        assert!(
+            message.contains("may since have been reused"),
+            "a verified-dead owner must not leave the operator believing pid 4242 is still the \
+             daemon: {message}"
         );
     }
 
