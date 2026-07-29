@@ -1722,6 +1722,12 @@ fn validate_git_authority_shape_and_projection(
     authority.validate_shape().map_err(|error| {
         ModelError::InvalidOperation(format!("invalid Git external authority shape: {error}"))
     })?;
+    let closure_entries = authority
+        .closure
+        .objects
+        .iter()
+        .map(|entry| (entry.record.object, entry))
+        .collect::<BTreeMap<_, _>>();
 
     let records = metadata
         .external_objects
@@ -1753,9 +1759,7 @@ fn validate_git_authority_shape_and_projection(
         .iter()
         .map(|alias| (alias.oid, alias))
         .collect::<BTreeMap<_, _>>();
-    let mut replay = snapshot.clone();
-    replay.repository_authority = None;
-    let graph = InMemoryGraph::from_snapshot(replay)?;
+    let mut tree_targets = BTreeMap::new();
     for projection in &authority.commit_projections {
         let alias = aliases.get(&projection.commit_oid).ok_or_else(|| {
             ModelError::InvalidOperation(format!(
@@ -1808,21 +1812,164 @@ fn validate_git_authority_shape_and_projection(
             .into());
         }
 
-        let raw_tree = materialize_git_tree(authority, projection.raw_tree_oid)?;
-        let semantic_tree = graph
-            .resolve_tree_at(&change.id)?
-            .artifacts()
-            .map(|artifact| (artifact.path.clone(), artifact.entry))
-            .collect::<BTreeMap<_, _>>();
-        if semantic_tree != raw_tree {
+        if tree_targets
+            .insert(
+                change.id,
+                GitProjectionTreeTarget {
+                    commit_oid: projection.commit_oid,
+                    raw_tree_oid: projection.raw_tree_oid,
+                },
+            )
+            .is_some()
+        {
             return Err(ModelError::Conflict(format!(
-                "Git commit projection {} raw tree {} does not match the deterministic semantic tree for change {}",
-                projection.commit_oid, projection.raw_tree_oid, change.id
+                "more than one Git commit projection aliases semantic change {}",
+                change.id
             ))
             .into());
         }
     }
+    validate_git_projection_tree_replay(snapshot, &tree_targets, |raw_tree_oid| {
+        materialize_git_tree(&closure_entries, raw_tree_oid)
+    })?;
     validate_persisted_git_alias_coverage(snapshot, metadata)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GitProjectionTreeTarget {
+    commit_oid: GitObjectId,
+    raw_tree_oid: GitObjectId,
+}
+
+enum GitProjectionTreeFrame {
+    Enter(SemanticChangeId),
+    Exit(SemanticChangeId),
+}
+
+/// Cross-check every Git projection against semantic tree identity in one
+/// first-parent traversal.
+///
+/// Resolving each projection independently walks from that commit to genesis,
+/// making a linear history quadratic and repeatedly cloning complete semantic
+/// changes. Git material state has exactly one parent: the first ordered
+/// parent. Walk that forest once, carry one exact [`ResolvedTree`], and invert
+/// each change while backtracking between branches. Every forward and inverse
+/// step still passes through `ResolvedTree::apply`, so stable artifact
+/// identity, old-side equality, path occupancy, and rename-cycle semantics
+/// remain the same fail-closed contract as ordinary graph replay. Exit frames
+/// retain only change identities; inverse deltas are built one change at a
+/// time so a deep history does not duplicate its whole delta chain on-stack.
+fn validate_git_projection_tree_replay<F>(
+    snapshot: &GraphSnapshot,
+    targets: &BTreeMap<SemanticChangeId, GitProjectionTreeTarget>,
+    mut materialize: F,
+) -> Result<(), KinDbError>
+where
+    F: FnMut(GitObjectId) -> Result<BTreeMap<RepoPath, TreeEntry>, KinDbError>,
+{
+    let mut roots = BTreeSet::new();
+    let mut children: BTreeMap<SemanticChangeId, BTreeSet<SemanticChangeId>> = BTreeMap::new();
+    for change_id in targets.keys() {
+        let change = snapshot
+            .changes
+            .get(change_id)
+            .ok_or_else(|| ModelError::ChangeNotFound(change_id.to_string()))?;
+        if let Some(first_parent) = change.parents.first() {
+            if !targets.contains_key(first_parent) {
+                return Err(ModelError::ChangeNotFound(first_parent.to_string()).into());
+            }
+            children
+                .entry(*first_parent)
+                .or_default()
+                .insert(*change_id);
+        } else {
+            roots.insert(*change_id);
+        }
+    }
+
+    let mut frames = Vec::with_capacity(targets.len().saturating_mul(2));
+    for root in roots.iter().rev() {
+        frames.push(GitProjectionTreeFrame::Enter(*root));
+    }
+    let mut visited = BTreeSet::new();
+    let mut semantic_tree = ResolvedTree::default();
+    while let Some(frame) = frames.pop() {
+        match frame {
+            GitProjectionTreeFrame::Enter(change_id) => {
+                if !visited.insert(change_id) {
+                    return Err(ModelError::Conflict(format!(
+                        "cycle in first-parent Git projection history at change {change_id}"
+                    ))
+                    .into());
+                }
+                let change = snapshot
+                    .changes
+                    .get(&change_id)
+                    .ok_or_else(|| ModelError::ChangeNotFound(change_id.to_string()))?;
+                let target = targets
+                    .get(&change_id)
+                    .expect("projection traversal only enters collected targets");
+                semantic_tree = semantic_tree.apply(&change.tree_deltas).map_err(|error| {
+                    ModelError::Conflict(format!(
+                        "Git commit projection {} has an invalid semantic tree transition for change {}: {error}",
+                        target.commit_oid, change.id
+                    ))
+                })?;
+                let raw_tree = materialize(target.raw_tree_oid)?;
+                let exact_match = semantic_tree.len() == raw_tree.len()
+                    && semantic_tree
+                        .artifacts()
+                        .all(|artifact| raw_tree.get(&artifact.path) == Some(&artifact.entry));
+                if !exact_match {
+                    return Err(ModelError::Conflict(format!(
+                        "Git commit projection {} raw tree {} does not match the deterministic semantic tree for change {}",
+                        target.commit_oid, target.raw_tree_oid, change.id
+                    ))
+                    .into());
+                }
+
+                frames.push(GitProjectionTreeFrame::Exit(change_id));
+                if let Some(next) = children.get(&change_id) {
+                    for child in next.iter().rev() {
+                        frames.push(GitProjectionTreeFrame::Enter(*child));
+                    }
+                }
+            }
+            GitProjectionTreeFrame::Exit(change_id) => {
+                let change = snapshot
+                    .changes
+                    .get(&change_id)
+                    .ok_or_else(|| ModelError::ChangeNotFound(change_id.to_string()))?;
+                let inverse = change
+                    .tree_deltas
+                    .iter()
+                    .map(TreeDelta::inverse)
+                    .collect::<Vec<_>>();
+                semantic_tree = semantic_tree.apply(&inverse).map_err(|error| {
+                    storage(format!(
+                        "failed to rewind validated Git projection tree at change {change_id}: {error}"
+                    ))
+                })?;
+            }
+        }
+    }
+
+    if visited.len() != targets.len() {
+        let change_id = targets
+            .keys()
+            .find(|change_id| !visited.contains(change_id))
+            .expect("unequal projection counts have an unvisited target");
+        return Err(ModelError::Conflict(format!(
+            "cycle in first-parent Git projection history at change {change_id}"
+        ))
+        .into());
+    }
+    if !semantic_tree.is_empty() {
+        return Err(storage(
+            "Git projection tree traversal did not restore the empty root state".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_persisted_git_alias_coverage(
@@ -1895,15 +2042,9 @@ fn validate_persisted_git_alias_coverage(
 }
 
 fn materialize_git_tree(
-    authority: &GitExternalAuthority,
+    entries: &BTreeMap<ExternalObjectId, &kin_model::GitObjectClosureEntry>,
     root_oid: GitObjectId,
 ) -> Result<BTreeMap<RepoPath, TreeEntry>, KinDbError> {
-    let entries = authority
-        .closure
-        .objects
-        .iter()
-        .map(|entry| (entry.record.object, entry))
-        .collect::<BTreeMap<_, _>>();
     let root = ExternalObjectId::new(ExternalObjectKind::Tree, root_oid);
     if !entries.contains_key(&root) {
         return Err(ModelError::InvalidOperation(format!(
@@ -6865,6 +7006,307 @@ mod tests {
         assert!(
             RepositoryAuthorityManager::open(repository_id(), tampered_backend).is_err(),
             "reopen must independently reject tampered authority bodies"
+        );
+    }
+
+    fn projection_test_oid(seed: u64) -> GitObjectId {
+        let mut bytes = [0_u8; 20];
+        bytes[..8].copy_from_slice(&seed.to_le_bytes());
+        GitObjectId::sha1(bytes)
+    }
+
+    fn projection_test_change(
+        commit_oid: GitObjectId,
+        parents: Vec<SemanticChangeId>,
+        tree_deltas: Vec<TreeDelta>,
+        message: impl Into<String>,
+    ) -> SemanticChange {
+        let mut change = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+            origin: ChangeOrigin::GitCommit { oid: commit_oid },
+            parents,
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("projection-replay-test"),
+            message: message.into(),
+            entity_deltas: Vec::new(),
+            relation_deltas: Vec::new(),
+            tree_deltas,
+            admission_policy_delta: None,
+            external_reference_deltas: Vec::new(),
+            projected_files: Vec::new(),
+            spec_link: None,
+            evidence: Vec::new(),
+            risk_summary: None,
+        };
+        change.id = compute_semantic_change_id(&change).unwrap();
+        change
+    }
+
+    fn projection_test_raw_tree(
+        entries: impl IntoIterator<Item = (&'static str, TreeEntry)>,
+    ) -> BTreeMap<RepoPath, TreeEntry> {
+        entries
+            .into_iter()
+            .map(|(path, entry)| (RepoPath::from_utf8(path).unwrap(), entry))
+            .collect()
+    }
+
+    #[test]
+    fn git_projection_tree_replay_materializes_every_commit_exactly_once() {
+        const DEPTH: usize = 128;
+
+        let mut snapshot = GraphSnapshot::empty();
+        let mut targets = BTreeMap::new();
+        let mut raw_trees = BTreeMap::new();
+        let mut expected_paths = BTreeMap::new();
+        let mut parent = None;
+        for index in 0..DEPTH {
+            let commit_oid = projection_test_oid(index as u64 + 1);
+            let raw_tree_oid = projection_test_oid(index as u64 + 10_000);
+            let path = RepoPath::from_utf8(format!("src/file-{index}.rs")).unwrap();
+            let entry = TreeEntry::blob(Hash256::from_bytes([index as u8; 32]), false);
+            let change = projection_test_change(
+                commit_oid,
+                parent.into_iter().collect(),
+                vec![TreeDelta::Added {
+                    artifact_id: ArtifactId(Uuid::from_u128(index as u128 + 1)),
+                    new: LocatedEntry::new(path.clone(), entry),
+                }],
+                format!("add file {index}"),
+            );
+            expected_paths.insert(path, entry);
+            raw_trees.insert(raw_tree_oid, expected_paths.clone());
+            targets.insert(
+                change.id,
+                GitProjectionTreeTarget {
+                    commit_oid,
+                    raw_tree_oid,
+                },
+            );
+            parent = Some(change.id);
+            snapshot.changes.insert(change.id, change);
+        }
+
+        let mut materializations = BTreeMap::new();
+        validate_git_projection_tree_replay(&snapshot, &targets, |raw_tree_oid| {
+            *materializations.entry(raw_tree_oid).or_insert(0_usize) += 1;
+            Ok(raw_trees
+                .get(&raw_tree_oid)
+                .expect("every projection has one exact raw tree")
+                .clone())
+        })
+        .unwrap();
+
+        assert_eq!(materializations.len(), DEPTH);
+        assert!(
+            materializations.values().all(|count| *count == 1),
+            "projection replay must not re-walk or re-materialize prior commits: {materializations:?}"
+        );
+    }
+
+    #[test]
+    fn git_projection_tree_replay_handles_branches_swaps_and_merge_first_parent() {
+        let artifact_a = ArtifactId(Uuid::from_u128(0xa1));
+        let artifact_b = ArtifactId(Uuid::from_u128(0xb1));
+        let artifact_c = ArtifactId(Uuid::from_u128(0xc1));
+        let entry_a = TreeEntry::blob(Hash256::from_bytes([0xa1; 32]), false);
+        let entry_b = TreeEntry::blob(Hash256::from_bytes([0xb1; 32]), false);
+        let entry_c = TreeEntry::blob(Hash256::from_bytes([0xc1; 32]), false);
+
+        let root_oid = projection_test_oid(1);
+        let root_tree_oid = projection_test_oid(101);
+        let root = projection_test_change(
+            root_oid,
+            Vec::new(),
+            vec![
+                TreeDelta::Added {
+                    artifact_id: artifact_a,
+                    new: LocatedEntry::new(RepoPath::from_utf8("a").unwrap(), entry_a),
+                },
+                TreeDelta::Added {
+                    artifact_id: artifact_b,
+                    new: LocatedEntry::new(RepoPath::from_utf8("b").unwrap(), entry_b),
+                },
+            ],
+            "root",
+        );
+
+        let swap_oid = projection_test_oid(2);
+        let swap_tree_oid = projection_test_oid(102);
+        let swap = projection_test_change(
+            swap_oid,
+            vec![root.id],
+            vec![
+                TreeDelta::Updated {
+                    artifact_id: artifact_a,
+                    old: LocatedEntry::new(RepoPath::from_utf8("a").unwrap(), entry_a),
+                    new: LocatedEntry::new(RepoPath::from_utf8("b").unwrap(), entry_a),
+                },
+                TreeDelta::Updated {
+                    artifact_id: artifact_b,
+                    old: LocatedEntry::new(RepoPath::from_utf8("b").unwrap(), entry_b),
+                    new: LocatedEntry::new(RepoPath::from_utf8("a").unwrap(), entry_b),
+                },
+            ],
+            "swap paths",
+        );
+
+        let side_oid = projection_test_oid(3);
+        let side_tree_oid = projection_test_oid(103);
+        let side = projection_test_change(
+            side_oid,
+            vec![root.id],
+            vec![
+                TreeDelta::Removed {
+                    artifact_id: artifact_a,
+                    old: LocatedEntry::new(RepoPath::from_utf8("a").unwrap(), entry_a),
+                },
+                TreeDelta::Added {
+                    artifact_id: artifact_c,
+                    new: LocatedEntry::new(RepoPath::from_utf8("c").unwrap(), entry_c),
+                },
+            ],
+            "side branch",
+        );
+
+        let merge_oid = projection_test_oid(4);
+        let merge_tree_oid = projection_test_oid(104);
+        let merge = projection_test_change(
+            merge_oid,
+            vec![swap.id, side.id],
+            vec![TreeDelta::Updated {
+                artifact_id: artifact_a,
+                old: LocatedEntry::new(RepoPath::from_utf8("b").unwrap(), entry_a),
+                new: LocatedEntry::new(RepoPath::from_utf8("d").unwrap(), entry_a),
+            }],
+            "merge from swap material parent",
+        );
+
+        let mut snapshot = GraphSnapshot::empty();
+        let mut targets = BTreeMap::new();
+        for (change, raw_tree_oid) in [
+            (&root, root_tree_oid),
+            (&swap, swap_tree_oid),
+            (&side, side_tree_oid),
+            (&merge, merge_tree_oid),
+        ] {
+            snapshot.changes.insert(change.id, change.clone());
+            let ChangeOrigin::GitCommit { oid } = change.origin else {
+                unreachable!()
+            };
+            targets.insert(
+                change.id,
+                GitProjectionTreeTarget {
+                    commit_oid: oid,
+                    raw_tree_oid,
+                },
+            );
+        }
+        let mut raw_trees = BTreeMap::from([
+            (
+                root_tree_oid,
+                projection_test_raw_tree([("a", entry_a), ("b", entry_b)]),
+            ),
+            (
+                swap_tree_oid,
+                projection_test_raw_tree([("a", entry_b), ("b", entry_a)]),
+            ),
+            (
+                side_tree_oid,
+                projection_test_raw_tree([("b", entry_b), ("c", entry_c)]),
+            ),
+            (
+                merge_tree_oid,
+                projection_test_raw_tree([("a", entry_b), ("d", entry_a)]),
+            ),
+        ]);
+
+        validate_git_projection_tree_replay(&snapshot, &targets, |raw_tree_oid| {
+            Ok(raw_trees[&raw_tree_oid].clone())
+        })
+        .unwrap();
+
+        raw_trees
+            .get_mut(&merge_tree_oid)
+            .unwrap()
+            .insert(RepoPath::from_utf8("a").unwrap(), entry_c);
+        let error = validate_git_projection_tree_replay(&snapshot, &targets, |raw_tree_oid| {
+            Ok(raw_trees[&raw_tree_oid].clone())
+        })
+        .expect_err(
+            "an untouched raw-tree entry must not diverge from semantic first-parent state",
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("does not match the deterministic semantic tree"),
+            "unexpected untouched-entry error: {error}"
+        );
+    }
+
+    #[test]
+    fn git_projection_tree_replay_rejects_missing_first_parent_and_cycles() {
+        let missing_parent = SemanticChangeId::from_hash(Hash256::from_bytes([0x99; 32]));
+        let missing_oid = projection_test_oid(201);
+        let missing = projection_test_change(
+            missing_oid,
+            vec![missing_parent],
+            Vec::new(),
+            "missing first parent",
+        );
+        let missing_targets = BTreeMap::from([(
+            missing.id,
+            GitProjectionTreeTarget {
+                commit_oid: missing_oid,
+                raw_tree_oid: projection_test_oid(301),
+            },
+        )]);
+        let mut missing_snapshot = GraphSnapshot::empty();
+        missing_snapshot.changes.insert(missing.id, missing);
+        let error =
+            validate_git_projection_tree_replay(&missing_snapshot, &missing_targets, |_| {
+                panic!("a structurally incomplete projection must fail before materialization")
+            })
+            .expect_err("a projected first parent must also have an exact tree target");
+        assert!(
+            error.to_string().contains(&missing_parent.to_string()),
+            "unexpected missing-parent error: {error}"
+        );
+
+        let left_oid = projection_test_oid(202);
+        let right_oid = projection_test_oid(203);
+        let mut left = projection_test_change(left_oid, Vec::new(), Vec::new(), "cycle left");
+        let mut right = projection_test_change(right_oid, Vec::new(), Vec::new(), "cycle right");
+        left.parents = vec![right.id];
+        right.parents = vec![left.id];
+        let cycle_targets = BTreeMap::from([
+            (
+                left.id,
+                GitProjectionTreeTarget {
+                    commit_oid: left_oid,
+                    raw_tree_oid: projection_test_oid(302),
+                },
+            ),
+            (
+                right.id,
+                GitProjectionTreeTarget {
+                    commit_oid: right_oid,
+                    raw_tree_oid: projection_test_oid(303),
+                },
+            ),
+        ]);
+        let mut cycle_snapshot = GraphSnapshot::empty();
+        cycle_snapshot.changes.insert(left.id, left);
+        cycle_snapshot.changes.insert(right.id, right);
+        let error = validate_git_projection_tree_replay(&cycle_snapshot, &cycle_targets, |_| {
+            panic!("a cyclic projection forest must fail before materialization")
+        })
+        .expect_err("a first-parent projection cycle must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("cycle in first-parent Git projection history"),
+            "unexpected cycle error: {error}"
         );
     }
 
