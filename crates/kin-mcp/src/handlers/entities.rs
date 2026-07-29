@@ -2757,8 +2757,9 @@ Reach for it as a quick health/readiness check: confirm the selected graph is po
 check how much of its own retrieval universe has embeddings indexed, and verify the scope \
 before relying on other tools. embedding_source is selected_graph; any pipeline-specific \
 fallback coverage is reported by semantic_locate itself. sampling=point_in_time_selected_graph \
-means the daemon serialized embedding mutation and revalidated authority_epoch after capturing \
-every counter; authority_epoch is process-local, not a durable repository generation. \
+means the daemon held its normal embedding-work fence while reading internally synchronized \
+coverage counters, then revalidated authority_epoch after capturing every counter; \
+authority_epoch is process-local, not a durable repository generation. \
 Enrichment completeness is not attested \
 (completion_attested=false), so a populated graph is not by itself a complete one. This \
 tool requires the Kin daemon; it does not invent an offline approximation.";
