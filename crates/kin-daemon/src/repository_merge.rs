@@ -774,8 +774,8 @@ pub(crate) fn publish_resolved_merge(
     snapshot.repository_authority = None;
     drop(lease);
 
-    let graph =
-        kin_db::InMemoryGraph::from_snapshot(snapshot).context("prepare graph-owned merge history")?;
+    let graph = kin_db::InMemoryGraph::from_snapshot(snapshot)
+        .context("prepare graph-owned merge history")?;
     let base_state = graph
         .resolve_graph_at(&record.binding.base_change)
         .context("resolve exact graph at the merge base")?;
@@ -905,7 +905,8 @@ pub(crate) fn publish_resolved_merge(
 
     let desired_tree = ResolvedTree::from_artifacts(merged_artifacts.into_values())
         .context("compose exact resolved repository tree")?;
-    let (shared_policy, admission_policy_delta) = derive_policy(state, &ours_policy, &desired_tree)?;
+    let (shared_policy, admission_policy_delta) =
+        derive_policy(state, &ours_policy, &desired_tree)?;
     if admission_policy_delta.is_some() || shared_policy != ours_policy {
         return Err(merge_conflict(format!(
             "merging {} into {} changes the shared admission policy; a merge that transitions \
@@ -1203,7 +1204,9 @@ fn apply_resolution(
                 MergeConflictSubject::Path { path },
                 MergeResolutionPayload::PathOwner { artifact: owner },
             ) => {
-                let MergeDivergence::PathCollision { artifacts: claimants } = &entry.divergence
+                let MergeDivergence::PathCollision {
+                    artifacts: claimants,
+                } = &entry.divergence
                 else {
                     bail!("a path owner settles a path collision")
                 };
@@ -1217,7 +1220,9 @@ fn apply_resolution(
                 }
             }
             (MergeConflictSubject::Path { .. }, MergeResolutionPayload::Removed) => {
-                let MergeDivergence::PathCollision { artifacts: claimants } = &entry.divergence
+                let MergeDivergence::PathCollision {
+                    artifacts: claimants,
+                } = &entry.divergence
                 else {
                     bail!("a removal of a contested path settles a path collision")
                 };
@@ -1345,7 +1350,9 @@ fn value_divergence(in_base: bool, in_ours: bool, in_theirs: bool) -> Result<Mer
         (false, true, true) => MergeDivergence::AddedBothSides,
         (_, true, false) => MergeDivergence::ChangedOursRemovedTheirs,
         (_, false, true) => MergeDivergence::RemovedOursChangedTheirs,
-        (_, false, false) => bail!("composition reported a conflict for an identity neither side holds"),
+        (_, false, false) => {
+            bail!("composition reported a conflict for an identity neither side holds")
+        }
     })
 }
 
@@ -1709,11 +1716,7 @@ fn open_conflicted_merge(
     let mut lines = vec![format!(
         "Merging {} into {} left {} unresolved conflict(s); the merge is held as merge \
          transaction {} (authority generation {})",
-        request.source,
-        plan.target_ref,
-        conflict_count,
-        record.hash,
-        receipt.generation
+        request.source, plan.target_ref, conflict_count, record.hash, receipt.generation
     )];
     lines.extend(render_conflict_lines(&record));
     lines.push(
@@ -1924,7 +1927,9 @@ fn merge_model_status(error: &kin_model::ModelError) -> StatusCode {
     }
 }
 
-pub(crate) fn repository_finalization_error(error: crate::error::DaemonError) -> (StatusCode, String) {
+pub(crate) fn repository_finalization_error(
+    error: crate::error::DaemonError,
+) -> (StatusCode, String) {
     use crate::error::DaemonError;
     let status = match &error {
         DaemonError::Graph(kin_db::KinDbError::Model(kin_model::ModelError::InvalidOperation(

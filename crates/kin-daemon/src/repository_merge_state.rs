@@ -248,9 +248,9 @@ fn plan_resolution(
     }
 
     match &request.action {
-        ResolveAction::Settle { directives, all } => {
-            settle(authority, request, roots, workspace, record, directives, *all)
-        }
+        ResolveAction::Settle { directives, all } => settle(
+            authority, request, roots, workspace, record, directives, *all,
+        ),
         ResolveAction::Continue => {
             let execution =
                 publish_resolved_merge(state, authority, request, roots, workspace, record)?;
@@ -262,9 +262,9 @@ fn plan_resolution(
 
 fn into_resolve_execution(execution: MergeExecution) -> ResolveExecution {
     ResolveExecution {
-        resolve_response: execution.resolve_response.expect(
-            "a merge execution reached through resolve carries its resolve response",
-        ),
+        resolve_response: execution
+            .resolve_response
+            .expect("a merge execution reached through resolve carries its resolve response"),
         receipt: execution.receipt,
         authority_freeze: execution.authority_freeze,
         daemon_delta: execution.daemon_delta,
@@ -310,12 +310,8 @@ fn settle(
             .map(|entry| entry.subject.clone())
             .collect();
         for subject in remaining {
-            let resolution = resolution_for(
-                &next,
-                &subject,
-                &ResolveChoice::Side { side },
-                &provenance,
-            )?;
+            let resolution =
+                resolution_for(&next, &subject, &ResolveChoice::Side { side }, &provenance)?;
             next = next.resolve_entry(&subject, resolution).with_context(|| {
                 format!("settle merge conflict {subject:?} by taking the {side:?} side")
             })?;
@@ -339,8 +335,8 @@ fn settle(
     transaction
         .validate()
         .context("validate the merge resolution transaction")?;
-    let (receipt, authority_freeze) =
-        commit_and_freeze_exact(&authority.manager, transaction).context("settle merge conflicts")?;
+    let (receipt, authority_freeze) = commit_and_freeze_exact(&authority.manager, transaction)
+        .context("settle merge conflicts")?;
 
     let unresolved = next.unresolved().count();
     let mut lines = vec![format!(
@@ -356,7 +352,12 @@ fn settle(
         lines.extend(render_conflict_lines(&next));
     }
     Ok(record_execution(
-        lines, workspace, receipt, authority_freeze, next, None,
+        lines,
+        workspace,
+        receipt,
+        authority_freeze,
+        next,
+        None,
     ))
 }
 
@@ -405,7 +406,12 @@ fn abort(
         receipt.generation
     )];
     Ok(record_execution(
-        lines, workspace, receipt, authority_freeze, next, None,
+        lines,
+        workspace,
+        receipt,
+        authority_freeze,
+        next,
+        None,
     ))
 }
 
@@ -482,10 +488,7 @@ fn record_execution(
 /// Ambiguity is refused rather than broken by preference: settling the wrong
 /// identity is indistinguishable from settling the right one once the merge
 /// publishes.
-fn select_subject(
-    record: &MergeTransactionRecord,
-    selector: &str,
-) -> Result<MergeConflictSubject> {
+fn select_subject(record: &MergeTransactionRecord, selector: &str) -> Result<MergeConflictSubject> {
     let needle = selector.trim();
     if needle.is_empty() {
         return Err(merge_bad_request("a conflict selector must not be blank"));

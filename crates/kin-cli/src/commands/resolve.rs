@@ -244,8 +244,9 @@ fn plan_action(
 }
 
 fn parse_record_hash(value: &str) -> Result<Hash256> {
-    let bytes = hex::decode(value.trim())
-        .map_err(|error| anyhow::anyhow!("--expect must be a hex merge record identity: {error}"))?;
+    let bytes = hex::decode(value.trim()).map_err(|error| {
+        anyhow::anyhow!("--expect must be a hex merge record identity: {error}")
+    })?;
     let bytes: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
         anyhow::anyhow!(
             "--expect must be a 32-byte merge record identity, found {} byte(s)",

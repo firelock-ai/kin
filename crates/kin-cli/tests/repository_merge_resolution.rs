@@ -122,7 +122,10 @@ fn persisted_record(layout: &kin_core::KinLayout) -> Option<kin_model::MergeTran
     record
 }
 
-fn change_parents(layout: &kin_core::KinLayout, change: &SemanticChangeId) -> Vec<SemanticChangeId> {
+fn change_parents(
+    layout: &kin_core::KinLayout,
+    change: &SemanticChangeId,
+) -> Vec<SemanticChangeId> {
     let manager = open_authority(layout);
     let lease = manager.read_authority();
     let graph = kin_db::InMemoryGraph::from_snapshot(lease.snapshot().clone())
@@ -260,11 +263,14 @@ fn concurrent_resolutions_from_one_view_leave_one_winner() {
 
     let view = record_hash(&conflicts_report(&repo, &home));
     let first = std::thread::scope(|scope| {
-        let ours = scope.spawn(|| {
-            run_kin(&repo, &home, &["resolve", "--all-ours", "--expect", &view])
-        });
+        let ours =
+            scope.spawn(|| run_kin(&repo, &home, &["resolve", "--all-ours", "--expect", &view]));
         let theirs = scope.spawn(|| {
-            run_kin(&repo, &home, &["resolve", "--all-theirs", "--expect", &view])
+            run_kin(
+                &repo,
+                &home,
+                &["resolve", "--all-theirs", "--expect", &view],
+            )
         });
         (ours.join().expect("ours"), theirs.join().expect("theirs"))
     });
@@ -273,7 +279,8 @@ fn concurrent_resolutions_from_one_view_leave_one_winner() {
         .filter(|output| output.status.success())
         .count();
     assert_eq!(
-        winners, 1,
+        winners,
+        1,
         "exactly one resolution settles from one view: ours={} / {}, theirs={} / {}",
         String::from_utf8_lossy(&first.0.stdout),
         String::from_utf8_lossy(&first.0.stderr),
