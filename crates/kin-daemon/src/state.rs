@@ -918,6 +918,11 @@ pub struct DaemonState {
     /// request; constructing a new backend from the mutable path would bless a
     /// swapped `.kin/kindb` namespace.
     local_repository_backend: Option<Arc<LocalFileBackend>>,
+    /// One repository-v6 authority shared by the projection (VFS) routes,
+    /// revalidated against the durable publication record before every use so
+    /// a commit from this daemon or from a separate process is served as soon
+    /// as it is published.
+    pub(crate) projection_authority: crate::api::ProjectionAuthorityCache,
     /// Local sibling capabilities captured from registry configuration at
     /// startup. The lazy spine loader may open only these retained bindings.
     registered_local_repository_authorities: Vec<RegisteredLocalRepositoryAuthority>,
@@ -1842,6 +1847,7 @@ impl DaemonState {
             reconciliation_status: AtomicU8::new(RECON_IDLE),
             storage_backend: None,
             local_repository_backend: Some(local_repository_backend),
+            projection_authority: crate::api::ProjectionAuthorityCache::default(),
             registered_local_repository_authorities,
             registered_local_repository_authority_incomplete,
             filesystem_reconcile_disabled: AtomicBool::new(
@@ -2038,6 +2044,7 @@ impl DaemonState {
             reconciliation_status: AtomicU8::new(RECON_IDLE),
             storage_backend: Some(backend),
             local_repository_backend: None,
+            projection_authority: crate::api::ProjectionAuthorityCache::default(),
             registered_local_repository_authorities: Vec::new(),
             registered_local_repository_authority_incomplete: false,
             filesystem_reconcile_disabled: AtomicBool::new(
