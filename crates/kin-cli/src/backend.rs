@@ -991,11 +991,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn release_retry_rejection_after_timeout_remains_uncertain() {
+    async fn release_retry_rejection_after_request_timeout_remains_uncertain() {
         let repo = tempfile::tempdir().unwrap();
         let layout = kin_core::init(repo.path()).unwrap().layout;
         let state = ReleaseRetryServerState::default();
-        *state.first_delay.lock().unwrap() = Some(Duration::from_millis(80));
+        *state.first_response.lock().unwrap() = Some(StatusCode::REQUEST_TIMEOUT);
         *state.later_response.lock().unwrap() = Some(StatusCode::CONFLICT);
         let (url, server) = release_retry_server(state.clone()).await;
         let payload = serialized_release_fixture();
@@ -1005,7 +1005,7 @@ mod tests {
             &url,
             &payload,
             "main",
-            Duration::from_millis(20),
+            Duration::from_secs(1),
             2,
             Duration::from_millis(1),
         )
@@ -1014,6 +1014,10 @@ mod tests {
         server.abort();
 
         assert_eq!(error.kind, super::DaemonReleaseFailureKind::Uncertain);
+        assert!(
+            error.to_string().contains("HTTP 409 Conflict"),
+            "later rejection must stay attached to the uncertain result: {error}"
+        );
         let received = state.received.lock().unwrap();
         assert_eq!(received.len(), 2);
         assert!(received.iter().all(|request| request == &payload));

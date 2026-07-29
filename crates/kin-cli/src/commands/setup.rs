@@ -3445,14 +3445,27 @@ fn config_transaction_test_kin_home(subject_path: &Path) -> PathBuf {
         .canonicalize()
         .unwrap_or_else(|_| env::temp_dir());
     let normalized = canonicalize_nearest_existing_test_path(subject_path);
-    let fixture_scope = normalized
+    let fixture_root = normalized
         .strip_prefix(&temp)
         .ok()
         .and_then(|relative| relative.components().next())
-        .map(|component| component.as_os_str().to_string_lossy().into_owned())
-        .unwrap_or_else(|| normalized.to_string_lossy().into_owned());
+        .map(|component| temp.join(component.as_os_str()))
+        .filter(|candidate| candidate != &normalized && candidate.is_dir());
+    let fixture_scope = fixture_root
+        .as_deref()
+        .unwrap_or(&normalized)
+        .to_string_lossy()
+        .into_owned();
     let digest = crate::commands::setup_ledger::sha256_hex(fixture_scope.as_bytes());
-    temp.join(format!("kin-config-transaction-tests-{}", &digest[..24]))
+    let name = format!(".kin-config-transaction-tests-{}", &digest[..24]);
+    // A tempfile fixture already gives this test exclusive directory
+    // authority. Keep its transaction home beneath that fixture so parallel
+    // setup tests do not all serialize on the process-wide temporary parent.
+    // A subject directly beneath TMPDIR cannot contain its own authority, so
+    // retain the sibling fallback for that shape.
+    fixture_root
+        .map(|root| root.join(&name))
+        .unwrap_or_else(|| temp.join(name.trim_start_matches('.')))
 }
 
 impl ConfigTransactionAuthority {
@@ -14539,6 +14552,18 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
         let identity = wal_test_record(ConfigTransactionPhase::Prepared).sidecar;
         let subject_a = fixture_a.path().join("first.lock");
         let subject_b = fixture_b.path().join("first.lock");
+        let fixture_a_root = fixture_a.path().canonicalize().unwrap();
+        let fixture_b_root = fixture_b.path().canonicalize().unwrap();
+        assert_eq!(
+            config_transaction_test_kin_home(&subject_a).parent(),
+            Some(fixture_a_root.as_path()),
+            "parallel transaction fixtures must not share the system temporary parent"
+        );
+        assert_eq!(
+            config_transaction_test_kin_home(&subject_b).parent(),
+            Some(fixture_b_root.as_path()),
+            "each transaction fixture must own its recovery namespace"
+        );
 
         let authority_a = ConfigTransactionAuthority::acquire(&identity, &subject_a).unwrap();
         let authority_a_path = authority_a.path.clone();
