@@ -450,7 +450,10 @@ impl DaemonClient {
     /// Search entities via the multi-repo API.
     ///
     /// Uses `GET /repos/{repo_id}/entities?query=<pattern>`.
-    /// The `repo_id` is derived from the `.kin/` directory name.
+    /// The `repo_id` is the identity the daemon advertises on `GET /health`,
+    /// which is the only key space the repo-scoped routes resolve. Deriving it
+    /// from a directory name instead addresses a repository the daemon does
+    /// not serve.
     pub async fn search_entities(
         &self,
         repo_id: &str,

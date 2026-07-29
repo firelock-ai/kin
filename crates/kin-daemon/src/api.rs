@@ -6698,6 +6698,44 @@ async fn mcp_tools_call(
 // Multi-repo endpoints — list and query lazily-loaded repo graphs
 // ---------------------------------------------------------------------------
 
+/// Resolve one repo-scoped route's `{repo_id}` to its graph.
+///
+/// Every `/repos/{repo_id}/…` route goes through here so the identity a daemon
+/// advertises on `/health` is the identity those routes accept: `/health`
+/// reports [`primary_repo_id`], which is the repository authority id the
+/// daemon opened, and that id is always resident in the repo graph map.
+///
+/// Addressing is decided from the served key space
+/// ([`DaemonState::serves_repo_id`]) *before* any load is attempted, so the two
+/// failure categories stay distinct. An id outside that key space is an
+/// identity mismatch and answers 404 naming the id that is served. Every
+/// failure of a repository this daemon does serve is a fault and keeps its
+/// underlying error, whether or not that repository is the advertised one: a
+/// hosted daemon serves each allowlisted sibling, so an unreachable backend or
+/// a corrupt delta chain must not be relabelled as a repository this daemon
+/// does not have.
+///
+/// Deciding the category from the failure afterwards cannot work, because an
+/// identity compare answers "is this the advertised repository" while the
+/// question is "is this one we serve". Those diverge for every sibling a hosted
+/// daemon carries, and a load error holds no evidence either way.
+async fn repo_scoped_graph(
+    state: &DaemonState,
+    repo_id: &str,
+) -> Result<Arc<kin_db::InMemoryGraph>, (StatusCode, String)> {
+    if !state.serves_repo_id(repo_id) {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!(
+                "this daemon serves repository {} and does not serve {repo_id}; \
+                 GET /health advertises the repo_id every /repos/{{repo_id}} route accepts",
+                state.cached_repo_id
+            ),
+        ));
+    }
+    state.get_repo_graph(repo_id).await.map_err(internal_error)
+}
+
 async fn repository_authority_snapshot(
     state: &DaemonState,
     repo_id: &str,
@@ -6707,10 +6745,7 @@ async fn repository_authority_snapshot(
         return Ok(authority.manager.read_authority().snapshot().clone());
     }
 
-    let graph = state
-        .get_repo_graph(repo_id)
-        .await
-        .map_err(internal_error)?;
+    let graph = repo_scoped_graph(state, repo_id).await?;
     let snapshot = graph.to_snapshot();
     let metadata = snapshot.repository_authority.as_ref().ok_or_else(|| {
         (
@@ -7340,7 +7375,7 @@ async fn command_transfer_plan(
 async fn list_repos(
     State(state): State<Arc<DaemonState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let repos = state.list_available_repos().map_err(|e| {
+    let repos = state.list_available_repos().await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("failed to list repos: {e}"),
@@ -7354,10 +7389,7 @@ async fn repo_health(
     Path(repo_id): Path<String>,
     State(state): State<Arc<DaemonState>>,
 ) -> std::result::Result<impl IntoResponse, (StatusCode, String)> {
-    let graph = state
-        .get_repo_graph(&repo_id)
-        .await
-        .map_err(internal_error)?;
+    let graph = repo_scoped_graph(&state, &repo_id).await?;
     let entity_count = graph.entity_count();
     Ok(Json(RepoHealthResponse {
         repo_id,
@@ -7384,10 +7416,7 @@ async fn repo_entities(
     Query(params): Query<RepoEntitiesQuery>,
     State(state): State<Arc<DaemonState>>,
 ) -> std::result::Result<impl IntoResponse, (StatusCode, String)> {
-    let graph = state
-        .get_repo_graph(&repo_id)
-        .await
-        .map_err(internal_error)?;
+    let graph = repo_scoped_graph(&state, &repo_id).await?;
 
     let filter = kin_model::EntityFilter {
         name_pattern: params.query.clone(),
@@ -7574,10 +7603,7 @@ async fn repo_provenance_entity(
     Path((repo_id, entity_id_str)): Path<(String, String)>,
     State(state): State<Arc<DaemonState>>,
 ) -> std::result::Result<impl IntoResponse, (StatusCode, String)> {
-    let graph = state
-        .get_repo_graph(&repo_id)
-        .await
-        .map_err(internal_error)?;
+    let graph = repo_scoped_graph(&state, &repo_id).await?;
     let entity_id = parse_entity_id_hex(&entity_id_str)?;
 
     let snapshot = graph.to_snapshot();
@@ -7681,10 +7707,7 @@ async fn repo_provenance_verify(
     Path(repo_id): Path<String>,
     State(state): State<Arc<DaemonState>>,
 ) -> std::result::Result<impl IntoResponse, (StatusCode, String)> {
-    let graph = state
-        .get_repo_graph(&repo_id)
-        .await
-        .map_err(internal_error)?;
+    let graph = repo_scoped_graph(&state, &repo_id).await?;
     let snapshot = graph.to_snapshot();
 
     // Build a stored hash map from the current snapshot (this represents the
@@ -8708,6 +8731,21 @@ fn persist_coordination_reservation(
     persist_coordination_event(state, draft)
 }
 
+/// The repository identity `/health` advertises.
+///
+/// This is the repository authority id the daemon opened, which is also the
+/// key every `/repos/{repo_id}/…` route resolves through
+/// ([`repo_scoped_graph`], [`repository_authority_snapshot`],
+/// [`repository_transfer_authority`]). One key space *for the daemon API*, so a
+/// client may take `/health.repo_id` and address any repo-scoped route on this
+/// daemon with it. A hosted daemon additionally serves the allowlisted siblings
+/// `GET /repos` lists.
+///
+/// The supervisor is a different service on its own port and its
+/// `/repos/{repo_id}/route` endpoint is a distinct, path-derived key space
+/// (`local-<sha16>` of the working directory, see
+/// `kin_cli::daemon_client::supervisor_repo_id_for_working_dir`). Those ids are
+/// not interchangeable with this one in either direction.
 fn primary_repo_id(state: &DaemonState) -> String {
     state.cached_repo_id.clone()
 }
@@ -13917,6 +13955,357 @@ mod tests {
         let legacy: HealthResponse = serde_json::from_value(legacy).unwrap();
         assert!(legacy.coordination.is_none());
         assert!(legacy.coordination_event_persist_failures.is_none());
+    }
+
+    async fn advertised_repo_id(state: Arc<DaemonState>) -> String {
+        let response = router(state)
+            .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        serde_json::from_slice::<HealthResponse>(&body)
+            .unwrap()
+            .repo_id
+    }
+
+    async fn repo_route(state: Arc<DaemonState>, path: &str) -> (StatusCode, Vec<u8>) {
+        let response = router(state)
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        (status, body.to_vec())
+    }
+
+    /// The identity contract a client depends on: read `repo_id` off `/health`
+    /// and every `/repos/{repo_id}/…` route resolves it. Two key spaces here
+    /// meant a caller that trusted the advertised id got a storage-mode 500 on
+    /// every repo-scoped call against a perfectly healthy daemon.
+    #[tokio::test]
+    async fn health_repo_id_addresses_every_repo_scoped_route() {
+        let state = test_state();
+        let repo_id = advertised_repo_id(Arc::clone(&state)).await;
+        assert!(!repo_id.trim().is_empty(), "/health must advertise an id");
+
+        let (status, body) =
+            repo_route(Arc::clone(&state), &format!("/repos/{repo_id}/health")).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "advertised repo id must route: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let health: RepoHealthResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            health.repo_id, repo_id,
+            "the repo route must echo the advertised identity back"
+        );
+
+        for path in [
+            format!("/repos/{repo_id}/entities"),
+            format!("/repos/{repo_id}/refs"),
+            format!("/repos/{repo_id}/files"),
+            format!("/repos/{repo_id}/history"),
+            format!("/repos/{repo_id}/provenance/verify"),
+        ] {
+            let (status, body) = repo_route(Arc::clone(&state), &path).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{path} must accept the advertised repo id: {}",
+                String::from_utf8_lossy(&body)
+            );
+        }
+
+        // /repos lists the same key space the advertised id belongs to.
+        let (status, body) = repo_route(Arc::clone(&state), "/repos").await;
+        assert_eq!(status, StatusCode::OK);
+        let listed: ReposResponse = serde_json::from_slice(&body).unwrap();
+        assert!(
+            listed.repos.contains(&repo_id),
+            "the advertised id must appear in the repo listing: {:?}",
+            listed.repos
+        );
+    }
+
+    /// An id this daemon does not serve is an identity mismatch, not a broken
+    /// daemon: 404 naming the id that is served, rather than the lazy
+    /// multi-repo loader's "no storage backend configured" 500.
+    ///
+    /// The route list covers every surface the identity resolution reaches,
+    /// including the four that resolve through `repository_authority_snapshot`.
+    /// Those short-circuit on the advertised id, so driving them with an id the
+    /// daemon serves exercises none of this: only an unserved id reaches
+    /// `repo_scoped_graph` through them.
+    #[tokio::test]
+    async fn an_unserved_repo_id_is_an_identity_mismatch_rather_than_a_storage_failure() {
+        let state = test_state();
+        let served = advertised_repo_id(Arc::clone(&state)).await;
+        let unserved = format!("not-{served}");
+        // Parses as a canonical semantic change id, so the archive route
+        // reaches identity resolution instead of refusing on the id shape.
+        let well_formed_change = "a".repeat(64);
+
+        for path in [
+            format!("/repos/{unserved}/health"),
+            format!("/repos/{unserved}/entities"),
+            format!("/repos/{unserved}/provenance/verify"),
+            format!("/repos/{unserved}/files"),
+            format!("/repos/{unserved}/refs"),
+            format!("/repos/{unserved}/history"),
+            format!("/repos/{unserved}/archive/tar/{well_formed_change}"),
+        ] {
+            let (status, body) = repo_route(Arc::clone(&state), &path).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
+            let message = String::from_utf8_lossy(&body);
+            assert!(
+                message.contains(&served) && message.contains(&unserved),
+                "the refusal must name both the served and requested ids: {message}"
+            );
+            assert!(
+                !message.contains("no storage backend configured"),
+                "an identity mismatch must not read as a storage-mode failure: {message}"
+            );
+        }
+    }
+
+    /// A `StorageBackend` that faults on demand for named repositories,
+    /// delegating everything else to a real local backend.
+    ///
+    /// The faults it raises are the ones a hosted backend actually raises for a
+    /// repository it is configured to serve: an unreachable object store,
+    /// expired credentials, a snapshot authority that disagrees with the
+    /// acknowledged head, or a corrupt delta chain. All of them arrive as an
+    /// `Err` out of the recovery read, which is the single path
+    /// `load_recovered_snapshot` takes.
+    struct RepoFaultBackend {
+        inner: kin_db::LocalFileBackend,
+        faulting: FaultSwitch,
+    }
+
+    /// Handle the test keeps after the backend is moved into the daemon, so a
+    /// fault can be armed once the daemon has already opened healthy.
+    #[derive(Clone)]
+    struct FaultSwitch(Arc<std::sync::Mutex<std::collections::HashSet<String>>>);
+
+    impl FaultSwitch {
+        fn start_faulting(&self, repo_id: &str) {
+            self.0.lock().unwrap().insert(repo_id.to_string());
+        }
+
+        fn fault_for(&self, repo_id: &str) -> Option<kin_db::KinDbError> {
+            self.0.lock().unwrap().contains(repo_id).then(|| {
+                kin_db::KinDbError::StorageError(format!(
+                    "{BACKEND_FAULT_TEXT} while reading {repo_id}"
+                ))
+            })
+        }
+    }
+
+    impl RepoFaultBackend {
+        fn new(path: &std::path::Path) -> (Self, FaultSwitch) {
+            let faulting = FaultSwitch(Arc::new(std::sync::Mutex::new(
+                std::collections::HashSet::new(),
+            )));
+            (
+                Self {
+                    inner: kin_db::LocalFileBackend::new(path),
+                    faulting: faulting.clone(),
+                },
+                faulting,
+            )
+        }
+
+        fn fault_for(&self, repo_id: &str) -> Option<kin_db::KinDbError> {
+            self.faulting.fault_for(repo_id)
+        }
+    }
+
+    const BACKEND_FAULT_TEXT: &str = "object store unreachable";
+
+    impl kin_db::StorageBackend for RepoFaultBackend {
+        fn load_recovery_state(
+            &self,
+            repo_id: &str,
+        ) -> std::result::Result<kin_db::SnapshotRecoveryState, kin_db::KinDbError> {
+            match self.fault_for(repo_id) {
+                Some(error) => Err(error),
+                None => self.inner.load_recovery_state(repo_id),
+            }
+        }
+
+        fn load_snapshot_authority(
+            &self,
+            repo_id: &str,
+        ) -> std::result::Result<Option<kin_db::SnapshotAuthority>, kin_db::KinDbError> {
+            match self.fault_for(repo_id) {
+                Some(error) => Err(error),
+                None => self.inner.load_snapshot_authority(repo_id),
+            }
+        }
+
+        fn load_snapshot(
+            &self,
+            repo_id: &str,
+        ) -> std::result::Result<Option<(Vec<u8>, kin_db::Generation)>, kin_db::KinDbError>
+        {
+            match self.fault_for(repo_id) {
+                Some(error) => Err(error),
+                None => self.inner.load_snapshot(repo_id),
+            }
+        }
+
+        fn save_snapshot(
+            &self,
+            repo_id: &str,
+            data: &[u8],
+            expected_gen: kin_db::Generation,
+        ) -> std::result::Result<kin_db::Generation, kin_db::KinDbError> {
+            self.inner.save_snapshot(repo_id, data, expected_gen)
+        }
+
+        fn save_delta(
+            &self,
+            repo_id: &str,
+            delta_data: &[u8],
+            base_gen: kin_db::Generation,
+        ) -> std::result::Result<kin_db::Generation, kin_db::KinDbError> {
+            self.inner.save_delta(repo_id, delta_data, base_gen)
+        }
+
+        fn load_deltas_since(
+            &self,
+            repo_id: &str,
+            since_gen: kin_db::Generation,
+        ) -> std::result::Result<Vec<(Vec<u8>, kin_db::Generation)>, kin_db::KinDbError> {
+            self.inner.load_deltas_since(repo_id, since_gen)
+        }
+
+        fn clear_deltas(&self, repo_id: &str) -> std::result::Result<(), kin_db::KinDbError> {
+            self.inner.clear_deltas(repo_id)
+        }
+
+        fn save_overlay(
+            &self,
+            repo_id: &str,
+            session_id: &str,
+            data: &[u8],
+        ) -> std::result::Result<(), kin_db::KinDbError> {
+            self.inner.save_overlay(repo_id, session_id, data)
+        }
+
+        fn load_overlay(
+            &self,
+            repo_id: &str,
+            session_id: &str,
+        ) -> std::result::Result<Option<Vec<u8>>, kin_db::KinDbError> {
+            self.inner.load_overlay(repo_id, session_id)
+        }
+
+        fn delete_overlay(
+            &self,
+            repo_id: &str,
+            session_id: &str,
+        ) -> std::result::Result<(), kin_db::KinDbError> {
+            self.inner.delete_overlay(repo_id, session_id)
+        }
+
+        fn list_repos(&self) -> std::result::Result<Vec<String>, kin_db::KinDbError> {
+            self.inner.list_repos()
+        }
+    }
+
+    /// A hosted daemon serves every allowlisted repository, not only the one it
+    /// advertises. So a backend fault on an allowlisted sibling is a fault, and
+    /// answering 404 there would report a GCS outage or a corrupt delta chain as
+    /// a repository this daemon does not have: false on its face, contradicted
+    /// by `GET /repos` on the same daemon, and invisible to every retry loop and
+    /// 5xx alert that exists to catch exactly that.
+    ///
+    /// This is the case an identity compare cannot decide, and the reason
+    /// addressing is resolved from the served key space before the load rather
+    /// than inferred from the failure afterwards.
+    #[tokio::test]
+    async fn a_backend_fault_on_a_served_sibling_stays_a_fault_rather_than_a_404() {
+        let dir = std::env::temp_dir().join(format!("kin-daemon-repo-fault-{}", Uuid::new_v4()));
+        let kin_dir = dir.join(".kin");
+        std::fs::create_dir_all(kin_dir.join("objects")).unwrap();
+        std::fs::create_dir_all(kin_dir.join("working")).unwrap();
+        let layout = kin_core::KinLayout::new(kin_dir);
+        kin_core::manifest::KinManifest::new()
+            .save(&layout.manifest_path())
+            .unwrap();
+        let backend_dir = dir.join("backend");
+        std::fs::create_dir_all(&backend_dir).unwrap();
+
+        // The shipped hosted shape: one advertised repo, several allowlisted
+        // siblings, none of them pre-warmed into the repo graph map.
+        let advertised = "primary-repo";
+        let sibling = "sibling-repo";
+        let (backend, faults) = RepoFaultBackend::new(&backend_dir);
+        let allowed: std::collections::HashSet<String> =
+            [advertised.to_string(), sibling.to_string()]
+                .into_iter()
+                .collect();
+        let state = Arc::new(
+            DaemonState::open_with_backend(layout, Box::new(backend), advertised, Some(allowed))
+                .unwrap(),
+        );
+        assert_eq!(
+            advertised_repo_id(Arc::clone(&state)).await,
+            advertised,
+            "the fixture must advertise the primary id"
+        );
+        assert!(
+            state.serves_repo_id(sibling),
+            "the allowlist is the served key space, so the sibling is served"
+        );
+
+        faults.start_faulting(sibling);
+
+        for path in [
+            format!("/repos/{sibling}/health"),
+            format!("/repos/{sibling}/entities"),
+            format!("/repos/{sibling}/provenance/verify"),
+        ] {
+            let (status, body) = repo_route(Arc::clone(&state), &path).await;
+            let message = String::from_utf8_lossy(&body);
+            assert_eq!(
+                status,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "a backend fault on a served repository must stay a fault at {path}: {message}"
+            );
+            assert!(
+                message.contains(BACKEND_FAULT_TEXT),
+                "the fault must carry the backend error rather than discard it: {message}"
+            );
+            assert!(
+                !message.contains("does not serve"),
+                "a served repository must never be reported as unserved: {message}"
+            );
+        }
+
+        // The same daemon still refuses an id outside the served key space, and
+        // still refuses it as an identity mismatch.
+        let unserved = "absent-repo";
+        let (status, body) =
+            repo_route(Arc::clone(&state), &format!("/repos/{unserved}/entities")).await;
+        let message = String::from_utf8_lossy(&body);
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "an id outside the allowlist is an identity mismatch: {message}"
+        );
+        assert!(
+            message.contains(advertised) && message.contains(unserved),
+            "the refusal must name both the served and requested ids: {message}"
+        );
     }
 
     #[tokio::test]
