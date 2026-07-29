@@ -127,6 +127,7 @@ mod repository_checkout;
 pub mod repository_commit;
 mod repository_drift;
 mod repository_merge;
+mod repository_merge_state;
 mod repository_rollback;
 mod repository_stash;
 mod repository_tag;
