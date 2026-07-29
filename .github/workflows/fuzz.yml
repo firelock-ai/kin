@@ -30,6 +30,13 @@
 # Every campaign has a hard `-max_total_time` wall-clock cap plus a per-input
 # `-timeout`, so neither a single pathological input nor the campaign as a whole
 # can hang the runner.
+#
+# `fuzz/Cargo.lock` is tracked, and this job proves the build resolved through
+# it. `cargo fuzz build` has no `--locked` flag to pass, so enforcement is split
+# in two: `cargo metadata --locked` fails before the build if the committed lock
+# would need updating, and a diff check after the build fails if the build
+# rewrote it. Together those cover both halves of what `--locked` means, and the
+# second half holds no matter what cargo-fuzz does to its argument surface.
 
 name: Fuzz
 
@@ -38,6 +45,8 @@ on:
     branches: [main]
     paths:
       - "crates/kin-parser/**"
+      # fuzz/** covers fuzz/Cargo.lock, which is now the resolved version set
+      # this job builds against.
       - "fuzz/**"
       - ".github/workflows/fuzz.yml"
       # Root manifest carries the kin-model / tree-sitter pins kin-parser
@@ -67,7 +76,13 @@ jobs:
           - parse_adapter
           - parse_shallow
     steps:
-      - uses: actions/checkout@v7
+      # Actions are pinned by commit sha with the version in a trailing comment,
+      # matching the rest of this repo's workflows: a moving tag is the same
+      # reproducibility hole as a moving toolchain, and this job exists to
+      # remove those.
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
 
       # kin-parser's transitive kin-model resolves from the Kin sparse registry
       # ([registries.kin]). The fuzz crate is detached from the kin workspace,
@@ -84,13 +99,17 @@ jobs:
       # nightly for the same reason that file pins stable: an unpinned @nightly
       # lets a green build turn red with no change to this repository, and the
       # failure then has to be told apart from a real one. Bump DELIBERATELY.
+      # The action itself is sha-pinned, same commit the release workflow pins.
+      # Its ref used to be @master, which is a branch: the action could change
+      # under a job whose whole purpose is a fixed toolchain. The Rust version
+      # comes from the explicit input below, so the ref never had to spell it.
       - name: Install nightly toolchain
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@c0e9df88980754dd93e5833b8dcb1b304c1fe173 # pinned commit
         with:
           toolchain: nightly-2026-06-17
 
       - name: Cache cargo registry and fuzz build
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.0.0
         with:
           path: |
             ~/.cargo/registry
@@ -99,8 +118,9 @@ jobs:
           # Keyed on the toolchain pin as well as the sources, so bumping the
           # nightly cannot restore objects built by the previous one. The root
           # manifest is in the hash because it carries the dependency pins
-          # kin-parser inherits.
-          key: ${{ runner.os }}-parser-fuzz-nightly-2026-06-17-${{ hashFiles('fuzz/Cargo.toml', 'Cargo.toml', 'crates/kin-parser/**') }}
+          # kin-parser inherits, and the fuzz lock because it is the resolved
+          # version set those pins produce.
+          key: ${{ runner.os }}-parser-fuzz-nightly-2026-06-17-${{ hashFiles('fuzz/Cargo.lock', 'fuzz/Cargo.toml', 'Cargo.toml', 'crates/kin-parser/**') }}
           restore-keys: |
             ${{ runner.os }}-parser-fuzz-nightly-2026-06-17-
 
@@ -112,8 +132,24 @@ jobs:
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --version 0.13.1 --locked
 
+      # Half one of `--locked`: the committed lock must already resolve the
+      # manifest, so a dependency edit that forgot to re-lock fails here rather
+      # than being papered over by a silent re-resolve during the build.
+      - name: Verify committed fuzz lock resolves the manifest
+        run: |
+          cargo +nightly-2026-06-17 metadata --locked --format-version 1 \
+            --manifest-path fuzz/Cargo.toml > /dev/null
+
       - name: Build fuzz target
-        run: cargo +nightly-2026-06-17 fuzz build ${{ matrix.target }}
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo +nightly-2026-06-17 fuzz build "$TARGET"
+
+      # Half two: the build must not have rewritten the lock. `cargo fuzz build`
+      # takes no `--locked`, so this is what actually holds it to the committed
+      # version set, and it keeps holding regardless of cargo-fuzz's flags.
+      - name: Assert the fuzz build used the committed lock
+        run: git diff --exit-code -- fuzz/Cargo.lock
 
       # Bounded campaign: 300s/target on the weekly schedule, 60s on dispatch.
       # Skipped on pull_request, where the build step above is the whole gate.
@@ -134,7 +170,7 @@ jobs:
 
       - name: Upload crash artifacts on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
         with:
           name: fuzz-artifacts-${{ matrix.target }}
           path: fuzz/artifacts/${{ matrix.target }}/
