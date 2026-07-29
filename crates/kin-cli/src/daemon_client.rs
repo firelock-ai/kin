@@ -639,12 +639,13 @@ impl DaemonClient {
 
     /// POST one non-idempotent JSON command exactly once.
     ///
-    /// Once dispatch begins, transport failures, response-body failures,
-    /// successful-but-undecodable responses, and server errors cannot prove
-    /// whether the daemon committed the operation. They therefore return a
-    /// typed indeterminate error carrying the caller-stable operation identity
-    /// instead of transparently sending the mutation again. Ordinary 4xx
-    /// responses are direct rejections and remain ordinary command errors.
+    /// Once dispatch begins, no response class alone proves whether the daemon
+    /// committed the operation. Merge and resolve can durably publish authority
+    /// before daemon-side finalization reports a 4xx or 5xx error, so every
+    /// non-success response, transport failure, response-body failure, and
+    /// successful-but-undecodable response returns a typed indeterminate error
+    /// carrying the caller-stable operation identity. A future protocol may
+    /// recover precise rejection semantics through explicit pre-commit proof.
     async fn post_non_idempotent_json<Req, Resp>(
         &self,
         path: &str,
@@ -686,14 +687,11 @@ impl DaemonClient {
                 .text()
                 .await
                 .unwrap_or_else(|error| format!("<response body unavailable: {error}>"));
-            if status.is_server_error() {
-                return Err(anyhow::Error::new(IndeterminateDaemonCommandError::new(
-                    operation_id,
-                    path,
-                    format!("daemon returned HTTP {status}: {body}"),
-                )));
-            }
-            bail!("daemon command failed (HTTP {status}): {body}");
+            return Err(anyhow::Error::new(IndeterminateDaemonCommandError::new(
+                operation_id,
+                path,
+                format!("daemon returned HTTP {status}: {body}"),
+            )));
         }
 
         let body = response.bytes().await.map_err(|error| {
@@ -5615,6 +5613,19 @@ mod tests {
         OperationId::from_uuid(Uuid::from_u128(0x12345678_90ab_cdef_0123_456789abcdef))
     }
 
+    struct UnserializableRequest;
+
+    impl serde::Serialize for UnserializableRequest {
+        fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            Err(serde::ser::Error::custom(
+                "intentional serialization failure",
+            ))
+        }
+    }
+
     fn assert_indeterminate(error: &anyhow::Error, operation_id: OperationId) {
         let indeterminate = error
             .downcast_ref::<IndeterminateDaemonCommandError>()
@@ -5624,6 +5635,35 @@ mod tests {
         assert!(rendered.contains("outcome is indeterminate"));
         assert!(rendered.contains(&operation_id.to_string()));
         assert!(rendered.contains("do not retry automatically"));
+    }
+
+    #[tokio::test]
+    async fn non_idempotent_post_serialization_failure_is_direct_and_never_dispatched() {
+        let (base_url, requests, server) =
+            spawn_fixed_response_server(axum::http::StatusCode::OK, "{}").await;
+        let client =
+            DaemonClient::from_base_url_with_explicit_authority(base_url, None, None).unwrap();
+        let operation_id = stable_test_operation_id();
+
+        let error = client
+            .post_non_idempotent_json::<_, serde_json::Value>(
+                "/commands/test",
+                &UnserializableRequest,
+                operation_id,
+                "test one-dispatch post",
+            )
+            .await
+            .expect_err("serialization must fail before dispatch");
+        server.abort();
+
+        assert!(
+            error
+                .downcast_ref::<IndeterminateDaemonCommandError>()
+                .is_none(),
+            "a pre-dispatch serialization failure has a proven direct outcome"
+        );
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(format!("{error:#}").contains("encode non-idempotent daemon request"));
     }
 
     #[tokio::test]
@@ -5721,7 +5761,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_idempotent_post_client_rejection_is_direct_and_dispatched_once() {
+    async fn non_idempotent_post_client_error_is_indeterminate_and_dispatched_once() {
         let (base_url, requests, server) =
             spawn_fixed_response_server(axum::http::StatusCode::CONFLICT, "stale merge record")
                 .await;
@@ -5737,20 +5777,37 @@ mod tests {
                 "test one-dispatch post",
             )
             .await
-            .expect_err("a 4xx response must be a direct rejection");
+            .expect_err("a 4xx response cannot prove the mutation was rejected");
         server.abort();
 
-        assert!(
-            error
-                .downcast_ref::<IndeterminateDaemonCommandError>()
-                .is_none(),
-            "a direct daemon rejection must not be reported as an ambiguous commit"
-        );
+        assert_indeterminate(&error, operation_id);
         assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
-        assert_eq!(
-            format!("{error:#}"),
-            "daemon command failed (HTTP 409 Conflict): stale merge record"
-        );
+        assert!(format!("{error:#}").contains("409 Conflict: stale merge record"));
+    }
+
+    #[tokio::test]
+    async fn non_idempotent_post_bad_request_is_indeterminate_and_dispatched_once() {
+        let (base_url, requests, server) =
+            spawn_fixed_response_server(axum::http::StatusCode::BAD_REQUEST, "finalization failed")
+                .await;
+        let client =
+            DaemonClient::from_base_url_with_explicit_authority(base_url, None, None).unwrap();
+        let operation_id = stable_test_operation_id();
+
+        let error = client
+            .post_non_idempotent_json::<_, serde_json::Value>(
+                "/commands/test",
+                &serde_json::json!({"operation_id": operation_id}),
+                operation_id,
+                "test one-dispatch post",
+            )
+            .await
+            .expect_err("a 400 response cannot prove the mutation was rejected");
+        server.abort();
+
+        assert_indeterminate(&error, operation_id);
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(format!("{error:#}").contains("400 Bad Request: finalization failed"));
     }
 
     #[tokio::test]
@@ -5771,12 +5828,7 @@ mod tests {
             .expect_err("a redirect is not authority to redispatch a mutation");
         server.abort();
 
-        assert!(
-            error
-                .downcast_ref::<IndeterminateDaemonCommandError>()
-                .is_none(),
-            "a received redirect is a direct protocol rejection, not an ambiguous acknowledgement"
-        );
+        assert_indeterminate(&error, operation_id);
         assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert!(format!("{error:#}").contains("307 Temporary Redirect"));
     }
