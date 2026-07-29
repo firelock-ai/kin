@@ -3191,6 +3191,26 @@ mod tests {
         }
     }
 
+    /// The filter is keyed on the clap subcommand name, so a renamed command
+    /// would silently stop reporting progress with every other test still green.
+    /// This CLI does rename subcommands, so pin the names against clap itself.
+    #[test]
+    fn progress_reporting_commands_are_real_subcommands() {
+        on_cli_test_stack(|| {
+            let command = Cli::command();
+            let known: Vec<String> = command
+                .get_subcommands()
+                .map(|sub| sub.get_name().to_string())
+                .collect();
+            for expected in PROGRESS_REPORTING_COMMANDS {
+                assert!(
+                    known.iter().any(|name| name == expected),
+                    "{expected:?} is not a kin subcommand; known: {known:?}"
+                );
+            }
+        });
+    }
+
     /// Ordinary commands print their own result, so raising them would only add
     /// noise to every invocation.
     #[test]
