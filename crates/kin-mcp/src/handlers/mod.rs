@@ -1738,13 +1738,17 @@ mod tests {
                 stability_score: 0.9,
             },
             file_origin: Some(file_id.clone()),
+            // Graph spans carry tree-sitter rows, which are 0-based: an entity
+            // occupying the whole file starts at row 0, not row 1. The fixture
+            // states the graph convention so the presentation assertions below
+            // are testing the conversion rather than agreeing with themselves.
             span: Some(kin_model::entity::SourceSpan {
                 file: file_id,
                 start_byte: 0,
                 end_byte: content.len(),
-                start_line: 1,
+                start_line: 0,
                 start_col: 0,
-                end_line: content.lines().count() as u32,
+                end_line: (content.lines().count() as u32).saturating_sub(1),
                 end_col: 1,
             }),
             signature: "export function validate_probe_range_1d8f8275(value: number, minVal: number, maxVal: number): boolean".into(),
@@ -1799,13 +1803,14 @@ mod tests {
                 stability_score: 0.9,
             },
             file_origin: Some(file_id.clone()),
+            // 0-based graph rows: the signature line is row 0.
             span: Some(kin_model::entity::SourceSpan {
                 file: file_id,
                 start_byte: 0,
                 end_byte,
-                start_line: 1,
+                start_line: 0,
                 start_col: 0,
-                end_line: 1,
+                end_line: 0,
                 end_col: end_byte as u32,
             }),
             signature,
@@ -2574,7 +2579,9 @@ mod tests {
 
         assert_eq!(object.get("name").unwrap(), "SnapDocsApp.saveDocument");
         assert_eq!(object.get("file_path").unwrap(), "src/app.js");
-        assert_eq!(object.get("start_line").unwrap(), 12);
+        // Graph row 12 is the 13th line of the file, and that is what an agent
+        // opening `src/app.js` in an editor must be told.
+        assert_eq!(object.get("start_line").unwrap(), 13);
         assert!(object.get("signature").is_some());
         assert!(object.get("fingerprint").is_none());
         assert!(object.get("metadata").is_none());

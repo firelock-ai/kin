@@ -208,7 +208,6 @@ pub fn handle_get_entity_source<G: GraphStore>(
             .ok_or_else(|| McpError::Context("entity source body unavailable".into()))?;
             let is_stale = LAST_READ_STALE.with(|f| f.get());
             let source = LAST_READ_SOURCE.with(|f| f.get());
-            let span = entity.span.as_ref();
             let value = serde_json::json!({
                 "id": entity.id,
                 "name": entity.name,
@@ -216,8 +215,8 @@ pub fn handle_get_entity_source<G: GraphStore>(
                 "language": entity.language,
                 "file_path": entity.file_origin.as_ref().map(|p| p.to_string()),
                 "read_path": entity_read_path(&entity),
-                "start_line": span.map(|s| s.start_line),
-                "end_line": span.map(|s| s.end_line),
+                "start_line": entity_presentation_start_line(&entity),
+                "end_line": entity_presentation_end_line(&entity),
                 "signature": entity.signature,
                 "body": exact_source.body,
                 "source_change_id": exact_source.source_change_id,
@@ -499,12 +498,8 @@ fn resolve_entity_source_generic<G: GraphStore>(
                         .as_ref()
                         .map(|path| path.0.clone())
                         .unwrap_or_default(),
-                    start_line: entity
-                        .span
-                        .as_ref()
-                        .map(|span| span.start_line)
-                        .unwrap_or(0),
-                    end_line: entity.span.as_ref().map(|span| span.end_line).unwrap_or(0),
+                    start_line: entity_presentation_start_line(&entity).unwrap_or(0),
+                    end_line: entity_presentation_end_line(&entity).unwrap_or(0),
                     signature: entity.signature.clone(),
                     body: source.body,
                 }),
@@ -626,8 +621,8 @@ pub fn handle_get_context_pack<G: GraphStore>(
                 "signature": e.signature,
                 "file_path": e.file_origin.as_ref().map(|p| p.to_string()),
                 "read_path": entity_read_path(&e),
-                "start_line": e.span.as_ref().map(|span| span.start_line),
-                "end_line": e.span.as_ref().map(|span| span.end_line),
+                "start_line": entity_presentation_start_line(&e),
+                "end_line": entity_presentation_end_line(&e),
             });
             if !compact {
                 obj["projection"] = serde_json::json!(format!("{:?}", entry.projection_level));
@@ -643,9 +638,17 @@ pub fn handle_get_context_pack<G: GraphStore>(
                 let source = LAST_READ_SOURCE.with(|f| f.get());
                 obj["stale"] = serde_json::json!(is_stale);
                 obj["source"] = serde_json::json!(source);
-                obj["body"] = serde_json::json!(body
-                    .map(|source| source.body)
-                    .unwrap_or_else(|| entry.content.clone()));
+                // Same rule as the focal body: a dependency's `body` is the
+                // graph-owned projection or null. The pack's own `entry.content`
+                // is a token-accounting stub, and serving it here would hand an
+                // agent signature text shaped like an implementation.
+                match body {
+                    Some(source) => obj["body"] = serde_json::json!(source.body),
+                    None => {
+                        obj["body"] = serde_json::Value::Null;
+                        obj["body_unavailable"] = serde_json::json!(entity_body_gap_reason(&e));
+                    }
+                }
             }
             Ok(obj)
         } else {
@@ -856,6 +859,8 @@ fn spine_reference_rows(
             kind: source.map(|entity| format!("{:?}", entity.kind)),
             file_path: Some(file_path),
             start_line: None,
+            // A federated xref carries no site span from the other repo's graph.
+            reference_lines: Vec::new(),
             signature: source.map(|entity| entity.signature.clone()),
             snippet: None,
             // CrossRepoEdge proves a dependency but does not retain whether
@@ -879,7 +884,11 @@ fn reference_row_json(row: ReferenceRow) -> serde_json::Value {
         "name": row.name,
         "kind": row.kind,
         "file_path": row.file_path,
+        // `start_line` locates the CALLER's definition; `reference_lines` locates
+        // the usages inside it. Both are graph facts and both are 1-based, so an
+        // agent never has to count forward from a definition to find a call site.
         "start_line": row.start_line,
+        "reference_lines": row.reference_lines,
         "signature": row.signature,
         "snippet": row.snippet,
         "relation_kinds": row
@@ -1636,7 +1645,8 @@ pub fn handle_explore_codebase<G: GraphStore>(
                     output.push_str(&format!("  File: {}\n", fp));
                 }
                 if let Some(ref span) = focal.span {
-                    output.push_str(&format!("  Lines: {}–{}\n", span.start_line, span.end_line));
+                    let (start_line, end_line) = presentation_span_lines(span);
+                    output.push_str(&format!("  Lines: {start_line}–{end_line}\n"));
                 }
 
                 let chain = collect_primary_trace_chain(store, &focal, 12)?;
@@ -1668,11 +1678,12 @@ pub fn handle_explore_codebase<G: GraphStore>(
                             }
                         }
                         if let Some(span) = step.span.as_ref() {
+                            let (start_line, end_line) = presentation_span_lines(span);
                             if !push_with_budget(
                                 &mut output,
                                 &mut tokens_used,
                                 token_budget,
-                                &format!("   Lines: {}–{}\n", span.start_line, span.end_line),
+                                &format!("   Lines: {start_line}–{end_line}\n"),
                             ) {
                                 output.push_str("  ... (truncated)\n");
                                 break;
@@ -1892,8 +1903,8 @@ pub fn handle_explore_codebase<G: GraphStore>(
                         output.push_str(&format!("  File: {}\n", fp));
                     }
                     if let Some(ref span) = entity.span {
-                        output
-                            .push_str(&format!("  Lines: {}–{}\n", span.start_line, span.end_line));
+                        let (start_line, end_line) = presentation_span_lines(span);
+                        output.push_str(&format!("  Lines: {start_line}–{end_line}\n"));
                     }
 
                     match build_context_pack(store, &entity.id, &opts) {

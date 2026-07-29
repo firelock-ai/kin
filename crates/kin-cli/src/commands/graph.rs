@@ -4,6 +4,7 @@
 use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result};
+use kin_mcp::handlers::common::presentation_span_lines;
 use kin_model::{
     Entity, EntityId, EntityKind, EntityRole, EntityStore, GraphStore, Hash256, RelationKind,
 };
@@ -37,6 +38,10 @@ pub struct GraphSourceRecord {
     pub kind: String,
     pub language: String,
     pub file_path: String,
+    /// 1-based inclusive presentation lines, converted from the graph's 0-based
+    /// span rows at construction. This record is only ever printed or serialized
+    /// to an agent, so it carries the editor convention; `start_byte`/`end_byte`
+    /// stay in the graph's own domain because they are offsets, not positions.
     pub start_line: u32,
     pub end_line: u32,
     pub start_byte: usize,
@@ -592,10 +597,8 @@ fn build_graph_inspect_response(
             lines.push(format!("  File: {}", fo.0));
         }
         if let Some(ref span) = entity.span {
-            lines.push(format!(
-                "  Span: lines {}-{}",
-                span.start_line, span.end_line
-            ));
+            let (start_line, end_line) = presentation_span_lines(span);
+            lines.push(format!("  Span: lines {start_line}-{end_line}"));
         }
         lines.push(format!("  Signature: {}", entity.signature));
         if let Some(ref doc) = entity.doc_summary {
@@ -895,14 +898,15 @@ fn graph_source_record(
             )
         })?
         .to_string();
+    let (start_line, end_line) = presentation_span_lines(span);
     Ok(GraphSourceRecord {
         id: entity.id.to_string(),
         name: entity.name.clone(),
         kind: format!("{:?}", entity.kind),
         language: entity.language.to_string(),
         file_path: file_origin.0.clone(),
-        start_line: span.start_line,
-        end_line: span.end_line,
+        start_line,
+        end_line,
         start_byte: span.start_byte,
         end_byte: span.end_byte,
         signature: entity.signature.clone(),
