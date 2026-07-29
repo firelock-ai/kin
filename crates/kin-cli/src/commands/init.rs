@@ -51,8 +51,8 @@ struct InitResultPayload<'a> {
     authority: &'static str,
     source_boundary: &'static str,
     history: &'static str,
-    /// What the published repository's query graph actually carries, read back
-    /// through the accessor `kin status` reports from.
+    /// Durable generation-bound enrichment committed by admission. This is
+    /// carried from the bootstrap lease, not reopened after publication.
     semantic_enrichment: SemanticEnrichmentStatus,
     repo_root: String,
     kin_dir: String,
@@ -96,27 +96,14 @@ pub async fn run(path: Option<String>, json: bool) -> Result<()> {
         }
     };
 
-    let enrichment = admitted_semantic_enrichment(&result)?;
+    let enrichment =
+        SemanticEnrichmentStatus::from_durable_summary(&result.authority.semantic_enrichment);
     if json {
         print_json_result(&result, boundary, enrichment)?;
     } else {
         print_human_result(&result, boundary, &enrichment)?;
     }
     Ok(())
-}
-
-/// Read what admission actually bound into the published graph.
-///
-/// Admission is not a claim this command gets to make on its own: exact Git
-/// admission enriches every supported source in reachable history, native
-/// unborn admission has nothing to enrich, and both publish before this runs.
-/// Reading the published repository back through the accessor `kin status`
-/// uses is what keeps the two commands from disagreeing about the same graph.
-fn admitted_semantic_enrichment(result: &kin_core::InitResult) -> Result<SemanticEnrichmentStatus> {
-    let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&result.layout)
-        .context("bind the published repository authority to report admission enrichment")?;
-    super::status::semantic_enrichment(&binding)
-        .context("read semantic enrichment from the published repository authority")
 }
 
 fn ensure_directory(dir: &Path) -> Result<()> {
@@ -255,8 +242,11 @@ fn render_semantic_enrichment(enrichment: &SemanticEnrichmentStatus) -> String {
         SemanticEnrichmentPresence::Present => "present",
     };
     format!(
-        "{presence} ({} entities, {} relations, {} changes; completion not attested)",
-        enrichment.entity_count, enrichment.relation_count, enrichment.semantic_change_count
+        "{presence} ({} entities, {} relations, {} changes in durable authority generation {}; completion not attested)",
+        enrichment.entity_count,
+        enrichment.relation_count,
+        enrichment.semantic_change_count,
+        enrichment.authority_generation
     )
 }
 

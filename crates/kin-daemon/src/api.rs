@@ -15123,17 +15123,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn command_status_endpoint_uses_repository_authority() {
+    async fn command_status_and_graph_status_pin_distinct_durable_and_live_views() {
         install_test_registry_override();
         let dir = std::env::temp_dir().join(format!("kin-daemon-status-state-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let initialized = kin_core::init(&dir).unwrap();
         let state = Arc::new(DaemonState::open(initialized.layout).unwrap());
         state
+            .graph
+            .upsert_entity(&test_entity("live_derived_only", "src/derived.rs"))
+            .unwrap();
+        state
             .is_initialized
             .store(true, std::sync::atomic::Ordering::Relaxed);
         let app = router(state);
         let response = app
+            .clone()
             .oneshot(
                 Request::post("/commands/status")
                     .header("content-type", "application/json")
@@ -15161,8 +15166,44 @@ mod tests {
         );
         assert_eq!(result.report.repository.generation, 1);
         assert_eq!(result.report.workspace.artifact_count, 0);
+        assert_eq!(
+            result.report.semantic_enrichment.view,
+            kin_cli::commands::status::SemanticEnrichmentView::DurableRepositoryAuthority
+        );
+        assert_eq!(result.report.semantic_enrichment.authority_generation, 1);
+        assert_eq!(
+            result.report.semantic_enrichment.entity_count, 0,
+            "live-only daemon enrichment must not be restated as durable authority"
+        );
         assert!(result.report.repository.source_cas_verified);
         assert!(result.text.contains("Kin repository-v6 status"));
+        assert!(result.text.contains("Live graph enrichment"));
+
+        let graph_response = app
+            .oneshot(
+                Request::post("/commands/graph")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "command": "status" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(graph_response.status(), StatusCode::OK);
+        let graph_body = axum::body::to_bytes(graph_response.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let graph_result: kin_cli::commands::graph::GraphCommandResponse =
+            serde_json::from_slice(&graph_body).unwrap();
+        assert!(
+            graph_result
+                .lines
+                .iter()
+                .any(|line| line.contains("Entities: 1")),
+            "graph status must report the daemon's mutable live view: {:?}",
+            graph_result.lines
+        );
     }
 
     #[tokio::test]

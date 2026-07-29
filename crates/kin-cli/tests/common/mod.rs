@@ -178,7 +178,7 @@ fn daemon_compat_ok(path: &Path) -> bool {
 
 pub fn fresh_daemon_bin() -> PathBuf {
     let kin_bin = PathBuf::from(env!("CARGO_BIN_EXE_kin"));
-    let daemon_bin = kin_bin.with_file_name("kin-daemon");
+    let daemon_bin = kin_bin.with_file_name(format!("kin-daemon{}", std::env::consts::EXE_SUFFIX));
     if daemon_compat_ok(&daemon_bin) {
         return daemon_bin;
     }

@@ -10,10 +10,16 @@ mod common;
 
 use common::Command;
 
+#[cfg(windows)]
+const NULL_GIT_CONFIG: &str = "NUL";
+#[cfg(not(windows))]
+const NULL_GIT_CONFIG: &str = "/dev/null";
+
 fn run_git(path: &Path, args: &[&str]) {
     let output = Command::new("git")
         .args(args)
         .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", NULL_GIT_CONFIG)
         .current_dir(path)
         .output()
         .expect("run git");
@@ -97,6 +103,12 @@ fn fresh_native_init_json_reports_exact_unborn_authority() {
     assert_eq!(payload["authority"], "repository-v6");
     assert_eq!(payload["source_boundary"], "native-unborn");
     assert_eq!(payload["history"], "unborn");
+    assert_eq!(
+        payload["semantic_enrichment"]["view"],
+        "durable_repository_authority"
+    );
+    assert_eq!(payload["semantic_enrichment"]["authority_generation"], 1);
+    assert_eq!(payload["semantic_enrichment"]["workspace_generation"], 0);
     assert_eq!(payload["semantic_enrichment"]["presence"], "absent");
     assert_eq!(payload["semantic_enrichment"]["entity_count"], 0);
     assert_eq!(payload["semantic_enrichment"]["relation_count"], 0);
@@ -128,6 +140,12 @@ fn fresh_git_init_json_reports_exact_reachable_authority() {
     assert_eq!(payload["authority"], "repository-v6");
     assert_eq!(payload["source_boundary"], "git-exact-reachable-history");
     assert_eq!(payload["history"], "exact-reachable");
+    assert_eq!(
+        payload["semantic_enrichment"]["view"],
+        "durable_repository_authority"
+    );
+    assert_eq!(payload["semantic_enrichment"]["authority_generation"], 1);
+    assert_eq!(payload["semantic_enrichment"]["workspace_generation"], 0);
     assert_eq!(payload["semantic_enrichment"]["presence"], "absent");
     assert_eq!(payload["semantic_enrichment"]["entity_count"], 0);
     assert!(payload["semantic_enrichment"]["semantic_change_count"]
@@ -195,7 +213,7 @@ fn init_and_status_report_the_same_admission_enrichment() {
 
     assert_eq!(
         reported["semantic_enrichment"], admitted["semantic_enrichment"],
-        "init and status report one graph"
+        "init and status report the same generation-bound durable authority view"
     );
 }
 

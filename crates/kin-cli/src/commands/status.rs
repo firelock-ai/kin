@@ -8,11 +8,10 @@
 //! snapshot. Opening the authority also revalidates every referenced source
 //! body in the repository-owned CAS.
 //!
-//! Semantic counts are materialized from that same lease rather than read off
-//! the authority's raw tables, because the entities a workspace resolves to are
-//! a replay of the deltas its history carries. That materialization is the
-//! query graph the daemon serves, so status, `kin init`, and `kin graph status`
-//! all answer from one view.
+//! Semantic counts are resolved from the workspace's durable first-parent
+//! history and cumulative semantic overlay inside that lease. They deliberately
+//! do not describe the daemon's mutable live graph: runtime reconcile and LSP
+//! work may advance that derived view without changing repository authority.
 
 use std::path::PathBuf;
 
@@ -34,7 +33,18 @@ pub enum SemanticEnrichmentPresence {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticEnrichmentView {
+    DurableRepositoryAuthority,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SemanticEnrichmentStatus {
+    /// This is durable repository/workspace authority, not the daemon's live
+    /// query graph. `kin graph status` reports the latter.
+    pub view: SemanticEnrichmentView,
+    pub authority_generation: u64,
+    pub workspace_generation: u64,
     pub presence: SemanticEnrichmentPresence,
     pub entity_count: usize,
     pub relation_count: usize,
@@ -44,55 +54,50 @@ pub struct SemanticEnrichmentStatus {
     pub completion_attested: bool,
 }
 
-/// Read the enrichment the workspace query graph actually carries.
+impl SemanticEnrichmentStatus {
+    pub(crate) fn from_durable_summary(
+        summary: &kin_core::DurableSemanticEnrichmentSummary,
+    ) -> Self {
+        Self {
+            view: SemanticEnrichmentView::DurableRepositoryAuthority,
+            authority_generation: summary.authority_generation,
+            workspace_generation: summary.workspace_generation,
+            presence: if summary.entity_count == 0 && summary.relation_count == 0 {
+                SemanticEnrichmentPresence::Absent
+            } else {
+                SemanticEnrichmentPresence::Present
+            },
+            entity_count: summary.entity_count,
+            relation_count: summary.relation_count,
+            semantic_change_count: summary.semantic_change_count,
+            completion_attested: false,
+        }
+    }
+}
+
+/// Read the durable enrichment this exact authority lease carries.
 ///
 /// The authority snapshot's own entity and relation tables are not this
 /// answer. Exact admission binds entity and relation deltas onto the changes it
-/// admits, and the entities a workspace resolves to are materialized by
-/// replaying those deltas to its base change and applying its semantic overlay.
+/// admits, and the entities a workspace resolves to come from replaying those
+/// deltas to its base change and applying its semantic overlay.
 /// A surface that counted the raw tables instead would report zero enrichment
 /// on a fully enriched repository.
 ///
-/// This is the one accessor every enrichment claim goes through, so `init`,
-/// `status`, and the daemon's query graph cannot drift apart: it materializes
-/// exactly the snapshot `kin-daemon` loads to serve `graph status`.
+/// This accessor intentionally does not materialize the complete workspace
+/// graph. Kin core replays only semantic identities and never reconstructs the
+/// exact tree, reads source CAS bodies, or builds query indices. The result is
+/// generation-bound durable truth. The daemon's live graph is a distinct view
+/// and may carry additional derived enrichment.
 pub fn semantic_enrichment_from_authority(
     authority: &kin_db::RepositoryAuthorityState,
     workspace_id: &WorkspaceId,
 ) -> Result<SemanticEnrichmentStatus> {
-    let snapshot = authority
-        .workspace_graph_snapshot(workspace_id)
+    let summary = kin_core::durable_semantic_enrichment_summary(authority, workspace_id)
         .with_context(|| {
-            format!("materialize repository-v6 query graph for workspace {workspace_id}")
-        })?
-        .ok_or_else(|| {
-            anyhow::anyhow!("repository-v6 authority has no workspace {workspace_id}")
+            format!("summarize durable repository-v6 semantics for workspace {workspace_id}")
         })?;
-    let entity_count = snapshot.entities.len();
-    let relation_count = snapshot.relations.len();
-    Ok(SemanticEnrichmentStatus {
-        presence: if entity_count == 0 && relation_count == 0 {
-            SemanticEnrichmentPresence::Absent
-        } else {
-            SemanticEnrichmentPresence::Present
-        },
-        entity_count,
-        relation_count,
-        semantic_change_count: snapshot.changes.len(),
-        completion_attested: false,
-    })
-}
-
-/// Read enrichment truth through a one-shot binding.
-///
-/// For callers that hold no authority lease yet. A caller that already holds
-/// one uses [`semantic_enrichment_from_authority`] instead of opening a second.
-pub fn semantic_enrichment(
-    binding: &kin_core::LocalRepositoryAuthorityBinding,
-) -> Result<SemanticEnrichmentStatus> {
-    let authority = ActiveRepositoryAuthority::open(binding)?;
-    let lease = authority.manager().read_authority();
-    semantic_enrichment_from_authority(&lease, &authority.workspace_id)
+    Ok(SemanticEnrichmentStatus::from_durable_summary(&summary))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -204,9 +209,6 @@ pub fn inspect(
                 authority.workspace_id
             )
         })?;
-    workspace
-        .validate()
-        .context("active repository-v6 workspace is invalid")?;
     let roots = lease.roots().clone();
     if roots.generation != metadata.roots.generation {
         anyhow::bail!("repository-v6 lease exposed inconsistent root generations");
@@ -310,11 +312,14 @@ fn render_text(report: &StatusReport, build: Option<&BuildStatus>) -> String {
                 .unwrap_or_default()
         ),
         format!(
-            "Semantic enrichment: {enrichment} ({} entities, {} relations, {} changes; completion not attested)",
+            "Durable semantic enrichment: {enrichment} ({} entities, {} relations, {} changes at authority generation {}, workspace generation {}; completion not attested)",
             report.semantic_enrichment.entity_count,
             report.semantic_enrichment.relation_count,
-            report.semantic_enrichment.semantic_change_count
+            report.semantic_enrichment.semantic_change_count,
+            report.semantic_enrichment.authority_generation,
+            report.semantic_enrichment.workspace_generation
         ),
+        "Live graph enrichment: see `kin graph status`".to_string(),
         "Source CAS: verified".to_string(),
     ];
     if let Some(build) = build {

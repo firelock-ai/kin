@@ -122,11 +122,16 @@ kin init .
 In a clean Git repository, `kin init` atomically admits complete reachable
 history, refs, raw objects, the exact workspace tree, and admission policy into
 repository-v6 graph authority. It never substitutes an exact-HEAD snapshot or
-raw-filesystem semantic rebuild. Remote-bearing repositories currently fail
-closed until exact Kin remote mapping is available.
+raw-filesystem semantic rebuild. Supported repository-local remote URLs,
+refspecs, branch tracking, and push defaults are sealed into Kin's Git
+coexistence configuration; unsafe, ambiguous, or unsupported transfer settings
+fail closed before publication.
 
 Admission also derives the semantic entity and relation layer for every
-supported source in that history, and `kin init` reports the counts it bound.
+supported source in that history, and `kin init` reports the durable,
+generation-bound counts it committed. `kin status` reports that repository
+authority view; `kin graph status` separately reports the daemon's mutable live
+query graph, which may include later derived enrichment.
 Query surfaces consume graph-owned enrichment when it exists and report its
 absence instead of hiding the gap behind raw file search.
 

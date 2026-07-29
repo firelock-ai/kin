@@ -4,17 +4,19 @@
 //! Reporting truth on a freshly admitted repository-v6 repository.
 //!
 //! Every case here admits a real Git repository through the exact admission
-//! boundary and then reads the same workspace-materialized query graph the
-//! daemon serves, so the verdicts under test are the verdicts a user gets.
-
-// Exact Git admission is unix-only, so the whole binary is scoped to it.
-#![cfg(unix)]
+//! boundary. Durable status and the live query graph are exercised as distinct
+//! views: they agree immediately after admission, while daemon routing tests
+//! separately pin that later live-only enrichment does not rewrite authority.
 
 use std::fs;
+use std::net::{SocketAddr, TcpStream};
 use std::path::Path;
+use std::process::{Child, Command as ProcessCommand, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use kin_cli::commands::graph::{execute_graph_command, GraphCommandRequest};
-use kin_cli::commands::status::{self, SemanticEnrichmentPresence};
+use kin_cli::commands::status::{self, SemanticEnrichmentPresence, SemanticEnrichmentView};
 use kin_model::{
     ArtifactKind, EntityStore, FilePathId, Hash256, OpaqueArtifact, StructuredArtifact,
 };
@@ -24,11 +26,86 @@ mod common;
 
 use common::Command;
 
+#[cfg(windows)]
+const NULL_GIT_CONFIG: &str = "NUL";
+#[cfg(not(windows))]
+const NULL_GIT_CONFIG: &str = "/dev/null";
+
+struct IsolatedDaemon {
+    child: Option<Child>,
+}
+
+impl IsolatedDaemon {
+    fn spawn(repo: &Path, home: &Path) -> Self {
+        let child = ProcessCommand::new(common::fresh_daemon_bin())
+            .arg("--repo")
+            .arg(repo)
+            .arg("--port")
+            .arg("0")
+            .env("HOME", home)
+            .env("USERPROFILE", home)
+            .env("KIN_DAEMON_DISABLE_LSP", "1")
+            .env("KIN_DAEMON_IDLE_TIMEOUT_SECS", "0")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn isolated kin-daemon");
+        Self { child: Some(child) }
+    }
+
+    fn wait_until_serving(&mut self, kin_root: &Path) -> u16 {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let child = self.child.as_mut().expect("daemon child exists");
+            if let Some(status) = child.try_wait().expect("inspect daemon child") {
+                panic!("isolated daemon exited before readiness: {status}");
+            }
+            if let Some(port) = fs::read_to_string(kin_root.join("daemon.port"))
+                .ok()
+                .and_then(|value| value.trim().parse::<u16>().ok())
+            {
+                let address = SocketAddr::from(([127, 0, 0, 1], port));
+                if TcpStream::connect_timeout(&address, Duration::from_millis(200)).is_ok() {
+                    return port;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "isolated daemon did not become ready"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    fn stop(mut self) {
+        let mut child = self.child.take().expect("daemon child exists");
+        let _ = child.kill();
+        let status = child.wait().expect("reap isolated daemon");
+        assert!(
+            child
+                .try_wait()
+                .expect("verify isolated daemon cleanup")
+                .is_some(),
+            "isolated daemon child survived cleanup: {status}"
+        );
+    }
+}
+
+impl Drop for IsolatedDaemon {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 fn run_git(path: &Path, args: &[&str]) {
     let output = Command::new("git")
         .args(args)
         .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_GLOBAL", NULL_GIT_CONFIG)
         .current_dir(path)
         .output()
         .expect("run git");
@@ -60,6 +137,13 @@ fn seed_repository(repo: &Path) {
     fs::write(repo.join("payload.bin"), [0_u8, 255, 17, 0, 128, 42]).expect("write opaque bytes");
     run_git(repo, &["add", "--all"]);
     run_git(repo, &["commit", "-m", "exact mixed tree"]);
+    fs::write(
+        repo.join("src/lib.rs"),
+        b"pub fn helper() -> u32 {\n    11\n}\n\npub fn replacement() -> u32 {\n    helper() + 2\n}\n",
+    )
+    .expect("write semantic add/modify/remove transition");
+    run_git(repo, &["add", "--all"]);
+    run_git(repo, &["commit", "-m", "advance semantic identities"]);
 }
 
 struct AdmittedRepository {
@@ -218,7 +302,7 @@ fn compose_content_hash(graph: &kin_db::InMemoryGraph) -> Hash256 {
 }
 
 #[test]
-fn status_reports_the_enrichment_the_query_graph_actually_carries() {
+fn status_reports_durable_admission_enrichment_from_one_authority_generation() {
     let root = tempdir().expect("temp root");
     let repo = root.path().join("repo");
     fs::create_dir_all(&repo).expect("create repo");
@@ -235,6 +319,18 @@ fn status_reports_the_enrichment_the_query_graph_actually_carries() {
         report.semantic_enrichment.presence,
         SemanticEnrichmentPresence::Present,
         "an enriched repository is not reported as unenriched"
+    );
+    assert_eq!(
+        report.semantic_enrichment.view,
+        SemanticEnrichmentView::DurableRepositoryAuthority
+    );
+    assert_eq!(
+        report.semantic_enrichment.authority_generation,
+        report.repository.generation
+    );
+    assert_eq!(
+        report.semantic_enrichment.workspace_generation,
+        report.workspace.generation
     );
     assert!(report.semantic_enrichment.semantic_change_count > 0);
 }
@@ -256,4 +352,80 @@ fn status_reports_enrichment_absent_on_an_unenriched_repository() {
     );
     assert_eq!(report.semantic_enrichment.entity_count, 0);
     assert_eq!(report.semantic_enrichment.relation_count, 0);
+}
+
+#[test]
+fn init_status_and_graph_status_use_their_real_durable_and_live_routes() {
+    let root = tempdir().expect("temp root");
+    let home = root.path().join("home");
+    let repo = root.path().join("repo");
+    fs::create_dir_all(&home).expect("create home");
+    fs::create_dir_all(&repo).expect("create repo");
+    seed_repository(&repo);
+
+    let init = Command::new(env!("CARGO_BIN_EXE_kin"))
+        .args(["init", ".", "--json"])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .current_dir(&repo)
+        .output()
+        .expect("run production kin init route");
+    assert!(
+        init.status.success(),
+        "init stdout={} stderr={}",
+        String::from_utf8_lossy(&init.stdout),
+        String::from_utf8_lossy(&init.stderr)
+    );
+    let init_payload: serde_json::Value =
+        serde_json::from_slice(&init.stdout).expect("init emits JSON");
+
+    let status = Command::new(env!("CARGO_BIN_EXE_kin"))
+        .args(["status", "--json"])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env_remove("KIN_DAEMON_URL")
+        .current_dir(&repo)
+        .output()
+        .expect("run production kin status route");
+    assert!(
+        status.status.success(),
+        "status stdout={} stderr={}",
+        String::from_utf8_lossy(&status.stdout),
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let status_payload: serde_json::Value =
+        serde_json::from_slice(&status.stdout).expect("status emits JSON");
+    assert_eq!(
+        status_payload["semantic_enrichment"], init_payload["semantic_enrichment"],
+        "init and status share the committed durable authority generation"
+    );
+    assert_eq!(
+        status_payload["semantic_enrichment"]["view"],
+        "durable_repository_authority"
+    );
+
+    let mut daemon = IsolatedDaemon::spawn(&repo, &home);
+    let port = daemon.wait_until_serving(&repo.join(".kin"));
+    let graph_status = Command::new(env!("CARGO_BIN_EXE_kin"))
+        .args(["graph", "status"])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("KIN_DAEMON_URL", format!("http://127.0.0.1:{port}"))
+        .current_dir(&repo)
+        .output()
+        .expect("run production kin graph status route");
+    daemon.stop();
+
+    assert!(
+        graph_status.status.success(),
+        "graph status stdout={} stderr={}",
+        String::from_utf8_lossy(&graph_status.stdout),
+        String::from_utf8_lossy(&graph_status.stderr)
+    );
+    let graph_stdout = String::from_utf8_lossy(&graph_status.stdout);
+    assert!(graph_stdout.contains("Entities:"), "{graph_stdout}");
+    assert!(
+        graph_stdout.contains("Entity-to-entity relations:"),
+        "{graph_stdout}"
+    );
 }

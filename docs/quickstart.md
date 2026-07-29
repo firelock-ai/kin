@@ -146,10 +146,13 @@ kin init path/to/project
 In a clean detected Git repository, `kin init` imports complete reachable
 history, refs, raw objects, the exact workspace tree, and admission policy into
 graph-owned authority. It also derives the semantic entity and relation layer
-for every supported source in that history, and reports the resulting counts.
-Git stays in place as an explicit interoperability boundary; Kin runtime queries
-do not fall back to it. Repositories with remotes currently fail closed until
-exact Kin remote mapping is available.
+for every supported source in that history, and reports the durable,
+generation-bound counts it committed. Git stays in place as an explicit
+interoperability boundary; Kin runtime queries do not fall back to it.
+Repository-local remote URLs, refspecs, branch tracking, and push defaults that
+Kin can represent safely are sealed into its Git coexistence configuration.
+Unsafe, ambiguous, or unsupported transfer settings fail closed before
+publication.
 
 *Flags:*
 - `--json`: report the exact committed repository/workspace authority result,
@@ -171,8 +174,13 @@ via `KIN_EMBED_MODEL_ID`). You can check coverage at any time:
 
 ```sh
 kin graph status   # "Embeddings: <indexed>/<total> indexed (<pending> pending)"
-kin status --json  # the "semantic_enrichment" block: entity, relation, and change counts
+kin status --json  # durable authority entity/relation/change counts and generations
 ```
+
+These commands intentionally answer for different views. `kin status` reports
+the immutable repository/workspace authority generation it opened.
+`kin graph status` reports the daemon's mutable live query graph, including
+derived runtime enrichment that has not become repository authority.
 
 > Until embedding is complete, `kin search --semantic` and `kin locate` degrade
 > gracefully (vector hits over whatever is already embedded, plus a text fallback) and
