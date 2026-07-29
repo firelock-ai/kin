@@ -13,9 +13,17 @@
 # the parent kin workspace and is built only by the Fuzz CI workflow, never by
 # the standard `cargo build --workspace` / clippy gate. kin-parser is pulled in
 # by path; its `workspace = true` dependency inheritance still resolves from the
-# kin workspace root, so kin-model resolves from the Kin registry exactly as in a
-# normal kin build (Cargo discovers the tracked .cargo/config.toml by walking up
-# from this directory).
+# kin workspace root, so its transitive kin-model comes from the Kin registry at
+# whatever version that root pins (Cargo discovers the tracked .cargo/config.toml
+# by walking up from this directory).
+#
+# Deliberately no direct kin-model dependency. Being a detached workspace, this
+# manifest cannot inherit the root's pin via `workspace = true`, so a version
+# written here is a second, independently-drifting pin: once the root moved to a
+# semver-incompatible kin-model, both versions compiled and the shared
+# `FilePathId` became two distinct types. The targets reach that type through
+# `kin_parser`'s re-export instead, leaving kin-parser as the single edge into
+# the kin dependency graph and the duplicate unrepresentable.
 
 [package]
 name = "kin-parser-fuzz"
@@ -30,7 +38,6 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 kin-parser = { path = "../crates/kin-parser" }
-kin-model = { version = "0.2.1", registry = "kin" }
 
 [workspace]
 
