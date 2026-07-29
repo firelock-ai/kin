@@ -870,7 +870,33 @@ pub fn publish_daemon_endpoint(kin_root: &Path, port: u16) -> std::io::Result<()
     })
 }
 
+/// Publish under an injectable ownership probe, so a test can drive the
+/// indeterminate case that the host's own permissions decide otherwise.
+#[cfg(test)]
+fn publish_daemon_endpoint_with_probe(
+    kin_root: &Path,
+    port: u16,
+    probe: impl FnOnce(&kin_cli::daemon_client::ProcessIdentity) -> std::io::Result<bool>,
+) -> std::io::Result<()> {
+    without_blocking_runtime_worker(|| {
+        let _authority = acquire_singleton_coordination_guard(kin_root)?;
+        publish_daemon_endpoint_under_authority_with_probe(kin_root, port, probe)
+    })
+}
+
 fn publish_daemon_endpoint_under_authority(kin_root: &Path, port: u16) -> std::io::Result<()> {
+    publish_daemon_endpoint_under_authority_with_probe(
+        kin_root,
+        port,
+        kin_cli::daemon_client::process_identity_is_current,
+    )
+}
+
+fn publish_daemon_endpoint_under_authority_with_probe(
+    kin_root: &Path,
+    port: u16,
+    probe: impl FnOnce(&kin_cli::daemon_client::ProcessIdentity) -> std::io::Result<bool>,
+) -> std::io::Result<()> {
     // Port 0 means "the OS will pick one", never "connect here". Publishing it
     // strands every reader on an endpoint nothing can dial, and the daemon that
     // published it keeps refusing successors because it still owns the repo.
@@ -883,7 +909,7 @@ fn publish_daemon_endpoint_under_authority(kin_root: &Path, port: u16) -> std::i
     // A starter that lost the singleton must never reach this, but publication
     // overwrites files by design, so the guarantee is asserted here rather than
     // assumed from the call graph.
-    if let Some(pid) = proven_live_other_endpoint_owner(kin_root) {
+    if let Some(pid) = proven_live_other_endpoint_owner_with_probe(kin_root, probe) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
             format!(
@@ -2169,6 +2195,7 @@ mod tests {
         let _ = incumbent.wait();
     }
 
+    #[cfg(unix)]
     #[test]
     fn an_unreadable_owner_probe_is_not_proof_of_a_live_owner() {
         // The wedge this closes. A daemon is SIGKILLed, so its endpoint and
@@ -2179,14 +2206,23 @@ mod tests {
         // startup, so the repo's daemon could never start again: no sweep
         // clears the record either, because they all preserve what they cannot
         // inspect. Only a human deleting the file recovered it.
+        //
+        // Both the record's owner and the probe are supplied by the test. An
+        // earlier version seeded the record from pid 1 and fell back to this
+        // process's own identity when that could not be read, which made the
+        // outcome depend on whether the host lets you inspect pid 1: on macOS
+        // it passed through the owner-is-self shortcut without touching the
+        // indeterminate path at all, and on Linux pid 1 was readable, so
+        // publication saw a genuinely live owner and correctly refused.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let identity = kin_cli::daemon_client::process_identity(1)
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| {
-                kin_cli::daemon_client::current_process_identity().expect("an identity to reshape")
-            });
+        let mut foreign = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn a stand-in foreign owner");
+        let identity = kin_cli::daemon_client::process_identity(foreign.id())
+            .expect("read the foreign owner's identity")
+            .expect("the foreign owner is running");
         publish_foreign_endpoint_for_test(root, identity, 51234);
 
         let unreadable = |_: &kin_cli::daemon_client::ProcessIdentity| {
@@ -2201,10 +2237,13 @@ mod tests {
             "an unreadable probe is not proof, so it must not block publication"
         );
 
-        publish_daemon_endpoint(root, 4219)
+        publish_daemon_endpoint_with_probe(root, 4219, unreadable)
             .expect("the rightful owner must still be able to advertise itself");
         assert_eq!(endpoint_ownership(root), EndpointOwnership::CurrentProcess);
         assert_eq!(read_port_file(root), Some(4219));
+
+        let _ = foreign.kill();
+        let _ = foreign.wait();
     }
 
     #[cfg(unix)]
