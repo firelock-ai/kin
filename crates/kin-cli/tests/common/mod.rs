@@ -1626,7 +1626,6 @@ fn read_command_capture_pipe(
     pipe: &mut (impl Read + std::os::windows::io::AsRawHandle),
     buffer: &mut [u8],
 ) -> std::io::Result<CommandCaptureRead> {
-    use std::os::windows::io::AsRawHandle as _;
     use windows_sys::Win32::Foundation::{
         ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_PIPE_NOT_CONNECTED,
     };
