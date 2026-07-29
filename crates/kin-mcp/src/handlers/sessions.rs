@@ -566,7 +566,13 @@ pub fn resolve_target_entity<G: GraphStore>(
 /// entity carries no source origin.
 fn candidate_location(entity: &kin_model::Entity) -> String {
     match (entity.file_origin.as_ref(), entity.span.as_ref()) {
-        (Some(file), Some(span)) => format!("{}:{}", file.0, span.start_line),
+        // `file:line` is read straight into an editor, so it carries the 1-based
+        // line rather than the graph's 0-based row.
+        (Some(file), Some(span)) => format!(
+            "{}:{}",
+            file.0,
+            crate::handlers::common::presentation_line(span.start_line)
+        ),
         (Some(file), None) => file.0.clone(),
         (None, _) => "<no source origin>".to_string(),
     }

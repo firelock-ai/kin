@@ -43,6 +43,56 @@ radius — \"if I change this, what else might break?\" — answered from the gr
 call instead of hand-tracing callers. Pair it with semantic_diff (what changed) or use \
 semantic_review when you want diff + impact + risk together in a single report.";
 
+/// The blast-radius buckets of an [`kin_review::ImpactReport`] that serialize as
+/// arrays of raw entities, paired with their key in the response object.
+const IMPACT_ENTITY_BUCKETS: [&str; 4] = [
+    "affected_callers",
+    "affected_dependents",
+    "affected_contract_consumers",
+    "affected_tests",
+];
+
+/// Give every entity in an impact response the same 1-based `start_line` /
+/// `end_line` fields its sibling surfaces emit.
+///
+/// `ImpactReport` holds raw `Entity` values, so serializing it exposes only the
+/// nested `span`, whose rows are the graph's 0-based tree-sitter positions. An
+/// agent reading those numbers to locate an affected caller lands one line above
+/// it. The convention used everywhere else applies here: `span` stays a faithful
+/// serialization of graph truth (its byte offsets are read as offsets), and the
+/// top-level `start_line`/`end_line` carry the editor-ready position.
+fn annotate_impact_presentation_lines(
+    result: &mut serde_json::Value,
+    impact: &kin_review::ImpactReport,
+) {
+    let buckets: [&Vec<kin_model::Entity>; 4] = [
+        &impact.affected_callers,
+        &impact.affected_dependents,
+        &impact.affected_contract_consumers,
+        &impact.affected_tests,
+    ];
+    for (key, entities) in IMPACT_ENTITY_BUCKETS.iter().zip(buckets) {
+        let Some(serde_json::Value::Array(rows)) = result.get_mut(*key) else {
+            continue;
+        };
+        // `to_value` preserves order, so a positional zip stays aligned with the
+        // entities the report actually carries.
+        for (row, entity) in rows.iter_mut().zip(entities) {
+            let Some(object) = row.as_object_mut() else {
+                continue;
+            };
+            object.insert(
+                "start_line".to_string(),
+                serde_json::json!(entity_presentation_start_line(entity)),
+            );
+            object.insert(
+                "end_line".to_string(),
+                serde_json::json!(entity_presentation_end_line(entity)),
+            );
+        }
+    }
+}
+
 pub async fn handle_impact_analysis<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
@@ -56,6 +106,7 @@ pub async fn handle_impact_analysis<G: GraphStore>(
         kin_review::analyze_impact(store, &diff).map_err(|e| McpError::Review(e.to_string()))?;
 
     let mut result = serde_json::to_value(&impact).map_err(McpError::Json)?;
+    annotate_impact_presentation_lines(&mut result, &impact);
 
     if include_traffic {
         // Collect traffic for all changed entities.
@@ -968,6 +1019,94 @@ fn parse_identity_arg(
 mod tests {
     use super::super::tests::with_empty_test_repository;
     use super::*;
+
+    /// Impact rows must locate an affected caller where an editor would.
+    ///
+    /// `ImpactReport` holds raw entities, so serializing it exposed only the
+    /// nested 0-based graph span. An agent reading that to open the caller landed
+    /// one line above it, which is the same off-by-one the other read surfaces
+    /// carried before the presentation seam.
+    #[test]
+    fn impact_rows_carry_one_based_presentation_lines_beside_the_raw_span() {
+        fn caller(name: &str, graph_row: u32) -> kin_model::Entity {
+            let file = kin_model::ids::FilePathId::new("src/consumer.ts");
+            let mut entity = kin_model::Entity {
+                id: kin_model::EntityId::new(),
+                kind: kin_model::EntityKind::Function,
+                name: name.to_string(),
+                language: kin_model::LanguageId::TypeScript,
+                fingerprint: kin_model::entity::SemanticFingerprint {
+                    algorithm: kin_model::entity::FingerprintAlgorithm::V1TreeSitter,
+                    ast_hash: kin_model::Hash256::from_bytes([4; 32]),
+                    signature_hash: kin_model::Hash256::from_bytes([5; 32]),
+                    behavior_hash: kin_model::Hash256::from_bytes([6; 32]),
+                    equivalence_hash: kin_model::Hash256::from_bytes([0; 32]),
+                    stability_score: 1.0,
+                },
+                file_origin: Some(file.clone()),
+                span: None,
+                signature: format!("function {name}(): void"),
+                visibility: kin_model::entity::Visibility::Public,
+                role: kin_model::entity::EntityRole::Source,
+                doc_summary: None,
+                metadata: kin_model::entity::EntityMetadata::default(),
+                lineage_parent: None,
+                created_in: None,
+                superseded_by: None,
+            };
+            entity.span = Some(kin_model::entity::SourceSpan {
+                file,
+                start_byte: 0,
+                end_byte: 20,
+                start_line: graph_row,
+                start_col: 0,
+                end_line: graph_row + 2,
+                end_col: 1,
+            });
+            entity
+        }
+
+        let direct = caller("probe_direct_9ab1", 41);
+        let spanless = {
+            let mut entity = caller("probe_spanless_9ab1", 0);
+            entity.span = None;
+            entity
+        };
+        let report = kin_review::ImpactReport {
+            affected_callers: vec![direct.clone(), spanless.clone()],
+            affected_dependents: vec![],
+            affected_contract_consumers: vec![],
+            affected_tests: vec![],
+            affected_work_items: vec![],
+            affected_annotations: vec![],
+            changed_ids: vec![],
+            unreviewed_agent_changes: vec![],
+            actor_attribution: vec![],
+            entity_impacts: vec![],
+        };
+
+        let mut value = serde_json::to_value(&report).unwrap();
+        annotate_impact_presentation_lines(&mut value, &report);
+        let rows = value["affected_callers"].as_array().unwrap();
+
+        assert_eq!(
+            rows[0]["start_line"], 42,
+            "graph row 41 is line 42: {}",
+            rows[0]
+        );
+        assert_eq!(rows[0]["end_line"], 44);
+        // The raw span is untouched: its byte offsets are read as offsets, so it
+        // stays a faithful serialization of graph truth.
+        assert_eq!(rows[0]["span"]["start_line"], 41);
+        assert_eq!(rows[0]["name"], "probe_direct_9ab1");
+
+        // A spanless entity gets null rather than a fabricated line 1.
+        assert!(
+            rows[1]["start_line"].is_null(),
+            "an entity with no span has no line to report: {}",
+            rows[1]
+        );
+    }
 
     #[test]
     fn parse_review_create_scopes_accepts_uuid_and_paths() {

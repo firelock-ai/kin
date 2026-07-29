@@ -1884,7 +1884,9 @@ mod tests {
                 "every candidate id must be re-targetable: {error}"
             );
         }
-        assert!(error.contains("src/cli/host.ts:40"), "{error}");
+        // `file:line` is pasted into an editor, so the candidate list carries the
+        // 1-based line: the fixture's graph row 40 is line 41.
+        assert!(error.contains("src/cli/host.ts:41"), "{error}");
         assert!(
             !error.contains(&unrelated.id.to_string()),
             "only exact-name matches are candidates: {error}"
@@ -2120,6 +2122,417 @@ mod tests {
             object.get("stale").map(|v| v.is_boolean()).unwrap_or(false),
             "focal payload must include a boolean stale flag"
         );
+    }
+
+    /// The one number an agent acts on must be the number an editor shows.
+    ///
+    /// Every surface below reads the SAME entity, whose span starts at graph row
+    /// 0, so each must report line 1. Pinning them together is the point: the
+    /// defect this replaces was not any single wrong number but two conventions
+    /// living in one response set, where `get_entity` and `find_references`
+    /// disagreed about where the same function starts.
+    #[test]
+    fn every_read_surface_reports_the_same_one_based_start_line() {
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let content = "export function validate_probe_range_1d8f8275(value: number, minVal: number, maxVal: number): boolean {\n  return value <= maxVal;\n}\n";
+        let source = make_source_backed_entity(content);
+        let entity = &source.entity;
+        assert_eq!(
+            entity.span.as_ref().unwrap().start_line,
+            0,
+            "fixture states graph truth: the entity begins on the file's first line, row 0"
+        );
+
+        let mut store = EmptyStore::default();
+        store.entities_by_id.insert(entity.id, entity.clone());
+        store
+            .file_hashes
+            .insert(entity.file_origin.clone().unwrap(), source.hash);
+        install_empty_store_exact_tree(&mut store, source._dir.path());
+        let authority = test_repository_authority(source._dir.path());
+
+        let entity_json = entity_response_json(&store, entity, Some(&authority)).unwrap();
+        assert_eq!(
+            entity_json["start_line"], 1,
+            "get_entity must present row 0 as line 1"
+        );
+
+        let entry = kin_model::ContextEntry {
+            entity_id: entity.id,
+            projection_level: kin_model::ProjectionLevel::FullBody,
+            content: entity.signature.clone(),
+        };
+        let focal = focal_context_json(&store, &entry, entity, false, Some(&authority)).unwrap();
+        assert_eq!(
+            focal["start_line"], 1,
+            "get_context_pack focal must agree with get_entity"
+        );
+
+        let summary = serde_json::to_value(SemanticSearchResult::from(entity.clone())).unwrap();
+        assert_eq!(
+            summary["start_line"], 1,
+            "semantic_search must agree with get_entity"
+        );
+
+        // The raw graph span rides along untouched. It is a faithful
+        // serialization of graph truth, and its byte offsets are read as offsets,
+        // so presentation lives in the sibling fields rather than by rewriting it.
+        assert_eq!(
+            entity_json["span"]["start_line"], 0,
+            "the nested span stays graph truth"
+        );
+    }
+
+    /// `find_references` must answer "where is this used" with graph facts, not
+    /// with a base position an agent has to count forward from.
+    #[test]
+    fn find_references_rows_carry_graph_owned_snippets_and_one_based_site_lines() {
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let caller_body = "export function probe_caller_4b21e0(): boolean {\n  // padding\n  return validate_probe_range_1d8f8275(1, 0, 2);\n}\n";
+        let target = make_source_backed_entity(
+            "export function validate_probe_range_1d8f8275(value: number, minVal: number, maxVal: number): boolean {\n  return value <= maxVal;\n}\n",
+        );
+
+        // The caller lives in the same graph-owned repository as the target, with
+        // its body in the same blob store, so its snippet is a graph read.
+        let caller_file = FilePathId::new("caller.ts");
+        let blob_store =
+            kin_blobs::BlobStore::new(target._dir.path().join(".kin").join("objects")).unwrap();
+        let caller_hash = model_blob_hash(&blob_store, caller_body.as_bytes());
+        let mut caller = target.entity.clone();
+        caller.id = EntityId::new();
+        caller.name = "probe_caller_4b21e0".into();
+        caller.signature = "export function probe_caller_4b21e0(): boolean".into();
+        caller.file_origin = Some(caller_file.clone());
+        caller.span = Some(kin_model::entity::SourceSpan {
+            file: caller_file.clone(),
+            start_byte: 0,
+            end_byte: caller_body.len(),
+            start_line: 0,
+            start_col: 0,
+            end_line: 3,
+            end_col: 1,
+        });
+
+        let mut store = EmptyStore::default();
+        store
+            .entities_by_id
+            .insert(target.entity.id, target.entity.clone());
+        store.entities_by_id.insert(caller.id, caller.clone());
+        store
+            .file_hashes
+            .insert(target.entity.file_origin.clone().unwrap(), target.hash);
+        store.file_hashes.insert(caller_file.clone(), caller_hash);
+
+        // The call sits on the third line of the caller, graph row 2.
+        let call_site_row = 2;
+        let relation = Relation {
+            id: RelationId::new(),
+            kind: RelationKind::Calls,
+            src: kin_model::GraphNodeId::Entity(caller.id),
+            dst: kin_model::GraphNodeId::Entity(target.entity.id),
+            confidence: 1.0,
+            origin: kin_model::relation::RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+            evidence: vec![kin_model::relation::RelationEvidence {
+                source_span: Some(kin_model::entity::SourceSpan {
+                    file: caller_file,
+                    start_byte: 63,
+                    end_byte: 105,
+                    start_line: call_site_row,
+                    start_col: 2,
+                    end_line: call_site_row,
+                    end_col: 44,
+                }),
+                parser_rule: Some("call_expression".into()),
+                token: Some("validate_probe_range_1d8f8275".into()),
+                source_path: None,
+                resolved_path: None,
+                occurrence_count: 1,
+                call_shape: None,
+            }],
+        };
+        store
+            .relations_by_entity
+            .entry(target.entity.id)
+            .or_default()
+            .push(relation);
+
+        install_empty_store_exact_tree(&mut store, target._dir.path());
+        let authority = test_repository_authority(target._dir.path());
+
+        let rows = collect_graph_reference_rows(
+            &store,
+            &target.entity.id,
+            &[RelationKind::Calls],
+            Some(&authority),
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 1, "one caller, one row: {rows:?}");
+        let row = &rows[0];
+
+        // The caller's body arrives with the reference, so an agent never has to
+        // resolve the id back to a body to read the usage in context.
+        let snippet = row
+            .snippet
+            .as_deref()
+            .expect("a graph-owned caller body must produce a snippet, never null");
+        assert!(
+            snippet.contains("validate_probe_range_1d8f8275(1, 0, 2)"),
+            "snippet must be the caller's real source: {snippet}"
+        );
+
+        assert_eq!(
+            row.start_line,
+            Some(1),
+            "the caller's definition starts on line 1"
+        );
+        assert_eq!(
+            row.reference_lines,
+            vec![call_site_row + 1],
+            "the call site is served as a graph fact at its own 1-based line"
+        );
+    }
+
+    /// A context pack's focal body must be the same bytes a direct body read
+    /// serves. When it silently diverged, an agent asked to modify the entity saw
+    /// a signature stub and either refused or guessed.
+    #[test]
+    fn context_pack_focal_body_matches_the_direct_entity_source_read() {
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let content = "export function validate_probe_range_1d8f8275(value: number, minVal: number, maxVal: number): boolean {\n  if (value < minVal) {\n    return false;\n  }\n  return value <= maxVal;\n}\n";
+        let source = make_source_backed_entity(content);
+        let entity = &source.entity;
+
+        let mut store = EmptyStore::default();
+        store.entities_by_id.insert(entity.id, entity.clone());
+        store
+            .file_hashes
+            .insert(entity.file_origin.clone().unwrap(), source.hash);
+        install_empty_store_exact_tree(&mut store, source._dir.path());
+        let authority = test_repository_authority(source._dir.path());
+
+        // Sibling surface: the direct body read an agent would fall back to.
+        let direct = tool_result_json(
+            entities::handle_get_entity_source(
+                &HashMap::from([("entity_id".into(), serde_json::json!(entity.id.to_string()))]),
+                &store,
+                Some(&authority),
+            )
+            .unwrap(),
+        );
+        let direct_body = direct["body"].as_str().expect("direct read serves a body");
+
+        let entry = kin_model::ContextEntry {
+            entity_id: entity.id,
+            projection_level: kin_model::ProjectionLevel::FullBody,
+            content: project_full_body_stub(entity),
+        };
+        let focal = focal_context_json(&store, &entry, entity, false, Some(&authority)).unwrap();
+        let focal_body = focal["body"]
+            .as_str()
+            .expect("focal body must be a string, never null, when the graph has the source");
+
+        assert_eq!(
+            focal_body, direct_body,
+            "the context pack and the direct read must serve one body"
+        );
+        assert!(focal_body.contains("return value <= maxVal;"));
+        assert_eq!(focal["source"], "graph");
+        assert!(
+            focal.get("body_unavailable").is_none(),
+            "no gap is reported when the body was served"
+        );
+        // The regression this pins: the pack's own token-accounting stub must
+        // never surface as the body.
+        assert_ne!(focal_body, entry.content);
+        assert!(
+            !focal_body.starts_with("// validate_probe_range_1d8f8275 (Function"),
+            "a synthesized comment header is not a body: {focal_body}"
+        );
+    }
+
+    /// An entity with no source coordinates has no body, and the response says
+    /// so instead of substituting text that looks like one.
+    #[test]
+    fn context_pack_reports_a_body_gap_rather_than_a_synthesized_body() {
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let source = make_source_backed_entity(
+            "export function validate_probe_range_1d8f8275(): boolean {\n  return true;\n}\n",
+        );
+        // A declaration the graph knows by signature only: no span, so no bytes.
+        let mut spanless = source.entity.clone();
+        spanless.span = None;
+
+        let mut store = EmptyStore::default();
+        store.entities_by_id.insert(spanless.id, spanless.clone());
+        // The repository is otherwise coherent: the file is admitted and its blob
+        // is present. Only the entity's span is missing, so the gap being tested
+        // is the entity's own, not a broken repository.
+        store
+            .file_hashes
+            .insert(source.entity.file_origin.clone().unwrap(), source.hash);
+        install_empty_store_exact_tree(&mut store, source._dir.path());
+        let authority = test_repository_authority(source._dir.path());
+
+        let entry = kin_model::ContextEntry {
+            entity_id: spanless.id,
+            projection_level: kin_model::ProjectionLevel::FullBody,
+            content: project_full_body_stub(&spanless),
+        };
+        let focal = focal_context_json(&store, &entry, &spanless, false, Some(&authority)).unwrap();
+
+        assert!(
+            focal["body"].is_null(),
+            "an unavailable body is null, not a stub: {}",
+            focal["body"]
+        );
+        let reason = focal["body_unavailable"]
+            .as_str()
+            .expect("a null body must be explained");
+        assert!(
+            reason.contains("no source span"),
+            "the reason must name the missing coordinate: {reason}"
+        );
+        assert!(
+            focal["start_line"].is_null(),
+            "a spanless entity has no line to report"
+        );
+    }
+
+    /// After a committed transaction moves an entity, the read surfaces must
+    /// report where it is NOW. Serving the pre-commit position made agents
+    /// "correct" right line numbers into wrong ones.
+    #[test]
+    fn committed_span_shift_updates_the_reported_start_line_and_body() {
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let before = "export function validate_probe_range_1d8f8275(value: number): boolean {\n  return value > 0;\n}\n";
+        let source = make_source_backed_entity(before);
+        let entity = &source.entity;
+
+        let mut store = EmptyStore::default();
+        store.entities_by_id.insert(entity.id, entity.clone());
+        store
+            .file_hashes
+            .insert(entity.file_origin.clone().unwrap(), source.hash);
+        install_empty_store_exact_tree(&mut store, source._dir.path());
+        let first_head = *store.changes_by_id.keys().next().unwrap();
+        let authority = test_repository_authority(source._dir.path());
+
+        assert_eq!(
+            entity_response_json(&store, entity, Some(&authority)).unwrap()["start_line"],
+            1,
+            "before the commit the entity begins on line 1"
+        );
+
+        // Commit a change that prepends two lines to the file and shifts the
+        // entity down, exactly the shape that produced stale line reasoning.
+        let after = "// added header\n// added header\nexport function validate_probe_range_1d8f8275(value: number, searchDirs: string[]): boolean {\n  return value > 0;\n}\n";
+        let blob_store =
+            kin_blobs::BlobStore::new(source._dir.path().join(".kin").join("objects")).unwrap();
+        let after_hash = model_blob_hash(&blob_store, after.as_bytes());
+        let file_id = entity.file_origin.clone().unwrap();
+        let path = kin_model::RepoPath::from_utf8(file_id.0.clone()).unwrap();
+        let entity_start = after.find("export function").unwrap();
+
+        let mut moved = entity.clone();
+        moved.signature =
+            "export function validate_probe_range_1d8f8275(value: number, searchDirs: string[]): boolean"
+                .into();
+        moved.span = Some(kin_model::entity::SourceSpan {
+            file: file_id,
+            start_byte: entity_start,
+            end_byte: after.len(),
+            // Two prepended lines put the definition on graph row 2.
+            start_line: 2,
+            start_col: 0,
+            end_line: 4,
+            end_col: 1,
+        });
+
+        // The bootstrap mints its own artifact ids, so the update has to name the
+        // identity that actually occupies the path rather than the fixture's.
+        let admitted = super::repository_authority::ActiveRepositoryAuthority::open(&authority)
+            .unwrap()
+            .workspace()
+            .unwrap()
+            .tree
+            .artifact_at_path(&path)
+            .cloned()
+            .expect("the bootstrap admitted the entity's file");
+        let old_entry = kin_model::LocatedEntry::new(path.clone(), admitted.entry.clone());
+        let new_entry =
+            kin_model::LocatedEntry::new(path, kin_model::TreeEntry::blob(after_hash, false));
+        let shift = exact_test_change(
+            vec![first_head],
+            "add a parameter and shift the definition down",
+            vec![kin_model::EntityDelta::Modified {
+                old: entity.clone(),
+                new: moved.clone(),
+            }],
+            vec![kin_model::TreeDelta::Updated {
+                artifact_id: admitted.artifact_id,
+                old: old_entry,
+                new: new_entry,
+            }],
+        );
+        store.changes_by_id.insert(shift.id, shift.clone());
+        store.entities_by_id.insert(moved.id, moved.clone());
+        advance_test_repository(source._dir.path(), &shift);
+
+        // The live graph now holds the moved entity, and the committed workspace
+        // holds the new bytes. Every surface must agree on the new position.
+        let after_json = entity_response_json(&store, &moved, Some(&authority)).unwrap();
+        assert_eq!(
+            after_json["start_line"], 3,
+            "graph row 2 after the shift is line 3: {after_json}"
+        );
+        assert_eq!(after_json["source"], "graph");
+        let excerpt = after_json["source_excerpt"].as_str().unwrap();
+        assert!(
+            excerpt.contains("searchDirs: string[]"),
+            "the body must be the post-commit source: {excerpt}"
+        );
+
+        let entry = kin_model::ContextEntry {
+            entity_id: moved.id,
+            projection_level: kin_model::ProjectionLevel::FullBody,
+            content: project_full_body_stub(&moved),
+        };
+        let focal = focal_context_json(&store, &entry, &moved, false, Some(&authority)).unwrap();
+        assert_eq!(
+            focal["start_line"], 3,
+            "the context pack must not serve the pre-commit position"
+        );
+        assert!(focal["body"]
+            .as_str()
+            .expect("a committed body is readable")
+            .contains("searchDirs: string[]"));
+    }
+
+    /// Stand-in for the context builder's token-accounting projection, so the
+    /// tests above assert against the exact text that used to leak into `body`.
+    fn project_full_body_stub(entity: &Entity) -> String {
+        format!(
+            "// {} ({:?}, {})\n{}\n",
+            entity.name, entity.kind, entity.language, entity.signature
+        )
     }
 
     #[test]

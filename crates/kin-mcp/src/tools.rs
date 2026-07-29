@@ -165,7 +165,7 @@ pub fn tool_definitions() -> ToolsListResult {
                         },
                         "include_snippet": {
                             "type": "boolean",
-                            "description": "Attach a bounded inline source snippet to each entity hit",
+                            "description": "Attach a bounded inline source snippet to each entity hit, projected from graph-owned content. Read it from the hit's `snippet` field (the fused pipeline also carries the same text as `body` for locate-schema parity). Entity granularity only: a file hit has no single entity body. A hit with no graph-owned body carries no snippet rather than a placeholder.",
                             "default": true
                         },
                         "pipeline": {

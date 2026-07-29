@@ -5747,8 +5747,10 @@ fn build_semantic_locate_result(
             "match_evidence": match_evidence,
         });
         if let Some(span) = span {
-            hit["start_line"] = json!(span.start_line);
-            hit["end_line"] = json!(span.end_line);
+            let (start_line, end_line) =
+                kin_mcp::handlers::common::presentation_span_lines(span);
+            hit["start_line"] = json!(start_line);
+            hit["end_line"] = json!(end_line);
         }
         if let Some(snippet) = snippet {
             hit["snippet"] = json!(snippet);
@@ -5844,6 +5846,17 @@ fn fused_semantic_locate_payload(
                     "match_evidence".to_string(),
                     fused_match_evidence(query, entity),
                 );
+                // The two `semantic_locate` arms carried the same graph-owned
+                // excerpt under different names: the cosine arm called it
+                // `snippet`, the fused arm `body`. An agent that set
+                // `include_snippet` and looked for `snippet` therefore found no
+                // snippet key at all on whichever arm its profile happened to
+                // serve. Mirror the field so `include_snippet` means one thing on
+                // both arms, and keep `body` for the locate-schema parity that
+                // consumers of `kin locate --json` already parse.
+                if let Some(body) = entity.body.as_ref() {
+                    map.insert("snippet".to_string(), json!(body));
+                }
             }
         }
     }
@@ -5973,10 +5986,14 @@ async fn build_fused_semantic_locate_result(
         // (returns page 0) rather than silently failing the page.
     }
 
+    // `entities[]` is the graph-native surface this tool answers with, so it is
+    // projected either way. Only the body text follows `include_snippet`. The
+    // default options would switch the whole projection off, which turned "omit
+    // snippets" into "omit the results".
     let snippet_opts = if include_snippet {
         kin_cli::commands::locate::SnippetOptions::enabled(None)
     } else {
-        kin_cli::commands::locate::SnippetOptions::default()
+        kin_cli::commands::locate::SnippetOptions::enabled(None).without_bodies()
     };
 
     // Multi-query fan-out: `query` plus any additional `queries` variants,
@@ -21795,6 +21812,88 @@ mod tests {
         );
         assert!(hit["score"].as_f64().is_some());
         assert!(hit["kind"].as_str().is_some());
+    }
+
+    /// `include_snippet` is one contract, and the field it fills must be named
+    /// the same on whichever arm the daemon's profile happens to serve.
+    ///
+    /// The two arms previously disagreed: the cosine arm wrote `snippet`, the
+    /// fused arm wrote `body`. An agent that asked for a snippet and read
+    /// `snippet` therefore found no snippet key at all under the fused profile,
+    /// which closed the one in-profile path to source text it had.
+    #[tokio::test]
+    async fn mcp_semantic_locate_serves_snippets_under_one_field_name_on_both_arms() {
+        let state = test_state();
+        let source = "def parse_config(path):\n    return {\"path\": path}\n";
+        install_repository_file(&state, "src/config.py", source.as_bytes());
+        install_working_copy_file(&state, "src/config.py", source.as_bytes(), false);
+
+        // An entity whose span actually covers its body, so a snippet is
+        // projectable from graph-owned bytes.
+        let mut entity = test_entity("parse_config", "src/config.py");
+        entity.span = Some(SourceSpan {
+            file: kin_model::FilePathId::new("src/config.py"),
+            start_byte: 0,
+            end_byte: source.len(),
+            start_line: 0,
+            start_col: 0,
+            end_line: 1,
+            end_col: 24,
+        });
+        // Parse time sets this preview from the node's source bytes, and the fused
+        // ranker reads it to decide an entity is a definition rather than a bare
+        // reference. Only definitions get bodies, so a fixture without it would be
+        // testing the reference path.
+        entity.metadata.extra.insert(
+            "embedding_body_preview".to_string(),
+            json!(source.lines().next().unwrap()),
+        );
+        state.graph.upsert_entity(&entity).unwrap();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let app = router(state);
+
+        let fused = call_semantic_locate(
+            app.clone(),
+            json!({
+                "query": "parse config",
+                "limit": 5,
+                "pipeline": "fused",
+                "include_snippet": true
+            }),
+        )
+        .await;
+        let hits = fused["entities"].as_array().unwrap();
+        assert!(!hits.is_empty(), "expected a fused hit: {fused}");
+        let snippet = hits[0]["snippet"]
+            .as_str()
+            .unwrap_or_else(|| panic!("fused hit must carry a `snippet` key: {}", hits[0]));
+        assert!(
+            snippet.contains("return {\"path\": path}"),
+            "the snippet must be the entity's graph-owned source: {snippet}"
+        );
+        // `body` stays for the locate-schema parity consumers already parse.
+        assert_eq!(hits[0]["body"].as_str(), Some(snippet));
+
+        // Suppression is honored, not ignored: no snippet key when opted out.
+        let suppressed = call_semantic_locate(
+            app,
+            json!({
+                "query": "parse config",
+                "limit": 5,
+                "pipeline": "fused",
+                "include_snippet": false
+            }),
+        )
+        .await;
+        let suppressed_hits = suppressed["entities"].as_array().unwrap();
+        assert!(!suppressed_hits.is_empty());
+        assert!(
+            suppressed_hits[0].get("snippet").is_none(),
+            "include_snippet:false must suppress the snippet: {}",
+            suppressed_hits[0]
+        );
     }
 
     // The legacy cosine ranking stays reachable per-call, independent of the

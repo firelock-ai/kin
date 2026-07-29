@@ -305,8 +305,17 @@ pub fn entity_page_size() -> usize {
 /// `semantic_locate` hits alike) and are env-overridable.
 #[derive(Clone, Copy, Debug)]
 pub struct SnippetOptions {
-    /// Whether to project snippets at all.
+    /// Whether this is the agent/JSON surface. Gates BOTH the inline snippet
+    /// projection and the graph-native `entities[]` re-projection, so the
+    /// human/in-process path stays coordinates-only.
     pub enabled: bool,
+    /// Whether the projected surfaces carry body text.
+    ///
+    /// Separate from `enabled` because they answer different questions: whether
+    /// the graph-native entity surface exists at all, and whether its hits carry
+    /// source. Collapsing them meant an agent asking to omit snippets lost the
+    /// entire `entities[]` array with them, which is the surface it was reading.
+    pub bodies: bool,
     /// Max snippet lines per symbol (signature + first body lines).
     pub max_lines: usize,
     /// Hard char cap per snippet.
@@ -323,6 +332,7 @@ impl Default for SnippetOptions {
     fn default() -> Self {
         Self {
             enabled: false,
+            bodies: false,
             max_lines: kin_mcp::handlers::common::RETRIEVAL_SNIPPET_MAX_LINES,
             max_chars: kin_mcp::handlers::common::RETRIEVAL_SNIPPET_MAX_CHARS,
             max_symbols_per_file: DEFAULT_SNIPPET_SYMBOLS,
@@ -342,6 +352,7 @@ impl SnippetOptions {
             .clamp(1, 200);
         Self {
             enabled: true,
+            bodies: true,
             max_lines: lines,
             max_chars: locate_env_usize("KIN_LOCATE_SNIPPET_CHARS", base.max_chars).clamp(1, 8000),
             max_symbols_per_file: locate_env_usize(
@@ -350,6 +361,16 @@ impl SnippetOptions {
             )
             .clamp(1, 50),
         }
+    }
+
+    /// The agent/JSON surface with body text omitted.
+    ///
+    /// What `include_snippet: false` means: still project the graph-native
+    /// `entities[]` ranking, just without source bodies. Dropping the ranking
+    /// too would answer a request to save tokens by removing the results.
+    pub fn without_bodies(mut self) -> Self {
+        self.bodies = false;
+        self
     }
 }
 
@@ -15194,7 +15215,7 @@ pub fn attach_snippets(
     repository_authority: Option<&kin_core::LocalRepositoryAuthorityBinding>,
     source_scope: kin_mcp::handlers::common::EntitySourceScope,
 ) -> Result<()> {
-    if !opts.enabled {
+    if !opts.enabled || !opts.bodies {
         return Ok(());
     }
     for file in result.files.iter_mut() {
@@ -15348,7 +15369,9 @@ pub fn build_entity_view(
             }
             // Bodies belong to definitions; references/re-exports stay
             // coordinates-only (the symbol already reused its snippet, if any).
-            let body = if sym.definition {
+            // With bodies off, the hit keeps its coordinates and the ranking is
+            // still projected.
+            let body = if opts.bodies && sym.definition {
                 bounded_entity_body_with_note(
                     graph,
                     entity,
@@ -16685,6 +16708,33 @@ mod tests {
             result.entities.is_empty(),
             "disabled snippet opts must leave the entity surface untouched"
         );
+    }
+
+    /// Omitting bodies must not omit the ranking.
+    ///
+    /// `enabled` selects the agent/JSON surface and `bodies` selects whether its
+    /// hits carry source. One flag used to do both, so `include_snippet: false`
+    /// silently returned zero entities: an agent economizing on tokens lost the
+    /// results instead of the snippets.
+    #[test]
+    fn without_bodies_keeps_the_entity_surface_and_drops_only_source_text() {
+        let opts = SnippetOptions::enabled(None);
+        assert!(opts.enabled && opts.bodies);
+
+        let lean = SnippetOptions::enabled(None).without_bodies();
+        assert!(
+            lean.enabled,
+            "the agent/JSON surface stays selected, so entities are still projected"
+        );
+        assert!(!lean.bodies, "only body text is dropped");
+        // The bounds are untouched: nothing about paging or caps changes.
+        assert_eq!(lean.max_lines, opts.max_lines);
+        assert_eq!(lean.max_chars, opts.max_chars);
+        assert_eq!(lean.max_symbols_per_file, opts.max_symbols_per_file);
+
+        // The human/in-process default is unchanged: no surface, no bodies.
+        let human = SnippetOptions::default();
+        assert!(!human.enabled && !human.bodies);
     }
 
     #[test]
