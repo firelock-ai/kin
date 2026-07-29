@@ -19,7 +19,7 @@ use anyhow::{Context, Result};
 use kin_model::{
     Hash256, RefName, RefTarget, RepositoryId, RootBundle, WorkspaceHead, WorkspaceId,
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use super::repository_authority::ActiveRepositoryAuthority;
 
@@ -27,6 +27,19 @@ use super::repository_authority::ActiveRepositoryAuthority;
 /// exact authority/workspace generations. The earlier, unreleased v1 shape
 /// carried counts with different semantics and cannot be inferred truthfully.
 pub const STATUS_SCHEMA: &str = "kin.status.v2";
+
+fn deserialize_status_schema<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let schema = String::deserialize(deserializer)?;
+    if schema != STATUS_SCHEMA {
+        return Err(serde::de::Error::custom(format!(
+            "unsupported status schema '{schema}', expected '{STATUS_SCHEMA}'"
+        )));
+    }
+    Ok(schema)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -132,6 +145,7 @@ pub struct WorkspaceStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StatusReport {
+    #[serde(deserialize_with = "deserialize_status_schema")]
     pub schema: String,
     pub authority: String,
     pub repo_root: PathBuf,
@@ -366,21 +380,22 @@ mod tests {
 
     #[test]
     fn unreleased_v1_enrichment_is_not_silently_reinterpreted_as_v2() {
-        let legacy = serde_json::json!({
-            "presence": "present",
-            "entity_count": 7,
-            "relation_count": 4,
-            "semantic_change_count": 2,
-            "completion_attested": false
-        });
+        let root = tempfile::tempdir().unwrap();
+        let init = kin_core::init(root.path()).unwrap();
+        let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&init.layout).unwrap();
+        let report = inspect(&init.layout, &binding).unwrap();
+        let mut legacy = serde_json::to_value(report).unwrap();
+        legacy["schema"] = serde_json::Value::String("kin.status.v1".to_string());
 
-        let error = serde_json::from_value::<SemanticEnrichmentStatus>(legacy)
-            .expect_err("v1 counts have no durable-view or generation proof");
+        let error = serde_json::from_value::<StatusReport>(legacy)
+            .expect_err("a complete late-v1 daemon response must be rejected by schema");
 
         assert_eq!(STATUS_SCHEMA, "kin.status.v2");
         assert!(
-            error.to_string().contains("missing field `view`"),
-            "v1 must fail explicitly instead of inferring v2 semantics: {error}"
+            error
+                .to_string()
+                .contains("unsupported status schema 'kin.status.v1'"),
+            "v1 must fail explicitly even when every v2 payload field is present: {error}"
         );
     }
 
