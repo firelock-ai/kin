@@ -2,7 +2,9 @@
 // Copyright 2026 Firelock, LLC
 
 use anyhow::{Context, Result};
-use kin_model::{EntityId, EntityStore, GraphNodeId, GraphStore, RelationKind};
+use kin_model::{
+    EntityId, EntityKind, EntityRole, EntityStore, GraphNodeId, GraphStore, RelationKind,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::commands::search::{
@@ -129,26 +131,86 @@ async fn run_daemon_dead_code_seeded(
 pub fn build_dead_code_response(graph: &kin_db::InMemoryGraph) -> Result<DeadCodeResponse> {
     let mut lines = vec!["Scanning for dead code...".to_string()];
 
-    let dead = graph.find_dead_code()?;
-    if dead.is_empty() {
-        lines.push("No dead code found.".to_string());
-    } else {
-        lines.push(format!("Found {} unreferenced entities:", dead.len()));
-        for e in &dead {
-            lines.push(format!(
-                "  {} ({:?}, {}) - {}",
-                e.name,
-                e.kind,
-                e.language,
-                e.file_origin
-                    .as_ref()
-                    .map(|f| f.to_string())
-                    .unwrap_or_else(|| "unknown".to_string())
-            ));
+    // A missing incoming edge is only evidence of deadness for an entity whose
+    // callers would have produced one. A test is invoked by its harness and a
+    // trait method is invoked through the trait, so neither is named by any
+    // edge, and reporting both as unreferenced buries the genuine finds. Both
+    // exclusions are read off graph truth, and the counts stay in the output so
+    // the scan never quietly shrinks its own number.
+    let mut unreferenced = Vec::new();
+    let mut nonproduction = 0usize;
+    let mut trait_satisfying = 0usize;
+    for entity in graph.find_dead_code()? {
+        if entity.role != EntityRole::Source {
+            nonproduction += 1;
+        } else if entity.kind == EntityKind::Method && satisfies_trait_contract(graph, &entity.id)?
+        {
+            trait_satisfying += 1;
+        } else {
+            unreferenced.push(entity);
         }
     }
 
+    // The scan reads a randomly seeded hash map in parallel, so without an
+    // explicit order the same repository lists its findings differently on every
+    // run and two scans cannot be diffed against each other.
+    unreferenced.sort_by(|left, right| {
+        let file_of = |entity: &kin_model::Entity| {
+            entity
+                .file_origin
+                .as_ref()
+                .map(|file| file.to_string())
+                .unwrap_or_default()
+        };
+        file_of(left)
+            .cmp(&file_of(right))
+            .then_with(|| left.name.cmp(&right.name))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+
+    if unreferenced.is_empty() {
+        lines.push("No dead code found.".to_string());
+    } else {
+        lines.push(format!(
+            "Found {} unreferenced entities:",
+            unreferenced.len()
+        ));
+    }
+    if nonproduction > 0 || trait_satisfying > 0 {
+        lines.push(format!(
+            "  ({nonproduction} excluded as non-production entities, {trait_satisfying} as trait-implementation methods reached through their trait)"
+        ));
+    }
+    for e in &unreferenced {
+        lines.push(format!(
+            "  {} ({:?}, {}) - {}",
+            e.name,
+            e.kind,
+            e.language,
+            e.file_origin
+                .as_ref()
+                .map(|f| f.to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        ));
+    }
+
     Ok(DeadCodeResponse { lines })
+}
+
+/// Whether the entity declares that it satisfies a trait contract.
+///
+/// Ingestion records an `Implements` edge from a method declared in a trait
+/// implementation to the trait it satisfies. A call through the trait names the
+/// trait, never the implementation, so this edge is the only thing standing
+/// between a dispatch-reached method and a dead-code report.
+fn satisfies_trait_contract(graph: &impl GraphStore, entity_id: &EntityId) -> Result<bool> {
+    Ok(graph
+        .get_all_relations_for_entity(entity_id)?
+        .into_iter()
+        .any(|relation| {
+            relation.kind == RelationKind::Implements
+                && relation.src == GraphNodeId::Entity(*entity_id)
+        }))
 }
 
 /// Build a seeded dead-code response: semantic_search(query) → top N candidates,
@@ -436,6 +498,77 @@ mod tests {
         let live_row = &response.candidates[live_idx];
         assert_eq!(live_row.reference_count, 1);
         assert!(!live_row.dead);
+    }
+
+    #[test]
+    fn scan_excludes_tests_and_trait_methods_and_says_how_many() {
+        let graph = InMemoryGraph::new();
+
+        let orphan = make_entity("never_called", "src/orphan.rs");
+
+        let mut harness_test = make_entity("checks_never_called", "src/orphan.rs");
+        harness_test.role = EntityRole::Test;
+
+        let mut dispatched = make_entity("Summary::matched", "src/summary.rs");
+        dispatched.kind = EntityKind::Method;
+
+        let mut inherent = make_entity("Summary::helper", "src/summary.rs");
+        inherent.kind = EntityKind::Method;
+
+        let mut sink = make_entity("Sink", "src/sink.rs");
+        sink.kind = EntityKind::TraitDef;
+
+        for entity in [&orphan, &harness_test, &dispatched, &inherent, &sink] {
+            graph.upsert_entity(entity).unwrap();
+        }
+        graph
+            .upsert_relation(&make_relation(
+                dispatched.id,
+                sink.id,
+                RelationKind::Implements,
+            ))
+            .unwrap();
+
+        let lines = build_dead_code_response(&graph).unwrap().lines;
+        let joined = lines.join("\n");
+
+        assert!(
+            joined.contains("Found 2 unreferenced entities:"),
+            "only the orphan and the inherent method are unreferenced: {joined}"
+        );
+        assert!(
+            joined.contains("never_called"),
+            "a function nothing calls is still reported: {joined}"
+        );
+        assert!(
+            joined.contains("Summary::helper"),
+            "an inherent method nothing calls is still reported: {joined}"
+        );
+        assert!(
+            !joined.contains("checks_never_called"),
+            "the harness invokes a test with no edge to record: {joined}"
+        );
+        assert!(
+            !joined.contains("Summary::matched"),
+            "a call through the trait never names the implementation: {joined}"
+        );
+        assert!(
+            joined.contains("1 excluded as non-production entities, 1 as trait-implementation"),
+            "the scan reports what it set aside: {joined}"
+        );
+
+        let orphan_line = lines
+            .iter()
+            .position(|line| line.contains("never_called"))
+            .unwrap();
+        let helper_line = lines
+            .iter()
+            .position(|line| line.contains("Summary::helper"))
+            .unwrap();
+        assert!(
+            orphan_line < helper_line,
+            "findings order by file so two scans of one repo can be diffed: {joined}"
+        );
     }
 
     #[test]

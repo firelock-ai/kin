@@ -326,6 +326,23 @@ fn extract_rust_node(
                                 span: span_from_node(&member, file_id),
                             });
                             extract_calls_from_context(&member, source, &qualified, relations);
+                            // A method declared in `impl Trait for Type` satisfies
+                            // the trait's contract, so a caller holding the trait
+                            // reaches it without any edge naming the method. Only
+                            // the implementing type carried that fact before, which
+                            // left no way to tell a trait method apart from an
+                            // inherent one that nothing calls.
+                            if let Some(ref trait_n) = trait_name {
+                                if !trait_n.is_empty() {
+                                    relations.push(ExtractedRelation {
+                                        call_shape: None,
+                                        kind: kin_model::RelationKind::Implements,
+                                        src_name: qualified.clone(),
+                                        dst_name: trait_n.clone(),
+                                        import_source: None,
+                                    });
+                                }
+                            }
                             if !type_name.is_empty() {
                                 relations.push(ExtractedRelation {
                                     call_shape: None,
@@ -1505,5 +1522,51 @@ mod handlers {
 
         assert!(entity_names(&out, EntityKind::Module).contains(&"other"));
         assert!(call_edges(&out).contains(&("top", "local")));
+    }
+
+    #[test]
+    fn trait_impl_methods_declare_the_trait_they_satisfy() {
+        let adapter = RustAdapter;
+        let source = br#"
+pub struct Summary;
+
+impl Sink for Summary {
+    fn matched(&mut self) -> bool { true }
+    fn finish(&mut self) {}
+}
+
+impl Summary {
+    fn helper(&self) -> u32 { 1 }
+}
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let out = adapter
+            .extract(&tree, source, &FilePathId::new("src/summary.rs"))
+            .unwrap();
+
+        let implements: Vec<(&str, &str)> = out
+            .relations
+            .iter()
+            .filter(|r| r.kind == kin_model::RelationKind::Implements)
+            .map(|r| (r.src_name.as_str(), r.dst_name.as_str()))
+            .collect();
+
+        assert!(
+            implements.contains(&("Summary::matched", "Sink")),
+            "a trait method must name the trait it satisfies: {implements:?}"
+        );
+        assert!(
+            implements.contains(&("Summary::finish", "Sink")),
+            "every method of the impl block satisfies the trait: {implements:?}"
+        );
+        assert!(
+            implements.contains(&("Summary", "Sink")),
+            "the implementing type keeps its own edge: {implements:?}"
+        );
+        assert!(
+            !implements.iter().any(|(src, _)| *src == "Summary::helper"),
+            "an inherent method satisfies no trait, so nothing shields it from a \
+             dead-code report: {implements:?}"
+        );
     }
 }
