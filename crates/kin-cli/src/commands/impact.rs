@@ -748,13 +748,12 @@ mod tests {
         let walked = downstream_impact_by_hop(&graph, &target.id, depth).unwrap();
         let walked_ids: std::collections::BTreeSet<EntityId> =
             walked.iter().map(|(_, entity)| entity.id).collect();
-        let authority_ids: std::collections::BTreeSet<EntityId> =
-            graph
-                .get_downstream_impact(&target.id, depth)
-                .unwrap()
-                .into_iter()
-                .map(|entity| entity.id)
-                .collect();
+        let authority_ids: std::collections::BTreeSet<EntityId> = graph
+            .get_downstream_impact(&target.id, depth)
+            .unwrap()
+            .into_iter()
+            .map(|entity| entity.id)
+            .collect();
         assert_eq!(
             walked_ids, authority_ids,
             "hop walk must reach exactly what the graph's own downstream impact reaches"
