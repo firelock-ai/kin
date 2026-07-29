@@ -11,6 +11,7 @@ repository.workspace = true
 
 [dependencies]
 kin-core = { workspace = true }
+kin-daemon-spawn = { workspace = true }
 kin-git = { workspace = true }
 kin-model = { workspace = true }
 kin-db = { workspace = true }
