@@ -833,13 +833,18 @@ fn transaction_touched_scopes<G: GraphStore>(
 /// Indexed reasons for every staged operation the in-process commit path must
 /// refuse even though staging and the daemon planner accept it.
 ///
-/// Today that is exactly the payload-less source update (verb update/modify
-/// with a `target` and a `body`). Turning that shape into a real change means
-/// planning the exact span edit and projecting the new source into the working
-/// file, and both live in the daemon (`kin-daemon`'s `plan_exact_transaction`).
-/// The in-process path has no projection, so committing it here can only
-/// produce a same-entity no-op delta while reporting success, discarding the
-/// agent's body. Refuse instead.
+/// That is every operation carrying new source text, whether or not it also
+/// carries an entity payload. Turning a body into a real change means planning
+/// the exact span edit and projecting the new source into the working file, and
+/// both live in the daemon (`kin-daemon`'s `plan_exact_transaction`). The
+/// in-process path has no projection, so it can only apply whatever else the
+/// operation carries and drop the body.
+///
+/// The payload-ful case is the one that bit hardest, because it does not look
+/// like a no-op from the outside: the entity payload commits, the response says
+/// `ops_applied: 1` and `empty: false`, and the source the agent actually sent
+/// is gone. A partial success reported as a success is worse than a refusal,
+/// because the caller has no way to detect it and no reason to retry.
 ///
 /// Deliberately private and applied only after the daemon-delegate early
 /// return in [`handle_transaction_commit`]: the daemon commits through
@@ -850,15 +855,21 @@ fn offline_only_uncommittable_operations(operations: &[McpMutationOperation]) ->
     operations
         .iter()
         .enumerate()
-        .filter(|(_, op)| crate::session::is_target_body_update(op))
+        .filter(|(_, op)| crate::session::carries_source_body(op))
         .map(|(idx, op)| {
+            let shape = if op.payload.is_some() {
+                "an entity payload plus a source body"
+            } else {
+                "a payload-less source update (target plus body)"
+            };
+            let target = op.target.trim();
+            let target = if target.is_empty() { "(unnamed)" } else { target };
             format!(
-                "operation #{idx} ('{}'): a payload-less source update (target '{}' plus body) \
-                 requires the daemon commit path, which plans the exact span edit and projects \
-                 the new source into the working file; the in-process commit path has no \
-                 projection and would report success while discarding the body",
+                "operation #{idx} ('{}'): {shape} for target '{target}' requires the daemon \
+                 commit path, which plans the exact span edit and projects the new source into \
+                 the working file; the in-process commit path has no projection and would report \
+                 success while discarding the body",
                 op.verb,
-                op.target.trim()
             )
         })
         .collect()
@@ -873,13 +884,14 @@ pub async fn handle_transaction_commit<G: GraphStore>(
     let transaction_id = get_string_param(args, "transaction_id")?;
 
     // If operations are provided, validate and stage them in one shot
-    // to bypass state-loss across HTTP calls.
+    // to bypass state-loss across HTTP calls. Decoded through the same parser
+    // the stage tool uses, so an inline caller gets the identical contract: a
+    // field Kin does not model is named rather than dropped, and a shape the
+    // commit path cannot honor is refused here instead of at commit.
     let mut inline_ops = None;
     if let Some(ops_val) = args.get("operations") {
-        let parsed: Vec<crate::session::McpMutationOperation> =
-            serde_json::from_value(ops_val.clone()).map_err(|e| {
-                crate::error::McpError::InvalidParams(format!("invalid operations array: {e}"))
-            })?;
+        let parsed = crate::session::parse_staged_operations(ops_val)
+            .map_err(crate::error::McpError::InvalidParams)?;
         crate::session::validate_staged_operations(&parsed)
             .map_err(crate::error::McpError::InvalidParams)?;
         inline_ops = Some(parsed);
@@ -931,30 +943,31 @@ pub async fn handle_transaction_commit<G: GraphStore>(
     // is applied and the transaction stays active so the agent can fix it.
     let uncommittable = crate::session::uncommittable_operations(&tx.staged_operations);
     if !uncommittable.is_empty() {
-        return Ok(ToolCallResult::error(format!(
-            "Cannot commit transaction {}: {} staged operation(s) are not committable and would \
-             be silently dropped:\n  - {}\nFix or remove them and retry; the transaction is left \
-             active.",
-            transaction_id,
-            uncommittable.len(),
-            uncommittable.join("\n  - ")
-        )));
+        return Ok(ToolCallResult::error(
+            crate::session::CommitRefusal::new(
+                crate::session::CommitRefusalCode::NotCommittable,
+                &transaction_id,
+                uncommittable,
+            )
+            .render(),
+        ));
     }
 
     // Everything from here down is the in-process path: the daemon returned
     // above. Refuse the operation shapes only the daemon can honor rather than
-    // applying a delta that reports success and changes nothing. Rejected
-    // atomically and before any graph apply, so the transaction stays active.
+    // applying a delta that reports success while dropping the source the
+    // caller sent. Rejected atomically and before any graph apply, so the
+    // transaction stays active.
     let daemon_only = offline_only_uncommittable_operations(&tx.staged_operations);
     if !daemon_only.is_empty() {
-        return Ok(ToolCallResult::error(format!(
-            "Cannot commit transaction {}: {} staged operation(s) require the daemon commit \
-             path:\n  - {}\nCommit through a running Kin daemon, or restage the change as an \
-             entity payload. The transaction is left active.",
-            transaction_id,
-            daemon_only.len(),
-            daemon_only.join("\n  - ")
-        )));
+        return Ok(ToolCallResult::error(
+            crate::session::CommitRefusal::new(
+                crate::session::CommitRefusalCode::SourceBodyRequiresDaemonCommit,
+                &transaction_id,
+                daemon_only,
+            )
+            .render(),
+        ));
     }
 
     // Load-bearing ordering: run coordination enforcement against the fully

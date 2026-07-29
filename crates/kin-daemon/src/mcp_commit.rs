@@ -73,17 +73,37 @@ fn commit_exact_transaction_inner(
         .ok_or_else(|| "missing required parameter: transaction_id".to_string())?
         .to_string();
 
-    if let Some(inline) = arguments.get("operations") {
-        let operations = kin_mcp::session::parse_staged_operations(inline)?;
-        kin_mcp::session::validate_staged_operations(&operations)?;
-        sessions
-            .stage_transaction(&transaction_id, operations)
-            .map_err(|error| format!("cannot stage inline transaction operations: {error}"))?;
-    }
-
     let mut transaction = sessions
         .get_transaction(&transaction_id)
         .ok_or_else(|| format!("Transaction not found: {transaction_id}"))?;
+
+    // Operations handed to the commit call itself stage and publish in one
+    // step. Once the transaction is fenced they are read as a restatement of
+    // what is already fenced instead: `kin_transaction_commit` documents
+    // re-entry as an idempotent resume, and staging onto a fenced transaction
+    // would fail on the state check and strand a caller whose only published
+    // recovery is to re-send the identical call.
+    if let Some(inline) = arguments.get("operations") {
+        let operations = kin_mcp::session::parse_staged_operations(inline)?;
+        kin_mcp::session::validate_staged_operations(&operations)?;
+        if matches!(transaction.state.as_str(), "committing" | "committed") {
+            if !kin_mcp::session::staged_operations_match(
+                &transaction.staged_operations,
+                &operations,
+            ) {
+                return Err(format!(
+                    "Cannot commit transaction {transaction_id}: the inline operations differ from \
+                     the operations already fenced for publication, and a fenced payload cannot be \
+                     edited. Re-send the fenced operations to resume it, or begin a new transaction \
+                     with kin_transaction_begin for a different change."
+                ));
+            }
+        } else {
+            transaction = sessions
+                .stage_transaction(&transaction_id, operations)
+                .map_err(|error| format!("cannot stage inline transaction operations: {error}"))?;
+        }
+    }
     if !matches!(
         transaction.state.as_str(),
         "active" | "validated" | "committing" | "committed"
@@ -1431,6 +1451,320 @@ mod tests {
         assert_ne!(
             reparsed.fingerprint, entity.fingerprint,
             "semantic fingerprint must come from reparsing the exact new bytes"
+        );
+    }
+
+    /// Operations handed to the commit call itself must land exactly like
+    /// staged ones.
+    ///
+    /// The tool advertises the inline array as the single-call convenience
+    /// form, so a caller that uses it is entitled to the same durability as
+    /// stage-then-commit. The failure this closes reported `status: committed`
+    /// with `ops_applied: 1` while `modified_files` stayed empty and the body
+    /// never reached the file: a success response for a change that never
+    /// happened, which is the one outcome an agent cannot detect or recover
+    /// from. Read-back is byte-exact against the working file, the repository
+    /// CAS blob, and the reparsed entity.
+    #[test]
+    fn inline_operations_commit_persists_the_body_byte_exact() {
+        let (_dir, state) = test_state();
+        let (entity, _) = install_exact_source(
+            &state,
+            "src/lib.rs",
+            b"pub fn value() -> u8 { 1 }\n",
+            "value",
+        );
+        let sessions = test_sessions();
+        let transaction = sessions
+            .begin_transaction(TEST_SESSION, "file:src/lib.rs")
+            .unwrap();
+
+        // The exact shape reported as lost: an entity payload plus a body,
+        // passed on the commit call with no prior kin_transaction_stage.
+        let arguments = HashMap::from([
+            (
+                "transaction_id".to_string(),
+                serde_json::json!(transaction.transaction_id),
+            ),
+            (
+                "operations".to_string(),
+                serde_json::json!([{
+                    "verb": "update",
+                    "target": entity.id.to_string(),
+                    "payload": {"Entity": entity},
+                    "body": "pub fn value() -> u8 { 2 }",
+                    "description": "inline entity body update",
+                }]),
+            ),
+        ]);
+        let result = commit_exact_transaction(&state, &sessions, &arguments, None);
+        assert_ne!(
+            result.is_error,
+            Some(true),
+            "inline operations commit failed: {}",
+            result_text(&result)
+        );
+
+        let response: serde_json::Value = serde_json::from_str(result_text(&result)).unwrap();
+        assert_eq!(response["status"], "committed");
+        assert_eq!(response["ops_applied"], 1);
+        assert_eq!(
+            response["modified_files"],
+            serde_json::json!(["src/lib.rs"]),
+            "a committed inline body must name the file it changed: {}",
+            result_text(&result)
+        );
+
+        let expected = b"pub fn value() -> u8 { 2 }\n";
+        assert_eq!(
+            std::fs::read(state.layout.working_dir().join("src/lib.rs")).unwrap(),
+            expected,
+            "inline body must reach the working file byte-exact"
+        );
+        let after = load_native_commit_base(&state.layout).unwrap();
+        let artifact = after
+            .tree
+            .artifact_at_path(&RepoPath::from_utf8("src/lib.rs").unwrap())
+            .unwrap();
+        assert_eq!(
+            load_native_source_blob(&state.layout, artifact.entry.blob_identity().unwrap())
+                .unwrap(),
+            expected,
+            "inline body must reach repository CAS byte-exact"
+        );
+        let reparsed = after.graph.get_entity(&entity.id).unwrap().unwrap();
+        assert_ne!(
+            reparsed.fingerprint, entity.fingerprint,
+            "inline body must be reparsed into graph truth"
+        );
+    }
+
+    /// The payload-less inline form has to persist too.
+    #[test]
+    fn inline_payload_less_operations_commit_persists_the_body_byte_exact() {
+        let (_dir, state) = test_state();
+        let (entity, _) = install_exact_source(
+            &state,
+            "src/lib.rs",
+            b"pub fn value() -> u8 { 1 }\n",
+            "value",
+        );
+        let sessions = test_sessions();
+        let transaction = sessions
+            .begin_transaction(TEST_SESSION, "file:src/lib.rs")
+            .unwrap();
+
+        let arguments = HashMap::from([
+            (
+                "transaction_id".to_string(),
+                serde_json::json!(transaction.transaction_id),
+            ),
+            (
+                "operations".to_string(),
+                serde_json::json!([{
+                    "verb": "update",
+                    "target": "value",
+                    "body": "pub fn value() -> u8 { 3 }",
+                    "description": "inline payload-less body update",
+                }]),
+            ),
+        ]);
+        let result = commit_exact_transaction(&state, &sessions, &arguments, None);
+        assert_ne!(
+            result.is_error,
+            Some(true),
+            "inline payload-less commit failed: {}",
+            result_text(&result)
+        );
+
+        let expected = b"pub fn value() -> u8 { 3 }\n";
+        assert_eq!(
+            std::fs::read(state.layout.working_dir().join("src/lib.rs")).unwrap(),
+            expected
+        );
+        let after = load_native_commit_base(&state.layout).unwrap();
+        let reparsed = after.graph.get_entity(&entity.id).unwrap().unwrap();
+        assert_ne!(reparsed.fingerprint, entity.fingerprint);
+    }
+
+    /// An `operations` element carrying a key Kin does not model is refused
+    /// before anything commits.
+    ///
+    /// A caller improvising the shape reaches for `content`, `source`, or
+    /// `new_body` before it reaches for `body`. Serde ignores keys it does not
+    /// know, so the misspelled body vanished and the operation was planned as
+    /// if no body had been sent at all. Naming the unknown key is the whole
+    /// difference between a caller fixing one word and a caller concluding
+    /// that inline commits do not work.
+    #[test]
+    fn inline_operations_with_an_unmodelled_key_are_refused() {
+        let (_dir, state) = test_state();
+        let (entity, _) = install_exact_source(
+            &state,
+            "src/lib.rs",
+            b"pub fn value() -> u8 { 1 }\n",
+            "value",
+        );
+        let before = load_native_commit_base(&state.layout).unwrap();
+        let sessions = test_sessions();
+        let transaction = sessions
+            .begin_transaction(TEST_SESSION, "file:src/lib.rs")
+            .unwrap();
+
+        let arguments = HashMap::from([
+            (
+                "transaction_id".to_string(),
+                serde_json::json!(transaction.transaction_id),
+            ),
+            (
+                "operations".to_string(),
+                serde_json::json!([{
+                    "verb": "update",
+                    "target": entity.id.to_string(),
+                    "content": "pub fn value() -> u8 { 2 }",
+                    "description": "misspelled body key",
+                }]),
+            ),
+        ]);
+        let result = commit_exact_transaction(&state, &sessions, &arguments, None);
+        assert_eq!(result.is_error, Some(true));
+        assert!(
+            result_text(&result).contains("content"),
+            "the refusal must name the unknown key: {}",
+            result_text(&result)
+        );
+
+        let after = load_native_commit_base(&state.layout).unwrap();
+        assert_eq!(after.roots.generation, before.roots.generation);
+        assert_eq!(
+            std::fs::read(state.layout.working_dir().join("src/lib.rs")).unwrap(),
+            b"pub fn value() -> u8 { 1 }\n"
+        );
+    }
+
+    /// Re-sending an inline commit after its fence is a resume, not a restage.
+    ///
+    /// `kin_transaction_commit` documents itself as idempotent on re-entry: the
+    /// fenced payload resumes and the call reports whether it landed. Inline
+    /// callers were excluded from that contract, because the resume tried to
+    /// stage the same array onto a transaction no longer in `active` and died
+    /// on the staging error instead of resolving the commit. The identical
+    /// array now resumes; a different one is refused rather than appended to a
+    /// payload already fenced under a different digest.
+    #[test]
+    fn re_sent_inline_operations_resume_a_fenced_commit() {
+        let (_dir, state) = test_state();
+        let (entity, _) = install_exact_source(
+            &state,
+            "src/lib.rs",
+            b"pub fn value() -> u8 { 1 }\n",
+            "value",
+        );
+        let sessions = test_sessions();
+        let transaction = sessions
+            .begin_transaction(TEST_SESSION, "file:src/lib.rs")
+            .unwrap();
+        let operations = serde_json::json!([{
+            "verb": "update",
+            "target": entity.id.to_string(),
+            "body": "pub fn value() -> u8 { 2 }",
+            "description": "inline body update",
+        }]);
+        let arguments = HashMap::from([
+            (
+                "transaction_id".to_string(),
+                serde_json::json!(transaction.transaction_id),
+            ),
+            ("operations".to_string(), operations.clone()),
+        ]);
+
+        // Fail after the repository receipt exists, so the transaction is left
+        // fenced exactly as a crashed publication would leave it.
+        state
+            .mcp_fail_after_authority_once
+            .store(true, Ordering::SeqCst);
+        let crashed = commit_exact_transaction(&state, &sessions, &arguments, None);
+        assert_eq!(crashed.is_error, Some(true));
+        assert_eq!(
+            sessions
+                .get_transaction(&transaction.transaction_id)
+                .unwrap()
+                .state,
+            "committing"
+        );
+
+        let resumed = commit_exact_transaction(&state, &sessions, &arguments, None);
+        assert_ne!(
+            resumed.is_error,
+            Some(true),
+            "re-sending the same inline array must resume the fenced commit: {}",
+            result_text(&resumed)
+        );
+        assert_eq!(
+            std::fs::read(state.layout.working_dir().join("src/lib.rs")).unwrap(),
+            b"pub fn value() -> u8 { 2 }\n"
+        );
+    }
+
+    /// A fenced transaction must not absorb a different inline payload.
+    #[test]
+    fn divergent_inline_operations_cannot_edit_a_fenced_commit() {
+        let (_dir, state) = test_state();
+        let (entity, _) = install_exact_source(
+            &state,
+            "src/lib.rs",
+            b"pub fn value() -> u8 { 1 }\n",
+            "value",
+        );
+        let sessions = test_sessions();
+        let transaction = sessions
+            .begin_transaction(TEST_SESSION, "file:src/lib.rs")
+            .unwrap();
+        let arguments = |body: &str| {
+            HashMap::from([
+                (
+                    "transaction_id".to_string(),
+                    serde_json::json!(transaction.transaction_id),
+                ),
+                (
+                    "operations".to_string(),
+                    serde_json::json!([{
+                        "verb": "update",
+                        "target": entity.id.to_string(),
+                        "body": body,
+                        "description": "inline body update",
+                    }]),
+                ),
+            ])
+        };
+
+        state
+            .mcp_fail_after_authority_once
+            .store(true, Ordering::SeqCst);
+        let crashed = commit_exact_transaction(
+            &state,
+            &sessions,
+            &arguments("pub fn value() -> u8 { 2 }"),
+            None,
+        );
+        assert_eq!(crashed.is_error, Some(true));
+
+        let diverged = commit_exact_transaction(
+            &state,
+            &sessions,
+            &arguments("pub fn value() -> u8 { 9 }"),
+            None,
+        );
+        assert_eq!(diverged.is_error, Some(true));
+        assert!(
+            result_text(&diverged).contains("differ from the operations already fenced"),
+            "a divergent resume must say so: {}",
+            result_text(&diverged)
+        );
+        assert_eq!(
+            std::fs::read(state.layout.working_dir().join("src/lib.rs")).unwrap(),
+            b"pub fn value() -> u8 { 2 }\n",
+            "the fenced body, not the divergent one, is what authority holds"
         );
     }
 

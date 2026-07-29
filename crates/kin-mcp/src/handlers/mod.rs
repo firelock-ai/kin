@@ -3158,6 +3158,222 @@ mod tests {
         );
     }
 
+    /// An entity payload sent alongside a source body must not commit the
+    /// payload and drop the body.
+    ///
+    /// This is the shape that reported `status: committed, ops_applied: 1,
+    /// empty: false` while the file it named never changed. The payload part
+    /// applies cleanly, so nothing in the response looks wrong, and the source
+    /// the agent actually wrote is gone with no signal that it was. A partial
+    /// commit reported as a whole one is undetectable to the caller, which is
+    /// why the whole operation is refused instead.
+    #[tokio::test]
+    async fn offline_commit_refuses_an_entity_payload_carrying_a_source_body() {
+        use crate::session::{McpMutationOperation, McpMutationPayload};
+
+        let store = InMemoryGraph::default();
+        let entity = placement_free_entity("value");
+        store.upsert_entity(&entity).unwrap();
+        let before = serde_json::to_value(&entity).unwrap();
+
+        let sessions = SessionRegistry::new();
+        sessions.set_coordination_mode(crate::session::CoordinationEnforcementMode::Warn);
+        let session_authority = SessionAuthorityMode::OfflineFallback;
+        let tx_id = begin_offline_transaction(&sessions, "offline-payload-plus-body").await;
+
+        let mut updated = entity.clone();
+        updated.doc_summary = Some("returns the configured value".into());
+        let op = McpMutationOperation {
+            verb: "update".into(),
+            target: entity.id.to_string(),
+            payload: Some(McpMutationPayload::Entity(updated)),
+            body: Some("pub fn value() -> u8 { 2 }".into()),
+            description: "entity payload plus source body".into(),
+        };
+        let mut stage_args = HashMap::new();
+        stage_args.insert("transaction_id".into(), serde_json::json!(tx_id));
+        stage_args.insert("operations".into(), serde_json::json!(vec![op]));
+        let stage_res =
+            sessions::handle_transaction_stage(&stage_args, &sessions, session_authority)
+                .await
+                .unwrap();
+        assert_ne!(
+            stage_res.is_error,
+            Some(true),
+            "staging must keep accepting the daemon-committable shape: {}",
+            tool_result_text(&stage_res)
+        );
+
+        let mut commit_args = HashMap::new();
+        commit_args.insert("transaction_id".into(), serde_json::json!(tx_id));
+        let commit_res =
+            sessions::handle_transaction_commit(&commit_args, &store, &sessions, session_authority)
+                .await
+                .unwrap();
+
+        assert_eq!(
+            commit_res.is_error,
+            Some(true),
+            "a commit that cannot honor the body must refuse, not report success"
+        );
+        let commit_text = tool_result_text(&commit_res);
+        assert!(
+            commit_text.contains("require the daemon commit path"),
+            "message must name the daemon requirement, got: {commit_text}"
+        );
+        assert!(
+            commit_text.contains("source_body_requires_daemon_commit"),
+            "refusal must carry its machine-readable code, got: {commit_text}"
+        );
+
+        assert_eq!(sessions.get_transaction(&tx_id).unwrap().state, "active");
+        let after = serde_json::to_value(store.get_entity(&entity.id).unwrap().unwrap()).unwrap();
+        assert_eq!(
+            before, after,
+            "no part of a body-carrying operation may reach graph truth on this path"
+        );
+    }
+
+    /// The refusal follows the operations, not the way they were delivered.
+    ///
+    /// The inline array is advertised as the single-call convenience form, so
+    /// it is the form an agent reaches for first. It must reach the same
+    /// verdict as stage-then-commit rather than becoming the one route that
+    /// reports success for a dropped body.
+    #[tokio::test]
+    async fn offline_commit_refuses_inline_operations_carrying_a_source_body() {
+        use crate::session::{McpMutationOperation, McpMutationPayload};
+
+        let store = InMemoryGraph::default();
+        let entity = placement_free_entity("value");
+        store.upsert_entity(&entity).unwrap();
+        let before = serde_json::to_value(&entity).unwrap();
+
+        let sessions = SessionRegistry::new();
+        sessions.set_coordination_mode(crate::session::CoordinationEnforcementMode::Warn);
+        let session_authority = SessionAuthorityMode::OfflineFallback;
+        let tx_id = begin_offline_transaction(&sessions, "offline-inline-body").await;
+
+        let mut updated = entity.clone();
+        updated.doc_summary = Some("returns the configured value".into());
+        let op = McpMutationOperation {
+            verb: "update".into(),
+            target: entity.id.to_string(),
+            payload: Some(McpMutationPayload::Entity(updated)),
+            body: Some("pub fn value() -> u8 { 2 }".into()),
+            description: "inline entity payload plus source body".into(),
+        };
+        let mut commit_args = HashMap::new();
+        commit_args.insert("transaction_id".into(), serde_json::json!(tx_id));
+        commit_args.insert("operations".into(), serde_json::json!(vec![op]));
+        let commit_res =
+            sessions::handle_transaction_commit(&commit_args, &store, &sessions, session_authority)
+                .await
+                .unwrap();
+
+        assert_eq!(commit_res.is_error, Some(true));
+        let commit_text = tool_result_text(&commit_res);
+        assert!(
+            commit_text.contains("source_body_requires_daemon_commit"),
+            "inline delivery must reach the same typed refusal, got: {commit_text}"
+        );
+        let after = serde_json::to_value(store.get_entity(&entity.id).unwrap().unwrap()).unwrap();
+        assert_eq!(before, after);
+    }
+
+    /// A refusal is parseable, not just readable.
+    ///
+    /// An agent that has to regex prose to decide whether to retry, restage, or
+    /// escalate will get it wrong. The refusal carries a stable schema, code,
+    /// and operation list so the decision is a field lookup.
+    #[tokio::test]
+    async fn commit_refusal_is_machine_readable() {
+        use crate::session::{CommitRefusal, McpMutationOperation, McpMutationPayload};
+
+        let store = InMemoryGraph::default();
+        let entity = placement_free_entity("value");
+        store.upsert_entity(&entity).unwrap();
+
+        let sessions = SessionRegistry::new();
+        sessions.set_coordination_mode(crate::session::CoordinationEnforcementMode::Warn);
+        let session_authority = SessionAuthorityMode::OfflineFallback;
+        let tx_id = begin_offline_transaction(&sessions, "offline-typed-refusal").await;
+
+        let op = McpMutationOperation {
+            verb: "update".into(),
+            target: "value".into(),
+            payload: None::<McpMutationPayload>,
+            body: Some("pub fn value() -> u8 { 2 }".into()),
+            description: "payload-less body update".into(),
+        };
+        let mut commit_args = HashMap::new();
+        commit_args.insert("transaction_id".into(), serde_json::json!(tx_id));
+        commit_args.insert("operations".into(), serde_json::json!(vec![op]));
+        let commit_res =
+            sessions::handle_transaction_commit(&commit_args, &store, &sessions, session_authority)
+                .await
+                .unwrap();
+
+        assert_eq!(commit_res.is_error, Some(true));
+        let commit_text = tool_result_text(&commit_res);
+        let evidence = commit_text
+            .lines()
+            .next_back()
+            .expect("refusal renders its evidence on the last line");
+        let refusal: CommitRefusal =
+            serde_json::from_str(evidence).expect("refusal evidence must parse");
+        assert_eq!(refusal.schema, CommitRefusal::SCHEMA);
+        assert_eq!(
+            refusal.code,
+            crate::session::CommitRefusalCode::SourceBodyRequiresDaemonCommit
+        );
+        assert_eq!(refusal.transaction_id, tx_id);
+        assert!(!refusal.applied, "a refusal never applied anything");
+        assert_eq!(refusal.transaction_state, "active");
+        assert_eq!(refusal.operations.len(), 1);
+    }
+
+    /// A field Kin does not model is named, not dropped.
+    ///
+    /// Serde ignores unknown keys, so an operation calling its source text
+    /// `content` decoded to `body: None` and committed nothing while looking
+    /// entirely well-formed. One misspelled word is the whole difference
+    /// between a caller fixing it and a caller concluding inline commits are
+    /// broken.
+    #[tokio::test]
+    async fn inline_operations_with_an_unmodelled_field_are_refused() {
+        let store = InMemoryGraph::default();
+        let entity = placement_free_entity("value");
+        store.upsert_entity(&entity).unwrap();
+
+        let sessions = SessionRegistry::new();
+        sessions.set_coordination_mode(crate::session::CoordinationEnforcementMode::Warn);
+        let session_authority = SessionAuthorityMode::OfflineFallback;
+        let tx_id = begin_offline_transaction(&sessions, "offline-unknown-field").await;
+
+        let mut commit_args = HashMap::new();
+        commit_args.insert("transaction_id".into(), serde_json::json!(tx_id));
+        commit_args.insert(
+            "operations".into(),
+            serde_json::json!([{
+                "verb": "update",
+                "target": entity.id.to_string(),
+                "content": "pub fn value() -> u8 { 2 }",
+                "description": "misspelled body key",
+            }]),
+        );
+        let err =
+            sessions::handle_transaction_commit(&commit_args, &store, &sessions, session_authority)
+                .await
+                .expect_err("an unknown operation field must be refused");
+        assert!(matches!(err, McpError::InvalidParams(_)));
+        assert!(
+            err.to_string().contains("'content'"),
+            "the refusal must name the unknown field, got: {err}"
+        );
+        assert_eq!(sessions.get_transaction(&tx_id).unwrap().state, "active");
+    }
+
     #[tokio::test]
     async fn handle_transaction_stage_rejects_malformed_op_at_stage_time() {
         // D.7 Track A: a payload-less operation must fail loud at stage time —

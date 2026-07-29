@@ -70,6 +70,109 @@ pub fn is_target_body_update(op: &McpMutationOperation) -> bool {
             .is_some_and(|body| !body.trim().is_empty())
 }
 
+/// An operation that carries new source text for a file.
+///
+/// Source text can only become truth by being spliced into exact repository
+/// bytes and projected into the working file, which lives in the daemon commit
+/// path. Any other path must refuse an operation shaped like this rather than
+/// commit whatever else the operation carries, because a commit that keeps the
+/// metadata and drops the source reports an agent's edit as durable while the
+/// file it named is unchanged.
+///
+/// Deliberately wider than [`is_target_body_update`]: that names the one shape
+/// the daemon can honor without a payload, while this names every shape whose
+/// substance is the body, including an entity payload sent alongside one.
+pub fn carries_source_body(op: &McpMutationOperation) -> bool {
+    op.body.as_deref().is_some_and(|body| !body.trim().is_empty())
+}
+
+/// Why a commit was refused before anything was applied, in a form a caller can
+/// branch on without reading prose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommitRefusalCode {
+    /// The operations cannot be turned into a committed delta on any path.
+    NotCommittable,
+    /// The operations carry new source text and this path has no projection to
+    /// write it with. The daemon commit path honors the identical operations.
+    SourceBodyRequiresDaemonCommit,
+}
+
+impl CommitRefusalCode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotCommittable => "not_committable",
+            Self::SourceBodyRequiresDaemonCommit => "source_body_requires_daemon_commit",
+        }
+    }
+
+    fn remedy(self) -> &'static str {
+        match self {
+            Self::NotCommittable => {
+                "Fix or remove the named operations and commit again; the transaction is left \
+                 active and nothing was applied."
+            }
+            Self::SourceBodyRequiresDaemonCommit => {
+                "These operations require the daemon commit path, which splices the body into \
+                 exact repository bytes and projects the result into the working file. Commit \
+                 through a running Kin daemon; the transaction is left active and nothing was \
+                 applied."
+            }
+        }
+    }
+}
+
+/// One refusal, naming its code, the operations that caused it, and the state
+/// the transaction is left in.
+///
+/// Rendered as a sentence followed by the same refusal as JSON: an agent reads
+/// the code and the operation list, a human reads the sentence, and neither has
+/// to reconstruct the other from the other's format.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommitRefusal {
+    pub schema: String,
+    pub code: CommitRefusalCode,
+    pub transaction_id: String,
+    pub transaction_state: String,
+    pub applied: bool,
+    pub operations: Vec<String>,
+    pub remedy: String,
+}
+
+impl CommitRefusal {
+    pub const SCHEMA: &'static str = "kin.mcp.commit_refusal.v1";
+
+    pub fn new(code: CommitRefusalCode, transaction_id: &str, operations: Vec<String>) -> Self {
+        Self {
+            schema: Self::SCHEMA.to_string(),
+            code,
+            transaction_id: transaction_id.to_string(),
+            transaction_state: "active".to_string(),
+            applied: false,
+            operations,
+            remedy: code.remedy().to_string(),
+        }
+    }
+
+    pub fn render(&self) -> String {
+        let listed = self
+            .operations
+            .iter()
+            .map(|reason| format!("  - {reason}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let evidence = serde_json::to_string(self)
+            .unwrap_or_else(|error| format!("{{\"serialize_error\":\"{error}\"}}"));
+        format!(
+            "Cannot commit transaction {}: {} staged operation(s) were refused ({}):\n{listed}\n{}\n{evidence}",
+            self.transaction_id,
+            self.operations.len(),
+            self.code.as_str(),
+            self.remedy,
+        )
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpTransaction {
     pub transaction_id: String,
@@ -327,6 +430,14 @@ pub const ACCEPTED_OPERATION_SHAPES: &str = "each element of `operations` is one
      \"description\": \"<why>\"}\n\
      Prefer the first shape: it needs only a target and the new source text";
 
+/// Every field an operation is allowed to carry.
+///
+/// Serde drops keys it does not model, so an operation naming its source text
+/// anything other than `body` decodes cleanly with `body: None` and is planned
+/// as if no source had been sent. Checking the key set first is what turns that
+/// into a refusal the caller can act on.
+const OPERATION_FIELDS: [&str; 5] = ["verb", "target", "payload", "body", "description"];
+
 /// Decode an `operations` argument into staged operations.
 ///
 /// A raw serde failure here names an internal field of whichever payload
@@ -334,17 +445,60 @@ pub const ACCEPTED_OPERATION_SHAPES: &str = "each element of `operations` is one
 /// improvising the shape nothing it can act on. Every decode failure is
 /// rewritten to name the accepted shapes, so a caller that guessed wrong learns
 /// the contract from the refusal instead of looping on retries.
+///
+/// Unknown keys are refused rather than ignored. A caller writing the shape by
+/// hand reaches for `content`, `source`, or `new_body` before it reaches for
+/// `body`, and silently discarding that key is indistinguishable from a commit
+/// that dropped the change: the operation stages, commits, and reports success
+/// having carried no source at all.
 pub fn parse_staged_operations(
     operations: &serde_json::Value,
 ) -> std::result::Result<Vec<McpMutationOperation>, String> {
-    if !operations.is_array() {
+    let serde_json::Value::Array(elements) = operations else {
         return Err(format!(
             "invalid operations: expected a JSON array, got {}; {ACCEPTED_OPERATION_SHAPES}",
             json_type_name(operations)
         ));
+    };
+    for (idx, element) in elements.iter().enumerate() {
+        let Some(fields) = element.as_object() else {
+            return Err(format!(
+                "invalid operations: element #{idx} is {}, expected an object; \
+                 {ACCEPTED_OPERATION_SHAPES}",
+                json_type_name(element)
+            ));
+        };
+        let unknown = fields
+            .keys()
+            .filter(|key| !OPERATION_FIELDS.contains(&key.as_str()))
+            .map(|key| format!("'{key}'"))
+            .collect::<Vec<_>>();
+        if !unknown.is_empty() {
+            return Err(format!(
+                "invalid operations: element #{idx} carries unknown field(s) {}; an operation is \
+                 described only by {}. New source text goes in `body`, and nowhere else, or it is \
+                 not committed; {ACCEPTED_OPERATION_SHAPES}",
+                unknown.join(", "),
+                OPERATION_FIELDS.join(", ")
+            ));
+        }
     }
     serde_json::from_value(operations.clone())
         .map_err(|error| format!("invalid operations array: {error}; {ACCEPTED_OPERATION_SHAPES}"))
+}
+
+/// Whether two staged operation sets describe exactly the same work.
+///
+/// Used to tell a resume of a fenced commit apart from an attempt to change
+/// what that commit publishes. Compared through their serialized form because
+/// an operation carries payload types that model no equality of their own.
+pub fn staged_operations_match(left: &[McpMutationOperation], right: &[McpMutationOperation]) -> bool {
+    match (serde_json::to_value(left), serde_json::to_value(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        // A set that cannot be serialized cannot be proven identical, and a
+        // resume that guesses wrong would append to a fenced payload.
+        _ => false,
+    }
 }
 
 fn json_type_name(value: &serde_json::Value) -> &'static str {
