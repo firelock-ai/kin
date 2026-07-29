@@ -406,10 +406,14 @@ pub fn project_to_bytes(
         } = region
         {
             if let Some(new_body) = mutations.get(entity_id) {
-                splices.push(Splice {
-                    byte_range: byte_range.clone(),
-                    new_content: new_body.clone(),
-                });
+                // Caller-authored bodies, so the same first-line indentation
+                // reading `splice_entity` uses. A body that is the region's own
+                // bytes is unaffected.
+                splices.push(crate::splice::entity_body_splice(
+                    base_content,
+                    byte_range.clone(),
+                    new_body,
+                ));
             }
         }
     }

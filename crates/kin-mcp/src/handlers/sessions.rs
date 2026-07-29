@@ -627,8 +627,13 @@ pub async fn handle_transaction_begin(
 pub const TRANSACTION_STAGE_DESC: &str = "\
 Stage one or more mutation operations onto an active transaction. The simplest write is \
 a payload-less entity source edit: {verb: \"update\", target: \"<entity name or id>\", \
-body: \"<the entity's full new source text>\", description: \"...\"}. The entity is \
-resolved fail-closed server-side (exact name or id; ambiguity is an error) and on \
+body: \"<the entity's full new source text>\", description: \"...\"}. Prefer the entity \
+id that semantic_locate, find_references, or get_context_pack already handed you: a bare \
+name resolves only when it is unique, and an ambiguous one is refused (with the candidate \
+ids, so the retry is mechanical). The body is the entity exactly as its file renders it; \
+its first line's indentation is read as the entity's own line indentation, not as extra \
+indentation on top of it, so a nested method or function goes back unchanged. The entity is \
+resolved fail-closed server-side and on \
 commit the graph-to-file projection writes the body into the entity's working-directory \
 file. Structured payloads (full entity, relation add/remove) are also accepted. Each \
 operation is validated at stage time: anything the commit path would silently drop (a \
@@ -732,7 +737,10 @@ collision_warnings, and conflicts (entities skipped due to a concurrent file edi
 non-empty set is surfaced as an error instead). Before graph application, exact entity/artifact \
 intent conflicts and session write/commit capabilities are attested; enforce mode rejects \
 before graph truth changes. Contract-scope coverage remains explicitly false until touched \
-contracts can be derived from the semantic delta.";
+contracts can be derived from the semantic delta. A commit that is refused before anything \
+is published leaves the transaction usable: its staged operations are cleared and named in \
+the refusal, so you re-stage corrected ones on the SAME transaction and commit again, and \
+kin_transaction_abort is the clean exit if you would rather abandon it.";
 
 fn push_scope_once(scopes: &mut Vec<kin_model::IntentScope>, scope: kin_model::IntentScope) {
     if !scopes.contains(&scope) {
@@ -1092,7 +1100,11 @@ pub async fn handle_transaction_commit<G: GraphStore>(
 }
 
 pub const TRANSACTION_ABORT_DESC: &str = "\
-Abort the transaction and discard all staged mutations.";
+Abort the transaction and discard all staged mutations. Reach for it when you decide \
+against work you already staged, so the transaction ends instead of sitting open holding \
+operations you no longer intend. You do not need it to recover from a refused commit: a \
+commit refused before publication already clears its staged operations and names them, so \
+you can re-stage corrected ones on the same transaction.";
 
 pub async fn handle_transaction_abort(
     args: &HashMap<String, serde_json::Value>,

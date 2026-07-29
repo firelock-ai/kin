@@ -1043,6 +1043,11 @@ pub fn agent_default_tool_names() -> &'static [&'static str] {
         "kin_transaction_begin",
         "kin_transaction_stage",
         "kin_transaction_commit",
+        // Without abort, an agent that decides against a transaction, or that
+        // wants to start clean after a refusal, has no way out of the one it
+        // holds: begin/stage/commit can only push work forward. A write profile
+        // that cannot abandon a transaction cannot honor "nothing half-applies".
+        "kin_transaction_abort",
         "kin_provenance_query",
     ]
 }
@@ -1156,6 +1161,8 @@ mod tests {
             // this tool. A profile that carries the advice without the tool
             // strands any agent whose read phase outlasts the idle TTL.
             "kin_session_heartbeat",
+            // The only clean exit from a transaction the agent decided against.
+            "kin_transaction_abort",
         ] {
             assert!(
                 profile.contains(&required),
