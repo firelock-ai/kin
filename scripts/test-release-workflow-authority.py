@@ -438,18 +438,43 @@ def workflow_job_blocks(workflow: str) -> dict[str, str]:
     return blocks
 
 
+def job_top_level_mapping_fields(job: str) -> list[tuple[str, str]]:
+    """Return canonical job-level fields, rejecting YAML key aliases."""
+
+    active_lines = classifier_active_job_source(job).splitlines()
+    fields: list[tuple[str, str]] = []
+    for line in active_lines[1:]:
+        indent = len(line) - len(line.lstrip())
+        if indent != 2:
+            continue
+        match = re.fullmatch(
+            r"  (?P<key>[A-Za-z0-9_-]+):(?:[ \t]*(?P<value>.*))?",
+            line,
+        )
+        if match is None:
+            raise AssertionError(
+                "workflow job top-level keys must use canonical unquoted "
+                f"`key:` syntax: {line.strip()}"
+            )
+        fields.append((match.group("key"), match.group("value") or ""))
+    return fields
+
+
 def optional_job_display_name(job: str) -> str | None:
     """Return a job's exact top-level display name, if it declares one."""
 
-    active_lines = classifier_active_job_source(job).splitlines()
     names = [
-        line.removeprefix("  name:").strip()
-        for line in active_lines[1:]
-        if line.startswith("  name:")
+        value.strip()
+        for key, value in job_top_level_mapping_fields(job)
+        if key == "name"
     ]
     if len(names) > 1:
         raise AssertionError(
             "workflow jobs may carry at most one one-line display name"
+        )
+    if names and (not names[0] or names[0] in {"|", "|-", ">", ">-"}):
+        raise AssertionError(
+            "workflow job display names must be non-empty one-line scalars"
         )
     return names[0] if names else None
 
@@ -1184,6 +1209,42 @@ def main() -> None:
         "canonical unquoted scalar",
         lambda: assert_workflow_job_census(quoted_job_spoof),
     )
+
+    unnamed_workflow = WORKFLOWS / "registry-index-migrate.yml"
+    if unnamed_workflow not in workflow_sources:
+        raise AssertionError(
+            "workflow census falsification could not identify an unnamed job"
+        )
+    for label, alternate_name_key in (
+        ("double-quoted job name key", '"name": cargo-deny'),
+        ("single-quoted job name key", "'name': cargo-deny"),
+        ("job name key with whitespace before the colon", "name : cargo-deny"),
+        ("tagged job name key", "!!str name: cargo-deny"),
+    ):
+        alternate_name_spoof = dict(workflow_sources)
+        alternate_name_spoof[unnamed_workflow] = textwrap.dedent(
+            f"""\
+            name: Registry Index Migrate
+            on:
+              push:
+                branches: [main]
+            permissions:
+              contents: read
+            jobs:
+              migrate:
+                {alternate_name_key}
+                runs-on: ubuntu-latest
+                steps:
+                  - run: echo success
+            """
+        )
+        expect_assertion(
+            f"{label} emits a required context from an expected unnamed job",
+            "canonical unquoted `key:` syntax",
+            lambda alternate_name_spoof=alternate_name_spoof: (
+                assert_workflow_job_census(alternate_name_spoof)
+            ),
+        )
 
     auxiliary_dco = WORKFLOWS / "dco.yml"
     promoted_dco = dict(workflow_sources)
