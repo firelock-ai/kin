@@ -2151,6 +2151,89 @@ mod tests {
     }
 
     #[test]
+    fn parse_staged_operations_names_a_field_it_does_not_model() {
+        // The whole point: a misspelled `body` used to decode to no body at
+        // all, so the operation staged clean and committed nothing.
+        let error = parse_staged_operations(&serde_json::json!([{
+            "verb": "update",
+            "target": "value",
+            "content": "pub fn value() -> u8 { 2 }",
+            "description": "misspelled body key",
+        }]))
+        .expect_err("an unknown field must be refused, not dropped");
+        assert!(error.contains("'content'"), "got: {error}");
+        assert!(error.contains("body"), "the fix must be named: {error}");
+    }
+
+    #[test]
+    fn parse_staged_operations_rejects_a_non_object_element() {
+        let error = parse_staged_operations(&serde_json::json!(["update value"]))
+            .expect_err("a string element is not an operation");
+        assert!(error.contains("element #0"), "got: {error}");
+    }
+
+    #[test]
+    fn staged_operations_match_distinguishes_a_resume_from_an_edit() {
+        let staged = vec![op(
+            "update",
+            Some(McpMutationPayload::Entity(entity_named("foo"))),
+        )];
+        assert!(staged_operations_match(&staged, &staged.clone()));
+
+        let mut edited = staged.clone();
+        edited[0].body = Some("pub fn foo() {}".to_string());
+        assert!(
+            !staged_operations_match(&staged, &edited),
+            "a changed body is a different payload, not a resume"
+        );
+        assert!(!staged_operations_match(&staged, &[]));
+    }
+
+    #[test]
+    fn commit_refusal_renders_prose_and_machine_readable_evidence() {
+        let refusal = CommitRefusal::new(
+            CommitRefusalCode::SourceBodyRequiresDaemonCommit,
+            "tx-1",
+            vec!["operation #0 ('update'): needs projection".to_string()],
+        );
+        let rendered = refusal.render();
+        assert!(rendered.contains("tx-1"));
+        assert!(rendered.contains("needs projection"));
+
+        let evidence: CommitRefusal =
+            serde_json::from_str(rendered.lines().next_back().unwrap()).unwrap();
+        assert_eq!(evidence.schema, CommitRefusal::SCHEMA);
+        assert_eq!(
+            evidence.code,
+            CommitRefusalCode::SourceBodyRequiresDaemonCommit
+        );
+        assert!(!evidence.applied);
+        assert_eq!(evidence.operations.len(), 1);
+    }
+
+    #[test]
+    fn carries_source_body_covers_every_shape_whose_substance_is_the_body() {
+        let mut payload_less = op("update", None);
+        payload_less.body = Some("pub fn value() {}".to_string());
+        assert!(carries_source_body(&payload_less));
+
+        let mut with_payload = op(
+            "update",
+            Some(McpMutationPayload::Entity(entity_named("value"))),
+        );
+        with_payload.body = Some("pub fn value() {}".to_string());
+        assert!(
+            carries_source_body(&with_payload),
+            "an entity payload does not make the body optional"
+        );
+
+        let mut blank = with_payload.clone();
+        blank.body = Some("   \n".to_string());
+        assert!(!carries_source_body(&blank), "whitespace is not source");
+        assert!(!carries_source_body(&op("update", None)));
+    }
+
+    #[test]
     fn validate_staged_operations_accepts_well_formed_and_empty() {
         assert!(validate_staged_operations(&[]).is_ok());
         let ops = vec![op(
