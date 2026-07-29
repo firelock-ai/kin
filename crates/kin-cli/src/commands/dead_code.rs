@@ -151,6 +151,23 @@ pub fn build_dead_code_response(graph: &kin_db::InMemoryGraph) -> Result<DeadCod
         }
     }
 
+    // The scan reads a randomly seeded hash map in parallel, so without an
+    // explicit order the same repository lists its findings differently on every
+    // run and two scans cannot be diffed against each other.
+    unreferenced.sort_by(|left, right| {
+        let file_of = |entity: &kin_model::Entity| {
+            entity
+                .file_origin
+                .as_ref()
+                .map(|file| file.to_string())
+                .unwrap_or_default()
+        };
+        file_of(left)
+            .cmp(&file_of(right))
+            .then_with(|| left.name.cmp(&right.name))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+
     if unreferenced.is_empty() {
         lines.push("No dead code found.".to_string());
     } else {
@@ -538,6 +555,19 @@ mod tests {
         assert!(
             joined.contains("1 excluded as non-production entities, 1 as trait-implementation"),
             "the scan reports what it set aside: {joined}"
+        );
+
+        let orphan_line = lines
+            .iter()
+            .position(|line| line.contains("never_called"))
+            .unwrap();
+        let helper_line = lines
+            .iter()
+            .position(|line| line.contains("Summary::helper"))
+            .unwrap();
+        assert!(
+            orphan_line < helper_line,
+            "findings order by file so two scans of one repo can be diffed: {joined}"
         );
     }
 
