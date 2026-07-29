@@ -2,7 +2,7 @@
 // Copyright 2026 Firelock, LLC
 
 use anyhow::{Context, Result};
-use kin_model::{EntityFilter, EntityId, EntityStore};
+use kin_model::{EntityFilter, EntityId, EntityStore, GraphNodeId};
 use serde::{Deserialize, Serialize};
 
 pub const IMPACT_RESPONSE_SCHEMA_VERSION: &str = "kin-impact-response-v1";
@@ -167,12 +167,10 @@ pub async fn build_impact_response(
     }
 
     // 1. Local Impact, grouped by traversal distance so a reader can tell the
-    // direct callers from the transitive ripple. get_downstream_impact(id, d)
-    // is one breadth-first walk capped at d, so the set at hop d minus the set
-    // at hop d-1 is exactly the entities first reached at distance d; reusing
-    // the same traversal per hop keeps the grouped listing consistent with the
-    // flat listing it replaces.
-    let local_impacted = graph.get_downstream_impact(&target.id, request.depth)?;
+    // direct callers from the transitive ripple. The walk below records the hop
+    // at which each entity is first reached, so the count and every group are
+    // read off one traversal of one graph state.
+    let local_impacted = downstream_impact_by_hop(graph, &target.id, request.depth)?;
     if local_impacted.is_empty() {
         lines.push("  No local downstream impact found.".to_string());
     } else {
@@ -182,32 +180,20 @@ pub async fn build_impact_response(
             request.depth,
             if request.depth == 1 { "" } else { "s" }
         ));
-        let mut listed: std::collections::HashSet<EntityId> = std::collections::HashSet::new();
-        for hop in 1..=request.depth {
-            let reached = if hop == request.depth {
-                local_impacted.clone()
-            } else {
-                graph.get_downstream_impact(&target.id, hop)?
-            };
-            let fresh: Vec<&kin_model::Entity> = reached
-                .iter()
-                .filter(|entity| !listed.contains(&entity.id))
-                .collect();
-            if fresh.is_empty() {
-                continue;
+        let mut current_hop = 0;
+        for (hop, entity) in &local_impacted {
+            if *hop != current_hop {
+                current_hop = *hop;
+                lines.push(if *hop == 1 {
+                    "  1 hop (direct callers):".to_string()
+                } else {
+                    format!("  {hop} hops:")
+                });
             }
-            lines.push(if hop == 1 {
-                "  1 hop (direct callers):".to_string()
-            } else {
-                format!("  {hop} hops:")
-            });
-            for entity in fresh {
-                listed.insert(entity.id);
-                let at = entity_location(entity)
-                    .map(|loc| format!(" @ {loc}"))
-                    .unwrap_or_default();
-                lines.push(format!("    - {} ({:?}){}", entity.name, entity.kind, at));
-            }
+            let at = entity_location(entity)
+                .map(|loc| format!(" @ {loc}"))
+                .unwrap_or_default();
+            lines.push(format!("    - {} ({:?}){}", entity.name, entity.kind, at));
         }
     }
 
@@ -223,6 +209,61 @@ pub async fn build_impact_response(
         query,
         ranked,
     })
+}
+
+/// One breadth-first walk over inbound entity edges, pairing every reached
+/// entity with the hop it was first reached at, in discovery order.
+///
+/// Breadth-first order reaches a node by a shortest path, so first-reach hop is
+/// that entity's minimum distance from the target and the caller can group
+/// straight out of this one result. Walking the graph again per hop instead
+/// would cost depth times as much and would read a different graph state each
+/// time, so a concurrent write between two walks could leave the grouped
+/// listing disagreeing with the count printed above it.
+///
+/// The edge set matches `GraphStore::get_downstream_impact`: entity-to-entity
+/// relations pointing at the entity being expanded, with the relation's source
+/// as the dependent. `impact_hop_walk_matches_graph_downstream_impact` pins
+/// that equivalence.
+fn downstream_impact_by_hop(
+    graph: &kin_db::InMemoryGraph,
+    target: &EntityId,
+    depth: u32,
+) -> Result<Vec<(u32, kin_model::Entity)>> {
+    let mut visited: std::collections::HashSet<EntityId> =
+        std::collections::HashSet::from([*target]);
+    let mut reached: Vec<(u32, kin_model::Entity)> = Vec::new();
+    let mut frontier = vec![*target];
+
+    for hop in 1..=depth {
+        let mut next = Vec::new();
+        for current in frontier {
+            for relation in graph.get_all_relations_for_entity(&current)? {
+                if relation.dst != GraphNodeId::Entity(current) {
+                    continue;
+                }
+                let Some(dependent) = relation.src.as_entity() else {
+                    continue;
+                };
+                if !visited.insert(dependent) {
+                    continue;
+                }
+                // An id carried by a relation whose entity record is missing is
+                // still a real step in the walk, so it keeps expanding even
+                // though it cannot be listed.
+                if let Some(entity) = graph.get_entity(&dependent)? {
+                    reached.push((hop, entity));
+                }
+                next.push(dependent);
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        frontier = next;
+    }
+
+    Ok(reached)
 }
 
 fn resolve_entities(
@@ -303,7 +344,10 @@ fn impact_not_found_guidance(entity: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_impact_response, impact_not_found_guidance, ImpactRequest, ImpactResponse};
+    use super::{
+        build_impact_response, downstream_impact_by_hop, impact_not_found_guidance, ImpactRequest,
+        ImpactResponse,
+    };
     use kin_model::{
         Entity, EntityId, EntityKind, EntityMetadata, EntityRole, EntityStore, FilePathId,
         FingerprintAlgorithm, GraphNodeId, Hash256, LanguageId, Relation, RelationId, RelationKind,
@@ -655,6 +699,92 @@ mod tests {
         assert!(
             h1 < d && d < h2 && h2 < i,
             "hop groups out of order: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn impact_hop_walk_matches_graph_downstream_impact() {
+        let graph = kin_db::InMemoryGraph::new();
+        let target = entity("changed", "src/lib.rs");
+        let direct = entity("direct_caller", "src/direct.rs");
+        // Reaches the target both directly and through `direct`, so a walk that
+        // recorded last-reach rather than first-reach would file it at 2 hops.
+        let both_ways = entity("shortcut_caller", "src/shortcut.rs");
+        let indirect = entity("indirect_caller", "src/indirect.rs");
+        // Sits one hop past the depth cap and must not appear at all.
+        let beyond = entity("beyond_depth_caller", "src/beyond.rs");
+        // The target's own dependency, reachable only by walking an edge
+        // outward. Nothing the target calls is downstream of it, so a walk that
+        // followed edges in either direction would pick this up and diverge
+        // from the graph's own downstream impact.
+        let callee = entity("upstream_callee", "src/callee.rs");
+        for e in [&target, &direct, &both_ways, &indirect, &beyond, &callee] {
+            graph.upsert_entity(e).unwrap();
+        }
+        for (src, dst) in [
+            (&direct, &target),
+            (&both_ways, &target),
+            (&both_ways, &direct),
+            (&indirect, &direct),
+            (&beyond, &indirect),
+            (&target, &callee),
+        ] {
+            graph
+                .upsert_relation(&Relation {
+                    id: RelationId::from_content(&src.id.to_string(), &dst.id.to_string(), "calls"),
+                    kind: RelationKind::Calls,
+                    src: GraphNodeId::Entity(src.id),
+                    dst: GraphNodeId::Entity(dst.id),
+                    confidence: 1.0,
+                    origin: RelationOrigin::Parsed,
+                    created_in: None,
+                    import_source: None,
+                    evidence: Vec::new(),
+                })
+                .unwrap();
+        }
+
+        let depth = 2;
+        let walked = downstream_impact_by_hop(&graph, &target.id, depth).unwrap();
+        let walked_ids: std::collections::BTreeSet<EntityId> =
+            walked.iter().map(|(_, entity)| entity.id).collect();
+        let authority_ids: std::collections::BTreeSet<EntityId> =
+            graph
+                .get_downstream_impact(&target.id, depth)
+                .unwrap()
+                .into_iter()
+                .map(|entity| entity.id)
+                .collect();
+        assert_eq!(
+            walked_ids, authority_ids,
+            "hop walk must reach exactly what the graph's own downstream impact reaches"
+        );
+        assert!(
+            !walked_ids.contains(&beyond.id),
+            "depth cap must exclude the entity one hop past it"
+        );
+        assert!(
+            !walked_ids.contains(&callee.id),
+            "what the target calls is its dependency, not its downstream impact"
+        );
+
+        let hop_of = |id: EntityId| {
+            walked
+                .iter()
+                .find(|(_, entity)| entity.id == id)
+                .map(|(hop, _)| *hop)
+                .unwrap_or_else(|| panic!("{id} missing from the walk"))
+        };
+        assert_eq!(hop_of(direct.id), 1);
+        assert_eq!(
+            hop_of(both_ways.id),
+            1,
+            "an entity on both a 1-hop and a 2-hop path belongs to the shorter one"
+        );
+        assert_eq!(hop_of(indirect.id), 2);
+        assert!(
+            walked.windows(2).all(|pair| pair[0].0 <= pair[1].0),
+            "hops must come back in nondecreasing order so the listing can group in one pass"
         );
     }
 }
