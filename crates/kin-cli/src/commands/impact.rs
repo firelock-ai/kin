@@ -225,8 +225,29 @@ pub async fn build_impact_response(
 /// relations pointing at the entity being expanded, with the relation's source
 /// as the dependent. `impact_hop_walk_matches_graph_downstream_impact` pins
 /// that equivalence.
-fn downstream_impact_by_hop(
-    graph: &kin_db::InMemoryGraph,
+/// The two graph reads the hop walk performs, named so a test can count them.
+trait ImpactWalkGraph {
+    /// Entity-to-entity relations that point at `id`.
+    fn inbound_relations(&self, id: &EntityId) -> Result<Vec<kin_model::Relation>>;
+    fn entity(&self, id: &EntityId) -> Result<Option<kin_model::Entity>>;
+}
+
+impl ImpactWalkGraph for kin_db::InMemoryGraph {
+    fn inbound_relations(&self, id: &EntityId) -> Result<Vec<kin_model::Relation>> {
+        Ok(self
+            .get_all_relations_for_entity(id)?
+            .into_iter()
+            .filter(|relation| relation.dst == GraphNodeId::Entity(*id))
+            .collect())
+    }
+
+    fn entity(&self, id: &EntityId) -> Result<Option<kin_model::Entity>> {
+        Ok(self.get_entity(id)?)
+    }
+}
+
+fn downstream_impact_by_hop<G: ImpactWalkGraph>(
+    graph: &G,
     target: &EntityId,
     depth: u32,
 ) -> Result<Vec<(u32, kin_model::Entity)>> {
@@ -238,10 +259,7 @@ fn downstream_impact_by_hop(
     for hop in 1..=depth {
         let mut next = Vec::new();
         for current in frontier {
-            for relation in graph.get_all_relations_for_entity(&current)? {
-                if relation.dst != GraphNodeId::Entity(current) {
-                    continue;
-                }
+            for relation in graph.inbound_relations(&current)? {
                 let Some(dependent) = relation.src.as_entity() else {
                     continue;
                 };
@@ -251,7 +269,7 @@ fn downstream_impact_by_hop(
                 // An id carried by a relation whose entity record is missing is
                 // still a real step in the walk, so it keeps expanding even
                 // though it cannot be listed.
-                if let Some(entity) = graph.get_entity(&dependent)? {
+                if let Some(entity) = graph.entity(&dependent)? {
                     reached.push((hop, entity));
                 }
                 next.push(dependent);
@@ -346,7 +364,7 @@ fn impact_not_found_guidance(entity: &str) -> Vec<String> {
 mod tests {
     use super::{
         build_impact_response, downstream_impact_by_hop, impact_not_found_guidance, ImpactRequest,
-        ImpactResponse,
+        ImpactResponse, ImpactWalkGraph,
     };
     use kin_model::{
         Entity, EntityId, EntityKind, EntityMetadata, EntityRole, EntityStore, FilePathId,
@@ -784,6 +802,158 @@ mod tests {
         assert!(
             walked.windows(2).all(|pair| pair[0].0 <= pair[1].0),
             "hops must come back in nondecreasing order so the listing can group in one pass"
+        );
+    }
+
+    /// Counts each graph read so a test can assert the walk's cost.
+    struct CountingGraph<'a> {
+        inner: &'a kin_db::InMemoryGraph,
+        inbound_reads: std::cell::Cell<usize>,
+    }
+
+    impl ImpactWalkGraph for CountingGraph<'_> {
+        fn inbound_relations(&self, id: &EntityId) -> anyhow::Result<Vec<kin_model::Relation>> {
+            self.inbound_reads.set(self.inbound_reads.get() + 1);
+            self.inner.inbound_relations(id)
+        }
+
+        fn entity(&self, id: &EntityId) -> anyhow::Result<Option<Entity>> {
+            self.inner.entity(id)
+        }
+    }
+
+    fn chain_graph(length: usize) -> (kin_db::InMemoryGraph, Entity) {
+        let graph = kin_db::InMemoryGraph::new();
+        let entities: Vec<Entity> = (0..length)
+            .map(|i| entity(&format!("link_{i}"), &format!("src/link_{i}.rs")))
+            .collect();
+        for e in &entities {
+            graph.upsert_entity(e).unwrap();
+        }
+        // link_1 calls link_0, link_2 calls link_1, and so on, so link_0 has a
+        // chain of dependents exactly `length - 1` hops deep.
+        for pair in entities.windows(2) {
+            graph
+                .upsert_relation(&Relation {
+                    id: RelationId::from_content(
+                        &pair[1].id.to_string(),
+                        &pair[0].id.to_string(),
+                        "calls",
+                    ),
+                    kind: RelationKind::Calls,
+                    src: GraphNodeId::Entity(pair[1].id),
+                    dst: GraphNodeId::Entity(pair[0].id),
+                    confidence: 1.0,
+                    origin: RelationOrigin::Parsed,
+                    created_in: None,
+                    import_source: None,
+                    evidence: Vec::new(),
+                })
+                .unwrap();
+        }
+        let root = entities.into_iter().next().unwrap();
+        (graph, root)
+    }
+
+    #[test]
+    fn impact_walk_reads_each_entity_once_regardless_of_depth() {
+        // A chain of four: the target plus three entities that depend on it in
+        // sequence.
+        let (graph, root) = chain_graph(4);
+        let walk_at = |depth: u32| {
+            let counted = CountingGraph {
+                inner: &graph,
+                inbound_reads: std::cell::Cell::new(0),
+            };
+            let walked = downstream_impact_by_hop(&counted, &root.id, depth).unwrap();
+            let ids: Vec<(u32, EntityId)> =
+                walked.into_iter().map(|(hop, e)| (hop, e.id)).collect();
+            (ids, counted.inbound_reads.get())
+        };
+
+        // Each entity is expanded at most once, and entities found at the depth
+        // cap are never expanded at all. Three reads covers the whole chain. The
+        // shape this replaced ran a complete traversal for each of the three
+        // hops instead.
+        let (reached, reads) = walk_at(3);
+        assert_eq!(reached.len(), 3, "the whole chain is within 3 hops");
+        assert_eq!(
+            reads, 3,
+            "one read per entity expanded, not one traversal per hop"
+        );
+
+        // Past the end of the chain the walk expands the last entity once to
+        // learn nothing depends on it, then stops. That is the ceiling: raising
+        // the cap by an order of magnitude buys no further reads, where the
+        // per-hop shape charged for every hop asked for.
+        let (deep, deep_reads) = walk_at(32);
+        let (deeper, deeper_reads) = walk_at(320);
+        assert_eq!(deep_reads, 4, "one read per entity, and the chain has four");
+        assert_eq!(
+            deep_reads, deeper_reads,
+            "cost stops growing once the graph is exhausted"
+        );
+        assert_eq!(
+            reached, deep,
+            "a larger depth cap must not change what the walk reports"
+        );
+        assert_eq!(deep, deeper);
+    }
+
+    #[tokio::test]
+    async fn impact_listing_lines_are_exact() {
+        // Pins the grouped listing verbatim. The rewrite changed how hops are
+        // computed and must not have changed a single rendered byte.
+        let graph = kin_db::InMemoryGraph::new();
+        let target = entity_at("changed", "src/lib.rs", 10);
+        let direct = entity_at("direct_caller", "src/direct.rs", 20);
+        let indirect = entity_at("indirect_caller", "src/indirect.rs", 30);
+        for e in [&target, &direct, &indirect] {
+            graph.upsert_entity(e).unwrap();
+        }
+        for (src, dst) in [(&direct, &target), (&indirect, &direct)] {
+            graph
+                .upsert_relation(&Relation {
+                    id: RelationId::from_content(&src.id.to_string(), &dst.id.to_string(), "calls"),
+                    kind: RelationKind::Calls,
+                    src: GraphNodeId::Entity(src.id),
+                    dst: GraphNodeId::Entity(dst.id),
+                    confidence: 1.0,
+                    origin: RelationOrigin::Parsed,
+                    created_in: None,
+                    import_source: None,
+                    evidence: Vec::new(),
+                })
+                .unwrap();
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
+        let response = build_impact_response(
+            &layout,
+            &graph,
+            &ImpactRequest {
+                entity: "changed".to_string(),
+                depth: 3,
+                file: None,
+                kind: None,
+                signature: None,
+                require_unique: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            response.lines,
+            vec![
+                "Impact analysis for 'changed' (Function) @ src/lib.rs:10:".to_string(),
+                "  2 local entities impacted within 3 hops:".to_string(),
+                "  1 hop (direct callers):".to_string(),
+                "    - direct_caller (Function) @ src/direct.rs:20".to_string(),
+                "  2 hops:".to_string(),
+                "    - indirect_caller (Function) @ src/indirect.rs:30".to_string(),
+            ]
         );
     }
 }
