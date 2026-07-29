@@ -2098,8 +2098,7 @@ mod tests {
             state.graph.as_ref(),
         )
         .unwrap();
-        let provenance: serde_json::Value =
-            serde_json::from_str(result_text(&provenance)).unwrap();
+        let provenance: serde_json::Value = serde_json::from_str(result_text(&provenance)).unwrap();
         assert!(
             provenance["change_count"].as_u64().unwrap() >= 1,
             "provenance must count the MCP change: {provenance}"
@@ -2150,8 +2149,7 @@ mod tests {
         let session_id = session.session_id.to_string();
 
         for body in ["pub fn value() -> u8 { 2 }", "pub fn value() -> u8 { 3 }"] {
-            let result =
-                commit_one_entity_edit(&state, &sessions, &session_id, &entity, body);
+            let result = commit_one_entity_edit(&state, &sessions, &session_id, &entity, body);
             assert_ne!(
                 result.is_error,
                 Some(true),

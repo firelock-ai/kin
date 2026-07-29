@@ -83,7 +83,9 @@ pub fn is_target_body_update(op: &McpMutationOperation) -> bool {
 /// the daemon can honor without a payload, while this names every shape whose
 /// substance is the body, including an entity payload sent alongside one.
 pub fn carries_source_body(op: &McpMutationOperation) -> bool {
-    op.body.as_deref().is_some_and(|body| !body.trim().is_empty())
+    op.body
+        .as_deref()
+        .is_some_and(|body| !body.trim().is_empty())
 }
 
 /// Why a commit was refused before anything was applied, in a form a caller can
@@ -492,7 +494,10 @@ pub fn parse_staged_operations(
 /// Used to tell a resume of a fenced commit apart from an attempt to change
 /// what that commit publishes. Compared through their serialized form because
 /// an operation carries payload types that model no equality of their own.
-pub fn staged_operations_match(left: &[McpMutationOperation], right: &[McpMutationOperation]) -> bool {
+pub fn staged_operations_match(
+    left: &[McpMutationOperation],
+    right: &[McpMutationOperation],
+) -> bool {
     match (serde_json::to_value(left), serde_json::to_value(right)) {
         (Ok(left), Ok(right)) => left == right,
         // A set that cannot be serialized cannot be proven identical, and a

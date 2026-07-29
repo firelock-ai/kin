@@ -766,7 +766,15 @@ delta. A commit refused before anything is published leaves the transaction usab
 operations are cleared and named in the refusal, so re-stage corrected ones on the SAME \
 transaction and commit again; kin_transaction_abort is the clean exit if you would rather \
 abandon it. An optional operations array may stage and commit in one call and uses the same \
-payload-less source-edit or structured payload operation shapes as kin_transaction_stage.";
+payload-less source-edit or structured payload operation shapes as kin_transaction_stage; it \
+commits with identical durability, so a success naming modified_files means the body reached the \
+file, and re-sending the same array after an interrupted commit resumes it rather than staging it \
+twice. New source text is carried ONLY by `body`: an operation naming it anything else is refused \
+with the unknown field named, never accepted with the source dropped. A refusal ends with a \
+one-line JSON object carrying schema, code, and the operations it names, so you can branch on the \
+code instead of reading the sentence. On success the change is attributed to the calling session: \
+its vendor and client name become the change author and a queryable audit record, so \
+kin_provenance_query, kin history, and kin blame all name the agent that wrote it.";
 
 fn push_scope_once(scopes: &mut Vec<kin_model::IntentScope>, scope: kin_model::IntentScope) {
     if !scopes.contains(&scope) {
@@ -863,7 +871,11 @@ fn offline_only_uncommittable_operations(operations: &[McpMutationOperation]) ->
                 "a payload-less source update (target plus body)"
             };
             let target = op.target.trim();
-            let target = if target.is_empty() { "(unnamed)" } else { target };
+            let target = if target.is_empty() {
+                "(unnamed)"
+            } else {
+                target
+            };
             format!(
                 "operation #{idx} ('{}'): {shape} for target '{target}' requires the daemon \
                  commit path, which plans the exact span edit and projects the new source into \

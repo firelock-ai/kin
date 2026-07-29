@@ -3374,6 +3374,109 @@ mod tests {
         assert_eq!(sessions.get_transaction(&tx_id).unwrap().state, "active");
     }
 
+    /// Across every operation shape, a commit either persists the content it
+    /// was handed or refuses; it never reports success having dropped it.
+    ///
+    /// This is the invariant, stated once over the whole shape matrix rather
+    /// than one shape at a time. On this path, which has no projection, the
+    /// dividing line is simply whether the operation carries source text: if it
+    /// does, the commit refuses, and if it does not, the commit applies
+    /// everything the operation carried. Nothing lands in between.
+    #[tokio::test]
+    async fn no_commit_shape_reports_success_while_dropping_content() {
+        use crate::session::{McpMutationOperation, McpMutationPayload};
+
+        struct Shape {
+            label: &'static str,
+            body: Option<&'static str>,
+            with_payload: bool,
+        }
+        let shapes = [
+            Shape {
+                label: "payload-less source edit",
+                body: Some("pub fn value() -> u8 { 2 }"),
+                with_payload: false,
+            },
+            Shape {
+                label: "entity payload plus source edit",
+                body: Some("pub fn value() -> u8 { 2 }"),
+                with_payload: true,
+            },
+            Shape {
+                label: "entity payload alone",
+                body: None,
+                with_payload: true,
+            },
+        ];
+
+        for shape in shapes {
+            let store = InMemoryGraph::default();
+            let entity = placement_free_entity("value");
+            store.upsert_entity(&entity).unwrap();
+
+            let sessions = SessionRegistry::new();
+            sessions.set_coordination_mode(crate::session::CoordinationEnforcementMode::Warn);
+            let session_authority = SessionAuthorityMode::OfflineFallback;
+            let tx_id = begin_offline_transaction(&sessions, "offline-shape-matrix").await;
+
+            let mut updated = entity.clone();
+            updated.doc_summary = Some("returns the configured value".into());
+            let op = McpMutationOperation {
+                verb: "update".into(),
+                target: entity.id.to_string(),
+                payload: shape
+                    .with_payload
+                    .then(|| McpMutationPayload::Entity(updated)),
+                body: shape.body.map(str::to_string),
+                description: shape.label.into(),
+            };
+            let mut commit_args = HashMap::new();
+            commit_args.insert("transaction_id".into(), serde_json::json!(tx_id));
+            commit_args.insert("operations".into(), serde_json::json!(vec![op]));
+            let commit_res = sessions::handle_transaction_commit(
+                &commit_args,
+                &store,
+                &sessions,
+                session_authority,
+            )
+            .await
+            .unwrap();
+
+            let text = tool_result_text(&commit_res);
+            let applied = store
+                .get_entity(&entity.id)
+                .unwrap()
+                .unwrap()
+                .doc_summary
+                .is_some();
+            if shape.body.is_some() {
+                assert_eq!(
+                    commit_res.is_error,
+                    Some(true),
+                    "{}: a body this path cannot write must refuse: {text}",
+                    shape.label
+                );
+                assert!(
+                    !applied,
+                    "{}: a refusal must apply no part of the operation",
+                    shape.label
+                );
+            } else {
+                assert_ne!(
+                    commit_res.is_error,
+                    Some(true),
+                    "{}: a body-free operation must still commit: {text}",
+                    shape.label
+                );
+                assert!(
+                    applied,
+                    "{}: a reported commit must have applied its payload",
+                    shape.label
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn handle_transaction_stage_rejects_malformed_op_at_stage_time() {
         // D.7 Track A: a payload-less operation must fail loud at stage time —
