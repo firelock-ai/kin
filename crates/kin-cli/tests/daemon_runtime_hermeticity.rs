@@ -420,6 +420,18 @@ fn runtime_command_rebinds_git_and_kin_authority_at_launch() {
         Some(Some(OsString::from("1"))),
         "command-local process-group capability replaced the isolated runtime"
     );
+    assert_eq!(
+        command.configured_env_for_test(std::ffi::OsStr::new("KIN_DAEMON_SHUTDOWN_GRACE_SECS")),
+        Some(Some(OsString::from("3"))),
+        "isolated runtime lost its bounded daemon shutdown grace"
+    );
+    assert_eq!(
+        command.configured_env_for_test(std::ffi::OsStr::new(
+            "KIN_DAEMON_RUNTIME_SHUTDOWN_GRACE_SECS"
+        )),
+        Some(Some(OsString::from("1"))),
+        "isolated runtime lost its bounded tokio shutdown grace"
+    );
 }
 
 #[test]

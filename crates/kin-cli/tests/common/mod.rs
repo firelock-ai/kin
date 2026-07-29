@@ -847,6 +847,13 @@ impl IsolatedDaemonRuntime {
             .env("KIN_VFS_DISABLE", "1")
             .env("KIN_DAEMON_IDLE_TIMEOUT_SECS", "1")
             .env("KIN_SUPERVISOR_IDLE_TIMEOUT_SECS", "1")
+            // Production deliberately allows ~18s for graceful daemon
+            // shutdown and force-exits after ~25s. Integration cleanup has a
+            // tighter independent bound, so use the daemon's supported grace
+            // controls instead of assuming LSP/enrichment work will drain in
+            // under the CLI's five-second stop window.
+            .env("KIN_DAEMON_SHUTDOWN_GRACE_SECS", "3")
+            .env("KIN_DAEMON_RUNTIME_SHUTDOWN_GRACE_SECS", "1")
             // `daemon stop --all` can wait once per worker and once for the
             // supervisor. Keep both waits below Drop's independent wall cap.
             .env("KIN_DAEMON_STOP_TIMEOUT_SECS", "5");
