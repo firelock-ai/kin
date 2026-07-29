@@ -2526,6 +2526,77 @@ mod tests {
             .contains("searchDirs: string[]"));
     }
 
+    /// An agent restricted to the agent-default profile must be able to read an
+    /// entity's real source through a tool that profile actually exposes.
+    ///
+    /// The profile ships the transaction write surface, so this is the difference
+    /// between an agent that can complete a body update and one that has to guess
+    /// the source it is replacing. Membership is asserted in `tools.rs`; this
+    /// drives the in-profile tools against a graph-backed entity and checks that
+    /// real bytes come back.
+    #[test]
+    fn the_agent_default_profile_can_read_a_real_entity_body() {
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let content = "export function validate_probe_range_1d8f8275(value: number, maxVal: number): boolean {\n  return value <= maxVal;\n}\n";
+        let source = make_source_backed_entity(content);
+        let entity = &source.entity;
+
+        let mut store = EmptyStore::default();
+        store.entities_by_id.insert(entity.id, entity.clone());
+        store
+            .file_hashes
+            .insert(entity.file_origin.clone().unwrap(), source.hash);
+        install_empty_store_exact_tree(&mut store, source._dir.path());
+        let authority = test_repository_authority(source._dir.path());
+        let sessions = SessionRegistry::new();
+        let args = HashMap::from([(
+            "entity_id".to_string(),
+            serde_json::json!(entity.id.to_string()),
+        )]);
+
+        // Every body-shaped tool the profile carries, driven for real.
+        let profile: std::collections::HashSet<&str> = crate::tools::agent_default_tool_names()
+            .iter()
+            .copied()
+            .collect();
+        let mut served: Vec<&str> = Vec::new();
+
+        if profile.contains("get_entity_source") {
+            let value = tool_result_json(
+                entities::handle_get_entity_source(&args, &store, Some(&authority)).unwrap(),
+            );
+            assert!(
+                value["body"]
+                    .as_str()
+                    .is_some_and(|body| body.contains("return value <= maxVal;")),
+                "get_entity_source must serve the real body: {value}"
+            );
+            served.push("get_entity_source");
+        }
+
+        if profile.contains("get_context_pack") {
+            let value = tool_result_json(
+                entities::handle_get_context_pack(&args, &store, &sessions, Some(&authority))
+                    .unwrap(),
+            );
+            assert!(
+                value["focal_entity"]["body"]
+                    .as_str()
+                    .is_some_and(|body| body.contains("return value <= maxVal;")),
+                "get_context_pack focal body must serve the real body: {value}"
+            );
+            served.push("get_context_pack");
+        }
+
+        assert!(
+            !served.is_empty(),
+            "the agent-default profile must expose at least one working body read"
+        );
+    }
+
     /// Stand-in for the context builder's token-accounting projection, so the
     /// tests above assert against the exact text that used to leak into `body`.
     fn project_full_body_stub(entity: &Entity) -> String {
