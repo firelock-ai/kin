@@ -67,10 +67,8 @@
         "if sibling.exists()",
         "if target_sibling.exists()",
         "if candidate.exists()",
-        "std::process::Command::new(&daemon_bin)",
         "cmd.stdout(std::process::Stdio::null());",
-        "cmd.stderr(std::process::Stdio::null());",
-        "use std::os::unix::process::CommandExt;"
+        "cmd.stderr(std::process::Stdio::null());"
       ]
     },
     {
@@ -167,6 +165,12 @@
       "allow_match": [
         "use std::process::ExitCode;"
       ]
+    },
+    {
+      "file": "crates/kin-daemon-spawn/src/lib.rs",
+      "reason": "Daemon process lifecycle IO boundary end to end (spawn plan, port record, disposition, registrar); zero answer-authority surface. Every filesystem and subprocess primitive here reaches or supervises the daemon that holds graph authority, never answers in its place, and no query result derives from any of them. Exempt whole-file rather than pinned because the process handle signatures repeat, which an exactly-once allow_match cannot express. lib.rs is the crate's only module, so a later-added module is scanned by default: re-review this exemption when a second .rs file joins the crate",
+      "owner": "kin-daemon-spawn",
+      "expiration": "2026-12-31"
     }
   ]
 }
