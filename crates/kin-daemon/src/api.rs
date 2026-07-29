@@ -117,11 +117,15 @@ fn repository_authority_error(error: impl std::fmt::Display) -> (StatusCode, Str
 /// KinDB's commit record for one local repository's durable publication.
 ///
 /// KinDB stages snapshot and delta bodies, fsyncs them, and then atomically
-/// replaces this one record; that rename is the commit point. The record names
-/// the base and head generations and the digest of the snapshot bytes they
-/// describe, so its exact contents identify one publication and nothing else.
-/// Generations only ever advance, so a record that reads identically twice
-/// cannot have moved and returned in between.
+/// replaces this one record; that rename is the commit point. The record
+/// content-binds the snapshot digest and every acknowledged delta digest under
+/// deterministic serialization, so identical record bytes mean identical
+/// durable state by construction, and a record that reads identically twice
+/// cannot have moved and returned in between. The converse does not hold: a
+/// rewrite is not always a new publication, because opening a legacy store can
+/// re-mint this record once while binding validation state. With the label read
+/// before the load it describes, that costs one spurious reload and never a
+/// stale serve.
 const AUTHORITY_PUBLICATION_RECORD: &str = "authority.json";
 
 /// KinDB reads its own record under a 1 MiB bound. A larger file at that path
