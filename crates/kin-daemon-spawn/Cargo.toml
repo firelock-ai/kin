@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+
+[package]
+name = "kin-daemon-spawn"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared contract for starting a repo daemon and learning the port it bound"
+repository.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+pretty_assertions = { workspace = true }

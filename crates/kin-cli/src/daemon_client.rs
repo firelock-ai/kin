@@ -1646,6 +1646,14 @@ pub struct ProcessIdentity {
     birth_token: String,
 }
 
+impl ProcessIdentity {
+    /// The PID this identity names. Only a lookup key on its own — compare
+    /// whole identities to decide whether it is still the same process.
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
+}
+
 impl ProcessLiveness {
     /// Compatibility view for callers that only need a conservative boolean.
     ///
@@ -1798,7 +1806,7 @@ fn stable_boot_identity() -> std::io::Result<String> {
     }
 }
 
-fn process_identity(pid: u32) -> std::io::Result<Option<ProcessIdentity>> {
+pub fn process_identity(pid: u32) -> std::io::Result<Option<ProcessIdentity>> {
     let liveness = process_liveness(pid);
     if liveness == ProcessLiveness::Dead {
         return Ok(None);
@@ -1930,7 +1938,7 @@ fn process_identity(pid: u32) -> std::io::Result<Option<ProcessIdentity>> {
     }
 }
 
-fn current_process_identity() -> std::io::Result<ProcessIdentity> {
+pub fn current_process_identity() -> std::io::Result<ProcessIdentity> {
     process_identity(std::process::id())?.ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::NotFound,
@@ -1939,7 +1947,7 @@ fn current_process_identity() -> std::io::Result<ProcessIdentity> {
     })
 }
 
-fn process_identity_is_current(identity: &ProcessIdentity) -> std::io::Result<bool> {
+pub fn process_identity_is_current(identity: &ProcessIdentity) -> std::io::Result<bool> {
     Ok(process_identity(identity.pid)?.as_ref() == Some(identity))
 }
 
@@ -2615,10 +2623,12 @@ fn read_pid_file(kin_root: &Path) -> Option<u32> {
         .and_then(|s| s.trim().parse().ok())
 }
 
+/// Read the port the daemon published for this repo.
+///
+/// Delegates to the shared spawn contract so the CLI and MCP paths cannot
+/// disagree about what counts as a published port.
 fn read_port_file(kin_root: &Path) -> Option<u16> {
-    std::fs::read_to_string(repo_daemon_port_path(kin_root))
-        .ok()
-        .and_then(|s| s.trim().parse().ok())
+    kin_daemon_spawn::read_reported_port(kin_root)
 }
 
 /// The (pid, port) recorded for the current repo's worker daemon, read from its
@@ -2891,10 +2901,10 @@ fn default_idle_timeout_secs() -> &'static str {
 
 /// Idle timeout (seconds) for MCP-initiated daemon autostarts: 30 minutes.
 ///
-/// Mirrors `kin_daemon::lifecycle::MCP_IDLE_TIMEOUT_SECS`; keep both in sync
-/// at "1800". kin-cli does not take a direct dep on kin-daemon, so the value
-/// is repeated here with an explicit cross-reference as the guard.
-const MCP_IDLE_TIMEOUT_SECS: &str = "1800";
+/// Defined once in the shared spawn contract, which both this path and the MCP
+/// revival path start daemons through. It used to be a literal repeated in each
+/// crate with a comment asking future readers to keep them in sync.
+const MCP_IDLE_TIMEOUT_SECS: &str = kin_daemon_spawn::MCP_IDLE_TIMEOUT_SECS;
 
 /// Pure env-assembly for the daemon's idle timeout, mirroring
 /// `kin_daemon::lifecycle::resolve_idle_timeout_env`.
@@ -4182,12 +4192,27 @@ async fn wait_for_daemon_ready(
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 
-    let _ = child.kill();
-    let _ = child.wait();
+    // The deadline measures this caller's patience, not the daemon's health.
+    // Killing here used to be unconditional, which meant a daemon still loading
+    // a large graph was destroyed for being slow — and its replacement started
+    // from cold and hit the same deadline. Endpoint probing already settled
+    // this: only positive evidence of death authorizes destruction. A daemon
+    // proven gone is reaped; a live one is left holding its repo, and the next
+    // invocation finds it through the ordinary escalating-patience path.
+    let disposition = kin_daemon_spawn::startup_disposition(child)
+        .unwrap_or(kin_daemon_spawn::StartupDisposition::Indeterminate);
+    let reaped = kin_daemon_spawn::terminate_if_proven_dead(child, &disposition);
+    let fate = if reaped {
+        "it had already exited and was reaped"
+    } else {
+        "it is still running and was left alone rather than killed for being slow; \
+         wait for it, or stop it with `kin daemon stop`"
+    };
     bail!(
-        "daemon failed to become ready within {:.1}s: {}; recent log:\n{}",
+        "daemon failed to become ready within {:.1}s: {}; {}; recent log:\n{}",
         timeout.as_secs_f64(),
         last_error,
+        fate,
         daemon_log_tail_since(kin_root, log_offset)
     )
 }
@@ -5049,6 +5074,46 @@ fn is_connection_error(err: &reqwest::Error) -> bool {
     err.is_connect() || err.is_request() || err.is_timeout()
 }
 
+/// Supervisor access published to whichever crate is starting a daemon.
+///
+/// Supervisor startup and registration live here, and `kin-mcp` cannot call
+/// this crate: `kin-cli` already depends on `kin-mcp`. So the MCP revival path
+/// started daemons the supervisor never learned about, leaving them out of its
+/// routing table and unreachable to every other client. Installing this seam
+/// gives that path the same registration this one performs.
+struct CliSpawnRegistrar;
+
+impl kin_daemon_spawn::DaemonSpawnRegistrar for CliSpawnRegistrar {
+    fn supervisor_url(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send>> {
+        Box::pin(async { ensure_supervisor_running().await.ok() })
+    }
+
+    fn register(
+        &self,
+        kin_root: PathBuf,
+        daemon_url: String,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>> {
+        Box::pin(async move {
+            let supervisor_url = ensure_supervisor_running()
+                .await
+                .map_err(|error| format!("{error:#}"))?;
+            register_repo_daemon_with_supervisor(&kin_root, &daemon_url, &supervisor_url)
+                .await
+                .map_err(|error| format!("{error:#}"))
+        })
+    }
+}
+
+/// Publish this crate's supervisor access to every daemon spawn in this
+/// process, including spawns made from crates that cannot depend on it.
+///
+/// Idempotent: the first installation wins.
+pub fn install_spawn_registrar() {
+    kin_daemon_spawn::install_registrar(std::sync::Arc::new(CliSpawnRegistrar));
+}
+
 pub async fn ensure_daemon_running(kin_root: &Path) -> Result<String> {
     ensure_daemon_running_with_idle_timeout(kin_root, None).await
 }
@@ -5064,6 +5129,7 @@ pub async fn ensure_daemon_running_with_idle_timeout(
     kin_root: &Path,
     idle_timeout_override: Option<&'static str>,
 ) -> Result<String> {
+    install_spawn_registrar();
     let supervisor_url = ensure_supervisor_running()
         .await
         .context("kin supervisor is required")?;
@@ -5111,9 +5177,15 @@ pub async fn ensure_daemon_running_with_idle_timeout(
 
     info!(binary = %daemon_bin.display(), repo = %working_dir.display(), "starting daemon (OS-assigned port)");
 
-    let mut cmd = std::process::Command::new(&daemon_bin);
+    let user_timeout_set = std::env::var_os("KIN_DAEMON_IDLE_TIMEOUT_SECS").is_some();
+    let plan = kin_daemon_spawn::DaemonSpawnPlan {
+        daemon_bin,
+        working_dir: working_dir.to_path_buf(),
+        idle_timeout_secs: resolve_idle_timeout_env(user_timeout_set, idle_timeout_override),
+        supervisor_url: Some(supervisor_url.clone()),
+    };
+    let mut cmd = plan.command();
     scrub_daemon_process_authority(&mut cmd);
-    cmd.args(["--repo", &working_dir.display().to_string(), "--port", "0"]);
     let log_offset = daemon_log_len(kin_root);
     let log = open_daemon_log(kin_root)?;
     let stderr = log
@@ -5121,22 +5193,6 @@ pub async fn ensure_daemon_running_with_idle_timeout(
         .context("clone daemon log handle for stderr")?;
     cmd.stdout(Stdio::from(log));
     cmd.stderr(Stdio::from(stderr));
-    let user_timeout_set = std::env::var_os("KIN_DAEMON_IDLE_TIMEOUT_SECS").is_some();
-    if let Some(timeout) = resolve_idle_timeout_env(user_timeout_set, idle_timeout_override) {
-        cmd.env("KIN_DAEMON_IDLE_TIMEOUT_SECS", timeout);
-    }
-    cmd.env("KIN_SUPERVISOR_URL", &supervisor_url);
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        unsafe {
-            cmd.pre_exec(|| {
-                libc::setsid();
-                Ok(())
-            });
-        }
-    }
 
     let mut child = cmd
         .spawn()
@@ -7302,6 +7358,56 @@ mod tests {
 
         assert!(startup_lock_is_stale(&lock, Duration::ZERO));
         assert!(!startup_lock_is_stale(&lock, Duration::from_secs(60)));
+    }
+
+    // ── startup deadline is patience, not a death sentence ─────────────────
+    //
+    // The ready-wait used to SIGKILL its child the moment the deadline passed,
+    // with no check that anything was wrong with it. A daemon loading a large
+    // graph was killed for being slow, and its replacement started cold and hit
+    // the same deadline.
+
+    #[tokio::test]
+    async fn a_daemon_still_running_at_the_deadline_is_not_killed() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn a long-lived stand-in for a slow daemon");
+
+        let disposition = kin_daemon_spawn::startup_disposition(&mut child)
+            .expect("a child we spawned is observable");
+        assert_eq!(disposition, kin_daemon_spawn::StartupDisposition::Alive);
+        assert!(
+            !kin_daemon_spawn::terminate_if_proven_dead(&mut child, &disposition),
+            "a live daemon must survive its caller's deadline"
+        );
+        assert!(
+            child.try_wait().expect("still observable").is_none(),
+            "the child must still be running after the deadline elapsed"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[tokio::test]
+    async fn a_daemon_that_already_exited_is_reaped() {
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn a child that exits immediately");
+        // Let it actually exit before classifying.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let disposition = kin_daemon_spawn::startup_disposition(&mut child)
+            .expect("a child we spawned is observable");
+        assert!(
+            matches!(disposition, kin_daemon_spawn::StartupDisposition::Exited(_)),
+            "an exited child is positive evidence: {disposition:?}"
+        );
+        assert!(
+            kin_daemon_spawn::terminate_if_proven_dead(&mut child, &disposition),
+            "a dead child is reaped rather than left as a zombie"
+        );
     }
 
     // ── idle-timeout env-assembly ──────────────────────────────────────────

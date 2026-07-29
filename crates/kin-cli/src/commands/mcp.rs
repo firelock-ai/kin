@@ -97,6 +97,11 @@ pub async fn start(global: bool, repo: Option<PathBuf>) -> Result<()> {
         },
     ));
 
+    // The MCP server revives dead repo daemons itself, from a crate that cannot
+    // reach supervisor startup or registration. Publish them before serving so
+    // a revived daemon joins supervisor routing like an autostarted one.
+    crate::daemon_client::install_spawn_registrar();
+
     kin_mcp::run_stdio_daemon(config, repo_binder)
         .await
         .map_err(|e| anyhow::anyhow!("MCP server error: {}", e))?;

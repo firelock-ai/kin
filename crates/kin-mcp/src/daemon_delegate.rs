@@ -94,19 +94,36 @@ fn daemon_base_url() -> Option<String> {
 /// 30 minutes gives ample headroom while still ensuring eventual cleanup when
 /// an agent session is truly abandoned.  An explicit
 /// `KIN_DAEMON_IDLE_TIMEOUT_SECS` env var always overrides this at runtime.
-const MCP_IDLE_TIMEOUT_SECS: &str = "1800";
+const MCP_IDLE_TIMEOUT_SECS: &str = kin_daemon_spawn::MCP_IDLE_TIMEOUT_SECS;
 
 /// Idle timeout to inject into a revival-spawned daemon, or `None` to inject
 /// nothing.
 ///
-/// Mirrors `kin_cli::daemon_client::resolve_idle_timeout_env` and
-/// `kin_daemon::lifecycle::resolve_idle_timeout_env`: a user-set
-/// `KIN_DAEMON_IDLE_TIMEOUT_SECS` propagates to the child on its own and must
-/// never be overwritten, so this returns `None` in that case. Factored out of
-/// the spawn path so the precedence is unit-testable without spawning a
-/// process.
+/// A user-set `KIN_DAEMON_IDLE_TIMEOUT_SECS` propagates to the child on its own
+/// and must never be overwritten, so this returns `None` in that case. The
+/// precedence itself lives in `kin_daemon_spawn` so the CLI autostart path and
+/// this one cannot disagree about it.
 fn mcp_spawn_idle_timeout(user_env_is_set: bool) -> Option<&'static str> {
-    (!user_env_is_set).then_some(MCP_IDLE_TIMEOUT_SECS)
+    kin_daemon_spawn::resolve_idle_timeout(user_env_is_set, Some(MCP_IDLE_TIMEOUT_SECS))
+}
+
+/// The spawn plan the revival path starts a daemon from.
+///
+/// Split out so the contract this path once diverged from is assertable without
+/// spawning anything: no port is chosen here, so there is no port to hardcode.
+fn mcp_spawn_plan(
+    daemon_bin: std::path::PathBuf,
+    working_dir: std::path::PathBuf,
+    supervisor_url: Option<String>,
+) -> kin_daemon_spawn::DaemonSpawnPlan {
+    kin_daemon_spawn::DaemonSpawnPlan {
+        daemon_bin,
+        working_dir,
+        idle_timeout_secs: mcp_spawn_idle_timeout(
+            std::env::var_os("KIN_DAEMON_IDLE_TIMEOUT_SECS").is_some(),
+        ),
+        supervisor_url,
+    }
 }
 
 // ── Unrecoverable-daemon error class ────────────────────────────────────
@@ -608,19 +625,20 @@ fn find_mcp_daemon_binary() -> Option<std::path::PathBuf> {
     None
 }
 
-fn find_mcp_free_port() -> Option<u16> {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .ok()
-        .and_then(|l| l.local_addr().ok())
-        .map(|a| a.port())
-}
-
 /// Spawn a fresh daemon and wait for it to pass `/health`.
 ///
 /// Uses the MCP-path idle timeout (30 min) unless the user has set
 /// `KIN_DAEMON_IDLE_TIMEOUT_SECS` explicitly.  On success, writes the new
 /// base URL into [`DAEMON_URL_OVERRIDE`] so all subsequent delegate calls
 /// are routed to the revived daemon automatically.
+///
+/// Every decision about *how* the daemon is started belongs to
+/// [`kin_daemon_spawn`], which the CLI autostart path uses too. This path once
+/// carried its own copy and drifted from it twice: it reserved a port and
+/// passed the number (reopening the reserve-release-rebind race the port file
+/// exists to close), fell back to a hardcoded port when reservation failed,
+/// never cleared a stale port record, and never registered the daemon it
+/// started with the supervisor.
 async fn revive_mcp_daemon() -> Result<String, String> {
     // Serialize revival across concurrent tool calls. Every forwarded request
     // now reaches this path, so a dead daemon can be observed by several calls
@@ -646,42 +664,36 @@ async fn revive_mcp_daemon() -> Result<String, String> {
     let daemon_bin = find_mcp_daemon_binary().ok_or_else(|| {
         "MCP revival: kin-daemon binary not found (not in PATH or next to kin binary)".to_string()
     })?;
-    let port = find_mcp_free_port().unwrap_or(4219);
+
+    // A port record with no PID owner beside it belongs to a daemon that is
+    // already gone. Left in place, the port we are about to read back would be
+    // its port, not the new daemon's.
+    kin_daemon_spawn::clear_orphaned_port_record(&kin_dir);
+
+    let supervisor_url = kin_daemon_spawn::supervisor_url_for_spawn().await;
+    let plan = mcp_spawn_plan(daemon_bin, working_dir.clone(), supervisor_url);
 
     tracing::info!(
-        binary = %daemon_bin.display(),
+        binary = %plan.daemon_bin.display(),
         repo = %working_dir.display(),
-        port,
-        "MCP revival: starting fresh daemon"
+        "MCP revival: starting fresh daemon (daemon-assigned port)"
     );
 
-    let mut cmd = std::process::Command::new(&daemon_bin);
-    cmd.args([
-        "--repo",
-        &working_dir.display().to_string(),
-        "--port",
-        &port.to_string(),
-    ]);
+    let mut cmd = plan.command();
     cmd.stdout(std::process::Stdio::null());
     cmd.stderr(std::process::Stdio::null());
-    // Inject the MCP-path idle timeout unless the user has an explicit
-    // override in the environment — user's value always wins.
-    if let Some(timeout) =
-        mcp_spawn_idle_timeout(std::env::var_os("KIN_DAEMON_IDLE_TIMEOUT_SECS").is_some())
-    {
-        cmd.env("KIN_DAEMON_IDLE_TIMEOUT_SECS", timeout);
-    }
-    #[cfg(unix)]
-    unsafe {
-        use std::os::unix::process::CommandExt;
-        cmd.pre_exec(|| {
-            libc::setsid();
-            Ok(())
-        });
-    }
-
-    cmd.spawn()
+    let mut child = cmd
+        .spawn()
         .map_err(|e| format!("MCP revival: spawn kin-daemon failed: {e}"))?;
+
+    // The daemon binds :0 and publishes the port it actually got. There is no
+    // fallback: a revival that cannot learn the real port has no daemon to
+    // talk to, and addressing a default port would reach whatever else is
+    // listening there.
+    let port_deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let port = kin_daemon_spawn::await_reported_port(&kin_dir, &mut child, port_deadline)
+        .await
+        .map_err(|e| format!("MCP revival: {e}"))?;
 
     // Poll /health until the daemon is ready (bounded at 15 s).
     let new_base = format!("http://127.0.0.1:{port}");
@@ -692,13 +704,19 @@ async fn revive_mcp_daemon() -> Result<String, String> {
         .map_err(|e| format!("MCP revival: build probe client: {e}"))?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     loop {
-        if tokio::time::Instant::now() >= deadline {
-            return Err(format!(
-                "MCP revival: daemon did not become healthy within 15s (port {port})"
-            ));
-        }
         if let Ok(resp) = probe.get(format!("{new_base}/health")).send().await {
             if resp.status().is_success() {
+                // A daemon the supervisor does not know about is unroutable to
+                // every other client, so registration is part of starting one.
+                if let Err(error) =
+                    kin_daemon_spawn::register_started_daemon(&kin_dir, &new_base).await
+                {
+                    tracing::warn!(
+                        url = %new_base,
+                        %error,
+                        "MCP revival: daemon is healthy but supervisor registration failed"
+                    );
+                }
                 // Route all subsequent delegate calls at the revived daemon.
                 if let Ok(mut guard) = DAEMON_URL_OVERRIDE.lock() {
                     *guard = Some(new_base.clone());
@@ -706,6 +724,22 @@ async fn revive_mcp_daemon() -> Result<String, String> {
                 tracing::info!(url = %new_base, "MCP revival: daemon is healthy");
                 return Ok(new_base);
             }
+        }
+
+        // The child reporting a port then failing to serve is still a startup
+        // in progress; only its death is evidence against it.
+        if let Ok(disposition) = kin_daemon_spawn::startup_disposition(&mut child) {
+            if let kin_daemon_spawn::StartupDisposition::Exited(status) = disposition {
+                return Err(format!(
+                    "MCP revival: daemon exited during startup with status {status} (port {port})"
+                ));
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "MCP revival: daemon did not become healthy within 15s (port {port}); it was left \
+                 running rather than killed"
+            ));
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -2103,6 +2137,67 @@ mod tests {
             mcp_spawn_idle_timeout(true),
             None,
             "a user-set KIN_DAEMON_IDLE_TIMEOUT_SECS must never be overwritten"
+        );
+    }
+
+    // ── Revival spawn contract ─────────────────────────────────────────────
+    //
+    // This path used to reserve a port itself, pass the number, and fall back
+    // to a hardcoded 4219 when reservation failed. Both are gone: the daemon
+    // binds and reports, and the port comes back off the port file.
+
+    #[test]
+    fn revival_lets_the_daemon_choose_its_port() {
+        let plan = mcp_spawn_plan(
+            std::path::PathBuf::from("/usr/bin/kin-daemon"),
+            std::path::PathBuf::from("/repo"),
+            None,
+        );
+        let cmd = plan.command();
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+
+        assert_eq!(
+            args,
+            vec!["--repo", "/repo", "--port", "0"],
+            "revival must pass --port 0, not a port it reserved and released"
+        );
+        assert!(
+            !args.contains(&"4219".to_string()),
+            "no hardcoded fallback port may reach the daemon: {args:?}"
+        );
+    }
+
+    #[test]
+    fn revival_reads_the_port_the_daemon_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        // The port file is the handshake; nothing else names the port.
+        assert_eq!(kin_daemon_spawn::read_reported_port(dir.path()), None);
+        std::fs::write(dir.path().join(kin_daemon_spawn::PORT_FILE_NAME), "51234\n").unwrap();
+        assert_eq!(
+            kin_daemon_spawn::read_reported_port(dir.path()),
+            Some(51234)
+        );
+    }
+
+    #[test]
+    fn revival_passes_a_supervisor_url_through_to_the_daemon() {
+        let plan = mcp_spawn_plan(
+            std::path::PathBuf::from("/usr/bin/kin-daemon"),
+            std::path::PathBuf::from("/repo"),
+            Some("http://127.0.0.1:9100".to_string()),
+        );
+        let cmd = plan.command();
+        let has_supervisor = cmd.get_envs().any(|(k, v)| {
+            k == "KIN_SUPERVISOR_URL"
+                && v.map(|v| v.to_string_lossy().to_string())
+                    == Some("http://127.0.0.1:9100".to_string())
+        });
+        assert!(
+            has_supervisor,
+            "a revived daemon must be told where its supervisor is"
         );
     }
 

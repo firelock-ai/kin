@@ -3085,6 +3085,7 @@ dependencies = [
  "kin-buildinfo",
  "kin-context",
  "kin-core",
+ "kin-daemon-spawn",
  "kin-db",
  "kin-git",
  "kin-index",
@@ -3200,6 +3201,7 @@ dependencies = [
  "kin-buildinfo",
  "kin-cli",
  "kin-core",
+ "kin-daemon-spawn",
  "kin-db",
  "kin-git",
  "kin-index",
@@ -3234,6 +3236,17 @@ dependencies = [
  "uuid",
  "which 8.0.4",
  "zip",
+]
+
+[[package]]
+name = "kin-daemon-spawn"
+version = "0.3.6"
+dependencies = [
+ "libc",
+ "pretty_assertions",
+ "tempfile",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -3397,6 +3410,7 @@ dependencies = [
  "kin-blobs",
  "kin-context",
  "kin-core",
+ "kin-daemon-spawn",
  "kin-db",
  "kin-git",
  "kin-model",
