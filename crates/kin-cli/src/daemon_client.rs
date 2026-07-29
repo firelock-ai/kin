@@ -14,12 +14,13 @@ use serde::Deserialize;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
+use uuid::Uuid;
 
 static BUILD_MISMATCH_REPORTED: AtomicBool = AtomicBool::new(false);
 
@@ -45,6 +46,7 @@ const DAEMON_AMBIENT_AUTHORITY_ENV: &[&str] = &[
     "KIN_SESSION_DIR",
     "KIN_DAEMON_URL",
     "KIN_DAEMON_WATCH_PID",
+    SUPERVISOR_STARTUP_GENERATION_ENV,
     "KIN_REPO_ID",
     "KIN_REPO_IDS",
     "KIN_PRIMARY_REPO_ID",
@@ -2101,6 +2103,11 @@ const SUPERVISOR_PORT_FILE: &str = "supervisor.port";
 const SUPERVISOR_LIFECYCLE_FILE: &str = "supervisor.lifecycle";
 const SUPERVISOR_SINGLETON_FILE: &str = "supervisor.lock";
 const SUPERVISOR_STARTUP_FILE: &str = "supervisor.start.lock";
+/// Internal handoff from the current CLI launcher to the supervisor child.
+///
+/// This is scrubbed from every daemon command and set only on a supervisor
+/// spawn. It names the exact startup-lock generation the child must adopt.
+pub const SUPERVISOR_STARTUP_GENERATION_ENV: &str = "KIN_SUPERVISOR_STARTUP_GENERATION";
 
 /// Path to the per-user supervisor pid file (under the Kin registry directory).
 pub fn supervisor_pid_path() -> PathBuf {
@@ -2116,12 +2123,12 @@ pub fn supervisor_port_path() -> PathBuf {
 /// supervisor stop so a later `status` never reports the dead endpoint as stale.
 pub fn remove_stale_supervisor_files() {
     let dir = supervisor_dir();
-    let startup_authority = match try_acquire_supervisor_startup_lock_in_dir(&dir) {
+    let startup_authority = match try_acquire_supervisor_startup_lock_for_cleanup(&dir) {
         Ok(authority) => authority,
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             warn!(
                 dir = %dir.display(),
-                "preserving supervisor endpoint because legacy startup authority is held"
+                "preserving supervisor endpoint because cross-version startup authority is held"
             );
             return;
         }
@@ -2129,7 +2136,7 @@ pub fn remove_stale_supervisor_files() {
             warn!(
                 dir = %dir.display(),
                 %error,
-                "preserving supervisor endpoint because legacy startup authority is unavailable"
+                "preserving supervisor endpoint because cross-version startup authority is unavailable"
             );
             return;
         }
@@ -2154,6 +2161,32 @@ pub fn remove_stale_supervisor_files() {
         None => {
             let _ = retire_supervisor_endpoint_if_unchanged(&dir, recorded, &startup_authority);
         }
+    }
+}
+
+fn try_acquire_supervisor_startup_lock_for_cleanup(
+    dir: &Path,
+) -> std::io::Result<SupervisorStartupLock> {
+    match try_acquire_supervisor_startup_lock_in_dir(dir) {
+        Ok(authority) => Ok(authority),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let path = dir.join(SUPERVISOR_STARTUP_FILE);
+            let (snapshot, record) = supervisor_startup_record_at(&path)?;
+            let Some(record) = record else {
+                return Err(error);
+            };
+            if !process_liveness(record.pid).authorizes_cleanup() {
+                return Err(error);
+            }
+            if !remove_supervisor_startup_lock_if_unchanged(&path, &snapshot)? {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "supervisor startup authority changed during dead-owner cleanup",
+                ));
+            }
+            try_acquire_supervisor_startup_lock_in_dir(dir)
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -2859,26 +2892,200 @@ impl Drop for StartupLock {
     }
 }
 
-/// Proof that this process owns the cross-version supervisor startup
-/// authority for one state directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SupervisorStartupRecord {
+    pid: u32,
+    generation: Option<String>,
+}
+
+fn parse_supervisor_startup_record(content: &str) -> Option<SupervisorStartupRecord> {
+    let mut pid = None;
+    let mut generation = None;
+    for field in content.split_whitespace() {
+        if let Some(value) = field.strip_prefix("pid=") {
+            pid = value.parse::<u32>().ok();
+        } else if let Some(value) = field.strip_prefix("generation=") {
+            generation = (!value.is_empty()).then(|| value.to_string());
+        }
+    }
+    pid.map(|pid| SupervisorStartupRecord { pid, generation })
+}
+
+fn write_supervisor_startup_record(
+    file: &mut File,
+    pid: u32,
+    generation: &str,
+) -> std::io::Result<()> {
+    FileExt::lock_exclusive(file)?;
+    let result = (|| {
+        file.set_len(0)?;
+        file.seek(SeekFrom::Start(0))?;
+        writeln!(
+            file,
+            "pid={pid} generation={generation} heartbeat_at={:?}",
+            std::time::SystemTime::now()
+        )?;
+        file.flush()
+    })();
+    let unlock = FileExt::unlock(file);
+    result.and(unlock)
+}
+
+fn supervisor_startup_record_at(
+    path: &Path,
+) -> std::io::Result<(String, Option<SupervisorStartupRecord>)> {
+    let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+    FileExt::lock_shared(&file)?;
+    let mut content = String::new();
+    let result = file.read_to_string(&mut content);
+    let unlock = FileExt::unlock(&file);
+    result.and(unlock)?;
+    let record = parse_supervisor_startup_record(&content);
+    Ok((content, record))
+}
+
+fn remove_supervisor_startup_lock_if_unchanged(
+    path: &Path,
+    expected: &str,
+) -> std::io::Result<bool> {
+    let current = match supervisor_startup_record_at(path) {
+        Ok((current, _)) => current,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if current != expected {
+        return Ok(false);
+    }
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn remove_supervisor_startup_lock_generation(
+    path: &Path,
+    generation: &str,
+) -> std::io::Result<bool> {
+    let (content, record) = match supervisor_startup_record_at(path) {
+        Ok(record) => record,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if record.and_then(|record| record.generation).as_deref() != Some(generation) {
+        return Ok(false);
+    }
+    remove_supervisor_startup_lock_if_unchanged(path, &content)
+}
+
+/// Generation-bound proof that one startup participant owns the cross-version
+/// supervisor launch authority for one state directory.
 ///
-/// Compatible pre-singleton CLIs use the same create-new lock path and keep it
-/// until their child publishes and passes health. Requiring this token for
-/// endpoint retirement therefore excludes both current publishers (through
-/// lifecycle/singleton locks) and supported legacy publishers (through this
-/// startup lock).
-struct SupervisorStartupLock {
+/// Compatible pre-singleton CLIs use the same create-new pathname. Current
+/// launchers add a generation and transfer that exact generation to the
+/// supervisor child, which keeps the marker present for its entire lifetime.
+/// Every destructive use re-reads the pathname, so an unlinked/replaced token
+/// immediately stops authorizing work and its eventual `Drop` cannot remove a
+/// successor generation.
+#[derive(Debug)]
+pub struct SupervisorStartupLock {
     dir: PathBuf,
-    lock: StartupLock,
+    path: PathBuf,
+    file: File,
+    generation: String,
+    remove_on_drop: bool,
 }
 
 impl SupervisorStartupLock {
     fn path(&self) -> &Path {
-        &self.lock.path
+        &self.path
+    }
+
+    /// Exact generation handed from a launcher to its supervisor child.
+    pub fn generation(&self) -> &str {
+        &self.generation
     }
 
     fn authorizes(&self, dir: &Path) -> bool {
-        self.dir == dir && self.lock.path == dir.join(SUPERVISOR_STARTUP_FILE)
+        if self.dir != dir || self.path != dir.join(SUPERVISOR_STARTUP_FILE) {
+            return false;
+        }
+        supervisor_startup_record_at(&self.path)
+            .ok()
+            .and_then(|(_, record)| record)
+            .and_then(|record| record.generation)
+            .as_deref()
+            == Some(self.generation.as_str())
+    }
+
+    /// Refresh the old-client-visible marker without changing its current
+    /// owner. Returns false if the pathname no longer names this generation.
+    pub fn heartbeat(&mut self) -> std::io::Result<bool> {
+        let Some(record) = supervisor_startup_record_at(&self.path)?.1 else {
+            return Ok(false);
+        };
+        if record.generation.as_deref() != Some(self.generation.as_str()) {
+            return Ok(false);
+        }
+        write_supervisor_startup_record(&mut self.file, record.pid, &self.generation)?;
+        Ok(self.authorizes(&self.dir))
+    }
+
+    /// Refresh this generation while assigning its liveness record to `pid`.
+    /// The launcher uses the spawned child's PID at final handoff; the child
+    /// then keeps stamping its own PID for its process lifetime.
+    pub fn heartbeat_for_pid(&mut self, pid: u32) -> std::io::Result<bool> {
+        if !self.authorizes(&self.dir) {
+            return Ok(false);
+        }
+        write_supervisor_startup_record(&mut self.file, pid, &self.generation)?;
+        Ok(self.authorizes(&self.dir))
+    }
+
+    /// Leave pathname cleanup to the supervisor child that adopted this same
+    /// generation. Used only after that child has answered health.
+    fn handoff_cleanup_to_supervisor(&mut self) {
+        self.remove_on_drop = false;
+    }
+
+    fn adopt_in_dir(dir: &Path, generation: &str) -> std::io::Result<Self> {
+        let path = dir.join(SUPERVISOR_STARTUP_FILE);
+        let record = supervisor_startup_record_at(&path)?.1.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "supervisor startup marker has no parseable owner",
+            )
+        })?;
+        if record.generation.as_deref() != Some(generation) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "supervisor startup generation does not match the launcher handoff",
+            ));
+        }
+        let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
+        write_supervisor_startup_record(&mut file, std::process::id(), generation)?;
+        let authority = Self {
+            dir: dir.to_path_buf(),
+            path,
+            file,
+            generation: generation.to_string(),
+            remove_on_drop: true,
+        };
+        if !authority.authorizes(dir) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "supervisor startup generation changed during child handoff",
+            ));
+        }
+        Ok(authority)
+    }
+}
+
+impl Drop for SupervisorStartupLock {
+    fn drop(&mut self) {
+        if self.remove_on_drop {
+            let _ = remove_supervisor_startup_lock_generation(&self.path, &self.generation);
+        }
     }
 }
 
@@ -2930,48 +3137,99 @@ async fn acquire_startup_lock(kin_root: &Path) -> Result<StartupLock> {
     }
 }
 
-fn try_acquire_supervisor_startup_lock_in_dir(
+/// Create a fresh generation only when the shared startup pathname is absent.
+///
+/// Exposed for the supervisor runtime and cross-version executable tests; normal
+/// callers should use the bounded acquisition path.
+#[doc(hidden)]
+pub fn try_acquire_supervisor_startup_lock_in_dir(
     dir: &Path,
 ) -> std::io::Result<SupervisorStartupLock> {
     std::fs::create_dir_all(dir)?;
     let path = dir.join(SUPERVISOR_STARTUP_FILE);
+    let generation = Uuid::new_v4().to_string();
     let mut file = OpenOptions::new()
+        .read(true)
         .write(true)
         .create_new(true)
         .open(&path)?;
-    let _ = writeln!(
-        file,
-        "pid={} acquired_at={:?}",
-        std::process::id(),
-        std::time::SystemTime::now()
-    );
+    if let Err(error) = write_supervisor_startup_record(&mut file, std::process::id(), &generation)
+    {
+        let _ = std::fs::remove_file(&path);
+        return Err(error);
+    }
     Ok(SupervisorStartupLock {
         dir: dir.to_path_buf(),
-        lock: StartupLock { path, _file: file },
+        path,
+        file,
+        generation,
+        remove_on_drop: true,
     })
 }
 
 async fn acquire_supervisor_startup_lock() -> Result<SupervisorStartupLock> {
     let dir = supervisor_dir();
-    acquire_supervisor_startup_lock_in_dir(&dir).await
+    acquire_supervisor_startup_lock_in_dir_with_timeout(
+        &dir,
+        Duration::from_secs(startup_lock_timeout_secs()),
+    )
+    .await
 }
 
-async fn acquire_supervisor_startup_lock_in_dir(dir: &Path) -> Result<SupervisorStartupLock> {
+async fn acquire_supervisor_startup_lock_in_dir_with_timeout(
+    dir: &Path,
+    timeout: Duration,
+) -> Result<SupervisorStartupLock> {
     std::fs::create_dir_all(dir)
         .with_context(|| format!("create supervisor state directory {}", dir.display()))?;
     let path = dir.join(SUPERVISOR_STARTUP_FILE);
-    let timeout = Duration::from_secs(startup_lock_timeout_secs());
-    let stale_after = timeout.saturating_mul(2).max(Duration::from_secs(10));
     let deadline = Instant::now() + timeout;
+    let mut reported_unparseable_owner = false;
 
     loop {
         match try_acquire_supervisor_startup_lock_in_dir(dir) {
             Ok(authority) => return Ok(authority),
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                if startup_lock_is_stale(&path, stale_after) {
-                    warn!(path = %path.display(), "removing stale supervisor startup lock");
-                    let _ = std::fs::remove_file(&path);
-                    continue;
+                match supervisor_startup_record_at(&path) {
+                    Ok((snapshot, Some(record)))
+                        if process_liveness(record.pid).authorizes_cleanup() =>
+                    {
+                        match remove_supervisor_startup_lock_if_unchanged(&path, &snapshot) {
+                            Ok(true) => {
+                                warn!(
+                                    path = %path.display(),
+                                    pid = record.pid,
+                                    "reclaimed supervisor startup lock from a dead owner"
+                                );
+                                continue;
+                            }
+                            Ok(false) => continue,
+                            Err(error) => {
+                                return Err(error).with_context(|| {
+                                    format!(
+                                        "reclaim dead supervisor startup lock at {}",
+                                        path.display()
+                                    )
+                                });
+                            }
+                        }
+                    }
+                    Ok((_snapshot, Some(_record))) => {}
+                    Ok((_snapshot, None)) => {
+                        if !reported_unparseable_owner {
+                            warn!(
+                                path = %path.display(),
+                                "preserving supervisor startup lock with an unparseable owner"
+                            );
+                            reported_unparseable_owner = true;
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!("read supervisor startup lock at {}", path.display())
+                        });
+                    }
                 }
                 if Instant::now() >= deadline {
                     bail!(
@@ -2987,6 +3245,24 @@ async fn acquire_supervisor_startup_lock_in_dir(dir: &Path) -> Result<Supervisor
                 });
             }
         }
+    }
+}
+
+/// Adopt the launcher's exact startup generation inside the supervisor child.
+///
+/// A direct/manual supervisor launch may create a fresh generation only when
+/// no launcher owns the path. If a legacy launcher holds the marker but did not
+/// pass a generation, the current child fails closed instead of running without
+/// cross-version lifetime protection.
+#[doc(hidden)]
+pub fn acquire_supervisor_runtime_startup_lock(
+    dir: &Path,
+) -> std::io::Result<SupervisorStartupLock> {
+    match std::env::var(SUPERVISOR_STARTUP_GENERATION_ENV) {
+        Ok(generation) if !generation.trim().is_empty() => {
+            SupervisorStartupLock::adopt_in_dir(dir, generation.trim())
+        }
+        _ => try_acquire_supervisor_startup_lock_in_dir(dir),
     }
 }
 
@@ -3610,14 +3886,30 @@ fn open_supervisor_log() -> Result<File> {
         .with_context(|| format!("open supervisor log at {}", log_path.display()))
 }
 
-async fn wait_for_supervisor_ready(child: &mut Child, deadline: Instant) -> Result<String> {
+async fn wait_for_supervisor_ready(
+    child: &mut Child,
+    deadline: Instant,
+    startup_authority: &mut SupervisorStartupLock,
+) -> Result<String> {
     let timeout = deadline.saturating_duration_since(Instant::now());
     let client = daemon_health_client();
     let mut last_error = String::from("supervisor did not report its port");
+    let mut next_startup_heartbeat = Instant::now();
 
     while Instant::now() < deadline {
         if let Some(status) = child.try_wait().context("check supervisor child status")? {
             bail!("supervisor exited during startup with status {status}");
+        }
+        if Instant::now() >= next_startup_heartbeat {
+            if !startup_authority
+                .heartbeat()
+                .context("refresh supervisor startup authority during readiness")?
+            {
+                let _ = child.kill();
+                let _ = child.wait();
+                bail!("supervisor startup authority changed during readiness");
+            }
+            next_startup_heartbeat = Instant::now() + Duration::from_secs(1);
         }
 
         // The supervisor binds :0 and writes its real bound port to its port
@@ -3679,7 +3971,7 @@ pub async fn ensure_supervisor_running() -> Result<String> {
         }
     }
 
-    let startup_authority = acquire_supervisor_startup_lock().await?;
+    let mut startup_authority = acquire_supervisor_startup_lock().await?;
     let dir = supervisor_dir();
     match wait_for_existing_supervisor_in_dir(&dir, Some(&startup_authority)).await {
         ExistingSupervisor::Connected(base_url) => return Ok(base_url),
@@ -3703,6 +3995,10 @@ pub async fn ensure_supervisor_running() -> Result<String> {
     let mut cmd = std::process::Command::new(&daemon_bin);
     scrub_daemon_process_authority(&mut cmd);
     cmd.args(["--supervisor", "--port", "0"]);
+    cmd.env(
+        SUPERVISOR_STARTUP_GENERATION_ENV,
+        startup_authority.generation(),
+    );
     let log = open_supervisor_log()?;
     let stderr = log
         .try_clone()
@@ -3729,7 +4025,16 @@ pub async fn ensure_supervisor_running() -> Result<String> {
 
     let mut child = cmd.spawn().context("spawn kin supervisor")?;
     let deadline = Instant::now() + Duration::from_secs(daemon_ready_timeout_secs());
-    let base_url = wait_for_supervisor_ready(&mut child, deadline).await?;
+    let base_url = wait_for_supervisor_ready(&mut child, deadline, &mut startup_authority).await?;
+    if !startup_authority
+        .heartbeat_for_pid(child.id())
+        .context("transfer supervisor startup authority to the ready child")?
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+        bail!("supervisor startup authority changed before lifetime handoff");
+    }
+    startup_authority.handoff_cleanup_to_supervisor();
     info!(supervisor = %base_url, "supervisor is up and ready");
     Ok(base_url)
 }
@@ -4685,6 +4990,127 @@ mod tests {
                  replacement: {verdict:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn supervisor_startup_authority_is_live_owner_and_generation_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut launcher_a = try_acquire_supervisor_startup_lock_in_dir(dir.path()).unwrap();
+        assert!(
+            startup_lock_is_stale(launcher_a.path(), Duration::ZERO),
+            "the marker must be old enough for the former time-only predicate"
+        );
+
+        let shortened_wait =
+            acquire_supervisor_startup_lock_in_dir_with_timeout(dir.path(), Duration::ZERO)
+                .await
+                .unwrap_err();
+        assert!(
+            shortened_wait
+                .to_string()
+                .contains("timed out waiting for supervisor startup lock"),
+            "launcher B must not time-steal launcher A while A's PID is live: {shortened_wait:#}"
+        );
+        assert!(launcher_a.authorizes(dir.path()));
+        assert!(launcher_a.heartbeat().unwrap());
+
+        // Model an external/legacy pathname replacement while A still has its
+        // original open file. A must immediately lose authority, and its later
+        // Drop must compare-preserve B's generation.
+        std::fs::remove_file(launcher_a.path()).unwrap();
+        let launcher_b = try_acquire_supervisor_startup_lock_in_dir(dir.path()).unwrap();
+        assert_ne!(launcher_a.generation(), launcher_b.generation());
+        assert!(!launcher_a.authorizes(dir.path()));
+        drop(launcher_a);
+        assert!(
+            launcher_b.authorizes(dir.path()),
+            "launcher A's Drop must not unlink launcher B's generation"
+        );
+
+        let launcher_c_error =
+            acquire_supervisor_startup_lock_in_dir_with_timeout(dir.path(), Duration::ZERO)
+                .await
+                .unwrap_err();
+        assert!(
+            launcher_c_error
+                .to_string()
+                .contains("timed out waiting for supervisor startup lock"),
+            "launcher C must not enter while launcher B is live: {launcher_c_error:#}"
+        );
+        assert!(launcher_b.authorizes(dir.path()));
+
+        drop(launcher_b);
+        let launcher_c = try_acquire_supervisor_startup_lock_in_dir(dir.path()).unwrap();
+        assert!(launcher_c.authorizes(dir.path()));
+    }
+
+    #[test]
+    fn supervisor_startup_generation_transfers_without_a_cleanup_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut launcher = try_acquire_supervisor_startup_lock_in_dir(dir.path()).unwrap();
+        let generation = launcher.generation().to_string();
+        let child = SupervisorStartupLock::adopt_in_dir(dir.path(), &generation).unwrap();
+
+        launcher.handoff_cleanup_to_supervisor();
+        drop(launcher);
+        assert!(
+            child.authorizes(dir.path()),
+            "the launcher must leave the adopted generation present"
+        );
+
+        drop(child);
+        assert!(
+            !dir.path().join(SUPERVISOR_STARTUP_FILE).exists(),
+            "the adopted child owns compare-removal at process exit"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_legacy_startup_owner_is_not_reclaimed_by_elapsed_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SUPERVISOR_STARTUP_FILE);
+        let legacy_record = format!(
+            "pid={} acquired_at={:?}\n",
+            std::process::id(),
+            std::time::SystemTime::now()
+        );
+        std::fs::write(&path, &legacy_record).unwrap();
+        assert!(startup_lock_is_stale(&path, Duration::ZERO));
+
+        let error = acquire_supervisor_startup_lock_in_dir_with_timeout(dir.path(), Duration::ZERO)
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("timed out waiting for supervisor startup lock"));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            legacy_record,
+            "a parseable live legacy owner is liveness authority, not an mtime lease"
+        );
+    }
+
+    #[tokio::test]
+    async fn dead_legacy_startup_owner_is_reclaimed_without_time_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SUPERVISOR_STARTUP_FILE);
+        std::fs::write(
+            &path,
+            "pid=999999999 acquired_at=SystemTime { tv_sec: 0, tv_nsec: 0 }\n",
+        )
+        .unwrap();
+
+        let authority =
+            acquire_supervisor_startup_lock_in_dir_with_timeout(dir.path(), Duration::ZERO)
+                .await
+                .unwrap();
+        assert!(authority.authorizes(dir.path()));
+        assert!(
+            std::fs::read_to_string(path)
+                .unwrap()
+                .contains(authority.generation()),
+            "dead legacy recovery must mint a fresh generation"
+        );
     }
 
     #[test]

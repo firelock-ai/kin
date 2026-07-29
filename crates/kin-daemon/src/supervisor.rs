@@ -14,7 +14,7 @@ use std::io::{Seek, SeekFrom, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::extract::{Path as AxumPath, Query, State};
@@ -38,8 +38,13 @@ const SUPERVISOR_PORT_FILE: &str = "supervisor.port";
 const SUPERVISOR_TOKEN_FILE: &str = "supervisor.token";
 const SUPERVISOR_LIFECYCLE_FILE: &str = "supervisor.lifecycle";
 const SUPERVISOR_SINGLETON_FILE: &str = "supervisor.lock";
+#[cfg(test)]
+const SUPERVISOR_STARTUP_FILE: &str = "supervisor.start.lock";
 const SUPERVISOR_LIFECYCLE_BUDGET: Duration = Duration::from_secs(5);
 const SUPERVISOR_LIFECYCLE_RETRY_INTERVAL: Duration = Duration::from_millis(50);
+/// Keep the legacy create-new marker younger than the immutable old client's
+/// minimum ten-second stale threshold.
+const SUPERVISOR_STARTUP_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const HEARTBEAT_TTL: Duration = Duration::from_secs(20);
 /// Ceiling for the retry backoff a repo daemon applies while it cannot reach a
@@ -294,6 +299,75 @@ fn write_supervisor_endpoint_files(
         }
     }
     result
+}
+
+fn maintain_legacy_supervisor_exclusion(
+    dir: &Path,
+    startup_lock: &Mutex<kin_cli::daemon_client::SupervisorStartupLock>,
+    supervisor_lock: &SupervisorLock,
+    port: u16,
+) -> std::io::Result<()> {
+    let mut startup_lock = startup_lock
+        .lock()
+        .map_err(|_| std::io::Error::other("supervisor startup lock mutex was poisoned"))?;
+    if !startup_lock.heartbeat_for_pid(std::process::id())? {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "supervisor startup-lock generation was replaced",
+        ));
+    }
+    drop(startup_lock);
+
+    let current_pid = recorded_supervisor_pid(dir);
+    let current_port = std::fs::read_to_string(dir.join(SUPERVISOR_PORT_FILE))
+        .ok()
+        .and_then(|value| value.trim().parse::<u16>().ok());
+    if current_pid != Some(std::process::id()) || current_port != Some(port) {
+        // The immutable PR-base client deletes these files on any health
+        // failure before it tries the shared startup marker. Re-publish while
+        // our current process-lifetime singleton is still held. The marker
+        // prevents that old client from reaching its spawn after deletion.
+        write_supervisor_endpoint_files(dir, supervisor_lock, port)?;
+    }
+    Ok(())
+}
+
+fn spawn_legacy_supervisor_exclusion_maintenance(
+    dir: PathBuf,
+    startup_lock: Arc<Mutex<kin_cli::daemon_client::SupervisorStartupLock>>,
+    supervisor_lock: Arc<SupervisorLock>,
+    port: u16,
+    failure_shutdown: tokio::sync::watch::Sender<bool>,
+    mut stop_rx: tokio::sync::watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(SUPERVISOR_STARTUP_HEARTBEAT_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                changed = stop_rx.changed() => {
+                    if changed.is_err() || *stop_rx.borrow() {
+                        break;
+                    }
+                }
+                _ = interval.tick() => {
+                    if let Err(error) = maintain_legacy_supervisor_exclusion(
+                        &dir,
+                        &startup_lock,
+                        &supervisor_lock,
+                        port,
+                    ) {
+                        warn!(
+                            %error,
+                            "lost cross-version supervisor exclusion; shutting down fail-closed"
+                        );
+                        let _ = failure_shutdown.send(true);
+                        break;
+                    }
+                }
+            }
+        }
+    })
 }
 
 fn remove_supervisor_endpoint_files_if_current_process(dir: &Path, port: u16) {
@@ -1207,7 +1281,10 @@ async fn deregister_daemon(
 
 pub async fn run_supervisor(port: u16, idle_timeout: Option<Duration>) -> std::io::Result<()> {
     let state_dir = supervisor_dir();
-    let supervisor_lock = acquire_supervisor_lock(&state_dir)?;
+    let startup_lock = Arc::new(Mutex::new(
+        kin_cli::daemon_client::acquire_supervisor_runtime_startup_lock(&state_dir)?,
+    ));
+    let supervisor_lock = Arc::new(acquire_supervisor_lock(&state_dir)?);
     let state = Arc::new(SupervisorState::new());
 
     let bind_host = std::env::var("KIN_SUPERVISOR_BIND_HOST")
@@ -1237,6 +1314,17 @@ pub async fn run_supervisor(port: u16, idle_timeout: Option<Duration>) -> std::i
     let bound_port = listener.local_addr()?.port();
     write_supervisor_endpoint_files(&state_dir, &supervisor_lock, bound_port)?;
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    let (startup_maintenance_stop, startup_maintenance_stop_rx) =
+        tokio::sync::watch::channel(false);
+    maintain_legacy_supervisor_exclusion(&state_dir, &startup_lock, &supervisor_lock, bound_port)?;
+    let startup_maintenance = spawn_legacy_supervisor_exclusion_maintenance(
+        state_dir.clone(),
+        Arc::clone(&startup_lock),
+        Arc::clone(&supervisor_lock),
+        bound_port,
+        shutdown_tx.clone(),
+        startup_maintenance_stop_rx,
+    );
 
     if let Some(idle_timeout) = idle_timeout {
         let idle_state = Arc::clone(&state);
@@ -1296,6 +1384,10 @@ pub async fn run_supervisor(port: u16, idle_timeout: Option<Duration>) -> std::i
             }
         })
         .await;
+    let _ = startup_maintenance_stop.send(true);
+    if let Err(error) = startup_maintenance.await {
+        warn!(%error, "supervisor startup-lock maintenance task failed");
+    }
     remove_supervisor_endpoint_files_if_current_process(&state_dir, bound_port);
     result
 }
@@ -2259,6 +2351,60 @@ mod tests {
         assert!(!dir.path().join(SUPERVISOR_PID_FILE).exists());
         assert!(!dir.path().join(SUPERVISOR_PORT_FILE).exists());
         assert!(dir.path().join(SUPERVISOR_SINGLETON_FILE).exists());
+    }
+
+    #[test]
+    fn current_supervisor_blocks_legacy_prelock_respawn_and_repairs_discovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let startup_lock = Arc::new(Mutex::new(
+            kin_cli::daemon_client::try_acquire_supervisor_startup_lock_in_dir(dir.path()).unwrap(),
+        ));
+        let supervisor_lock = Arc::new(acquire_supervisor_lock(dir.path()).unwrap());
+        let port = 50597;
+        write_supervisor_endpoint_files(dir.path(), &supervisor_lock, port).unwrap();
+
+        let deleted = Arc::new(std::sync::Barrier::new(2));
+        let legacy_dir = dir.path().to_path_buf();
+        let legacy_deleted = Arc::clone(&deleted);
+        let legacy = std::thread::spawn(move || {
+            // Exact destructive ordering in the immutable PR-base CLI:
+            // health fails, both discovery files are deleted, and only then
+            // does it attempt create-new startup authority.
+            let _ = std::fs::remove_file(legacy_dir.join(SUPERVISOR_PID_FILE));
+            let _ = std::fs::remove_file(legacy_dir.join(SUPERVISOR_PORT_FILE));
+            legacy_deleted.wait();
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(legacy_dir.join(SUPERVISOR_STARTUP_FILE))
+                .is_ok()
+        });
+
+        deleted.wait();
+        maintain_legacy_supervisor_exclusion(dir.path(), &startup_lock, &supervisor_lock, port)
+            .unwrap();
+        assert!(
+            !legacy.join().unwrap(),
+            "the old client must not obtain spawn authority after deleting discovery"
+        );
+        assert_eq!(
+            recorded_supervisor_pid(dir.path()),
+            Some(std::process::id())
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(SUPERVISOR_PORT_FILE))
+                .unwrap()
+                .trim(),
+            port.to_string()
+        );
+        assert!(
+            startup_lock
+                .lock()
+                .unwrap()
+                .heartbeat_for_pid(std::process::id())
+                .unwrap(),
+            "the current supervisor must retain its exact startup generation"
+        );
     }
 
     fn repo_payload(instance_id: &str, port: u16) -> RepoDaemonRegistration {
