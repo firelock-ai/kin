@@ -600,7 +600,7 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "kin_transaction_abort".into(),
-                description: "Abort the transaction and discard all staged mutations.".into(),
+                description: "Abort an active or validated transaction and discard all staged mutations. Once kin_transaction_commit has fenced the transaction for publication this is refused, because repository authority may already have moved; re-send the commit instead, which resumes the fenced payload idempotently and reports whether it landed. You do not need abort to recover from a refused commit: a commit refused before publication already clears its staged operations and names them, so corrected ones go on the same transaction.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {

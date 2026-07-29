@@ -2034,6 +2034,149 @@ mod tests {
         }
     }
 
+    /// Abandoning a transaction must leave the repository exactly as if it had
+    /// never been begun.
+    ///
+    /// `kin_transaction_abort` sits in the default agent write profile and its
+    /// description promises to discard the staged mutations, so what has to be
+    /// asserted is not the state label but that repository authority and the
+    /// working tree are untouched and the staged set is gone.
+    #[test]
+    fn aborting_a_staged_transaction_moves_neither_authority_nor_the_working_tree() {
+        let (_dir, state) = test_state();
+        let (value, _) = install_exact_source(
+            &state,
+            "src/lib.rs",
+            b"pub fn value() -> u8 { 1 }\n",
+            "value",
+        );
+        let before = load_native_commit_base(&state.layout).unwrap();
+        let before_file = std::fs::read(state.layout.working_dir().join("src/lib.rs")).unwrap();
+
+        let sessions = test_sessions();
+        let (transaction_id, _arguments) =
+            stage_entity_edit(&sessions, &value, "pub fn value() -> u8 { 2 }");
+        assert_eq!(
+            sessions
+                .get_transaction(&transaction_id)
+                .unwrap()
+                .staged_operations
+                .len(),
+            1
+        );
+
+        let aborted = sessions.abort_transaction(&transaction_id).unwrap();
+        assert_eq!(aborted.state, "aborted");
+        assert!(
+            aborted.staged_operations.is_empty(),
+            "abort must discard the staged mutations it says it discards"
+        );
+        assert_eq!(
+            load_native_commit_base(&state.layout)
+                .unwrap()
+                .roots
+                .generation,
+            before.roots.generation,
+            "an aborted transaction must not move repository authority"
+        );
+        assert_eq!(
+            std::fs::read(state.layout.working_dir().join("src/lib.rs")).unwrap(),
+            before_file,
+            "an aborted transaction must not touch the working tree"
+        );
+        assert!(
+            sessions
+                .begin_transaction(TEST_SESSION, "file:src/lib.rs")
+                .is_ok(),
+            "the session must outlive the transaction it abandoned"
+        );
+    }
+
+    /// The recovery an agent actually reaches for: a transaction whose commit
+    /// was refused must still be abandonable.
+    ///
+    /// A refused pre-publication commit returns the transaction to `active`
+    /// with its operations cleared. An agent that decides against the work
+    /// rather than correcting it calls abort, so abort has to accept the state
+    /// the failure path leaves behind and not only a pristine one.
+    #[test]
+    fn a_transaction_whose_commit_was_refused_can_still_be_aborted() {
+        let (_dir, state) = test_state();
+        let (value, _) = install_exact_source(
+            &state,
+            "src/lib.rs",
+            b"pub fn value() -> u8 { 1 }\n",
+            "value",
+        );
+        let before = load_native_commit_base(&state.layout).unwrap();
+        let sessions = test_sessions();
+        let transaction = sessions
+            .begin_transaction(TEST_SESSION, "file:src/lib.rs")
+            .unwrap();
+        let arguments = HashMap::from([(
+            "transaction_id".to_string(),
+            serde_json::json!(transaction.transaction_id),
+        )]);
+
+        sessions
+            .stage_transaction(
+                &transaction.transaction_id,
+                vec![
+                    kin_mcp::McpMutationOperation {
+                        verb: "update".to_string(),
+                        target: value.id.to_string(),
+                        payload: None,
+                        body: Some("pub fn value() -> u8 { 2 }".to_string()),
+                        description: "correct work staged alongside the failure".to_string(),
+                    },
+                    kin_mcp::McpMutationOperation {
+                        verb: "update".to_string(),
+                        target: "no_such_entity".to_string(),
+                        payload: None,
+                        body: Some("pub fn no_such_entity() {}".to_string()),
+                        description: String::new(),
+                    },
+                ],
+            )
+            .unwrap();
+
+        let refused = commit_exact_transaction(&state, &sessions, &arguments, None);
+        assert_eq!(refused.is_error, Some(true));
+        let poisoned = sessions
+            .get_transaction(&transaction.transaction_id)
+            .unwrap();
+        assert_eq!(poisoned.state, "active");
+        assert!(poisoned.staged_operations.is_empty());
+
+        let aborted = sessions
+            .abort_transaction(&transaction.transaction_id)
+            .expect("a transaction a refused commit returned to active must be abortable");
+        assert_eq!(aborted.state, "aborted");
+        assert_eq!(
+            load_native_commit_base(&state.layout)
+                .unwrap()
+                .roots
+                .generation,
+            before.roots.generation,
+            "neither the refused commit nor the abort may move repository authority"
+        );
+        assert!(
+            sessions
+                .stage_transaction(
+                    &transaction.transaction_id,
+                    vec![kin_mcp::McpMutationOperation {
+                        verb: "update".to_string(),
+                        target: value.id.to_string(),
+                        payload: None,
+                        body: Some("pub fn value() -> u8 { 3 }".to_string()),
+                        description: "after the abort".to_string(),
+                    }],
+                )
+                .is_err(),
+            "an abandoned transaction must not accept new work"
+        );
+    }
+
     /// A caller that guesses the operations shape gets the accepted shapes
     /// back, not a serde field name from inside a payload variant.
     #[test]

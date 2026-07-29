@@ -61,11 +61,13 @@ other agents, and gate collaboration features. It returns a session ID that the 
 the session lifecycle uses — keep it alive with kin_session_heartbeat, declare what \
 you'll touch via kin_register_intent (enabling collision detection against other \
 agents), and close out with kin_session_end. Prefer this over the legacy \
-register_session, which captures none of this context. The response carries \
-idle_timeout_secs and expires_at: the session is reaped if it goes that long with no \
-call, so if your next step is a read phase that could outlast expires_at, send \
-kin_session_heartbeat (any session-bound call also refreshes the window). A call on an \
-expired session fails saying so and names kin_session_start as the recovery.";
+register_session, which captures none of this context. When the session is daemon-backed \
+the response also carries idle_timeout_secs and expires_at: the session is reaped if it \
+goes that long with no call, so if your next step is a read phase that could outlast \
+expires_at, send kin_session_heartbeat (any session-bound call also refreshes the \
+window), and a call on an expired session fails saying so and names kin_session_start as \
+the recovery. An in-process session returns neither field; heartbeat it on the same \
+cadence rather than reading a deadline off the response.";
 
 pub async fn handle_session_start(
     args: &HashMap<String, serde_json::Value>,
@@ -134,9 +136,11 @@ Send a heartbeat to keep an agent session marked alive. Reach for it periodicall
 during a long-running session so Kin doesn't treat it as stale and so the agent's \
 presence (and any held intents) stays visible to other agents. Pair it with \
 kin_session_start (which issues the session ID) and kin_session_end (which closes the \
-session and releases its intents). Its response carries the refreshed idle_timeout_secs \
-and expires_at, so you always know how long the session is good for; heartbeating an \
-already-expired session fails saying so and names kin_session_start as the recovery.";
+session and releases its intents). A daemon-backed response carries the refreshed \
+idle_timeout_secs and expires_at, so you know how long the session is good for, and \
+heartbeating an already-expired session fails saying so and names kin_session_start as \
+the recovery. An in-process response carries neither field and reports only that the \
+session is alive.";
 
 pub async fn handle_session_heartbeat(
     args: &HashMap<String, serde_json::Value>,
@@ -632,7 +636,14 @@ id that semantic_locate, find_references, or get_context_pack already handed you
 name resolves only when it is unique, and an ambiguous one is refused (with the candidate \
 ids, so the retry is mechanical). The body is the entity exactly as its file renders it; \
 its first line's indentation is read as the entity's own line indentation, not as extra \
-indentation on top of it, so a nested method or function goes back unchanged. The entity is \
+indentation on top of it, so a nested method or function goes back unchanged. That read \
+is a byte-exact prefix match against the file's own indentation run, so copy the file's \
+whitespace rather than re-indenting; a body opening with spaces where the file uses tabs \
+(or with a different width) is spliced verbatim and lands on top of the file's \
+indentation. Note also that source rendered by get_entity_source and \
+get_context_pack.focal_entity.body is capped at 40 lines or 2400 characters and marks \
+the cut with \"... [truncated]\": a body that came back truncated is not the entity's \
+full source and must not be staged as-is. The entity is \
 resolved fail-closed server-side and on \
 commit the graph-to-file projection writes the body into the entity's working-directory \
 file. Structured payloads (full entity, relation add/remove) are also accepted. Each \
@@ -1100,11 +1111,14 @@ pub async fn handle_transaction_commit<G: GraphStore>(
 }
 
 pub const TRANSACTION_ABORT_DESC: &str = "\
-Abort the transaction and discard all staged mutations. Reach for it when you decide \
-against work you already staged, so the transaction ends instead of sitting open holding \
-operations you no longer intend. You do not need it to recover from a refused commit: a \
-commit refused before publication already clears its staged operations and names them, so \
-you can re-stage corrected ones on the same transaction.";
+Abort an active or validated transaction and discard all staged mutations. Reach for it \
+when you decide against work you already staged, so the transaction ends instead of \
+sitting open holding operations you no longer intend. Once kin_transaction_commit has \
+fenced the transaction for publication this is refused, because repository authority may \
+already have moved; re-send the commit instead, which resumes the fenced payload \
+idempotently and reports whether it landed. You do not need abort to recover from a \
+refused commit either: a commit refused before publication already clears its staged \
+operations and names them, so you can re-stage corrected ones on the same transaction.";
 
 pub async fn handle_transaction_abort(
     args: &HashMap<String, serde_json::Value>,
