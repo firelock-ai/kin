@@ -1966,7 +1966,7 @@ fn main() -> Result<()> {
             .init();
     } else {
         tracing_subscriber::registry()
-            .with(default_env_filter(false, &command_name))
+            .with(default_env_filter(&command_name))
             .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
             .init();
     }
@@ -3123,39 +3123,53 @@ fn env_flag(name: &str) -> bool {
 /// killed after 11h43m of silence that turned out to be ordinary progress.
 const PROGRESS_REPORTING_COMMANDS: [&str; 2] = ["init", "clone"];
 
-/// Progress-bearing targets raised to `info` for [`PROGRESS_REPORTING_COMMANDS`].
+/// Admission targets raised to `info` for [`PROGRESS_REPORTING_COMMANDS`].
 ///
 /// Deliberately target-scoped rather than crate-wide. `kin_core=info` would also
 /// surface every unrelated event those crates emit, which is how a default
-/// filter becomes noise nobody reads. Add a target here only when it reports
-/// admission or validation progress.
+/// filter becomes noise nobody reads.
 ///
-/// The two `kin_core` modules hold three event callsites between them, none in a
-/// loop, so they contribute at most three lines to an admission. The KinDB
-/// target reports periodic replay progress and is throttled at its source; it
-/// stays inert until this workspace depends on a KinDB that emits it, because a
-/// directive naming an absent target simply never matches.
+/// What each target actually delivers today, because the difference matters to
+/// anyone watching a long run:
+///
+/// - `kin_core::init` and `kin_core::git_init` carry three callsites between
+///   them, and all three are **terminal**: two report a completed admission and
+///   one reports recovered stale initialization stages. They add at most three
+///   lines, and none of them appears mid-flight. They are enabled so the
+///   admission surfaces its own outcome and so no further `kin-cli` change is
+///   needed later.
+/// - `kin_db::storage::history_replay` is the only periodic emitter, throttled
+///   at its source. It does not exist in the KinDB this workspace currently
+///   pins, and a directive naming an absent target simply never matches, so it
+///   is pre-wired and inert.
+///
+/// So a long admission does **not** report mid-flight progress at this version.
+/// It begins to the moment this workspace consumes a KinDB shipping
+/// `storage::history_replay`, with no change here. Anyone diagnosing an
+/// apparently stalled `kin init` before then should not read silence as
+/// evidence that the instrumentation ran.
 const ADMISSION_PROGRESS_TARGETS: [&str; 3] = [
     "kin_core::init",
     "kin_core::git_init",
     "kin_db::storage::history_replay",
 ];
 
-fn default_env_filter(profile_enabled: bool, command: &str) -> EnvFilter {
+fn default_env_filter(command: &str) -> EnvFilter {
     if std::env::var_os("RUST_LOG").is_some() {
         return EnvFilter::from_default_env();
     }
-    EnvFilter::new(default_filter_directives(profile_enabled, command))
+    EnvFilter::new(default_filter_directives(command))
 }
 
 /// The directive string [`default_env_filter`] would install, absent `RUST_LOG`.
 ///
 /// Split out so the choice is testable without mutating process environment,
 /// which no test can do without racing every other test in the binary.
-fn default_filter_directives(profile_enabled: bool, command: &str) -> String {
-    if profile_enabled {
-        return "info".to_string();
-    }
+///
+/// Profiling is deliberately absent here. That path installs its own subscriber
+/// with no `EnvFilter` at all, so it never reaches this function; carrying a
+/// `profile_enabled` branch would only invite a test that proves a dead arm.
+fn default_filter_directives(command: &str) -> String {
     if !PROGRESS_REPORTING_COMMANDS.contains(&command) {
         return "warn".to_string();
     }
@@ -3173,11 +3187,12 @@ mod tests {
     use super::*;
     use clap::CommandFactory;
 
-    /// A long admission must report progress without `RUST_LOG` being set.
+    /// The admission commands must carry every configured target without
+    /// `RUST_LOG` being set.
     #[test]
     fn progress_reporting_commands_raise_admission_targets_to_info() {
         for command in PROGRESS_REPORTING_COMMANDS {
-            let directives = default_filter_directives(false, command);
+            let directives = default_filter_directives(command);
             assert!(
                 directives.starts_with("warn"),
                 "{command} must keep warn as its floor: {directives}"
@@ -3221,17 +3236,10 @@ mod tests {
                 "{command} is not a long single-phase command"
             );
             assert_eq!(
-                default_filter_directives(false, command),
+                default_filter_directives(command),
                 "warn",
                 "{command} must stay quiet by default"
             );
-        }
-    }
-
-    #[test]
-    fn profiling_still_raises_everything_to_info() {
-        for command in ["init", "locate"] {
-            assert_eq!(default_filter_directives(true, command), "info");
         }
     }
 
@@ -3240,13 +3248,8 @@ mod tests {
     /// exact string the binary installs and require each target to survive.
     #[test]
     fn every_default_directive_parses_and_is_retained() {
-        for (profile, command) in [
-            (false, "init"),
-            (false, "clone"),
-            (false, "locate"),
-            (true, "init"),
-        ] {
-            let directives = default_filter_directives(profile, command);
+        for command in ["init", "clone", "locate", "help"] {
+            let directives = default_filter_directives(command);
             let filter = tracing_subscriber::filter::EnvFilter::builder()
                 .parse(&directives)
                 .unwrap_or_else(|error| {
