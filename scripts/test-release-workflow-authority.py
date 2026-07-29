@@ -39,7 +39,28 @@ REQUIRED_RELEASE_CHECKS = (
     "gitleaks (full history)",
     "Windows installer + vector-free release build",
 )
-WINDOWS_INSTALLER_CHECK = "Windows installer + vector-free release build"
+DOCS_ONLY_CLASSIFIER_SHELL = textwrap.dedent(
+    """\
+    set -euo pipefail
+    docs_only=false
+    if [ "$EVENT_NAME" = "pull_request" ]; then
+      changed="$(git diff --name-only "$BASE_SHA...$HEAD_SHA")"
+      if [ -n "$changed" ]; then
+        docs_only=true
+        while IFS= read -r path; do
+          case "$path" in
+            .github/workflows/ci.yml) docs_only=false; break ;;
+            *.md | docs/*) ;;
+            .github/workflows/*) ;;
+            *) docs_only=false; break ;;
+          esac
+        done <<< "$changed"
+      fi
+      printf '%s\\n' "$changed"
+    fi
+    echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"
+    """
+).rstrip()
 
 
 def require(content: str, needle: str, context: str) -> None:
@@ -73,13 +94,9 @@ def workflow_paths(directory: Path = WORKFLOWS) -> list[Path]:
     )
 
 
-def active_shell_code(line: str) -> str:
-    """Return active shell code for the classifier's deliberately closed form."""
+def classifier_shell_source(classifier: str) -> str:
+    """Extract the classifier's complete active shell block."""
 
-    return line.strip().split("#", 1)[0].strip()
-
-
-def assert_docs_only_classifier_guard(classifier: str) -> None:
     lines = classifier.splitlines()
     run_lines = [index for index, line in enumerate(lines) if line.strip() == "run: |"]
     if len(run_lines) != 1:
@@ -88,102 +105,118 @@ def assert_docs_only_classifier_guard(classifier: str) -> None:
         )
     run_line = run_lines[0]
     run_indent = len(lines[run_line]) - len(lines[run_line].lstrip())
-    shell_lines: list[int] = []
+    shell_lines: list[str] = []
     for index in range(run_line + 1, len(lines)):
         line = lines[index]
         if not line.strip():
+            shell_lines.append(line)
             continue
         indent = len(line) - len(line.lstrip())
         if indent <= run_indent:
             break
-        shell_lines.append(index)
+        shell_lines.append(line)
 
-    guard = 'if [ "$EVENT_NAME" = "pull_request" ]; then'
-    guard_lines = [
-        index for index in shell_lines if active_shell_code(lines[index]) == guard
+    source = textwrap.dedent("\n".join(shell_lines)).strip()
+    active_lines = [
+        line.rstrip()
+        for line in source.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
     ]
-    if len(guard_lines) != 1:
-        raise AssertionError(
-            "diff classifier must gate its whole classification on exactly one "
-            "pull_request guard; docs_only has to stay false on every push to main"
-        )
-    guard_line = guard_lines[0]
+    return "\n".join(active_lines)
 
-    default_lines = [
-        index
-        for index in shell_lines
-        if active_shell_code(lines[index]) == "docs_only=false"
-    ]
-    if len(default_lines) != 1 or default_lines[0] >= guard_line:
+
+def assert_docs_only_classifier_guard(classifier: str) -> None:
+    """Require the exact reviewed shell program, with comments as the only slack."""
+
+    source = classifier_shell_source(classifier)
+    if source != DOCS_ONLY_CLASSIFIER_SHELL:
         raise AssertionError(
-            "diff classifier must default docs_only=false exactly once before the "
-            "pull_request guard so any other event fails closed"
+            "diff classifier active shell must exactly match the closed-form "
+            "docs_only program"
         )
 
-    depth = 0
-    closing_fi = None
-    for index in (candidate for candidate in shell_lines if candidate >= guard_line):
-        code = active_shell_code(lines[index])
-        if re.fullmatch(r"if\b.*;\s*then", code):
-            depth += 1
-        elif code == "fi":
-            depth -= 1
-            if depth == 0:
-                closing_fi = index
-                break
-            if depth < 0:
-                raise AssertionError(
-                    "diff classifier pull_request guard has an unmatched fi"
-                )
-    if closing_fi is None:
+
+def execute_docs_only_classifier(
+    classifier: str,
+) -> tuple[subprocess.CompletedProcess[str], list[str]]:
+    """Execute a classifier mutant on a push and return its emitted outputs."""
+
+    source = classifier_shell_source(classifier)
+    with tempfile.TemporaryDirectory() as directory:
+        output = Path(directory) / "github-output"
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "EVENT_NAME": "push",
+                "BASE_SHA": "unused-on-push",
+                "HEAD_SHA": "unused-on-push",
+                "GITHUB_OUTPUT": str(output),
+            }
+        )
+        result = subprocess.run(
+            ["bash", "--noprofile", "--norc", "-c", source],
+            cwd=ROOT,
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        outputs = (
+            output.read_text(encoding="utf-8").splitlines()
+            if output.exists()
+            else []
+        )
+    return result, outputs
+
+
+def assert_classifier_bypass_rejected(
+    label: str,
+    classifier: str,
+    *,
+    execute: bool = True,
+) -> None:
+    """Prove a shell-equivalent bypass is rejected and would otherwise win."""
+
+    expect_assertion(
+        label,
+        "exactly match the closed-form docs_only program",
+        lambda: assert_docs_only_classifier_guard(classifier),
+    )
+    if not execute:
+        return
+
+    result, outputs = execute_docs_only_classifier(classifier)
+    if result.returncode != 0:
         raise AssertionError(
-            "diff classifier pull_request guard has no structurally matching fi"
+            f"classifier falsification did not execute: {label}: "
+            f"{result.stdout}{result.stderr}"
+        )
+    if not outputs or outputs[-1] != "docs_only=true":
+        raise AssertionError(
+            f"classifier falsification did not override push output: {label}: "
+            f"{outputs}"
         )
 
-    output = 'echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"'
-    allowed_references = {
-        "docs_only=false",
-        "docs_only=true",
-        ".github/workflows/ci.yml) docs_only=false; break ;;",
-        "*) docs_only=false; break ;;",
-        output,
-    }
-    unauthorized_references = [
-        (index, active_shell_code(lines[index]))
-        for index in shell_lines
-        if re.search(r"\bdocs_only\b", active_shell_code(lines[index]))
-        and active_shell_code(lines[index]) not in allowed_references
-    ]
-    if unauthorized_references:
-        line_number, code = unauthorized_references[0]
-        raise AssertionError(
-            "diff classifier violates the closed-form docs_only policy at "
-            f"shell line {line_number + 1}: {code}"
-        )
 
-    truthy_lines = [
-        index
-        for index in shell_lines
-        if active_shell_code(lines[index]) == "docs_only=true"
-    ]
-    if (
-        len(truthy_lines) != 1
-        or truthy_lines[0] <= guard_line
-        or truthy_lines[0] >= closing_fi
-    ):
-        raise AssertionError(
-            "diff classifier must set docs_only=true exactly once inside the "
-            "structurally matched pull_request guard"
-        )
+def bash_supports_nameref() -> bool:
+    """Return whether the local bash can execute the hosted nameref bypass."""
 
-    output_lines = [
-        index for index in shell_lines if active_shell_code(lines[index]) == output
-    ]
-    if len(output_lines) != 1 or output_lines[0] <= closing_fi:
-        raise AssertionError(
-            "diff classifier must emit its single fail-closed output after the "
-            "pull_request guard"
-        )
+    probe = subprocess.run(
+        [
+            "bash",
+            "--noprofile",
+            "--norc",
+            "-c",
+            "target=original; original=false; declare -n ref=\"$target\"; "
+            "ref=true; [ \"$original\" = true ]",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    return probe.returncode == 0
 
 
 def yaml_uses_scalar(line: str) -> str | None:
@@ -197,8 +230,22 @@ def yaml_uses_scalar(line: str) -> str | None:
         line,
     )
     if match is None:
+        if re.match(r"^\s*(?:-\s*)?uses:\s*", line):
+            raise AssertionError(
+                "workflow uses scalar must be a single plain or quoted value"
+            )
         return None
-    return next(value for value in match.groups() if value is not None)
+    double_quoted, single_quoted, plain = match.groups()
+    if double_quoted is not None:
+        if "\\" in double_quoted:
+            raise AssertionError(
+                "workflow uses scalar must not contain YAML escape sequences"
+            )
+        return double_quoted
+    if single_quoted is not None:
+        return single_quoted
+    assert plain is not None
+    return plain
 
 
 def rust_cache_step_bounds(lines: list[str], uses_line: int) -> tuple[int, int]:
@@ -378,6 +425,19 @@ def assert_release_check_rejected(
         raise AssertionError(
             "release check falsification failed without the expected refusal: "
             f"{check_name}={conclusion}: {output}"
+        )
+
+
+def assert_release_check_accepted(
+    source: str,
+    check_name: str,
+    conclusion: str,
+) -> None:
+    result = execute_release_check_gate(source, {check_name: conclusion})
+    if result.returncode != 0:
+        raise AssertionError(
+            "release check falsification rejected an allowed conclusion: "
+            f"{check_name}={conclusion}: {result.stdout}{result.stderr}"
         )
 
 
@@ -1135,27 +1195,55 @@ def main() -> None:
         '          echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"',
         1,
     )
-    expect_assertion(
+    assert_classifier_bypass_rejected(
         "docs_only=true after the matching pull_request fi",
-        "structurally matched pull_request guard",
-        lambda: assert_docs_only_classifier_guard(truthy_after_guard),
+        truthy_after_guard,
     )
-    for label, assignment in (
+    for label, command in (
         ("single-quoted docs_only assignment", "docs_only='true'"),
         ("double-quoted docs_only assignment", 'docs_only="true"'),
         ("indirect printf docs_only assignment", "printf -v docs_only true"),
+        (
+            "computed-name docs_only assignment",
+            'name=docs_$(printf only); printf -v "$name" true',
+        ),
+        ("eval-computed docs_only assignment", "eval 'docs_'only=true"),
+        ("quoted-hash docs_only assignment", "printf '#'; docs_only=true"),
     ):
         bypass = classifier.replace(
             classifier_falsification_needle,
-            f"          fi\n          {assignment}\n"
+            f"          fi\n          {command}\n"
             '          echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"',
             1,
         )
-        expect_assertion(
+        assert_classifier_bypass_rejected(
             label,
-            "closed-form docs_only policy",
-            lambda bypass=bypass: assert_docs_only_classifier_guard(bypass),
+            bypass,
         )
+    nameref_bypass = classifier.replace(
+        classifier_falsification_needle,
+        "          fi\n"
+        '          name=docs_only; declare -n ref="$name"; ref=true\n'
+        '          echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"',
+        1,
+    )
+    assert_classifier_bypass_rejected(
+        "nameref docs_only assignment",
+        nameref_bypass,
+        execute=bash_supports_nameref(),
+    )
+    duplicate_computed_output = classifier.replace(
+        classifier_falsification_needle,
+        "          fi\n"
+        '          echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"\n'
+        "          name=docs_$(printf only); "
+        "printf '%s=true\\n' \"$name\" >> \"$GITHUB_OUTPUT\"",
+        1,
+    )
+    assert_classifier_bypass_rejected(
+        "duplicate computed docs_only output",
+        duplicate_computed_output,
+    )
     comment_only = classifier.replace(
         classifier_falsification_needle,
         "          fi\n"
@@ -1188,21 +1276,21 @@ def main() -> None:
         require(release_tag, policy, "per-check release conclusion policy")
 
     release_gate = release_check_gate_source(release_tag)
-    dco_skipped = execute_release_check_gate(
-        release_gate,
-        {"DCO Sign-off": "skipped"},
-    )
-    if dco_skipped.returncode != 0:
-        raise AssertionError(
-            "release gate rejected the explicitly justified DCO skip: "
-            f"{dco_skipped.stdout}{dco_skipped.stderr}"
-        )
-    for rejected_conclusion in ("skipped", "neutral"):
-        assert_release_check_rejected(
+    for accepted_conclusion in ("success", "skipped"):
+        assert_release_check_accepted(
             release_gate,
-            WINDOWS_INSTALLER_CHECK,
-            rejected_conclusion,
+            "DCO Sign-off",
+            accepted_conclusion,
         )
+    for check_name in REQUIRED_RELEASE_CHECKS:
+        if check_name == "DCO Sign-off":
+            continue
+        for rejected_conclusion in ("skipped", "neutral"):
+            assert_release_check_rejected(
+                release_gate,
+                check_name,
+                rejected_conclusion,
+            )
     assert_release_check_rejected(
         release_gate,
         "DCO Sign-off",
@@ -1313,6 +1401,14 @@ def main() -> None:
     )
     assert_rust_cache_steps(quoted_pinned)
 
+    single_quoted_pinned = dict(workflow_sources)
+    single_quoted_pinned[ci_path] = single_quoted_pinned[ci_path].replace(
+        pinned_use,
+        f"uses: '{RUST_CACHE_ACTION}'",
+        1,
+    )
+    assert_rust_cache_steps(single_quoted_pinned)
+
     quoted_unpinned = dict(workflow_sources)
     quoted_unpinned[ci_path] = quoted_unpinned[ci_path].replace(
         pinned_use,
@@ -1339,6 +1435,23 @@ jobs:
         "uses rust-cache at an unpinned ref",
         lambda: assert_rust_cache_steps(yaml_unpinned),
     )
+
+    for label, escaped_action in (
+        ("hex-escaped rust-cache separator", r"Swatinem/rust-cache\x40v2"),
+        ("unicode-escaped rust-cache separator", r"Swatinem/rust-cache\u0040v2"),
+        ("unicode-escaped rust-cache repository", r"Swatinem/rust-ca\u0063he@v2"),
+    ):
+        escaped_use = dict(workflow_sources)
+        escaped_use[ci_path] = escaped_use[ci_path].replace(
+            pinned_use,
+            f'uses: "{escaped_action}"',
+            1,
+        )
+        expect_assertion(
+            label,
+            "must not contain YAML escape sequences",
+            lambda escaped_use=escaped_use: assert_rust_cache_steps(escaped_use),
+        )
 
     unaccounted_text = dict(workflow_sources)
     unaccounted_text[ci_path] += (
