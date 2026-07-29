@@ -3426,7 +3426,7 @@ mod tests {
                 target: entity.id.to_string(),
                 payload: shape
                     .with_payload
-                    .then(|| McpMutationPayload::Entity(updated)),
+                    .then_some(McpMutationPayload::Entity(updated)),
                 body: shape.body.map(str::to_string),
                 description: shape.label.into(),
             };
