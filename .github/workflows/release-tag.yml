@@ -143,8 +143,9 @@ jobs:
       - name: Verify required checks are green
         # Fail closed on the commit's check-runs. REQUIRED_CHECKS is the
         # presence-required release-critical set — a sha missing any of these is
-        # refused even if nothing failed. Each must be present and green
-        # (skipped/neutral allowed — DCO is skipped on a merged HEAD). Separately,
+        # refused even if nothing failed. Every required check must conclude
+        # success except DCO, which is allowed to report skipped because that
+        # pull-request-only job is inapplicable on a merged main HEAD. Separately,
         # no check anywhere may be failing or still in progress; the second loop
         # owns that present-check strictness, so this list need not mirror every
         # CI context. It is the main branch-protection required contexts plus the
@@ -180,7 +181,8 @@ jobs:
                       runs[name] = run
 
           required = [c.strip() for c in os.environ["REQUIRED_CHECKS"].splitlines() if c.strip()]
-          acceptable = {"success", "skipped", "neutral"}
+          skippable_required = {"DCO Sign-off"}
+          non_failing_optional = {"success", "skipped", "neutral"}
           errors = []
 
           if not runs:
@@ -188,11 +190,16 @@ jobs:
 
           for name in required:
               run = runs.get(name)
+              allowed_conclusions = (
+                  {"success", "skipped"}
+                  if name in skippable_required
+                  else {"success"}
+              )
               if run is None:
                   errors.append(f"missing required check: {name}")
               elif run["status"] != "completed":
                   errors.append(f"required check not completed: {name} (status={run['status']})")
-              elif run["conclusion"] not in acceptable:
+              elif run["conclusion"] not in allowed_conclusions:
                   errors.append(f"required check not green: {name} (conclusion={run['conclusion']})")
 
           for name, run in runs.items():
@@ -201,7 +208,7 @@ jobs:
                   continue
               if run["status"] != "completed":
                   errors.append(f"check still in progress: {name} (status={run['status']})")
-              elif run["conclusion"] not in acceptable:
+              elif run["conclusion"] not in non_failing_optional:
                   errors.append(f"check not green: {name} (conclusion={run['conclusion']})")
 
           if errors:

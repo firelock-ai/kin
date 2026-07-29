@@ -6,7 +6,13 @@
 
 from __future__ import annotations
 
+import json
+import os
 import re
+import subprocess
+import sys
+import tempfile
+import textwrap
 from collections.abc import Callable
 from pathlib import Path
 
@@ -24,6 +30,16 @@ INSTALL_PS1 = ROOT / "scripts" / "install.ps1"
 HEALTH = ROOT / "crates" / "kin-cli" / "src" / "commands" / "health.rs"
 RUST_CACHE_ACTION = "Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4"
 MAIN_ONLY_CACHE_SAVE = "save-if: ${{ github.ref == 'refs/heads/main' }}"
+RUST_CACHE_REFERENCE = re.compile(r"Swatinem/rust-cache@", re.IGNORECASE)
+REQUIRED_RELEASE_CHECKS = (
+    "Check & Test (ubuntu-latest)",
+    "Check & Test (macos-latest)",
+    "DCO Sign-off",
+    "cargo-deny",
+    "gitleaks (full history)",
+    "Windows installer + vector-free release build",
+)
+WINDOWS_INSTALLER_CHECK = "Windows installer + vector-free release build"
 
 
 def require(content: str, needle: str, context: str) -> None:
@@ -47,13 +63,44 @@ def expect_assertion(
     raise AssertionError(f"falsification did not fail: {label}")
 
 
+def workflow_paths(directory: Path = WORKFLOWS) -> list[Path]:
+    """Return every workflow filename GitHub Actions recognizes."""
+
+    return sorted(
+        path
+        for path in directory.iterdir()
+        if path.is_file() and path.suffix in {".yml", ".yaml"}
+    )
+
+
+def active_shell_code(line: str) -> str:
+    """Return active shell code for the classifier's deliberately closed form."""
+
+    return line.strip().split("#", 1)[0].strip()
+
+
 def assert_docs_only_classifier_guard(classifier: str) -> None:
     lines = classifier.splitlines()
+    run_lines = [index for index, line in enumerate(lines) if line.strip() == "run: |"]
+    if len(run_lines) != 1:
+        raise AssertionError(
+            "diff classifier must contain exactly one closed-form shell run block"
+        )
+    run_line = run_lines[0]
+    run_indent = len(lines[run_line]) - len(lines[run_line].lstrip())
+    shell_lines: list[int] = []
+    for index in range(run_line + 1, len(lines)):
+        line = lines[index]
+        if not line.strip():
+            continue
+        indent = len(line) - len(line.lstrip())
+        if indent <= run_indent:
+            break
+        shell_lines.append(index)
+
     guard = 'if [ "$EVENT_NAME" = "pull_request" ]; then'
     guard_lines = [
-        index
-        for index, line in enumerate(lines)
-        if line.strip().split("#", 1)[0].strip() == guard
+        index for index in shell_lines if active_shell_code(lines[index]) == guard
     ]
     if len(guard_lines) != 1:
         raise AssertionError(
@@ -64,8 +111,8 @@ def assert_docs_only_classifier_guard(classifier: str) -> None:
 
     default_lines = [
         index
-        for index, line in enumerate(lines)
-        if line.strip().split("#", 1)[0].strip() == "docs_only=false"
+        for index in shell_lines
+        if active_shell_code(lines[index]) == "docs_only=false"
     ]
     if len(default_lines) != 1 or default_lines[0] >= guard_line:
         raise AssertionError(
@@ -75,8 +122,8 @@ def assert_docs_only_classifier_guard(classifier: str) -> None:
 
     depth = 0
     closing_fi = None
-    for index in range(guard_line, len(lines)):
-        code = lines[index].strip().split("#", 1)[0].strip()
+    for index in (candidate for candidate in shell_lines if candidate >= guard_line):
+        code = active_shell_code(lines[index])
         if re.fullmatch(r"if\b.*;\s*then", code):
             depth += 1
         elif code == "fi":
@@ -93,12 +140,32 @@ def assert_docs_only_classifier_guard(classifier: str) -> None:
             "diff classifier pull_request guard has no structurally matching fi"
         )
 
-    truthy_assignment = re.compile(r"(?:^|[;\s])docs_only=true(?:$|[;\s])")
-    truthy_lines = []
-    for index, line in enumerate(lines):
-        code = line.strip().split("#", 1)[0].strip()
-        if truthy_assignment.search(code):
-            truthy_lines.append(index)
+    output = 'echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"'
+    allowed_references = {
+        "docs_only=false",
+        "docs_only=true",
+        ".github/workflows/ci.yml) docs_only=false; break ;;",
+        "*) docs_only=false; break ;;",
+        output,
+    }
+    unauthorized_references = [
+        (index, active_shell_code(lines[index]))
+        for index in shell_lines
+        if re.search(r"\bdocs_only\b", active_shell_code(lines[index]))
+        and active_shell_code(lines[index]) not in allowed_references
+    ]
+    if unauthorized_references:
+        line_number, code = unauthorized_references[0]
+        raise AssertionError(
+            "diff classifier violates the closed-form docs_only policy at "
+            f"shell line {line_number + 1}: {code}"
+        )
+
+    truthy_lines = [
+        index
+        for index in shell_lines
+        if active_shell_code(lines[index]) == "docs_only=true"
+    ]
     if (
         len(truthy_lines) != 1
         or truthy_lines[0] <= guard_line
@@ -109,17 +176,29 @@ def assert_docs_only_classifier_guard(classifier: str) -> None:
             "structurally matched pull_request guard"
         )
 
-    output = 'echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"'
     output_lines = [
-        index
-        for index, line in enumerate(lines)
-        if line.strip().split("#", 1)[0].strip() == output
+        index for index in shell_lines if active_shell_code(lines[index]) == output
     ]
     if len(output_lines) != 1 or output_lines[0] <= closing_fi:
         raise AssertionError(
             "diff classifier must emit its single fail-closed output after the "
             "pull_request guard"
         )
+
+
+def yaml_uses_scalar(line: str) -> str | None:
+    """Read the simple scalar forms accepted for a workflow step's `uses` key."""
+
+    if not line.strip() or line.lstrip().startswith("#"):
+        return None
+    match = re.match(
+        r"""^\s*(?:-\s*)?uses:\s*(?:"([^"\r\n]+)"|'([^'\r\n]+)'|([^#\s]+))"""
+        r"""\s*(?:#.*)?$""",
+        line,
+    )
+    if match is None:
+        return None
+    return next(value for value in match.groups() if value is not None)
 
 
 def rust_cache_step_bounds(lines: list[str], uses_line: int) -> tuple[int, int]:
@@ -166,19 +245,16 @@ def rust_cache_step_bounds(lines: list[str], uses_line: int) -> tuple[int, int]:
 def assert_rust_cache_steps(workflows: dict[Path, str]) -> None:
     rust_cache_uses = 0
     for workflow, content in sorted(workflows.items()):
+        textual_occurrences = len(RUST_CACHE_REFERENCE.findall(content))
+        accounted_occurrences = 0
         lines = content.splitlines()
         for uses_line, line in enumerate(lines):
-            stripped = line.lstrip()
-            if not stripped or stripped.startswith("#"):
+            action = yaml_uses_scalar(line)
+            if action is None or RUST_CACHE_REFERENCE.search(action) is None:
                 continue
-            match = re.match(
-                r"^\s*(?:-\s*)?uses:\s+(Swatinem/rust-cache@\S+)",
-                line,
-            )
-            if not match:
-                continue
+            accounted_occurrences += 1
             rust_cache_uses += 1
-            if match.group(1) != RUST_CACHE_ACTION:
+            if action != RUST_CACHE_ACTION:
                 raise AssertionError(
                     f"{workflow.name} uses rust-cache at an unpinned ref"
                 )
@@ -230,8 +306,79 @@ def assert_rust_cache_steps(workflows: dict[Path, str]) -> None:
                     "bound to its with mapping or is not main-only"
                 )
 
+        if textual_occurrences != accounted_occurrences:
+            raise AssertionError(
+                f"{workflow.name} contains a rust-cache textual occurrence that "
+                "is not an accounted uses scalar"
+            )
+
     if rust_cache_uses == 0:
         raise AssertionError("no pinned rust-cache steps found")
+
+
+def release_check_gate_source(release_tag: str) -> str:
+    """Extract the exact Python gate executed by the release-tag workflow."""
+
+    step_start = release_tag.index("      - name: Verify required checks are green")
+    step_end = release_tag.index("\n      - name:", step_start + 1)
+    step = release_tag[step_start:step_end]
+    marker = "          python3 - <<'PY'\n"
+    source_start = step.index(marker) + len(marker)
+    source_end = step.index("\n          PY", source_start)
+    return textwrap.dedent(step[source_start:source_end])
+
+
+def execute_release_check_gate(
+    source: str,
+    conclusions: dict[str, str],
+) -> subprocess.CompletedProcess[str]:
+    """Execute the workflow's real admission code against synthetic check runs."""
+
+    runs = [
+        {
+            "name": name,
+            "status": "completed",
+            "conclusion": conclusions.get(name, "success"),
+            "id": index,
+        }
+        for index, name in enumerate(REQUIRED_RELEASE_CHECKS, start=1)
+    ]
+    with tempfile.TemporaryDirectory() as directory:
+        evidence = Path(directory) / "check_runs.ndjson"
+        evidence.write_text(
+            "".join(f"{json.dumps(run)}\n" for run in runs),
+            encoding="utf-8",
+        )
+        environment = os.environ.copy()
+        environment["REQUIRED_CHECKS"] = "\n".join(REQUIRED_RELEASE_CHECKS)
+        return subprocess.run(
+            [sys.executable, "-c", source],
+            cwd=directory,
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+
+
+def assert_release_check_rejected(
+    source: str,
+    check_name: str,
+    conclusion: str,
+) -> None:
+    result = execute_release_check_gate(source, {check_name: conclusion})
+    output = result.stdout + result.stderr
+    expected = f"required check not green: {check_name} (conclusion={conclusion})"
+    if result.returncode == 0:
+        raise AssertionError(
+            f"release check falsification admitted {check_name}={conclusion}"
+        )
+    if expected not in output:
+        raise AssertionError(
+            "release check falsification failed without the expected refusal: "
+            f"{check_name}={conclusion}: {output}"
+        )
 
 
 def main() -> None:
@@ -962,14 +1109,14 @@ def main() -> None:
         "Windows installer proof still reaching every main commit",
     )
 
-    # The single fact that keeps a skipped installer off a main commit is the
-    # diff classifier computing docs_only ONLY for pull_request events. The
-    # group above pins the consumer of that output; this pins the producer.
-    # Without it, moving the classification outside the pull_request guard (a
-    # plausible "skip heavy jobs on docs-only main pushes too" optimisation)
-    # would let the installer report skipped on a main commit, which
-    # release-tag.yml accepts, and a tag would mint on a sha whose Windows
-    # release build never ran, with this test still green.
+    # Main's classifier must keep reporting false so the release-critical
+    # installer actually runs. The release-tag gate independently requires an
+    # exact success conclusion, but preserving both controls keeps a main push
+    # from silently losing the proof and discovering that only at tag time.
+    # Enforce the classifier as a closed form: one false default, exact false
+    # downgrade arms, one true write inside the structurally matched PR guard,
+    # and one output write. That rejects shell-equivalent quoted or indirect
+    # assignments outside the guard.
     classifier_start = ci_workflow.index("  changes:")
     classifier_end = ci_workflow.index("\n  check-docs-only:", classifier_start)
     classifier = ci_workflow[classifier_start:classifier_end]
@@ -993,6 +1140,30 @@ def main() -> None:
         "structurally matched pull_request guard",
         lambda: assert_docs_only_classifier_guard(truthy_after_guard),
     )
+    for label, assignment in (
+        ("single-quoted docs_only assignment", "docs_only='true'"),
+        ("double-quoted docs_only assignment", 'docs_only="true"'),
+        ("indirect printf docs_only assignment", "printf -v docs_only true"),
+    ):
+        bypass = classifier.replace(
+            classifier_falsification_needle,
+            f"          fi\n          {assignment}\n"
+            '          echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"',
+            1,
+        )
+        expect_assertion(
+            label,
+            "closed-form docs_only policy",
+            lambda bypass=bypass: assert_docs_only_classifier_guard(bypass),
+        )
+    comment_only = classifier.replace(
+        classifier_falsification_needle,
+        "          fi\n"
+        "          # docs_only='true' is intentionally ignored in comments\n"
+        '          echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"',
+        1,
+    )
+    assert_docs_only_classifier_guard(comment_only)
 
     release_tag = RELEASE_TAG.read_text(encoding="utf-8")
     for policy in (
@@ -1007,6 +1178,36 @@ def main() -> None:
         "required check not green: {name}",
     ):
         require(release_tag, policy, "release tag required-check gate")
+    for policy in (
+        'skippable_required = {"DCO Sign-off"}',
+        'non_failing_optional = {"success", "skipped", "neutral"}',
+        "if name in skippable_required",
+        'else {"success"}',
+        'run["conclusion"] not in allowed_conclusions',
+    ):
+        require(release_tag, policy, "per-check release conclusion policy")
+
+    release_gate = release_check_gate_source(release_tag)
+    dco_skipped = execute_release_check_gate(
+        release_gate,
+        {"DCO Sign-off": "skipped"},
+    )
+    if dco_skipped.returncode != 0:
+        raise AssertionError(
+            "release gate rejected the explicitly justified DCO skip: "
+            f"{dco_skipped.stdout}{dco_skipped.stderr}"
+        )
+    for rejected_conclusion in ("skipped", "neutral"):
+        assert_release_check_rejected(
+            release_gate,
+            WINDOWS_INSTALLER_CHECK,
+            rejected_conclusion,
+        )
+    assert_release_check_rejected(
+        release_gate,
+        "DCO Sign-off",
+        "neutral",
+    )
 
     # Cargo caches are restore-anywhere, save-from-main-only, so one reusable
     # warm entry per job stays alive under the repository cache budget instead
@@ -1024,10 +1225,19 @@ def main() -> None:
     # qualifying pull request. This is not a repository-wide no-PR-writes
     # invariant.
     workflow_sources = {
-        workflow: workflow.read_text(encoding="utf-8")
-        for workflow in sorted(WORKFLOWS.glob("*.yml"))
+        workflow: workflow.read_text(encoding="utf-8") for workflow in workflow_paths()
     }
     assert_rust_cache_steps(workflow_sources)
+
+    with tempfile.TemporaryDirectory() as directory:
+        fixture_directory = Path(directory)
+        for name in ("recognized.yml", "recognized.yaml", "ignored.txt"):
+            (fixture_directory / name).write_text("fixture\n", encoding="utf-8")
+        enumerated = [path.name for path in workflow_paths(fixture_directory)]
+        if enumerated != ["recognized.yaml", "recognized.yml"]:
+            raise AssertionError(
+                "workflow enumeration must include both .yml and .yaml files"
+            )
 
     ci_path = WORKFLOWS / "ci.yml"
     check_start = ci_workflow.index("\n  check:")
@@ -1088,6 +1298,56 @@ def main() -> None:
         "rust-cache save-if moved from with to an env field in the same step",
         "not structurally bound to its with mapping",
         lambda: assert_rust_cache_steps(same_step_field),
+    )
+
+    pinned_use = f"uses: {RUST_CACHE_ACTION}"
+    if workflow_sources[ci_path].count(pinned_use) < 1:
+        raise AssertionError(
+            "cache falsification could not identify a pinned rust-cache use"
+        )
+    quoted_pinned = dict(workflow_sources)
+    quoted_pinned[ci_path] = quoted_pinned[ci_path].replace(
+        pinned_use,
+        f'uses: "{RUST_CACHE_ACTION}"',
+        1,
+    )
+    assert_rust_cache_steps(quoted_pinned)
+
+    quoted_unpinned = dict(workflow_sources)
+    quoted_unpinned[ci_path] = quoted_unpinned[ci_path].replace(
+        pinned_use,
+        'uses: "Swatinem/rust-cache@v2"',
+        1,
+    )
+    expect_assertion(
+        "quoted rust-cache use at a moving ref",
+        "uses rust-cache at an unpinned ref",
+        lambda: assert_rust_cache_steps(quoted_unpinned),
+    )
+
+    yaml_unpinned = dict(workflow_sources)
+    yaml_unpinned[WORKFLOWS / "adversarial-cache.yaml"] = f"""\
+jobs:
+  adversarial:
+    steps:
+      - uses: "Swatinem/rust-cache@v2"
+        with:
+          {MAIN_ONLY_CACHE_SAVE}
+"""
+    expect_assertion(
+        ".yaml workflow containing a moving rust-cache ref",
+        "uses rust-cache at an unpinned ref",
+        lambda: assert_rust_cache_steps(yaml_unpinned),
+    )
+
+    unaccounted_text = dict(workflow_sources)
+    unaccounted_text[ci_path] += (
+        f"\nenv:\n  UNACCOUNTED_CACHE_ACTION: {RUST_CACHE_ACTION}\n"
+    )
+    expect_assertion(
+        "rust-cache text outside an accounted uses scalar",
+        "not an accounted uses scalar",
+        lambda: assert_rust_cache_steps(unaccounted_text),
     )
 
     for obsolete in (
@@ -1310,7 +1570,7 @@ def main() -> None:
             "release.yml has moving third-party action refs: " + ", ".join(unpinned)
         )
 
-    for workflow in sorted(WORKFLOWS.glob("*.yml")):
+    for workflow in workflow_paths():
         content = workflow.read_text(encoding="utf-8")
         header = content.split("\njobs:", maxsplit=1)[0]
         if re.search(r"(?m)^permissions:\s*$", header) is None:
