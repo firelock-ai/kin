@@ -506,6 +506,14 @@ jobs:
           # That proved the guards worked at that spot and nowhere else, and it
           # passed for as long as a comment-tracking desync left the last third
           # of the largest answer module unscanned.
+          #
+          # The harness also probes the two ways an EXEMPTION can lose scope
+          # rather than a pattern losing a site: a brace inside a literal or a
+          # comment planted in an allowlisted function body, which a raw brace
+          # counter reads as an unclosed body and silently excuses to end of
+          # file, and a counted pin paid for by a rename in test code the guard
+          # never reads. Both are the same failure as [2/3] reached through the
+          # exemption mechanism instead of a stale pin.
           echo "[1/3] every answer module, every probe site, both guards"
           python3 scripts/falsify-zero-file-search.py "$poisoned"
 
