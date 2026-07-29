@@ -190,6 +190,10 @@ pub struct HealthResponse {
     pub graph_loaded: bool,
     pub reconciliation_status: String,
     pub repo_id: String,
+    /// Exact local workspace authority. Hosted snapshot daemons do not carry a
+    /// local workspace and report `null`.
+    #[serde(default)]
+    pub workspace_id: Option<String>,
     pub repo_root: String,
     pub pid: u32,
     #[serde(default)]
@@ -249,6 +253,11 @@ pub struct HealthResponse {
     /// complete citable measurement source during this daemon lifetime.
     #[serde(default)]
     pub coordination_event_persist_failures: Option<u64>,
+    /// A cross-repo spine warm-up is loading sibling repository graphs right
+    /// now. The daemon is alive and serving its own repo throughout; this is
+    /// the signal that distinguishes "busy" from "dead".
+    #[serde(default)]
+    pub spine_warming: bool,
     pub build: BuildResponse,
 }
 
@@ -264,9 +273,14 @@ pub struct BuildResponse {
 }
 
 /// Readiness response.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, serde::Deserialize)]
 pub struct ReadinessResponse {
     pub ready: bool,
+    /// The daemon is alive and its own repo is served, but a cross-repo spine
+    /// warm-up is still materializing sibling graphs. Clients must read this as
+    /// alive-and-waiting; it is never evidence that the daemon is dead.
+    #[serde(default)]
+    pub warming: bool,
 }
 
 /// JSON-friendly intent payload for CLI and adapter consumers.
@@ -326,6 +340,13 @@ struct SessionStartResponse {
     started_at: kin_model::timestamp::Timestamp,
     capabilities: SessionCapabilities,
     status: String,
+    /// How long the session may go idle before the sweeper may reap it.
+    idle_timeout_secs: u64,
+    /// When the current idle window becomes eligible for reaping if no call
+    /// refreshes it. A live registered PID is stronger liveness evidence and
+    /// can keep the session past this boundary, so this is deliberately not
+    /// named `expires_at`.
+    idle_reap_eligible_at: kin_model::timestamp::Timestamp,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -333,6 +354,10 @@ struct SessionHeartbeatResponse {
     session_id: String,
     status: String,
     heartbeat_at: kin_model::timestamp::Timestamp,
+    /// Same contract as on [`SessionStartResponse`]: the refreshed idle window
+    /// and its next reaping-eligibility boundary.
+    idle_timeout_secs: u64,
+    idle_reap_eligible_at: kin_model::timestamp::Timestamp,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1721,6 +1746,9 @@ async fn health(
         graph_loaded,
         reconciliation_status: state.reconciliation_status_str().to_string(),
         repo_id: primary_repo_id(&state),
+        workspace_id: state
+            .local_repository_workspace_id()
+            .map(|workspace_id| workspace_id.to_string()),
         repo_root: state
             .layout
             .working_dir()
@@ -1746,6 +1774,7 @@ async fn health(
             ),
         ),
         coordination_event_persist_failures: Some(coordination_event_persist_failures),
+        spine_warming: state.spine_warming(),
         build: current_build_response(),
     }))
 }
@@ -1753,17 +1782,32 @@ async fn health(
 /// GET /readiness — returns 200 when initialized, 503 otherwise.
 /// An initialized daemon has either loaded a snapshot or completed at least
 /// one reconciliation cycle. An empty but initialized workspace is ready.
+///
+/// Readiness is deliberately independent of cross-repo spine warm-up: this
+/// daemon's own repo is what a client connecting to it needs served, and a
+/// sibling warm-up that gated readiness would report a busy daemon as a dead
+/// one. A warm-up in progress is reported through `warming` instead.
 async fn readiness(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
     let initialized = state
         .is_initialized
         .load(std::sync::atomic::Ordering::Relaxed);
+    let warming = state.spine_warming();
 
     if initialized {
-        (StatusCode::OK, Json(ReadinessResponse { ready: true }))
+        (
+            StatusCode::OK,
+            Json(ReadinessResponse {
+                ready: true,
+                warming,
+            }),
+        )
     } else {
         (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(ReadinessResponse { ready: false }),
+            Json(ReadinessResponse {
+                ready: false,
+                warming,
+            }),
         )
     }
 }
@@ -1823,6 +1867,8 @@ async fn start_session(
             )
         })?;
 
+    let idle_ttl = state.coordinator.session_idle_ttl();
+    let idle_reap_eligible_at = session_idle_reap_eligibility(&session.last_heartbeat, idle_ttl);
     Ok(Json(SessionStartResponse {
         session_id: session.session_id.to_string(),
         vendor: session.vendor,
@@ -1831,7 +1877,49 @@ async fn start_session(
         started_at: session.started_at,
         capabilities: session.capabilities,
         status: "active".to_string(),
+        idle_timeout_secs: idle_ttl.as_secs(),
+        idle_reap_eligible_at,
     }))
+}
+
+/// What to tell a caller whose session id no longer names a live session.
+///
+/// The id is well-formed, so this is an ended or idle-reaped session rather
+/// than a typo, and the only move is a fresh `kin_session_start`. Saying so is
+/// the difference between an agent restarting in one call and an agent
+/// retrying the same dead id until it times out.
+fn expired_session_message(session_id: &SessionId) -> String {
+    format!(
+        "session not found: {session_id}. It was ended or expired after its idle timeout \
+         (KIN_SESSION_IDLE_TTL_SECS). Call kin_session_start for a new session id, then \
+         re-open any transaction on it; every session-bound call refreshes the idle window, \
+         and kin_session_heartbeat refreshes it during a long read phase."
+    )
+}
+
+/// The instant the current idle window becomes eligible for reaping, measured
+/// from the last recorded heartbeat.
+///
+/// A registered PID that is still alive is stronger liveness evidence and can
+/// keep the session active beyond this boundary.
+///
+/// Saturates rather than wrapping: a TTL large enough to overflow the calendar
+/// means "not reachable from here", and reporting the heartbeat itself as the
+/// deadline would tell an agent its live session had already expired.
+fn session_idle_reap_eligibility(
+    last_heartbeat: &kin_model::timestamp::Timestamp,
+    idle_ttl: Duration,
+) -> kin_model::timestamp::Timestamp {
+    let window = i64::try_from(idle_ttl.as_secs())
+        .ok()
+        .and_then(chrono::TimeDelta::try_seconds)
+        .unwrap_or(chrono::TimeDelta::MAX);
+    kin_model::timestamp::Timestamp(
+        last_heartbeat
+            .0
+            .checked_add_signed(window)
+            .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC),
+    )
 }
 
 /// GET /session/{session_id} — fetch a single active session.
@@ -1859,21 +1947,25 @@ async fn session_heartbeat(
     State(state): State<Arc<DaemonState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let session_id = parse_session_id(&session_id)?;
-    state
-        .coordinator
-        .heartbeat(&session_id)
-        .map_err(internal_error)?;
-
+    // Existence and refresh are one coordinator operation under the same
+    // arbitration guard as stale-session sweeping. A heartbeat against a
+    // session the sweeper already reaped is the one call guaranteed to be in
+    // flight when a long-lived agent loses its session; it must come back as an
+    // actionable 404, never a precheck/update race reported as HTTP 500.
     let session = state
         .coordinator
-        .get_session(&session_id)
+        .heartbeat_session(&session_id)
         .map_err(internal_error)?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, "session not found".to_string()))?;
+        .ok_or_else(|| (StatusCode::NOT_FOUND, expired_session_message(&session_id)))?;
 
+    let idle_ttl = state.coordinator.session_idle_ttl();
+    let idle_reap_eligible_at = session_idle_reap_eligibility(&session.last_heartbeat, idle_ttl);
     Ok(Json(SessionHeartbeatResponse {
         session_id: session.session_id.to_string(),
         status: "active".to_string(),
         heartbeat_at: session.last_heartbeat,
+        idle_timeout_secs: idle_ttl.as_secs(),
+        idle_reap_eligible_at,
     }))
 }
 
@@ -17138,6 +17230,9 @@ mod tests {
     #[tokio::test]
     async fn health_includes_version_string() {
         let state = test_state();
+        let expected_workspace_id = state
+            .local_repository_workspace_id()
+            .map(|workspace_id| workspace_id.to_string());
         let app = router(state);
         let response = app
             .oneshot(Request::get("/health").body(Body::empty()).unwrap())
@@ -17154,6 +17249,10 @@ mod tests {
         let json: HealthResponse = serde_json::from_slice(&body).unwrap();
         assert!(!json.version.is_empty());
         assert_eq!(json.reconciliation_status, "idle");
+        assert_eq!(
+            json.workspace_id, expected_workspace_id,
+            "health must name the exact local workspace authority"
+        );
     }
 
     #[tokio::test]
@@ -17168,6 +17267,120 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    // ── Readiness must survive a blocking warm-up ─────────────────────────
+    //
+    // Sibling spine warm-up is a synchronous join that can run for minutes, and
+    // it is reached from async request handlers. Run inline it parks a runtime
+    // worker, and a daemon whose workers are all parked answers nothing — which
+    // is how a live, warming daemon came to look dead to a client and had its
+    // endpoint files clobbered.
+    //
+    // The runtime here has exactly one worker, so a warm-up that fails to release
+    // it starves everything. The assertion is made from the test thread (which is
+    // NOT on that runtime) with a hard wall-clock cap, so the old behavior fails
+    // this test in bounded time instead of hanging.
+    #[test]
+    fn readiness_is_answered_while_a_blocking_warm_up_holds_the_runtime() {
+        use std::sync::mpsc;
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("build single-worker runtime");
+
+        let state = runtime.block_on(async { test_state() });
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let (warm_started_tx, warm_started_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
+        let hook_release_rx = Arc::clone(&release_rx);
+        state.set_spine_initialization_test_hook(Some(Arc::new(move || {
+            let _ = warm_started_tx.send(());
+            // Bounded so a failing assertion still lets the runtime shut down.
+            let _ = hook_release_rx
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .recv_timeout(Duration::from_secs(120));
+        })));
+
+        let (warm_finished_tx, warm_finished_rx) = mpsc::channel::<bool>();
+        let warm_state = Arc::clone(&state);
+        runtime.spawn(async move {
+            let _ = warm_finished_tx.send(warm_state.ensure_spine().is_some());
+        });
+        warm_started_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the real ensure_spine warm-up must start");
+
+        let (answered_tx, answered_rx) = mpsc::channel::<(StatusCode, bool)>();
+        let probe_state = Arc::clone(&state);
+        runtime.spawn(async move {
+            let response = router(probe_state)
+                .oneshot(Request::get("/readiness").body(Body::empty()).unwrap())
+                .await
+                .expect("readiness request");
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .expect("readiness body");
+            let readiness: ReadinessResponse =
+                serde_json::from_slice(&body).expect("readiness JSON");
+            let _ = answered_tx.send((status, readiness.warming));
+        });
+
+        // Generous enough that whole-workspace CPU contention cannot trip it,
+        // while still bounded: a warm-up that parks the worker never answers at
+        // any cap, so this fails rather than hangs.
+        let answer = answered_rx.recv_timeout(Duration::from_secs(60));
+        let _ = release_tx.send(());
+        let warmed = warm_finished_rx.recv_timeout(Duration::from_secs(60));
+
+        let (status, warming) = answer.expect(
+            "readiness must be answered while a sibling warm-up blocks; a warm-up that \
+             holds the runtime worker makes a live daemon indistinguishable from a dead one",
+        );
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            warming,
+            "readiness must identify the actual ensure_spine pass as warming"
+        );
+        assert!(
+            warmed.expect("spine initialization must finish after release"),
+            "spine initialization must publish after release"
+        );
+    }
+
+    #[tokio::test]
+    async fn readiness_reports_the_warming_state_it_is_in() {
+        // Readiness is about this daemon's own repo, so it stays 200 during a
+        // cross-repo warm-up. `warming` is how a client learns the daemon is
+        // busy rather than idle — the signal that makes waiting the correct
+        // response instead of respawning.
+        let state = test_state();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let response = router(Arc::clone(&state))
+            .oneshot(Request::get("/readiness").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let readiness: ReadinessResponse = serde_json::from_slice(&body).unwrap();
+        assert!(readiness.ready);
+        assert!(
+            !readiness.warming,
+            "an idle daemon must not claim to be warming"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -17337,6 +17550,103 @@ mod tests {
             .unwrap();
         let end_json: SessionEndResponse = serde_json::from_slice(&end_body).unwrap();
         assert_eq!(end_json.status, "ended");
+    }
+
+    /// Session start and heartbeat must both expose the next idle-reaping
+    /// eligibility boundary, and a call on a dead session must say it expired
+    /// and name the restart.
+    ///
+    /// An agent cannot decide to heartbeat before a deadline it cannot see, and
+    /// a bare "not found" reads like a bad argument rather than an expiry, so a
+    /// thinking pause silently stranded the whole session.
+    #[tokio::test]
+    async fn session_responses_carry_their_expiry_and_a_dead_session_says_so() {
+        let state = test_state();
+        let idle_ttl = state.coordinator.session_idle_ttl();
+        let app = router(state);
+
+        let start_response = app
+            .clone()
+            .oneshot(
+                Request::post("/session")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "vendor": "claude-code",
+                            "client_name": "expiry-test",
+                            "transport": "mcp",
+                            "cwd": "/project"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(start_response.status(), StatusCode::OK);
+        let start_body = axum::body::to_bytes(start_response.into_body(), 4096)
+            .await
+            .unwrap();
+        let start_json: SessionStartResponse = serde_json::from_slice(&start_body).unwrap();
+        assert_eq!(start_json.idle_timeout_secs, idle_ttl.as_secs());
+        assert!(
+            start_json.idle_reap_eligible_at.0 > start_json.started_at.0,
+            "the idle-reaping boundary must be ahead of the session it belongs to: {:?} vs {:?}",
+            start_json.idle_reap_eligible_at,
+            start_json.started_at
+        );
+
+        let heartbeat_response = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/session/{}/heartbeat", start_json.session_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(heartbeat_response.status(), StatusCode::OK);
+        let heartbeat_body = axum::body::to_bytes(heartbeat_response.into_body(), 4096)
+            .await
+            .unwrap();
+        let heartbeat_json: SessionHeartbeatResponse =
+            serde_json::from_slice(&heartbeat_body).unwrap();
+        assert_eq!(heartbeat_json.idle_timeout_secs, idle_ttl.as_secs());
+        assert!(
+            heartbeat_json.idle_reap_eligible_at.0 >= start_json.idle_reap_eligible_at.0,
+            "a heartbeat must not move the idle-reaping boundary backwards"
+        );
+
+        // End the session, then heartbeat it: the shape an agent hits after the
+        // sweeper reaps an idle session.
+        let end_response = app
+            .clone()
+            .oneshot(
+                Request::delete(format!("/session/{}", start_json.session_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(end_response.status(), StatusCode::OK);
+
+        let dead_response = app
+            .oneshot(
+                Request::post(format!("/session/{}/heartbeat", start_json.session_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(dead_response.status(), StatusCode::NOT_FOUND);
+        let dead_body = axum::body::to_bytes(dead_response.into_body(), 4096)
+            .await
+            .unwrap();
+        let message = String::from_utf8(dead_body.to_vec()).unwrap();
+        assert!(
+            message.contains("expired") && message.contains("kin_session_start"),
+            "an expired session must be named as expired and name its recovery: {message}"
+        );
     }
 
     // -----------------------------------------------------------------------

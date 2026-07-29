@@ -67,6 +67,7 @@ uuid = { workspace = true }
 serde_json = { workspace = true }
 semver = { workspace = true }
 chrono = { workspace = true }
+filetime = { workspace = true }
 reqwest = { workspace = true, features = ["blocking", "json"] }
 hex = { workspace = true }
 sha2.workspace = true
@@ -103,6 +104,7 @@ rustix = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
+    "Wdk_System_SystemInformation",
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Authorization",
