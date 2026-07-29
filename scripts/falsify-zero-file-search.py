@@ -22,6 +22,7 @@ Usage: falsify-zero-file-search.py <tree_root>
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -98,6 +99,12 @@ DENY_SET_PROBES = [
 ]
 CMD_DIR = "crates/kin-cli/src/commands"
 
+# (module, one function the allowlist exempts by name). Each pair is probed
+# inside that body, immediately after it, and at end of file.
+DAEMON_FN_SCOPED = [
+    ("crates/kin-daemon/src/api.rs", "ensure_loopback_token"),
+]
+
 
 def load_guard(root):
     path = os.path.join(root, "scripts", "verify-zero-file-search.py")
@@ -115,27 +122,46 @@ def load_guard(root):
     return module
 
 
+def allowlist_entries(root):
+    path = os.path.join(root, "scripts", "zero-file-search-allowlist.json")
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f).get("allowlist", [])
+
+
 def whole_file_exempt(root):
     """Files the allowlist exempts entirely, which the guard therefore never
     scans. Excluding them here is correct, but it must be visible: an
     exemption that silently cancels a module's enforcement is exactly the kind
-    of gap this harness exists to surface."""
-    path = os.path.join(root, "scripts", "zero-file-search-allowlist.json")
-    with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    return {e["file"] for e in data.get("allowlist", []) if not e.get("allow_match")}
+    of gap this harness exists to surface.
+
+    An entry carrying either kind of pin is not whole-file exempt: expression
+    pins and function-body pins both leave the rest of the file scanned."""
+    return {
+        e["file"]
+        for e in allowlist_entries(root)
+        if not e.get("allow_match") and not e.get("allow_fn")
+    }
 
 
 def pinned_allowlist(root):
-    """Return every expression-pinned exemption keyed by source file."""
-    path = os.path.join(root, "scripts", "zero-file-search-allowlist.json")
-    with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    return {
-        entry["file"]: entry["allow_match"]
-        for entry in data.get("allowlist", [])
-        if entry.get("allow_match")
-    }
+    """Return {file: {expression: expected occurrence count}}.
+
+    A pin is a bare string, meaning exactly one occurrence, or an object
+    carrying its own count for an expression that legitimately recurs. The
+    count is what makes a recurring pin falsifiable, so this harness reads it
+    rather than assuming one site per pin."""
+    pinned = {}
+    for entry in allowlist_entries(root):
+        matches = entry.get("allow_match")
+        if not matches:
+            continue
+        pinned[entry["file"]] = {
+            (m if isinstance(m, str) else m["expr"]): (
+                1 if isinstance(m, str) else m.get("count", 1)
+            )
+            for m in matches
+        }
+    return pinned
 
 
 def production_end(lines):
@@ -190,6 +216,29 @@ def shell_guard_modules(root):
                 if entry.startswith("$cmd_dir/"):
                     modules.add(entry.split("/")[-1])
     return modules
+
+
+def fn_body_span(lines, name):
+    """(declaration index, closing-brace index) for a named function, or None.
+
+    Located textually, by the indentation of the declaration and the first line
+    that is exactly that indentation followed by `}`. Deliberately not the
+    guard's own brace-depth parser: a harness that sited its probes with the
+    parser under test would put both of them wherever that parser believed the
+    body was, and a body it mislocated would never be probed at all.
+    `cargo fmt --check` runs in the same CI job, so the closing brace of a
+    function is reliably indented to match its declaration.
+    """
+    pattern = re.compile(r"^(\s*)(?:pub\S*\s+)?(?:async\s+)?fn\s+" + re.escape(name) + r"\s*[(<]")
+    for idx, line in enumerate(lines):
+        m = pattern.match(line)
+        if not m:
+            continue
+        closer = m.group(1) + "}"
+        for end in range(idx + 1, len(lines)):
+            if lines[end].rstrip() == closer:
+                return idx, end
+    return None
 
 
 def run(cmd):
@@ -286,16 +335,21 @@ def main():
             originals[path] = original
             lines = original.split("\n")
             poisoned_lines = set()
-            for match in matches:
-                locations = [idx for idx, line in enumerate(lines) if match in line]
-                if len(locations) != 1:
+            for match, want in matches.items():
+                found = original.count(match)
+                if found != want:
                     failures.append(
                         f"{rel}: pinned expression {match!r} occurs "
-                        f"{len(locations)} times (want exactly 1)"
+                        f"{found} times (want {want})"
                     )
                     setup_failed = True
                     continue
-                poisoned_lines.add(locations[0])
+                # Every site a recurring pin covers, not just the first: an
+                # exemption that masked one line and dropped the rest would
+                # pass a single-site probe.
+                poisoned_lines.update(
+                    idx for idx, line in enumerate(lines) if match in line
+                )
             for idx in poisoned_lines:
                 lines[idx] = f"{POISON} {lines[idx]}"
             with open(path, "w", encoding="utf-8") as f:
@@ -327,7 +381,7 @@ def main():
     # also present in the shared JSON policy, so use that one representative
     # line to prove the dependency-free guard masks rather than drops it.
     shell_same_line_rel = f"{CMD_DIR}/locate.rs"
-    shell_matches = pinned.get(shell_same_line_rel, [])
+    shell_matches = list(pinned.get(shell_same_line_rel, {}))
     shell_path = os.path.join(root, shell_same_line_rel)
     if len(shell_matches) != 1:
         failures.append(
@@ -368,6 +422,66 @@ def main():
         finally:
             with open(shell_path, "w", encoding="utf-8") as f:
                 f.write(original)
+
+    # Function-body exemptions need falsifying from both sides. Poison inside
+    # an exempt body must NOT be reported, or the exemption does not work;
+    # poison just past its closing brace must be, or the exemption is really a
+    # whole-file one wearing a function's name. The daemon RPC surface is where
+    # this matters: it was a directory-level exemption with a six-handler
+    # rescue covering a sixtieth of the file, so "the guard names api.rs" is a
+    # claim that has to be demonstrated rather than assumed.
+    for rel, exempt_fn in DAEMON_FN_SCOPED:
+        path = os.path.join(root, rel)
+        if not os.path.isfile(path):
+            failures.append(f"{rel}: fn-scoped falsification target is missing")
+            continue
+        with open(path, "r", encoding="utf-8") as f:
+            original = f.read()
+        lines = original.split("\n")
+        span = fn_body_span(lines, exempt_fn)
+        if span is None:
+            failures.append(
+                f"{rel}: could not locate the body of {exempt_fn} to falsify"
+            )
+            continue
+        start, end = span
+        base = os.path.basename(rel)
+        marks = []
+        try:
+            for label, idx, want_named in (
+                ("inside-exempt-fn", start + 1, False),
+                ("after-exempt-fn", end + 1, True),
+                ("eof", len(lines), True),
+            ):
+                poisoned = lines[:idx] + [POISON] + lines[idx:]
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write("\n".join(poisoned))
+                code, out = run([sys.executable, py_guard, root])
+                named = base in out
+                if want_named and not named:
+                    failures.append(
+                        f"{rel} @ {label}: guard did not name the file on a "
+                        "poisoned scanned region"
+                    )
+                    marks.append(f"{label}=BLIND")
+                elif not want_named and named:
+                    failures.append(
+                        f"{rel} @ {label}: guard named the file for poison inside "
+                        f"the exempt body of {exempt_fn}, so the exemption is not "
+                        "scoped to it"
+                    )
+                    marks.append(f"{label}=UNSCOPED")
+                elif want_named and code == 0:
+                    failures.append(
+                        f"{rel} @ {label}: guard PASSED on a poisoned tree"
+                    )
+                    marks.append(f"{label}=BLIND")
+                else:
+                    marks.append(f"{label}=ok")
+        finally:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(original)
+        print(f"  {base:24} {'  '.join(marks)}")
 
     # The broad probe above proves coverage across every claimed module, but
     # one representative read primitive cannot prove the deny sets themselves
