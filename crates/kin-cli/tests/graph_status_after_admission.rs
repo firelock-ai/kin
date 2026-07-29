@@ -231,6 +231,60 @@ fn graph_status_passes_on_a_healthy_freshly_admitted_repository() {
     );
 }
 
+fn graph_validate(
+    binding: &kin_core::LocalRepositoryAuthorityBinding,
+    graph: &kin_db::InMemoryGraph,
+) -> kin_cli::commands::graph::GraphCommandResponse {
+    execute_graph_command(binding, graph, &GraphCommandRequest::Validate)
+        .expect("run graph validate")
+}
+
+fn note_lines(response: &kin_cli::commands::graph::GraphCommandResponse) -> Vec<&String> {
+    response
+        .lines
+        .iter()
+        .filter(|line| line.starts_with('ℹ'))
+        .collect()
+}
+
+/// Exact admission binds the entity layer and no facet layer, so a freshly
+/// admitted repository is healthy with its enrichment still pending. Validate
+/// must say so: passing silently makes a pending repository indistinguishable
+/// from a fully enriched one, which is the same reporting loss on the validate
+/// surface that the status surface was fixed for.
+#[test]
+fn graph_validate_reports_pending_enrichment_and_agrees_with_status() {
+    let root = tempdir().expect("temp root");
+    let repo = root.path().join("repo");
+    fs::create_dir_all(&repo).expect("create repo");
+    let admitted = admit(&repo);
+    let graph = workspace_query_graph(&admitted.binding);
+
+    let validate = graph_validate(&admitted.binding, &graph);
+
+    assert!(
+        validate.error.is_none(),
+        "pending enrichment is healthy, so validate must not fail: {:?}\n{}",
+        validate.error,
+        validate.lines.join("\n")
+    );
+    assert!(
+        validate
+            .lines
+            .iter()
+            .any(|line| line.contains("no query-facing enrichment facet")),
+        "validate must surface the pending-enrichment note: {}",
+        validate.lines.join("\n")
+    );
+
+    let status = graph_status(&admitted.binding, &graph);
+    assert_eq!(
+        note_lines(&validate),
+        note_lines(&status),
+        "validate and status must agree on note presence for one repo state"
+    );
+}
+
 #[test]
 fn graph_status_fails_on_a_facet_that_disagrees_with_exact_tree_truth() {
     let root = tempdir().expect("temp root");
