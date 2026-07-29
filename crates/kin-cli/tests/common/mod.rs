@@ -159,27 +159,109 @@ fn read_capture(mut file: std::fs::File) -> std::io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn daemon_compat_ok(path: &Path) -> bool {
+/// The build identity this test binary carries, in the exact form the daemon
+/// stamps persisted vector sidecars with.
+///
+/// A test that seeds prepared state writes this stamp; the daemon that later
+/// reopens the repository demands its own. The two only agree when both
+/// binaries came out of one build of `kin-buildinfo`.
+pub fn expected_build_stamp() -> String {
+    kin_buildinfo::sha_with_dirty(kin_buildinfo::get())
+}
+
+/// Recompose a `--compat-json` `build.sha` / `build.dirty` pair into the stamp
+/// `kin_buildinfo::sha_with_dirty` would produce for the same build.
+///
+/// The daemon reports the two fields separately, so the harness has to join
+/// them the way the authority does rather than comparing the pair directly:
+/// when the commit is unknown the dirty flag is not part of the identity, and
+/// a raw pair comparison would reject a daemon whose embedder identity
+/// actually matches.
+fn build_stamp(sha: &str, dirty: bool) -> String {
+    if dirty && sha != "unknown" {
+        format!("{sha}-dirty")
+    } else {
+        sha.to_string()
+    }
+}
+
+/// Why a candidate `kin-daemon` may not be reused by this test binary, or
+/// `None` when it may be.
+///
+/// Two independent reasons, and the second is the one that used to be missed.
+/// A daemon whose graph snapshot version differs cannot read the repository at
+/// all. A daemon that is merely built from a *different commit or working
+/// tree* reads it fine, but stamps and demands a different embedder identity —
+/// so a sidecar seeded by this test binary is rejected on load,
+/// `indexed_embedding_count` reads 0, and the suite reports a product defect
+/// that only exists because two binaries in one target directory were built at
+/// different times.
+pub fn daemon_compat_mismatch(
+    payload: &Value,
+    expected_snapshot_version: u64,
+    expected_stamp: &str,
+) -> Option<String> {
+    match payload["graph_snapshot_version"].as_u64() {
+        Some(version) if version == expected_snapshot_version => {}
+        Some(version) => {
+            return Some(format!(
+                "graph snapshot version {version} does not match this test binary's {expected_snapshot_version}"
+            ));
+        }
+        None => return Some("compat payload has no graph_snapshot_version".to_string()),
+    }
+
+    let Some(sha) = payload["build"]["sha"].as_str() else {
+        return Some("compat payload has no build.sha".to_string());
+    };
+    let Some(dirty) = payload["build"]["dirty"].as_bool() else {
+        return Some("compat payload has no build.dirty".to_string());
+    };
+
+    let daemon_stamp = build_stamp(sha, dirty);
+    if daemon_stamp != expected_stamp {
+        return Some(format!(
+            "daemon build identity {daemon_stamp} does not match this test binary's {expected_stamp}"
+        ));
+    }
+    None
+}
+
+fn daemon_compat(path: &Path) -> Result<(), String> {
     if !path.exists() {
-        return false;
+        return Err(format!("{} does not exist", path.display()));
     }
-    let Ok(output) = Command::new(path).arg("--compat-json").output() else {
-        return false;
-    };
+    let output = Command::new(path)
+        .arg("--compat-json")
+        .output()
+        .map_err(|error| format!("could not run {} --compat-json: {error}", path.display()))?;
     if !output.status.success() {
-        return false;
+        return Err(format!(
+            "{} --compat-json exited with {}",
+            path.display(),
+            output.status
+        ));
     }
-    let Ok(payload) = serde_json::from_slice::<Value>(&output.stdout) else {
-        return false;
-    };
-    payload["graph_snapshot_version"].as_u64()
-        == Some(kin_db::GraphSnapshot::CURRENT_VERSION as u64)
+    let payload = serde_json::from_slice::<Value>(&output.stdout).map_err(|error| {
+        format!(
+            "{} --compat-json did not emit JSON: {error}",
+            path.display()
+        )
+    })?;
+    match daemon_compat_mismatch(
+        &payload,
+        kin_db::GraphSnapshot::CURRENT_VERSION as u64,
+        &expected_build_stamp(),
+    ) {
+        Some(reason) => Err(reason),
+        None => Ok(()),
+    }
 }
 
 pub fn fresh_daemon_bin() -> PathBuf {
     let kin_bin = PathBuf::from(env!("CARGO_BIN_EXE_kin"));
     let daemon_bin = kin_bin.with_file_name(format!("kin-daemon{}", std::env::consts::EXE_SUFFIX));
-    if daemon_compat_ok(&daemon_bin) {
+    if daemon_compat(&daemon_bin).is_ok() {
         return daemon_bin;
     }
 
@@ -203,10 +285,18 @@ pub fn fresh_daemon_bin() -> PathBuf {
         );
     });
 
-    assert!(
-        daemon_compat_ok(&daemon_bin),
-        "kin-daemon at {} is missing or incompatible after rebuild",
-        daemon_bin.display()
-    );
+    if let Err(reason) = daemon_compat(&daemon_bin) {
+        panic!(
+            "kin-daemon at {} is unusable after rebuild: {reason}.\n\
+             This test binary carries build identity {}. A daemon built from a \
+             different commit or working tree stamps persisted vector sidecars \
+             with a different embedder identity, so state this suite seeds is \
+             rejected on reopen and indexed_embedding_count reads 0 — a harness \
+             fault that reads as a product defect. Build both from one tree: \
+             cargo build --all-targets",
+            daemon_bin.display(),
+            expected_build_stamp()
+        );
+    }
     daemon_bin
 }
