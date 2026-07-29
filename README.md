@@ -128,7 +128,7 @@ coexistence configuration; unsafe, ambiguous, or unsupported transfer settings
 fail closed before publication.
 
 Admission also derives the semantic entity and relation layer for every
-supported source in that history, and `kin init` reports the durable,
+supported entity-source file in that history, and `kin init` reports the durable,
 generation-bound counts it committed. `kin status` reports that repository
 authority view; `kin graph status` separately reports the daemon's mutable live
 query graph, which may include later derived enrichment.

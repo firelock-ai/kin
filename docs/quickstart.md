@@ -146,7 +146,7 @@ kin init path/to/project
 In a clean detected Git repository, `kin init` imports complete reachable
 history, refs, raw objects, the exact workspace tree, and admission policy into
 graph-owned authority. It also derives the semantic entity and relation layer
-for every supported source in that history, and reports the durable,
+for every supported entity-source file in that history, and reports the durable,
 generation-bound counts it committed. Git stays in place as an explicit
 interoperability boundary; Kin runtime queries do not fall back to it.
 Repository-local remote URLs, refspecs, branch tracking, and push defaults that

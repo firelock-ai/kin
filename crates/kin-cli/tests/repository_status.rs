@@ -93,7 +93,7 @@ fn status_is_one_exact_authority_lease_and_ignores_checkout_and_git_drift() {
     );
     let before_report: Value =
         serde_json::from_slice(&before.stdout).expect("status stdout should be JSON");
-    assert_eq!(before_report["schema"], "kin.status.v1");
+    assert_eq!(before_report["schema"], "kin.status.v2");
     assert_eq!(before_report["authority"], "repository-v6");
     assert_eq!(before_report["repository"]["generation"], 1);
     assert_eq!(before_report["repository"]["source_cas_verified"], true);

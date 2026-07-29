@@ -23,7 +23,10 @@ use serde::{Deserialize, Serialize};
 
 use super::repository_authority::ActiveRepositoryAuthority;
 
-pub const STATUS_SCHEMA: &str = "kin.status.v1";
+/// First status contract whose enrichment counts name their durable view and
+/// exact authority/workspace generations. The earlier, unreleased v1 shape
+/// carried counts with different semantics and cannot be inferred truthfully.
+pub const STATUS_SCHEMA: &str = "kin.status.v2";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -360,6 +363,49 @@ fn build_id(sha: &str, dirty: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unreleased_v1_enrichment_is_not_silently_reinterpreted_as_v2() {
+        let legacy = serde_json::json!({
+            "presence": "present",
+            "entity_count": 7,
+            "relation_count": 4,
+            "semantic_change_count": 2,
+            "completion_attested": false
+        });
+
+        let error = serde_json::from_value::<SemanticEnrichmentStatus>(legacy)
+            .expect_err("v1 counts have no durable-view or generation proof");
+
+        assert_eq!(STATUS_SCHEMA, "kin.status.v2");
+        assert!(
+            error.to_string().contains("missing field `view`"),
+            "v1 must fail explicitly instead of inferring v2 semantics: {error}"
+        );
+    }
+
+    #[test]
+    fn v2_enrichment_round_trip_preserves_view_and_generations() {
+        let enrichment = SemanticEnrichmentStatus {
+            view: SemanticEnrichmentView::DurableRepositoryAuthority,
+            authority_generation: 9,
+            workspace_generation: 3,
+            presence: SemanticEnrichmentPresence::Present,
+            entity_count: 7,
+            relation_count: 4,
+            semantic_change_count: 2,
+            completion_attested: false,
+        };
+
+        let encoded = serde_json::to_value(&enrichment).unwrap();
+        assert_eq!(encoded["view"], "durable_repository_authority");
+        assert_eq!(encoded["authority_generation"], 9);
+        assert_eq!(encoded["workspace_generation"], 3);
+        assert_eq!(
+            serde_json::from_value::<SemanticEnrichmentStatus>(encoded).unwrap(),
+            enrichment
+        );
+    }
 
     #[test]
     fn non_utf8_symbolic_head_is_rendered_without_loss() {
