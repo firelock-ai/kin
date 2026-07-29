@@ -31,7 +31,152 @@ INSTALL_PS1 = ROOT / "scripts" / "install.ps1"
 HEALTH = ROOT / "crates" / "kin-cli" / "src" / "commands" / "health.rs"
 RUST_CACHE_ACTION = "Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4"
 MAIN_ONLY_CACHE_SAVE = "save-if: ${{ github.ref == 'refs/heads/main' }}"
+MAIN_ONLY_CACHE_SAVE_VALUE = "${{ github.ref == 'refs/heads/main' }}"
 RUST_CACHE_REFERENCE = re.compile(r"Swatinem/rust-cache@", re.IGNORECASE)
+CANONICAL_STEP_FIELDS = frozenset(
+    {
+        "continue-on-error",
+        "env",
+        "id",
+        "if",
+        "name",
+        "run",
+        "shell",
+        "timeout-minutes",
+        "uses",
+        "with",
+        "working-directory",
+    }
+)
+CACHE_AUTHORITY_ADVERSARIAL_WORKFLOWS = (
+    (
+        "escaped action key and value",
+        "canonical unquoted `key:` syntax",
+        r"""
+name: Escaped action
+on: push
+permissions:
+  contents: read
+jobs:
+  adversarial:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Hidden moving cache action
+        "u\u0073es": "Swatinem/rust-ca\u0063he@v2"
+        with:
+          save-if: ${{ true }}
+""",
+    ),
+    (
+        "aliased action value",
+        "direct action scalar",
+        r"""
+name: Aliased action
+on: push
+permissions:
+  contents: read
+env:
+  HIDDEN_CACHE: &hidden_cache "Swatinem/rust-ca\u0063he@v2"
+jobs:
+  adversarial:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Hidden alias cache action
+        uses: *hidden_cache
+        with:
+          save-if: ${{ true }}
+""",
+    ),
+    (
+        "multiline escaped action value",
+        "direct action scalar",
+        r"""
+name: Multiline escaped action
+on: push
+permissions:
+  contents: read
+jobs:
+  adversarial:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Hidden multiline cache action
+        uses: "Swatinem/rust-ca\
+          che@v2"
+        with:
+          save-if: ${{ true }}
+""",
+    ),
+    (
+        "flow-mapping action step",
+        "canonical block mapping",
+        r"""
+name: Flow action
+on: push
+permissions:
+  contents: read
+jobs:
+  adversarial:
+    runs-on: ubuntu-latest
+    steps:
+      - {name: Hidden flow cache action, "u\u0073es": "Swatinem/rust-ca\u0063he@v2", with: {save-if: "${{ true }}"}}
+""",
+    ),
+    (
+        "escaped save-if key",
+        "canonical unquoted `key:` syntax",
+        r"""
+name: Escaped cache policy
+on: push
+permissions:
+  contents: read
+jobs:
+  adversarial:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Hidden cache save policy
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+        with:
+          "save\u002dif": ${{ true }}
+""",
+    ),
+    (
+        "aliased save-if value",
+        "must be the exact main-only scalar",
+        r"""
+name: Aliased cache policy
+on: push
+permissions:
+  contents: read
+env:
+  HIDDEN_SAVE: &hidden_save "${{ true }}"
+jobs:
+  adversarial:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Hidden aliased save policy
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+        with:
+          save-if: *hidden_save
+""",
+    ),
+    (
+        "flow-mapping with policy",
+        "with field must be a canonical block mapping",
+        r"""
+name: Flow cache policy
+on: push
+permissions:
+  contents: read
+jobs:
+  adversarial:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Hidden flow save policy
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+        with: {save-if: "${{ true }}"}
+""",
+    ),
+)
 REQUIRED_RELEASE_CHECKS = (
     "Check & Test (ubuntu-latest)",
     "Check & Test (macos-latest)",
@@ -827,145 +972,295 @@ def create_docs_only_git_fixture(directory: Path) -> tuple[Path, str, str]:
     return repository, base_sha, head_sha
 
 
-def yaml_uses_scalar(line: str) -> str | None:
-    """Read the simple scalar forms accepted for a workflow step's `uses` key."""
+def workflow_structural_lines(content: str) -> list[tuple[int, int, str]]:
+    """Return active YAML lines while excluding literal and folded bodies."""
 
-    if not line.strip() or line.lstrip().startswith("#"):
-        return None
-    match = re.match(
-        r"""^\s*(?:-\s*)?uses:\s*(?:"([^"\r\n]+)"|'([^'\r\n]+)'|([^#\s]+))"""
-        r"""\s*(?:#.*)?$""",
-        line,
+    structural: list[tuple[int, int, str]] = []
+    block_scalar_indent: int | None = None
+    block_scalar = re.compile(
+        r"^(?:-\s+)?[A-Za-z0-9_-]+:\s*[|>]"
+        r"(?:[+-]?[1-9]?|[1-9][+-]?)?\s*(?:#.*)?$"
+    )
+    for line_number, line in enumerate(content.splitlines(), start=1):
+        if block_scalar_indent is not None:
+            if not line.strip():
+                continue
+            indent = len(line) - len(line.lstrip())
+            if indent > block_scalar_indent:
+                continue
+            block_scalar_indent = None
+
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        indentation = line[: len(line) - len(line.lstrip())]
+        if "\t" in indentation:
+            raise AssertionError(
+                f"workflow YAML indentation must use spaces: line {line_number}"
+            )
+        stripped = line.lstrip()
+        indent = len(indentation)
+        structural.append((line_number, indent, stripped))
+        if block_scalar.fullmatch(stripped):
+            block_scalar_indent = indent
+    return structural
+
+
+def canonical_step_field(
+    workflow: Path,
+    line_number: int,
+    source: str,
+) -> tuple[str, str]:
+    """Parse one canonical block-style workflow-step field."""
+
+    match = re.fullmatch(
+        r"(?P<key>[A-Za-z][A-Za-z0-9-]*):(?P<value>.*)",
+        source,
     )
     if match is None:
-        if re.match(r"^\s*(?:-\s*)?uses:\s*", line):
-            raise AssertionError(
-                "workflow uses scalar must be a single plain or quoted value"
-            )
-        return None
-    double_quoted, single_quoted, plain = match.groups()
-    if double_quoted is not None:
-        if "\\" in double_quoted:
-            raise AssertionError(
-                "workflow uses scalar must not contain YAML escape sequences"
-            )
-        return double_quoted
-    if single_quoted is not None:
-        return single_quoted
-    assert plain is not None
-    return plain
+        raise AssertionError(
+            f"{workflow.name}:{line_number} workflow step fields must use "
+            "canonical unquoted `key:` syntax in a canonical block mapping"
+        )
+    key = match.group("key")
+    if key not in CANONICAL_STEP_FIELDS:
+        raise AssertionError(
+            f"{workflow.name}:{line_number} workflow step field is not in the "
+            f"canonical Actions grammar: {key}"
+        )
+    return key, match.group("value").strip()
 
 
-def rust_cache_step_bounds(lines: list[str], uses_line: int) -> tuple[int, int]:
-    uses = lines[uses_line]
-    inline = re.match(r"^(\s*)-\s+uses:\s*", uses)
-    if inline:
-        step_start = uses_line
-        step_indent = len(inline.group(1))
-    else:
-        uses_indent = len(uses) - len(uses.lstrip())
-        step_indent = uses_indent - 2
-        step_start = -1
-        for index in range(uses_line - 1, -1, -1):
-            line = lines[index]
-            stripped = line.lstrip()
-            if not stripped or stripped.startswith("#"):
-                continue
-            indent = len(line) - len(stripped)
-            if indent < step_indent:
-                break
-            if indent == step_indent and re.match(r"-\s+", stripped):
-                step_start = index
-                break
-        if step_start < 0:
-            raise AssertionError(
-                "rust-cache use is not nested in a structurally identifiable step"
-            )
+def canonical_workflow_steps(
+    workflow: Path,
+    content: str,
+) -> list[
+    tuple[
+        dict[str, tuple[int, int, str]],
+        list[tuple[int, int, str]],
+    ]
+]:
+    """Inventory steps under a fail-closed, actionlint-compatible block grammar."""
 
-    step_end = len(lines)
-    for index in range(step_start + 1, len(lines)):
-        line = lines[index]
-        stripped = line.lstrip()
-        if not stripped or stripped.startswith("#"):
+    structural = workflow_structural_lines(content)
+    steps: list[
+        tuple[
+            dict[str, tuple[int, int, str]],
+            list[tuple[int, int, str]],
+        ]
+    ] = []
+
+    for steps_index, (steps_line, steps_indent, stripped) in enumerate(structural):
+        steps_match = re.fullmatch(r"steps:(?P<value>.*)", stripped)
+        if steps_match is None:
             continue
-        indent = len(line) - len(stripped)
-        if indent < step_indent or (
-            indent == step_indent and re.match(r"-\s+", stripped)
-        ):
-            step_end = index
+        steps_value = steps_match.group("value").strip()
+        if steps_value and not steps_value.startswith("#"):
+            raise AssertionError(
+                f"{workflow.name}:{steps_line} workflow steps must use a "
+                "canonical block sequence"
+            )
+        end = len(structural)
+        for index in range(steps_index + 1, len(structural)):
+            if structural[index][1] <= steps_indent:
+                end = index
+                break
+        children = structural[steps_index + 1 : end]
+        if not children:
+            raise AssertionError(
+                f"{workflow.name} steps mapping must contain canonical step entries"
+            )
+
+        list_indent = steps_indent + 2
+        field_indent = list_indent + 2
+        fields: dict[str, tuple[int, int, str]] | None = None
+        step_lines: list[tuple[int, int, str]] = []
+
+        def finish_step() -> None:
+            nonlocal fields, step_lines
+            if fields is None:
+                return
+            execution_fields = {"run", "uses"}.intersection(fields)
+            if len(execution_fields) != 1:
+                raise AssertionError(
+                    f"{workflow.name}:{step_lines[0][0]} canonical workflow "
+                    "steps must contain exactly one run or uses field"
+                )
+            steps.append((fields, step_lines))
+            fields = None
+            step_lines = []
+
+        for line_number, indent, child in children:
+            if indent == list_indent:
+                finish_step()
+                if not child.startswith("- "):
+                    raise AssertionError(
+                        f"{workflow.name}:{line_number} workflow steps must use "
+                        "a canonical block mapping for every sequence item"
+                    )
+                fields = {}
+                step_lines = [(line_number, indent, child)]
+                key, value = canonical_step_field(
+                    workflow,
+                    line_number,
+                    child[2:],
+                )
+                fields[key] = (line_number, field_indent, value)
+                continue
+
+            if fields is None:
+                raise AssertionError(
+                    f"{workflow.name}:{line_number} workflow step entries must "
+                    "start at canonical two-space child indentation"
+                )
+            step_lines.append((line_number, indent, child))
+            if indent == field_indent:
+                key, value = canonical_step_field(workflow, line_number, child)
+                if key in fields:
+                    raise AssertionError(
+                        f"{workflow.name}:{line_number} workflow step contains "
+                        f"a duplicate {key} field"
+                    )
+                fields[key] = (line_number, field_indent, value)
+            elif indent < field_indent:
+                raise AssertionError(
+                    f"{workflow.name}:{line_number} workflow step fields must "
+                    "use canonical two-space child indentation"
+                )
+        finish_step()
+    return steps
+
+
+def yaml_uses_scalar(workflow: Path, line_number: int, value: str) -> str:
+    """Decode the direct scalar forms permitted for every action reference."""
+
+    double_quoted = re.fullmatch(r'"([^"\r\n]*)"\s*(?:#.*)?', value)
+    if double_quoted is not None:
+        action = double_quoted.group(1)
+        if "\\" in action:
+            raise AssertionError(
+                f"{workflow.name}:{line_number} workflow uses scalar must not "
+                "contain YAML escape sequences"
+            )
+        return action
+
+    single_quoted = re.fullmatch(r"'([^'\r\n]*)'\s*(?:#.*)?", value)
+    if single_quoted is not None:
+        return single_quoted.group(1)
+
+    plain = re.fullmatch(r"""([^#\s'"\\]+)\s*(?:#.*)?""", value)
+    if plain is None or plain.group(1).startswith(("*", "&", "!", "{", "[", "|", ">")):
+        raise AssertionError(
+            f"{workflow.name}:{line_number} workflow uses must be one direct "
+            "action scalar without aliases, anchors, tags, or flow values"
+        )
+    return plain.group(1)
+
+
+def canonical_job_action_uses(workflow: Path, content: str) -> list[str]:
+    """Inventory reusable-workflow references alongside action-step references."""
+
+    actions: list[str] = []
+    for block in workflow_job_blocks(content).values():
+        for key, value in job_top_level_mapping_fields(block):
+            if key == "uses":
+                actions.append(yaml_uses_scalar(workflow, 0, value))
+    return actions
+
+
+def canonical_child_mapping(
+    workflow: Path,
+    step_lines: list[tuple[int, int, str]],
+    parent_line: int,
+    parent_indent: int,
+) -> dict[str, tuple[int, str]]:
+    """Parse a step field's canonical two-space-indented child mapping."""
+
+    fields: dict[str, tuple[int, str]] = {}
+    expected_indent = parent_indent + 2
+    for line_number, indent, source in step_lines:
+        if line_number <= parent_line:
+            continue
+        if indent <= parent_indent:
             break
-    return step_start, step_end
+        if indent != expected_indent:
+            raise AssertionError(
+                f"{workflow.name}:{line_number} workflow with inputs must use "
+                "canonical two-space child indentation"
+            )
+        match = re.fullmatch(
+            r"(?P<key>[A-Za-z][A-Za-z0-9_-]*):(?P<value>.*)",
+            source,
+        )
+        if match is None:
+            raise AssertionError(
+                f"{workflow.name}:{line_number} workflow with inputs must use "
+                "canonical unquoted `key:` syntax"
+            )
+        key = match.group("key")
+        if key in fields:
+            raise AssertionError(
+                f"{workflow.name}:{line_number} workflow with mapping contains "
+                f"a duplicate {key} input"
+            )
+        fields[key] = (line_number, match.group("value").strip())
+    return fields
 
 
 def assert_rust_cache_steps(workflows: dict[Path, str]) -> None:
     rust_cache_uses = 0
     for workflow, content in sorted(workflows.items()):
-        textual_occurrences = len(RUST_CACHE_REFERENCE.findall(content))
-        accounted_occurrences = 0
-        lines = content.splitlines()
-        for uses_line, line in enumerate(lines):
-            action = yaml_uses_scalar(line)
-            if action is None or RUST_CACHE_REFERENCE.search(action) is None:
+        for fields, step_lines in canonical_workflow_steps(workflow, content):
+            uses_field = fields.get("uses")
+            if uses_field is None:
                 continue
-            accounted_occurrences += 1
+            uses_line, _, uses_value = uses_field
+            action = yaml_uses_scalar(workflow, uses_line, uses_value)
+            if RUST_CACHE_REFERENCE.search(action) is None:
+                continue
             rust_cache_uses += 1
             if action != RUST_CACHE_ACTION:
                 raise AssertionError(
                     f"{workflow.name} uses rust-cache at an unpinned ref"
                 )
 
-            step_start, step_end = rust_cache_step_bounds(lines, uses_line)
-            step = lines[step_start:step_end]
-            with_lines = []
-            save_lines = []
-            for relative_index, step_line in enumerate(step):
-                active = step_line.lstrip()
-                if not active or active.startswith("#"):
-                    continue
-                with_match = re.match(r"^(\s*)with:\s*(?:#.*)?$", step_line)
-                if with_match:
-                    with_lines.append((relative_index, len(with_match.group(1))))
-                save_match = re.match(
-                    r"^(\s*)save-if:\s*(.*?)\s*$",
-                    step_line,
-                )
-                if save_match:
-                    value = save_match.group(2).split(" #", 1)[0].rstrip()
-                    save_lines.append((relative_index, len(save_match.group(1)), value))
-
-            if len(with_lines) != 1 or len(save_lines) != 1:
+            with_field = fields.get("with")
+            if with_field is None:
                 raise AssertionError(
-                    f"{workflow.name} rust-cache step must contain exactly one "
+                    f"{workflow.name} rust-cache step must contain one canonical "
                     "with mapping and one main-only save-if"
                 )
-            with_line, with_indent = with_lines[0]
-            save_line, save_indent, save_value = save_lines[0]
-            with_end = len(step)
-            for relative_index in range(with_line + 1, len(step)):
-                candidate = step[relative_index]
-                active = candidate.lstrip()
-                if not active or active.startswith("#"):
-                    continue
-                indent = len(candidate) - len(active)
-                if indent <= with_indent:
-                    with_end = relative_index
-                    break
-            if (
-                save_line <= with_line
-                or save_line >= with_end
-                or save_indent != with_indent + 2
-                or f"save-if: {save_value}" != MAIN_ONLY_CACHE_SAVE
-            ):
+            with_line, with_indent, with_value = with_field
+            if with_value and not with_value.startswith("#"):
                 raise AssertionError(
-                    f"{workflow.name} rust-cache save-if is not structurally "
-                    "bound to its with mapping or is not main-only"
+                    f"{workflow.name} rust-cache with field must be a canonical "
+                    "block mapping"
+                )
+            inputs = canonical_child_mapping(
+                workflow,
+                step_lines,
+                with_line,
+                with_indent,
+            )
+            save = inputs.get("save-if")
+            if save is None:
+                raise AssertionError(
+                    f"{workflow.name} rust-cache step must contain one canonical "
+                    "with mapping and one main-only save-if"
+                )
+            _, save_value = save
+            save_value = save_value.split(" #", 1)[0].rstrip()
+            if save_value != MAIN_ONLY_CACHE_SAVE_VALUE:
+                raise AssertionError(
+                    f"{workflow.name} rust-cache save-if must be the exact "
+                    "main-only scalar"
                 )
 
-        if textual_occurrences != accounted_occurrences:
-            raise AssertionError(
-                f"{workflow.name} contains a rust-cache textual occurrence that "
-                "is not an accounted uses scalar"
-            )
+        for action in canonical_job_action_uses(workflow, content):
+            if RUST_CACHE_REFERENCE.search(action) is not None:
+                raise AssertionError(
+                    f"{workflow.name} rust-cache use must be a canonical "
+                    "workflow action step, not a reusable-workflow job"
+                )
 
     if rust_cache_uses == 0:
         raise AssertionError("no pinned rust-cache steps found")
@@ -2867,7 +3162,7 @@ def main() -> None:
     )
     expect_assertion(
         "rust-cache save-if moved from with to an env field in the same step",
-        "not structurally bound to its with mapping",
+        "one canonical with mapping and one main-only save-if",
         lambda: assert_rust_cache_steps(same_step_field),
     )
 
@@ -2936,15 +3231,27 @@ jobs:
             lambda escaped_use=escaped_use: assert_rust_cache_steps(escaped_use),
         )
 
-    unaccounted_text = dict(workflow_sources)
-    unaccounted_text[ci_path] += (
-        f"\nenv:\n  UNACCOUNTED_CACHE_ACTION: {RUST_CACHE_ACTION}\n"
+    for index, (label, expected_error, fixture) in enumerate(
+        CACHE_AUTHORITY_ADVERSARIAL_WORKFLOWS,
+        start=1,
+    ):
+        adversarial = dict(workflow_sources)
+        adversarial[WORKFLOWS / f"cache-authority-adversarial-{index}.yml"] = (
+            textwrap.dedent(fixture).lstrip()
+        )
+        expect_assertion(
+            label,
+            expected_error,
+            lambda adversarial=adversarial: assert_rust_cache_steps(adversarial),
+        )
+
+    non_action_text = dict(workflow_sources)
+    non_action_text[ci_path] = non_action_text[ci_path].replace(
+        "jobs:\n",
+        f"env:\n  UNACCOUNTED_CACHE_ACTION: {RUST_CACHE_ACTION}\n\njobs:\n",
+        1,
     )
-    expect_assertion(
-        "rust-cache text outside an accounted uses scalar",
-        "not an accounted uses scalar",
-        lambda: assert_rust_cache_steps(unaccounted_text),
-    )
+    assert_rust_cache_steps(non_action_text)
 
     for obsolete in (
         ROOT / "scripts" / "promote-npm-release.sh",
