@@ -15,10 +15,16 @@ use super::common::*;
 /// How many recent audit events to consider before narrowing them to the
 /// queried entity.
 ///
-/// The store filters by actor, never by scope, so the scope narrowing has to
-/// happen here over a window of recent events. Wide enough that an entity's own
-/// recent activity is not pushed out by unrelated commits, bounded so the answer
-/// does not grow with the repository's whole audit history.
+/// The store filters by actor, never by scope, so narrowing by scope has to
+/// happen here, which means taking a window of recent events first and filtering
+/// second. The consequence is stated in the tool description rather than hidden:
+/// an entity whose last write is older than this many events returns an empty
+/// list even though it was written. Filtering before limiting would need a
+/// scope-aware query in the store, which is kin-db's surface, not this one.
+///
+/// Bounded so one entity's answer does not grow with the repository's whole
+/// audit history, and wide enough that an entity's own recent activity survives
+/// a busy period from other lanes.
 const AUDIT_SCAN: usize = 512;
 
 /// How many of the queried entity's own events to return.
@@ -31,8 +37,13 @@ recorded against that entity. Reach for it to establish accountability and trust
 relying on a piece of code, to answer \"who last touched this, and has it been signed \
 off?\", or when assembling an audit trail. It builds on entity_history (the raw change \
 list) by adding approval status and audit context in one call. Every field is scoped to \
-the entity you asked about; an empty recent_audit_events means no recorded write named \
-this entity, not that the repository has been quiet.";
+the entity you asked about: recent_audit_events never carries another entity's writes. It \
+is drawn from the repository's recent audit activity and then narrowed, so it is the \
+entity's own recent writes rather than its complete write history, and an entity whose \
+last write is older than the scan window comes back with an empty list. Treat a populated \
+list as authoritative about who wrote this entity, and an empty one as no recent record \
+rather than as proof nothing ever wrote it; change_count and latest_change are the \
+complete-history fields.";
 
 pub fn handle_provenance_query<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,

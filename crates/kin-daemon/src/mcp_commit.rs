@@ -514,9 +514,36 @@ fn record_commit_provenance(
             EntityDelta::Removed { old } => old.id,
         })
         .collect::<Vec<_>>();
+    // A relation-only commit changed no entity, so it has no entity delta to
+    // scope to, but it is still an agent write against the entities the relation
+    // joins. Scoping it to the change alone made it unfindable: every reader
+    // that answers "who touched this entity" selects changes by scanning entity
+    // deltas, which a relation-only change has none of, so the commit was
+    // recorded and invisible. Its endpoints are the entities an operator would
+    // ask about, so they are what it is attributed to.
+    if entities.is_empty() {
+        entities.extend(
+            committed
+                .change
+                .relation_deltas
+                .iter()
+                .flat_map(|delta| match delta {
+                    RelationDelta::Added { new } | RelationDelta::Modified { new, .. } => {
+                        [new.src, new.dst]
+                    }
+                    RelationDelta::Removed { old } => [old.src, old.dst],
+                })
+                .filter_map(|endpoint| match endpoint {
+                    GraphNodeId::Entity(id) => Some(id),
+                    _ => None,
+                }),
+        );
+    }
     entities.sort_unstable();
     entities.dedup();
     let scopes = if entities.is_empty() {
+        // Nothing entity-shaped to name, so the change itself carries the
+        // attribution rather than the write going unrecorded.
         vec![(
             mcp_audit_event_id(&committed.change.id, None),
             WorkScope::Change(committed.change.id),
@@ -763,25 +790,28 @@ fn plan_exact_transaction(
                     ));
                 }
                 // The commit publishes whatever reparsing the new bytes derives,
-                // so a payload field the caller edited by hand cannot survive.
+                // so a doc summary the caller edited by hand cannot survive.
                 // Refusing an edited one is the same rule already applied to
-                // name, kind, origin, and span, extended to the two fields an
-                // agent would plausibly try to change on their own: keeping
-                // them would report a metadata edit as committed while
-                // publishing only the body.
+                // name, kind, origin, and span: keeping it would report a
+                // documentation edit as committed while publishing only the
+                // body.
+                //
+                // Scoped to `doc_summary` and deliberately not extended to the
+                // whole `metadata` bag. That bag holds keys the daemon's own
+                // workers maintain, `embedding_body_preview` from the embed
+                // pipeline and `blob_hash` from indexing, and they move
+                // asynchronously with respect to any caller. An agent that
+                // reads an entity, thinks, and then commits can therefore hold
+                // a metadata bag that authority has since moved on from, and
+                // comparing the bag would refuse it for a difference it neither
+                // caused nor can control. `doc_summary` is a single named field
+                // whose value a caller either changed on purpose or did not, so
+                // a difference there is real evidence of intent.
                 if payload_entity.doc_summary != existing.doc_summary {
                     return Err(format!(
                         "staged doc summary for entity {} differs from repository authority; \
-                         entity metadata is derived from the committed source, so send it \
+                         entity documentation is derived from the committed source, so send it \
                          unchanged and put the new documentation in `body`",
-                        existing.id
-                    ));
-                }
-                if payload_entity.metadata != existing.metadata {
-                    return Err(format!(
-                        "staged metadata for entity {} differs from repository authority; \
-                         entity metadata is derived from the committed source and cannot be \
-                         set directly, so send it unchanged",
                         existing.id
                     ));
                 }
@@ -2363,6 +2393,95 @@ mod tests {
         );
     }
 
+    /// The payload an agent actually builds is what `get_entity` handed it,
+    /// decoded from the wire, and it has to commit.
+    ///
+    /// This is the shape the product uses: call `get_entity`, take the returned
+    /// object whole, add a `body`, commit. It is not the same as echoing the
+    /// in-memory struct, because `entity_response_json` injects ten
+    /// response-only keys at top level (read_path, start_line, end_line,
+    /// source_excerpt, source_change_id, artifact_id, artifact_path,
+    /// artifact_entry, stale, source) and `Entity` does not deny unknown
+    /// fields.
+    ///
+    /// What this pins is that the round trip is faithful: those keys are
+    /// discarded on the way back in and land nowhere, so an echoed payload
+    /// equals what authority holds. That is worth a test because it is not
+    /// obvious. `EntityMetadata` is `#[serde(flatten)] extra: HashMap`, so it
+    /// absorbs unknown keys found inside the `metadata` object; `Entity.metadata`
+    /// is a plain named field, so top-level decorations never reach it. Flip
+    /// either of those and every field-by-field check the commit planner makes
+    /// against authority starts refusing a caller that did nothing but echo.
+    #[test]
+    fn a_payload_decoded_from_a_real_get_entity_response_still_commits() {
+        let (_dir, state) = test_state();
+        let (entity, _) = install_exact_source(
+            &state,
+            "src/lib.rs",
+            b"pub fn value() -> u8 { 1 }\n",
+            "value",
+        );
+
+        // The exact bytes `get_entity` returns, then straight back in as the
+        // payload, which is the round trip nothing else in the workspace walks.
+        let binding = state.local_repository_authority_binding().unwrap();
+        let response = kin_mcp::handlers::common::entity_response_json(
+            state.graph.as_ref(),
+            &entity,
+            Some(&binding),
+        )
+        .expect("the read surface must render the entity");
+        for injected in ["read_path", "start_line", "source_excerpt", "stale"] {
+            assert!(
+                response.get(injected).is_some(),
+                "fixture must exercise a response carrying the injected key {injected}: {response}"
+            );
+        }
+        let echoed: Entity = serde_json::from_value(response)
+            .expect("a get_entity response must decode back into an Entity");
+        assert_eq!(
+            echoed.metadata, entity.metadata,
+            "response-only keys must be discarded on decode, not folded into metadata"
+        );
+        assert_eq!(
+            echoed.doc_summary, entity.doc_summary,
+            "an echoed payload must carry the doc summary authority holds"
+        );
+
+        let sessions = test_sessions();
+        let transaction = sessions
+            .begin_transaction(TEST_SESSION, "file:src/lib.rs")
+            .unwrap();
+        let arguments = HashMap::from([
+            (
+                "transaction_id".to_string(),
+                serde_json::json!(transaction.transaction_id),
+            ),
+            (
+                "operations".to_string(),
+                serde_json::json!([{
+                    "verb": "update",
+                    "target": entity.id.to_string(),
+                    "payload": {"Entity": echoed},
+                    "body": "pub fn value() -> u8 { 2 }",
+                    "description": "echo the read response back as the payload",
+                }]),
+            ),
+        ]);
+        let result = commit_exact_transaction(&state, &sessions, &arguments, None);
+        assert_ne!(
+            result.is_error,
+            Some(true),
+            "a payload echoed from a real get_entity response must commit: {}",
+            result_text(&result)
+        );
+        assert_eq!(
+            std::fs::read(state.layout.working_dir().join("src/lib.rs")).unwrap(),
+            b"pub fn value() -> u8 { 2 }\n",
+            "the body must land for the payload shape the product actually builds"
+        );
+    }
+
     /// An unchanged payload beside a body still commits.
     ///
     /// The refusal above is scoped to a field the caller edited. Echoing back
@@ -2495,13 +2614,19 @@ mod tests {
         );
     }
 
-    /// A commit that changed no entity is still an agent write.
+    /// A relation-only commit must be answerable through the surface an
+    /// operator actually asks.
     ///
     /// Attribution keyed only to changed entities would leave a relation-only
-    /// transaction out of the audit trail entirely, which is the same silence
-    /// this whole surface exists to end. It is attributed to the change itself.
+    /// transaction out of the audit trail entirely. Scoping it to the change
+    /// instead was no better in practice: every reader that answers "who touched
+    /// this entity" selects changes by scanning entity deltas, and a
+    /// relation-only change has none, so the record existed and no query could
+    /// reach it. Asserted through `kin_provenance_query` rather than through
+    /// `query_audit_events`, because querying the store directly is exactly what
+    /// hid the gap.
     #[test]
-    fn a_relation_only_commit_is_attributed_to_the_change_it_published() {
+    fn a_relation_only_commit_is_attributed_to_the_entities_it_joined() {
         let (_dir, state) = test_state();
         let (caller, _) = install_exact_source(
             &state,
@@ -2560,14 +2685,45 @@ mod tests {
             .unwrap();
         assert_eq!(
             events.len(),
-            1,
-            "a relation-only commit must still leave an attribution record"
+            2,
+            "a relation-only commit is attributed to both endpoints it joined"
         );
-        assert!(
-            matches!(events[0].target_scope, Some(WorkScope::Change(_))),
-            "with no entity to scope to, the change itself is the scope: {:?}",
-            events[0].target_scope
-        );
+        let mut scoped = events
+            .iter()
+            .filter_map(|event| match event.target_scope {
+                Some(WorkScope::Entity(id)) => Some(id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        scoped.sort_unstable();
+        let mut expected = vec![caller.id, callee.id];
+        expected.sort_unstable();
+        assert_eq!(scoped, expected, "both endpoints must be named");
+
+        // The surface that matters: asking about either endpoint returns the
+        // agent that created the relation.
+        for endpoint in [&caller, &callee] {
+            let provenance = kin_mcp::handlers::provenance::handle_provenance_query(
+                &HashMap::from([(
+                    "entity_id".to_string(),
+                    serde_json::json!(endpoint.id.to_string()),
+                )]),
+                state.graph.as_ref(),
+            )
+            .unwrap();
+            let provenance: serde_json::Value =
+                serde_json::from_str(result_text(&provenance)).unwrap();
+            let events = provenance["recent_audit_events"].as_array().unwrap();
+            assert_eq!(
+                events.len(),
+                1,
+                "provenance for {} must reach the relation write: {provenance}",
+                endpoint.name
+            );
+            let details: serde_json::Value =
+                serde_json::from_str(events[0]["details"].as_str().unwrap()).unwrap();
+            assert_eq!(details["actor"], "gemini-cli/relation-writer");
+        }
     }
 
     fn entity_span_by_name(state: &Arc<DaemonState>, name: &str) -> kin_model::SourceSpan {
