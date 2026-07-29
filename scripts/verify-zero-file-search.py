@@ -12,6 +12,14 @@ The optional repo_root selects the tree to scan (default: the repo containing
 this script). The allowlist always travels with the script — it is the policy,
 not a property of the tree under test — which lets CI point the guard at a
 deliberately poisoned copy and assert that it fails.
+
+Allowlist validation never short-circuits the scan. A stale pin used to abort
+before the walk began, so CI reported the pin errors and nothing else: on one
+change two stale pins hid ten real violations in a newly covered crate. The
+gate still failed closed, but a red allowlist stopped being a measure of the
+work left. The scan now always runs to completion, an unvalidated pin masks
+nothing so the lines it claimed are reported like any other, and allowlist
+errors are printed after the scan with both feeding the exit status.
 """
 import os
 import sys
@@ -29,8 +37,69 @@ ALLOWLIST_PATH = os.path.join(SCRIPT_DIR, "zero-file-search-allowlist.json")
 REQUIRED_FIELDS = ("file", "reason", "owner", "expiration")
 
 
+class Policy:
+    """What the allowlist exempts inside one file.
+
+    `whole_file` skips the file outright. Otherwise the file is scanned and only
+    the validated pins are excused: `matches` masks exact expressions and `fns`
+    skips named function bodies. A pin that failed validation never reaches
+    here, so the lines it claimed are reported like any other.
+    """
+
+    __slots__ = ("whole_file", "matches", "fns")
+
+    def __init__(self):
+        self.whole_file = False
+        self.matches = set()
+        self.fns = set()
+
+
+def parse_pin(item, key):
+    """Normalize one pin into (value, expected_count).
+
+    A bare string means "occurs exactly once", which is the right default: it
+    proves the pin names one specific site rather than a shape that repeats.
+    The object form declares a count, for the cases where exactly-once cannot
+    be expressed: a cfg-gated pair of same-named functions, or a boundary
+    expression that legitimately recurs. The count is enforced exactly, so a
+    new occurrence still fails the guard and has to be re-justified.
+    """
+    if isinstance(item, str):
+        if not item or "\n" in item:
+            raise ValueError("want a non-empty single-line string")
+        return item, 1
+    if not isinstance(item, dict):
+        raise ValueError("want a string or an object")
+    unknown = set(item) - {key, "count"}
+    if unknown:
+        raise ValueError(f"unknown field(s): {', '.join(sorted(unknown))}")
+    value = item.get(key)
+    if not isinstance(value, str) or not value or "\n" in value:
+        raise ValueError(f"'{key}' must be a non-empty single-line string")
+    count = item.get("count", 1)
+    if not isinstance(count, int) or isinstance(count, bool) or count < 1:
+        raise ValueError("'count' must be a positive integer")
+    return value, count
+
+
+def parse_pin_list(raw, key):
+    """Normalize a pin list into {value: count}, raising on any malformation."""
+    if not isinstance(raw, list) or not raw:
+        raise ValueError(f"want a non-empty list of {key} pins")
+    pins = {}
+    for item in raw:
+        value, count = parse_pin(item, key)
+        if value in pins:
+            raise ValueError(f"repeats the pin {value!r}")
+        pins[value] = count
+    return pins
+
+
 def load_allowlist():
-    """Load and validate the allowlist, returning {file: allowed_matches}.
+    """Load and validate the allowlist, returning ({file: Policy}, errors).
+
+    Errors are returned rather than raised so the caller can complete the scan
+    first. Nothing here exits.
 
     Each entry must declare file, reason, owner, and an ISO `expiration` date,
     and must name a path that actually exists. Missing fields, malformed dates,
@@ -39,25 +108,34 @@ def load_allowlist():
     dormant waiting to auto-exempt a file that gets recreated under the same
     path.
 
-    `allow_match` is optional. When present it lists exact source expressions
-    that are exempt within that file, mirroring `allow_for` in
-    scripts/zero_file_search_guard.sh. Every expression must occur exactly
-    once: the scanner masks only those bytes and still checks the rest of the
-    line, so neither a same-shaped use elsewhere nor a second primitive beside
-    the allowed one can inherit the exemption. When absent the whole file is
-    exempt, which is only appropriate for files that are an IO boundary end to
-    end.
+    `allow_match` and `allow_fn` are optional and compose. `allow_match` lists
+    exact source expressions that are exempt within that file, mirroring
+    `allow_for` in scripts/zero_file_search_guard.sh; the scanner masks only
+    those bytes and still checks the rest of the line, so a second primitive
+    beside the allowed one cannot inherit the exemption. `allow_fn` names
+    function bodies that are an IO boundary in whole, which is how a mixed
+    file keeps every other line scanned even when it both answers queries and
+    serves package registries and writes its own auth token. Each pin's
+    occurrence count is enforced exactly.
+
+    When neither is present the whole file is exempt, which is only appropriate
+    for files that are an IO boundary end to end.
+
+    A pin whose count does not match is dropped rather than applied, so the
+    scan reports the lines that pin claimed and the true scope stays visible.
+    An expired or malformed expiration is an accountability failure rather than
+    a scope question, so it is reported while the exemption still applies.
     """
+    errors = []
     try:
         with open(ALLOWLIST_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
     except Exception as e:
-        print(f"Error loading allowlist from {ALLOWLIST_PATH}: {e}")
-        sys.exit(1)
+        errors.append(f"  could not load allowlist from {ALLOWLIST_PATH}: {e}")
+        return {}, errors
 
     entries = data.get("allowlist", [])
-    errors = []
-    files = {}
+    policies = {}
     today = date.today()
 
     for i, item in enumerate(entries):
@@ -78,44 +156,56 @@ def load_allowlist():
             )
             continue
 
-        if item["file"] in files:
+        if item["file"] in policies:
             errors.append(
                 f"  entry {item['file']} is duplicated — one file must have "
                 "exactly one allowlist policy"
             )
             continue
 
-        matches = item.get("allow_match")
-        if matches is not None and (
-            not isinstance(matches, list)
-            or not matches
-            or not all(isinstance(m, str) and m and "\n" not in m for m in matches)
-        ):
-            errors.append(
-                f"  entry {item['file']} has an invalid allow_match "
-                f"(want a non-empty list of non-empty single-line strings)"
-            )
-            continue
-        if matches and len(set(matches)) != len(matches):
-            errors.append(
-                f"  entry {item['file']} repeats an allow_match expression"
-            )
-            continue
-        if matches:
+        policy = Policy()
+        policies[item["file"]] = policy
+
+        raw_matches = item.get("allow_match")
+        raw_fns = item.get("allow_fn")
+        policy.whole_file = raw_matches is None and raw_fns is None
+
+        source = None
+        if not policy.whole_file:
             try:
                 with open(source_path, "r", encoding="utf-8") as source_file:
                     source = source_file.read()
             except OSError as error:
                 errors.append(f"  entry {item['file']} could not be read: {error}")
-                continue
-            for match in matches:
-                occurrences = source.count(match)
-                if occurrences != 1:
-                    errors.append(
-                        f"  entry {item['file']} allow_match {match!r} occurs "
-                        f"{occurrences} times (want exactly 1)"
-                    )
-        files[item["file"]] = set(matches) if matches else None
+
+        if raw_matches is not None and source is not None:
+            try:
+                for expression, want in parse_pin_list(raw_matches, "expr").items():
+                    found = source.count(expression)
+                    if found != want:
+                        errors.append(
+                            f"  entry {item['file']} allow_match {expression!r} "
+                            f"occurs {found} times (want {want})"
+                        )
+                        continue
+                    policy.matches.add(expression)
+            except ValueError as error:
+                errors.append(f"  entry {item['file']} has an invalid allow_match: {error}")
+
+        if raw_fns is not None and source is not None:
+            try:
+                bodies = find_fn_body_ranges(source.splitlines(keepends=True))
+                for name, want in parse_pin_list(raw_fns, "fn").items():
+                    found = len(bodies.get(name, ()))
+                    if found != want:
+                        errors.append(
+                            f"  entry {item['file']} allow_fn {name!r} resolves to "
+                            f"{found} function bodies (want {want})"
+                        )
+                        continue
+                    policy.fns.add(name)
+            except ValueError as error:
+                errors.append(f"  entry {item['file']} has an invalid allow_fn: {error}")
 
         try:
             exp_date = date.fromisoformat(item["expiration"])
@@ -131,16 +221,16 @@ def load_allowlist():
                 f"(owner: {item['owner']}) — re-justify or remove"
             )
 
-    if errors:
-        print("Allowlist validation FAILED:")
-        print("\n".join(errors))
-        sys.exit(1)
-
-    return files
+    return policies, errors
 
 
 BOUNDARY_DIRS = [
-    "crates/kin-daemon/",
+    # kin-daemon is deliberately absent. It used to be exempt as a directory,
+    # which exempted the RPC surface every agent and CLI reaches Kin through,
+    # and a six-handler opt-in rescued roughly a sixtieth of api.rs. The crate
+    # is now scanned by default and its boundary IO is declared per file in
+    # scripts/zero-file-search-allowlist.json, so a new daemon module, a new
+    # query handler above all, is covered the moment it is added.
     "crates/kin-migrate/",
     "crates/kin-index/",
     "crates/kin-registry/",
@@ -243,32 +333,23 @@ QUERY_COMMANDS = {
     "mcp.rs"
 }
 
-# Query/answer authority handlers that live inside an otherwise IO-boundary
-# crate (the daemon serves package registries, persists snapshots, and writes
-# auth tokens — all legitimate boundary IO). These files are scanned
-# function-scoped: only the named handler bodies are checked, so the boundary
-# IO elsewhere in the same file is not falsely flagged, while a raw filesystem
-# read sneaking into a query answer path still fails the guard.
-DAEMON_QUERY_HANDLERS = {
-    "crates/kin-daemon/src/api.rs": {
-        "locate",
-        "search",
-        "context",
-        "trace",
-        "impact",
-        "review",
-    },
-}
-
-# Matches a (possibly `pub`/`async`) free or method function declaration.
-FN_DECL = re.compile(r"^\s*(?:pub\s+)?(?:async\s+)?fn\s+([A-Za-z0-9_]+)\s*[(<]")
+# Matches a free or method function declaration, including the visibility,
+# constness, asyncness, unsafety and ABI a declaration may carry. `pub(crate)`
+# was missing for as long as function scoping existed, and every miss was a
+# silent one in both directions: a `pub(crate)` handler named for scoping was
+# never found, and a `pub(crate)` body an allowlist entry means to excuse would
+# not resolve.
+FN_DECL = re.compile(
+    r"^\s*(?:pub\s*(?:\([^)]*\)\s*)?)?(?:default\s+)?(?:const\s+)?(?:async\s+)?"
+    r"(?:unsafe\s+)?(?:extern\s+\"[^\"]*\"\s+)?fn\s+([A-Za-z0-9_]+)\s*[(<]"
+)
 
 
 def is_test_file(rel_path):
     # Skip standalone test directories
     if "tests/" in rel_path or "test_" in rel_path or rel_path.endswith("_test.rs"):
         return True
-    # Skip ingestion/migration/daemon boundary directories/files
+    # Skip ingestion/migration/projection boundary directories/files
     for bdir in BOUNDARY_DIRS:
         if rel_path.startswith(bdir) or rel_path == bdir:
             return True
@@ -292,8 +373,15 @@ def is_test_file(rel_path):
 # traversal all read the tree just as directly. Spawning a subprocess is also
 # denied in answer modules: otherwise `rg`, `grep`, `find`, or a multiline
 # `git grep` builder can replace the semantic authority behind the guard's
-# back. Writes and directory creation stay out of the deny set —
-# materialization is a projection boundary, not answer-by-search.
+# back.
+#
+# Writes and directory creation ARE denied here, unlike in the shell guard,
+# because the module-qualified patterns below match all of `std::fs::` and the
+# named `fs::` calls include the mutating ones. Materialization is a projection
+# boundary rather than answer-by-search, so a write in an answer module is not
+# the violation this rule exists to stop. It is still a claim worth stating out
+# loud, and stating it means an explicit allowlist pin naming the boundary
+# rather than a pattern that never looked.
 PATTERNS = [
     (re.compile(r'\.is_file\(\)'), "filesystem existence probe (is_file)"),
     (re.compile(r'\.is_dir\(\)'), "filesystem existence probe (is_dir)"),
@@ -318,34 +406,56 @@ PATTERNS = [
 ]
 
 
-def find_fn_body_ranges(lines, fn_names):
-    """Return inclusive 0-based line ranges for the bodies of the named
-    functions. Body bounds are tracked by brace depth from the function's
-    opening brace to its matching close."""
-    ranges = []
+def find_fn_body_ranges(lines, fn_names=None):
+    """Return {name: [(first_line, last_line), ...]} for function bodies.
+
+    Line numbers are inclusive and 0-based, and bounds are tracked by brace
+    depth from the function's opening brace to its matching close. With
+    `fn_names` only those names are collected; without it, every declaration is,
+    which is what validation counts.
+
+    A declaration with no body, a trait method or an `extern` signature ending
+    in `;`, is skipped. Brace counting alone would find no opening brace and
+    run the "body" to end of file, so a name that matched such a signature would
+    exempt everything after it.
+    """
+    found = {}
     n = len(lines)
     i = 0
     while i < n:
         m = FN_DECL.match(lines[i])
-        if m and m.group(1) in fn_names:
-            depth = 0
-            started = False
-            j = i
-            while j < n:
-                opens = lines[j].count("{")
-                closes = lines[j].count("}")
-                if opens > 0:
-                    started = True
-                if started:
-                    depth += opens - closes
-                    if depth <= 0:
-                        break
-                j += 1
-            ranges.append((i, j))
-            i = j + 1
-        else:
+        if not m or (fn_names is not None and m.group(1) not in fn_names):
             i += 1
-    return ranges
+            continue
+
+        depth = 0
+        started = False
+        bodyless = False
+        j = i
+        while j < n:
+            line = lines[j]
+            if not started:
+                brace = line.find("{")
+                semi = line.find(";")
+                if semi >= 0 and (brace < 0 or semi < brace):
+                    bodyless = True
+                    break
+            opens = line.count("{")
+            closes = line.count("}")
+            if opens > 0:
+                started = True
+            if started:
+                depth += opens - closes
+                if depth <= 0:
+                    break
+            j += 1
+
+        if bodyless:
+            i = j + 1
+            continue
+        found.setdefault(m.group(1), []).append((i, j))
+        i = j + 1
+    return found
 
 
 class LexState:
@@ -474,17 +584,19 @@ def split_code(line, st):
     return "".join(structure), "".join(code)
 
 
-def scan_file(filepath, rel_path, query_fn_names=None, allowed_matches=None):
+def scan_file(filepath, rel_path, exempt_fn_names=None, allowed_matches=None):
     violations = []
 
     with open(filepath, "r", encoding="utf-8") as f:
         lines = f.readlines()
 
-    # When scanning a mixed boundary file, restrict violations to the bodies of
-    # the designated query handlers.
-    allowed_ranges = (
-        find_fn_body_ranges(lines, query_fn_names) if query_fn_names else None
-    )
+    # Function scoping is an opt-out, not an opt-in. Every line is scanned
+    # except the bodies the allowlist declares to be a boundary, so a handler
+    # added to a mixed file is covered without anyone remembering to list it.
+    exempt_ranges = []
+    if exempt_fn_names:
+        for ranges in find_fn_body_ranges(lines, exempt_fn_names).values():
+            exempt_ranges.extend(ranges)
 
     lex = LexState()
     in_test_module = False
@@ -519,13 +631,11 @@ def scan_file(filepath, rel_path, query_fn_names=None, allowed_matches=None):
         if stripped.startswith("#[test]"):
             continue
 
-        # When function-scoped, only flag lines inside a designated handler body.
-        if allowed_ranges is not None and not any(
-            lo <= (idx - 1) <= hi for lo, hi in allowed_ranges
-        ):
+        # Skip the function bodies the allowlist declares to be a boundary.
+        if any(lo <= (idx - 1) <= hi for lo, hi in exempt_ranges):
             continue
 
-        # Mask only the exact, uniquely validated boundary expression. The
+        # Mask only the exact, count-validated boundary expression. The
         # remainder of the line stays authoritative: a second filesystem read
         # beside an allowed one must still fail rather than inheriting a
         # whole-line exemption.
@@ -533,12 +643,13 @@ def scan_file(filepath, rel_path, query_fn_names=None, allowed_matches=None):
         if allowed_matches:
             for match in allowed_matches:
                 offset = scan_line.find(match)
-                if offset >= 0:
+                while offset >= 0:
                     scan_line = (
                         scan_line[:offset]
                         + (" " * len(match))
                         + scan_line[offset + len(match) :]
                     )
+                    offset = scan_line.find(match, offset + len(match))
 
         # Scan for patterns. A line can match several primitives at once
         # (`std::fs::read_dir` is both an fs call and a traversal); report the
@@ -552,50 +663,80 @@ def scan_file(filepath, rel_path, query_fn_names=None, allowed_matches=None):
 
 
 def main():
-    allowlist = load_allowlist()
+    policies, allowlist_errors = load_allowlist()
     total_violations = 0
+    scanned = 0
+    whole_file_exempt = 0
+    fn_scoped = 0
 
     # Walk crates directory
     crates_dir = os.path.join(KIN_ROOT, "crates")
     if not os.path.exists(crates_dir):
         print(f"Error: crates directory not found at {crates_dir}")
+        if allowlist_errors:
+            report_allowlist_errors(allowlist_errors)
         sys.exit(1)
 
     for root, _, files in os.walk(crates_dir):
-        for file in files:
+        for file in sorted(files):
             if not file.endswith(".rs"):
                 continue
 
             filepath = os.path.join(root, file)
             rel_path = os.path.relpath(filepath, KIN_ROOT)
 
-            # Whole-file exemptions (an `allow_match`-less entry) skip the scan
-            # entirely; pinned exemptions still scan, minus their named lines.
-            allowed_matches = None
-            if rel_path in allowlist:
-                allowed_matches = allowlist[rel_path]
-                if allowed_matches is None:
-                    continue
+            policy = policies.get(rel_path)
 
-            # Query handlers inside boundary crates are scanned function-scoped;
-            # they bypass the boundary skip so their answer paths are covered.
-            query_fns = DAEMON_QUERY_HANDLERS.get(rel_path)
-            if query_fns is None and allowed_matches is None and is_test_file(rel_path):
+            # A whole-file exemption skips the scan entirely; a pinned or
+            # function-scoped one still scans everything it did not pin.
+            if policy is not None and policy.whole_file:
+                whole_file_exempt += 1
                 continue
 
-            violations = scan_file(filepath, rel_path, query_fns, allowed_matches)
+            # An allowlisted file is scanned even inside a boundary directory:
+            # naming it is a statement about which spans are boundary IO, not a
+            # request to stop looking at the rest.
+            if policy is None and is_test_file(rel_path):
+                continue
+
+            exempt_fns = policy.fns if policy else None
+            allowed_matches = policy.matches if policy else None
+            if exempt_fns:
+                fn_scoped += 1
+            scanned += 1
+
+            violations = scan_file(filepath, rel_path, exempt_fns, allowed_matches)
             if violations:
                 print(f"\n[VIOLATION] {rel_path} contains forbidden filesystem access:")
                 for line_num, content, desc in violations:
                     print(f"  Line {line_num:4d}: {content} ({desc})")
                 total_violations += len(violations)
 
+    print(
+        f"\nScanned {scanned} source files "
+        f"({fn_scoped} with function-scoped exemptions, "
+        f"{whole_file_exempt} exempt whole-file)."
+    )
+
     if total_violations > 0:
-        print(f"\nVerification FAILED: Found {total_violations} zero-file-search violations.")
+        print(f"Verification FAILED: Found {total_violations} zero-file-search violations.")
+    if allowlist_errors:
+        report_allowlist_errors(allowlist_errors)
+    if total_violations or allowlist_errors:
         sys.exit(1)
 
     print("Verification PASSED: Zero File-Search Invariant holds.")
     sys.exit(0)
+
+
+def report_allowlist_errors(errors):
+    """Print allowlist errors after the scan.
+
+    Deliberately last. These used to abort before the walk, so a stale pin
+    reported itself and hid every violation behind it.
+    """
+    print("\nAllowlist validation FAILED:")
+    print("\n".join(errors))
 
 
 if __name__ == "__main__":
