@@ -1231,6 +1231,30 @@ impl DaemonClient {
         .await
     }
 
+    pub async fn conflicts(
+        &self,
+        request: &crate::commands::conflicts::ConflictsRequest,
+    ) -> Result<crate::commands::conflicts::ConflictsResponse> {
+        self.post_idempotent_json(
+            "/commands/conflicts",
+            request,
+            "send daemon-owned merge conflict listing request",
+        )
+        .await
+    }
+
+    pub async fn resolve(
+        &self,
+        request: &crate::commands::resolve::ResolveRequest,
+    ) -> Result<crate::commands::resolve::ResolveResponse> {
+        self.post_idempotent_json(
+            "/commands/resolve",
+            request,
+            "send daemon-owned merge resolution request",
+        )
+        .await
+    }
+
     pub async fn tag(
         &self,
         request: &crate::commands::tag::TagRequest,

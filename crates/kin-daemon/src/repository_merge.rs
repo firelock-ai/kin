@@ -15,17 +15,19 @@ use std::collections::{BTreeMap, BTreeSet};
 use anyhow::{bail, Context, Result};
 use axum::http::StatusCode;
 use kin_cli::commands::merge::{
-    MergeConflict, MergeConflictScope, MergeOutcome, MergeReport, MergeRequest, MergeResponse,
-    MERGE_REPORT_SCHEMA,
+    MergeOutcome, MergeReport, MergeRequest, MergeResponse, MERGE_REPORT_SCHEMA,
 };
 use kin_db::LocalRepositoryAuthorityFreeze;
 use kin_model::{
     compute_resolved_tree_hash, compute_semantic_change_id, ChangeOrigin, ChangeStore,
-    EffectiveAdmissionPolicyStamp, EntityStore, Hash256, ModelError, RefExpectation, RefMutation,
-    RefName, RefTarget, RefUpdatePolicy, RepositoryCommitOutcome, RepositoryCommitReceipt,
-    RepositoryTransaction, ResolvedArtifact, ResolvedTree, RootBundle, SemanticChange,
-    SemanticChangeId, SharedAdmissionPolicy, Timestamp, TransactionDelta, WorkspaceExpectation,
-    WorkspaceHead, WorkspaceMutation, WorkspaceSemanticDelta, WorkspaceState,
+    EffectiveAdmissionPolicyStamp, EntityStore, Hash256, MergeConflictEntry, MergeConflictSubject,
+    MergeDivergence, MergeEntryResolution, MergeOpening, MergeParentBinding,
+    MergeResolutionPayload, MergeSide, MergeSideValue, MergeTransactionDelta,
+    MergeTransactionRecord, MergeTransactionState, MergeWorkspaceRestorePoint, ModelError,
+    RefExpectation, RefMutation, RefName, RefTarget, RefUpdatePolicy, RepositoryCommitOutcome,
+    RepositoryCommitReceipt, RepositoryTransaction, ResolvedArtifact, ResolvedTree, RootBundle,
+    SemanticChange, SemanticChangeId, SharedAdmissionPolicy, Timestamp, TransactionDelta,
+    WorkspaceExpectation, WorkspaceHead, WorkspaceMutation, WorkspaceSemanticDelta, WorkspaceState,
     REPOSITORY_TRANSACTION_SCHEMA_VERSION,
 };
 
@@ -36,19 +38,23 @@ use crate::state::{DaemonEvent, DaemonState};
 
 const MERGE_REASON: &str = "publish exact repository-v6 semantic merge";
 const FAST_FORWARD_REASON: &str = "advance exact repository-v6 branch to a descendant";
+const OPEN_MERGE_REASON: &str = "open a durable repository-v6 merge transaction";
 
 /// How many conflicts a refusal names individually before summarizing. The
 /// total is always stated, so the message never reads as a complete list when
 /// it is truncated.
 const RENDERED_CONFLICT_LIMIT: usize = 25;
 
-struct MergeExecution {
+pub(crate) struct MergeExecution {
     response: MergeResponse,
-    receipt: RepositoryCommitReceipt,
-    authority_freeze: LocalRepositoryAuthorityFreeze,
-    daemon_delta: TransactionDelta,
-    previous_tree: ResolvedTree,
-    desired_tree: ResolvedTree,
+    /// Present only when the merge was published by `kin resolve --continue`,
+    /// whose caller answers on the resolve wire rather than the merge one.
+    pub(crate) resolve_response: Option<kin_cli::commands::resolve::ResolveResponse>,
+    pub(crate) receipt: RepositoryCommitReceipt,
+    pub(crate) authority_freeze: LocalRepositoryAuthorityFreeze,
+    pub(crate) daemon_delta: TransactionDelta,
+    pub(crate) previous_tree: ResolvedTree,
+    pub(crate) desired_tree: ResolvedTree,
 }
 
 enum MergeCommandOutcome {
@@ -78,11 +84,11 @@ impl std::fmt::Display for MergeBadRequest {
 
 impl std::error::Error for MergeBadRequest {}
 
-fn merge_conflict(message: impl Into<String>) -> anyhow::Error {
+pub(crate) fn merge_conflict(message: impl Into<String>) -> anyhow::Error {
     anyhow::Error::new(MergeConflictRefusal(message.into()))
 }
 
-fn merge_bad_request(message: impl Into<String>) -> anyhow::Error {
+pub(crate) fn merge_bad_request(message: impl Into<String>) -> anyhow::Error {
     anyhow::Error::new(MergeBadRequest(message.into()))
 }
 
@@ -159,6 +165,10 @@ struct MergePlan {
     ours_policy: SharedAdmissionPolicy,
     workspace_graph: kin_db::GraphSnapshot,
     graph: kin_db::InMemoryGraph,
+    /// The workspace's durable merge record as this lease saw it. An
+    /// in-progress record refuses the merge; a terminated one is what the next
+    /// merge compare-and-swaps over.
+    existing_merge: Option<MergeTransactionRecord>,
 }
 
 fn plan_and_publish(
@@ -221,6 +231,23 @@ fn read_merge_plan(
     let roots = lease.roots().clone();
     let metadata = lease.metadata();
     let workspace = local_workspace(authority, metadata)?.clone();
+    let existing_merge =
+        crate::repository_merge_state::workspace_merge_record(metadata, workspace.workspace_id)
+            .cloned();
+    if let Some(open) = existing_merge
+        .as_ref()
+        .filter(|record| record.state.is_in_progress())
+    {
+        return Err(merge_conflict(format!(
+            "workspace {} already has a merge of {} into {} in progress with {} unresolved \
+             conflict(s); settle it with `kin resolve` or discard it with `kin resolve --abort` \
+             before merging again",
+            workspace.workspace_id,
+            open.binding.source_ref,
+            open.binding.target_ref,
+            open.unresolved().count()
+        )));
+    }
     if workspace.is_dirty() {
         return Err(merge_conflict(format!(
             "workspace {} has graph-owned changes; commit or discard them before merging",
@@ -304,6 +331,7 @@ fn read_merge_plan(
         ours_policy,
         workspace_graph,
         graph,
+        existing_merge,
     })
 }
 
@@ -467,48 +495,60 @@ fn three_way(
         &base_state.entities,
         &ours_state.entities,
         &theirs_state.entities,
-        |entity| MergeConflictScope::Entity {
-            entity: *entity,
-            name: describe_entity(&ours_state.entities, &theirs_state.entities, entity),
-        },
+        |entity| MergeConflictSubject::Entity { entity: *entity },
+        MergeSideValue::entity,
+        |entity| describe_entity(&ours_state.entities, &theirs_state.entities, entity),
         &mut conflicts,
-    );
+    )?;
     let merged_relations = compose(
         &base_state.relations,
         &ours_state.relations,
         &theirs_state.relations,
-        |relation| MergeConflictScope::Relation {
+        |relation| MergeConflictSubject::Relation {
             relation: *relation,
         },
+        MergeSideValue::relation,
+        |_| None,
         &mut conflicts,
-    );
+    )?;
     let merged_artifacts = compose(
         &artifacts_by_id(&base_state.tree),
         &artifacts_by_id(&ours_state.tree),
         &artifacts_by_id(&theirs_state.tree),
-        |artifact| MergeConflictScope::Artifact {
+        |artifact| MergeConflictSubject::Artifact {
             artifact: *artifact,
-            path: ours_state
+        },
+        MergeSideValue::artifact,
+        |artifact| {
+            ours_state
                 .tree
                 .get(artifact)
                 .or_else(|| theirs_state.tree.get(artifact))
-                .map(|resolved| resolved.path.to_string()),
+                .map(|resolved| resolved.path.to_string())
         },
         &mut conflicts,
-    );
-    let mut claimed: BTreeMap<&kin_model::RepoPath, usize> = BTreeMap::new();
+    )?;
+    let mut claimed: BTreeMap<&kin_model::RepoPath, Vec<kin_model::ArtifactId>> = BTreeMap::new();
     for artifact in merged_artifacts.values() {
-        *claimed.entry(&artifact.path).or_default() += 1;
+        claimed
+            .entry(&artifact.path)
+            .or_default()
+            .push(artifact.artifact_id);
     }
-    for (path, count) in claimed {
-        if count > 1 {
-            conflicts.push(MergeConflict {
-                scope: MergeConflictScope::Path {
-                    path: path.to_string(),
-                },
-                detail: format!(
-                    "{count} distinct artifacts occupy this path after composing both sides"
-                ),
+    for (path, mut artifacts) in claimed {
+        if artifacts.len() > 1 {
+            artifacts.sort();
+            conflicts.push(MergeConflictEntry {
+                subject: MergeConflictSubject::Path { path: path.clone() },
+                divergence: MergeDivergence::PathCollision { artifacts },
+                // A contested path holds no value on any side: each claimant
+                // composed cleanly on its own, so the claimants above are the
+                // whole conflict.
+                base: MergeSideValue::Absent,
+                ours: MergeSideValue::Absent,
+                theirs: MergeSideValue::Absent,
+                label: Some(path.to_string()),
+                resolution: MergeEntryResolution::Unresolved,
             });
         }
     }
@@ -519,9 +559,9 @@ fn three_way(
         &ours_state,
         &theirs_state,
         &mut conflicts,
-    );
+    )?;
     if !conflicts.is_empty() {
-        return Err(conflict_refusal(request, &plan, &conflicts));
+        return open_conflicted_merge(state, authority, request, plan, base, conflicts);
     }
 
     let desired_tree = ResolvedTree::from_artifacts(merged_artifacts.into_values())
@@ -668,22 +708,595 @@ fn three_way(
     Ok(execution)
 }
 
+/// Publish a parked merge from the resolutions its record already carries.
+///
+/// Composition is redone from graph truth rather than replayed from anything
+/// the record cached: the record holds which identities conflicted and how each
+/// was settled, and history holds the values. Recomposition is then held to the
+/// record, so a merge whose inputs moved underneath it fails loud instead of
+/// publishing a different merge than the one that was resolved.
+pub(crate) fn publish_resolved_merge(
+    state: &DaemonState,
+    authority: &ActiveLocalRepositoryAuthority,
+    request: &kin_cli::commands::resolve::ResolveRequest,
+    roots: RootBundle,
+    workspace: WorkspaceState,
+    record: MergeTransactionRecord,
+) -> Result<MergeExecution> {
+    if !record.is_fully_resolved() {
+        return Err(merge_conflict(format!(
+            "merging {} into {} still has {} unresolved conflict(s): {}",
+            record.binding.source_ref,
+            record.binding.target_ref,
+            record.unresolved().count(),
+            crate::repository_merge_state::describe_unresolved(&record)
+        )));
+    }
+    if restore_point(&workspace) != record.restore {
+        return Err(merge_conflict(format!(
+            "workspace {} has moved since this merge opened, so publishing it would not be the \
+             merge that was resolved; abandon it with `kin resolve --abort` and merge again",
+            workspace.workspace_id
+        )));
+    }
+
+    let lease = authority.manager.read_authority();
+    let metadata = lease.metadata();
+    let ours_policy = resolved_policy(metadata, &record.binding.ours_change)?;
+    let current_target = lease
+        .resolve_ref_target(&record.binding.target_ref)
+        .with_context(|| {
+            format!(
+                "resolve repository branch {} from one authority lease",
+                record.binding.target_ref
+            )
+        })?;
+    if current_target.as_ref() != Some(&record.binding.ours_target) {
+        return Err(merge_conflict(format!(
+            "branch {} has advanced since this merge opened; abandon it with `kin resolve --abort` \
+             and merge again",
+            record.binding.target_ref
+        )));
+    }
+    let workspace_graph = lease
+        .workspace_graph_snapshot(&workspace.workspace_id)
+        .context("materialize graph-owned workspace semantics for merge publication")?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "repository {} has no graph snapshot for workspace {}",
+                authority.repository_id,
+                workspace.workspace_id
+            )
+        })?;
+    require_fresh_daemon_workspace(state, &roots, &workspace_graph, "publishing a merge")
+        .map_err(|error| merge_conflict(error.to_string()))?;
+    let mut snapshot = lease.snapshot().clone();
+    snapshot.repository_authority = None;
+    drop(lease);
+
+    let graph = kin_db::InMemoryGraph::from_snapshot(snapshot)
+        .context("prepare graph-owned merge history")?;
+    let base_state = graph
+        .resolve_graph_at(&record.binding.base_change)
+        .context("resolve exact graph at the merge base")?;
+    let ours_state = graph
+        .resolve_graph_at(&record.binding.ours_change)
+        .context("resolve exact graph for the branch being merged into")?;
+    let theirs_state = graph
+        .resolve_graph_at(&record.binding.theirs_change)
+        .context("resolve exact graph for the branch being merged in")?;
+
+    let mut recomposed = Vec::new();
+    let mut merged_entities = compose(
+        &base_state.entities,
+        &ours_state.entities,
+        &theirs_state.entities,
+        |entity| MergeConflictSubject::Entity { entity: *entity },
+        MergeSideValue::entity,
+        |entity| describe_entity(&ours_state.entities, &theirs_state.entities, entity),
+        &mut recomposed,
+    )?;
+    let mut merged_relations = compose(
+        &base_state.relations,
+        &ours_state.relations,
+        &theirs_state.relations,
+        |relation| MergeConflictSubject::Relation {
+            relation: *relation,
+        },
+        MergeSideValue::relation,
+        |_| None,
+        &mut recomposed,
+    )?;
+    let ours_artifacts = artifacts_by_id(&ours_state.tree);
+    let theirs_artifacts = artifacts_by_id(&theirs_state.tree);
+    let base_artifacts = artifacts_by_id(&base_state.tree);
+    let mut merged_artifacts = compose(
+        &base_artifacts,
+        &ours_artifacts,
+        &theirs_artifacts,
+        |artifact| MergeConflictSubject::Artifact {
+            artifact: *artifact,
+        },
+        MergeSideValue::artifact,
+        |artifact| {
+            ours_state
+                .tree
+                .get(artifact)
+                .or_else(|| theirs_state.tree.get(artifact))
+                .map(|resolved| resolved.path.to_string())
+        },
+        &mut recomposed,
+    )?;
+    let mut claimed: BTreeMap<&kin_model::RepoPath, Vec<kin_model::ArtifactId>> = BTreeMap::new();
+    for artifact in merged_artifacts.values() {
+        claimed
+            .entry(&artifact.path)
+            .or_default()
+            .push(artifact.artifact_id);
+    }
+    for (path, mut artifacts) in claimed {
+        if artifacts.len() > 1 {
+            artifacts.sort();
+            recomposed.push(MergeConflictEntry {
+                subject: MergeConflictSubject::Path { path: path.clone() },
+                divergence: MergeDivergence::PathCollision { artifacts },
+                base: MergeSideValue::Absent,
+                ours: MergeSideValue::Absent,
+                theirs: MergeSideValue::Absent,
+                label: Some(path.to_string()),
+                resolution: MergeEntryResolution::Unresolved,
+            });
+        }
+    }
+    collect_dangling_endpoints(
+        &merged_relations,
+        &merged_entities,
+        &merged_artifacts,
+        &ours_state,
+        &theirs_state,
+        &mut recomposed,
+    )?;
+    require_same_conflicts(&record, &mut recomposed)?;
+
+    for entry in &record.entries {
+        apply_resolution(
+            entry,
+            &base_state,
+            &ours_state,
+            &theirs_state,
+            &base_artifacts,
+            &ours_artifacts,
+            &theirs_artifacts,
+            &mut merged_entities,
+            &mut merged_relations,
+            &mut merged_artifacts,
+        )?;
+    }
+
+    // The resolutions are the caller's, so a composition they leave broken is
+    // named rather than parked again: the record already holds one settlement
+    // per conflict, and re-opening would discard it.
+    let mut residual = Vec::new();
+    let mut settled_paths: BTreeMap<&kin_model::RepoPath, usize> = BTreeMap::new();
+    for artifact in merged_artifacts.values() {
+        *settled_paths.entry(&artifact.path).or_default() += 1;
+    }
+    for (path, count) in settled_paths {
+        if count > 1 {
+            residual.push(format!("{count} artifacts still occupy path {path}"));
+        }
+    }
+    let mut dangling = Vec::new();
+    collect_dangling_endpoints(
+        &merged_relations,
+        &merged_entities,
+        &merged_artifacts,
+        &ours_state,
+        &theirs_state,
+        &mut dangling,
+    )?;
+    residual.extend(dangling.iter().map(render_entry));
+    if !residual.is_empty() {
+        return Err(merge_conflict(format!(
+            "the recorded resolutions do not compose into a publishable merge: {}",
+            residual.join("; ")
+        )));
+    }
+
+    let desired_tree = ResolvedTree::from_artifacts(merged_artifacts.into_values())
+        .context("compose exact resolved repository tree")?;
+    let (shared_policy, admission_policy_delta) =
+        derive_policy(state, &ours_policy, &desired_tree)?;
+    if admission_policy_delta.is_some() || shared_policy != ours_policy {
+        return Err(merge_conflict(format!(
+            "merging {} into {} changes the shared admission policy; a merge that transitions \
+             admission policy is not a proven repository-v6 shape",
+            record.binding.source_ref, record.binding.target_ref
+        )));
+    }
+
+    let change_delta = kin_core::diff_workspace_semantics(
+        &ours_state.entities,
+        &ours_state.relations,
+        &merged_entities,
+        &merged_relations,
+    )
+    .context("author exact merge semantics against the first parent")?;
+    let change_tree_deltas = kin_core::exact_tree_correction(&ours_state.tree, &desired_tree)
+        .context("author exact merge tree deltas against the first parent")?;
+    let mut change = SemanticChange {
+        id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+        origin: ChangeOrigin::Native,
+        parents: vec![record.binding.ours_change, record.binding.theirs_change],
+        timestamp: Timestamp::now(),
+        author: request.actor.clone(),
+        message: format!(
+            "Merge {} into {}",
+            record.binding.source_ref, record.binding.target_ref
+        ),
+        entity_deltas: change_delta.entity_deltas().to_vec(),
+        relation_deltas: change_delta.relation_deltas().to_vec(),
+        tree_deltas: change_tree_deltas,
+        admission_policy_delta: None,
+        projected_files: Vec::new(),
+        spec_link: None,
+        evidence: Vec::new(),
+        risk_summary: None,
+    };
+    change.id = compute_semantic_change_id(&change).context("hash exact merge change")?;
+    let merge_target = RefTarget::change(change.id);
+
+    let replay = kin_db::InMemoryGraph::from_snapshot(graph.to_snapshot())
+        .context("prepare merge replay validation")?;
+    replay
+        .create_change(&change)
+        .context("admit the merge change for replay validation")?;
+    let authoritative = replay
+        .resolve_graph_at(&change.id)
+        .context("replay the exact merge change")?;
+    if authoritative.tree != desired_tree {
+        bail!("replaying the merge change did not reproduce the resolved merged tree");
+    }
+    let desired_tree_hash =
+        compute_resolved_tree_hash(&desired_tree).context("hash exact merged tree")?;
+    let workspace_tree_deltas = kin_core::exact_tree_correction(&workspace.tree, &desired_tree)
+        .context("plan exact merged workspace transition")?;
+    let workspace_semantic_delta = kin_core::diff_workspace_semantics(
+        &workspace_graph.entities,
+        &workspace_graph.relations,
+        &authoritative.entities,
+        &authoritative.relations,
+    )
+    .context("plan exact merged workspace semantics")?;
+    let daemon_semantic_delta = crate::local_repository_authority::plan_daemon_semantic_delta(
+        state,
+        &authoritative.entities,
+        &authoritative.relations,
+    )
+    .context("plan the exact merged workspace semantics for the daemon view")?;
+    let daemon_delta = TransactionDelta {
+        entity_deltas: daemon_semantic_delta.entity_deltas().to_vec(),
+        relation_deltas: daemon_semantic_delta.relation_deltas().to_vec(),
+        tree_deltas: workspace_tree_deltas.clone(),
+        admission_policy_delta: None,
+    };
+    preflight_merge_delta(
+        state,
+        &workspace.tree,
+        &desired_tree,
+        &authoritative.entities,
+        &authoritative.relations,
+        &daemon_delta,
+    )?;
+
+    let terminated = record
+        .terminate(MergeTransactionState::Committed {
+            merge_change: change.id,
+            operation_id: request.operation_id,
+            committed_at: Timestamp::now(),
+        })
+        .context("terminate the merge transaction as published")?;
+    let transaction = RepositoryTransaction {
+        schema_version: REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+        operation_id: request.operation_id,
+        repository_id: workspace.repository_id.clone(),
+        expected_generation: roots.generation,
+        expected_roots: roots.clone(),
+        actor: request.actor.clone(),
+        reason: MERGE_REASON.to_string(),
+        external_objects: Vec::new(),
+        git_authority_delta: None,
+        changes: vec![change.clone()],
+        aliases: Vec::new(),
+        ref_mutations: vec![RefMutation {
+            name: record.binding.target_ref.clone(),
+            expected: RefExpectation::MustEqual {
+                target: record.binding.ours_target.clone(),
+            },
+            new_target: Some(merge_target.clone()),
+            policy: RefUpdatePolicy::FastForwardOnly,
+        }],
+        default_ref_mutation: None,
+        workspace_mutation: Some(workspace_mutation(
+            &workspace,
+            merge_target,
+            desired_tree_hash,
+            workspace_tree_deltas,
+            workspace_semantic_delta,
+            shared_policy,
+        )?),
+        local_overlay_delta: None,
+        merge_transaction_delta: Some(MergeTransactionDelta::update(
+            record.clone(),
+            terminated.clone(),
+        )),
+    };
+    transaction
+        .validate()
+        .context("validate exact repository-v6 resolved merge transaction")?;
+    let drift = kin_core::report_repository_workspace_projection_drift(
+        state.layout.working_dir(),
+        &workspace.tree,
+        &authority.manager,
+    )
+    .context("validate exact workspace projection before publishing the merge")?;
+    if let Some(first) = drift.first() {
+        return Err(kin_core::KinError::ProjectionConflict(format!(
+            "{first}; {} tracked path(s) diverge from the graph-owned workspace projection; \
+             reconcile them into graph authority or discard them before publishing this merge",
+            drift.len()
+        ))
+        .into());
+    }
+    let (materialized, receipt, authority_freeze) =
+        kin_core::tree::transition_repository_workspace_tree_and_commit_repository_transaction(
+            state.layout.working_dir(),
+            &workspace.tree,
+            &desired_tree,
+            &authority.manager,
+            transaction,
+        )
+        .with_context(|| {
+            format!(
+                "publish resolved repository-v6 merge of {} into {}",
+                record.binding.source_ref, record.binding.target_ref
+            )
+        })?;
+
+    let resolved_count = terminated.entries.len();
+    let report = kin_cli::commands::resolve::ResolveReport {
+        schema: kin_cli::commands::resolve::RESOLVE_REPORT_SCHEMA.to_string(),
+        authority: "repository-v6".to_string(),
+        repository_id: workspace.repository_id.clone(),
+        workspace_id: workspace.workspace_id,
+        authority_generation: receipt.generation,
+        roots: receipt.roots_after.clone(),
+        record: Some(terminated),
+        merge_change: Some(change.id),
+        resolved_count,
+        unresolved_count: 0,
+    };
+    let previous_tree = workspace.tree.clone();
+    Ok(MergeExecution {
+        response: MergeResponse::default(),
+        resolve_response: Some(kin_cli::commands::resolve::ResolveResponse {
+            lines: vec![format!(
+                "Merged {} into {} as change {} after settling {} conflict(s) ({} projected \
+                 entries, authority generation {})",
+                record.binding.source_ref,
+                record.binding.target_ref,
+                change.id,
+                resolved_count,
+                materialized,
+                receipt.generation
+            )],
+            mutated: matches!(receipt.outcome, RepositoryCommitOutcome::Committed),
+            report: Some(report),
+            operation_id: Some(receipt.operation_id),
+            authority_generation: Some(receipt.generation),
+            idempotent: matches!(receipt.outcome, RepositoryCommitOutcome::IdempotentReplay),
+        }),
+        receipt,
+        authority_freeze,
+        daemon_delta,
+        previous_tree,
+        desired_tree,
+    })
+}
+
+/// Hold recomposition to the record: same identities, same divergences, same
+/// side values. Anything else means the merge being published is not the merge
+/// that was resolved.
+fn require_same_conflicts(
+    record: &MergeTransactionRecord,
+    recomposed: &mut Vec<MergeConflictEntry>,
+) -> Result<()> {
+    recomposed.sort_by(|left, right| left.subject.cmp(&right.subject));
+    if recomposed.len() != record.entries.len() {
+        return Err(merge_conflict(format!(
+            "recomposing this merge now finds {} conflict(s) where the record holds {}; history \
+             moved underneath the merge, so abandon it with `kin resolve --abort` and merge again",
+            recomposed.len(),
+            record.entries.len()
+        )));
+    }
+    for (recorded, found) in record.entries.iter().zip(recomposed.iter()) {
+        if recorded.subject != found.subject
+            || recorded.divergence != found.divergence
+            || recorded.base != found.base
+            || recorded.ours != found.ours
+            || recorded.theirs != found.theirs
+        {
+            return Err(merge_conflict(format!(
+                "recomposing this merge no longer reproduces the recorded conflict {}; history \
+                 moved underneath the merge, so abandon it with `kin resolve --abort` and merge \
+                 again",
+                render_subject(recorded)
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Apply one settled entry to the composed maps.
+#[allow(clippy::too_many_arguments)]
+fn apply_resolution(
+    entry: &MergeConflictEntry,
+    base_state: &kin_model::graph::ResolvedGraphState,
+    ours_state: &kin_model::graph::ResolvedGraphState,
+    theirs_state: &kin_model::graph::ResolvedGraphState,
+    base_artifacts: &std::collections::HashMap<kin_model::ArtifactId, ResolvedArtifact>,
+    ours_artifacts: &std::collections::HashMap<kin_model::ArtifactId, ResolvedArtifact>,
+    theirs_artifacts: &std::collections::HashMap<kin_model::ArtifactId, ResolvedArtifact>,
+    entities: &mut std::collections::HashMap<kin_model::EntityId, kin_model::Entity>,
+    relations: &mut std::collections::HashMap<kin_model::RelationId, kin_model::Relation>,
+    artifacts: &mut std::collections::HashMap<kin_model::ArtifactId, ResolvedArtifact>,
+) -> Result<()> {
+    match (&entry.subject, &entry.resolution) {
+        (_, MergeEntryResolution::Unresolved) => {
+            bail!("an unresolved entry reached merge publication")
+        }
+        (MergeConflictSubject::Entity { entity }, MergeEntryResolution::Side { side, .. }) => {
+            let state = graph_side(side, base_state, ours_state, theirs_state);
+            let value = state.entities.get(entity);
+            require_recorded_side(entry, side, MergeSideValue::entity(value)?)?;
+            match value {
+                Some(value) => entities.insert(*entity, value.clone()),
+                None => entities.remove(entity),
+            };
+        }
+        (MergeConflictSubject::Relation { relation }, MergeEntryResolution::Side { side, .. }) => {
+            let state = graph_side(side, base_state, ours_state, theirs_state);
+            let value = state.relations.get(relation);
+            require_recorded_side(entry, side, MergeSideValue::relation(value)?)?;
+            match value {
+                Some(value) => relations.insert(*relation, value.clone()),
+                None => relations.remove(relation),
+            };
+        }
+        (MergeConflictSubject::Artifact { artifact }, MergeEntryResolution::Side { side, .. }) => {
+            let side_artifacts = match side {
+                MergeSide::Base => base_artifacts,
+                MergeSide::Ours => ours_artifacts,
+                MergeSide::Theirs => theirs_artifacts,
+            };
+            let value = side_artifacts.get(artifact);
+            require_recorded_side(entry, side, MergeSideValue::artifact(value)?)?;
+            match value {
+                Some(value) => artifacts.insert(*artifact, value.clone()),
+                None => artifacts.remove(artifact),
+            };
+        }
+        (MergeConflictSubject::Path { .. }, MergeEntryResolution::Side { .. }) => {
+            bail!("a contested path has no side to take")
+        }
+        (subject, MergeEntryResolution::Payload { payload, .. }) => match (subject, payload) {
+            (MergeConflictSubject::Entity { entity }, MergeResolutionPayload::Removed) => {
+                entities.remove(entity);
+            }
+            (MergeConflictSubject::Relation { relation }, MergeResolutionPayload::Removed) => {
+                relations.remove(relation);
+            }
+            (MergeConflictSubject::Artifact { artifact }, MergeResolutionPayload::Removed) => {
+                artifacts.remove(artifact);
+            }
+            (
+                MergeConflictSubject::Path { path },
+                MergeResolutionPayload::PathOwner { artifact: owner },
+            ) => {
+                let MergeDivergence::PathCollision {
+                    artifacts: claimants,
+                } = &entry.divergence
+                else {
+                    bail!("a path owner settles a path collision")
+                };
+                for claimant in claimants {
+                    if claimant != owner {
+                        artifacts.remove(claimant);
+                    }
+                }
+                if !artifacts.contains_key(owner) {
+                    bail!("the artifact chosen to keep path {path} did not survive composition")
+                }
+            }
+            (MergeConflictSubject::Path { .. }, MergeResolutionPayload::Removed) => {
+                let MergeDivergence::PathCollision {
+                    artifacts: claimants,
+                } = &entry.divergence
+                else {
+                    bail!("a removal of a contested path settles a path collision")
+                };
+                for claimant in claimants {
+                    artifacts.remove(claimant);
+                }
+            }
+            _ => {
+                return Err(merge_bad_request(format!(
+                    "authoring a merge resolution value for {} is not a proven repository-v6 \
+                     shape; settle it by taking a side, removing it, or naming a path owner",
+                    render_subject(entry)
+                )))
+            }
+        },
+    }
+    Ok(())
+}
+
+fn graph_side<'a>(
+    side: &MergeSide,
+    base: &'a kin_model::graph::ResolvedGraphState,
+    ours: &'a kin_model::graph::ResolvedGraphState,
+    theirs: &'a kin_model::graph::ResolvedGraphState,
+) -> &'a kin_model::graph::ResolvedGraphState {
+    match side {
+        MergeSide::Base => base,
+        MergeSide::Ours => ours,
+        MergeSide::Theirs => theirs,
+    }
+}
+
+/// A resolution that claims a side is checked against history rather than
+/// trusted: the value that side holds now must be the value the record bound.
+fn require_recorded_side(
+    entry: &MergeConflictEntry,
+    side: &MergeSide,
+    found: MergeSideValue,
+) -> Result<()> {
+    let recorded = match side {
+        MergeSide::Base => &entry.base,
+        MergeSide::Ours => &entry.ours,
+        MergeSide::Theirs => &entry.theirs,
+    };
+    if &found != recorded {
+        return Err(merge_conflict(format!(
+            "the {side:?} side of {} no longer holds the value this merge recorded; abandon the \
+             merge with `kin resolve --abort` and merge again",
+            render_subject(entry)
+        )));
+    }
+    Ok(())
+}
+
 /// Compose one identity-keyed dimension of the three-way merge.
 ///
 /// Every decision is by exact value equality against the merge base, so a side
 /// that did not move never overrides a side that did, and both sides moving to
 /// the same value is agreement rather than conflict.
-fn compose<K, V, S>(
+fn compose<K, V, S, D, L>(
     base: &std::collections::HashMap<K, V>,
     ours: &std::collections::HashMap<K, V>,
     theirs: &std::collections::HashMap<K, V>,
-    scope: S,
-    conflicts: &mut Vec<MergeConflict>,
-) -> std::collections::HashMap<K, V>
+    subject: S,
+    side_value: D,
+    label: L,
+    conflicts: &mut Vec<MergeConflictEntry>,
+) -> Result<std::collections::HashMap<K, V>>
 where
     K: Copy + Ord + std::hash::Hash,
     V: Clone + PartialEq,
-    S: Fn(&K) -> MergeConflictScope,
+    S: Fn(&K) -> MergeConflictSubject,
+    D: Fn(Option<&V>) -> std::result::Result<MergeSideValue, ModelError>,
+    L: Fn(&K) -> Option<String>,
 {
     // Identity iteration is ordered so the reported conflict set is stable
     // across runs; the composed maps themselves are order-independent.
@@ -703,13 +1316,18 @@ where
         } else if their_side == base_side {
             our_side
         } else {
-            conflicts.push(MergeConflict {
-                scope: scope(&id),
-                detail: describe_divergence(
+            conflicts.push(MergeConflictEntry {
+                subject: subject(&id),
+                divergence: value_divergence(
                     base_side.is_some(),
                     our_side.is_some(),
                     their_side.is_some(),
-                ),
+                )?,
+                base: side_value(base_side)?,
+                ours: side_value(our_side)?,
+                theirs: side_value(their_side)?,
+                label: label(&id),
+                resolution: MergeEntryResolution::Unresolved,
             });
             continue;
         };
@@ -717,7 +1335,25 @@ where
             merged.insert(id, value.clone());
         }
     }
-    merged
+    Ok(merged)
+}
+
+/// Classify a value divergence from which of the three inputs held the identity.
+///
+/// Composition only reaches this for an identity where both sides moved and
+/// moved differently, so exactly four shapes are reachable. Anything else means
+/// composition and classification disagree, which is a defect rather than a
+/// conflict, and is refused instead of recorded.
+fn value_divergence(in_base: bool, in_ours: bool, in_theirs: bool) -> Result<MergeDivergence> {
+    Ok(match (in_base, in_ours, in_theirs) {
+        (true, true, true) => MergeDivergence::ChangedBothSides,
+        (false, true, true) => MergeDivergence::AddedBothSides,
+        (_, true, false) => MergeDivergence::ChangedOursRemovedTheirs,
+        (_, false, true) => MergeDivergence::RemovedOursChangedTheirs,
+        (_, false, false) => {
+            bail!("composition reported a conflict for an identity neither side holds")
+        }
+    })
 }
 
 /// Refuse a composition where one side removed a node the other side still
@@ -734,9 +1370,10 @@ fn collect_dangling_endpoints(
     artifacts: &std::collections::HashMap<kin_model::ArtifactId, ResolvedArtifact>,
     ours: &kin_model::graph::ResolvedGraphState,
     theirs: &kin_model::graph::ResolvedGraphState,
-    conflicts: &mut Vec<MergeConflict>,
-) {
-    let mut dangling: BTreeMap<kin_model::RelationId, String> = BTreeMap::new();
+    conflicts: &mut Vec<MergeConflictEntry>,
+) -> Result<()> {
+    let mut dangling: BTreeMap<kin_model::RelationId, (kin_model::GraphNodeId, String)> =
+        BTreeMap::new();
     for (id, relation) in relations {
         for endpoint in [&relation.src, &relation.dst] {
             if let Some(entity) = endpoint.as_entity() {
@@ -746,9 +1383,12 @@ fn collect_dangling_endpoints(
                 if !survives && existed {
                     dangling.entry(*id).or_insert_with(|| {
                         let name = describe_entity(&ours.entities, &theirs.entities, &entity);
-                        format!(
-                            "one branch removed {}, which the other branch still relates to",
-                            name.unwrap_or_else(|| entity.to_string())
+                        (
+                            *endpoint,
+                            format!(
+                                "one branch removed {}, which the other branch still relates to",
+                                name.unwrap_or_else(|| entity.to_string())
+                            ),
                         )
                     });
                 }
@@ -766,37 +1406,31 @@ fn collect_dangling_endpoints(
                             .or_else(|| theirs.tree.get(&artifact))
                             .map(|resolved| resolved.path.to_string())
                             .unwrap_or_else(|| format!("{artifact:?}"));
-                        format!(
-                            "one branch removed {path}, which the other branch still relates to"
+                        (
+                            *endpoint,
+                            format!(
+                                "one branch removed {path}, which the other branch still relates to"
+                            ),
                         )
                     });
                 }
             }
         }
     }
-    conflicts.extend(
-        dangling
-            .into_iter()
-            .map(|(relation, detail)| MergeConflict {
-                scope: MergeConflictScope::Relation { relation },
-                detail,
-            }),
-    );
-}
-
-fn describe_divergence(in_base: bool, in_ours: bool, in_theirs: bool) -> String {
-    match (in_base, in_ours, in_theirs) {
-        (_, false, true) => {
-            "removed on the active branch and changed on the source branch".to_string()
-        }
-        (_, true, false) => {
-            "changed on the active branch and removed on the source branch".to_string()
-        }
-        (false, true, true) => {
-            "added independently on both branches with different content".to_string()
-        }
-        _ => "changed on both branches with different content".to_string(),
+    for (relation, (endpoint, detail)) in dangling {
+        conflicts.push(MergeConflictEntry {
+            subject: MergeConflictSubject::Relation { relation },
+            divergence: MergeDivergence::DanglingEndpoint { endpoint },
+            // The relation itself composed; what broke is the node it points
+            // at, so its sides are recorded as history holds them.
+            base: MergeSideValue::Absent,
+            ours: MergeSideValue::relation(ours.relations.get(&relation))?,
+            theirs: MergeSideValue::relation(theirs.relations.get(&relation))?,
+            label: Some(detail),
+            resolution: MergeEntryResolution::Unresolved,
+        });
     }
+    Ok(())
 }
 
 fn artifacts_by_id(
@@ -969,6 +1603,9 @@ fn publish(
         MergeOutcome::AlreadyUpToDate => {
             bail!("an up-to-date merge must not reach the publication path")
         }
+        MergeOutcome::Conflicted => {
+            bail!("a parked merge must not reach the workspace publication path")
+        }
     };
     let report = MergeReport {
         schema: MERGE_REPORT_SCHEMA.to_string(),
@@ -989,6 +1626,7 @@ fn publish(
         tree_delta_count: 0,
     };
     Ok(MergeExecution {
+        resolve_response: None,
         response: MergeResponse {
             lines: vec![line],
             mutated: matches!(receipt.outcome, RepositoryCommitOutcome::Committed),
@@ -1005,47 +1643,193 @@ fn publish(
     })
 }
 
-fn conflict_refusal(
+/// Park a merge that did not compose as one durable merge-transaction record.
+///
+/// Nothing else moves: no merge change is authored, no ref advances, and the
+/// workspace stays exactly where the restore point says it was. The record is
+/// the whole of the publication, so the merge is recoverable across a daemon
+/// restart and abortable back to a workspace that never moved.
+fn open_conflicted_merge(
+    state: &DaemonState,
+    authority: &ActiveLocalRepositoryAuthority,
     request: &MergeRequest,
-    plan: &MergePlan,
-    conflicts: &[MergeConflict],
-) -> anyhow::Error {
-    let mut message = format!(
-        "merging {} into {} has {} unresolved conflict(s); repository-v6 has no durable merge \
-         transaction to hold them, so nothing was published",
-        request.source,
-        plan.target_ref,
-        conflicts.len()
+    plan: MergePlan,
+    base: SemanticChangeId,
+    conflicts: Vec<MergeConflictEntry>,
+) -> Result<MergeExecution> {
+    let conflict_count = conflicts.len();
+    let record = MergeTransactionRecord::open(
+        plan.workspace.repository_id.clone(),
+        plan.workspace.workspace_id,
+        MergeOpening {
+            operation_id: request.operation_id,
+            actor: request.actor.clone(),
+            opened_at: Timestamp::now(),
+        },
+        MergeParentBinding {
+            target_ref: plan.target_ref.clone(),
+            source_ref: request.source.clone(),
+            base_change: base,
+            ours_change: plan.ours_change,
+            theirs_change: plan.theirs_change,
+            ours_target: plan.ours_target.clone(),
+            theirs_target: plan.theirs_target.clone(),
+        },
+        restore_point(&plan.workspace),
+        conflicts,
+    )
+    .context("open the durable merge transaction for a merge that did not compose")?;
+    let delta = match plan.existing_merge.clone() {
+        Some(previous) => MergeTransactionDelta::update(previous, record.clone()),
+        None => MergeTransactionDelta::open(record.clone()),
+    };
+    let transaction = RepositoryTransaction {
+        schema_version: REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+        operation_id: request.operation_id,
+        repository_id: plan.workspace.repository_id.clone(),
+        expected_generation: plan.roots.generation,
+        expected_roots: plan.roots.clone(),
+        actor: request.actor.clone(),
+        reason: OPEN_MERGE_REASON.to_string(),
+        external_objects: Vec::new(),
+        git_authority_delta: None,
+        changes: Vec::new(),
+        aliases: Vec::new(),
+        ref_mutations: Vec::new(),
+        default_ref_mutation: None,
+        workspace_mutation: None,
+        local_overlay_delta: None,
+        merge_transaction_delta: Some(delta),
+    };
+    transaction
+        .validate()
+        .context("validate the durable merge transaction that parks this merge")?;
+    let (receipt, authority_freeze) =
+        crate::repository_merge_state::commit_and_freeze_exact(&authority.manager, transaction)
+            .with_context(|| {
+                format!(
+                    "open the durable merge transaction for {} into {}",
+                    request.source, plan.target_ref
+                )
+            })?;
+    let _ = state;
+    let mut lines = vec![format!(
+        "Merging {} into {} left {} unresolved conflict(s); the merge is held as merge \
+         transaction {} (authority generation {})",
+        request.source, plan.target_ref, conflict_count, record.hash, receipt.generation
+    )];
+    lines.extend(render_conflict_lines(&record));
+    lines.push(
+        "Settle each conflict with `kin resolve`, then `kin resolve --continue`, or discard the \
+         merge with `kin resolve --abort`"
+            .to_string(),
     );
-    for conflict in conflicts.iter().take(RENDERED_CONFLICT_LIMIT) {
-        message.push_str(&format!(
-            "\n  - {}: {}",
-            render_scope(&conflict.scope),
-            conflict.detail
-        ));
-    }
-    if conflicts.len() > RENDERED_CONFLICT_LIMIT {
-        message.push_str(&format!(
-            "\n  - ... and {} further conflict(s) not listed",
-            conflicts.len() - RENDERED_CONFLICT_LIMIT
-        ));
-    }
-    merge_conflict(message)
+    let report = MergeReport {
+        schema: MERGE_REPORT_SCHEMA.to_string(),
+        authority: "repository-v6".to_string(),
+        repository_id: plan.workspace.repository_id.clone(),
+        authority_generation: receipt.generation,
+        roots: receipt.roots_after.clone(),
+        workspace_id: plan.workspace.workspace_id,
+        target_ref: plan.target_ref.clone(),
+        source_ref: request.source.clone(),
+        base_change: base,
+        ours_change: plan.ours_change,
+        theirs_change: plan.theirs_change,
+        outcome: MergeOutcome::Conflicted,
+        merge_change: None,
+        entity_delta_count: 0,
+        relation_delta_count: 0,
+        tree_delta_count: 0,
+    };
+    let tree = plan.workspace.tree.clone();
+    Ok(MergeExecution {
+        resolve_response: None,
+        response: MergeResponse {
+            lines,
+            mutated: matches!(receipt.outcome, RepositoryCommitOutcome::Committed),
+            report: Some(report),
+            operation_id: Some(receipt.operation_id),
+            authority_generation: Some(receipt.generation),
+            idempotent: matches!(receipt.outcome, RepositoryCommitOutcome::IdempotentReplay),
+        },
+        receipt,
+        authority_freeze,
+        daemon_delta: TransactionDelta::default(),
+        previous_tree: tree.clone(),
+        desired_tree: tree,
+    })
 }
 
-fn render_scope(scope: &MergeConflictScope) -> String {
-    match scope {
-        MergeConflictScope::Entity {
-            entity,
-            name: Some(name),
-        } => format!("entity {name} ({entity})"),
-        MergeConflictScope::Entity { entity, name: None } => format!("entity {entity}"),
-        MergeConflictScope::Relation { relation } => format!("relation {relation}"),
-        MergeConflictScope::Artifact {
-            path: Some(path), ..
-        } => format!("artifact {path}"),
-        MergeConflictScope::Artifact { artifact, .. } => format!("artifact {artifact:?}"),
-        MergeConflictScope::Path { path } => format!("path {path}"),
+/// The exact workspace an abort must prove the workspace equals again.
+pub(crate) fn restore_point(workspace: &WorkspaceState) -> MergeWorkspaceRestorePoint {
+    MergeWorkspaceRestorePoint {
+        generation: workspace.generation,
+        head: workspace.head.clone(),
+        base_target: workspace.base_target.clone(),
+        base_tree_hash: workspace.base_tree_hash,
+        tree_hash: workspace.tree_hash,
+        semantic_overlay_hash: workspace.semantic_overlay_hash,
+        admission_policy: workspace.admission_policy,
+    }
+}
+
+/// Name the first conflicts individually and state the total, so a listing
+/// never reads as complete when it is truncated.
+pub(crate) fn render_conflict_lines(record: &MergeTransactionRecord) -> Vec<String> {
+    let unresolved: Vec<&MergeConflictEntry> = record.unresolved().collect();
+    let mut lines: Vec<String> = unresolved
+        .iter()
+        .take(RENDERED_CONFLICT_LIMIT)
+        .map(|entry| format!("  - {}", render_entry(entry)))
+        .collect();
+    if unresolved.len() > RENDERED_CONFLICT_LIMIT {
+        lines.push(format!(
+            "  - ... and {} further conflict(s) not listed",
+            unresolved.len() - RENDERED_CONFLICT_LIMIT
+        ));
+    }
+    lines
+}
+
+pub(crate) fn render_entry(entry: &MergeConflictEntry) -> String {
+    let detail = match &entry.divergence {
+        MergeDivergence::ChangedBothSides => {
+            "changed on both branches with different content".to_string()
+        }
+        MergeDivergence::AddedBothSides => {
+            "added independently on both branches with different content".to_string()
+        }
+        MergeDivergence::ChangedOursRemovedTheirs => {
+            "changed on the active branch and removed on the source branch".to_string()
+        }
+        MergeDivergence::RemovedOursChangedTheirs => {
+            "removed on the active branch and changed on the source branch".to_string()
+        }
+        MergeDivergence::PathCollision { artifacts } => format!(
+            "{} distinct artifacts occupy this path after composing both sides",
+            artifacts.len()
+        ),
+        MergeDivergence::DanglingEndpoint { .. } => entry
+            .label
+            .clone()
+            .unwrap_or_else(|| "relates to a node neither composed side kept".to_string()),
+    };
+    format!("{}: {detail}", render_subject(entry))
+}
+
+pub(crate) fn render_subject(entry: &MergeConflictEntry) -> String {
+    match &entry.subject {
+        MergeConflictSubject::Entity { entity } => match &entry.label {
+            Some(name) => format!("entity {name} ({entity})"),
+            None => format!("entity {entity}"),
+        },
+        MergeConflictSubject::Relation { relation } => format!("relation {relation}"),
+        MergeConflictSubject::Artifact { artifact } => match &entry.label {
+            Some(path) => format!("artifact {path} ({artifact:?})"),
+            None => format!("artifact {artifact:?}"),
+        },
+        MergeConflictSubject::Path { path } => format!("path {path}"),
     }
 }
 
@@ -1084,7 +1868,7 @@ fn resolved_policy(
         })
 }
 
-fn local_workspace<'a>(
+pub(crate) fn local_workspace<'a>(
     authority: &ActiveLocalRepositoryAuthority,
     metadata: &'a kin_db::PersistedRepositoryAuthority,
 ) -> Result<&'a WorkspaceState> {
@@ -1101,7 +1885,7 @@ fn local_workspace<'a>(
         })
 }
 
-fn classify_merge_error(error: anyhow::Error) -> (StatusCode, String) {
+pub(crate) fn classify_merge_error(error: anyhow::Error) -> (StatusCode, String) {
     if error.downcast_ref::<MergeBadRequest>().is_some() {
         return (StatusCode::BAD_REQUEST, format!("{error:#}"));
     }
@@ -1143,7 +1927,9 @@ fn merge_model_status(error: &kin_model::ModelError) -> StatusCode {
     }
 }
 
-fn repository_finalization_error(error: crate::error::DaemonError) -> (StatusCode, String) {
+pub(crate) fn repository_finalization_error(
+    error: crate::error::DaemonError,
+) -> (StatusCode, String) {
     use crate::error::DaemonError;
     let status = match &error {
         DaemonError::Graph(kin_db::KinDbError::Model(kin_model::ModelError::InvalidOperation(
@@ -1159,7 +1945,7 @@ fn repository_finalization_error(error: crate::error::DaemonError) -> (StatusCod
     (status, error.to_string())
 }
 
-fn merge_bind_refusal(refusal: RepositoryAuthorityBindRefusal) -> (StatusCode, String) {
+pub(crate) fn merge_bind_refusal(refusal: RepositoryAuthorityBindRefusal) -> (StatusCode, String) {
     let identity = refusal.is_identity_refusal();
     let error = refusal.into_error();
     if identity {

@@ -304,12 +304,13 @@
         "compose semantic entities, relations, and exact tree artifacts by stable identity against the merge base",
         "author the merge change against its first parent and record both heads as ordered parents",
         "publish the merge change, the target ref, and the exact workspace in one repository transaction with compare-and-swap",
-        "refuse a conflicting, unrelated, criss-cross, or admission-policy-changing merge without publishing any part of it"
+        "park a merge that does not compose as one durable merge-transaction record without publishing any part of it",
+        "refuse an unrelated, criss-cross, or admission-policy-changing merge without publishing any part of it"
       ],
       "evidence_tests": [
         "crates/kin-cli/tests/repository_merge.rs"
       ],
-      "note": "Merge composes graph truth: both heads and the single merge base are materialized by DAG replay, then entities, relations, and exact tree artifacts are merged by stable identity against that base. Composition decides each identity by whole value, so a side that did not move never overrides a side that did, and both sides moving differently is a conflict rather than a resolution. Granularity is the whole entity or artifact, never the line. Two branches editing disjoint regions of one file therefore conflict, because a semantic-entity model has no textual line merge to fall back on. A move on one branch against an edit on the other conflicts as well, because an artifact's path is part of the value being compared and history that records the move as a removal plus an addition leaves the edited side conflicting against that removal. The merge change carries ordered parents with the active branch first and its deltas are authored against that first parent, which is what history replay validates. Up-to-date and fast-forward merges publish no merge change. Unproven shapes fail closed with nothing published and are named in the refusal: conflicting entities, relations, or artifacts, which covers both branches editing one file and a move against an edit; two artifacts composing onto one path; a relation left with no surviving endpoint; unrelated histories; multiple merge bases (criss-cross); a merge that would change the shared admission policy; a dirty or detached workspace. A conflict refusal states the total conflict count, names the first 25 individually, and reports how many further conflicts it found. There is no mid-merge state, so a conflicting merge is refused rather than parked; `kin conflicts` and `kin resolve` stay fail-closed for that reason. One interaction is inherited, not introduced: a workspace whose semantics were installed from history (branch switch, checkout, or merge) and is then committed retains a semantic overlay, because the commit observation re-derives entities from source bytes while the installed ones came from replayed history. `kin branch switch` followed by `kin commit` reproduces it with no merge involved. Until that is fixed, a second merge in the same session refuses on the resulting dirty workspace."
+      "note": "Merge composes graph truth: both heads and the single merge base are materialized by DAG replay, then entities, relations, and exact tree artifacts are merged by stable identity against that base. Composition decides each identity by whole value, so a side that did not move never overrides a side that did, and both sides moving differently is a conflict rather than a resolution. Granularity is the whole entity or artifact, never the line. Two branches editing disjoint regions of one file therefore conflict, because a semantic-entity model has no textual line merge to fall back on. A move on one branch against an edit on the other conflicts as well, because an artifact's path is part of the value being compared and history that records the move as a removal plus an addition leaves the edited side conflicting against that removal. The merge change carries ordered parents with the active branch first and its deltas are authored against that first parent, which is what history replay validates. Up-to-date and fast-forward merges publish no merge change. A merge that does not compose is now parked rather than refused: the conflict set is published as one durable merge-transaction record bound to the workspace, no ref moves, and the workspace stays at the restore point the record captures, so `kin conflicts` and `kin resolve` continue it. Shapes that are still not proven fail closed with nothing published and are named in the refusal: unrelated histories; multiple merge bases (criss-cross); a merge that would change the shared admission policy; a dirty or detached workspace; and a second merge on a workspace whose merge is already in progress. One interaction is inherited, not introduced: a workspace whose semantics were installed from history (branch switch, checkout, or merge) and is then committed retains a semantic overlay, because the commit observation re-derives entities from source bytes while the installed ones came from replayed history. `kin branch switch` followed by `kin commit` reproduces it with no merge involved."
     },
     {
       "command": "stash",
@@ -356,29 +357,36 @@
     },
     {
       "command": "conflicts",
-      "status": "open_gate",
-      "exposure": "fail_closed",
-      "authority": "repository-v6 merge transaction state",
+      "status": "ready",
+      "exposure": "enabled",
+      "authority": "repository-v6 durable merge-transaction record",
       "required_for_bounded_dogfood": false,
       "acceptance_spec": [
         "read conflict state committed with the exact merge transaction rather than a .kin sidecar",
-        "represent semantic and exact-tree conflicts across every artifact kind"
+        "represent semantic and exact-tree conflicts across every artifact kind",
+        "recover the exact workspace-bound record across a daemon restart"
       ],
-      "evidence_tests": [],
-      "note": "Repository-v6 authority has no durable merge-transaction record, so a mid-merge conflict set and its per-entity resolutions cannot be committed with the merge transaction, and the retired sidecar shape (.kin/merge_state.json) is not an acceptable substitute. `kin merge` therefore refuses a conflicting merge atomically instead of parking one, stating the total conflict count and naming the first 25 individually. Flipping this command requires a first-class merge transaction in the kin-model and kin-db substrate."
+      "evidence_tests": [
+        "crates/kin-cli/tests/repository_merge_resolution.rs"
+      ],
+      "note": "The conflict set is the durable merge-transaction record repository authority holds for this workspace, not a rendering of one and not the retired sidecar shape (.kin/merge_state.json). Every entry carries its subject by stable identity, why it failed to compose, a content digest of the base, ours, and theirs values, and how it has been settled if it has. The record is rooted in local authority, so it survives a daemon restart and is excluded from replicated truth. A terminated record is still returned as the durable account of the last merge on the workspace, so whether a merge is in progress is a state check rather than an existence check. The listing reports the record identity, which `kin resolve --expect` requires to still be current."
     },
     {
       "command": "resolve",
-      "status": "open_gate",
-      "exposure": "fail_closed",
+      "status": "ready",
+      "exposure": "enabled",
       "authority": "repository-v6 merge resolution transaction",
       "required_for_bounded_dogfood": false,
       "acceptance_spec": [
         "resolve semantic and exact-tree conflicts against one durable merge transaction",
-        "publish the resolved workspace and target ref atomically with compare-and-swap"
+        "publish the resolved workspace and target ref atomically with compare-and-swap",
+        "refuse a resolution authored against a merge record another session has advanced",
+        "abort by proving the workspace equals the recorded restore point and moving no ref"
       ],
-      "evidence_tests": [],
-      "note": "Repository-v6 authority has no durable merge-transaction record, so a mid-merge conflict set and its per-entity resolutions cannot be committed with the merge transaction, and the retired sidecar shape (.kin/merge_state.json) is not an acceptable substitute. `kin merge` therefore refuses a conflicting merge atomically instead of parking one, stating the total conflict count and naming the first 25 individually. Flipping this command requires a first-class merge transaction in the kin-model and kin-db substrate."
+      "evidence_tests": [
+        "crates/kin-cli/tests/repository_merge_resolution.rs"
+      ],
+      "note": "Resolution moves the durable merge-transaction record through the sealed repository transaction path. Settling entries and publishing the merge are separate transactions by construction: a record commits the resolutions it already carries, so the transaction that publishes never decides any part of the merge. Each settlement carries its actor, timestamp, and the operation that committed it, and the persistence layer proves that operation is the one committing it, so provenance cannot name a transaction that never happened. `--expect` binds a resolution to the record identity the caller read, so a session resolving against a view another session already advanced is refused rather than silently rebased. Completing recomposes from graph truth and holds the result to the record: same identities, same divergences, same side digests, or the merge fails loud rather than publishing a different merge than the one resolved. A resolution that claims a side is checked against history rather than trusted. The merge change, the target ref by compare-and-swap against the recorded first parent, the exact workspace, and the record's termination publish in one transaction. Aborting proves the workspace still equals the recorded restore point and terminates the record without moving any ref. Authoring a resolution value neither side holds is not a proven shape and is refused; every divergence the composer produces is settled by taking a side, removing the identity, or naming which claimant keeps a contested path."
     },
     {
       "command": "rename",

@@ -13736,6 +13736,7 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
 
     #[cfg(windows)]
     #[test]
+    #[serial]
     fn windows_unavailable_se_security_privilege_fails_before_wal_or_namespace_change() {
         struct ResetPrivilegeInjection;
         impl Drop for ResetPrivilegeInjection {
@@ -13784,6 +13785,7 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
 
     #[cfg(windows)]
     #[test]
+    #[serial]
     fn windows_config_lock_round_trips_public_and_private_files() {
         let dir = tempfile::tempdir().unwrap();
         let public = dir.path().join("config.json");
@@ -13817,6 +13819,7 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
 
     #[cfg(windows)]
     #[test]
+    #[serial]
     fn windows_prepared_handoff_failure_deletes_stage_and_rolls_back_from_wal() {
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("config.json");
@@ -13851,6 +13854,7 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
 
     #[cfg(windows)]
     #[test]
+    #[serial]
     fn windows_file_id_info_is_stable_across_handles_and_rename() {
         let dir = tempfile::tempdir().unwrap();
         let original = dir.path().join("identity-original.tmp");
@@ -13896,6 +13900,7 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
 
     #[cfg(windows)]
     #[test]
+    #[serial]
     fn windows_created_file_validation_failures_leave_no_named_residue() {
         use super::super::update::windows_update::{
             inject_created_file_validation_failure, CreatedFileValidationFailure,
@@ -14658,6 +14663,7 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
     // never pruned: an append-only journal grows without bound and keeps a
     // finished transaction replayable forever.
     #[test]
+    #[serial]
     fn a_resolved_config_transaction_retires_its_journal() {
         let dir = tempfile::tempdir().unwrap();
         let dir_path = dir.path().canonicalize().unwrap();
@@ -14744,6 +14750,7 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
     }
 
     #[test]
+    #[serial]
     fn config_transaction_wal_ignores_newline_terminated_torn_envelope() {
         let record = wal_test_record(ConfigTransactionPhase::Prepared);
         let committed = wal_test_pair(&record, 1);
@@ -14900,6 +14907,7 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
 
     #[cfg(unix)]
     #[test]
+    #[serial]
     fn guarded_config_write_restores_raced_replacement_after_final_validation() {
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("config.json");
@@ -14932,6 +14940,7 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
 
     #[cfg(unix)]
     #[test]
+    #[serial]
     fn guarded_config_removal_restores_raced_replacement_after_final_validation() {
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("config.json");
@@ -14961,6 +14970,7 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
 
     #[cfg(unix)]
     #[test]
+    #[serial]
     fn guarded_config_write_revalidates_authority_after_transition_hook() {
         use std::os::unix::fs::PermissionsExt as _;
 
@@ -14996,6 +15006,7 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
 
     #[cfg(unix)]
     #[test]
+    #[serial]
     fn write_namespace_phase_refuses_authority_drift_and_restart_rolls_back() {
         use std::os::unix::fs::PermissionsExt as _;
 
@@ -15040,6 +15051,7 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
 
     #[cfg(unix)]
     #[test]
+    #[serial]
     fn write_namespace_phase_reobserves_retained_bytes_before_advancing_wal() {
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("config.json");
@@ -15081,6 +15093,7 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
 
     #[cfg(unix)]
     #[test]
+    #[serial]
     fn write_rollback_phase_refuses_authority_drift_and_preserves_raced_object() {
         use std::os::unix::fs::PermissionsExt as _;
 
@@ -15133,6 +15146,7 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
 
     #[cfg(unix)]
     #[test]
+    #[serial]
     fn guarded_config_remove_revalidates_authority_after_quarantine_hook() {
         use std::os::unix::fs::PermissionsExt as _;
 
@@ -15156,6 +15170,7 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
 
     #[cfg(unix)]
     #[test]
+    #[serial]
     fn remove_namespace_phase_refuses_authority_drift_and_restart_restores() {
         use std::os::unix::fs::PermissionsExt as _;
 
@@ -15197,6 +15212,7 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
 
     #[cfg(unix)]
     #[test]
+    #[serial]
     fn remove_namespace_phase_reobserves_retained_metadata_before_advancing_wal() {
         use std::os::unix::fs::PermissionsExt as _;
 
@@ -15244,6 +15260,7 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
 
     #[cfg(unix)]
     #[test]
+    #[serial]
     fn next_guarded_acquire_removes_only_exact_unjournaled_stage_names() {
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("config.json");
@@ -15420,6 +15437,7 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
     }
 
     #[test]
+    #[serial]
     fn workspace_mcp_excludes_are_idempotent_in_linked_worktrees() {
         let dir = tempfile::tempdir().unwrap();
         let main = dir.path().join("main");

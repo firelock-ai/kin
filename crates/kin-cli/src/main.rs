@@ -460,16 +460,29 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// [OPEN GATE] Show repository-v6 merge conflicts
-    Conflicts,
-    /// [OPEN GATE] Resolve repository-v6 merge conflicts
+    /// Show the durable merge transaction held for this workspace
+    Conflicts {
+        /// Emit the machine-readable merge transaction record
+        #[arg(long)]
+        json: bool,
+    },
+    /// Resolve repository-v6 merge conflicts
     Resolve {
-        /// Keep your (target branch) version of a conflicting entity
-        #[arg(long, value_name = "ENTITY")]
-        ours: Option<String>,
-        /// Keep the incoming (source branch) version of a conflicting entity
-        #[arg(long, value_name = "ENTITY")]
-        theirs: Option<String>,
+        /// Keep your (target branch) version of a conflicting identity
+        #[arg(long, value_name = "SELECTOR")]
+        ours: Vec<String>,
+        /// Keep the incoming (source branch) version of a conflicting identity
+        #[arg(long, value_name = "SELECTOR")]
+        theirs: Vec<String>,
+        /// Keep the merge base version of a conflicting identity
+        #[arg(long, value_name = "SELECTOR")]
+        base: Vec<String>,
+        /// Settle a conflicting identity by dropping it from the merge
+        #[arg(long, value_name = "SELECTOR")]
+        remove: Vec<String>,
+        /// Settle a contested path by naming the artifact that keeps it
+        #[arg(long, value_name = "PATH=ARTIFACT")]
+        keep_path: Vec<String>,
         /// Resolve all remaining conflicts keeping your version
         #[arg(long)]
         all_ours: bool,
@@ -482,6 +495,12 @@ enum Command {
         /// Abort the merge and discard conflict state
         #[arg(long)]
         abort: bool,
+        /// Require the merge transaction to still be the one this identity names
+        #[arg(long, value_name = "HASH")]
+        expect: Option<String>,
+        /// Emit the machine-readable merge transaction record
+        #[arg(long)]
+        json: bool,
     },
     /// Seal and restore exact graph-owned workspace state
     Stash {
@@ -2475,8 +2494,39 @@ fn main() -> Result<()> {
                     commands::capabilities::require_ready("merge")?;
                     commands::merge::run(branch, json).await
                 }
-                Command::Conflicts => commands::capabilities::require_ready("conflicts"),
-                Command::Resolve { .. } => commands::capabilities::require_ready("resolve"),
+                Command::Conflicts { json } => {
+                    commands::capabilities::require_ready("conflicts")?;
+                    commands::conflicts::run(json).await
+                }
+                Command::Resolve {
+                    ours,
+                    theirs,
+                    base,
+                    remove,
+                    keep_path,
+                    all_ours,
+                    all_theirs,
+                    do_continue,
+                    abort,
+                    expect,
+                    json,
+                } => {
+                    commands::capabilities::require_ready("resolve")?;
+                    commands::resolve::run(
+                        ours,
+                        theirs,
+                        base,
+                        remove,
+                        keep_path,
+                        all_ours,
+                        all_theirs,
+                        do_continue,
+                        abort,
+                        expect,
+                        json,
+                    )
+                    .await
+                }
                 Command::Stash { action } => match action {
                     StashAction::Push { message, yes } => commands::stash::push(message, yes).await,
                     StashAction::Pop => commands::stash::pop().await,

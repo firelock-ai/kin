@@ -897,6 +897,8 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route("/commands/security", post(command_security))
         .route("/commands/branch", post(command_branch))
         .route("/commands/merge", post(command_merge))
+        .route("/commands/conflicts", post(command_conflicts))
+        .route("/commands/resolve", post(command_resolve))
         .route("/commands/drift", post(command_drift))
         .route("/commands/tag", post(command_tag))
         .route("/commands/rollback", post(command_rollback))
@@ -2805,6 +2807,76 @@ async fn command_merge(
 
     let _coordination = state.coordination_gate.lock().await;
     let response = crate::repository_merge::execute(&state, &request)?;
+    Ok(Json(response))
+}
+
+/// POST /commands/conflicts — read the workspace's durable merge record.
+async fn command_conflicts(
+    headers: axum::http::HeaderMap,
+    State(state): State<Arc<DaemonState>>,
+    Json(request): Json<kin_cli::commands::conflicts::ConflictsRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if !state
+        .is_initialized
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon not fully initialized".to_string(),
+        ));
+    }
+    if state.storage_backend.is_some() {
+        return Err((
+            StatusCode::CONFLICT,
+            "local repository merge authority is unavailable for hosted snapshot authority"
+                .to_string(),
+        ));
+    }
+    if extract_session_id_from_headers(&headers)?.is_some() {
+        return Err((
+            StatusCode::CONFLICT,
+            "conflicts does not accept X-Kin-Session because a merge transaction is bound to the \
+             primary repository workspace"
+                .to_string(),
+        ));
+    }
+    let response = crate::repository_merge_state::execute_conflicts(&state, &request)?;
+    Ok(Json(response))
+}
+
+/// POST /commands/resolve — settle, publish, or abandon a durable merge.
+async fn command_resolve(
+    headers: axum::http::HeaderMap,
+    State(state): State<Arc<DaemonState>>,
+    Json(request): Json<kin_cli::commands::resolve::ResolveRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if !state
+        .is_initialized
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon not fully initialized".to_string(),
+        ));
+    }
+    if state.storage_backend.is_some() {
+        return Err((
+            StatusCode::CONFLICT,
+            "local repository merge authority is unavailable for hosted snapshot authority"
+                .to_string(),
+        ));
+    }
+    if extract_session_id_from_headers(&headers)?.is_some() {
+        return Err((
+            StatusCode::CONFLICT,
+            "resolve does not accept X-Kin-Session because it mutates the primary repository \
+             workspace and its active branch"
+                .to_string(),
+        ));
+    }
+
+    let _coordination = state.coordination_gate.lock().await;
+    let response = crate::repository_merge_state::execute_resolve(&state, &request)?;
     Ok(Json(response))
 }
 

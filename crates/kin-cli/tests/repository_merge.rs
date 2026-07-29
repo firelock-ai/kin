@@ -401,11 +401,11 @@ fn merge_of_a_descendant_branch_fast_forwards_the_active_branch() {
     );
 }
 
-/// Both branches changed the same artifact and the same entity. There is no
-/// durable merge transaction to park the conflict in, so the whole merge is
-/// refused and nothing is published.
+/// Both branches changed the same artifact and the same entity. The merge is
+/// parked as a durable transaction while refs and working-copy state remain
+/// unchanged.
 #[test]
-fn conflicting_merge_is_refused_atomically_and_names_what_conflicted() {
+fn conflicting_merge_is_parked_as_a_durable_transaction_and_names_what_conflicted() {
     let root = tempdir().expect("temp root");
     let repo = root.path().join("repo");
     initialize_git_repo(&repo);
@@ -432,31 +432,35 @@ fn conflicting_merge_is_refused_atomically_and_names_what_conflicted() {
 
     let merged = run_kin(&runtime, &repo, &["merge", "feature"]);
     assert!(
-        !merged.status.success(),
-        "a conflicting merge must fail closed: stdout={}",
-        String::from_utf8_lossy(&merged.stdout)
+        merged.status.success(),
+        "a conflicting merge is parked, not refused: stderr={}",
+        String::from_utf8_lossy(&merged.stderr)
     );
-    let stderr = String::from_utf8_lossy(&merged.stderr);
+    let stdout = String::from_utf8_lossy(&merged.stdout);
     assert!(
-        stderr.contains("unresolved conflict"),
-        "the refusal names the conflict set: {stderr}"
+        stdout.contains("unresolved conflict"),
+        "the listing names the conflict set: {stdout}"
     );
     // Each dimension is asserted on its own. An `artifact || entity` check
     // would stay green with the entity detector deleted, because divergent
     // bytes report an artifact conflict for the same file either way.
     assert!(
-        stderr.contains("artifact shared.txt"),
-        "the refusal names the conflicting artifact: {stderr}"
+        stdout.contains("artifact shared.txt"),
+        "the listing names the conflicting artifact: {stdout}"
     );
     assert!(
-        stderr.contains("entity "),
-        "the refusal names the conflicting entity: {stderr}"
+        stdout.contains("entity "),
+        "the listing names the conflicting entity: {stdout}"
     );
 
-    // Nothing moved: refs, authority generation, and the working copy.
+    // No ref moved and the working copy is untouched. The authority generation
+    // does advance, because the parked merge is itself a publication.
     assert_eq!(branch_change(&layout, "main"), main_before);
     assert_eq!(branch_change(&layout, "feature"), feature_before);
-    assert_eq!(authority_generation(&layout), generation_before);
+    assert!(
+        authority_generation(&layout) > generation_before,
+        "parking the merge publishes its record"
+    );
     assert_eq!(fs::read(repo.join("shared.txt")).unwrap(), b"main shared\n");
     assert_eq!(
         fs::read(repo.join("src/lib.rs")).unwrap(),
@@ -465,7 +469,7 @@ fn conflicting_merge_is_refused_atomically_and_names_what_conflicted() {
 
     assert!(
         !workspace_is_dirty(&layout),
-        "a refused merge leaves no partial workspace state"
+        "a parked merge leaves no partial workspace state"
     );
 }
 
@@ -474,7 +478,7 @@ fn conflicting_merge_is_refused_atomically_and_names_what_conflicted() {
 /// so it conflicts, and the note says so rather than letting a reader infer
 /// sub-file composition from "stable identity".
 #[test]
-fn merge_of_disjoint_edits_to_one_file_is_refused_atomically() {
+fn merge_of_disjoint_edits_to_one_file_is_parked_atomically() {
     let root = tempdir().expect("temp root");
     let repo = root.path().join("repo");
     initialize_git_repo(&repo);
@@ -512,31 +516,34 @@ fn merge_of_disjoint_edits_to_one_file_is_refused_atomically() {
 
     let merged = run_kin(&runtime, &repo, &["merge", "feature"]);
     assert!(
-        !merged.status.success(),
-        "disjoint edits to one file must fail closed: stdout={}",
-        String::from_utf8_lossy(&merged.stdout)
+        merged.status.success(),
+        "disjoint edits to one file are parked, not refused: stderr={}",
+        String::from_utf8_lossy(&merged.stderr)
     );
-    let stderr = String::from_utf8_lossy(&merged.stderr);
+    let stdout = String::from_utf8_lossy(&merged.stdout);
     assert!(
-        stderr.contains("unresolved conflict"),
-        "the refusal names the conflict set: {stderr}"
+        stdout.contains("unresolved conflict"),
+        "the listing names the conflict set: {stdout}"
     );
     assert!(
-        stderr.contains("artifact src/lib.rs"),
-        "the whole artifact is what conflicted, not a line range: {stderr}"
+        stdout.contains("artifact src/lib.rs"),
+        "the whole artifact is what conflicted, not a line range: {stdout}"
     );
 
-    // Nothing moved: refs, authority generation, and the working copy.
+    // No ref moved and the working copy is untouched.
     assert_eq!(branch_change(&layout, "main"), main_before);
     assert_eq!(branch_change(&layout, "feature"), feature_before);
-    assert_eq!(authority_generation(&layout), generation_before);
+    assert!(
+        authority_generation(&layout) > generation_before,
+        "parking the merge publishes its record"
+    );
     assert_eq!(
         fs::read(repo.join("src/lib.rs")).unwrap(),
         b"pub fn alpha(value: u64) {}\n\npub fn beta() {}\n"
     );
     assert!(
         !workspace_is_dirty(&layout),
-        "a refused merge leaves no partial workspace state"
+        "a parked merge leaves no partial workspace state"
     );
 }
 
@@ -544,7 +551,7 @@ fn merge_of_disjoint_edits_to_one_file_is_refused_atomically() {
 /// each identity by whole value and an artifact's path is part of that value,
 /// so this is a conflict rather than a move carrying an edit along with it.
 #[test]
-fn merge_of_a_move_against_an_edit_is_refused_atomically() {
+fn merge_of_a_move_against_an_edit_is_parked_atomically() {
     let root = tempdir().expect("temp root");
     let repo = root.path().join("repo");
     initialize_git_repo(&repo);
@@ -567,35 +574,38 @@ fn merge_of_a_move_against_an_edit_is_refused_atomically() {
 
     let merged = run_kin(&runtime, &repo, &["merge", "feature"]);
     assert!(
-        !merged.status.success(),
-        "a move against an edit must fail closed: stdout={}",
-        String::from_utf8_lossy(&merged.stdout)
+        merged.status.success(),
+        "a move against an edit is parked, not refused: stderr={}",
+        String::from_utf8_lossy(&merged.stderr)
     );
-    let stderr = String::from_utf8_lossy(&merged.stderr);
+    let stdout = String::from_utf8_lossy(&merged.stdout);
     assert!(
-        stderr.contains("unresolved conflict"),
-        "the refusal names the conflict set: {stderr}"
+        stdout.contains("unresolved conflict"),
+        "the listing names the conflict set: {stdout}"
     );
     assert!(
-        stderr.contains("src/lib.rs"),
-        "the refusal names the artifact both branches moved apart: {stderr}"
+        stdout.contains("src/lib.rs"),
+        "the listing names the artifact both branches moved apart: {stdout}"
     );
 
-    // Nothing moved: refs, authority generation, and the working copy.
+    // No ref moved and the working copy is untouched.
     assert_eq!(branch_change(&layout, "main"), main_before);
     assert_eq!(branch_change(&layout, "feature"), feature_before);
-    assert_eq!(authority_generation(&layout), generation_before);
+    assert!(
+        authority_generation(&layout) > generation_before,
+        "parking the merge publishes its record"
+    );
     assert_eq!(
         fs::read(repo.join("src/lib.rs")).unwrap(),
         b"pub fn base(value: u64) {}\n"
     );
     assert!(
         !repo.join("src/renamed.rs").exists(),
-        "a refused merge does not materialize the source branch's move"
+        "a parked merge does not materialize the source branch's move"
     );
     assert!(
         !workspace_is_dirty(&layout),
-        "a refused merge leaves no partial workspace state"
+        "a parked merge leaves no partial workspace state"
     );
 }
 
@@ -647,27 +657,38 @@ fn merging_an_unknown_branch_is_refused_without_mutation() {
     assert_eq!(authority_generation(&layout), generation_before);
 }
 
-/// `kin conflicts` and `kin resolve` stay fail-closed: there is no durable
-/// merge transaction for them to read or settle.
+/// A workspace no merge has opened on has no merge record. `kin conflicts`
+/// says so rather than inventing an empty conflict set, and `kin resolve`
+/// refuses rather than settling nothing successfully.
 #[test]
-fn merge_conflict_commands_remain_fail_closed() {
+fn merge_conflict_commands_report_no_merge_on_a_clean_workspace() {
     let root = tempdir().expect("temp root");
     let repo = root.path().join("repo");
     initialize_git_repo(&repo);
     let runtime = common::IsolatedDaemonRuntime::new(&repo);
     initialize_kin_repo(&runtime, &repo);
 
-    for args in [vec!["conflicts"], vec!["resolve", "--all-ours"]] {
-        let output = run_kin(&runtime, &repo, &args);
-        assert!(
-            !output.status.success(),
-            "{args:?} must stay fail-closed: stdout={}",
-            String::from_utf8_lossy(&output.stdout)
-        );
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            stderr.contains("fail-closed"),
-            "{args:?} names its gate: {stderr}"
-        );
-    }
+    let listed = run_kin(&runtime, &repo, &["conflicts"]);
+    assert!(
+        listed.status.success(),
+        "listing an unmerged workspace is not an error: stderr={}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&listed.stdout);
+    assert!(
+        stdout.contains("No merge has opened"),
+        "the listing says there is no merge: {stdout}"
+    );
+
+    let resolved = run_kin(&runtime, &repo, &["resolve", "--all-ours"]);
+    assert!(
+        !resolved.status.success(),
+        "resolving without a merge must fail closed: stdout={}",
+        String::from_utf8_lossy(&resolved.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&resolved.stderr).contains("no merge transaction"),
+        "the refusal names what is missing: {}",
+        String::from_utf8_lossy(&resolved.stderr)
+    );
 }
