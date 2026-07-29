@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
+use std::path::PathBuf;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -31,6 +32,20 @@ pub enum DaemonError {
 
     #[error("Already running")]
     AlreadyRunning,
+
+    #[error(
+        "daemon authority protects {authority_root}, but daemon state belongs to {state_root}"
+    )]
+    AuthorityMismatch {
+        authority_root: PathBuf,
+        state_root: PathBuf,
+    },
+
+    /// A second daemon lost the per-repo singleton lock. Carries the actionable
+    /// text naming the holder; a bare "already running" told the operator
+    /// nothing about which process to wait for or stop.
+    #[error("{0}")]
+    RepoOwnedByAnotherDaemon(String),
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),

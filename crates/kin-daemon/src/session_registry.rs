@@ -212,27 +212,61 @@ impl SessionCoordinator {
         Ok(session_id)
     }
 
-    /// Record a heartbeat for a session. Returns an error if the session
-    /// doesn't exist.
-    pub fn heartbeat(&self, session_id: &SessionId) -> Result<()> {
-        // Verify the session exists.
-        let session = self
+    /// Refresh a session heartbeat and return the refreshed record.
+    ///
+    /// The existence check and update share the same arbitration guard as the
+    /// stale-session sweeper. Without that linearization point, the sweeper can
+    /// delete a session after a caller observes it but before the heartbeat
+    /// update lands, turning an ordinary expired-session response into an
+    /// internal error.
+    pub fn heartbeat_session(&self, session_id: &SessionId) -> Result<Option<AgentSession>> {
+        self.heartbeat_session_with(session_id, || {})
+    }
+
+    fn heartbeat_session_with<F>(
+        &self,
+        session_id: &SessionId,
+        before_update: F,
+    ) -> Result<Option<AgentSession>>
+    where
+        F: FnOnce(),
+    {
+        let _arbitration = self
+            .arbitration
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(mut session) = self
             .graph
             .get_session(session_id)
-            .map_err(DaemonError::from)?;
-        if session.is_none() {
-            return Err(DaemonError::Graph(kin_db::KinDbError::NotFound(format!(
-                "session not found: {}",
-                session_id
-            ))));
-        }
+            .map_err(DaemonError::from)?
+        else {
+            return Ok(None);
+        };
+
+        // Test seams can pause at the old precheck/update race boundary while
+        // the production path pays only an inlined no-op closure.
+        before_update();
 
         let now = Timestamp::now();
         self.graph
             .update_heartbeat(session_id, &now)
             .map_err(DaemonError::from)?;
+        session.last_heartbeat = now;
         debug!(session_id = %session_id, "heartbeat recorded");
-        Ok(())
+        Ok(Some(session))
+    }
+
+    /// Record a heartbeat for a session. Returns an error if the session
+    /// doesn't exist.
+    pub fn heartbeat(&self, session_id: &SessionId) -> Result<()> {
+        self.heartbeat_session(session_id)?
+            .map(drop)
+            .ok_or_else(|| {
+                DaemonError::Graph(kin_db::KinDbError::NotFound(format!(
+                    "session not found: {}",
+                    session_id
+                )))
+            })
     }
 
     /// Deregister a session and clean up all its intents.
@@ -1015,30 +1049,8 @@ fn timestamp_age(ts: &Timestamp, now: &Timestamp) -> Option<Duration> {
     }
 }
 
-/// Check if a process is alive by checking /proc or using kill -0.
 fn is_process_alive(pid: u32) -> bool {
-    // Use std::fs to check /proc on Linux, or signal 0 via Command on macOS/Unix.
-    #[cfg(target_os = "linux")]
-    {
-        std::path::Path::new(&format!("/proc/{}", pid)).exists()
-    }
-    #[cfg(target_os = "macos")]
-    {
-        // On macOS, use `kill -0 <pid>` via Command to avoid libc dependency.
-        std::process::Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(true) // If we can't check, assume alive (conservative).
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        // On unsupported platforms, assume alive (conservative).
-        let _ = pid;
-        true
-    }
+    kin_cli::daemon_client::is_process_alive(pid)
 }
 
 #[cfg(test)]
@@ -1105,6 +1117,101 @@ mod tests {
         // Heartbeat on nonexistent session should fail.
         let fake = SessionId::new();
         assert!(coord.heartbeat(&fake).is_err());
+    }
+
+    /// The stale-session sweeper must not be able to delete a session between
+    /// the heartbeat existence read and its update.
+    ///
+    /// The hook pauses the heartbeat at that historical race boundary while
+    /// the sweeper attempts to enter its own arbitration section. The sweeper
+    /// must remain blocked until the heartbeat publishes its fresh timestamp;
+    /// after that it must observe the refreshed session and reap nothing.
+    #[test]
+    fn heartbeat_refresh_is_atomic_with_stale_session_sweeping() {
+        let coord = Arc::new(SessionCoordinator::with_session_idle_ttl(
+            Arc::new(kin_db::InMemoryGraph::new()),
+            Duration::from_secs(1),
+        ));
+        let sid = coord
+            .register_session(
+                "codex",
+                "atomic-heartbeat",
+                SessionTransport::Mcp,
+                None,
+                PathBuf::from("/project"),
+                SessionCapabilities::default(),
+            )
+            .unwrap();
+        let stale_heartbeat =
+            Timestamp(chrono::Utc::now() - chrono::TimeDelta::try_seconds(5).unwrap());
+        coord
+            .graph
+            .update_heartbeat(&sid, &stale_heartbeat)
+            .unwrap();
+
+        let at_update_boundary = Arc::new(std::sync::Barrier::new(2));
+        let release_update = Arc::new(std::sync::Barrier::new(2));
+        let heartbeat_coord = Arc::clone(&coord);
+        let heartbeat_boundary = Arc::clone(&at_update_boundary);
+        let heartbeat_release = Arc::clone(&release_update);
+        let heartbeat = std::thread::spawn(move || {
+            heartbeat_coord.heartbeat_session_with(&sid, || {
+                heartbeat_boundary.wait();
+                heartbeat_release.wait();
+            })
+        });
+
+        at_update_boundary.wait();
+        let (sweep_started_tx, sweep_started_rx) = std::sync::mpsc::channel();
+        let (sweep_tx, sweep_rx) = std::sync::mpsc::channel();
+        let sweep_coord = Arc::clone(&coord);
+        let sweep = std::thread::spawn(move || {
+            sweep_started_tx.send(()).unwrap();
+            let outcome = sweep_coord.sweep_stale_sessions();
+            sweep_tx.send(outcome).unwrap();
+        });
+        sweep_started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("sweeper thread must reach the arbitration attempt");
+
+        // A missing heartbeat arbitration guard would let the sweeper delete
+        // the stale record immediately while the hook is paused.
+        let premature = sweep_rx.recv_timeout(Duration::from_millis(200));
+        release_update.wait();
+
+        let refreshed = heartbeat
+            .join()
+            .expect("heartbeat thread must not panic")
+            .expect("heartbeat refresh must not fail")
+            .expect("the registered session must still exist");
+        let sweeper_was_blocked =
+            matches!(&premature, Err(std::sync::mpsc::RecvTimeoutError::Timeout));
+        let sweep_outcome = match premature {
+            Ok(outcome) => outcome,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => sweep_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("sweeper must finish after heartbeat releases the guard"),
+            Err(error) => panic!("sweeper result channel failed: {error}"),
+        };
+        sweep.join().expect("sweeper thread must not panic");
+
+        assert!(
+            sweeper_was_blocked,
+            "the sweeper crossed the heartbeat precheck/update boundary"
+        );
+        assert_eq!(
+            sweep_outcome.expect("sweeper must succeed"),
+            0,
+            "the sweeper must observe the refreshed heartbeat"
+        );
+        assert_eq!(
+            coord
+                .get_session(&sid)
+                .unwrap()
+                .expect("session must remain active")
+                .last_heartbeat,
+            refreshed.last_heartbeat
+        );
     }
 
     #[test]

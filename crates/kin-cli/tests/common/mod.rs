@@ -747,6 +747,10 @@ impl IsolatedDaemonRuntime {
         fresh_daemon_bin(self)
     }
 
+    pub fn daemon_command(&self) -> Command<'_> {
+        self.command(self.daemon_bin())
+    }
+
     pub fn registry_path(&self) -> &Path {
         &self.registry_path
     }
@@ -960,6 +964,21 @@ impl<'runtime> Command<'runtime> {
         self
     }
 
+    pub fn stdin<T: Into<Stdio>>(&mut self, cfg: T) -> &mut Self {
+        self.inner.stdin(cfg);
+        self
+    }
+
+    pub fn stdout<T: Into<Stdio>>(&mut self, cfg: T) -> &mut Self {
+        self.inner.stdout(cfg);
+        self
+    }
+
+    pub fn stderr<T: Into<Stdio>>(&mut self, cfg: T) -> &mut Self {
+        self.inner.stderr(cfg);
+        self
+    }
+
     pub fn configured_env_for_test(&self, key: &OsStr) -> Option<Option<OsString>> {
         self.inner
             .get_envs()
@@ -973,6 +992,33 @@ impl<'runtime> Command<'runtime> {
     }
 
     pub fn output_within(&mut self, timeout: Duration) -> std::io::Result<Output> {
+        self.prepare_for_launch();
+        let label = self.inner.get_program().to_string_lossy().into_owned();
+        run_bounded_within(
+            &mut self.inner,
+            &label,
+            self.runtime.map(|runtime| &runtime.containment),
+            timeout,
+        )
+    }
+
+    /// Spawn a long-lived child inside this runtime's stable OS containment.
+    ///
+    /// Direct daemon tests need to probe a live child before stopping it, so
+    /// `output()` is the wrong lifecycle. This keeps the same authority scrub,
+    /// protected runtime capability, Unix process group, and Windows Job
+    /// Object as bounded commands while leaving the direct child handle with
+    /// the test.
+    pub fn spawn_owned(&mut self) -> std::io::Result<Child> {
+        let runtime = self.runtime.ok_or_else(|| {
+            std::io::Error::other("spawn_owned requires a command from IsolatedDaemonRuntime")
+        })?;
+        self.prepare_for_launch();
+        let label = self.inner.get_program().to_string_lossy().into_owned();
+        runtime.containment.spawn(&mut self.inner, &label)
+    }
+
+    fn prepare_for_launch(&mut self) {
         scrub_inherited_kin_authority(&mut self.inner);
         kin_git::test_support::isolate_fixture_git(&mut self.inner);
         if let Some(runtime) = self.runtime {
@@ -988,13 +1034,6 @@ impl<'runtime> Command<'runtime> {
                 }
             }
         }
-        let label = self.inner.get_program().to_string_lossy().into_owned();
-        run_bounded_within(
-            &mut self.inner,
-            &label,
-            self.runtime.map(|runtime| &runtime.containment),
-            timeout,
-        )
     }
 }
 
@@ -1324,28 +1363,110 @@ fn read_capture(mut file: std::fs::File) -> std::io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn daemon_compat_ok(runtime: &IsolatedDaemonRuntime, path: &Path) -> bool {
+/// The build identity this test binary carries, in the exact form the daemon
+/// stamps persisted vector sidecars with.
+///
+/// A test that seeds prepared state writes this stamp; the daemon that later
+/// reopens the repository demands its own. The two only agree when both
+/// binaries came out of one build of `kin-buildinfo`.
+pub fn expected_build_stamp() -> String {
+    kin_buildinfo::sha_with_dirty(kin_buildinfo::get())
+}
+
+/// Recompose a `--compat-json` `build.sha` / `build.dirty` pair into the stamp
+/// `kin_buildinfo::sha_with_dirty` would produce for the same build.
+///
+/// The daemon reports the two fields separately, so the harness has to join
+/// them the way the authority does rather than comparing the pair directly:
+/// when the commit is unknown the dirty flag is not part of the identity, and
+/// a raw pair comparison would reject a daemon whose embedder identity
+/// actually matches.
+fn build_stamp(sha: &str, dirty: bool) -> String {
+    if dirty && sha != "unknown" {
+        format!("{sha}-dirty")
+    } else {
+        sha.to_string()
+    }
+}
+
+/// Why a candidate `kin-daemon` may not be reused by this test binary, or
+/// `None` when it may be.
+///
+/// Two independent reasons, and the second is the one that used to be missed.
+/// A daemon whose graph snapshot version differs cannot read the repository at
+/// all. A daemon that is merely built from a *different commit or working
+/// tree* reads it fine, but stamps and demands a different embedder identity —
+/// so a sidecar seeded by this test binary is rejected on load,
+/// `indexed_embedding_count` reads 0, and the suite reports a product defect
+/// that only exists because two binaries in one target directory were built at
+/// different times.
+pub fn daemon_compat_mismatch(
+    payload: &Value,
+    expected_snapshot_version: u64,
+    expected_stamp: &str,
+) -> Option<String> {
+    match payload["graph_snapshot_version"].as_u64() {
+        Some(version) if version == expected_snapshot_version => {}
+        Some(version) => {
+            return Some(format!(
+                "graph snapshot version {version} does not match this test binary's {expected_snapshot_version}"
+            ));
+        }
+        None => return Some("compat payload has no graph_snapshot_version".to_string()),
+    }
+
+    let Some(sha) = payload["build"]["sha"].as_str() else {
+        return Some("compat payload has no build.sha".to_string());
+    };
+    let Some(dirty) = payload["build"]["dirty"].as_bool() else {
+        return Some("compat payload has no build.dirty".to_string());
+    };
+
+    let daemon_stamp = build_stamp(sha, dirty);
+    if daemon_stamp != expected_stamp {
+        return Some(format!(
+            "daemon build identity {daemon_stamp} does not match this test binary's {expected_stamp}"
+        ));
+    }
+    None
+}
+
+fn daemon_compat(runtime: &IsolatedDaemonRuntime, path: &Path) -> Result<(), String> {
     if !path.exists() {
-        return false;
+        return Err(format!("{} does not exist", path.display()));
     }
     let mut command = runtime.command(path);
-    let Ok(output) = command.arg("--compat-json").output() else {
-        return false;
-    };
+    let output = command
+        .arg("--compat-json")
+        .output()
+        .map_err(|error| format!("could not run {} --compat-json: {error}", path.display()))?;
     if !output.status.success() {
-        return false;
+        return Err(format!(
+            "{} --compat-json exited with {}",
+            path.display(),
+            output.status
+        ));
     }
-    let Ok(payload) = serde_json::from_slice::<Value>(&output.stdout) else {
-        return false;
-    };
-    payload["graph_snapshot_version"].as_u64()
-        == Some(kin_db::GraphSnapshot::CURRENT_VERSION as u64)
+    let payload = serde_json::from_slice::<Value>(&output.stdout).map_err(|error| {
+        format!(
+            "{} --compat-json did not emit JSON: {error}",
+            path.display()
+        )
+    })?;
+    match daemon_compat_mismatch(
+        &payload,
+        kin_db::GraphSnapshot::CURRENT_VERSION as u64,
+        &expected_build_stamp(),
+    ) {
+        Some(reason) => Err(reason),
+        None => Ok(()),
+    }
 }
 
 fn fresh_daemon_bin(runtime: &IsolatedDaemonRuntime) -> PathBuf {
     let kin_bin = PathBuf::from(env!("CARGO_BIN_EXE_kin"));
-    let daemon_bin = kin_bin.with_file_name("kin-daemon");
-    if daemon_compat_ok(runtime, &daemon_bin) {
+    let daemon_bin = kin_bin.with_file_name(format!("kin-daemon{}", std::env::consts::EXE_SUFFIX));
+    if daemon_compat(runtime, &daemon_bin).is_ok() {
         return daemon_bin;
     }
 
@@ -1371,10 +1492,18 @@ fn fresh_daemon_bin(runtime: &IsolatedDaemonRuntime) -> PathBuf {
         );
     });
 
-    assert!(
-        daemon_compat_ok(runtime, &daemon_bin),
-        "kin-daemon at {} is missing or incompatible after rebuild",
-        daemon_bin.display()
-    );
+    if let Err(reason) = daemon_compat(runtime, &daemon_bin) {
+        panic!(
+            "kin-daemon at {} is unusable after rebuild: {reason}.\n\
+             This test binary carries build identity {}. A daemon built from a \
+             different commit or working tree stamps persisted vector sidecars \
+             with a different embedder identity, so state this suite seeds is \
+             rejected on reopen and indexed_embedding_count reads 0 — a harness \
+             fault that reads as a product defect. Build both from one tree: \
+             cargo build --all-targets",
+            daemon_bin.display(),
+            expected_build_stamp()
+        );
+    }
     daemon_bin
 }

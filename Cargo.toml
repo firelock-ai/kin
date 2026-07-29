@@ -21,6 +21,7 @@ members = [
     "crates/kin-notify",
     "crates/kin-notifier-macos",
     "crates/kin-cli",
+    "crates/kin-daemon-spawn",
     "crates/kin-daemon",
     "crates/kin-mcp",
     "crates/kin-spine",
@@ -60,6 +61,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }
+filetime = "0.2"
 
 # Logging
 tracing = "0.1"
@@ -141,6 +143,7 @@ kin-buildinfo = { path = "crates/kin-buildinfo" }
 kin-notify = { path = "crates/kin-notify" }
 kin-cli = { path = "crates/kin-cli", default-features = false }
 kin-daemon = { path = "crates/kin-daemon" }
+kin-daemon-spawn = { path = "crates/kin-daemon-spawn" }
 kin-mcp = { path = "crates/kin-mcp" }
 kin-spine = { path = "crates/kin-spine" }
 kin-registry = { path = "crates/kin-registry" }
@@ -150,7 +153,7 @@ kin-lsp = { version = "0.6.0", registry = "kin" }
 # backend on every target (incl. Linux, where it cannot compile). Metal is re-enabled
 # additively on macOS via a `[target.'cfg(target_os = "macos")'.dependencies]` block in the
 # binary/runtime crates (kin-cli, kin-daemon). Feature unification makes that additive.
-kin-db = { version = "0.6.5", registry = "kin", default-features = false }
+kin-db = { version = "=0.6.7", registry = "kin", default-features = false }
 kin-vfs-core = { version = "0.1.5", registry = "kin" }
 
 [profile.release]

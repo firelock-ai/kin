@@ -66,11 +66,71 @@ pub fn apply_splices(original: &[u8], mut splices: Vec<Splice>) -> Result<Vec<u8
     Ok(result)
 }
 
+/// The whitespace run between the start of `start`'s line and `start` itself,
+/// or empty when `start` is at a line start or anything non-whitespace precedes
+/// it on the line.
+///
+/// This is the entity's own indentation: an entity span begins at the entity's
+/// first token, so for anything nested the file carries the indentation ahead of
+/// the span rather than inside it.
+fn line_indent_before(original: &[u8], start: usize) -> &[u8] {
+    let start = start.min(original.len());
+    let line_start = original[..start]
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |newline| newline + 1);
+    let indent = &original[line_start..start];
+    if !indent.is_empty() && indent.iter().all(|byte| matches!(byte, b' ' | b'\t')) {
+        indent
+    } else {
+        &[]
+    }
+}
+
+/// Build the splice that replaces an entity's source region with a new body,
+/// reading the body's first-line indentation the same way as every other line.
+///
+/// An entity span starts at the entity's first token, so a nested entity (an
+/// impl method, a function inside a module block) has its indentation sitting in
+/// the file *before* the span, while every line of its body after the first
+/// carries indentation *inside* it. A verbatim splice therefore reads line 1 as
+/// relative to the entity's column and lines 2..n as absolute, and a caller that
+/// submits the entity exactly as the file shows it gets line 1 indented twice:
+/// the caller's copy lands after the file's. It compiles and it is wrong, which
+/// is worse than a refusal.
+///
+/// The fix is to read line 1 absolutely too. When the span is preceded on its
+/// line by nothing but whitespace and the new body opens with exactly that
+/// whitespace, the splice extends back over the file's copy so the body's own
+/// indentation lands at column 0 of the entity's line. A body that does not open
+/// with the entity's indentation (an exact span slice, or a deliberate
+/// re-indentation) is spliced verbatim, so re-submitting what the read surface
+/// returned stays byte-identical.
+pub fn entity_body_splice(original: &[u8], byte_range: Range<usize>, new_body: &[u8]) -> Splice {
+    let indent = line_indent_before(original, byte_range.start);
+    let start = if !indent.is_empty() && new_body.starts_with(indent) {
+        byte_range.start - indent.len()
+    } else {
+        byte_range.start
+    };
+    Splice {
+        byte_range: start..byte_range.end,
+        new_content: new_body.to_vec(),
+    }
+}
+
 /// Build a splice for a specific entity within a FileLayout.
 ///
-/// Finds the entity's byte range in the layout and creates a splice
-/// that replaces it with `new_body`.
-pub fn splice_entity(layout: &FileLayout, entity_id: &EntityId, new_body: &[u8]) -> Result<Splice> {
+/// Finds the entity's byte range in the layout and creates a splice that
+/// replaces it with `new_body`, normalizing the body's first-line indentation
+/// through [`entity_body_splice`]. `original` is the file the layout describes;
+/// the replaced region cannot be decided without it.
+pub fn splice_entity(
+    original: &[u8],
+    layout: &FileLayout,
+    entity_id: &EntityId,
+    new_body: &[u8],
+) -> Result<Splice> {
     for region in &layout.regions {
         if let SourceRegion::EntityRef {
             entity_id: ref eid,
@@ -78,10 +138,7 @@ pub fn splice_entity(layout: &FileLayout, entity_id: &EntityId, new_body: &[u8])
         } = region
         {
             if eid == entity_id {
-                return Ok(Splice {
-                    byte_range: byte_range.clone(),
-                    new_content: new_body.to_vec(),
-                });
+                return Ok(entity_body_splice(original, byte_range.clone(), new_body));
             }
         }
     }
@@ -97,6 +154,12 @@ pub fn splice_entity(layout: &FileLayout, entity_id: &EntityId, new_body: &[u8])
 /// The `get_entity_body` closure is called for each EntityRef region to
 /// retrieve the entity's current source text. Trivia regions are copied
 /// from the original file content.
+///
+/// Bodies are spliced verbatim over their regions. This runs the graph-to-file
+/// direction, where a body is the exact bytes of its own region and the
+/// indentation ahead of it is trivia the layout already accounts for; the
+/// first-line normalization in [`entity_body_splice`] belongs to the opposite
+/// direction, where a caller authors a body against the file it can see.
 pub fn reconstruct_file<F>(
     original: &[u8],
     layout: &FileLayout,
@@ -202,7 +265,7 @@ mod tests {
             ],
         };
 
-        let splice = splice_entity(&layout, &entity_id, b"fn bar() {}").unwrap();
+        let splice = splice_entity(original, &layout, &entity_id, b"fn bar() {}").unwrap();
         let result = apply_splices(original, vec![splice]).unwrap();
         assert_eq!(result, b"// header\nfn bar() {}\n// end");
     }
@@ -211,8 +274,120 @@ mod tests {
     fn splice_entity_not_found() {
         let layout = make_layout();
         let missing_id = EntityId::new();
-        let err = splice_entity(&layout, &missing_id, b"new body").unwrap_err();
+        let err = splice_entity(
+            b"0123456789abcdefghijklmno",
+            &layout,
+            &missing_id,
+            b"new body",
+        )
+        .unwrap_err();
         assert!(matches!(err, ProjectionError::EntityNotInLayout { .. }));
+    }
+
+    /// An impl-nested method whose new body carries the indentation the file
+    /// shows must land at that indentation, not at twice it.
+    ///
+    /// This is the shape an agent produces: it reads the method as the file
+    /// renders it and writes it back the same way. A verbatim splice put the
+    /// body's four spaces after the file's four and produced an eight-space
+    /// method that compiles and fails `cargo fmt`.
+    #[test]
+    fn impl_method_body_carrying_its_indentation_is_not_double_indented() {
+        let original = b"impl Builder {\n    fn set(&mut self) {\n        self.a = 1;\n    }\n}\n";
+        let span = 19..64; // "fn set(&mut self) {\n        self.a = 1;\n    }"
+        assert_eq!(
+            &original[span.clone()],
+            b"fn set(&mut self) {\n        self.a = 1;\n    }"
+        );
+
+        let new_body = b"    fn set(&mut self) {\n        self.a = 2;\n    }";
+        let splice = entity_body_splice(original, span, new_body);
+        let result = apply_splices(original, vec![splice]).unwrap();
+        assert_eq!(
+            result,
+            b"impl Builder {\n    fn set(&mut self) {\n        self.a = 2;\n    }\n}\n"
+        );
+    }
+
+    /// The exact bytes the read surface serves are the span slice, with no
+    /// leading indentation on line 1. Submitting them back unchanged has to stay
+    /// byte-identical, or the normalization traded one indent bug for another.
+    #[test]
+    fn span_slice_body_round_trips_byte_identically() {
+        let original = b"impl Builder {\n    fn set(&mut self) {\n        self.a = 1;\n    }\n}\n";
+        let span = 19..64;
+        let splice = entity_body_splice(original, span.clone(), &original[span]);
+        let result = apply_splices(original, vec![splice]).unwrap();
+        assert_eq!(result, original);
+    }
+
+    /// Nested modules indent the same way impls do, at whatever depth.
+    #[test]
+    fn nested_module_function_body_carrying_its_indentation_is_not_double_indented() {
+        let original = b"mod outer {\n    mod inner {\n        fn f() -> u8 { 1 }\n    }\n}\n";
+        let span = 36..54; // "fn f() -> u8 { 1 }"
+        assert_eq!(&original[span.clone()], b"fn f() -> u8 { 1 }");
+
+        let new_body = b"        fn f() -> u8 { 2 }";
+        let splice = entity_body_splice(original, span, new_body);
+        let result = apply_splices(original, vec![splice]).unwrap();
+        assert_eq!(
+            result,
+            b"mod outer {\n    mod inner {\n        fn f() -> u8 { 2 }\n    }\n}\n"
+        );
+    }
+
+    /// A top-level function has no indentation to double, so the normalization
+    /// must leave it exactly alone.
+    #[test]
+    fn top_level_function_body_is_spliced_verbatim() {
+        let original = b"fn f() -> u8 { 1 }\n";
+        let splice = entity_body_splice(original, 0..18, b"fn f() -> u8 { 2 }");
+        let result = apply_splices(original, vec![splice]).unwrap();
+        assert_eq!(result, b"fn f() -> u8 { 2 }\n");
+    }
+
+    /// A caller that genuinely wants a deeper indentation still gets it: the
+    /// body's own first-line whitespace is what lands, whatever it is.
+    #[test]
+    fn deliberate_reindentation_is_preserved() {
+        let original = b"impl Builder {\n    fn set(&mut self) {}\n}\n";
+        let span = 19..39;
+        assert_eq!(&original[span.clone()], b"fn set(&mut self) {}");
+
+        // Eight spaces where the file has four: the caller re-indents, and the
+        // result is eight, not twelve.
+        let splice = entity_body_splice(original, span, b"        fn set(&mut self) {}");
+        let result = apply_splices(original, vec![splice]).unwrap();
+        assert_eq!(result, b"impl Builder {\n        fn set(&mut self) {}\n}\n");
+    }
+
+    /// Only whitespace running to the start of the line counts as the entity's
+    /// indentation. A second entity later on the same line has code before it,
+    /// so nothing is consumed.
+    #[test]
+    fn indentation_is_only_consumed_when_the_span_opens_its_line() {
+        let original = b"fn a() {} fn b() {}\n";
+        // "fn b() {}" starts at 10, preceded on its line by "fn a() {} ".
+        let splice = entity_body_splice(original, 10..19, b" fn b() {}");
+        assert_eq!(splice.byte_range, 10..19);
+        let result = apply_splices(original, vec![splice]).unwrap();
+        assert_eq!(result, b"fn a() {}  fn b() {}\n");
+    }
+
+    /// Tabs indent too, and a tab prefix must not be matched against a space
+    /// prefix.
+    #[test]
+    fn tab_indentation_is_matched_exactly() {
+        let original = b"impl B {\n\tfn f() {}\n}\n";
+        let span = 10..19;
+        assert_eq!(&original[span.clone()], b"fn f() {}");
+
+        let consumed = entity_body_splice(original, span.clone(), b"\tfn f() {2}");
+        assert_eq!(consumed.byte_range, 9..19);
+
+        let untouched = entity_body_splice(original, span, b"    fn f() {2}");
+        assert_eq!(untouched.byte_range, 10..19);
     }
 
     #[test]

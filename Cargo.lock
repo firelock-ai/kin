@@ -3076,6 +3076,7 @@ dependencies = [
  "dialoguer",
  "directories 5.0.1",
  "ed25519-dalek",
+ "filetime",
  "flate2",
  "fs2",
  "hex",
@@ -3084,6 +3085,7 @@ dependencies = [
  "kin-buildinfo",
  "kin-context",
  "kin-core",
+ "kin-daemon-spawn",
  "kin-db",
  "kin-git",
  "kin-index",
@@ -3199,6 +3201,7 @@ dependencies = [
  "kin-buildinfo",
  "kin-cli",
  "kin-core",
+ "kin-daemon-spawn",
  "kin-db",
  "kin-git",
  "kin-index",
@@ -3236,10 +3239,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "kin-daemon-spawn"
+version = "0.3.6"
+dependencies = [
+ "libc",
+ "pretty_assertions",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "kin-db"
-version = "0.6.5"
+version = "0.6.7"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "a5434248b321add448ef991990763793f55b9bf63ee4350bea52b369cd7618c8"
+checksum = "fab279dfb7cfc1c37fedaed1be22409f58ddb7cc31715694252c17e0b47f115d"
 dependencies = [
  "bincode",
  "bstr",
@@ -3397,6 +3411,7 @@ dependencies = [
  "kin-blobs",
  "kin-context",
  "kin-core",
+ "kin-daemon-spawn",
  "kin-db",
  "kin-git",
  "kin-model",

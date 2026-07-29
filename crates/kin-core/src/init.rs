@@ -41,6 +41,10 @@ const MAX_INIT_STAGE_OWNER_BYTES: u64 = 16 * 1024;
 pub struct RepositoryBootstrap {
     pub receipt: RepositoryCommitReceipt,
     pub workspace: WorkspaceSnapshotBinding,
+    /// Generation-bound durable semantic counts computed from the exact
+    /// committed bootstrap lease before publication. `kin init` carries this
+    /// value forward instead of reopening a potentially advanced repository.
+    pub semantic_enrichment: crate::DurableSemanticEnrichmentSummary,
     /// Present only when initialization admitted real history.
     pub initial_change_id: Option<SemanticChangeId>,
 }
@@ -1257,6 +1261,16 @@ where
     workspace
         .validate()
         .map_err(|error| KinError::Other(error.to_string()))?;
+    let semantic_enrichment = {
+        let lease = authority.read_authority();
+        if lease.roots() != &receipt.roots_after {
+            return Err(KinError::Graph(
+                "repository bootstrap enrichment lease is not bound to the committed roots"
+                    .to_string(),
+            ));
+        }
+        crate::durable_semantic_enrichment_summary(&lease, &workspace_id)?
+    };
     let initial_change_id = transaction
         .workspace_mutation
         .as_ref()
@@ -1267,6 +1281,7 @@ where
     Ok(RepositoryBootstrap {
         receipt,
         workspace,
+        semantic_enrichment,
         initial_change_id,
     })
 }

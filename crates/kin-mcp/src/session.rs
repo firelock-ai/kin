@@ -985,8 +985,15 @@ impl SessionRegistry {
         scope: &str,
     ) -> std::result::Result<McpTransaction, String> {
         if !self.has_session(session_id) {
+            // A well-formed id that names nothing is an ended or idle-reaped
+            // session, not a typo. Saying only "not found" sends an agent
+            // hunting for a bad argument; naming expiry sends it to the one
+            // call that recovers.
             return Err(format!(
-                "Session not found: {session_id}. Start a session with kin_session_start first."
+                "Session not found: {session_id}. It was ended or expired after its idle \
+                 timeout. Call kin_session_start for a new session id and begin the \
+                 transaction on that one; kin_session_heartbeat keeps a session alive \
+                 through a long read phase."
             ));
         }
         let transaction_id = EntityId::new().to_string();
@@ -1112,6 +1119,21 @@ impl SessionRegistry {
         Ok(cleared)
     }
 
+    /// End an editable transaction and discard everything it staged.
+    ///
+    /// Only `active` and `validated` transactions may abort, because those are
+    /// the states in which nothing has been fenced and the staged set is the
+    /// only thing to undo.
+    ///
+    /// A `committing` transaction is owned by the commit path instead:
+    /// `prepare_transaction_commit` has persisted its payload digest and
+    /// repository authority may already have moved, so the way out is to
+    /// re-enter the commit with the same staged operations, which resumes
+    /// idempotently and resolves whether the commit landed. Relabelling that
+    /// state `aborted` would make the resume unreachable and strand the
+    /// transaction in exactly the case the fence exists to survive. A
+    /// `committed` transaction refuses for a different reason: overwriting a
+    /// real receipt with `aborted` records provenance that never happened.
     pub fn abort_transaction(
         &self,
         transaction_id: &str,
@@ -1120,12 +1142,26 @@ impl SessionRegistry {
             .transactions
             .lock()
             .expect("transactions lock poisoned");
-        if let Some(tx) = map.get_mut(transaction_id) {
-            tx.state = "aborted".to_string();
-            Ok(tx.clone())
-        } else {
-            Err(format!("Transaction not found: {}", transaction_id))
+        let tx = map
+            .get_mut(transaction_id)
+            .ok_or_else(|| format!("Transaction not found: {transaction_id}"))?;
+        if !matches!(tx.state.as_str(), "active" | "validated") {
+            let recovery = if tx.state == "committing" {
+                "its commit is already fenced, so repository authority may have moved: \
+                 re-send kin_transaction_commit with the same transaction id, which \
+                 resumes the fenced payload idempotently and reports whether it landed"
+            } else {
+                "the transaction already reached a terminal state and holds nothing to \
+                 discard: begin a new one with kin_transaction_begin"
+            };
+            return Err(format!(
+                "Cannot abort transaction {} in state: {}. {recovery}.",
+                transaction_id, tx.state
+            ));
         }
+        tx.staged_operations.clear();
+        tx.state = "aborted".to_string();
+        Ok(tx.clone())
     }
 
     pub fn get_transaction(&self, transaction_id: &str) -> Option<McpTransaction> {
@@ -1776,6 +1812,139 @@ mod tests {
         assert!(registry
             .stage_transaction(&tx.transaction_id, vec![])
             .is_err());
+    }
+
+    fn staged_edit(registry: &SessionRegistry, session: &str) -> McpTransaction {
+        let tx = registry.begin_transaction(session, "src/lib.rs").unwrap();
+        registry
+            .stage_transaction(
+                &tx.transaction_id,
+                vec![McpMutationOperation {
+                    verb: "update".to_string(),
+                    target: "value".to_string(),
+                    payload: None,
+                    body: Some("pub fn value() -> u8 { 2 }".to_string()),
+                    description: "replace the body".to_string(),
+                }],
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn abort_discards_the_staged_mutations_it_says_it_discards() {
+        let registry = SessionRegistry::new();
+        registry.register("sess-1", "test");
+        let staged = staged_edit(&registry, "sess-1");
+        assert_eq!(staged.staged_operations.len(), 1);
+
+        let aborted = registry.abort_transaction(&staged.transaction_id).unwrap();
+        assert_eq!(aborted.state, "aborted");
+        assert!(
+            aborted.staged_operations.is_empty(),
+            "abort promises to discard the staged mutations, so the returned \
+             transaction must not still carry them"
+        );
+        let stored = registry.get_transaction(&staged.transaction_id).unwrap();
+        assert!(
+            stored.staged_operations.is_empty(),
+            "the registry's own copy must be discarded too, not just the clone \
+             handed back to the caller"
+        );
+        assert!(
+            registry
+                .stage_transaction(&staged.transaction_id, vec![])
+                .is_err(),
+            "an aborted transaction must not accept further operations"
+        );
+    }
+
+    #[test]
+    fn abort_is_refused_once_a_commit_is_fenced_and_the_commit_stays_resumable() {
+        let registry = SessionRegistry::new();
+        registry.register("sess-1", "test");
+        let staged = staged_edit(&registry, "sess-1");
+
+        let fenced = registry
+            .prepare_transaction_commit(&staged.transaction_id, "payload-digest")
+            .unwrap();
+        assert_eq!(fenced.state, "committing");
+
+        let refused = registry
+            .abort_transaction(&staged.transaction_id)
+            .expect_err("a fenced transaction must not be abortable");
+        assert!(
+            refused.contains("committing"),
+            "the refusal must name the state that blocks it: {refused}"
+        );
+        assert!(
+            refused.contains("kin_transaction_commit"),
+            "the refusal must name the call that owns a fenced transaction: {refused}"
+        );
+
+        // Refusing is only worth anything if it keeps the documented recovery
+        // reachable: re-entering the fence with the same digest still resumes,
+        // and the payload it resumes is the one that was fenced.
+        let resumed = registry
+            .prepare_transaction_commit(&staged.transaction_id, "payload-digest")
+            .expect("the fenced commit must remain resumable after a refused abort");
+        assert_eq!(resumed.state, "committing");
+        assert_eq!(
+            resumed.staged_operations.len(),
+            1,
+            "a refused abort must not touch the fenced payload"
+        );
+        assert_eq!(
+            registry
+                .commit_transaction(&staged.transaction_id)
+                .unwrap()
+                .state,
+            "committed"
+        );
+    }
+
+    #[test]
+    fn abort_is_refused_on_a_terminal_transaction() {
+        let registry = SessionRegistry::new();
+        registry.register("sess-1", "test");
+
+        let committed = staged_edit(&registry, "sess-1");
+        registry
+            .commit_transaction(&committed.transaction_id)
+            .unwrap();
+        let refused = registry
+            .abort_transaction(&committed.transaction_id)
+            .expect_err(
+                "aborting a committed transaction would record a receipt that never happened",
+            );
+        assert!(refused.contains("committed"), "{refused}");
+        assert_eq!(
+            registry
+                .get_transaction(&committed.transaction_id)
+                .unwrap()
+                .state,
+            "committed",
+            "a refused abort must not relabel the transaction"
+        );
+
+        let aborted = staged_edit(&registry, "sess-1");
+        registry.abort_transaction(&aborted.transaction_id).unwrap();
+        assert!(
+            registry.abort_transaction(&aborted.transaction_id).is_err(),
+            "a second abort must be refused rather than silently succeeding"
+        );
+    }
+
+    #[test]
+    fn abort_of_an_unknown_transaction_names_the_id() {
+        let registry = SessionRegistry::new();
+        let err = registry
+            .abort_transaction("no-such-transaction")
+            .expect_err("aborting an id that names nothing must fail");
+        assert!(
+            err.contains("no-such-transaction"),
+            "the failure must name the id the caller passed: {err}"
+        );
+        assert!(err.contains("not found"), "{err}");
     }
 
     // ── Stage-time validation (D.7 Track A) ──────────────────────────────────

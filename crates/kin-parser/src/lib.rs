@@ -38,6 +38,14 @@ pub mod languages;
 pub mod shallow;
 pub mod todos;
 
+/// Re-exported because this crate's public signatures name it: `LanguageAdapter::extract`
+/// and [`parse_shallow_file`] both take a `&FilePathId`. Without the re-export a caller
+/// must declare its own `kin-model` dependency purely to spell the argument type, and any
+/// version skew between that dependency and the one this crate resolves produces two
+/// distinct `FilePathId` types and a mismatched-types error at the call site. Reaching the
+/// type through `kin_parser` makes that skew unrepresentable.
+pub use kin_model::FilePathId;
+
 pub use adapter::{EditHint, LanguageAdapter};
 pub use error::{ParseError, Result};
 pub use extract::{

@@ -94,19 +94,36 @@ fn daemon_base_url() -> Option<String> {
 /// 30 minutes gives ample headroom while still ensuring eventual cleanup when
 /// an agent session is truly abandoned.  An explicit
 /// `KIN_DAEMON_IDLE_TIMEOUT_SECS` env var always overrides this at runtime.
-const MCP_IDLE_TIMEOUT_SECS: &str = "1800";
+const MCP_IDLE_TIMEOUT_SECS: &str = kin_daemon_spawn::MCP_IDLE_TIMEOUT_SECS;
 
 /// Idle timeout to inject into a revival-spawned daemon, or `None` to inject
 /// nothing.
 ///
-/// Mirrors `kin_cli::daemon_client::resolve_idle_timeout_env` and
-/// `kin_daemon::lifecycle::resolve_idle_timeout_env`: a user-set
-/// `KIN_DAEMON_IDLE_TIMEOUT_SECS` propagates to the child on its own and must
-/// never be overwritten, so this returns `None` in that case. Factored out of
-/// the spawn path so the precedence is unit-testable without spawning a
-/// process.
+/// A user-set `KIN_DAEMON_IDLE_TIMEOUT_SECS` propagates to the child on its own
+/// and must never be overwritten, so this returns `None` in that case. The
+/// precedence itself lives in `kin_daemon_spawn` so the CLI autostart path and
+/// this one cannot disagree about it.
 fn mcp_spawn_idle_timeout(user_env_is_set: bool) -> Option<&'static str> {
-    (!user_env_is_set).then_some(MCP_IDLE_TIMEOUT_SECS)
+    kin_daemon_spawn::resolve_idle_timeout(user_env_is_set, Some(MCP_IDLE_TIMEOUT_SECS))
+}
+
+/// The spawn plan the revival path starts a daemon from.
+///
+/// Split out so the contract this path once diverged from is assertable without
+/// spawning anything: no port is chosen here, so there is no port to hardcode.
+fn mcp_spawn_plan(
+    daemon_bin: std::path::PathBuf,
+    working_dir: std::path::PathBuf,
+    supervisor_url: Option<String>,
+) -> kin_daemon_spawn::DaemonSpawnPlan {
+    kin_daemon_spawn::DaemonSpawnPlan {
+        daemon_bin,
+        working_dir,
+        idle_timeout_secs: mcp_spawn_idle_timeout(
+            std::env::var_os("KIN_DAEMON_IDLE_TIMEOUT_SECS").is_some(),
+        ),
+        supervisor_url,
+    }
 }
 
 // ── Unrecoverable-daemon error class ────────────────────────────────────
@@ -555,10 +572,7 @@ impl DaemonCallSeam for RealDaemonSeam {
             .await
             .map_err(|e| classify_send_error("MCP tool call", e))?;
         if !resp.status().is_success() {
-            return Err(DaemonCallError::DaemonError(format!(
-                "daemon MCP tool call failed: HTTP {}",
-                resp.status()
-            )));
+            return Err(daemon_http_error("MCP tool call", resp).await);
         }
         let result = resp.json::<ToolCallResult>().await.map_err(|e| {
             DaemonCallError::DaemonError(format!("daemon MCP tool call response parse failed: {e}"))
@@ -611,19 +625,20 @@ fn find_mcp_daemon_binary() -> Option<std::path::PathBuf> {
     None
 }
 
-fn find_mcp_free_port() -> Option<u16> {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .ok()
-        .and_then(|l| l.local_addr().ok())
-        .map(|a| a.port())
-}
-
 /// Spawn a fresh daemon and wait for it to pass `/health`.
 ///
 /// Uses the MCP-path idle timeout (30 min) unless the user has set
 /// `KIN_DAEMON_IDLE_TIMEOUT_SECS` explicitly.  On success, writes the new
 /// base URL into [`DAEMON_URL_OVERRIDE`] so all subsequent delegate calls
 /// are routed to the revived daemon automatically.
+///
+/// Every decision about *how* the daemon is started belongs to
+/// [`kin_daemon_spawn`], which the CLI autostart path uses too. This path once
+/// carried its own copy and drifted from it twice: it reserved a port and
+/// passed the number (reopening the reserve-release-rebind race the port file
+/// exists to close), fell back to a hardcoded port when reservation failed,
+/// never cleared a stale port record, and never registered the daemon it
+/// started with the supervisor.
 async fn revive_mcp_daemon() -> Result<String, String> {
     // Serialize revival across concurrent tool calls. Every forwarded request
     // now reaches this path, so a dead daemon can be observed by several calls
@@ -649,42 +664,36 @@ async fn revive_mcp_daemon() -> Result<String, String> {
     let daemon_bin = find_mcp_daemon_binary().ok_or_else(|| {
         "MCP revival: kin-daemon binary not found (not in PATH or next to kin binary)".to_string()
     })?;
-    let port = find_mcp_free_port().unwrap_or(4219);
+
+    // A port record with no PID owner beside it belongs to a daemon that is
+    // already gone. Left in place, the port we are about to read back would be
+    // its port, not the new daemon's.
+    kin_daemon_spawn::clear_orphaned_port_record(&kin_dir);
+
+    let supervisor_url = kin_daemon_spawn::supervisor_url_for_spawn().await;
+    let plan = mcp_spawn_plan(daemon_bin, working_dir.clone(), supervisor_url);
 
     tracing::info!(
-        binary = %daemon_bin.display(),
+        binary = %plan.daemon_bin.display(),
         repo = %working_dir.display(),
-        port,
-        "MCP revival: starting fresh daemon"
+        "MCP revival: starting fresh daemon (daemon-assigned port)"
     );
 
-    let mut cmd = std::process::Command::new(&daemon_bin);
-    cmd.args([
-        "--repo",
-        &working_dir.display().to_string(),
-        "--port",
-        &port.to_string(),
-    ]);
+    let mut cmd = plan.command();
     cmd.stdout(std::process::Stdio::null());
     cmd.stderr(std::process::Stdio::null());
-    // Inject the MCP-path idle timeout unless the user has an explicit
-    // override in the environment — user's value always wins.
-    if let Some(timeout) =
-        mcp_spawn_idle_timeout(std::env::var_os("KIN_DAEMON_IDLE_TIMEOUT_SECS").is_some())
-    {
-        cmd.env("KIN_DAEMON_IDLE_TIMEOUT_SECS", timeout);
-    }
-    #[cfg(unix)]
-    unsafe {
-        use std::os::unix::process::CommandExt;
-        cmd.pre_exec(|| {
-            libc::setsid();
-            Ok(())
-        });
-    }
-
-    cmd.spawn()
+    let mut child = cmd
+        .spawn()
         .map_err(|e| format!("MCP revival: spawn kin-daemon failed: {e}"))?;
+
+    // The daemon binds :0 and publishes the port it actually got. There is no
+    // fallback: a revival that cannot learn the real port has no daemon to
+    // talk to, and addressing a default port would reach whatever else is
+    // listening there.
+    let port_deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let port = kin_daemon_spawn::await_reported_port(&kin_dir, &mut child, port_deadline)
+        .await
+        .map_err(|e| format!("MCP revival: {e}"))?;
 
     // Poll /health until the daemon is ready (bounded at 15 s).
     let new_base = format!("http://127.0.0.1:{port}");
@@ -695,13 +704,19 @@ async fn revive_mcp_daemon() -> Result<String, String> {
         .map_err(|e| format!("MCP revival: build probe client: {e}"))?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     loop {
-        if tokio::time::Instant::now() >= deadline {
-            return Err(format!(
-                "MCP revival: daemon did not become healthy within 15s (port {port})"
-            ));
-        }
         if let Ok(resp) = probe.get(format!("{new_base}/health")).send().await {
             if resp.status().is_success() {
+                // A daemon the supervisor does not know about is unroutable to
+                // every other client, so registration is part of starting one.
+                if let Err(error) =
+                    kin_daemon_spawn::register_started_daemon(&kin_dir, &new_base).await
+                {
+                    tracing::warn!(
+                        url = %new_base,
+                        %error,
+                        "MCP revival: daemon is healthy but supervisor registration failed"
+                    );
+                }
                 // Route all subsequent delegate calls at the revived daemon.
                 if let Ok(mut guard) = DAEMON_URL_OVERRIDE.lock() {
                     *guard = Some(new_base.clone());
@@ -709,6 +724,22 @@ async fn revive_mcp_daemon() -> Result<String, String> {
                 tracing::info!(url = %new_base, "MCP revival: daemon is healthy");
                 return Ok(new_base);
             }
+        }
+
+        // The child reporting a port then failing to serve is still a startup
+        // in progress; only its death is evidence against it.
+        if let Ok(disposition) = kin_daemon_spawn::startup_disposition(&mut child) {
+            if let kin_daemon_spawn::StartupDisposition::Exited(status) = disposition {
+                return Err(format!(
+                    "MCP revival: daemon exited during startup with status {status} (port {port})"
+                ));
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "MCP revival: daemon did not become healthy within 15s (port {port}); it was left \
+                 running rather than killed"
+            ));
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -850,6 +881,68 @@ where
     .await
 }
 
+/// Maximum daemon error-body bytes preserved in an MCP-facing error.
+///
+/// The daemon is a loopback peer, but an accidental HTML/proxy response or a
+/// pathological route body must not turn one rejected tool call into an
+/// unbounded MCP response.
+const MAX_DAEMON_ERROR_BODY_BYTES: usize = 8 * 1024;
+
+/// Preserve an actionable, bounded response body from a daemon HTTP error.
+///
+/// Reading by chunks enforces the bound while the response is in flight rather
+/// than collecting an arbitrarily large body and truncating only afterward.
+async fn daemon_http_error(operation: &str, mut response: reqwest::Response) -> DaemonCallError {
+    let status = response.status();
+    let mut body = Vec::with_capacity(MAX_DAEMON_ERROR_BODY_BYTES);
+    let mut truncated = false;
+
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                let remaining = MAX_DAEMON_ERROR_BODY_BYTES.saturating_sub(body.len());
+                if chunk.len() > remaining {
+                    body.extend_from_slice(&chunk[..remaining]);
+                    truncated = true;
+                    break;
+                }
+                body.extend_from_slice(&chunk);
+                if body.len() == MAX_DAEMON_ERROR_BODY_BYTES {
+                    match response.chunk().await {
+                        Ok(Some(_)) => truncated = true,
+                        Ok(None) => {}
+                        Err(error) => {
+                            return DaemonCallError::DaemonError(format!(
+                                "daemon {operation} failed: HTTP {status}; error response read \
+                                 failed after {} bytes: {error}",
+                                body.len()
+                            ));
+                        }
+                    }
+                    break;
+                }
+            }
+            Ok(None) => break,
+            Err(error) => {
+                return DaemonCallError::DaemonError(format!(
+                    "daemon {operation} failed: HTTP {status}; error response read failed: {error}"
+                ));
+            }
+        }
+    }
+
+    let detail = String::from_utf8_lossy(&body);
+    let detail = detail.trim();
+    let truncation = if truncated { " … [truncated]" } else { "" };
+    if detail.is_empty() {
+        DaemonCallError::DaemonError(format!("daemon {operation} failed: HTTP {status}"))
+    } else {
+        DaemonCallError::DaemonError(format!(
+            "daemon {operation} failed: HTTP {status}: {detail}{truncation}"
+        ))
+    }
+}
+
 /// Send one already-built daemon request and read its JSON body.
 ///
 /// Split out of [`daemon_json_request`] so the response handling is testable
@@ -869,10 +962,7 @@ async fn send_daemon_json(
         .await
         .map_err(|e| classify_send_error(operation, e))?;
     if !resp.status().is_success() {
-        return Err(DaemonCallError::DaemonError(format!(
-            "daemon {operation} failed: HTTP {}",
-            resp.status()
-        )));
+        return Err(daemon_http_error(operation, resp).await);
     }
     let body = resp.text().await.map_err(|e| {
         DaemonCallError::DaemonError(format!("daemon {operation} response read failed: {e}"))
@@ -967,11 +1057,10 @@ pub async fn forward_tool_call(
                 .map(text_result_from_value)
                 .transpose()
         }
-        // Coverage exposure: surface embedding-index coverage to MCP agents.
-        // The generic graph tool dispatcher only knows entity_count; the
-        // daemon's status command computes embedding coverage from the live
-        // graph (`graph.embedding_status()`), so forward there and project the
-        // fields MCP agents need. Self-contained — no daemon-api coordination.
+        // Coverage exposure: the structured graph-status response binds entity,
+        // relation, and embedding counts to one daemon-selected query graph.
+        // Durable repository-authority status is a different contract and must
+        // never be relabeled as MCP query readiness.
         "kin_graph_status" => forward_graph_status(arguments).await,
         // Stage-time validation in product mode: reject intrinsically-malformed
         // staged operations locally before the daemon round-trip, so the agent
@@ -1005,54 +1094,42 @@ fn validate_stage_arguments(arguments: &HashMap<String, serde_json::Value>) -> R
     crate::session::validate_staged_operations(&operations)
 }
 
-/// Forward `kin_graph_status` to the daemon's status command and project the
-/// graph/embedding coverage fields agents care about.
+/// Forward graph status over the same `/mcp/tools/call` route every other
+/// graph-backed MCP client uses, then validate the successful payload before it
+/// crosses the stdio boundary.
 ///
-/// In product mode coverage is otherwise CLI-only (`kin status`); this gives
-/// MCP agents the same embedding-index visibility without leaving graph-owned
-/// truth — the daemon computes the counts from its live graph.
+/// This catches an old or drifted daemon even though the outer
+/// [`ToolCallResult`] envelope still deserializes. Daemon errors remain errors
+/// verbatim; only a successful status body must satisfy the exact v1 contract.
 async fn forward_graph_status(
     arguments: &HashMap<String, serde_json::Value>,
 ) -> Result<Option<ToolCallResult>, String> {
-    let Some(base) = daemon_base_url() else {
-        return Ok(None);
-    };
-    let value = daemon_json_request("graph status", &base, |client, base| {
-        let request = client
-            .post(format!("{base}/commands/status"))
-            .json(&serde_json::json!({ "json": false }));
-        with_session_header(with_auth(request), arguments)
-    })
-    .await?;
-    text_result_from_value(project_graph_status(&value)?).map(Some)
+    forward_mcp_tool_call("kin_graph_status", arguments)
+        .await?
+        .map(validate_graph_status_result)
+        .transpose()
 }
 
-/// Project the daemon's status response into the coverage fields MCP agents
-/// need.
-///
-/// Rejects an empty body loudly. The shared request helper reads one as `Null`
-/// so the mutations that answer `204 No Content` work, but every count here
-/// falls back to 0, so letting `Null` through would render a missing answer as
-/// a real reading of an empty graph. A status surface that reports zeros it did
-/// not measure is worse than one that fails.
-fn project_graph_status(value: &serde_json::Value) -> Result<serde_json::Value, String> {
-    if value.is_null() {
-        return Err(
-            "daemon graph status returned an empty body; refusing to report zero counts as \
-             graph truth"
-                .to_string(),
-        );
+fn validate_graph_status_result(result: ToolCallResult) -> Result<ToolCallResult, String> {
+    parse_graph_status_report(&result)?;
+    Ok(result)
+}
+
+pub(crate) fn parse_graph_status_report(
+    result: &ToolCallResult,
+) -> Result<Option<crate::handlers::entities::GraphStatusReport>, String> {
+    if result.is_error == Some(true) {
+        return Ok(None);
     }
-    let summary = value.get("summary").unwrap_or(value);
-    let field_u64 = |key: &str| summary.get(key).and_then(serde_json::Value::as_u64);
-    Ok(serde_json::json!({
-        "entity_count": field_u64("entities").unwrap_or(0),
-        "embeddings_indexed": field_u64("embeddings_indexed").unwrap_or(0),
-        "embeddings_total": field_u64("embeddings_total").unwrap_or(0),
-        "embeddings_pending": field_u64("embeddings_pending").unwrap_or(0),
-        "authority": "repo-daemon",
-        "note": "Embedding coverage is computed from the daemon-owned live graph."
-    }))
+    let [ContentBlock::Text { text }] = result.content.as_slice() else {
+        return Err(format!(
+            "daemon kin_graph_status returned {} content blocks; expected exactly one text block",
+            result.content.len()
+        ));
+    };
+    serde_json::from_str(text)
+        .map(Some)
+        .map_err(|error| format!("daemon kin_graph_status contract validation failed: {error}"))
 }
 
 pub fn daemon_unavailable_tool_result(name: &str) -> ToolCallResult {
@@ -1184,11 +1261,18 @@ pub async fn forward_session_heartbeat(
     let Some(base) = daemon_base_url() else {
         return Ok(None);
     };
-    let value = daemon_json_request("heartbeat", &base, |client, base| {
+    session_heartbeat_request(&base, session_id).await.map(Some)
+}
+
+async fn session_heartbeat_request(
+    base: &str,
+    session_id: &str,
+) -> Result<serde_json::Value, String> {
+    let value = daemon_json_request("heartbeat", base, |client, base| {
         with_auth(client.post(format!("{base}/session/{session_id}/heartbeat")))
     })
     .await?;
-    Ok(Some(value))
+    Ok(value)
 }
 
 /// Forward a session end to the daemon.
@@ -1470,29 +1554,127 @@ mod tests {
         handle.abort();
     }
 
-    /// The empty-body allowance exists for the 204 mutations. It must not reach
-    /// the status projection, where every count defaults to 0 and an absent
-    /// answer would render as a genuine reading of an empty graph.
-    #[test]
-    fn graph_status_refuses_to_report_an_empty_body_as_zero_counts() {
-        let err = project_graph_status(&serde_json::Value::Null)
-            .expect_err("an empty status body must fail loudly");
-        assert!(err.contains("empty body"), "{err}");
-        assert!(err.contains("refusing"), "{err}");
+    fn valid_graph_status_result() -> ToolCallResult {
+        ToolCallResult::text(
+            serde_json::json!({
+                "schema": "kin.graph-status.v1",
+                "view": "daemon_selected_graph",
+                "scope": "head",
+                "authority": "repo-daemon",
+                "sampling": "point_in_time_selected_graph",
+                "authority_epoch": 42,
+                "entity_count": 42,
+                "relation_count": 17,
+                "embedding_source": "selected_graph",
+                "embeddings_indexed": 7,
+                "embeddings_pending": 3,
+                "embeddings_total": 10,
+                "completion_attested": false
+            })
+            .to_string(),
+        )
     }
 
     #[test]
-    fn graph_status_projects_summary_counts() {
-        let value = serde_json::json!({
-            "summary": { "entities": 42, "embeddings_indexed": 7, "embeddings_total": 10 }
-        });
-        let projected = project_graph_status(&value).expect("a real body must project");
-        assert_eq!(projected["entity_count"], 42);
-        assert_eq!(projected["embeddings_indexed"], 7);
-        assert_eq!(projected["embeddings_total"], 10);
-        // Absent within a present body is still 0: that is a real reading.
-        assert_eq!(projected["embeddings_pending"], 0);
-        assert_eq!(projected["authority"], "repo-daemon");
+    fn graph_status_accepts_the_exact_daemon_contract() {
+        let result = valid_graph_status_result();
+        let ContentBlock::Text { text: expected } = &result.content[0];
+        let expected = expected.clone();
+        let validated = validate_graph_status_result(result).unwrap();
+        let ContentBlock::Text { text: actual } = &validated.content[0];
+        assert_eq!(actual, &expected);
+    }
+
+    #[test]
+    fn graph_status_rejects_a_durable_status_body() {
+        let result = ToolCallResult::text(
+            serde_json::json!({
+                "report": {
+                    "schema": "kin.status.v2",
+                    "semantic_enrichment": { "entity_count": 42 }
+                }
+            })
+            .to_string(),
+        );
+        let error = validate_graph_status_result(result)
+            .expect_err("durable repository status cannot masquerade as MCP query-graph status");
+        assert!(error.contains("unknown field `report`"), "{error}");
+    }
+
+    #[test]
+    fn graph_status_rejects_wrong_schema_scope_and_additive_drift() {
+        for (field, value, expected) in [
+            (
+                "schema",
+                serde_json::json!("kin.graph-status.v0"),
+                "unsupported graph status schema",
+            ),
+            (
+                "scope",
+                serde_json::json!("workspace"),
+                "unknown variant `workspace`",
+            ),
+            (
+                "authority",
+                serde_json::json!("repository-v6"),
+                "unknown variant `repository-v6`",
+            ),
+            (
+                "completion_attested",
+                serde_json::json!(true),
+                "does not carry an enrichment-completion attestation",
+            ),
+            (
+                "unexpected",
+                serde_json::json!(true),
+                "unknown field `unexpected`",
+            ),
+        ] {
+            let ContentBlock::Text { text } = &valid_graph_status_result().content[0];
+            let mut body: serde_json::Value = serde_json::from_str(text).unwrap();
+            body[field] = value;
+            let error = validate_graph_status_result(ToolCallResult::text(body.to_string()))
+                .expect_err("contract drift must fail before the result reaches stdio");
+            assert!(error.contains(expected), "{field}: {error}");
+        }
+    }
+
+    #[test]
+    fn graph_status_rejects_impossible_embedding_coverage() {
+        for (indexed, pending, total, expected) in [
+            (
+                11,
+                0,
+                10,
+                "embeddings_indexed (11) exceeds embeddings_total (10)",
+            ),
+            (
+                7,
+                2,
+                10,
+                "embeddings_pending (2) is below the uncovered embedding count (3)",
+            ),
+        ] {
+            let ContentBlock::Text { text } = &valid_graph_status_result().content[0];
+            let mut body: serde_json::Value = serde_json::from_str(text).unwrap();
+            body["embeddings_indexed"] = serde_json::json!(indexed);
+            body["embeddings_pending"] = serde_json::json!(pending);
+            body["embeddings_total"] = serde_json::json!(total);
+            let error = validate_graph_status_result(ToolCallResult::text(body.to_string()))
+                .expect_err("impossible coverage must fail before the result reaches stdio");
+            assert!(error.contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn graph_status_preserves_daemon_errors_without_parsing_their_text() {
+        let result = ToolCallResult::error("daemon graph unavailable");
+        let ContentBlock::Text { text: expected } = &result.content[0];
+        let expected = expected.clone();
+        let validated = validate_graph_status_result(result).unwrap();
+        assert_eq!(validated.is_error, Some(true));
+        let ContentBlock::Text { text: actual } = &validated.content[0];
+        assert_eq!(actual, &expected);
     }
 
     /// An HTTP error from a live daemon must classify as `DaemonError`, never
@@ -1508,6 +1690,69 @@ mod tests {
         assert!(
             matches!(err, DaemonCallError::DaemonError(ref m) if m.contains("HTTP 500")),
             "expected a DaemonError naming the status, got: {err:?}"
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn daemon_error_body_is_preserved_but_bounded() {
+        let oversized: &'static str = Box::leak(
+            "actionable "
+                .repeat(MAX_DAEMON_ERROR_BODY_BYTES)
+                .into_boxed_str(),
+        );
+        let (base, handle) = stub_daemon_raw(400, "Bad Request", oversized).await;
+        let client = probe_client();
+        let error = send_daemon_json("transaction", client.post(format!("{base}/transaction")))
+            .await
+            .expect_err("HTTP 400 must fail");
+        let DaemonCallError::DaemonError(message) = error else {
+            panic!("an HTTP response must not be classified as a connection loss");
+        };
+
+        assert!(
+            message.contains("actionable"),
+            "the daemon's diagnostic body must survive: {message}"
+        );
+        assert!(
+            message.contains("[truncated]"),
+            "an oversized diagnostic must say it was truncated: {message}"
+        );
+        assert!(
+            message.len() <= MAX_DAEMON_ERROR_BODY_BYTES + 128,
+            "bounded error body grew to {} bytes",
+            message.len()
+        );
+        handle.abort();
+    }
+
+    /// Drive the real heartbeat delegate response reader and the same final
+    /// ToolCallResult adapter used by the product handler. This is the boundary
+    /// the direct Axum route test cannot cover.
+    #[tokio::test]
+    async fn expired_session_404_reaches_the_final_mcp_tool_result() {
+        let body = "session not found: dead-session. It expired after its idle timeout. \
+                    Call kin_session_start for a new session id.";
+        let (base, handle) = stub_daemon_raw(404, "Not Found", body).await;
+
+        let forwarded = session_heartbeat_request(&base, "dead-session")
+            .await
+            .map(Some);
+        let result = crate::handlers::sessions::delegated_session_heartbeat_result(
+            forwarded,
+            crate::server::SessionAuthorityMode::DaemonRequired,
+        )
+        .expect("delegate adaptation must succeed")
+        .expect("daemon-required mode must produce a result");
+
+        assert_eq!(result.is_error, Some(true));
+        let ContentBlock::Text { text } = result
+            .content
+            .first()
+            .expect("error ToolCallResult must carry text");
+        assert!(
+            text.contains("expired") && text.contains("kin_session_start"),
+            "final MCP error lost the daemon recovery diagnosis: {text}"
         );
         handle.abort();
     }
@@ -1667,6 +1912,67 @@ mod tests {
             mcp_spawn_idle_timeout(true),
             None,
             "a user-set KIN_DAEMON_IDLE_TIMEOUT_SECS must never be overwritten"
+        );
+    }
+
+    // ── Revival spawn contract ─────────────────────────────────────────────
+    //
+    // This path used to reserve a port itself, pass the number, and fall back
+    // to a hardcoded 4219 when reservation failed. Both are gone: the daemon
+    // binds and reports, and the port comes back off the port file.
+
+    #[test]
+    fn revival_lets_the_daemon_choose_its_port() {
+        let plan = mcp_spawn_plan(
+            std::path::PathBuf::from("/usr/bin/kin-daemon"),
+            std::path::PathBuf::from("/repo"),
+            None,
+        );
+        let cmd = plan.command();
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+
+        assert_eq!(
+            args,
+            vec!["--repo", "/repo", "--port", "0"],
+            "revival must pass --port 0, not a port it reserved and released"
+        );
+        assert!(
+            !args.contains(&"4219".to_string()),
+            "no hardcoded fallback port may reach the daemon: {args:?}"
+        );
+    }
+
+    #[test]
+    fn revival_reads_the_port_the_daemon_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        // The port file is the handshake; nothing else names the port.
+        assert_eq!(kin_daemon_spawn::read_reported_port(dir.path()), None);
+        std::fs::write(dir.path().join(kin_daemon_spawn::PORT_FILE_NAME), "51234\n").unwrap();
+        assert_eq!(
+            kin_daemon_spawn::read_reported_port(dir.path()),
+            Some(51234)
+        );
+    }
+
+    #[test]
+    fn revival_passes_a_supervisor_url_through_to_the_daemon() {
+        let plan = mcp_spawn_plan(
+            std::path::PathBuf::from("/usr/bin/kin-daemon"),
+            std::path::PathBuf::from("/repo"),
+            Some("http://127.0.0.1:9100".to_string()),
+        );
+        let cmd = plan.command();
+        let has_supervisor = cmd.get_envs().any(|(k, v)| {
+            k == "KIN_SUPERVISOR_URL"
+                && v.map(|v| v.to_string_lossy().to_string())
+                    == Some("http://127.0.0.1:9100".to_string())
+        });
+        assert!(
+            has_supervisor,
+            "a revived daemon must be told where its supervisor is"
         );
     }
 

@@ -179,7 +179,11 @@ pub fn project_entity_mutations_with_policy(
                 } = region
                 {
                     if eid == entity_id {
-                        let splice = splice_entity(layout, entity_id, new_body)?;
+                        let original = state
+                            .file_contents
+                            .get(file_id)
+                            .ok_or_else(|| ProjectionError::LayoutNotFound(file_id.to_string()))?;
+                        let splice = splice_entity(original, layout, entity_id, new_body)?;
                         file_mutations
                             .entry(file_id.clone())
                             .or_default()
@@ -402,10 +406,14 @@ pub fn project_to_bytes(
         } = region
         {
             if let Some(new_body) = mutations.get(entity_id) {
-                splices.push(Splice {
-                    byte_range: byte_range.clone(),
-                    new_content: new_body.clone(),
-                });
+                // Caller-authored bodies, so the same first-line indentation
+                // reading `splice_entity` uses. A body that is the region's own
+                // bytes is unaffected.
+                splices.push(crate::splice::entity_body_splice(
+                    base_content,
+                    byte_range.clone(),
+                    new_body,
+                ));
             }
         }
     }

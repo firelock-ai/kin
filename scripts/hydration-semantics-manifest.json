@@ -1,6 +1,6 @@
 {
   "comment": "Replay-semantics surface pinned by scripts/verify-hydration-semantics.py. These functions re-author the entity/relation deltas persisted for historical changes during Git admission, so editing one changes what Kin reports about the past on already-ingested repositories. A digest mismatch is not a failure to fix by regenerating: decide first whether replay semantics changed, and if so bump HYDRATION_SEMANTICS_VERSION and hydration_semantics_version together.",
-  "hydration_semantics_version": 5,
+  "hydration_semantics_version": 6,
   "guarded": [
     {
       "file": "crates/kin-index/src/history.rs",

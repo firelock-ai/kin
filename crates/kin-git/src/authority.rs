@@ -151,6 +151,11 @@ mod tests {
         let output = fixture_git()
             .args(args)
             .current_dir(repository)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env(
+                "GIT_CONFIG_GLOBAL",
+                if cfg!(windows) { "NUL" } else { "/dev/null" },
+            )
             .output()
             .unwrap();
         assert!(

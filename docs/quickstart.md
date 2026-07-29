@@ -6,8 +6,8 @@ Windows (via WSL2):
 1. **Install** the binaries with the one-line installer.
 2. **`kin setup`** — answer a couple of questions; the guided wizard configures your
    shell, PATH, daemon, and AI clients.
-3. **`kin init`** — atomically admit repository authority; semantic enrichment
-   and embeddings are separate graph-native stages.
+3. **`kin init`** admits repository authority atomically and derives the semantic
+   entity layer for supported sources; embeddings are a separate graph-native stage.
 4. **Verify** with `kin setup status` and read the health checklist.
 
 Manual / per-tool configuration is available in the
@@ -145,19 +145,25 @@ kin init path/to/project
 
 In a clean detected Git repository, `kin init` imports complete reachable
 history, refs, raw objects, the exact workspace tree, and admission policy into
-graph-owned authority. Git stays in place as an explicit interoperability
-boundary; Kin runtime queries do not fall back to it. Repositories with remotes
-currently fail closed until exact Kin remote mapping is available.
+graph-owned authority. It also derives the semantic entity and relation layer
+for every supported entity-source file in that history, and reports the durable,
+generation-bound counts it committed. Git stays in place as an explicit
+interoperability boundary; Kin runtime queries do not fall back to it.
+Repository-local remote URLs, refspecs, branch tracking, and push defaults that
+Kin can represent safely are sealed into its Git coexistence configuration.
+Unsafe, ambiguous, or unsupported transfer settings fail closed before
+publication.
 
 *Flags:*
-- `--json`: report the exact committed repository/workspace authority result.
+- `--json`: report the exact committed repository/workspace authority result,
+  including the semantic enrichment admission produced.
 
 ---
 
 ## 4. Add embeddings for semantic search
 
-Repository admission does not run semantic enrichment. Once graph-native
-semantic entities exist, build their vector index with:
+Admission derives the semantic entities, not their vectors. Build the vector
+index over them with:
 
 ```sh
 kin embed
@@ -167,8 +173,14 @@ Embeddings are generated locally with `nomic-embed-text-v1.5` (768 dimensions; o
 via `KIN_EMBED_MODEL_ID`). You can check coverage at any time:
 
 ```sh
-kin status --json   # see the "enrichment" block: embeddingsIndexed / embeddingsPending / embeddingsTotal
+kin graph status   # "Embeddings: <indexed>/<total> indexed (<pending> pending)"
+kin status --json  # durable authority entity/relation/change counts and generations
 ```
+
+These commands intentionally answer for different views. `kin status` reports
+the immutable repository/workspace authority generation it opened.
+`kin graph status` reports the daemon's mutable live query graph, including
+derived runtime enrichment that has not become repository authority.
 
 > Until embedding is complete, `kin search --semantic` and `kin locate` degrade
 > gracefully (vector hits over whatever is already embedded, plus a text fallback) and

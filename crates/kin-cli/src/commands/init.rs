@@ -17,6 +17,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::Serialize;
 
+use super::status::{SemanticEnrichmentPresence, SemanticEnrichmentStatus};
+
 /// Invalidates prepared state when the repository bootstrap authority changes.
 pub(crate) const GRAPH_BUILD_PIPELINE_EPOCH: &str =
     "graph-build-2026-07-26-repository-v6-authority-v2";
@@ -49,7 +51,9 @@ struct InitResultPayload<'a> {
     authority: &'static str,
     source_boundary: &'static str,
     history: &'static str,
-    semantic_enrichment: &'static str,
+    /// Durable generation-bound enrichment committed by admission. This is
+    /// carried from the bootstrap lease, not reopened after publication.
+    semantic_enrichment: SemanticEnrichmentStatus,
     repo_root: String,
     kin_dir: String,
     repository_id: &'a kin_model::RepositoryId,
@@ -92,10 +96,12 @@ pub async fn run(path: Option<String>, json: bool) -> Result<()> {
         }
     };
 
+    let enrichment =
+        SemanticEnrichmentStatus::from_durable_summary(&result.authority.semantic_enrichment);
     if json {
-        print_json_result(&result, boundary)?;
+        print_json_result(&result, boundary, enrichment)?;
     } else {
-        print_human_result(&result, boundary)?;
+        print_human_result(&result, boundary, &enrichment)?;
     }
     Ok(())
 }
@@ -150,15 +156,19 @@ fn path_exists(path: &Path) -> Result<bool> {
     }
 }
 
-fn print_json_result(result: &kin_core::InitResult, boundary: InitBoundary) -> Result<()> {
+fn print_json_result(
+    result: &kin_core::InitResult,
+    boundary: InitBoundary,
+    semantic_enrichment: SemanticEnrichmentStatus,
+) -> Result<()> {
     let workspace = &result.authority.workspace;
     let default_ref = initialized_default_ref(result);
     let payload = InitResultPayload {
-        schema: "kin.init-result.v4",
+        schema: "kin.init-result.v5",
         authority: "repository-v6",
         source_boundary: boundary.source_boundary(),
         history: boundary.history(),
-        semantic_enrichment: "not-run",
+        semantic_enrichment,
         repo_root: result.layout.working_dir().display().to_string(),
         kin_dir: result.layout.root().display().to_string(),
         repository_id: &result.repository_id,
@@ -179,7 +189,11 @@ fn print_json_result(result: &kin_core::InitResult, boundary: InitBoundary) -> R
     Ok(())
 }
 
-fn print_human_result(result: &kin_core::InitResult, boundary: InitBoundary) -> Result<()> {
+fn print_human_result(
+    result: &kin_core::InitResult,
+    boundary: InitBoundary,
+    semantic_enrichment: &SemanticEnrichmentStatus,
+) -> Result<()> {
     let default_ref = initialized_default_ref(result);
     println!(
         "Initialized Kin repository authority at {}",
@@ -209,14 +223,31 @@ fn print_human_result(result: &kin_core::InitResult, boundary: InitBoundary) -> 
             println!(
                 "  Imported: exact reachable Git history, refs, raw objects, workspace, and admission policy"
             );
-            println!("  Semantic enrichment: not run during authority admission");
         }
         InitBoundary::NativeUnborn => {
             println!("  History: unborn (no synthetic commit)");
             println!("  Workspace: empty exact tree");
         }
     }
+    println!(
+        "  Semantic enrichment: {}",
+        render_semantic_enrichment(semantic_enrichment)
+    );
     Ok(())
+}
+
+fn render_semantic_enrichment(enrichment: &SemanticEnrichmentStatus) -> String {
+    let presence = match enrichment.presence {
+        SemanticEnrichmentPresence::Absent => "absent",
+        SemanticEnrichmentPresence::Present => "present",
+    };
+    format!(
+        "{presence} ({} entities, {} relations, {} changes in durable authority generation {}; completion not attested)",
+        enrichment.entity_count,
+        enrichment.relation_count,
+        enrichment.semantic_change_count,
+        enrichment.authority_generation
+    )
 }
 
 fn initialized_default_ref(result: &kin_core::InitResult) -> Option<&kin_model::RefName> {

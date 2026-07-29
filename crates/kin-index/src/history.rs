@@ -36,7 +36,7 @@ use crate::pipeline::IndexPipeline;
 /// establish whether replay semantics actually changed, and if they did, bump
 /// this constant and the manifest's recorded version together. Never
 /// regenerate a digest silently.
-pub const HYDRATION_SEMANTICS_VERSION: u32 = 5;
+pub const HYDRATION_SEMANTICS_VERSION: u32 = 6;
 
 /// Semantic graph delta derived for one pre-enrichment change identity.
 ///

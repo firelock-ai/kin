@@ -145,11 +145,24 @@ impl IndexPipeline {
         } = output;
 
         let role = classify_file_role(&file_id.0);
+        // A test declared inside a production file is invisible to a classifier
+        // that only reads the path, and the harness that runs it leaves no edge
+        // for the graph to record, so it reads as unreferenced to everything
+        // downstream. The parser already recognized these by their attribute or
+        // framework convention, so that finding becomes the entity's role.
+        // Matching is by name within the file: a production declaration sharing
+        // a name with a test in the same file is read as the test.
+        let test_names: std::collections::HashSet<&str> =
+            tests.iter().map(|test| test.name.as_str()).collect();
         let mut entities: Vec<Entity> = extracted_entities
             .into_iter()
             .map(|entity| {
                 let mut ent = entity.into_entity_with_source(language, file_id, Some(source));
-                ent.role = role;
+                ent.role = if role == EntityRole::Source && test_names.contains(ent.name.as_str()) {
+                    EntityRole::Test
+                } else {
+                    role
+                };
                 ent
             })
             .collect();
@@ -1416,6 +1429,61 @@ pub fn add(a: i32, b: i32) -> i32 { a + b }\n";
             artifact.content_hash,
             Hash256::from_bytes(hash.0),
             "structured hash is an enrichment fingerprint, not exact tree identity"
+        );
+    }
+
+    #[test]
+    fn test_functions_in_a_production_file_carry_the_test_role() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob_store = BlobStore::new(dir.path().join("blobs")).unwrap();
+        let pipeline = IndexPipeline::new();
+        let source = br#"
+pub fn shipped() -> u32 { 1 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shipped_returns_one() {
+        assert_eq!(shipped(), 1);
+    }
+}
+"#;
+        let blob_hash = blob_store.write(source).unwrap();
+        let indexed = pipeline
+            .index_file_content_with_tests(&FilePathId::new("src/shipped.rs"), source, blob_hash)
+            .unwrap();
+
+        let role_of = |name: &str| {
+            indexed
+                .indexed_file
+                .entities
+                .iter()
+                .find(|entity| entity.name == name)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{name} missing from {:?}",
+                        indexed
+                            .indexed_file
+                            .entities
+                            .iter()
+                            .map(|e| e.name.as_str())
+                            .collect::<Vec<_>>()
+                    )
+                })
+                .role
+        };
+
+        assert_eq!(
+            role_of("shipped_returns_one"),
+            EntityRole::Test,
+            "a test in a production path is still a test"
+        );
+        assert_eq!(
+            role_of("shipped"),
+            EntityRole::Source,
+            "the production function beside it keeps its role"
         );
     }
 }

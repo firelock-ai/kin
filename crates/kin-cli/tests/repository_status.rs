@@ -14,10 +14,16 @@ mod common;
 
 use common::Command;
 
+#[cfg(windows)]
+const NULL_GIT_CONFIG: &str = "NUL";
+#[cfg(not(windows))]
+const NULL_GIT_CONFIG: &str = "/dev/null";
+
 fn run_git(path: &Path, args: &[&str]) {
     let output = Command::new("git")
         .args(args)
         .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", NULL_GIT_CONFIG)
         .current_dir(path)
         .output()
         .expect("run git");
@@ -87,7 +93,7 @@ fn status_is_one_exact_authority_lease_and_ignores_checkout_and_git_drift() {
     );
     let before_report: Value =
         serde_json::from_slice(&before.stdout).expect("status stdout should be JSON");
-    assert_eq!(before_report["schema"], "kin.status.v1");
+    assert_eq!(before_report["schema"], "kin.status.v2");
     assert_eq!(before_report["authority"], "repository-v6");
     assert_eq!(before_report["repository"]["generation"], 1);
     assert_eq!(before_report["repository"]["source_cas_verified"], true);
@@ -99,6 +105,18 @@ fn status_is_one_exact_authority_lease_and_ignores_checkout_and_git_drift() {
     assert_eq!(before_report["workspace"]["head"]["type"], "symbolic");
     assert_eq!(before_report["workspace"]["dirty"], false);
     assert_eq!(before_report["workspace"]["artifact_count"], 5);
+    assert_eq!(
+        before_report["semantic_enrichment"]["view"],
+        "durable_repository_authority"
+    );
+    assert_eq!(
+        before_report["semantic_enrichment"]["authority_generation"],
+        before_report["repository"]["generation"]
+    );
+    assert_eq!(
+        before_report["semantic_enrichment"]["workspace_generation"],
+        before_report["workspace"]["generation"]
+    );
     assert_eq!(before_report["semantic_enrichment"]["presence"], "absent");
     assert_eq!(
         before_report["semantic_enrichment"]["completion_attested"],

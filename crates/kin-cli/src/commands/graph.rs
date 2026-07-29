@@ -208,7 +208,11 @@ fn build_graph_status_response(
         *kind_counts.entry(e.kind).or_insert(0) += 1;
     }
 
-    // Relation counts by kind
+    // Relation counts by kind. Entity-rooted traversal only reaches edges whose
+    // src and dst are both entities, so this total is narrower than the whole
+    // relation table, which also carries artifact-, test-, contract-, work-, and
+    // verification-run-anchored edges. Both totals are reported below, each
+    // labeled with the scope it counts.
     let mut relation_counts: HashMap<RelationKind, usize> = HashMap::new();
     let mut seen_relation_ids = HashSet::new();
     let mut total_relations = 0usize;
@@ -237,13 +241,13 @@ fn build_graph_status_response(
     lines.push("=== Graph Health ===".to_string());
     lines.push(String::new());
     lines.push(format!(
-        "Entities: {}  |  Relations: {}  |  Files: {}",
+        "Entities: {}  |  Entity-to-entity relations: {}  |  Files: {}",
         entity_count,
         total_relations,
         unique_files.len()
     ));
     lines.push(format!(
-        "Rels/Entity: {:.2}",
+        "Entity-to-entity rels/entity: {:.2}",
         if entity_count == 0 {
             0.0
         } else {
@@ -274,7 +278,10 @@ fn build_graph_status_response(
         .iter()
         .map(|(kind, count)| format!("{:?}: {}", kind, count))
         .collect();
-    lines.push(format!("Relations: {}", rel_parts.join(", ")));
+    lines.push(format!(
+        "Entity-to-entity relation kinds: {}",
+        rel_parts.join(", ")
+    ));
 
     // Kind distribution
     let mut kind_pairs: Vec<_> = kind_counts.iter().collect();
@@ -302,7 +309,7 @@ fn build_graph_status_response(
         }
     ));
     lines.push(format!(
-        "Semantic rels (excluding CoChanges): {} ({:.2}/entity)",
+        "All graph relations excluding CoChanges: {} ({:.2}/entity)",
         health.semantic_relation_count, health.semantic_relation_density_excluding_cochanges
     ));
     lines.push(format!(
@@ -323,22 +330,25 @@ fn build_graph_status_response(
     // Warnings
     let mut warnings = health.warnings.clone();
     let criticals = health.critical_issues.clone();
-    if entity_count > 0 && total_relations == 0 {
+    let all_relation_count = health
+        .semantic_relation_count
+        .saturating_add(health.cochange_relation_count);
+    if entity_count > 0 && all_relation_count == 0 {
         warnings.push("no relations in graph — cross-file linking may have failed".to_string());
     }
     if entity_count > 0 && role_counts.len() == 1 && role_counts.contains_key(&EntityRole::Source) {
         warnings
             .push("all entities are Source — role classification may not be working".to_string());
     }
-    let rels_per_ent = if entity_count == 0 {
+    let entity_rels_per_ent = if entity_count == 0 {
         0.0
     } else {
         total_relations as f64 / entity_count as f64
     };
-    if rels_per_ent < 0.1 && entity_count > 100 {
+    if entity_rels_per_ent < 0.1 && entity_count > 100 {
         warnings.push(format!(
-            "very low relation density ({:.2} rels/entity) — linker may be failing",
-            rels_per_ent
+            "very low entity-to-entity relation density ({:.2} rels/entity) — entity linker may be failing",
+            entity_rels_per_ent
         ));
     }
     if warnings.is_empty() && criticals.is_empty() {
@@ -352,6 +362,11 @@ fn build_graph_status_response(
         for w in &warnings {
             lines.push(format!("⚠ {}", w));
         }
+    }
+    // Notes describe expected absences, so they follow the verdict rather than
+    // suppressing it.
+    for note in &health.notes {
+        lines.push(format!("ℹ {}", note));
     }
 
     Ok(GraphCommandResponse {
@@ -539,55 +554,20 @@ fn build_graph_inspect_response(
         lines.push(format!("  Visibility: {:?}", entity.visibility));
 
         // Show relations
-        let relations = graph.get_all_relations_for_entity(&entity.id)?;
-        if !relations.is_empty() {
-            lines.push(format!("  Relations ({}):", relations.len()));
-            for rel in relations.iter().take(20) {
-                let target_name = match rel.dst {
-                    kin_model::GraphNodeId::Entity(id) => {
-                        if id == entity.id {
-                            // Incoming relation — show source
-                            match rel.src {
-                                kin_model::GraphNodeId::Entity(src_id) => graph
-                                    .get_entity(&src_id)?
-                                    .map(|e| {
-                                        format!(
-                                            "{} ({})",
-                                            e.name,
-                                            e.file_origin
-                                                .as_ref()
-                                                .map(|f| f.0.as_str())
-                                                .unwrap_or("?")
-                                        )
-                                    })
-                                    .unwrap_or_else(|| format!("{}", src_id)),
-                                _ => format!("{:?}", rel.src),
-                            }
-                        } else {
-                            graph
-                                .get_entity(&id)?
-                                .map(|e| {
-                                    format!(
-                                        "{} ({})",
-                                        e.name,
-                                        e.file_origin.as_ref().map(|f| f.0.as_str()).unwrap_or("?")
-                                    )
-                                })
-                                .unwrap_or_else(|| format!("{}", id))
-                        }
-                    }
-                    _ => format!("{:?}", rel.dst),
-                };
-                let direction = if matches!(rel.dst, kin_model::GraphNodeId::Entity(id) if id == entity.id)
-                {
-                    "<-"
-                } else {
-                    "->"
-                };
-                lines.push(format!("    {} {:?} {}", direction, rel.kind, target_name));
+        let rows = inspect_relation_rows(graph, &entity)?;
+        if rows.total > 0 {
+            lines.push(format!("  Relations ({}):", rows.total));
+            for row in &rows.displayed {
+                lines.push(format!(
+                    "    {} {:?} {}",
+                    row.direction, row.kind, row.peer_label
+                ));
             }
-            if relations.len() > 20 {
-                lines.push(format!("    ... and {} more", relations.len() - 20));
+            if rows.total > rows.displayed.len() {
+                lines.push(format!(
+                    "    ... and {} more",
+                    rows.total - rows.displayed.len()
+                ));
             }
         }
         lines.push(String::new());
@@ -597,6 +577,86 @@ fn build_graph_inspect_response(
         lines,
         error: None,
         source: None,
+    })
+}
+
+/// Peer rows rendered past this point are summarized as a remainder count.
+const INSPECT_RELATION_LIMIT: usize = 20;
+
+/// One peer row of a `kin graph inspect` relation list.
+#[derive(Debug)]
+struct InspectRelationRow {
+    direction: &'static str,
+    kind: RelationKind,
+    peer_label: String,
+}
+
+/// Bounded rendered rows plus the full number of unique peer observations.
+#[derive(Debug)]
+struct InspectRelationRows {
+    total: usize,
+    displayed: Vec<InspectRelationRow>,
+}
+
+/// Build the deduplicated peer rows for one inspected entity.
+///
+/// Two rows are the same observation when they share direction marker, kind,
+/// and peer node, so only one is rendered. Mixed-domain relations are included,
+/// and entity labels carry their stable identity because overloads can share a
+/// name, kind, and file. Relation identities determine display order, and peer
+/// labels are resolved only for the bounded displayed prefix.
+fn inspect_relation_rows(
+    graph: &kin_db::InMemoryGraph,
+    entity: &Entity,
+) -> Result<InspectRelationRows> {
+    let mut rows = Vec::new();
+    let mut seen = HashSet::new();
+    let self_node = kin_model::GraphNodeId::Entity(entity.id);
+    let mut relations = graph.get_all_relations_for_node(&self_node)?;
+    relations.sort_unstable_by_key(|rel| rel.id.0);
+
+    for rel in relations {
+        let src_is_self = matches!(rel.src, kin_model::GraphNodeId::Entity(id) if id == entity.id);
+        let dst_is_self = matches!(rel.dst, kin_model::GraphNodeId::Entity(id) if id == entity.id);
+        let (direction, peer) = match (src_is_self, dst_is_self) {
+            (true, true) => ("<->", rel.src),
+            (false, true) => ("<-", rel.src),
+            (true, false) => ("->", rel.dst),
+            (false, false) => continue,
+        };
+        if !seen.insert((direction, rel.kind, peer)) {
+            continue;
+        }
+        if rows.len() >= INSPECT_RELATION_LIMIT {
+            continue;
+        }
+
+        let peer_label = match peer {
+            kin_model::GraphNodeId::Entity(peer_id) => graph
+                .get_entity(&peer_id)?
+                .map(|e| {
+                    format!(
+                        "{} [{:?}] ({}; entity:{})",
+                        e.name,
+                        e.kind,
+                        e.file_origin.as_ref().map(|f| f.0.as_str()).unwrap_or("?"),
+                        e.id
+                    )
+                })
+                .unwrap_or_else(|| format!("{}", peer_id)),
+            other => other.to_string(),
+        };
+
+        rows.push(InspectRelationRow {
+            direction,
+            kind: rel.kind,
+            peer_label,
+        });
+    }
+
+    Ok(InspectRelationRows {
+        total: seen.len(),
+        displayed: rows,
     })
 }
 
@@ -898,11 +958,15 @@ mod tests {
     }
 
     fn test_relation(kind: RelationKind, src: EntityId, dst: EntityId) -> Relation {
+        graph_relation(kind, GraphNodeId::Entity(src), GraphNodeId::Entity(dst))
+    }
+
+    fn graph_relation(kind: RelationKind, src: GraphNodeId, dst: GraphNodeId) -> Relation {
         Relation {
             id: RelationId::new(),
             kind,
-            src: GraphNodeId::Entity(src),
-            dst: GraphNodeId::Entity(dst),
+            src,
+            dst,
             confidence: 1.0,
             origin: RelationOrigin::Parsed,
             created_in: None,
@@ -961,6 +1025,80 @@ mod tests {
         let binding =
             kin_core::LocalRepositoryAuthorityBinding::from_layout(&initialized.layout).unwrap();
         (temp, binding, kin_db::InMemoryGraph::new())
+    }
+
+    #[test]
+    fn graph_status_labels_each_relation_total_with_its_scope() {
+        let (_temp, binding, graph) = graph_validation_fixture();
+        let caller = test_entity("run_task");
+        let callee = test_entity("finalize");
+        graph.upsert_entity(&caller).unwrap();
+        graph.upsert_entity(&callee).unwrap();
+        graph
+            .upsert_relation(&test_relation(RelationKind::Calls, caller.id, callee.id))
+            .unwrap();
+
+        let response = build_graph_status_response(&binding, &graph).unwrap();
+
+        // The entity-rooted total and the whole-table total count different
+        // scopes, so neither line may carry a bare "Relations" label.
+        assert!(response
+            .lines
+            .iter()
+            .any(|line| line.contains("Entity-to-entity relations: 1")));
+        assert!(response
+            .lines
+            .iter()
+            .any(|line| line.starts_with("Entity-to-entity rels/entity: ")));
+        assert!(response
+            .lines
+            .iter()
+            .any(|line| line.starts_with("Entity-to-entity relation kinds: ")));
+        assert!(response
+            .lines
+            .iter()
+            .any(|line| line.starts_with("All graph relations excluding CoChanges: ")));
+        assert!(
+            !response
+                .lines
+                .iter()
+                .any(|line| line.starts_with("Relations: ") || line.contains("  |  Relations: ")),
+            "{:?}",
+            response.lines
+        );
+    }
+
+    #[test]
+    fn graph_status_does_not_call_a_mixed_relation_graph_relationless() {
+        let (_temp, binding, graph) = graph_validation_fixture();
+        let entity = test_entity("run_task");
+        graph.upsert_entity(&entity).unwrap();
+        graph
+            .upsert_relation(&graph_relation(
+                RelationKind::Covers,
+                GraphNodeId::Test(kin_model::TestId::new()),
+                GraphNodeId::Entity(entity.id),
+            ))
+            .unwrap();
+
+        let response = build_graph_status_response(&binding, &graph).unwrap();
+
+        assert!(response
+            .lines
+            .iter()
+            .any(|line| line.contains("Entity-to-entity relations: 0")));
+        assert!(response
+            .lines
+            .iter()
+            .any(|line| line == "All graph relations excluding CoChanges: 1 (1.00/entity)"));
+        assert!(
+            !response
+                .lines
+                .iter()
+                .any(|line| line.contains("no relations in graph")),
+            "{:?}",
+            response.lines
+        );
     }
 
     #[test]
@@ -1041,6 +1179,260 @@ mod tests {
     }
 
     #[test]
+    fn graph_inspect_collapses_repeated_peer_edges() {
+        let graph = kin_db::InMemoryGraph::new();
+        let mut container = test_entity("Stats");
+        container.kind = EntityKind::Class;
+        container.file_origin = Some(FilePathId::new("crates/printer/src/stats.rs"));
+        let mut member = test_entity("Stats::elapsed");
+        member.kind = EntityKind::Method;
+        member.file_origin = Some(FilePathId::new("crates/printer/src/stats.rs"));
+        graph.upsert_entity(&container).unwrap();
+        graph.upsert_entity(&member).unwrap();
+
+        // Two rows for one logical edge: distinct relation IDs, identical
+        // (direction, kind, peer).
+        for _ in 0..2 {
+            graph
+                .upsert_relation(&test_relation(
+                    RelationKind::Contains,
+                    container.id,
+                    member.id,
+                ))
+                .unwrap();
+        }
+
+        let response = build_graph_inspect_response(&graph, "Stats::elapsed").unwrap();
+        let peer_rows: Vec<_> = response
+            .lines
+            .iter()
+            .filter(|line| line.starts_with("    <- Contains "))
+            .collect();
+
+        assert_eq!(peer_rows.len(), 1, "{:?}", response.lines);
+        assert_eq!(
+            peer_rows[0],
+            &format!(
+                "    <- Contains Stats [Class] (crates/printer/src/stats.rs; entity:{})",
+                container.id
+            )
+        );
+        assert!(response.lines.iter().any(|line| line == "  Relations (1):"));
+    }
+
+    #[test]
+    fn graph_inspect_keeps_distinct_peers_that_share_a_name_and_file() {
+        let graph = kin_db::InMemoryGraph::new();
+        let mut member = test_entity("Stats::elapsed");
+        member.kind = EntityKind::Method;
+        graph.upsert_entity(&member).unwrap();
+
+        let file = FilePathId::new("crates/printer/src/stats.rs");
+        let mut declaration = test_entity("Stats");
+        declaration.kind = EntityKind::Class;
+        declaration.file_origin = Some(file.clone());
+        let mut alias = test_entity("Stats");
+        alias.kind = EntityKind::TypeAlias;
+        alias.file_origin = Some(file);
+        graph.upsert_entity(&declaration).unwrap();
+        graph.upsert_entity(&alias).unwrap();
+
+        for peer in [&declaration, &alias] {
+            graph
+                .upsert_relation(&test_relation(RelationKind::Contains, peer.id, member.id))
+                .unwrap();
+        }
+
+        let response = build_graph_inspect_response(&graph, "Stats::elapsed").unwrap();
+        let peer_rows: Vec<_> = response
+            .lines
+            .iter()
+            .filter(|line| line.starts_with("    <- Contains "))
+            .collect();
+
+        assert_eq!(peer_rows.len(), 2, "{:?}", response.lines);
+        assert!(peer_rows
+            .iter()
+            .any(|line| line.contains("Stats [Class] (crates/printer/src/stats.rs; entity:")));
+        assert!(peer_rows
+            .iter()
+            .any(|line| line.contains("Stats [TypeAlias] (crates/printer/src/stats.rs; entity:")));
+    }
+
+    #[test]
+    fn graph_inspect_disambiguates_overloads_with_the_same_name_kind_and_file() {
+        let graph = kin_db::InMemoryGraph::new();
+        let mut subject = test_entity("dispatch");
+        subject.kind = EntityKind::Method;
+        graph.upsert_entity(&subject).unwrap();
+
+        let file = FilePathId::new("src/handlers.rs");
+        let mut first = test_entity("Handler::run");
+        first.kind = EntityKind::Method;
+        first.file_origin = Some(file.clone());
+        first.span = Some(SourceSpan {
+            file: file.clone(),
+            start_byte: 10,
+            end_byte: 20,
+            start_line: 2,
+            start_col: 0,
+            end_line: 4,
+            end_col: 1,
+        });
+        let mut second = test_entity("Handler::run");
+        second.kind = EntityKind::Method;
+        second.file_origin = Some(file.clone());
+        second.span = Some(SourceSpan {
+            file,
+            start_byte: 30,
+            end_byte: 40,
+            start_line: 6,
+            start_col: 0,
+            end_line: 8,
+            end_col: 1,
+        });
+        graph.upsert_entity(&first).unwrap();
+        graph.upsert_entity(&second).unwrap();
+
+        for peer in [&first, &second] {
+            graph
+                .upsert_relation(&test_relation(RelationKind::Calls, subject.id, peer.id))
+                .unwrap();
+        }
+
+        let response = build_graph_inspect_response(&graph, "dispatch").unwrap();
+        let peer_rows: Vec<_> = response
+            .lines
+            .iter()
+            .filter(|line| line.starts_with("    -> Calls Handler::run "))
+            .collect();
+
+        assert_eq!(peer_rows.len(), 2, "{:?}", response.lines);
+        assert_ne!(peer_rows[0], peer_rows[1], "{:?}", response.lines);
+        assert!(peer_rows
+            .iter()
+            .any(|line| line.contains(&format!("entity:{}", first.id))));
+        assert!(peer_rows
+            .iter()
+            .any(|line| line.contains(&format!("entity:{}", second.id))));
+    }
+
+    #[test]
+    fn graph_inspect_includes_mixed_domain_relations() {
+        let graph = kin_db::InMemoryGraph::new();
+        let subject = test_entity("dispatch");
+        graph.upsert_entity(&subject).unwrap();
+
+        let test_id = kin_model::TestId::new();
+        let artifact_id = ArtifactId::new();
+        graph
+            .upsert_relation(&graph_relation(
+                RelationKind::Covers,
+                GraphNodeId::Test(test_id),
+                GraphNodeId::Entity(subject.id),
+            ))
+            .unwrap();
+        graph
+            .upsert_relation(&graph_relation(
+                RelationKind::OwnedByFile,
+                GraphNodeId::Entity(subject.id),
+                GraphNodeId::Artifact(artifact_id),
+            ))
+            .unwrap();
+
+        let response = build_graph_inspect_response(&graph, "dispatch").unwrap();
+
+        assert!(response.lines.iter().any(|line| line == "  Relations (2):"));
+        assert!(response
+            .lines
+            .iter()
+            .any(|line| line == &format!("    <- Covers test:{test_id}")));
+        assert!(response
+            .lines
+            .iter()
+            .any(|line| line == &format!("    -> OwnedByFile artifact:{}", artifact_id.0)));
+    }
+
+    #[test]
+    fn graph_inspect_bounds_rendered_rows_but_reports_the_full_unique_count() {
+        let graph = kin_db::InMemoryGraph::new();
+        let subject = test_entity("dispatch");
+        graph.upsert_entity(&subject).unwrap();
+
+        for index in 0..=INSPECT_RELATION_LIMIT {
+            let peer = test_entity(&format!("peer_{index}"));
+            graph.upsert_entity(&peer).unwrap();
+            graph
+                .upsert_relation(&test_relation(RelationKind::Calls, subject.id, peer.id))
+                .unwrap();
+        }
+
+        let response = build_graph_inspect_response(&graph, "dispatch").unwrap();
+        let peer_rows = response
+            .lines
+            .iter()
+            .filter(|line| line.starts_with("    -> Calls peer_"))
+            .count();
+
+        assert_eq!(peer_rows, INSPECT_RELATION_LIMIT, "{:?}", response.lines);
+        assert!(response
+            .lines
+            .iter()
+            .any(|line| line == &format!("  Relations ({}):", INSPECT_RELATION_LIMIT + 1)));
+        assert!(response
+            .lines
+            .iter()
+            .any(|line| line == "    ... and 1 more"));
+    }
+
+    #[test]
+    fn graph_inspect_separates_incoming_and_outgoing_edges_of_one_kind() {
+        let graph = kin_db::InMemoryGraph::new();
+        let subject = test_entity("render");
+        let caller = test_entity("main");
+        let callee = test_entity("format_row");
+        for entity in [&subject, &caller, &callee] {
+            graph.upsert_entity(entity).unwrap();
+        }
+        graph
+            .upsert_relation(&test_relation(RelationKind::Calls, caller.id, subject.id))
+            .unwrap();
+        graph
+            .upsert_relation(&test_relation(RelationKind::Calls, subject.id, callee.id))
+            .unwrap();
+
+        let response = build_graph_inspect_response(&graph, "render").unwrap();
+
+        assert!(response.lines.iter().any(|line| line == "  Relations (2):"));
+        assert!(response
+            .lines
+            .iter()
+            .any(|line| line.starts_with("    <- Calls main ")));
+        assert!(response
+            .lines
+            .iter()
+            .any(|line| line.starts_with("    -> Calls format_row ")));
+    }
+
+    #[test]
+    fn graph_inspect_renders_self_relation_bidirectionally() {
+        let graph = kin_db::InMemoryGraph::new();
+        let subject = test_entity("render");
+        graph.upsert_entity(&subject).unwrap();
+        graph
+            .upsert_relation(&test_relation(RelationKind::Calls, subject.id, subject.id))
+            .unwrap();
+
+        let response = build_graph_inspect_response(&graph, "render").unwrap();
+
+        assert!(response.lines.iter().any(|line| line == "  Relations (1):"));
+        assert!(response
+            .lines
+            .iter()
+            .any(|line| line.starts_with("    <-> Calls render ")));
+    }
+
+    #[test]
     fn graph_inspect_accepts_entity_uuid() {
         let graph = kin_db::InMemoryGraph::new();
         let entity = test_entity("checkout");
@@ -1073,6 +1465,10 @@ mod tests {
         fs::create_dir(&repo).unwrap();
         let git = |args: &[&str]| {
             let output = crate::commands::test_subprocess::fixture_git(&repo)
+                // This fixture consumes the committed repository immediately.
+                // Prevent maintenance from detaching work that can leave
+                // transient pack locks after `git commit` exits.
+                .args(["-c", "maintenance.auto=false", "-c", "gc.auto=0"])
                 .args(args)
                 .output()
                 .unwrap();
@@ -1094,7 +1490,7 @@ mod tests {
             fs::write(repo.join("README.md"), b"authority without source\n").unwrap();
         }
         git(&["add", "--all"]);
-        git(&["commit", "-m", "seed exact source authority"]);
+        git(&["commit", "--signoff", "-m", "seed exact source authority"]);
         let init = kin_core::init_from_git(&repo).unwrap();
         let layout = init.layout;
         let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&layout).unwrap();
@@ -1319,5 +1715,85 @@ mod tests {
         assert!(response.source.is_none());
         let error = response.error.expect("not-found must populate error");
         assert!(error.contains(&invented.to_string()), "{error}");
+    }
+
+    /// Build a validate fixture whose graph carries exactly `tree_paths` in its
+    /// resolved tree, independent of what the working directory holds.
+    fn orphan_fixture(
+        tree_paths: &[&str],
+    ) -> (
+        tempfile::TempDir,
+        kin_core::KinLayout,
+        kin_core::LocalRepositoryAuthorityBinding,
+        kin_db::InMemoryGraph,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = kin_core::init(temp.path()).unwrap().layout;
+        let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&layout).unwrap();
+        let artifacts: Vec<_> = tree_paths
+            .iter()
+            .map(|path| {
+                ResolvedArtifact::new(
+                    ArtifactId::new(),
+                    RepoPath::from_utf8((*path).to_string()).unwrap(),
+                    TreeEntry::blob(Hash256::from_bytes([0x99; 32]), false),
+                )
+            })
+            .collect();
+        let mut snapshot = kin_db::GraphSnapshot::empty();
+        snapshot.resolved_tree = ResolvedTree::from_artifacts(artifacts).unwrap();
+        let graph = kin_db::InMemoryGraph::from_snapshot(snapshot).unwrap();
+        (temp, layout, binding, graph)
+    }
+
+    fn orphan_line(response: &GraphCommandResponse) -> Option<&String> {
+        response.lines.iter().find(|line| line.contains("orphaned"))
+    }
+
+    /// A file present in the working tree but absent from the graph's exact
+    /// tree is still an orphan. Deciding orphan status by probing the working
+    /// directory reports zero here, which is what this asserts against: the
+    /// projection cannot vouch for an entity the graph does not carry.
+    #[test]
+    fn graph_validate_counts_orphans_absent_from_the_graph_tree_despite_the_file_on_disk() {
+        let (_temp, layout, binding, graph) = orphan_fixture(&[]);
+        let on_disk = layout.working_dir().join("src/present.rs");
+        fs::create_dir_all(on_disk.parent().unwrap()).unwrap();
+        fs::write(&on_disk, b"fn present() {}\n").unwrap();
+        assert!(on_disk.exists(), "fixture must put the file on disk");
+
+        let mut entity = test_entity("present");
+        entity.file_origin = Some(FilePathId::new("src/present.rs"));
+        graph.upsert_entity(&entity).unwrap();
+
+        let response = build_graph_validate_response(&binding, &graph).unwrap();
+
+        let line = orphan_line(&response).expect("graph tree lacks the file, so it is orphaned");
+        assert!(line.contains('1'), "{line}");
+    }
+
+    /// The converse: a file the graph's exact tree carries is not an orphan
+    /// even though nothing was ever written to the working directory. Together
+    /// with the test above this pins the authority — the filesystem is neither
+    /// necessary nor sufficient to decide orphan status.
+    #[test]
+    fn graph_validate_clears_orphans_carried_by_the_graph_tree_with_no_file_on_disk() {
+        let (_temp, layout, binding, graph) = orphan_fixture(&["src/tracked.rs"]);
+        assert!(
+            !layout.working_dir().join("src/tracked.rs").exists(),
+            "fixture must leave the working tree empty"
+        );
+
+        let mut entity = test_entity("tracked");
+        entity.file_origin = Some(FilePathId::new("src/tracked.rs"));
+        graph.upsert_entity(&entity).unwrap();
+
+        let response = build_graph_validate_response(&binding, &graph).unwrap();
+
+        assert!(
+            orphan_line(&response).is_none(),
+            "graph tree carries the file: {:?}",
+            response.lines
+        );
     }
 }
