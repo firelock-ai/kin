@@ -224,6 +224,10 @@ fn run_git(repo: &Path, args: &[&str]) {
     let output = std::process::Command::new("git")
         .args(args)
         .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env(
+            "GIT_CONFIG_GLOBAL",
+            if cfg!(windows) { "NUL" } else { "/dev/null" },
+        )
         .current_dir(repo)
         .output()
         .expect("run Git");

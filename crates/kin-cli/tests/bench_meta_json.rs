@@ -8,12 +8,16 @@ mod common;
 
 use common::Command;
 
+const NULL_GIT_CONFIG: &str = if cfg!(windows) { "NUL" } else { "/dev/null" };
+
 #[test]
 fn bench_meta_json_reports_cache_key_dimensions() {
     let repo = tempdir().expect("temp repo");
     let output = Command::new(env!("CARGO_BIN_EXE_kin"))
         .arg("bench-meta")
         .arg("--json")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", NULL_GIT_CONFIG)
         .current_dir(repo.path())
         .output()
         .expect("run kin bench-meta");
@@ -123,6 +127,8 @@ fn bench_meta_prepared_state_json_reports_repo_specific_cache_keys() {
         .arg("bench-meta")
         .arg("--json")
         .arg("--prepared-state")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", NULL_GIT_CONFIG)
         .current_dir(repo.path())
         .output()
         .expect("run kin bench-meta --prepared-state");

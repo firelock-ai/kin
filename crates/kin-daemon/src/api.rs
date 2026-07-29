@@ -1410,6 +1410,78 @@ async fn resolve_session_source_scope(
 }
 
 const XREF_STABLE_READ_ATTEMPTS: usize = 3;
+const GRAPH_STATUS_STABLE_READ_ATTEMPTS: usize = 3;
+
+/// Capture one point-in-time status observation of the graph selected for this
+/// request.
+///
+/// Entity/relation mutations participate in the daemon's graph-authority
+/// seqlock. Normal foreground/background embedding passes use
+/// `embedding_work`; kin-db's own queue/vector locks keep reset and startup
+/// requeue transitions structurally valid. Holding the outer lock while reading
+/// all counters, then revalidating the graph epoch and selected HEAD/session
+/// graph, prevents a normal embedding pass or graph mutation from spanning the
+/// published observation without asking kin-mcp to reread a mutable graph.
+async fn mcp_graph_status_with_stable_authority(
+    state: &DaemonState,
+    session_id: Option<&SessionId>,
+    selected_graph: &Arc<kin_db::InMemoryGraph>,
+    authority: RequestGraphAuthority,
+    scope: kin_mcp::handlers::entities::GraphStatusScope,
+) -> kin_mcp::Result<kin_mcp::ToolCallResult> {
+    for _ in 0..GRAPH_STATUS_STABLE_READ_ATTEMPTS {
+        let Some(authority_epoch) = state.stable_graph_authority_epoch() else {
+            tokio::task::yield_now().await;
+            continue;
+        };
+
+        let observation = match state.embedding_work.try_lock() {
+            Ok(_embedding_guard) => {
+                let embeddings = selected_graph.embedding_status();
+                kin_mcp::handlers::entities::GraphStatusObservation {
+                    authority_epoch,
+                    entity_count: selected_graph.entity_count(),
+                    relation_count: selected_graph.relation_count(),
+                    embeddings_indexed: embeddings.indexed,
+                    embeddings_pending: embeddings.pending,
+                    embeddings_total: embeddings.total,
+                }
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Ok(kin_mcp::ToolCallResult::error(
+                    "selected-graph embedding coverage is changing; retry kin_graph_status",
+                ));
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(kin_mcp::McpError::Other(
+                    "embedding work lock poisoned while sampling kin_graph_status".to_string(),
+                ));
+            }
+        };
+
+        if !state.graph_authority_epoch_is_current(authority_epoch) {
+            tokio::task::yield_now().await;
+            continue;
+        }
+        if !state
+            .graph_authority_is_current(session_id, selected_graph, authority)
+            .await
+            || !state.graph_authority_epoch_is_current(authority_epoch)
+        {
+            tokio::task::yield_now().await;
+            continue;
+        }
+
+        return kin_mcp::handlers::entities::handle_daemon_graph_status_observation(
+            scope,
+            observation,
+        );
+    }
+
+    Ok(kin_mcp::ToolCallResult::error(
+        "selected graph changed during status sampling; retry kin_graph_status",
+    ))
+}
 
 /// One optimistic, point-in-time graph authority used by xref-style reads.
 ///
@@ -6406,6 +6478,21 @@ async fn mcp_tools_call(
                 |_| {},
             )
             .await
+        } else if request.name == "kin_graph_status" {
+            let scope = match graph_authority {
+                RequestGraphAuthority::Head => kin_mcp::handlers::entities::GraphStatusScope::Head,
+                RequestGraphAuthority::SessionScope => {
+                    kin_mcp::handlers::entities::GraphStatusScope::TemporalSession
+                }
+            };
+            mcp_graph_status_with_stable_authority(
+                &state,
+                session_id.as_ref(),
+                &graph,
+                graph_authority,
+                scope,
+            )
+            .await
         } else if request.name == "kin_transaction_commit" {
             Ok(crate::mcp_commit::commit_exact_transaction(
                 &state,
@@ -10375,6 +10462,10 @@ mod tests {
             .args(args)
             .current_dir(repository)
             .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env(
+                "GIT_CONFIG_GLOBAL",
+                if cfg!(windows) { "NUL" } else { "/dev/null" },
+            )
             .output()
             .unwrap();
         assert!(
@@ -10546,6 +10637,10 @@ mod tests {
                 .args(args)
                 .current_dir(repository)
                 .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env(
+                    "GIT_CONFIG_GLOBAL",
+                    if cfg!(windows) { "NUL" } else { "/dev/null" },
+                )
                 .output()
                 .unwrap();
             assert!(
@@ -12323,6 +12418,10 @@ mod tests {
                 .args(args)
                 .current_dir(repository)
                 .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env(
+                    "GIT_CONFIG_GLOBAL",
+                    if cfg!(windows) { "NUL" } else { "/dev/null" },
+                )
                 .output()
                 .unwrap();
             assert!(
@@ -15213,17 +15312,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn command_status_endpoint_uses_repository_authority() {
+    async fn command_status_and_graph_status_pin_distinct_durable_and_live_views() {
         install_test_registry_override();
         let dir = std::env::temp_dir().join(format!("kin-daemon-status-state-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let initialized = kin_core::init(&dir).unwrap();
         let state = Arc::new(DaemonState::open(initialized.layout).unwrap());
         state
+            .graph
+            .upsert_entity(&test_entity("live_derived_only", "src/derived.rs"))
+            .unwrap();
+        state
             .is_initialized
             .store(true, std::sync::atomic::Ordering::Relaxed);
         let app = router(state);
         let response = app
+            .clone()
             .oneshot(
                 Request::post("/commands/status")
                     .header("content-type", "application/json")
@@ -15251,8 +15355,195 @@ mod tests {
         );
         assert_eq!(result.report.repository.generation, 1);
         assert_eq!(result.report.workspace.artifact_count, 0);
+        assert_eq!(
+            result.report.semantic_enrichment.view,
+            kin_cli::commands::status::SemanticEnrichmentView::DurableRepositoryAuthority
+        );
+        assert_eq!(result.report.semantic_enrichment.authority_generation, 1);
+        assert_eq!(
+            result.report.semantic_enrichment.entity_count, 0,
+            "live-only daemon enrichment must not be restated as durable authority"
+        );
         assert!(result.report.repository.source_cas_verified);
         assert!(result.text.contains("Kin repository-v6 status"));
+        assert!(result.text.contains("Live graph enrichment"));
+
+        let graph_response = app
+            .clone()
+            .oneshot(
+                Request::post("/commands/graph")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "command": "status" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(graph_response.status(), StatusCode::OK);
+        let graph_body = axum::body::to_bytes(graph_response.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let graph_result: kin_cli::commands::graph::GraphCommandResponse =
+            serde_json::from_slice(&graph_body).unwrap();
+        assert!(
+            graph_result
+                .lines
+                .iter()
+                .any(|line| line.contains("Entities: 1")),
+            "graph status must report the daemon's mutable live view: {:?}",
+            graph_result.lines
+        );
+
+        let mcp_result = mcp_call(app, "kin_graph_status", serde_json::json!({})).await;
+        assert_ne!(
+            mcp_result.is_error,
+            Some(true),
+            "live MCP graph status failed: {mcp_result:?}"
+        );
+        let mcp_status: kin_mcp::handlers::entities::GraphStatusReport =
+            serde_json::from_str(&mcp_result_text(&mcp_result)).unwrap();
+        assert_eq!(
+            mcp_status.entity_count, 1,
+            "MCP graph status must not reuse the durable zero count"
+        );
+        assert_eq!(
+            mcp_status.view,
+            kin_mcp::handlers::entities::GraphStatusView::DaemonSelectedGraph
+        );
+        assert_eq!(
+            mcp_status.scope,
+            kin_mcp::handlers::entities::GraphStatusScope::Head
+        );
+        assert_eq!(
+            mcp_status.embedding_source,
+            kin_mcp::handlers::entities::GraphStatusEmbeddingSource::SelectedGraph
+        );
+        assert_eq!(
+            mcp_status.authority,
+            kin_mcp::handlers::entities::GraphStatusAuthority::RepoDaemon
+        );
+        assert_eq!(
+            mcp_status.sampling,
+            kin_mcp::handlers::entities::GraphStatusSampling::PointInTimeSelectedGraph
+        );
+        assert!(!mcp_status.completion_attested);
+        assert!(mcp_status.response_envelope.is_none());
+    }
+
+    #[tokio::test]
+    async fn mcp_graph_status_labels_the_graph_selected_by_temporal_scope() {
+        let state = test_state();
+        state
+            .graph
+            .upsert_entity(&test_entity("head_only", "src/head.rs"))
+            .unwrap();
+
+        let scoped_graph = Arc::new(kin_db::InMemoryGraph::new());
+        scoped_graph
+            .upsert_entity(&test_entity("historical_one", "src/old_one.rs"))
+            .unwrap();
+        scoped_graph
+            .upsert_entity(&test_entity("historical_two", "src/old_two.rs"))
+            .unwrap();
+        let scoped_entity_count = scoped_graph.entity_count();
+        let scoped_relation_count = scoped_graph.relation_count();
+        let scoped_embeddings = scoped_graph.embedding_status();
+        let session_id = SessionId::new();
+        state
+            .set_session_scope(
+                &session_id,
+                "git:historical".to_string(),
+                SemanticChangeId::from_hash(Hash256::from_bytes([0x7a; 32])),
+                Arc::clone(&scoped_graph),
+            )
+            .await;
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let result = mcp_call_as(
+            router(Arc::clone(&state)),
+            "kin_graph_status",
+            serde_json::json!({}),
+            session_id,
+        )
+        .await;
+        assert_ne!(result.is_error, Some(true), "{result:?}");
+        let report: kin_mcp::handlers::entities::GraphStatusReport =
+            serde_json::from_str(&mcp_result_text(&result)).unwrap();
+        assert_eq!(
+            report.scope,
+            kin_mcp::handlers::entities::GraphStatusScope::TemporalSession
+        );
+        assert_eq!(report.entity_count, scoped_entity_count);
+        assert_eq!(report.relation_count, scoped_relation_count);
+        assert_eq!(report.embeddings_indexed, scoped_embeddings.indexed);
+        assert_eq!(report.embeddings_pending, scoped_embeddings.pending);
+        assert_eq!(report.embeddings_total, scoped_embeddings.total);
+
+        // Scope comes from the graph resolver, not merely from the presence of
+        // a header. An unknown session therefore reports the actual HEAD view.
+        let unscoped = mcp_call_as(
+            router(state),
+            "kin_graph_status",
+            serde_json::json!({}),
+            SessionId::new(),
+        )
+        .await;
+        let unscoped_report: kin_mcp::handlers::entities::GraphStatusReport =
+            serde_json::from_str(&mcp_result_text(&unscoped)).unwrap();
+        assert_eq!(
+            unscoped_report.scope,
+            kin_mcp::handlers::entities::GraphStatusScope::Head
+        );
+        assert_eq!(unscoped_report.entity_count, 1);
+    }
+
+    #[tokio::test]
+    async fn mcp_graph_status_fails_loud_while_embedding_coverage_is_changing() {
+        let state = test_state();
+        let graph = Arc::clone(&state.graph);
+        let _embedding_guard = state.embedding_work.lock().unwrap();
+
+        let result = mcp_graph_status_with_stable_authority(
+            &state,
+            None,
+            &graph,
+            RequestGraphAuthority::Head,
+            kin_mcp::handlers::entities::GraphStatusScope::Head,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.is_error, Some(true));
+        assert!(
+            mcp_result_text(&result).contains("embedding coverage is changing"),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_graph_status_fails_loud_during_graph_authority_mutation() {
+        let state = test_state();
+        let graph = Arc::clone(&state.graph);
+        let _mutation_guard = state.begin_graph_authority_mutation();
+
+        let result = mcp_graph_status_with_stable_authority(
+            &state,
+            None,
+            &graph,
+            RequestGraphAuthority::Head,
+            kin_mcp::handlers::entities::GraphStatusScope::Head,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.is_error, Some(true));
+        assert!(
+            mcp_result_text(&result).contains("changed during status sampling"),
+            "{result:?}"
+        );
     }
 
     #[tokio::test]

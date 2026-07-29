@@ -2117,7 +2117,8 @@ fn read_single_git_pointer(path: &Path, label: &str) -> Result<String> {
 
 fn git_authority_output(repo_root: &Path, args: &[&str]) -> Result<String> {
     let git = which::which("git").context("git is required to validate workspace MCP authority")?;
-    let output = std::process::Command::new(git)
+    let mut command = std::process::Command::new(git);
+    command
         .arg("-C")
         .arg(repo_root)
         .args(args)
@@ -2128,7 +2129,13 @@ fn git_authority_output(repo_root: &Path, args: &[&str]) -> Result<String> {
         .env_remove("GIT_OBJECT_DIRECTORY")
         .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
         .env_remove("GIT_CEILING_DIRECTORIES")
-        .env_remove("GIT_DISCOVERY_ACROSS_FILESYSTEM")
+        .env_remove("GIT_DISCOVERY_ACROSS_FILESYSTEM");
+    #[cfg(test)]
+    command.env("GIT_CONFIG_NOSYSTEM", "1").env(
+        "GIT_CONFIG_GLOBAL",
+        if cfg!(windows) { "NUL" } else { "/dev/null" },
+    );
+    let output = command
         .output()
         .with_context(|| format!("failed to run git {:?}", args))?;
     if !output.status.success() {
@@ -15040,9 +15047,12 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
         let main = dir.path().join("main");
         let linked = dir.path().join("linked");
         fs::create_dir_all(&main).unwrap();
+        let null_git_config = if cfg!(windows) { "NUL" } else { "/dev/null" };
         let git = |args: &[&str], cwd: &Path| {
             let output = Command::new("git")
                 .args(args)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", null_git_config)
                 .current_dir(cwd)
                 .output()
                 .unwrap();
@@ -15078,6 +15088,8 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
         }
         let status = Command::new("git")
             .args(["status", "--porcelain", "--untracked-files=all"])
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", null_git_config)
             .current_dir(&linked)
             .output()
             .unwrap();
@@ -15111,6 +15123,8 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
         fs::copy(env::current_exe().unwrap(), kin_home.join("bin/kin")).unwrap();
         let git = Command::new("git")
             .args(["init", "-q"])
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .current_dir(&repo)
             .output()
             .unwrap();
@@ -15293,6 +15307,8 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
         fs::create_dir_all(&trusted).unwrap();
         let output = Command::new("git")
             .args(["init", "-q"])
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .current_dir(&trusted)
             .output()
             .unwrap();
@@ -15328,9 +15344,12 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
         let main = dir.path().join("main");
         let linked = dir.path().join("linked");
         fs::create_dir_all(&main).unwrap();
+        let null_git_config = if cfg!(windows) { "NUL" } else { "/dev/null" };
         let git = |args: &[&str], cwd: &Path| {
             let output = Command::new("git")
                 .args(args)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", null_git_config)
                 .current_dir(cwd)
                 .output()
                 .unwrap();

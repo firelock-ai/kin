@@ -57,7 +57,20 @@ pub struct Command(std::process::Command);
 
 impl Command {
     pub fn new<S: AsRef<OsStr>>(program: S) -> Self {
-        Self(std::process::Command::new(program))
+        let is_git = program.as_ref() == OsStr::new("git");
+        let mut command = std::process::Command::new(program);
+        if is_git {
+            // Fixture repositories must not inherit aliases, hooks, signing,
+            // excludes, or other machine-global Git policy. Tests that need a
+            // hostile config set an explicit command-scoped replacement after
+            // construction.
+            command.env("GIT_CONFIG_NOSYSTEM", "1");
+            command.env(
+                "GIT_CONFIG_GLOBAL",
+                if cfg!(windows) { "NUL" } else { "/dev/null" },
+            );
+        }
+        Self(command)
     }
 
     pub fn arg<S: AsRef<OsStr>>(&mut self, arg: S) -> &mut Self {
@@ -260,7 +273,7 @@ fn daemon_compat(path: &Path) -> Result<(), String> {
 
 pub fn fresh_daemon_bin() -> PathBuf {
     let kin_bin = PathBuf::from(env!("CARGO_BIN_EXE_kin"));
-    let daemon_bin = kin_bin.with_file_name("kin-daemon");
+    let daemon_bin = kin_bin.with_file_name(format!("kin-daemon{}", std::env::consts::EXE_SUFFIX));
     if daemon_compat(&daemon_bin).is_ok() {
         return daemon_bin;
     }

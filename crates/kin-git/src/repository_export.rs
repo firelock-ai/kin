@@ -1466,7 +1466,7 @@ mod tests {
                 .trim(),
             "refs/heads/main"
         );
-        let show_ref = Command::new("git")
+        let show_ref = git_test_command()
             .arg("--git-dir")
             .arg(&exported)
             .arg("show-ref")
@@ -1665,17 +1665,17 @@ mod tests {
     }
 
     fn git(repository: &Path, args: &[&str]) -> Vec<u8> {
-        command(Command::new("git").args(args).current_dir(repository))
+        command(git_test_command().args(args).current_dir(repository))
     }
 
     fn git_bare(repository: &Path, args: &[&str]) -> Vec<u8> {
-        let mut invocation = Command::new("git");
+        let mut invocation = git_test_command();
         invocation.arg("--git-dir").arg(repository).args(args);
         command(&mut invocation)
     }
 
     fn git_with_input(repository: &Path, args: &[&str], input: &[u8]) -> Vec<u8> {
-        let mut child = Command::new("git")
+        let mut child = git_test_command()
             .args(args)
             .current_dir(repository)
             .stdin(Stdio::piped())
@@ -1694,13 +1694,22 @@ mod tests {
     }
 
     fn git_clone_without_checkout(source: &Path, destination: &Path) {
-        let mut invocation = Command::new("git");
+        let mut invocation = git_test_command();
         invocation
             .arg("clone")
             .arg("--no-checkout")
             .arg(source)
             .arg(destination);
         command(&mut invocation);
+    }
+
+    fn git_test_command() -> Command {
+        let mut command = Command::new("git");
+        command.env("GIT_CONFIG_NOSYSTEM", "1").env(
+            "GIT_CONFIG_GLOBAL",
+            if cfg!(windows) { "NUL" } else { "/dev/null" },
+        );
+        command
     }
 
     fn command(invocation: &mut Command) -> Vec<u8> {

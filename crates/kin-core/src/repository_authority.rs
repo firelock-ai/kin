@@ -8,13 +8,187 @@
 //! through daemon-owned command and MCP handlers prevents a later request from
 //! rediscovering mutable manifests or blessing a replaced `.kin/kindb` path.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
 
-use kin_db::{LocalFileBackend, RepositoryAuthorityManager, StorageBackend};
-use kin_model::{RepositoryId, WorkspaceId};
+use kin_db::{
+    LocalFileBackend, RepositoryAuthorityManager, RepositoryAuthorityState, StorageBackend,
+};
+use kin_model::{
+    EntityDelta, EntityId, RelationDelta, RelationId, RepositoryId, SemanticChangeId, WorkspaceId,
+};
 
 use crate::{KinError, KinLayout, KinManifest, Result};
+
+/// Exact semantic counts derived from one immutable repository-authority lease.
+///
+/// This is deliberately not a summary of the daemon's mutable query graph.
+/// Runtime reconcile and LSP work may add derived state to that live graph
+/// without changing repository-v6 authority. The generations here identify the
+/// durable view this summary answers for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableSemanticEnrichmentSummary {
+    pub authority_generation: u64,
+    pub workspace_generation: u64,
+    pub entity_count: usize,
+    pub relation_count: usize,
+    /// Repository-wide immutable semantic changes sealed by this authority
+    /// generation. Entity and relation counts remain workspace-scoped.
+    pub semantic_change_count: usize,
+}
+
+/// Summarize one durable workspace without materializing its complete query graph.
+///
+/// Repository authority already validated every semantic payload and the
+/// first-parent lineage semantics during admission. This read therefore needs
+/// only to replay entity/relation identities along the workspace's exact base
+/// lineage, then apply its cumulative semantic overlay. It does not clone a
+/// graph snapshot, reconstruct the exact tree, read source CAS bodies, build
+/// indices, or mix another authority generation into the result.
+pub fn durable_semantic_enrichment_summary(
+    authority: &RepositoryAuthorityState,
+    workspace_id: &WorkspaceId,
+) -> Result<DurableSemanticEnrichmentSummary> {
+    let workspace = RepositoryAuthorityState::metadata(authority)
+        .workspaces
+        .iter()
+        .find(|workspace| &workspace.workspace_id == workspace_id)
+        .ok_or_else(|| {
+            KinError::Graph(format!(
+                "repository-v6 authority has no workspace {workspace_id}"
+            ))
+        })?;
+    workspace
+        .validate()
+        .map_err(|error| KinError::Graph(error.to_string()))?;
+
+    let mut entity_ids = HashSet::new();
+    let mut relation_ids = HashSet::new();
+    if let Some(target) = workspace.base_target.as_ref() {
+        let head = authority
+            .resolve_target_change_id(target)
+            .map_err(|error| KinError::Graph(error.to_string()))?;
+        replay_first_parent_semantic_ids(authority, head, &mut entity_ids, &mut relation_ids)?;
+    }
+    apply_entity_deltas(
+        &mut entity_ids,
+        workspace.semantic_overlay.entity_deltas(),
+        "workspace semantic overlay",
+    )?;
+    apply_relation_deltas(
+        &mut relation_ids,
+        workspace.semantic_overlay.relation_deltas(),
+        "workspace semantic overlay",
+    )?;
+
+    Ok(DurableSemanticEnrichmentSummary {
+        authority_generation: authority.roots().generation,
+        workspace_generation: workspace.generation,
+        entity_count: entity_ids.len(),
+        relation_count: relation_ids.len(),
+        semantic_change_count: authority.snapshot().changes.len(),
+    })
+}
+
+fn replay_first_parent_semantic_ids(
+    authority: &RepositoryAuthorityState,
+    head: SemanticChangeId,
+    entity_ids: &mut HashSet<EntityId>,
+    relation_ids: &mut HashSet<RelationId>,
+) -> Result<()> {
+    let changes = &authority.snapshot().changes;
+    let mut reverse_lineage = Vec::new();
+    let mut seen = HashSet::new();
+    let mut current = Some(head);
+    while let Some(change_id) = current {
+        if !seen.insert(change_id) {
+            return Err(KinError::Graph(format!(
+                "cycle in durable first-parent history at change {change_id}"
+            )));
+        }
+        let change = changes.get(&change_id).ok_or_else(|| {
+            KinError::Graph(format!(
+                "durable first-parent history is missing change {change_id}"
+            ))
+        })?;
+        current = change.parents.first().copied();
+        reverse_lineage.push(change);
+    }
+
+    for change in reverse_lineage.into_iter().rev() {
+        let context = format!("semantic change {}", change.id);
+        apply_entity_deltas(entity_ids, &change.entity_deltas, &context)?;
+        apply_relation_deltas(relation_ids, &change.relation_deltas, &context)?;
+    }
+    Ok(())
+}
+
+fn apply_entity_deltas(
+    ids: &mut HashSet<EntityId>,
+    deltas: &[EntityDelta],
+    context: &str,
+) -> Result<()> {
+    for delta in deltas {
+        match delta {
+            EntityDelta::Added { new } if !ids.insert(new.id) => {
+                return Err(KinError::Graph(format!(
+                    "{context} adds existing entity {}",
+                    new.id
+                )));
+            }
+            EntityDelta::Modified { old, new } => {
+                if old.id != new.id || !ids.contains(&old.id) {
+                    return Err(KinError::Graph(format!(
+                        "{context} modifies missing or mismatched entity {}",
+                        old.id
+                    )));
+                }
+            }
+            EntityDelta::Removed { old } if !ids.remove(&old.id) => {
+                return Err(KinError::Graph(format!(
+                    "{context} removes missing entity {}",
+                    old.id
+                )));
+            }
+            EntityDelta::Added { .. } | EntityDelta::Removed { .. } => {}
+        }
+    }
+    Ok(())
+}
+
+fn apply_relation_deltas(
+    ids: &mut HashSet<RelationId>,
+    deltas: &[RelationDelta],
+    context: &str,
+) -> Result<()> {
+    for delta in deltas {
+        match delta {
+            RelationDelta::Added { new } if !ids.insert(new.id) => {
+                return Err(KinError::Graph(format!(
+                    "{context} adds existing relation {}",
+                    new.id
+                )));
+            }
+            RelationDelta::Modified { old, new } => {
+                if old.id != new.id || !ids.contains(&old.id) {
+                    return Err(KinError::Graph(format!(
+                        "{context} modifies missing or mismatched relation {}",
+                        old.id
+                    )));
+                }
+            }
+            RelationDelta::Removed { old } if !ids.remove(&old.id) => {
+                return Err(KinError::Graph(format!(
+                    "{context} removes missing relation {}",
+                    old.id
+                )));
+            }
+            RelationDelta::Added { .. } | RelationDelta::Removed { .. } => {}
+        }
+    }
+    Ok(())
+}
 
 /// Startup-pinned identity and storage capability for one local repository.
 #[derive(Clone)]

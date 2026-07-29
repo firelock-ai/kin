@@ -252,6 +252,42 @@ impl Envelope {
         }
     }
 
+    /// Bind the stdio response envelope to the same selected-graph observation
+    /// carried by `kin.graph-status.v1`.
+    ///
+    /// Generic daemon responses enrich their envelope from `/health`. That
+    /// endpoint is HEAD-scoped, so using it for a temporal-session graph status
+    /// would mix two graph views in one payload. Graph status instead supplies
+    /// its own entity and embedding observations here. Fields that only
+    /// `/health` knows stay absent rather than being borrowed from HEAD.
+    pub fn with_selected_graph_observation(
+        mut self,
+        entity_count: u64,
+        embeddings_indexed: u64,
+        embeddings_pending: u64,
+        embeddings_total: u64,
+    ) -> Self {
+        let complete = embeddings_pending == 0 && embeddings_indexed == embeddings_total;
+        self.runtime = Runtime::RepoDaemon;
+        self.semantic_coverage = Some(SemanticCoverage {
+            indexed: embeddings_indexed,
+            total: embeddings_total,
+            pending: embeddings_pending,
+            complete,
+            note: (!complete).then(|| {
+                "Selected-graph embedding coverage is incomplete at this point-in-time observation."
+                    .to_string()
+            }),
+        });
+        self.graph_as_of = None;
+        self.graph_state = GraphState {
+            entity_count: Some(entity_count),
+            ..GraphState::default()
+        };
+        self.degraded = Degraded::default();
+        self
+    }
+
     /// Envelope for the case where the daemon was required but unreachable. The
     /// accompanying tool result is a transport error; this flags it structurally.
     pub fn daemon_unreachable() -> Self {

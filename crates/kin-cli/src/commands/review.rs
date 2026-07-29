@@ -1202,10 +1202,13 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path();
+        let null_git_config = if cfg!(windows) { "NUL" } else { "/dev/null" };
 
         let git = |args: &[&str]| {
             let output = Command::new("git")
                 .args(args)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", null_git_config)
                 .current_dir(repo)
                 .output()
                 .expect("run git");
@@ -1223,16 +1226,25 @@ mod tests {
             let date = format!("{epoch} +0000");
             let output = Command::new("git")
                 .args(["commit", "-m", message])
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", null_git_config)
                 .env("GIT_AUTHOR_DATE", &date)
                 .env("GIT_COMMITTER_DATE", &date)
                 .current_dir(repo)
                 .output()
                 .expect("git commit");
-            assert!(output.status.success(), "git commit failed");
+            assert!(
+                output.status.success(),
+                "git commit failed: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
         };
         let head_sha = || {
             let output = Command::new("git")
                 .args(["rev-parse", "HEAD"])
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", null_git_config)
                 .current_dir(repo)
                 .output()
                 .expect("git rev-parse HEAD");

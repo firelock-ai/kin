@@ -480,10 +480,14 @@ fn git_output_optional(repo_path: &Path, args: &[&str]) -> Option<String> {
 }
 
 fn git_output_inner(repo_path: &Path, args: &[&str]) -> Result<String> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(repo_path)
-        .output()?;
+    let mut command = Command::new("git");
+    command.args(args).current_dir(repo_path);
+    #[cfg(test)]
+    command.env("GIT_CONFIG_NOSYSTEM", "1").env(
+        "GIT_CONFIG_GLOBAL",
+        if cfg!(windows) { "NUL" } else { "/dev/null" },
+    );
+    let output = command.output()?;
     if !output.status.success() {
         return Err(anyhow::anyhow!(
             "git {} failed: {}",
@@ -514,8 +518,34 @@ mod tests {
         vector_index_metadata_version,
     };
     use std::fs;
+    use std::path::Path;
     use std::process::Command;
     use tempfile::tempdir;
+
+    fn test_git_command(repo: &Path) -> Command {
+        let mut command = Command::new("git");
+        command
+            .current_dir(repo)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env(
+                "GIT_CONFIG_GLOBAL",
+                if cfg!(windows) { "NUL" } else { "/dev/null" },
+            );
+        command
+    }
+
+    fn run_test_git(repo: &Path, args: &[&str]) {
+        let output = test_git_command(repo)
+            .args(args)
+            .output()
+            .unwrap_or_else(|error| panic!("run git {args:?}: {error}"));
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     #[test]
     fn feature_flags_reflect_compile_configuration() {
@@ -563,31 +593,14 @@ mod tests {
     fn prepared_manifest_tracks_repo_state() {
         let repo = tempdir().unwrap();
         fs::write(repo.path().join("README.md"), "hello\n").unwrap();
-        Command::new("git")
-            .args(["init"])
-            .current_dir(repo.path())
-            .output()
-            .unwrap();
-        Command::new("git")
-            .args(["config", "user.email", "kin@example.com"])
-            .current_dir(repo.path())
-            .output()
-            .unwrap();
-        Command::new("git")
-            .args(["config", "user.name", "Kin"])
-            .current_dir(repo.path())
-            .output()
-            .unwrap();
-        Command::new("git")
-            .args(["add", "README.md"])
-            .current_dir(repo.path())
-            .output()
-            .unwrap();
-        let commit = Command::new("git")
+        run_test_git(repo.path(), &["init"]);
+        run_test_git(repo.path(), &["config", "user.email", "kin@example.com"]);
+        run_test_git(repo.path(), &["config", "user.name", "Kin"]);
+        run_test_git(repo.path(), &["add", "README.md"]);
+        let commit = test_git_command(repo.path())
             .args(["commit", "--signoff", "-m", "init"])
             .env("GIT_AUTHOR_DATE", "1000000000 +0000")
             .env("GIT_COMMITTER_DATE", "1000000000 +0000")
-            .current_dir(repo.path())
             .output()
             .unwrap();
         assert!(
@@ -618,31 +631,14 @@ mod tests {
     fn prepared_manifest_cache_keys_track_kin_commit_and_dirty() {
         let repo = tempdir().unwrap();
         fs::write(repo.path().join("README.md"), "hello\n").unwrap();
-        Command::new("git")
-            .args(["init"])
-            .current_dir(repo.path())
-            .output()
-            .unwrap();
-        Command::new("git")
-            .args(["config", "user.email", "kin@example.com"])
-            .current_dir(repo.path())
-            .output()
-            .unwrap();
-        Command::new("git")
-            .args(["config", "user.name", "Kin"])
-            .current_dir(repo.path())
-            .output()
-            .unwrap();
-        Command::new("git")
-            .args(["add", "README.md"])
-            .current_dir(repo.path())
-            .output()
-            .unwrap();
-        let commit = Command::new("git")
+        run_test_git(repo.path(), &["init"]);
+        run_test_git(repo.path(), &["config", "user.email", "kin@example.com"]);
+        run_test_git(repo.path(), &["config", "user.name", "Kin"]);
+        run_test_git(repo.path(), &["add", "README.md"]);
+        let commit = test_git_command(repo.path())
             .args(["commit", "--signoff", "-m", "init"])
             .env("GIT_AUTHOR_DATE", "1000000100 +0000")
             .env("GIT_COMMITTER_DATE", "1000000100 +0000")
-            .current_dir(repo.path())
             .output()
             .unwrap();
         assert!(
