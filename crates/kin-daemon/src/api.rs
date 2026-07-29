@@ -497,6 +497,13 @@ pub struct RepoRefEntry {
     pub is_default_branch: bool,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RepoShadowReviewRequest {
+    base: String,
+    head: String,
+}
+
 /// Repo history response.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RepoHistoryResponse {
@@ -895,6 +902,10 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route("/repos/{repo_id}/files", get(repo_files))
         .route("/repos/{repo_id}/refs", get(repo_refs))
         .route("/repos/{repo_id}/history", get(repo_history))
+        .route(
+            "/repos/{repo_id}/review/shadow",
+            post(repo_shadow_review).layer(DefaultBodyLimit::max(4 * 1024)),
+        )
         .route(
             "/repos/{repo_id}/transfer/advertise",
             get(repo_transfer_advertise),
@@ -6553,6 +6564,162 @@ fn resolve_repository_ref_target(
     }
 }
 
+fn ensure_repo_shadow_change(
+    snapshot: &kin_db::GraphSnapshot,
+    change_id: kin_model::SemanticChangeId,
+    reference: &str,
+) -> Result<kin_model::SemanticChangeId, (StatusCode, String)> {
+    if snapshot.changes.contains_key(&change_id) {
+        return Ok(change_id);
+    }
+    Err((
+        StatusCode::FAILED_DEPENDENCY,
+        format!(
+            "repository-v6 ref {reference:?} resolves to {change_id}, which is not materialized in graph authority"
+        ),
+    ))
+}
+
+fn parse_repo_shadow_change(
+    snapshot: &kin_db::GraphSnapshot,
+    reference: &str,
+) -> Result<kin_model::SemanticChangeId, (StatusCode, String)> {
+    let hash = kin_model::Hash256::from_hex(reference).map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("invalid semantic change ID {reference:?}: {error}"),
+        )
+    })?;
+    if hash.to_string() != reference {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "semantic change ID must use canonical lowercase hexadecimal encoding".to_string(),
+        ));
+    }
+    ensure_repo_shadow_change(
+        snapshot,
+        kin_model::SemanticChangeId::from_hash(hash),
+        reference,
+    )
+}
+
+fn parse_repo_shadow_git_oid(
+    snapshot: &kin_db::GraphSnapshot,
+    reference: &str,
+) -> Result<kin_model::SemanticChangeId, (StatusCode, String)> {
+    if !reference.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("invalid Git object ID {reference:?}: expected hexadecimal bytes"),
+        ));
+    }
+    let bytes = hex::decode(reference).map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("invalid Git object ID {reference:?}: {error}"),
+        )
+    })?;
+    let oid = match bytes.len() {
+        20 => kin_model::GitObjectId::sha1(
+            bytes
+                .try_into()
+                .expect("20-byte Git object IDs convert to SHA-1 arrays"),
+        ),
+        32 => kin_model::GitObjectId::sha256(
+            bytes
+                .try_into()
+                .expect("32-byte Git object IDs convert to SHA-256 arrays"),
+        ),
+        length => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "invalid Git object ID {reference:?}: expected 20 or 32 bytes, found {length}"
+                ),
+            ));
+        }
+    };
+    let metadata = repository_metadata(snapshot)?;
+    let change_id = metadata
+        .aliases
+        .iter()
+        .find(|alias| alias.oid == oid)
+        .map(|alias| alias.change_id)
+        .ok_or_else(|| {
+            (
+                StatusCode::FAILED_DEPENDENCY,
+                format!("Git object ID {reference:?} has no repository-v6 semantic alias"),
+            )
+        })?;
+    ensure_repo_shadow_change(snapshot, change_id, reference)
+}
+
+fn resolve_repo_shadow_ref(
+    snapshot: &kin_db::GraphSnapshot,
+    reference: &str,
+) -> Result<kin_model::SemanticChangeId, (StatusCode, String)> {
+    if let Some(branch) = reference.strip_prefix("branch:") {
+        return resolve_repo_shadow_branch(snapshot, branch, reference);
+    }
+    if let Some(change) = reference
+        .strip_prefix("kin:")
+        .or_else(|| reference.strip_prefix("change:"))
+    {
+        return parse_repo_shadow_change(snapshot, change);
+    }
+    if let Some(oid) = reference.strip_prefix("git:") {
+        return parse_repo_shadow_git_oid(snapshot, oid);
+    }
+    if reference.len() == 40 && reference.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return parse_repo_shadow_git_oid(snapshot, reference);
+    }
+    if reference.len() == 64
+        && reference
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return parse_repo_shadow_change(snapshot, reference);
+    }
+    resolve_repo_shadow_branch(snapshot, reference, reference)
+}
+
+fn resolve_repo_shadow_branch(
+    snapshot: &kin_db::GraphSnapshot,
+    branch: &str,
+    reference: &str,
+) -> Result<kin_model::SemanticChangeId, (StatusCode, String)> {
+    let name = if branch.starts_with("refs/") {
+        kin_model::RefName::from_utf8(branch).map_err(|error| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("invalid fully-qualified repository ref {reference:?}: {error}"),
+            )
+        })?
+    } else {
+        kin_model::RefName::branch(branch.as_bytes()).map_err(|error| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("invalid branch ref {reference:?}: {error}"),
+            )
+        })?
+    };
+    let metadata = repository_metadata(snapshot)?;
+    let target = metadata
+        .ref_state
+        .refs
+        .iter()
+        .find(|repository_ref| repository_ref.name == name)
+        .map(|repository_ref| &repository_ref.target)
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("repository ref {reference:?} does not exist"),
+            )
+        })?;
+    let change_id = resolve_repository_ref_target(snapshot, target)?;
+    ensure_repo_shadow_change(snapshot, change_id, reference)
+}
+
 fn default_repository_ref(
     metadata: &kin_db::PersistedRepositoryAuthority,
 ) -> Option<&kin_model::RepositoryRef> {
@@ -7247,6 +7414,54 @@ async fn repo_refs(
         head_ref: selected_head,
         refs,
     }))
+}
+
+/// POST /repos/{repo_id}/review/shadow — graph-authoritative, repo-scoped
+/// semantic review for hosted clients that do not have a local checkout.
+async fn repo_shadow_review(
+    Path(repo_id): Path<String>,
+    State(state): State<Arc<DaemonState>>,
+    Json(request): Json<RepoShadowReviewRequest>,
+) -> std::result::Result<impl IntoResponse, (StatusCode, String)> {
+    let base_ref = request.base.trim().to_string();
+    let head_ref = request.head.trim().to_string();
+    if base_ref.is_empty() || head_ref.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "shadow review requires non-empty base and head refs".to_string(),
+        ));
+    }
+
+    // One immutable repository-v6 snapshot owns ref resolution and review
+    // evaluation. The route never consults a checkout, Git object database, or
+    // another mutable graph generation.
+    let snapshot = repository_authority_snapshot(&state, &repo_id).await?;
+    let resolved_base = resolve_repo_shadow_ref(&snapshot, &base_ref)?;
+    let resolved_head = resolve_repo_shadow_ref(&snapshot, &head_ref)?;
+    let root_hash = kin_db::compute_graph_root_hash(&snapshot);
+    let graph =
+        kin_db::InMemoryGraph::from_snapshot_without_text_index_with_root_hash(snapshot, root_hash)
+            .map_err(repository_authority_error)?;
+    let report = kin_review::build_shadow_report(
+        &graph,
+        &kin_review::ShadowRequest {
+            base_ref,
+            head_ref,
+            resolved_base,
+            resolved_head,
+            title: None,
+            source_url: None,
+            author: None,
+            actor: "kin-daemon-http".to_string(),
+        },
+    )
+    .map_err(|error| {
+        (
+            StatusCode::FAILED_DEPENDENCY,
+            format!("shadow review could not be built from graph authority: {error}"),
+        )
+    })?;
+    Ok(Json(report))
 }
 
 /// GET /repos/{repo_id}/history — first-parent history of the default ref.
@@ -10285,6 +10500,127 @@ mod tests {
         drop(authority);
         let state = Arc::new(DaemonState::open(layout.clone()).unwrap());
         (state, layout, repository, main_change, feature_change)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn repo_shadow_review_resolves_refs_from_one_repository_authority_snapshot() {
+        let (state, _layout, repository, main_change, feature_change) =
+            universal_branch_test_state("repo-shadow-review");
+        let repo_id = state.cached_repo_id.clone();
+        let mut resolver_snapshot = repository_authority_snapshot(&state, &repo_id)
+            .await
+            .unwrap();
+        let metadata = resolver_snapshot.repository_authority.as_mut().unwrap();
+        let repository_id = metadata.repository_id.clone();
+        let ambiguous_branch_names = ["z".repeat(40), "Z".repeat(64)];
+        for branch in &ambiguous_branch_names {
+            metadata.ref_state.refs.push(kin_model::RepositoryRef {
+                repository_id: repository_id.clone(),
+                name: kin_model::RefName::branch(branch.as_bytes()).unwrap(),
+                target: kin_model::RefTarget::change(feature_change),
+            });
+        }
+        for branch in ambiguous_branch_names {
+            assert_eq!(
+                resolve_repo_shadow_ref(&resolver_snapshot, &branch).unwrap(),
+                feature_change,
+                "hex-length branch names that are not canonical raw IDs remain branches"
+            );
+        }
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::post(format!("/repos/{repo_id}/review/shadow"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "base": "branch:main",
+                            "head": "branch:feature",
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 2 * 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let report: kin_review::ShadowGateReport = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            report.schema_version,
+            kin_review::SHADOW_GATE_REPORT_SCHEMA_VERSION
+        );
+        assert_eq!(report.mode, "shadow");
+        assert_eq!(report.input.base_ref, "branch:main");
+        assert_eq!(report.input.head_ref, "branch:feature");
+        assert_eq!(report.input.resolved_base, main_change.to_string());
+        assert_eq!(report.input.resolved_head, feature_change.to_string());
+        assert_eq!(report.policy.enforcement, "report_only");
+
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::post(format!("/repos/{repo_id}/review/shadow"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "base": main_change.to_string(),
+                            "head": feature_change.to_string(),
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let git_output = std::process::Command::new("git")
+            .args(["rev-parse", "main", "feature"])
+            .current_dir(&repository)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(git_output.status.success());
+        let git_oids = String::from_utf8(git_output.stdout).unwrap();
+        let mut git_oids = git_oids.lines();
+        let git_main = git_oids.next().unwrap();
+        let git_feature = git_oids.next().unwrap();
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::post(format!("/repos/{repo_id}/review/shadow"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "base": format!("git:{git_main}"),
+                            "head": git_feature,
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = router(state)
+            .oneshot(
+                Request::post(format!("/repos/{repo_id}/review/shadow"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "base": "branch:missing",
+                            "head": "branch:feature",
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[cfg(unix)]
