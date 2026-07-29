@@ -30,10 +30,11 @@ pub struct RepositoryArtifactCoverage {
     ///
     /// Absence is not a defect under the current substrate. No admission path
     /// writes the facet layer: exact Git admission binds entity and relation
-    /// deltas derived from supported sources and nothing else, and the facet
-    /// layer is written one file at a time by reconcile as it enriches them.
-    /// Every coverage level from none to full is therefore a reachable healthy
-    /// state, so this count describes progress rather than divergence.
+    /// deltas derived from supported sources and nothing else. Facets are
+    /// written one file at a time, after admission, by the reconcile loop, the
+    /// commit path, and projection. Every coverage level from none to full is
+    /// therefore a reachable healthy state, so this count describes progress
+    /// rather than divergence.
     pub missing_enrichment_path_count: usize,
     pub conflicting_enrichment_path_count: usize,
     pub stale_enrichment_path_count: usize,
@@ -371,15 +372,16 @@ fn build_graph_health_report(
 
     // Pending enrichment is expected, so it is reported and never promoted to
     // a failure. Nothing in the current substrate produces a facet at
-    // admission, and reconcile produces them one file at a time, so a health
-    // surface that failed on absence would fail on every healthy repository
-    // until the last file happened to be touched. What remains fail-closed is
-    // every facet that exists and disagrees with exact tree truth, below.
+    // admission, and the paths that do produce them work one file at a time,
+    // so a health surface that failed on absence would fail on every healthy
+    // repository until the last file happened to be touched. What remains
+    // fail-closed is every facet that exists and disagrees with exact tree
+    // truth, below.
     if artifact_coverage.missing_enrichment_path_count > 0 {
         notes.push(format!(
             "{} of {} admitted regular files have no query-facing enrichment facet yet; \
              authority admission binds the entity layer only and facets are written per file \
-             as reconcile enriches them",
+             after it",
             artifact_coverage.missing_enrichment_path_count,
             artifact_coverage.enrichable_artifact_count
         ));

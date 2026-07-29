@@ -271,6 +271,12 @@ fn render_support_json(report: &SupportJson) -> Vec<String> {
             lines.push(format!("  warning: {warning}"));
         }
     }
+    // Notes explain an expected absence, so they follow the verdict here for
+    // the same reason they do in `graph status`. Without them, incomplete
+    // coverage reads as an unexplained shortfall.
+    for note in &report.health.notes {
+        lines.push(format!("  note: {note}"));
+    }
 
     lines
 }
@@ -413,6 +419,66 @@ mod tests {
                 "  warning: 1 files are still shallow-tracked".to_string(),
             ]
         );
+    }
+
+    /// Incomplete coverage on a freshly admitted repository is expected, so
+    /// the observability surface has to say why rather than leave an operator
+    /// reading an unexplained shortfall.
+    #[test]
+    fn pending_enrichment_is_explained_beside_incomplete_coverage() {
+        let stats = GraphStats {
+            entity_counts: HashMap::new(),
+            relation_counts: HashMap::new(),
+            parse_completeness_counts: HashMap::new(),
+            shallow_file_count: 0,
+            file_layout_count: 0,
+            structured_artifact_count: 0,
+            opaque_artifact_count: 0,
+            working_tree_entry_count: 0,
+            text_indexed_entity_count: 0,
+            text_index_coverage_percent: 0.0,
+            indexed_embedding_count: 0,
+            pending_embedding_count: 0,
+            embedding_coverage_percent: 0.0,
+            work_item_count: 0,
+            test_case_count: 0,
+            review_count: 0,
+            session_count: 0,
+            total_entities: 9,
+            total_relations: 7,
+            role_counts: HashMap::new(),
+        };
+        let health = GraphHealthReport {
+            repository_artifact_coverage: artifact_coverage(7, 7, 7, 0, 0),
+            supported_entity_source_file_count: 7,
+            supported_shallow_source_file_count: 0,
+            graph_empty_for_supported_inputs: false,
+            contaminated_entity_count: 0,
+            contaminated_non_entity_count: 0,
+            contaminated_path_count: 0,
+            contaminated_paths_sample: Vec::new(),
+            test_role_entity_count: 0,
+            test_case_count: 0,
+            cochange_relation_count: 0,
+            semantic_relation_count: 7,
+            semantic_relation_density_excluding_cochanges: 0.78,
+            critical_issues: Vec::new(),
+            warnings: Vec::new(),
+            notes: vec![
+                "7 of 7 admitted regular files have no query-facing enrichment facet yet"
+                    .to_string(),
+            ],
+        };
+
+        let rendered = render_support_report(&stats, &health);
+
+        assert!(rendered
+            .iter()
+            .any(|line| line == "  repository artifact coverage: incomplete"));
+        assert!(rendered
+            .iter()
+            .any(|line| line.starts_with("  note: 7 of 7 admitted regular files")));
+        assert!(!rendered.iter().any(|line| line.starts_with("  critical:")));
     }
 
     #[test]
