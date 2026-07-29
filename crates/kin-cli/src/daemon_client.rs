@@ -21,6 +21,26 @@ use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 static BUILD_MISMATCH_REPORTED: AtomicBool = AtomicBool::new(false);
+#[cfg(unix)]
+const TEST_RUNTIME_OWNER_ENV: &str = "KIN_TEST_RUNTIME_OWNER_TOKEN";
+#[cfg(unix)]
+const TEST_RUNTIME_PROCESS_GROUP_ENV: &str = "KIN_TEST_RUNTIME_CONTAINMENT_PROCESS_GROUP";
+
+#[cfg(unix)]
+fn should_detach_daemon_process() -> bool {
+    // Integration tests place every CLI invocation in a stable OS process
+    // containment before launch. Retaining that group lets the harness reap a
+    // supervisor or worker even when graceful product cleanup fails. The
+    // owner marker alone is insufficient: the declared group must match the
+    // caller's live group, so a stray ambient variable cannot disable normal
+    // production detachment.
+    let owned = std::env::var_os(TEST_RUNTIME_OWNER_ENV).is_some_and(|value| !value.is_empty());
+    let expected_group = std::env::var(TEST_RUNTIME_PROCESS_GROUP_ENV)
+        .ok()
+        .and_then(|value| value.parse::<libc::pid_t>().ok())
+        .filter(|group| *group > 0);
+    !(owned && expected_group == Some(unsafe { libc::getpgrp() }))
+}
 
 /// Repository/session authority inherited by the CLI must not leak into a
 /// daemon process. Daemons receive their repository explicitly through
@@ -2429,7 +2449,7 @@ pub async fn ensure_supervisor_running() -> Result<String> {
     }
 
     #[cfg(unix)]
-    {
+    if should_detach_daemon_process() {
         use std::os::unix::process::CommandExt;
         unsafe {
             cmd.pre_exec(|| {
@@ -2734,7 +2754,7 @@ pub async fn ensure_daemon_running_with_idle_timeout(
     cmd.env("KIN_SUPERVISOR_URL", &supervisor_url);
 
     #[cfg(unix)]
-    {
+    if should_detach_daemon_process() {
         use std::os::unix::process::CommandExt;
         unsafe {
             cmd.pre_exec(|| {

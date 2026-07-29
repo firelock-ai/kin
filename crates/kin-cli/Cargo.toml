@@ -90,6 +90,7 @@ unicode-normalization = "0.1"
 kin-spine = { version = "0.3.6", path = "../kin-spine" }
 
 [dev-dependencies]
+kin-git = { workspace = true, features = ["test-support"] }
 pretty_assertions = { workspace = true }
 serial_test = { workspace = true }
 

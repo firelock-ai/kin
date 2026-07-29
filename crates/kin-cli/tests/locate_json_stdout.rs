@@ -61,10 +61,10 @@ fn commit_worktree(repo: &std::path::Path, message: &str) {
     );
 }
 
-fn kin_command(runtime: &common::IsolatedDaemonRuntime) -> Command {
+fn kin_command(runtime: &common::IsolatedDaemonRuntime) -> Command<'_> {
     let mut cmd = runtime.kin_command();
     cmd.env("KIN_DAEMON_DISABLE_LSP", "1")
-        .env("KIN_DAEMON_BIN", common::fresh_daemon_bin())
+        .env("KIN_DAEMON_BIN", runtime.daemon_bin())
         .env("KIN_DAEMON_IDLE_TIMEOUT_SECS", "1")
         .env("KIN_DAEMON_READY_TIMEOUT_SECS", "30")
         .env("KIN_BYPASS_EMBEDDING_COVERAGE_CHECK", "1");
@@ -189,7 +189,7 @@ fn locate_autostarts_daemon_when_available() {
         String::from_utf8_lossy(&init.stderr)
     );
 
-    let daemon_bin = common::fresh_daemon_bin();
+    let daemon_bin = runtime.daemon_bin();
     assert!(daemon_bin.exists(), "kin-daemon test binary path");
     let daemon_dir = daemon_bin.parent().expect("daemon bin dir");
     let mut path_entries =

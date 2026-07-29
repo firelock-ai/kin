@@ -15,9 +15,9 @@ mod common;
 
 use common::Command;
 
-fn kin_command() -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_kin"));
-    cmd.env("KIN_DAEMON_BIN", common::fresh_daemon_bin());
+fn kin_command(runtime: &common::IsolatedDaemonRuntime) -> Command<'_> {
+    let mut cmd = runtime.kin_command();
+    cmd.env("KIN_DAEMON_BIN", runtime.daemon_bin());
     cmd
 }
 
@@ -132,8 +132,9 @@ fn setup_divergent_repo(repo: &Path) -> (String, String) {
     (branch_a, branch_b)
 }
 
-fn kin_init(repo: &Path) {
-    let init = kin_command()
+fn kin_init(repo: &Path) -> common::IsolatedDaemonRuntime {
+    let runtime = common::IsolatedDaemonRuntime::new(repo);
+    let init = kin_command(&runtime)
         .arg("init")
         .current_dir(repo)
         .output()
@@ -144,10 +145,16 @@ fn kin_init(repo: &Path) {
         String::from_utf8_lossy(&init.stdout),
         String::from_utf8_lossy(&init.stderr)
     );
+    runtime
 }
 
-fn run_shadow_json(repo: &Path, base: &str, head: &str) -> Value {
-    let output = kin_command()
+fn run_shadow_json(
+    runtime: &common::IsolatedDaemonRuntime,
+    repo: &Path,
+    base: &str,
+    head: &str,
+) -> Value {
+    let output = kin_command(runtime)
         .args(["review", "shadow", &format!("{base}..{head}"), "--json"])
         .arg("--title")
         .arg("Shadow gate smoke")
@@ -174,9 +181,9 @@ fn shadow_report_stamps_range_depth_provenance() {
     let dir = tempdir().expect("tempdir");
     let repo = dir.path();
     let (base, head, _artifact_head) = setup_fixture_repo(repo);
-    kin_init(repo);
+    let runtime = kin_init(repo);
 
-    let report = run_shadow_json(repo, &base, &head);
+    let report = run_shadow_json(&runtime, repo, &base, &head);
 
     let range_depth = report
         .get("range_depth")
@@ -208,9 +215,9 @@ fn shadow_report_end_to_end_change_in_report_out() {
     let dir = tempdir().expect("tempdir");
     let repo = dir.path();
     let (base, head, _artifact_head) = setup_fixture_repo(repo);
-    kin_init(repo);
+    let runtime = kin_init(repo);
 
-    let report = run_shadow_json(repo, &base, &head);
+    let report = run_shadow_json(&runtime, repo, &base, &head);
 
     // Contract identity: report-only shadow payload with exact artifact trees.
     assert_eq!(report["schema_version"], 2);
@@ -319,10 +326,10 @@ fn shadow_report_labels_config_only_change_without_demoting() {
     run_git(repo, &["add", "-A"]);
     run_git(repo, &["commit", "-m", "artifact: relax policy config"]);
     let config_edit_head = git_head(repo);
-    kin_init(repo);
+    let runtime = kin_init(repo);
 
     // Adding the config artifact is a tree-structure transition.
-    let added = run_shadow_json(repo, &head, &artifact_head);
+    let added = run_shadow_json(&runtime, repo, &head, &artifact_head);
     let added_gaps = added["evidence_gaps"].as_array().unwrap();
     assert!(
         added_gaps.iter().any(
@@ -333,7 +340,7 @@ fn shadow_report_labels_config_only_change_without_demoting() {
 
     // Editing it in place is a pure content change the semantic graph cannot
     // see: the report must say so explicitly as an evidence gap.
-    let report = run_shadow_json(repo, &artifact_head, &config_edit_head);
+    let report = run_shadow_json(&runtime, repo, &artifact_head, &config_edit_head);
     let gaps = report["evidence_gaps"].as_array().unwrap();
     assert!(
         gaps.iter()
@@ -356,9 +363,9 @@ fn shadow_report_fails_loud_on_unknown_ref() {
     let dir = tempdir().expect("tempdir");
     let repo = dir.path();
     let (_base, head, _artifact_head) = setup_fixture_repo(repo);
-    kin_init(repo);
+    let runtime = kin_init(repo);
 
-    let output = kin_command()
+    let output = kin_command(&runtime)
         .args([
             "review",
             "shadow",
@@ -384,9 +391,9 @@ fn shadow_report_head_caret_resolves_from_a_fresh_init() {
     let dir = tempdir().expect("tempdir");
     let repo = dir.path();
     setup_fixture_repo(repo);
-    kin_init(repo);
+    let runtime = kin_init(repo);
 
-    let report = run_shadow_json(repo, "HEAD^", "HEAD");
+    let report = run_shadow_json(&runtime, repo, "HEAD^", "HEAD");
 
     assert_eq!(report["schema_version"], 2);
     assert_eq!(report["mode"], "shadow");
@@ -407,10 +414,10 @@ fn shadow_report_head_caret_and_head_tilde_one_agree() {
     let dir = tempdir().expect("tempdir");
     let repo = dir.path();
     setup_fixture_repo(repo);
-    kin_init(repo);
+    let runtime = kin_init(repo);
 
-    let caret_report = run_shadow_json(repo, "HEAD^", "HEAD");
-    let tilde_report = run_shadow_json(repo, "HEAD~1", "HEAD");
+    let caret_report = run_shadow_json(&runtime, repo, "HEAD^", "HEAD");
+    let tilde_report = run_shadow_json(&runtime, repo, "HEAD~1", "HEAD");
 
     assert_eq!(
         caret_report["input"]["resolved_base"], tilde_report["input"]["resolved_base"],
@@ -426,9 +433,9 @@ fn shadow_report_unsupported_ref_syntax_fails_friendly_not_opaque() {
     let dir = tempdir().expect("tempdir");
     let repo = dir.path();
     let (_base, head, _artifact_head) = setup_fixture_repo(repo);
-    kin_init(repo);
+    let runtime = kin_init(repo);
 
-    let output = kin_command()
+    let output = kin_command(&runtime)
         .args([
             "review",
             "shadow",
@@ -463,9 +470,9 @@ fn shadow_report_stale_base_surfaces_ancestry_gap_end_to_end() {
     let dir = tempdir().expect("tempdir");
     let repo = dir.path();
     let (branch_a, branch_b) = setup_divergent_repo(repo);
-    kin_init(repo);
+    let runtime = kin_init(repo);
 
-    let report = run_shadow_json(repo, &branch_a, &branch_b);
+    let report = run_shadow_json(&runtime, repo, &branch_a, &branch_b);
 
     let gaps = report["evidence_gaps"].as_array().unwrap();
     assert!(
@@ -482,9 +489,9 @@ fn shadow_report_unknown_abbreviated_sha_fails_friendly() {
     let dir = tempdir().expect("tempdir");
     let repo = dir.path();
     let (_base, head, _artifact_head) = setup_fixture_repo(repo);
-    kin_init(repo);
+    let runtime = kin_init(repo);
 
-    let output = kin_command()
+    let output = kin_command(&runtime)
         .args(["review", "shadow", &format!("deadbeef..{head}"), "--json"])
         .current_dir(repo)
         .output()
@@ -562,9 +569,9 @@ fn shadow_generated_copy_consumer_does_not_block() {
     let dir = tempdir().expect("tempdir");
     let repo = dir.path();
     let (base, head) = setup_generated_consumer_repo(repo);
-    kin_init(repo);
+    let runtime = kin_init(repo);
 
-    let report = run_shadow_json(repo, &base, &head);
+    let report = run_shadow_json(&runtime, repo, &base, &head);
 
     // The signature change is still captured as a real change...
     let changed = report["changed_entities"].as_array().unwrap();

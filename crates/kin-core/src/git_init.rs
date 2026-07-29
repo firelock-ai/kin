@@ -1593,34 +1593,8 @@ mod tests {
         assert!(leftovers.is_empty(), "staging leftovers: {leftovers:?}");
     }
 
-    /// A fixture `git` invocation bound to `repository` and nothing else.
-    ///
-    /// Git exports its own repository location to every process it starts, so a
-    /// test run from inside a hook or another Git command inherits `GIT_DIR`,
-    /// `GIT_INDEX_FILE`, and friends. A fixture command that keeps them writes
-    /// into the developer's real repository instead of its temporary one, so
-    /// they are cleared here rather than trusted to be absent.
     fn fixture_git(repository: &Path) -> Command {
-        let mut command = Command::new("git");
-        command
-            .current_dir(repository)
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env(
-                "GIT_CONFIG_GLOBAL",
-                repository.join(".kin-test-global-gitconfig"),
-            );
-        for inherited in [
-            "GIT_DIR",
-            "GIT_COMMON_DIR",
-            "GIT_WORK_TREE",
-            "GIT_INDEX_FILE",
-            "GIT_PREFIX",
-            "GIT_OBJECT_DIRECTORY",
-            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-        ] {
-            command.env_remove(inherited);
-        }
-        command
+        kin_git::test_support::fixture_git_in(repository)
     }
 
     fn git<const N: usize>(repository: &Path, args: [&str; N]) {

@@ -21,8 +21,9 @@ pub mod repository_export;
 pub mod sealed_observation;
 pub mod semantic_import;
 
-#[cfg(test)]
-mod test_support;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod test_support;
 
 pub use admission_history::{admit_semantic_git_import, AdmittedSemanticGitImportPlan};
 pub use authority::build_git_external_authority;

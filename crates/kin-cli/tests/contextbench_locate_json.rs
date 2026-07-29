@@ -83,7 +83,7 @@ fn contextbench_locate_keeps_query_selection_and_normalization_inside_kin() {
     // can claim the port in the gap and the daemon exits during startup. Each
     // attempt rebinds a fresh port, so a bounded retry clears that transient
     // startup race without masking a genuine failure.
-    let daemon_bin = common::fresh_daemon_bin();
+    let daemon_bin = runtime.daemon_bin();
     let mut locate = None;
     for attempt in 1..=8u64 {
         let out = runtime

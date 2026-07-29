@@ -11,7 +11,7 @@ use tokio::process::{Child, Command};
 
 mod common;
 
-use common::isolate_daemon_test_command;
+use common::{isolate_daemon_test_command, terminate_daemon};
 
 /// Readiness budget for a daemon to come up. Generous enough that two CI runs
 /// sharing a runner (a push build and a pull_request build on the same commit)
@@ -78,7 +78,8 @@ fn spawn_daemon_with_env(repo_root: &Path, port: u16, envs: &[(&str, &str)]) -> 
     let bin = env!("CARGO_BIN_EXE_kin-daemon");
     let mut cmd = Command::new(bin);
     isolate_daemon_test_command(&mut cmd);
-    cmd.arg("--repo")
+    cmd.kill_on_drop(true)
+        .arg("--repo")
         .arg(repo_root)
         .arg("--port")
         .arg(port.to_string())
@@ -237,11 +238,9 @@ async fn daemon_recovers_after_process_kill_and_restart() {
     assert_eq!(first.status, "ok");
     assert!(first.uptime_seconds < 20);
 
-    child.start_kill().expect("failed to kill kin-daemon");
-    let exit = tokio::time::timeout(Duration::from_secs(10), child.wait())
+    let exit = terminate_daemon(&mut child, "initial recovery daemon")
         .await
-        .expect("kin-daemon did not exit after kill")
-        .expect("kin-daemon wait failed");
+        .expect("terminate and reap initial recovery daemon");
     assert!(
         !exit.success(),
         "killed kin-daemon should not report success"
@@ -257,10 +256,9 @@ async fn daemon_recovers_after_process_kill_and_restart() {
     assert_eq!(second.status, "ok");
     assert!(second.uptime_seconds < 20);
 
-    restarted
-        .start_kill()
-        .expect("failed to stop restarted kin-daemon");
-    let _ = restarted.wait().await;
+    terminate_daemon(&mut restarted, "restarted recovery daemon")
+        .await
+        .expect("terminate and reap restarted recovery daemon");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -311,8 +309,8 @@ async fn daemon_exits_after_idle_timeout_and_removes_endpoint_files() {
     let exit = match tokio::time::timeout(Duration::from_secs(90), child.wait()).await {
         Ok(result) => result.expect("kin-daemon wait failed"),
         Err(_) => {
-            let _ = child.start_kill();
-            panic!("kin-daemon did not exit after idle timeout");
+            let cleanup = terminate_daemon(&mut child, "idle-timeout daemon").await;
+            panic!("kin-daemon did not exit after idle timeout; cleanup={cleanup:?}");
         }
     };
     assert!(exit.success(), "idle shutdown should be graceful: {exit}");
@@ -359,8 +357,8 @@ async fn daemon_exits_after_dirty_repo_control_dir_is_removed() {
     let exit = match tokio::time::timeout(Duration::from_secs(15), child.wait()).await {
         Ok(result) => result.expect("kin-daemon wait failed"),
         Err(_) => {
-            let _ = child.start_kill();
-            panic!("kin-daemon did not exit after deleted control directory");
+            let cleanup = terminate_daemon(&mut child, "deleted-control-dir daemon").await;
+            panic!("kin-daemon did not exit after deleted control directory; cleanup={cleanup:?}");
         }
     };
     assert!(

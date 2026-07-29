@@ -14,6 +14,25 @@ use std::time::Duration;
 use fs2::FileExt;
 use tracing::info;
 
+#[cfg(unix)]
+const TEST_RUNTIME_OWNER_ENV: &str = "KIN_TEST_RUNTIME_OWNER_TOKEN";
+#[cfg(unix)]
+const TEST_RUNTIME_PROCESS_GROUP_ENV: &str = "KIN_TEST_RUNTIME_CONTAINMENT_PROCESS_GROUP";
+
+#[cfg(unix)]
+fn should_detach_daemon_process() -> bool {
+    // The CLI integration harness binds test daemons to stable OS containment.
+    // The owner marker is honored only when its declared group matches this
+    // process's live group, so stray ambient state cannot change production
+    // daemon lifetime semantics.
+    let owned = std::env::var_os(TEST_RUNTIME_OWNER_ENV).is_some_and(|value| !value.is_empty());
+    let expected_group = std::env::var(TEST_RUNTIME_PROCESS_GROUP_ENV)
+        .ok()
+        .and_then(|value| value.parse::<libc::pid_t>().ok())
+        .filter(|group| *group > 0);
+    !(owned && expected_group == Some(unsafe { libc::getpgrp() }))
+}
+
 // ── Daemon Singleton Lock ───────────────────────────────────────────────
 
 /// An exclusive, per-repo daemon lock.
@@ -379,7 +398,7 @@ pub async fn ensure_daemon_running_with_idle_timeout(
     }
 
     #[cfg(unix)]
-    {
+    if should_detach_daemon_process() {
         use std::os::unix::process::CommandExt;
         unsafe {
             cmd.pre_exec(|| {

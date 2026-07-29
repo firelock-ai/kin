@@ -42,21 +42,23 @@ fn initialize_git_repo(repo: &Path) {
     run_git(repo, &["commit", "-m", "base"]);
 }
 
-fn run_kin(repo: &Path, home: &Path, args: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_kin"))
+fn run_kin(
+    runtime: &common::IsolatedDaemonRuntime,
+    repo: &Path,
+    args: &[&str],
+) -> std::process::Output {
+    runtime
+        .kin_command()
         .args(args)
-        .env("HOME", home)
         .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("KIN_DAEMON_BIN", common::fresh_daemon_bin())
-        .env_remove("KIN_DAEMON_URL")
-        .env_remove("KIN_VFS_WORKSPACE")
+        .env("KIN_DAEMON_BIN", runtime.daemon_bin())
         .current_dir(repo)
         .output()
         .expect("run kin")
 }
 
-fn initialize_kin_repo(repo: &Path, home: &Path) {
-    let init = run_kin(repo, home, &["init", ".", "--json"]);
+fn initialize_kin_repo(runtime: &common::IsolatedDaemonRuntime, repo: &Path) {
+    let init = run_kin(runtime, repo, &["init", ".", "--json"]);
     assert!(
         init.status.success(),
         "stdout={} stderr={}",
@@ -65,8 +67,8 @@ fn initialize_kin_repo(repo: &Path, home: &Path) {
     );
 }
 
-fn branch_list(repo: &Path, home: &Path) -> Value {
-    let output = run_kin(repo, home, &["branch", "list", "--json"]);
+fn branch_list(runtime: &common::IsolatedDaemonRuntime, repo: &Path) -> Value {
+    let output = run_kin(runtime, repo, &["branch", "list", "--json"]);
     assert!(
         output.status.success(),
         "stdout={} stderr={}",
@@ -79,13 +81,12 @@ fn branch_list(repo: &Path, home: &Path) -> Value {
 #[test]
 fn tag_publishes_an_exact_ref_transaction_and_never_replaces_one() {
     let root = tempdir().expect("temp root");
-    let home = root.path().join("home");
     let repo = root.path().join("repo");
-    fs::create_dir_all(&home).expect("create home");
     initialize_git_repo(&repo);
-    initialize_kin_repo(&repo, &home);
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    initialize_kin_repo(&runtime, &repo);
 
-    let before = branch_list(&repo, &home);
+    let before = branch_list(&runtime, &repo);
     let refs_before = before["repository_ref_count"]
         .as_u64()
         .expect("repository ref count");
@@ -95,7 +96,7 @@ fn tag_publishes_an_exact_ref_transaction_and_never_replaces_one() {
 
     // The source has no source-bound proof, so the baseline coverage refusal
     // fires and nothing is published.
-    let unforced = run_kin(&repo, &home, &["tag", "v1.0.0"]);
+    let unforced = run_kin(&runtime, &repo, &["tag", "v1.0.0"]);
     assert!(
         !unforced.status.success(),
         "a source below the coverage baseline was tagged without an acknowledgment"
@@ -105,7 +106,7 @@ fn tag_publishes_an_exact_ref_transaction_and_never_replaces_one() {
         stderr.contains("below the") && stderr.contains("--force"),
         "the baseline refusal must name the threshold and the acknowledgment: {stderr}"
     );
-    let after_refusal = branch_list(&repo, &home);
+    let after_refusal = branch_list(&runtime, &repo);
     assert_eq!(
         after_refusal["repository_ref_count"], refs_before,
         "a refused tag published a ref anyway"
@@ -115,7 +116,7 @@ fn tag_publishes_an_exact_ref_transaction_and_never_replaces_one() {
         "a refused tag advanced repository authority"
     );
 
-    let tagged = run_kin(&repo, &home, &["tag", "v1.0.0", "--force"]);
+    let tagged = run_kin(&runtime, &repo, &["tag", "v1.0.0", "--force"]);
     assert!(
         tagged.status.success(),
         "stdout={} stderr={}",
@@ -128,7 +129,7 @@ fn tag_publishes_an_exact_ref_transaction_and_never_replaces_one() {
         "tag output did not name the exact ref it published: {stdout}"
     );
 
-    let after = branch_list(&repo, &home);
+    let after = branch_list(&runtime, &repo);
     assert_eq!(
         after["repository_ref_count"].as_u64().expect("ref count"),
         refs_before + 1,
@@ -145,7 +146,7 @@ fn tag_publishes_an_exact_ref_transaction_and_never_replaces_one() {
 
     // Tags are immutable refs. A second publication of the same name is a
     // conflict, not a silent move.
-    let duplicate = run_kin(&repo, &home, &["tag", "v1.0.0", "--force"]);
+    let duplicate = run_kin(&runtime, &repo, &["tag", "v1.0.0", "--force"]);
     assert!(
         !duplicate.status.success(),
         "an existing tag was replaced in place"
@@ -155,7 +156,7 @@ fn tag_publishes_an_exact_ref_transaction_and_never_replaces_one() {
         stderr.contains("already exists"),
         "the duplicate-tag refusal must say the tag exists: {stderr}"
     );
-    let unchanged = branch_list(&repo, &home);
+    let unchanged = branch_list(&runtime, &repo);
     assert_eq!(
         unchanged["repository_ref_count"], after["repository_ref_count"],
         "a refused duplicate tag mutated the ref set"
@@ -165,20 +166,19 @@ fn tag_publishes_an_exact_ref_transaction_and_never_replaces_one() {
 #[test]
 fn declared_release_policy_is_a_refusal_and_never_a_warning() {
     let root = tempdir().expect("temp root");
-    let home = root.path().join("home");
     let repo = root.path().join("repo");
-    fs::create_dir_all(&home).expect("create home");
     initialize_git_repo(&repo);
-    initialize_kin_repo(&repo, &home);
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    initialize_kin_repo(&runtime, &repo);
 
-    let before = branch_list(&repo, &home);
+    let before = branch_list(&runtime, &repo);
 
     // Verification runs carry no immutable source binding yet, so proof cannot
     // be satisfied by any non-empty source and must fail closed even when the
     // baseline is explicitly acknowledged.
     let proof = run_kin(
+        &runtime,
         &repo,
-        &home,
         &["tag", "v2.0.0", "--require-proof", "--force"],
     );
     assert!(
@@ -191,7 +191,7 @@ fn declared_release_policy_is_a_refusal_and_never_a_warning() {
         "the proof refusal must name the missing source binding: {stderr}"
     );
 
-    let after = branch_list(&repo, &home);
+    let after = branch_list(&runtime, &repo);
     assert_eq!(
         after["repository_ref_count"], before["repository_ref_count"],
         "a policy refusal still published a tag"
@@ -205,13 +205,12 @@ fn declared_release_policy_is_a_refusal_and_never_a_warning() {
 #[test]
 fn tag_refuses_a_ref_outside_the_tag_namespace() {
     let root = tempdir().expect("temp root");
-    let home = root.path().join("home");
     let repo = root.path().join("repo");
-    fs::create_dir_all(&home).expect("create home");
     initialize_git_repo(&repo);
-    initialize_kin_repo(&repo, &home);
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    initialize_kin_repo(&runtime, &repo);
 
-    let output = run_kin(&repo, &home, &["tag", "refs/heads/main", "--force"]);
+    let output = run_kin(&runtime, &repo, &["tag", "refs/heads/main", "--force"]);
     assert!(
         !output.status.success(),
         "the tag command published outside refs/tags/"

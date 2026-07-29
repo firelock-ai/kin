@@ -3363,6 +3363,7 @@ dependencies = [
  "kin-core",
  "kin-daemon",
  "kin-db",
+ "kin-git",
  "kin-index",
  "kin-migrate",
  "kin-model",

@@ -18,11 +18,12 @@ use std::path::Path;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
+use sysinfo::{Pid, ProcessStatus, System};
 use tokio::process::{Child, Command};
 
 mod common;
 
-use common::isolate_daemon_test_command;
+use common::{isolate_daemon_test_command, terminate_daemon};
 
 /// Readiness budget for the daemon to bind and serve. Generous so two CI runs
 /// sharing a runner can both come up under load without a false timeout; a
@@ -34,6 +35,7 @@ fn spawn_daemon_ephemeral(repo_root: &Path) -> Child {
     let mut command = Command::new(env!("CARGO_BIN_EXE_kin-daemon"));
     isolate_daemon_test_command(&mut command);
     command
+        .kill_on_drop(true)
         .arg("--repo")
         .arg(repo_root)
         // The feature under test: the daemon, not the launcher, picks the port.
@@ -57,6 +59,12 @@ fn read_port_file(kin_root: &Path) -> Option<u16> {
     std::fs::read_to_string(kin_root.join("daemon.port"))
         .ok()
         .and_then(|value| value.trim().parse().ok())
+}
+
+fn live_process_start_time(pid: u32) -> Option<u64> {
+    let system = System::new_all();
+    let process = system.process(Pid::from_u32(pid))?;
+    (process.status() != ProcessStatus::Zombie).then_some(process.start_time())
 }
 
 /// Fail loudly the instant the daemon child exits before it is ready, instead of
@@ -85,8 +93,8 @@ async fn daemon_binds_ephemeral_port_and_publishes_it() {
             break port;
         }
         if Instant::now() >= deadline {
-            let _ = child.kill().await;
-            panic!("daemon never wrote its bound port to daemon.port");
+            let cleanup = terminate_daemon(&mut child, "ephemeral-port daemon").await;
+            panic!("daemon never wrote its bound port to daemon.port; cleanup={cleanup:?}");
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
@@ -108,11 +116,42 @@ async fn daemon_binds_ephemeral_port_and_publishes_it() {
     }
 
     // Shut the daemon down before asserting so a failure never leaks a process.
-    let _ = child.kill().await;
-    let _ = child.wait().await;
+    terminate_daemon(&mut child, "ephemeral-port daemon")
+        .await
+        .expect("terminate and reap ephemeral-port daemon");
 
     assert!(
         healthy,
         "daemon did not serve /health on its published port {port}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dropping_a_direct_daemon_child_terminates_the_process() {
+    let repo = tempfile::TempDir::new().expect("tempdir");
+    kin_core::init(repo.path()).expect("init scratch repo");
+    let mut child = spawn_daemon_ephemeral(repo.path());
+    let pid = child.id().expect("spawned daemon pid");
+    let deadline = Instant::now() + READINESS_TIMEOUT;
+    while read_port_file(&repo.path().join(".kin")).is_none() {
+        assert_child_alive(&mut child, "bound");
+        assert!(
+            Instant::now() < deadline,
+            "daemon never published its port before the Drop check"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let start_time = live_process_start_time(pid).expect("live daemon process identity");
+
+    drop(child);
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while live_process_start_time(pid) == Some(start_time) && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_ne!(
+        live_process_start_time(pid),
+        Some(start_time),
+        "kill_on_drop left direct daemon pid {pid} alive"
     );
 }

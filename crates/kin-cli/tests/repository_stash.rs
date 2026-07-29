@@ -43,22 +43,24 @@ fn require_git(path: &Path, args: &[&str]) {
     );
 }
 
-fn run_kin(repo: &Path, home: &Path, args: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_kin"))
+fn run_kin(
+    runtime: &common::IsolatedDaemonRuntime,
+    repo: &Path,
+    args: &[&str],
+) -> std::process::Output {
+    runtime
+        .kin_command()
         .args(args)
-        .env("HOME", home)
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("KIN_DAEMON_BIN", common::fresh_daemon_bin())
-        .env_remove("KIN_DAEMON_URL")
-        .env_remove("KIN_VFS_WORKSPACE")
+        .env("KIN_DAEMON_BIN", runtime.daemon_bin())
         .current_dir(repo)
         .output()
         .expect("run kin")
 }
 
-fn require_kin(repo: &Path, home: &Path, args: &[&str]) -> String {
-    let output = run_kin(repo, home, args);
+fn require_kin(runtime: &common::IsolatedDaemonRuntime, repo: &Path, args: &[&str]) -> String {
+    let output = run_kin(runtime, repo, args);
     assert!(
         output.status.success(),
         "kin {args:?} failed: stdout={} stderr={}",
@@ -68,8 +70,8 @@ fn require_kin(repo: &Path, home: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
-fn require_kin_json(repo: &Path, home: &Path, args: &[&str]) -> Value {
-    let stdout = require_kin(repo, home, args);
+fn require_kin_json(runtime: &common::IsolatedDaemonRuntime, repo: &Path, args: &[&str]) -> Value {
+    let stdout = require_kin(runtime, repo, args);
     serde_json::from_str(&stdout).expect("kin should emit JSON")
 }
 
@@ -78,7 +80,7 @@ const SEALED_SOURCE: &[u8] = b"pub fn shipped() -> u8 { 2 }\npub fn added() -> u
 const SEALED_OPAQUE: &[u8] = &[0x00, 0xfe, 0x7f, 0x41];
 
 /// A single-commit Git history admitted into Kin.
-fn initialize(repo: &Path, home: &Path) {
+fn initialize(runtime: &common::IsolatedDaemonRuntime, repo: &Path) {
     fs::create_dir_all(repo).expect("create repo");
     require_git(repo, &["init", "--initial-branch=main"]);
     require_git(repo, &["config", "user.email", "kin@example.invalid"]);
@@ -91,7 +93,7 @@ fn initialize(repo: &Path, home: &Path) {
     require_git(repo, &["add", "--all"]);
     require_git(repo, &["commit", "-m", "base"]);
 
-    let init = run_kin(repo, home, &["init", ".", "--json"]);
+    let init = run_kin(runtime, repo, &["init", ".", "--json"]);
     assert!(
         init.status.success(),
         "stdout={} stderr={}",
@@ -100,18 +102,18 @@ fn initialize(repo: &Path, home: &Path) {
     );
 }
 
-fn workspace_dirty(repo: &Path, home: &Path) -> bool {
-    require_kin_json(repo, home, &["status", "--json"])["workspace"]["dirty"]
+fn workspace_dirty(runtime: &common::IsolatedDaemonRuntime, repo: &Path) -> bool {
+    require_kin_json(runtime, repo, &["status", "--json"])["workspace"]["dirty"]
         .as_bool()
         .expect("status reports workspace dirtiness")
 }
 
 /// Block until the daemon has admitted the working-copy edits into workspace
 /// authority, or fail naming the wait rather than sealing an empty workspace.
-fn await_admitted_workspace_changes(repo: &Path, home: &Path) {
+fn await_admitted_workspace_changes(runtime: &common::IsolatedDaemonRuntime, repo: &Path) {
     let deadline = Instant::now() + ADMISSION_TIMEOUT;
     while Instant::now() < deadline {
-        if workspace_dirty(repo, home) {
+        if workspace_dirty(runtime, repo) {
             return;
         }
         std::thread::sleep(Duration::from_millis(500));
@@ -122,8 +124,8 @@ fn await_admitted_workspace_changes(repo: &Path, home: &Path) {
     );
 }
 
-fn stash_entries(repo: &Path, home: &Path) -> Vec<Value> {
-    let report = require_kin_json(repo, home, &["stash", "list", "--json"]);
+fn stash_entries(runtime: &common::IsolatedDaemonRuntime, repo: &Path) -> Vec<Value> {
+    let report = require_kin_json(runtime, repo, &["stash", "list", "--json"]);
     assert_eq!(report["schema"], "kin.stash-list.v1");
     assert_eq!(report["authority"], "repository-v6");
     report["entries"]
@@ -135,23 +137,22 @@ fn stash_entries(repo: &Path, home: &Path) -> Vec<Value> {
 #[test]
 fn stash_seals_graph_owned_workspace_state_and_pop_restores_it() {
     let root = tempdir().expect("temp root");
-    let home = root.path().join("home");
     let repo = root.path().join("repo");
-    fs::create_dir_all(&home).expect("create home");
-    initialize(&repo, &home);
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    initialize(&runtime, &repo);
 
     assert!(
-        stash_entries(&repo, &home).is_empty(),
+        stash_entries(&runtime, &repo).is_empty(),
         "a fresh repository holds no sealed state"
     );
 
     fs::write(repo.join("src/lib.rs"), SEALED_SOURCE).expect("edit tracked source");
     fs::write(repo.join("scratch.mystery"), SEALED_OPAQUE).expect("add opaque artifact");
-    await_admitted_workspace_changes(&repo, &home);
+    await_admitted_workspace_changes(&runtime, &repo);
 
     let sealed = require_kin(
+        &runtime,
         &repo,
-        &home,
         &["stash", "push", "--yes", "-m", "sealed under test"],
     );
     assert!(
@@ -171,16 +172,16 @@ fn stash_seals_graph_owned_workspace_state_and_pop_restores_it() {
         "sealing left an artifact the authority base does not hold"
     );
     assert!(
-        !workspace_dirty(&repo, &home),
+        !workspace_dirty(&runtime, &repo),
         "the workspace still reports graph-owned changes after a seal"
     );
 
-    let entries = stash_entries(&repo, &home);
+    let entries = stash_entries(&runtime, &repo);
     assert_eq!(entries.len(), 1, "the seal is not listed: {entries:?}");
     assert_eq!(entries[0]["ordinal"], 0);
     assert_eq!(entries[0]["message"], "sealed under test");
 
-    let restored = require_kin(&repo, &home, &["stash", "pop"]);
+    let restored = require_kin(&runtime, &repo, &["stash", "pop"]);
     assert!(
         restored.contains("refs/kin/stash/0"),
         "the restore did not name the stash it consumed: {restored}"
@@ -196,13 +197,13 @@ fn stash_seals_graph_owned_workspace_state_and_pop_restores_it() {
         "restoring dropped an opaque artifact the seal held"
     );
     assert!(
-        stash_entries(&repo, &home).is_empty(),
+        stash_entries(&runtime, &repo).is_empty(),
         "a restored stash must be dropped, not left for a second restore"
     );
 
     // The transition left the projection agreeing with graph truth, so the
     // commands gated on a fresh workspace still work against what it returned.
-    let drift = require_kin_json(&repo, &home, &["doctor", "--drift", "--json"]);
+    let drift = require_kin_json(&runtime, &repo, &["doctor", "--drift", "--json"]);
     assert_eq!(
         drift["clean"], true,
         "the stash cycle left the projection diverged from graph truth: {drift}"
@@ -212,15 +213,14 @@ fn stash_seals_graph_owned_workspace_state_and_pop_restores_it() {
 #[test]
 fn stash_answers_from_the_stash_surface_rather_than_the_capability_gate() {
     let root = tempdir().expect("temp root");
-    let home = root.path().join("home");
     let repo = root.path().join("repo");
-    fs::create_dir_all(&home).expect("create home");
-    initialize(&repo, &home);
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    initialize(&runtime, &repo);
 
     // A clean workspace has nothing to seal. The refusal must come from the
     // stash transaction, not from the capability gate that used to answer
     // before the command was ever reached.
-    let refused = run_kin(&repo, &home, &["stash", "push", "--yes"]);
+    let refused = run_kin(&runtime, &repo, &["stash", "push", "--yes"]);
     assert!(
         !refused.status.success(),
         "sealing a clean workspace published an empty stash"
@@ -236,7 +236,7 @@ fn stash_answers_from_the_stash_surface_rather_than_the_capability_gate() {
     );
 
     // Restoring with nothing sealed is likewise a stash refusal.
-    let popped = run_kin(&repo, &home, &["stash", "pop"]);
+    let popped = run_kin(&runtime, &repo, &["stash", "pop"]);
     assert!(
         !popped.status.success(),
         "restoring without a sealed stash reported success"

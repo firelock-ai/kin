@@ -198,15 +198,12 @@ fn parse_json_output(output: &Output, context: &str) -> Value {
     serde_json::from_slice(&output.stdout).expect("stdout should be valid json")
 }
 
-fn kin(repo: &Path, kin_home: &Path) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_kin"));
-    command
-        .current_dir(repo)
-        .env("KIN_HOME", kin_home)
-        .env("KIN_REGISTRY_PATH", kin_home.join("registry.toml"))
-        .env_remove("KIN_DAEMON_URL")
-        .env_remove("KIN_SUPERVISOR_URL")
-        .env_remove("KIN_SESSION_ID");
+fn kin<'runtime>(
+    runtime: &'runtime common::IsolatedDaemonRuntime,
+    repo: &Path,
+) -> Command<'runtime> {
+    let mut command = runtime.kin_command();
+    command.current_dir(repo);
     command
 }
 
@@ -216,13 +213,13 @@ fn prepared_state_publish_and_materialize_preserve_indexed_state() {
     let repo1 = root.path().join("repo1");
     let repo2 = root.path().join("repo2");
     let prepared_dir = root.path().join("prepared");
-    let kin_home = root.path().join("kin-home");
     let remote = "https://example.com/acme/prepared-state.git";
 
     init_seed_repo(&repo1, remote);
     clone_same_repo_identity(&repo1, &repo2, remote);
+    let runtime = common::IsolatedDaemonRuntime::new(&repo2);
 
-    let init = kin(&repo1, &kin_home)
+    let init = kin(&runtime, &repo1)
         .args(["init", "--json", "."])
         .output()
         .expect("run kin init");
@@ -231,7 +228,7 @@ fn prepared_state_publish_and_materialize_preserve_indexed_state() {
 
     seed_local_vectors(&repo1.join(".kin"));
 
-    let publish = kin(&repo1, &kin_home)
+    let publish = kin(&runtime, &repo1)
         .args([
             "prepared-state",
             "publish",
@@ -246,7 +243,7 @@ fn prepared_state_publish_and_materialize_preserve_indexed_state() {
     assert_eq!(publish_payload["text_index_present"], true);
     assert_eq!(publish_payload["vector_index_present"], true);
 
-    let materialize = kin(&repo2, &kin_home)
+    let materialize = kin(&runtime, &repo2)
         .args([
             "prepared-state",
             "materialize",
@@ -268,9 +265,9 @@ fn prepared_state_publish_and_materialize_preserve_indexed_state() {
         publish_payload["cache_key"]
     );
 
-    let support = kin(&repo2, &kin_home)
+    let support = kin(&runtime, &repo2)
         .args(["support", "--json"])
-        .env("KIN_DAEMON_BIN", common::fresh_daemon_bin())
+        .env("KIN_DAEMON_BIN", runtime.daemon_bin())
         .env("KIN_DAEMON_DISABLE_LSP", "1")
         .env("KIN_DAEMON_IDLE_TIMEOUT_SECS", "1")
         .env("KIN_DAEMON_READY_TIMEOUT_SECS", "30")
@@ -339,13 +336,13 @@ fn prepared_state_materialize_rejects_repo_state_mismatch() {
     let repo1 = root.path().join("repo1");
     let repo2 = root.path().join("repo2");
     let prepared_dir = root.path().join("prepared");
-    let kin_home = root.path().join("kin-home");
     let remote = "https://example.com/acme/prepared-state.git";
 
     init_seed_repo(&repo1, remote);
     clone_same_repo_identity(&repo1, &repo2, remote);
+    let runtime = common::IsolatedDaemonRuntime::new(&repo2);
 
-    let init = kin(&repo1, &kin_home)
+    let init = kin(&runtime, &repo1)
         .args(["init", "--json", "."])
         .output()
         .expect("run kin init");
@@ -353,7 +350,7 @@ fn prepared_state_materialize_rejects_repo_state_mismatch() {
 
     seed_local_vectors(&repo1.join(".kin"));
 
-    let publish = kin(&repo1, &kin_home)
+    let publish = kin(&runtime, &repo1)
         .args([
             "prepared-state",
             "publish",
@@ -369,7 +366,7 @@ fn prepared_state_materialize_rejects_repo_state_mismatch() {
     git(&repo2, &["config", "user.name", "Kin"]);
     git(&repo2, &["commit", "--allow-empty", "-m", "drift"]);
 
-    let materialize = kin(&repo2, &kin_home)
+    let materialize = kin(&runtime, &repo2)
         .args([
             "prepared-state",
             "materialize",

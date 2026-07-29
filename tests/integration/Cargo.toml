@@ -23,6 +23,7 @@ kin-reconcile = { workspace = true }
 kin-context = { workspace = true }
 kin-migrate = { workspace = true }
 kin-daemon = { workspace = true }
+kin-git = { workspace = true, features = ["test-support"] }
 
 # External
 tempfile = { workspace = true }
