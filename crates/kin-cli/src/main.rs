@@ -3114,13 +3114,51 @@ fn env_flag(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Targets whose `info` events are progress a user is waiting on rather than
+/// diagnostics they did not ask for.
+///
+/// On a real repository a `kin init` spends most of its wall clock inside
+/// admission and snapshot replay, and both report only at `info`. Against a
+/// blanket `warn` default that produced a command which printed nothing until
+/// it finished, and the sole way to see otherwise was to already know to set
+/// `RUST_LOG`.
+///
+/// Raising named targets rather than the global level is what keeps the fix
+/// from becoming its own problem: a blanket `info` default would admit every
+/// dependency's chatter on every command. Each entry here earns its place by
+/// being both rare and meaningful. The kin-core targets fire once per
+/// initialization. The kin-db snapshot target's events are all conditional and
+/// fire only when there is genuinely something to report: deltas replayed,
+/// orphaned vectors evicted, locate cache bypassed.
+///
+/// Deliberately absent, both for the same reason the list is an allowlist at
+/// all. `kin_db::embed`'s eleven `info!` sites sit on the embedding hot path.
+/// And `kin_core::init` reports the unborn-repository receipt, which fires on
+/// the one `kin init` that finishes instantly, restates what the command's own
+/// summary prints two lines later, and renders the default ref as a debug byte
+/// array; a guaranteed redundant line on the quickest command is a poor trade
+/// for the rare recovery notice that shares its target.
+const PROGRESS_TARGETS: &[&str] = &["kin_core::git_init", "kin_db::storage::snapshot"];
+
+/// The tracing directive for a plain CLI run: warnings from everything, plus
+/// progress from the targets that report it.
+fn default_directive() -> String {
+    let mut directive = String::from("warn");
+    for target in PROGRESS_TARGETS {
+        directive.push(',');
+        directive.push_str(target);
+        directive.push_str("=info");
+    }
+    directive
+}
+
 fn default_env_filter(profile_enabled: bool) -> EnvFilter {
     if std::env::var_os("RUST_LOG").is_some() {
         EnvFilter::from_default_env()
     } else if profile_enabled {
         EnvFilter::new("info")
     } else {
-        EnvFilter::new("warn")
+        EnvFilter::new(default_directive())
     }
 }
 
@@ -3128,6 +3166,147 @@ fn default_env_filter(profile_enabled: bool) -> EnvFilter {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    // ── Default log filter ────────────────────────────────────────────────
+    //
+    // A plain `kin init` used to print nothing while admission and snapshot
+    // replay ran, because both report at `info` and the CLI default was a
+    // blanket `warn`. These pin the fix from both sides: the progress targets
+    // are admitted, everything else is still quiet, and the old default really
+    // did drop the events, so the guard cannot pass vacuously.
+
+    /// Collects everything a subscriber writes, standing in for the terminal.
+    #[derive(Clone)]
+    struct CapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("log buffer poisoned")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+        type Writer = CapturedLog;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Run `emit` under `filter` and report whether anything reached the
+    /// writer. The event has to be emitted by the caller because
+    /// `tracing`'s macros build a static callsite and so require a literal
+    /// target, which is also why the probes below are spelled out one per
+    /// target rather than looped.
+    fn survives(filter: EnvFilter, emit: impl FnOnce()) -> bool {
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry()
+            .with(filter)
+            .with(tracing_subscriber::fmt::layer().with_writer(CapturedLog(buffer.clone())));
+        tracing::subscriber::with_default(subscriber, emit);
+        let written = buffer.lock().expect("log buffer poisoned").clone();
+        !written.is_empty()
+    }
+
+    #[test]
+    fn every_progress_target_has_a_probe() {
+        // The probes cannot iterate PROGRESS_TARGETS, so couple them by count:
+        // adding a target without adding its probes fails here rather than
+        // shipping an unverified entry.
+        assert_eq!(
+            PROGRESS_TARGETS.len(),
+            2,
+            "add probes to the tests below when adding a progress target"
+        );
+    }
+
+    #[test]
+    fn the_plain_cli_default_shows_admission_and_replay_progress() {
+        assert!(
+            survives(default_env_filter(false), || tracing::info!(
+                target: "kin_core::git_init",
+                "probe"
+            )),
+            "a plain kin run must show git admission progress without RUST_LOG"
+        );
+        assert!(
+            survives(default_env_filter(false), || tracing::info!(
+                target: "kin_db::storage::snapshot",
+                "probe"
+            )),
+            "a plain kin run must show snapshot replay progress without RUST_LOG"
+        );
+    }
+
+    #[test]
+    fn the_plain_cli_default_stays_quiet_everywhere_else() {
+        // The whole point of naming targets instead of raising the global
+        // level: ordinary info chatter, and the embedding hot path in
+        // particular, must stay exactly as silent as it is today.
+        assert!(
+            !survives(default_env_filter(false), || tracing::info!(
+                target: "kin_db::embed",
+                "probe"
+            )),
+            "the embedding hot path must not become visible by default"
+        );
+        assert!(
+            !survives(default_env_filter(false), || tracing::info!(
+                target: "reqwest::connect",
+                "probe"
+            )),
+            "dependency info must not become visible by default"
+        );
+        assert!(
+            survives(default_env_filter(false), || tracing::warn!(
+                target: "kin_db::embed",
+                "probe"
+            )),
+            "warnings must still reach the user from every target"
+        );
+    }
+
+    #[test]
+    fn the_previous_bare_warn_default_dropped_the_progress() {
+        // Root-cause proof. Without it the assertions above would still pass
+        // against a directive that admits everything, and would say nothing
+        // about the bug being fixed.
+        assert!(
+            !survives(EnvFilter::new("warn"), || tracing::info!(
+                target: "kin_core::git_init",
+                "probe"
+            )),
+            "the old default must be shown to drop admission progress"
+        );
+        assert!(
+            !survives(EnvFilter::new("warn"), || tracing::info!(
+                target: "kin_db::storage::snapshot",
+                "probe"
+            )),
+            "the old default must be shown to drop replay progress"
+        );
+    }
+
+    #[test]
+    fn the_default_directive_keeps_warn_as_the_floor() {
+        let directive = default_directive();
+        assert!(
+            directive.starts_with("warn"),
+            "the global floor must stay warn: {directive}"
+        );
+        for target in PROGRESS_TARGETS {
+            assert!(
+                directive.contains(&format!("{target}=info")),
+                "{target} must be raised to info: {directive}"
+            );
+        }
+    }
 
     fn on_cli_test_stack(test: impl FnOnce() + Send + 'static) {
         std::thread::Builder::new()
