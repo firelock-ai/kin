@@ -275,7 +275,7 @@ fn locate_requires_daemon_by_default() {
         .arg("locate")
         .arg("--json")
         .arg("lexer issue")
-        .env("KIN_DAEMON_URL", "http://127.0.0.1:9")
+        .fixture_daemon_url("http://127.0.0.1:9")
         .current_dir(repo.path())
         .output()
         .expect("run kin locate");
@@ -634,8 +634,7 @@ fn locate_ref_resolves_tip_and_root_after_full_history_init() {
                 "-m",
                 message,
             ])
-            .env("GIT_AUTHOR_DATE", &date)
-            .env("GIT_COMMITTER_DATE", &date)
+            .fixture_git_commit_dates(&date)
             .current_dir(repo.path())
             .output()
             .expect("git commit");

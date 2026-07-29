@@ -791,24 +791,12 @@ mod tests {
         args: [&str; N],
         stdin: Option<&[u8]>,
     ) -> std::process::Output {
-        use std::io::Write as _;
-        use std::process::Stdio;
-
         let mut command = fixture_git();
-        command
-            .current_dir(repo)
-            .args(args)
-            .stdin(if stdin.is_some() {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let mut child = command.spawn().unwrap();
-        if let Some(stdin) = stdin {
-            child.stdin.take().unwrap().write_all(stdin).unwrap();
+        command.current_dir(repo).args(args);
+        if let Some(input) = stdin {
+            command.output_with_input(input).unwrap()
+        } else {
+            command.output().unwrap()
         }
-        child.wait_with_output().unwrap()
     }
 }

@@ -8,20 +8,32 @@
 //! emit startup warnings). A regression here makes the CLI treat a perfectly
 //! good daemon binary as "stale or incompatible".
 
-use std::process::Command;
+use std::time::Duration;
+use tokio::process::Command;
 
-#[test]
-fn compat_json_stdout_is_pure_json_under_env_overrides() {
+mod common;
+
+use common::{daemon_test_output, isolate_daemon_test_command};
+
+#[tokio::test]
+async fn compat_json_stdout_is_pure_json_under_env_overrides() {
     // These correctness-relevant overrides make the env registry emit startup
     // WARNs. Because the tracing subscriber's default writer is stdout, those
     // warnings previously landed on stdout ahead of the JSON and broke the
     // probe. The compat payload must now be emitted before any logging.
-    let output = Command::new(env!("CARGO_BIN_EXE_kin-daemon"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_kin-daemon"));
+    isolate_daemon_test_command(&mut command);
+    command
         .arg("--compat-json")
         .env("KIN_BYPASS_EMBEDDING_COVERAGE_CHECK", "1")
-        .env("KIN_DAEMON_DISABLE_LSP", "1")
-        .output()
-        .expect("run kin-daemon --compat-json");
+        .env("KIN_DAEMON_DISABLE_LSP", "1");
+    let output = daemon_test_output(
+        &mut command,
+        "kin-daemon --compat-json",
+        Duration::from_secs(30),
+    )
+    .await
+    .expect("run kin-daemon --compat-json");
 
     assert!(
         output.status.success(),

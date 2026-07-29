@@ -38,6 +38,64 @@ impl Drop for EnvGuard {
     }
 }
 
+struct KillAndReapChild {
+    child: Child,
+}
+
+impl KillAndReapChild {
+    fn new(child: Child) -> Self {
+        Self { child }
+    }
+
+    fn terminate_and_reap(&mut self) -> Result<(), String> {
+        let probe_error = match self.child.try_wait() {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) => None,
+            Err(error) => Some(error),
+        };
+        let kill_error = self.child.kill().err();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let reap_result = loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => break Ok(()),
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Ok(None) => break Err("guarded child was not reaped within 5s".to_string()),
+                Err(error) => break Err(format!("reap guarded child: {error}")),
+            }
+        };
+        if probe_error.is_none() && kill_error.is_none() && reap_result.is_ok() {
+            Ok(())
+        } else {
+            Err(format!(
+                "guarded-child cleanup failed: initial probe={probe_error:?}; \
+                 kill={kill_error:?}; reap={reap_result:?}"
+            ))
+        }
+    }
+}
+
+impl std::ops::Deref for KillAndReapChild {
+    type Target = Child;
+
+    fn deref(&self) -> &Self::Target {
+        &self.child
+    }
+}
+
+impl std::ops::DerefMut for KillAndReapChild {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.child
+    }
+}
+
+impl Drop for KillAndReapChild {
+    fn drop(&mut self) {
+        let _ = self.terminate_and_reap();
+    }
+}
+
 fn git(repository: &Path, args: &[&str]) {
     let output = Command::new("git")
         .args(args)
@@ -67,6 +125,8 @@ fn process_alive(pid: u32) -> bool {
 
 const GENERIC_AUTHORITY_WORKER: &str = "KIN_TEST_GENERIC_AUTHORITY_WORKER";
 const GENERIC_INTENTIONAL_OVERRIDE: &str = "KIN_TEST_GENERIC_INTENTIONAL_OVERRIDE";
+const GENERIC_INTENTIONAL_GIT_DATE: &str = "KIN_TEST_GENERIC_INTENTIONAL_GIT_DATE";
+const GENERIC_INTENTIONAL_DAEMON_URL: &str = "KIN_TEST_GENERIC_INTENTIONAL_DAEMON_URL";
 
 #[test]
 #[serial]
@@ -88,6 +148,36 @@ fn generic_authority_worker() {
             std::env::var_os(removed).is_none(),
             "{removed} reached a generic test subprocess"
         );
+    }
+    match std::env::var_os(GENERIC_INTENTIONAL_GIT_DATE) {
+        Some(expected) => {
+            for key in ["GIT_AUTHOR_DATE", "GIT_COMMITTER_DATE"] {
+                assert_eq!(
+                    std::env::var_os(key).as_deref(),
+                    Some(expected.as_os_str()),
+                    "{key} did not carry the explicit fixture date"
+                );
+            }
+        }
+        None => {
+            for key in ["GIT_AUTHOR_DATE", "GIT_COMMITTER_DATE"] {
+                assert!(
+                    std::env::var_os(key).is_none(),
+                    "generic {key} override bypassed fixture isolation"
+                );
+            }
+        }
+    }
+    match std::env::var_os(GENERIC_INTENTIONAL_DAEMON_URL) {
+        Some(expected) => assert_eq!(
+            std::env::var_os("KIN_DAEMON_URL").as_deref(),
+            Some(expected.as_os_str()),
+            "typed fixture daemon URL was not preserved"
+        ),
+        None => assert!(
+            std::env::var_os("KIN_DAEMON_URL").is_none(),
+            "generic runtime-bound daemon URL override bypassed isolation"
+        ),
     }
     assert_eq!(
         std::env::var(GENERIC_INTENTIONAL_OVERRIDE).as_deref(),
@@ -123,6 +213,8 @@ fn generic_command_scrubs_ambient_and_command_local_authority() {
         .env("GIT_CEILING_DIRECTORIES", "/command-local/ceiling")
         .env("GIT_DISCOVERY_ACROSS_FILESYSTEM", "0")
         .env("GIT_NAMESPACE", "command-local")
+        .env("GIT_AUTHOR_DATE", "hostile author date")
+        .env("GIT_COMMITTER_DATE", "hostile committer date")
         .env("LD_AUDIT", "/command-local/libaudit.so")
         .output()
         .expect("run generic authority worker");
@@ -135,6 +227,115 @@ fn generic_command_scrubs_ambient_and_command_local_authority() {
     assert_eq!(
         std::fs::read(&marker).expect("read generic authority marker"),
         b"hermetic"
+    );
+}
+
+#[test]
+#[serial]
+fn typed_fixture_git_dates_survive_the_final_authority_scrub() {
+    let root = tempdir().expect("temp root");
+    let marker = root.path().join("fixture-date.marker");
+    let date = "1600000000 +0000";
+    let output = Command::new(std::env::current_exe().expect("current test executable"))
+        .args(["--exact", "generic_authority_worker", "--nocapture"])
+        .env(GENERIC_AUTHORITY_WORKER, &marker)
+        .env(GENERIC_INTENTIONAL_OVERRIDE, "preserved")
+        .env(GENERIC_INTENTIONAL_GIT_DATE, date)
+        .fixture_git_commit_dates(date)
+        .output()
+        .expect("run fixture-date authority worker");
+    assert!(
+        output.status.success(),
+        "fixture-date authority worker failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read(&marker).expect("read fixture-date marker"),
+        b"hermetic"
+    );
+}
+
+#[test]
+#[serial]
+fn typed_fixture_daemon_url_survives_while_generic_override_fails_closed() {
+    let root = tempdir().expect("temp root");
+    let repository = root.path().join("repository");
+    std::fs::create_dir_all(&repository).expect("create repository");
+    let runtime = common::IsolatedDaemonRuntime::with_cleanup_command_for_test(
+        &repository,
+        std::env::current_exe().expect("current test executable"),
+        vec![
+            OsString::from("--exact"),
+            OsString::from("cleanup_sleeper_worker"),
+            OsString::from("--nocapture"),
+        ],
+        Vec::new(),
+        Duration::from_secs(1),
+    );
+    for (label, typed) in [("generic", false), ("typed", true)] {
+        let marker = root.path().join(format!("{label}-daemon-url.marker"));
+        let expected_url = "http://127.0.0.1:9";
+        let mut command = runtime
+            .process_command_for_test(std::env::current_exe().expect("current test executable"));
+        command
+            .args(["--exact", "generic_authority_worker", "--nocapture"])
+            .env(GENERIC_AUTHORITY_WORKER, &marker)
+            .env(GENERIC_INTENTIONAL_OVERRIDE, "preserved")
+            .env("KIN_DAEMON_URL", "http://127.0.0.1:8");
+        if typed {
+            command
+                .env(GENERIC_INTENTIONAL_DAEMON_URL, expected_url)
+                .fixture_daemon_url(expected_url);
+        }
+        let output = command.output().expect("run daemon-URL authority worker");
+        assert!(
+            output.status.success(),
+            "{label} daemon-URL authority worker failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read(&marker).expect("read daemon-URL authority marker"),
+            b"hermetic"
+        );
+    }
+}
+
+#[test]
+#[serial]
+fn isolated_runtime_lifecycle_does_not_claim_product_control_state() {
+    let root = tempdir().expect("temp root");
+    let repository = root.path().join("repository");
+    std::fs::create_dir_all(&repository).expect("create fresh repository");
+    let _git_dir = EnvGuard::set("GIT_DIR", std::ffi::OsStr::new("/hostile/git-dir"));
+    let _git_config_count = EnvGuard::set("GIT_CONFIG_COUNT", std::ffi::OsStr::new("1"));
+    let _git_default_hash = EnvGuard::set("GIT_DEFAULT_HASH", std::ffi::OsStr::new("sha256"));
+    let _ld_custom = EnvGuard::set(
+        "LD_CUSTOM_INJECTION",
+        std::ffi::OsStr::new("/hostile/custom-loader"),
+    );
+    let runtime = common::IsolatedDaemonRuntime::with_cleanup_command_for_test(
+        &repository,
+        std::env::current_exe().expect("current test executable"),
+        vec![
+            OsString::from("--exact"),
+            OsString::from("cleanup_sleeper_worker"),
+            OsString::from("--nocapture"),
+        ],
+        Vec::new(),
+        Duration::from_secs(1),
+    );
+    assert!(
+        !repository.join(".kin").exists(),
+        "runtime construction claimed the product control directory"
+    );
+
+    drop(runtime);
+
+    assert!(
+        !repository.join(".kin").exists(),
+        "runtime cleanup claimed the product control directory"
     );
 }
 
@@ -223,6 +424,58 @@ fn runtime_command_rebinds_git_and_kin_authority_at_launch() {
 
 #[test]
 #[serial]
+fn runtime_launch_keeps_the_exact_safe_git_environment_after_final_scrub() {
+    let root = tempdir().expect("temp root");
+    let repository = root.path().join("repository");
+    std::fs::create_dir_all(&repository).expect("create repository");
+    let runtime = common::IsolatedDaemonRuntime::with_cleanup_command_for_test(
+        &repository,
+        std::env::current_exe().expect("current test executable"),
+        vec![
+            OsString::from("--exact"),
+            OsString::from("cleanup_sleeper_worker"),
+            OsString::from("--nocapture"),
+        ],
+        Vec::new(),
+        Duration::from_secs(1),
+    );
+    let mut command = runtime.process_command_for_test("unused-fixture-program");
+    command
+        .env("GIT_DIR", "/hostile/repository")
+        .env("GIT_CONFIG_NOSYSTEM", "0")
+        .env("GIT_ATTR_NOSYSTEM", "0")
+        .env("GIT_TERMINAL_PROMPT", "1")
+        .env("GIT_PAGER", "hostile-pager")
+        .env("GIT_ALLOW_PROTOCOL", "ext")
+        .env("GIT_PROTOCOL_FROM_USER", "1")
+        .env("GIT_CONFIG_GLOBAL", "/hostile/global.gitconfig");
+
+    command.prepare_for_launch_for_test();
+
+    assert_eq!(
+        command.configured_env_for_test(std::ffi::OsStr::new("GIT_DIR")),
+        Some(None),
+        "repository authority survived the final launch binding"
+    );
+    for (key, expected) in [
+        ("GIT_CONFIG_NOSYSTEM", "1"),
+        ("GIT_ATTR_NOSYSTEM", "1"),
+        ("GIT_TERMINAL_PROMPT", "0"),
+        ("GIT_PAGER", "cat"),
+        ("GIT_ALLOW_PROTOCOL", "file"),
+        ("GIT_PROTOCOL_FROM_USER", "0"),
+        ("GIT_CONFIG_GLOBAL", "/dev/null"),
+    ] {
+        assert_eq!(
+            command.configured_env_for_test(std::ffi::OsStr::new(key)),
+            Some(Some(OsString::from(expected))),
+            "{key} did not retain the exact safe fixture value after final preparation"
+        );
+    }
+}
+
+#[test]
+#[serial]
 fn isolated_runtime_scrubs_ambient_authority_and_reaps_every_process() {
     let root = tempdir().expect("temp root");
     let sentinel_home = root.path().join("sentinel-home");
@@ -278,6 +531,12 @@ fn isolated_runtime_scrubs_ambient_authority_and_reaps_every_process() {
         "KIN_TEST_HOSTILE_UNKNOWN_AUTHORITY",
         std::ffi::OsStr::new("must-be-scrubbed"),
     );
+    let _git_dir = EnvGuard::set("GIT_DIR", std::ffi::OsStr::new("/hostile/git-dir"));
+    let _git_config_count = EnvGuard::set("GIT_CONFIG_COUNT", std::ffi::OsStr::new("1"));
+    let _git_config_key = EnvGuard::set("GIT_CONFIG_KEY_0", std::ffi::OsStr::new("core.hooksPath"));
+    let _git_config_value =
+        EnvGuard::set("GIT_CONFIG_VALUE_0", std::ffi::OsStr::new("/hostile/hooks"));
+    let _git_default_hash = EnvGuard::set("GIT_DEFAULT_HASH", std::ffi::OsStr::new("sha256"));
     let _dyld = EnvGuard::set(
         "DYLD_INSERT_LIBRARIES",
         std::ffi::OsStr::new("/hostile/libkin_vfs.dylib"),
@@ -287,6 +546,10 @@ fn isolated_runtime_scrubs_ambient_authority_and_reaps_every_process() {
     let _ld_preload = EnvGuard::set("LD_PRELOAD", std::ffi::OsStr::new("/hostile/libkin_vfs.so"));
     let _ld_audit = EnvGuard::set("LD_AUDIT", std::ffi::OsStr::new("/hostile/libaudit.so"));
     let _ld_library_path = EnvGuard::set("LD_LIBRARY_PATH", std::ffi::OsStr::new("/hostile/ld"));
+    let _ld_custom = EnvGuard::set(
+        "LD_CUSTOM_INJECTION",
+        std::ffi::OsStr::new("/hostile/custom-loader"),
+    );
     let _last_vfs_dir = EnvGuard::set(
         "_KIN_VFS_LAST_DIR",
         std::ffi::OsStr::new("/hostile/workspace/src"),
@@ -309,17 +572,27 @@ fn isolated_runtime_scrubs_ambient_authority_and_reaps_every_process() {
     git(&repository, &["commit", "-m", "fixture"]);
 
     let runtime = common::IsolatedDaemonRuntime::new(&repository);
+    assert!(
+        !repository.join(".kin").exists(),
+        "constructing the isolated runtime created product control state before kin init"
+    );
     let isolated_command = runtime.kin_command();
     for removed in [
         "KIN_STORAGE",
         "KIN_GCS_BUCKET",
         "KIN_GCS_PREFIX",
         "KIN_TEST_HOSTILE_UNKNOWN_AUTHORITY",
+        "GIT_DIR",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_KEY_0",
+        "GIT_CONFIG_VALUE_0",
+        "GIT_DEFAULT_HASH",
         "DYLD_INSERT_LIBRARIES",
         "DYLD_LIBRARY_PATH",
         "LD_PRELOAD",
         "LD_AUDIT",
         "LD_LIBRARY_PATH",
+        "LD_CUSTOM_INJECTION",
         "_KIN_VFS_LAST_DIR",
     ] {
         assert_eq!(
@@ -335,7 +608,9 @@ fn isolated_runtime_scrubs_ambient_authority_and_reaps_every_process() {
         .env("KIN_DAEMON_URL", "http://127.0.0.1:9")
         .env("KIN_TEST_RUNTIME_OWNER_TOKEN", "hostile-owner")
         .env("KIN_TEST_RUNTIME_CONTAINMENT_PROCESS_GROUP", "1")
+        .env("GIT_DEFAULT_HASH", "sha256")
         .env("LD_AUDIT", "/hostile/libaudit.so")
+        .env("LD_CUSTOM_INJECTION", "/hostile/custom-loader")
         .env("KIN_DAEMON_BIN", "/intentional/test-daemon");
     let version = launch_bound
         .output()
@@ -374,6 +649,16 @@ fn isolated_runtime_scrubs_ambient_authority_and_reaps_every_process() {
         "command-local loader injection survived the launch-time binding"
     );
     assert_eq!(
+        launch_bound.configured_env_for_test(std::ffi::OsStr::new("LD_CUSTOM_INJECTION")),
+        Some(None),
+        "command-local wildcard loader injection survived the launch-time binding"
+    );
+    assert_eq!(
+        launch_bound.configured_env_for_test(std::ffi::OsStr::new("GIT_DEFAULT_HASH")),
+        Some(None),
+        "command-local Git authority survived the launch-time binding"
+    );
+    assert_eq!(
         launch_bound.configured_env_for_test(std::ffi::OsStr::new("KIN_DAEMON_BIN")),
         Some(Some(OsString::from("/intentional/test-daemon"))),
         "intentional safe daemon override was not preserved"
@@ -410,7 +695,11 @@ fn isolated_runtime_scrubs_ambient_authority_and_reaps_every_process() {
     );
 
     let worker_pid_path = repository.join(".kin/daemon.pid");
-    let supervisor_pid_path = repository.join(".kin/test-runtime/supervisor.pid");
+    let supervisor_pid_path = runtime
+        .registry_path()
+        .parent()
+        .expect("runtime registry parent")
+        .join("supervisor.pid");
     let worker_pid = recorded_pid(&worker_pid_path);
     let supervisor_pid = recorded_pid(&supervisor_pid_path);
     assert!(
@@ -530,6 +819,9 @@ fn containment_process_tree_worker() {
 
 #[test]
 #[serial]
+// The outer test kills this worker process to prove that hard parent death
+// terminates the owned descendant tree. Waiting here would defeat that test.
+#[allow(clippy::zombie_processes)]
 fn parent_death_runtime_worker() {
     let Some(root) = std::env::var_os(PARENT_DEATH_WORKER) else {
         return;
@@ -573,15 +865,17 @@ fn hard_parent_death_terminates_the_guarded_process_group() {
     let root = tempdir().expect("temp root");
     let ready = root.path().join("parent-death.ready");
     let descendant_marker = root.path().join("parent-death-descendant.pid");
-    let mut parent = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "parent_death_runtime_worker", "--nocapture"])
-        .env(PARENT_DEATH_WORKER, root.path())
-        .env(PARENT_DEATH_READY, &ready)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn parent-death runtime worker");
+    let mut parent = KillAndReapChild::new(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "parent_death_runtime_worker", "--nocapture"])
+            .env(PARENT_DEATH_WORKER, root.path())
+            .env(PARENT_DEATH_READY, &ready)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn parent-death runtime worker"),
+    );
     let deadline = Instant::now() + Duration::from_secs(5);
     while !ready.is_file() && Instant::now() < deadline {
         assert!(
@@ -596,8 +890,9 @@ fn hard_parent_death_terminates_the_guarded_process_group() {
     assert!(ready.is_file(), "parent-death worker never became ready");
     let descendant = recorded_pid(&descendant_marker);
 
-    parent.kill().expect("kill parent-death runtime worker");
-    parent.wait().expect("reap parent-death runtime worker");
+    parent
+        .terminate_and_reap()
+        .expect("kill and reap parent-death runtime worker");
 
     wait_for_process_exit(descendant);
 }
@@ -666,7 +961,11 @@ fn bounded_command_timeout_reaps_its_contained_descendants() {
         command
             .args(["--exact", "containment_process_tree_worker", "--nocapture"])
             .env(TREE_PARENT, &marker)
-            .output_within(Duration::from_millis(100))
+            .output_after_path_ready_within(
+                &marker,
+                Duration::from_secs(5),
+                Duration::from_millis(100),
+            )
     }));
     assert!(
         cleanup.is_err(),

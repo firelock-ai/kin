@@ -19,10 +19,11 @@
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
-use std::io::{Read as _, Seek as _, SeekFrom};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ExitStatus, Output, Stdio};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 #[cfg(unix)]
 use sysinfo::ProcessStatus;
@@ -45,6 +46,10 @@ pub const BUILD_TIMEOUT: Duration = Duration::from_secs(600);
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 const PROCESS_REAP_TIMEOUT: Duration = Duration::from_secs(5);
 const PROCESS_QUIESCENCE: Duration = Duration::from_millis(100);
+const COMMAND_CAPTURE_LIMIT: usize = 4 * 1024 * 1024;
+/// Maximum rendered UTF-8 bytes, including any truncation marker.
+const COMMAND_DIAGNOSTIC_LIMIT: usize = 4 * 1024;
+const COMMAND_DIAGNOSTIC_MARKER: &str = "\n[bounded capture truncated]";
 const RUNTIME_OWNER_ENV: &str = "KIN_TEST_RUNTIME_OWNER_TOKEN";
 const RUNTIME_CONTAINMENT_ENV: &str = "KIN_TEST_RUNTIME_CONTAINMENT_GUARDIAN";
 const RUNTIME_CONTAINMENT_READY_ENV: &str = "KIN_TEST_RUNTIME_CONTAINMENT_READY";
@@ -55,6 +60,7 @@ const RUNTIME_CONTAINMENT_GROUP_ENV: &str = "KIN_TEST_RUNTIME_CONTAINMENT_PROCES
 struct RuntimeContainment {
     process_group: libc::pid_t,
     guardian: Option<Child>,
+    termination_requested: AtomicBool,
 }
 
 #[cfg(unix)]
@@ -128,13 +134,14 @@ impl RuntimeContainment {
         Ok(Self {
             process_group,
             guardian: Some(guardian),
+            termination_requested: AtomicBool::new(false),
         })
     }
 
     fn spawn(&self, command: &mut std::process::Command, _label: &str) -> std::io::Result<Child> {
         use std::os::unix::process::CommandExt as _;
 
-        if self.guardian.is_none() {
+        if self.guardian.is_none() || self.termination_requested.load(Ordering::Acquire) {
             return Err(std::io::Error::other(
                 "runtime containment was already terminated",
             ));
@@ -144,11 +151,15 @@ impl RuntimeContainment {
     }
 
     fn terminate(&self) -> std::io::Result<()> {
-        if self.guardian.is_none() {
-            Ok(())
-        } else {
-            signal_process_group(self.process_group, libc::SIGKILL)
+        if self.termination_requested.swap(true, Ordering::AcqRel) {
+            return Ok(());
         }
+        if self.guardian.is_none() {
+            return Err(std::io::Error::other(
+                "runtime containment lost its guardian before termination",
+            ));
+        }
+        signal_process_group(self.process_group, libc::SIGKILL)
     }
 
     fn is_empty(&self) -> std::io::Result<bool> {
@@ -165,19 +176,26 @@ impl RuntimeContainment {
         }
         let terminate_error = self.terminate().err();
         let tree_result = confirm_containment_empty(self, Instant::now() + PROCESS_REAP_TIMEOUT);
-        let reap_result = match poll_child_until(
-            self.guardian
-                .as_mut()
-                .expect("guardian remains present until it is reaped"),
-            Instant::now() + PROCESS_REAP_TIMEOUT,
-            "runtime containment guardian",
-        ) {
-            Ok(Some(_)) => {
-                self.guardian.take();
-                Ok(())
+        let reap_result = if tree_result.is_ok() {
+            match poll_child_until(
+                self.guardian
+                    .as_mut()
+                    .expect("guardian remains present until quiescence permits reaping"),
+                Instant::now() + PROCESS_REAP_TIMEOUT,
+                "runtime containment guardian",
+            ) {
+                Ok(Some(_)) => {
+                    self.guardian.take();
+                    Ok(())
+                }
+                Ok(None) => Err("runtime containment guardian was not reaped".to_string()),
+                Err(error) => Err(error),
             }
-            Ok(None) => Err("runtime containment guardian was not reaped".to_string()),
-            Err(error) => Err(error),
+        } else {
+            Err(
+                "runtime containment guardian retained because quiescence was not proven"
+                    .to_string(),
+            )
         };
         combine_containment_results(terminate_error, tree_result, reap_result)
     }
@@ -195,6 +213,17 @@ impl Drop for RuntimeContainment {
 fn runtime_containment_guardian_worker() {
     if std::env::var_os(RUNTIME_CONTAINMENT_ENV).is_none() {
         return;
+    }
+    for forbidden in [
+        "GIT_DIR",
+        "GIT_CONFIG_COUNT",
+        "GIT_DEFAULT_HASH",
+        "LD_CUSTOM_INJECTION",
+    ] {
+        assert!(
+            std::env::var_os(forbidden).is_none(),
+            "{forbidden} reached the runtime containment guardian"
+        );
     }
     let expected_parent = std::env::var(RUNTIME_CONTAINMENT_PARENT_ENV)
         .expect("runtime guardian parent PID")
@@ -692,11 +721,14 @@ struct CleanupCommand {
 /// Per-test supervisor and registry state with fail-closed lifecycle cleanup.
 ///
 /// Daemon-backed integration tests must never discover the user's real Kin
-/// registry. The runtime lives under the fixture's reserved `.kin` control
-/// directory. Its `Drop` path first asks the product CLI to stop every process,
-/// then terminates the stable OS containment created before any child was
-/// launched. A final owner-token scan is verification only: it never signals a
-/// PID, so PID reuse cannot authorize killing an unrelated process.
+/// registry. Runtime-only state lives in an owned system temporary directory,
+/// outside the repository: constructing this harness before `kin init` must not
+/// create the product-owned `.kin` control directory and make initialization
+/// reject an otherwise fresh repository. Its `Drop` path first asks the product
+/// CLI to stop every process, then terminates the stable OS containment created
+/// before any child was launched. A final owner-token scan is verification only:
+/// it never signals a PID, so PID reuse cannot authorize killing an unrelated
+/// process.
 pub struct IsolatedDaemonRuntime {
     repository: PathBuf,
     registry_path: PathBuf,
@@ -705,27 +737,31 @@ pub struct IsolatedDaemonRuntime {
     containment: RuntimeContainment,
     cleanup_command: Option<CleanupCommand>,
     cleanup_timeout: Duration,
+    _runtime_root: tempfile::TempDir,
 }
 
 impl IsolatedDaemonRuntime {
     pub fn new(repository: &Path) -> Self {
-        let runtime_root = repository.join(".kin/test-runtime");
-        let home_path = runtime_root.join("home");
+        let runtime_root = tempfile::Builder::new()
+            .prefix("kin-isolated-runtime-")
+            .tempdir()
+            .unwrap_or_else(|error| panic!("create isolated runtime root: {error}"));
+        let home_path = runtime_root.path().join("home");
         let owner_token = uuid::Uuid::new_v4().to_string();
-        let containment = RuntimeContainment::new(&runtime_root, &owner_token)
+        let containment = RuntimeContainment::new(runtime_root.path(), &owner_token)
             .unwrap_or_else(|error| panic!("create isolated runtime containment: {error}"));
         Self {
             repository: repository.to_path_buf(),
-            registry_path: runtime_root.join("registry.toml"),
+            registry_path: runtime_root.path().join("registry.toml"),
             home_path,
             owner_token,
             containment,
             cleanup_command: None,
             cleanup_timeout: Duration::from_secs(15),
+            _runtime_root: runtime_root,
         }
     }
 
-    #[cfg(unix)]
     pub fn with_cleanup_command_for_test(
         repository: &Path,
         program: PathBuf,
@@ -737,6 +773,10 @@ impl IsolatedDaemonRuntime {
         runtime.cleanup_command = Some(CleanupCommand { program, args, env });
         runtime.cleanup_timeout = timeout;
         runtime
+    }
+
+    pub fn process_command_for_test<S: AsRef<OsStr>>(&self, program: S) -> Command<'_> {
+        self.command(program)
     }
 
     pub fn kin_command(&self) -> Command<'_> {
@@ -852,11 +892,10 @@ impl Drop for IsolatedDaemonRuntime {
         }));
         let graceful_failure = match cleanup {
             Ok(Ok(output)) if output.status.success() => None,
-            Ok(Ok(output)) => Some(format!(
-                "isolated daemon cleanup failed with {}: stdout={} stderr={}",
-                output.status,
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
+            Ok(Ok(output)) => Some(render_failed_cleanup_output(
+                &output.status.to_string(),
+                &output.stdout,
+                &output.stderr,
             )),
             Ok(Err(error)) => Some(format!("isolated daemon cleanup could not run: {error}")),
             Err(_) => Some("isolated daemon cleanup exceeded its wall-clock bound".to_string()),
@@ -890,11 +929,11 @@ impl Drop for IsolatedDaemonRuntime {
 ///
 /// Two differences from the standard type, both load-bearing:
 ///
-/// - Output is captured into regular files rather than pipes. `kin` detaches a
-///   `kin-daemon` that inherits the caller's stdout and stderr, and a pipe stays
-///   open for as long as any descendant holds its write end — so
-///   `std::process::Command::output()` keeps reading long after the `kin`
-///   process it launched has exited, for as long as the daemon lives.
+/// - Dedicated reader sinks drain stdout and stderr continuously while
+///   retaining at most a fixed byte ceiling per stream. A runtime-bound
+///   `kin-daemon` may inherit those streams; the caller snapshots a quiescent
+///   bounded prefix rather than waiting for descendant-owned EOF, then
+///   explicitly cancels and joins both readers within a bounded grace period.
 /// - The wait carries a wall-clock deadline. At the deadline the child is
 ///   killed and the test fails naming the command, instead of leaving a silent,
 ///   idle process the developer has to notice and kill by hand.
@@ -940,6 +979,45 @@ impl<'runtime> Command<'runtime> {
                 Some(value.to_os_string()),
             );
         }
+        self
+    }
+
+    /// Preserve one explicit timestamp for both halves of fixture commit
+    /// identity across the final Git-authority scrub.
+    ///
+    /// This is deliberately typed around the exact safe intent. General
+    /// `GIT_*` environment overrides remain fail-closed, and callers cannot use
+    /// this surface to replay repository/configuration authority after
+    /// `kin_git::test_support::isolate_fixture_git`.
+    pub fn fixture_git_commit_dates<V: AsRef<OsStr>>(&mut self, value: V) -> &mut Self {
+        let value = value.as_ref().to_os_string();
+        for key in ["GIT_AUTHOR_DATE", "GIT_COMMITTER_DATE"] {
+            self.inner.env(key, &value);
+            upsert_intentional_env(
+                &mut self.intentional_env,
+                OsString::from(key),
+                Some(value.clone()),
+            );
+        }
+        self
+    }
+
+    /// Preserve one explicit daemon endpoint for a runtime-bound negative-path
+    /// fixture after the final Kin-authority scrub.
+    ///
+    /// General `KIN_DAEMON_URL` overrides remain fail-closed. This narrow
+    /// surface exists only for tests that must prove behavior against a
+    /// deliberately unreachable endpoint without silently autostarting the
+    /// isolated runtime's daemon.
+    pub fn fixture_daemon_url<V: AsRef<OsStr>>(&mut self, value: V) -> &mut Self {
+        assert!(
+            self.runtime.is_some(),
+            "fixture_daemon_url requires an IsolatedDaemonRuntime command"
+        );
+        let key = OsString::from("KIN_DAEMON_URL");
+        let value = value.as_ref().to_os_string();
+        self.inner.env(&key, &value);
+        upsert_intentional_env(&mut self.intentional_env, key, Some(value));
         self
     }
 
@@ -991,18 +1069,45 @@ impl<'runtime> Command<'runtime> {
             .map(|(_, value)| value.map(OsStr::to_os_string))
     }
 
+    pub fn prepare_for_launch_for_test(&mut self) {
+        self.prepare_for_launch();
+    }
+
     /// Run to completion under [`COMMAND_TIMEOUT`] with stdin closed.
     pub fn output(&mut self) -> std::io::Result<Output> {
         self.output_within(COMMAND_TIMEOUT)
     }
 
     pub fn output_within(&mut self, timeout: Duration) -> std::io::Result<Output> {
+        self.output_within_after_path(None, timeout)
+    }
+
+    /// Wait for `ready_path` before starting the command's execution deadline.
+    ///
+    /// Process-tree tests use this to distinguish slow process startup from the
+    /// behavior under test. Readiness itself remains independently bounded, and
+    /// either deadline uses the same fail-closed descendant cleanup.
+    pub fn output_after_path_ready_within(
+        &mut self,
+        ready_path: &Path,
+        readiness_timeout: Duration,
+        timeout: Duration,
+    ) -> std::io::Result<Output> {
+        self.output_within_after_path(Some((ready_path, readiness_timeout)), timeout)
+    }
+
+    fn output_within_after_path(
+        &mut self,
+        readiness: Option<(&Path, Duration)>,
+        timeout: Duration,
+    ) -> std::io::Result<Output> {
         self.prepare_for_launch();
         let label = self.inner.get_program().to_string_lossy().into_owned();
         run_bounded_within(
             &mut self.inner,
             &label,
             self.runtime.map(|runtime| &runtime.containment),
+            readiness,
             timeout,
         )
     }
@@ -1025,10 +1130,14 @@ impl<'runtime> Command<'runtime> {
 
     fn prepare_for_launch(&mut self) {
         scrub_inherited_kin_authority(&mut self.inner);
-        kin_git::test_support::isolate_fixture_git(&mut self.inner);
         if let Some(runtime) = self.runtime {
             runtime.apply_isolated_environment(&mut self.inner);
         }
+        // This must be the final general authority transform. In particular,
+        // `apply_isolated_environment` scrubs every GIT_* key, so applying it
+        // after fixture isolation would silently remove the null-config,
+        // no-prompt, and protocol guards installed here.
+        kin_git::test_support::isolate_fixture_git(&mut self.inner);
         for (key, value) in &self.intentional_env {
             match value {
                 Some(value) => {
@@ -1115,10 +1224,9 @@ fn is_kin_authority(key: &OsStr) -> bool {
     let label = key.to_string_lossy();
     env_name_starts_with(&label, "KIN_")
         || env_name_eq(&label, "_KIN_VFS_LAST_DIR")
+        || env_name_starts_with(&label, "GIT_")
         || env_name_starts_with(&label, "DYLD_")
-        || env_name_eq(&label, "LD_PRELOAD")
-        || env_name_eq(&label, "LD_AUDIT")
-        || env_name_eq(&label, "LD_LIBRARY_PATH")
+        || env_name_starts_with(&label, "LD_")
 }
 
 #[cfg(windows)]
@@ -1127,8 +1235,9 @@ fn runtime_authority_names_are_case_insensitive_on_windows() {
     for hostile in [
         "kin_registry_path",
         "_kin_vfs_last_dir",
+        "git_config_count",
         "Dyld_Library_Path",
-        "ld_preload",
+        "Ld_Custom_Injection",
     ] {
         assert!(
             is_kin_authority(OsStr::new(hostile)),
@@ -1232,18 +1341,549 @@ fn process_has_owner_token(
         .any(|entry| entry == OsStr::new(&expected))
 }
 
+#[derive(Clone, Debug, Default)]
+struct CapturedCommandStream {
+    bytes: Vec<u8>,
+    observed_bytes: u64,
+    truncated: bool,
+    error: Option<String>,
+    done: bool,
+}
+
+struct CommandCaptureReader {
+    name: &'static str,
+    state: Arc<Mutex<CapturedCommandStream>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    cancel: Arc<AtomicBool>,
+}
+
+struct BoundedCommandCapture {
+    stdout: CommandCaptureReader,
+    stderr: CommandCaptureReader,
+    overflowed: Arc<AtomicBool>,
+}
+
+#[derive(Debug)]
+struct CapturedCommandOutput {
+    stdout: CapturedCommandStream,
+    stderr: CapturedCommandStream,
+}
+
+impl BoundedCommandCapture {
+    fn configure(command: &mut std::process::Command) {
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+    }
+
+    fn start(child: &mut Child, label: &str) -> std::io::Result<Self> {
+        let stdout = child.stdout.take().ok_or_else(|| {
+            std::io::Error::other(format!("{label} did not expose captured stdout"))
+        })?;
+        let stderr = child.stderr.take().ok_or_else(|| {
+            std::io::Error::other(format!("{label} did not expose captured stderr"))
+        })?;
+        let overflowed = Arc::new(AtomicBool::new(false));
+        Ok(Self {
+            stdout: CommandCaptureReader::spawn(stdout, "stdout", overflowed.clone())?,
+            stderr: CommandCaptureReader::spawn(stderr, "stderr", overflowed.clone())?,
+            overflowed,
+        })
+    }
+
+    fn overflowed(&self) -> bool {
+        self.overflowed.load(Ordering::Acquire)
+    }
+
+    fn finish(mut self, descendants_were_closed: bool) -> std::io::Result<CapturedCommandOutput> {
+        let join_deadline = Instant::now() + PROCESS_REAP_TIMEOUT;
+        if descendants_were_closed {
+            while !self.both_done()? && Instant::now() < join_deadline {
+                std::thread::sleep(POLL_INTERVAL);
+            }
+        } else {
+            // Observe a stable prefix before cancellation so diagnostics
+            // include output already in flight, but never wait for a
+            // descendant-owned EOF.
+            let deadline = Instant::now() + Duration::from_secs(1);
+            let mut prior = self.observed_lengths()?;
+            let mut quiet_since = Instant::now();
+            loop {
+                let current = self.observed_lengths()?;
+                if self.both_done()? {
+                    break;
+                }
+                if current != prior {
+                    prior = current;
+                    quiet_since = Instant::now();
+                } else if Instant::now() >= quiet_since + PROCESS_QUIESCENCE
+                    || Instant::now() >= deadline
+                {
+                    break;
+                }
+                std::thread::sleep(POLL_INTERVAL);
+            }
+        }
+        self.stdout
+            .cancel_and_join_until(Instant::now() + PROCESS_REAP_TIMEOUT)?;
+        self.stderr
+            .cancel_and_join_until(Instant::now() + PROCESS_REAP_TIMEOUT)?;
+
+        let output = CapturedCommandOutput {
+            stdout: self.stdout.snapshot()?,
+            stderr: self.stderr.snapshot()?,
+        };
+        if let Some(error) = output
+            .stdout
+            .error
+            .as_ref()
+            .or(output.stderr.error.as_ref())
+        {
+            return Err(std::io::Error::other(format!(
+                "bounded command capture failed: {error}"
+            )));
+        }
+        Ok(output)
+    }
+
+    fn observed_lengths(&self) -> std::io::Result<(u64, u64)> {
+        Ok((
+            self.stdout.snapshot()?.observed_bytes,
+            self.stderr.snapshot()?.observed_bytes,
+        ))
+    }
+
+    fn both_done(&self) -> std::io::Result<bool> {
+        Ok(self.stdout.snapshot()?.done && self.stderr.snapshot()?.done)
+    }
+}
+
+impl CommandCaptureReader {
+    fn spawn(
+        stream: impl CommandCapturePipe,
+        name: &'static str,
+        overflowed: Arc<AtomicBool>,
+    ) -> std::io::Result<Self> {
+        stream.prepare_nonblocking()?;
+        let state = Arc::new(Mutex::new(CapturedCommandStream::default()));
+        let reader_state = state.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let reader_cancel = cancel.clone();
+        let thread = std::thread::Builder::new()
+            .name(format!("kin-integration-{name}-capture"))
+            .spawn(move || {
+                drain_command_stream(stream, &reader_state, &overflowed, &reader_cancel);
+            })?;
+        Ok(Self {
+            name,
+            state,
+            thread: Some(thread),
+            cancel,
+        })
+    }
+
+    fn snapshot(&self) -> std::io::Result<CapturedCommandStream> {
+        self.state
+            .lock()
+            .map(|state| state.clone())
+            .map_err(|_| std::io::Error::other("bounded command capture state was poisoned"))
+    }
+
+    fn cancel_and_join_until(&mut self, deadline: Instant) -> std::io::Result<()> {
+        self.cancel.store(true, Ordering::Release);
+        if let Some(thread) = &self.thread {
+            thread.thread().unpark();
+        }
+        while !self.snapshot()?.done {
+            if Instant::now() >= deadline {
+                return Err(std::io::Error::other(format!(
+                    "{} capture reader ignored cancellation past its deadline",
+                    self.name
+                )));
+            }
+            std::thread::sleep(POLL_INTERVAL);
+        }
+        if let Some(thread) = self.thread.take() {
+            thread.join().map_err(|_| {
+                std::io::Error::other(format!("{} capture thread panicked", self.name))
+            })?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for CommandCaptureReader {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Release);
+        if let Some(thread) = &self.thread {
+            thread.thread().unpark();
+        }
+        let deadline = Instant::now() + POLL_INTERVAL.saturating_mul(4);
+        while self.snapshot().is_ok_and(|state| !state.done) && Instant::now() < deadline {
+            std::thread::sleep(POLL_INTERVAL);
+        }
+        if self.snapshot().is_ok_and(|state| state.done) {
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+}
+
+enum CommandCaptureRead {
+    Data(usize),
+    Pending,
+    Eof,
+}
+
+trait CommandCapturePipe: Read + Send + 'static {
+    fn prepare_nonblocking(&self) -> std::io::Result<()>;
+    fn read_available(&mut self, buffer: &mut [u8]) -> std::io::Result<CommandCaptureRead>;
+}
+
+macro_rules! impl_command_capture_pipe {
+    ($pipe:ty) => {
+        impl CommandCapturePipe for $pipe {
+            fn prepare_nonblocking(&self) -> std::io::Result<()> {
+                prepare_command_capture_pipe(self)
+            }
+
+            fn read_available(&mut self, buffer: &mut [u8]) -> std::io::Result<CommandCaptureRead> {
+                read_command_capture_pipe(self, buffer)
+            }
+        }
+    };
+}
+
+impl_command_capture_pipe!(std::process::ChildStdout);
+impl_command_capture_pipe!(std::process::ChildStderr);
+
+impl CommandCapturePipe for std::io::Cursor<Vec<u8>> {
+    fn prepare_nonblocking(&self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn read_available(&mut self, buffer: &mut [u8]) -> std::io::Result<CommandCaptureRead> {
+        match self.read(buffer)? {
+            0 => Ok(CommandCaptureRead::Eof),
+            read => Ok(CommandCaptureRead::Data(read)),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn prepare_command_capture_pipe(
+    pipe: &(impl std::os::fd::AsRawFd + ?Sized),
+) -> std::io::Result<()> {
+    let descriptor = pipe.as_raw_fd();
+    let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+    if flags == -1
+        || unsafe { libc::fcntl(descriptor, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn read_command_capture_pipe(
+    pipe: &mut impl Read,
+    buffer: &mut [u8],
+) -> std::io::Result<CommandCaptureRead> {
+    match pipe.read(buffer) {
+        Ok(0) => Ok(CommandCaptureRead::Eof),
+        Ok(read) => Ok(CommandCaptureRead::Data(read)),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            Ok(CommandCaptureRead::Pending)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(windows)]
+fn prepare_command_capture_pipe(
+    _pipe: &(impl std::os::windows::io::AsRawHandle + ?Sized),
+) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(windows)]
+fn read_command_capture_pipe(
+    pipe: &mut (impl Read + std::os::windows::io::AsRawHandle),
+    buffer: &mut [u8],
+) -> std::io::Result<CommandCaptureRead> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Foundation::{
+        ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_PIPE_NOT_CONNECTED,
+    };
+    use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+
+    let mut available = 0_u32;
+    let peeked = unsafe {
+        PeekNamedPipe(
+            pipe.as_raw_handle().cast(),
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            &mut available,
+            std::ptr::null_mut(),
+        )
+    };
+    if peeked == 0 {
+        let error = std::io::Error::last_os_error();
+        return match error.raw_os_error().map(|code| code as u32) {
+            Some(ERROR_BROKEN_PIPE | ERROR_NO_DATA | ERROR_PIPE_NOT_CONNECTED) => {
+                Ok(CommandCaptureRead::Eof)
+            }
+            _ => Err(error),
+        };
+    }
+    if available == 0 {
+        return Ok(CommandCaptureRead::Pending);
+    }
+    let request = buffer
+        .len()
+        .min(usize::try_from(available).unwrap_or(usize::MAX));
+    match pipe.read(&mut buffer[..request]) {
+        Ok(0) => Ok(CommandCaptureRead::Eof),
+        Ok(read) => Ok(CommandCaptureRead::Data(read)),
+        Err(error)
+            if error.kind() == std::io::ErrorKind::BrokenPipe
+                || matches!(
+                    error.raw_os_error().map(|code| code as u32),
+                    Some(ERROR_BROKEN_PIPE | ERROR_NO_DATA | ERROR_PIPE_NOT_CONNECTED)
+                ) =>
+        {
+            Ok(CommandCaptureRead::Eof)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn prepare_command_capture_pipe<T: ?Sized>(_pipe: &T) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn read_command_capture_pipe(
+    pipe: &mut impl Read,
+    buffer: &mut [u8],
+) -> std::io::Result<CommandCaptureRead> {
+    match pipe.read(buffer)? {
+        0 => Ok(CommandCaptureRead::Eof),
+        read => Ok(CommandCaptureRead::Data(read)),
+    }
+}
+
+fn drain_command_stream(
+    mut stream: impl CommandCapturePipe,
+    state: &Arc<Mutex<CapturedCommandStream>>,
+    overflowed: &Arc<AtomicBool>,
+    cancel: &Arc<AtomicBool>,
+) {
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        if cancel.load(Ordering::Acquire) {
+            break;
+        }
+        match stream.read_available(&mut buffer) {
+            Ok(CommandCaptureRead::Eof) => break,
+            Ok(CommandCaptureRead::Pending) => {
+                std::thread::park_timeout(POLL_INTERVAL);
+            }
+            Ok(CommandCaptureRead::Data(read)) => {
+                let Ok(mut state) = state.lock() else {
+                    return;
+                };
+                state.observed_bytes = state.observed_bytes.saturating_add(read as u64);
+                let remaining = COMMAND_CAPTURE_LIMIT.saturating_sub(state.bytes.len());
+                state
+                    .bytes
+                    .extend_from_slice(&buffer[..read.min(remaining)]);
+                if read > remaining {
+                    state.truncated = true;
+                    overflowed.store(true, Ordering::Release);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                if let Ok(mut state) = state.lock() {
+                    state.error = Some(error.to_string());
+                }
+                break;
+            }
+        }
+    }
+    if let Ok(mut state) = state.lock() {
+        state.done = true;
+    }
+}
+
+struct NeverEofCommandCapturePipe;
+
+impl Read for NeverEofCommandCapturePipe {
+    fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+        Err(std::io::ErrorKind::WouldBlock.into())
+    }
+}
+
+impl CommandCapturePipe for NeverEofCommandCapturePipe {
+    fn prepare_nonblocking(&self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn read_available(&mut self, _buffer: &mut [u8]) -> std::io::Result<CommandCaptureRead> {
+        Ok(CommandCaptureRead::Pending)
+    }
+}
+
+#[test]
+fn bounded_command_capture_sink_never_retains_past_the_ceiling() {
+    let state = Arc::new(Mutex::new(CapturedCommandStream::default()));
+    let overflowed = Arc::new(AtomicBool::new(false));
+    let cancel = Arc::new(AtomicBool::new(false));
+    let input = vec![b'x'; COMMAND_CAPTURE_LIMIT + 16 * 1024];
+    drain_command_stream(std::io::Cursor::new(input), &state, &overflowed, &cancel);
+    let captured = state.lock().expect("capture state").clone();
+
+    assert_eq!(captured.bytes.len(), COMMAND_CAPTURE_LIMIT);
+    assert_eq!(
+        captured.observed_bytes,
+        (COMMAND_CAPTURE_LIMIT + 16 * 1024) as u64
+    );
+    assert!(captured.truncated);
+    assert!(captured.done);
+    assert!(overflowed.load(Ordering::Acquire));
+    assert!(compact_command_capture(&captured).len() <= COMMAND_DIAGNOSTIC_LIMIT);
+}
+
+#[test]
+fn compact_command_capture_hard_bounds_invalid_utf8_after_lossy_expansion() {
+    let captured = CapturedCommandStream {
+        bytes: vec![0xff; COMMAND_DIAGNOSTIC_LIMIT],
+        observed_bytes: COMMAND_DIAGNOSTIC_LIMIT as u64,
+        ..CapturedCommandStream::default()
+    };
+    let diagnostic = compact_command_capture(&captured);
+
+    assert!(diagnostic.len() <= COMMAND_DIAGNOSTIC_LIMIT);
+    assert!(diagnostic.ends_with(COMMAND_DIAGNOSTIC_MARKER));
+    assert!(diagnostic.contains('\u{FFFD}'));
+}
+
+#[test]
+fn failed_cleanup_output_is_hard_bounded_after_lossy_expansion() {
+    let invalid = vec![0xff; COMMAND_CAPTURE_LIMIT];
+    let diagnostic = render_failed_cleanup_output("exit status: 1", &invalid, &invalid);
+
+    assert!(diagnostic.contains("isolated daemon cleanup failed with exit status: 1"));
+    assert_eq!(
+        diagnostic.matches(COMMAND_DIAGNOSTIC_MARKER).count(),
+        2,
+        "both cleanup streams should disclose truncation"
+    );
+    assert!(
+        diagnostic.len() <= COMMAND_DIAGNOSTIC_LIMIT * 2 + 128,
+        "cleanup diagnostic expanded past the two bounded streams: {} bytes",
+        diagnostic.len()
+    );
+}
+
+#[test]
+fn never_eof_command_capture_is_cancelled_and_joined() {
+    let mut reader = CommandCaptureReader::spawn(
+        NeverEofCommandCapturePipe,
+        "never-eof",
+        Arc::new(AtomicBool::new(false)),
+    )
+    .expect("start never-EOF command capture");
+    let started = Instant::now();
+    reader
+        .cancel_and_join_until(Instant::now() + Duration::from_secs(1))
+        .expect("cancel never-EOF command capture");
+
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "never-EOF capture exceeded its cancellation deadline"
+    );
+    assert!(reader.snapshot().expect("capture snapshot").done);
+}
+
+fn compact_command_capture(stream: &CapturedCommandStream) -> String {
+    compact_command_bytes(&stream.bytes, stream.truncated)
+}
+
+fn compact_command_bytes(bytes: &[u8], already_truncated: bool) -> String {
+    let prefix = &bytes[..bytes.len().min(COMMAND_DIAGNOSTIC_LIMIT)];
+    let lossy = String::from_utf8_lossy(prefix);
+    let needs_marker = already_truncated
+        || bytes.len() > COMMAND_DIAGNOSTIC_LIMIT
+        || lossy.len() > COMMAND_DIAGNOSTIC_LIMIT;
+    let content_budget = if needs_marker {
+        COMMAND_DIAGNOSTIC_LIMIT.saturating_sub(COMMAND_DIAGNOSTIC_MARKER.len())
+    } else {
+        COMMAND_DIAGNOSTIC_LIMIT
+    };
+    let mut content_end = lossy.len().min(content_budget);
+    while !lossy.is_char_boundary(content_end) {
+        content_end -= 1;
+    }
+    let mut rendered = lossy[..content_end].to_owned();
+    if needs_marker {
+        rendered.push_str(COMMAND_DIAGNOSTIC_MARKER);
+    }
+    debug_assert!(rendered.len() <= COMMAND_DIAGNOSTIC_LIMIT);
+    rendered
+}
+
+fn render_failed_cleanup_output(status: &str, stdout: &[u8], stderr: &[u8]) -> String {
+    format!(
+        "isolated daemon cleanup failed with {status}: stdout={} stderr={}",
+        compact_command_bytes(stdout, false),
+        compact_command_bytes(stderr, false)
+    )
+}
+
+fn command_output_from_capture(
+    status: ExitStatus,
+    capture: CapturedCommandOutput,
+    label: &str,
+) -> std::io::Result<Output> {
+    if capture.stdout.truncated || capture.stderr.truncated {
+        return Err(std::io::Error::other(format!(
+            "{label} exceeded the {COMMAND_CAPTURE_LIMIT}-byte per-stream capture limit \
+             (stdout={}, stderr={}); stdout={} stderr={}",
+            capture.stdout.observed_bytes,
+            capture.stderr.observed_bytes,
+            compact_command_capture(&capture.stdout),
+            compact_command_capture(&capture.stderr)
+        )));
+    }
+    Ok(Output {
+        status,
+        stdout: capture.stdout.bytes,
+        stderr: capture.stderr.bytes,
+    })
+}
+
+fn render_command_captures(capture: &CapturedCommandOutput) -> String {
+    format!(
+        "stdout={} stderr={}",
+        compact_command_capture(&capture.stdout),
+        compact_command_capture(&capture.stderr)
+    )
+}
+
 fn run_bounded_within(
     command: &mut std::process::Command,
     label: &str,
     runtime_containment: Option<&RuntimeContainment>,
+    readiness: Option<(&Path, Duration)>,
     timeout: Duration,
 ) -> std::io::Result<Output> {
-    let stdout = tempfile::tempfile()?;
-    let stderr = tempfile::tempfile()?;
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(stdout.try_clone()?))
-        .stderr(Stdio::from(stderr.try_clone()?));
+    BoundedCommandCapture::configure(command);
 
     let (mut child, mut command_containment) = match runtime_containment {
         Some(containment) => (containment.spawn(command, label)?, None),
@@ -1252,10 +1892,154 @@ fn run_bounded_within(
             (child, Some(containment))
         }
     };
+    let mut capture = Some(match BoundedCommandCapture::start(&mut child, label) {
+        Ok(capture) => capture,
+        Err(error) => {
+            let cleanup = terminate_spawned_process(
+                &mut child,
+                label,
+                command_containment
+                    .as_ref()
+                    .map(|containment| containment as &dyn ProcessContainment)
+                    .or_else(|| {
+                        runtime_containment
+                            .map(|containment| containment as &dyn ProcessContainment)
+                    }),
+            );
+            return Err(std::io::Error::other(format!(
+                "initialize bounded capture for {label}: {error}; cleanup={cleanup:?}"
+            )));
+        }
+    });
+    if let Some((ready_path, readiness_timeout)) = readiness {
+        let readiness_deadline = Instant::now() + readiness_timeout;
+        while !ready_path.is_file() {
+            if capture
+                .as_ref()
+                .is_some_and(BoundedCommandCapture::overflowed)
+            {
+                let cleanup = terminate_spawned_process(
+                    &mut child,
+                    label,
+                    command_containment
+                        .as_ref()
+                        .map(|containment| containment as &dyn ProcessContainment)
+                        .or_else(|| {
+                            runtime_containment
+                                .map(|containment| containment as &dyn ProcessContainment)
+                        }),
+                );
+                let captured = capture
+                    .take()
+                    .expect("capture remains owned")
+                    .finish(cleanup.is_ok())?;
+                return Err(std::io::Error::other(format!(
+                    "{label} exceeded the {COMMAND_CAPTURE_LIMIT}-byte per-stream capture limit \
+                     before readiness (stdout={}, stderr={}); cleanup={cleanup:?}; {}",
+                    captured.stdout.observed_bytes,
+                    captured.stderr.observed_bytes,
+                    render_command_captures(&captured)
+                )));
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    let descendants_closed = command_containment.is_some();
+                    if let Some(containment) = command_containment.as_mut() {
+                        containment.terminate_and_confirm().map_err(|error| {
+                            std::io::Error::other(format!(
+                                "clean descendants after {label} exited before readiness: {error}"
+                            ))
+                        })?;
+                    }
+                    let captured = capture
+                        .take()
+                        .expect("capture remains owned")
+                        .finish(descendants_closed)?;
+                    return command_output_from_capture(status, captured, label);
+                }
+                Ok(None) if Instant::now() < readiness_deadline => {
+                    std::thread::sleep(POLL_INTERVAL);
+                }
+                Ok(None) => {
+                    let cleanup = terminate_spawned_process(
+                        &mut child,
+                        label,
+                        command_containment
+                            .as_ref()
+                            .map(|containment| containment as &dyn ProcessContainment)
+                            .or_else(|| {
+                                runtime_containment
+                                    .map(|containment| containment as &dyn ProcessContainment)
+                            }),
+                    );
+                    let captured = capture
+                        .take()
+                        .expect("capture remains owned")
+                        .finish(cleanup.is_ok())
+                        .map(|captured| render_command_captures(&captured))
+                        .unwrap_or_else(|error| format!("capture-error={error}"));
+                    panic!(
+                        "{label} did not publish readiness at {} within {readiness_timeout:?}; cleanup={cleanup:?}; {captured}",
+                        ready_path.display(),
+                    );
+                }
+                Err(error) => {
+                    let cleanup = terminate_spawned_process(
+                        &mut child,
+                        label,
+                        command_containment
+                            .as_ref()
+                            .map(|containment| containment as &dyn ProcessContainment)
+                            .or_else(|| {
+                                runtime_containment
+                                    .map(|containment| containment as &dyn ProcessContainment)
+                            }),
+                    );
+                    let captured = capture
+                        .take()
+                        .expect("capture remains owned")
+                        .finish(cleanup.is_ok())
+                        .map(|captured| render_command_captures(&captured))
+                        .unwrap_or_else(|capture_error| format!("capture-error={capture_error}"));
+                    return Err(std::io::Error::other(format!(
+                        "{error}; cleanup={cleanup:?}; {captured}"
+                    )));
+                }
+            }
+        }
+    }
     let deadline = Instant::now() + timeout;
     loop {
+        if capture
+            .as_ref()
+            .is_some_and(BoundedCommandCapture::overflowed)
+        {
+            let cleanup = terminate_spawned_process(
+                &mut child,
+                label,
+                command_containment
+                    .as_ref()
+                    .map(|containment| containment as &dyn ProcessContainment)
+                    .or_else(|| {
+                        runtime_containment
+                            .map(|containment| containment as &dyn ProcessContainment)
+                    }),
+            );
+            let captured = capture
+                .take()
+                .expect("capture remains owned")
+                .finish(cleanup.is_ok())?;
+            return Err(std::io::Error::other(format!(
+                "{label} exceeded the {COMMAND_CAPTURE_LIMIT}-byte per-stream capture limit \
+                 (stdout={}, stderr={}); cleanup={cleanup:?}; {}",
+                captured.stdout.observed_bytes,
+                captured.stderr.observed_bytes,
+                render_command_captures(&captured)
+            )));
+        }
         match child.try_wait() {
             Ok(Some(status)) => {
+                let descendants_closed = command_containment.is_some();
                 if let Some(containment) = command_containment.as_mut() {
                     containment.terminate_and_confirm().map_err(|error| {
                         std::io::Error::other(format!(
@@ -1263,11 +2047,11 @@ fn run_bounded_within(
                         ))
                     })?;
                 }
-                return Ok(Output {
-                    status,
-                    stdout: read_capture(stdout)?,
-                    stderr: read_capture(stderr)?,
-                });
+                let captured = capture
+                    .take()
+                    .expect("capture remains owned")
+                    .finish(descendants_closed)?;
+                return command_output_from_capture(status, captured, label);
             }
             Ok(None) if Instant::now() < deadline => std::thread::sleep(POLL_INTERVAL),
             Ok(None) => {
@@ -1282,14 +2066,16 @@ fn run_bounded_within(
                                 .map(|containment| containment as &dyn ProcessContainment)
                         }),
                 );
-                panic!(
-                    "{label} did not exit within {timeout:?}; cleanup={cleanup:?}; stdout={} stderr={}",
-                    String::from_utf8_lossy(&read_capture(stdout).unwrap_or_default()),
-                    String::from_utf8_lossy(&read_capture(stderr).unwrap_or_default())
-                );
+                let captured = capture
+                    .take()
+                    .expect("capture remains owned")
+                    .finish(cleanup.is_ok())
+                    .map(|captured| render_command_captures(&captured))
+                    .unwrap_or_else(|error| format!("capture-error={error}"));
+                panic!("{label} did not exit within {timeout:?}; cleanup={cleanup:?}; {captured}");
             }
             Err(error) => {
-                return match terminate_spawned_process(
+                let cleanup = terminate_spawned_process(
                     &mut child,
                     label,
                     command_containment
@@ -1299,10 +2085,16 @@ fn run_bounded_within(
                             runtime_containment
                                 .map(|containment| containment as &dyn ProcessContainment)
                         }),
-                ) {
-                    Ok(()) => Err(error),
-                    Err(cleanup) => Err(std::io::Error::other(format!("{error}; {cleanup}"))),
-                };
+                );
+                let captured = capture
+                    .take()
+                    .expect("capture remains owned")
+                    .finish(cleanup.is_ok())
+                    .map(|captured| render_command_captures(&captured))
+                    .unwrap_or_else(|capture_error| format!("capture-error={capture_error}"));
+                return Err(std::io::Error::other(format!(
+                    "{error}; cleanup={cleanup:?}; {captured}"
+                )));
             }
         }
     }
@@ -1359,13 +2151,6 @@ fn terminate_spawned_process(
             "{label} cleanup failed: containment termination={termination:?}; direct kill={kill:?}; direct reap={reap:?}; containment quiescence={quiescence:?}"
         )),
     }
-}
-
-fn read_capture(mut file: std::fs::File) -> std::io::Result<Vec<u8>> {
-    file.seek(SeekFrom::Start(0))?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
-    Ok(bytes)
 }
 
 /// The build identity this test binary carries, in the exact form the daemon
@@ -1492,8 +2277,8 @@ fn fresh_daemon_bin(runtime: &IsolatedDaemonRuntime) -> PathBuf {
         assert!(
             output.status.success(),
             "cargo build -p kin-daemon failed: stdout={} stderr={}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+            compact_command_bytes(&output.stdout, false),
+            compact_command_bytes(&output.stderr, false)
         );
     });
 

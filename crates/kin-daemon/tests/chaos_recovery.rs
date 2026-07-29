@@ -7,11 +7,13 @@ use std::time::{Duration, Instant};
 
 use kin_daemon::api::HealthResponse;
 use tokio::net::TcpStream;
-use tokio::process::{Child, Command};
+use tokio::process::Command;
 
 mod common;
 
-use common::{isolate_daemon_test_command, terminate_daemon};
+use common::{
+    isolate_daemon_test_command, spawn_daemon_test_command, terminate_daemon, DaemonChild,
+};
 
 /// Readiness budget for a daemon to come up. Generous enough that two CI runs
 /// sharing a runner (a push build and a pull_request build on the same commit)
@@ -30,7 +32,7 @@ fn backoff_after(current: Duration) -> Duration {
 /// polling a dead process until the readiness deadline. This turns a bind
 /// collision or a startup crash into an immediate, legible failure rather than
 /// a multi-minute "never became healthy" hang.
-fn assert_child_alive(child: &mut Child, port: u16, what: &str) {
+fn assert_child_alive(child: &mut DaemonChild, port: u16, what: &str) {
     if let Ok(Some(status)) = child.try_wait() {
         panic!("daemon on port {port} exited before it became {what}: {status}");
     }
@@ -40,7 +42,7 @@ fn assert_child_alive(child: &mut Child, port: u16, what: &str) {
 /// and return it. Spawning with `--port 0` lets the daemon own port selection
 /// and advertise the real bound port here — the same handshake the CLI uses —
 /// so a kill/restart never depends on reusing one port's teardown timing.
-async fn read_published_port(child: &mut Child, repo_root: &Path) -> u16 {
+async fn read_published_port(child: &mut DaemonChild, repo_root: &Path) -> u16 {
     let port_file = repo_root.join(".kin/daemon.port");
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut backoff = Duration::from_millis(20);
@@ -70,16 +72,15 @@ fn init_repo(root: &Path) {
     kin_core::init(root).unwrap();
 }
 
-fn spawn_daemon(repo_root: &Path, port: u16) -> Child {
+fn spawn_daemon(repo_root: &Path, port: u16) -> DaemonChild {
     spawn_daemon_with_env(repo_root, port, &[])
 }
 
-fn spawn_daemon_with_env(repo_root: &Path, port: u16, envs: &[(&str, &str)]) -> Child {
+fn spawn_daemon_with_env(repo_root: &Path, port: u16, envs: &[(&str, &str)]) -> DaemonChild {
     let bin = env!("CARGO_BIN_EXE_kin-daemon");
     let mut cmd = Command::new(bin);
     isolate_daemon_test_command(&mut cmd);
-    cmd.kill_on_drop(true)
-        .arg("--repo")
+    cmd.arg("--repo")
         .arg(repo_root)
         .arg("--port")
         .arg(port.to_string())
@@ -90,15 +91,19 @@ fn spawn_daemon_with_env(repo_root: &Path, port: u16, envs: &[(&str, &str)]) -> 
             "KIN_REGISTRY_PATH",
             repo_root.join(".kin/test-runtime/registry.toml"),
         )
+        // These recovery tests exercise daemon lifecycle and graph durability,
+        // not host language-server discovery.
+        .env("KIN_DAEMON_DISABLE_LSP", "1")
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
     for (key, value) in envs {
         cmd.env(key, value);
     }
-    cmd.spawn().expect("failed to spawn kin-daemon")
+    spawn_daemon_test_command(&mut cmd, "chaos-recovery daemon")
+        .expect("failed to spawn contained kin-daemon")
 }
 
-async fn wait_for_health(child: &mut Child, port: u16) -> HealthResponse {
+async fn wait_for_health(child: &mut DaemonChild, port: u16) -> HealthResponse {
     let client = reqwest::Client::new();
     let url = format!("http://127.0.0.1:{port}/health");
     let deadline = Instant::now() + READINESS_TIMEOUT;
@@ -124,7 +129,7 @@ async fn wait_for_health(child: &mut Child, port: u16) -> HealthResponse {
     }
 }
 
-async fn wait_for_serving(child: &mut Child, port: u16) {
+async fn wait_for_serving(child: &mut DaemonChild, port: u16) {
     let addr = format!("127.0.0.1:{port}");
     let deadline = Instant::now() + READINESS_TIMEOUT;
     let mut backoff = Duration::from_millis(50);

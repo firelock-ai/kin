@@ -26,6 +26,7 @@
 //! reimplement it.
 
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -61,6 +62,114 @@ const TEST_RUNTIME_PROCESS_GROUP_ENV: &str = "KIN_TEST_RUNTIME_CONTAINMENT_PROCE
 /// How long to wait between polls of the port file.
 const PORT_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
+/// Repository, session, projection, and runtime authority that must not cross
+/// the host boundary into a daemon process.
+///
+/// Daemon configuration that is intentionally inherited (for example registry
+/// location, bearer token, and feature controls) is deliberately absent. The
+/// test-runtime owner capability is also absent: it is what keeps a daemon
+/// inside the harness's verified process group instead of detaching.
+const DAEMON_AMBIENT_AUTHORITY_ENV: &[&str] = &[
+    "GIT_DIR",
+    "GIT_COMMON_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_QUARANTINE_PATH",
+    "GIT_PREFIX",
+    "GIT_INTERNAL_SUPER_PREFIX",
+    "GIT_NAMESPACE",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_PARAMETERS",
+    "KIN_VFS_WORKSPACE",
+    "KIN_VFS_WORKSPACE_ALIASES",
+    "KIN_VFS_SOCK",
+    "KIN_VFS_PIPE",
+    "KIN_VFS_CANARY",
+    "KIN_VFS_INTERPOSE_ACTIVE",
+    "KIN_VFS_LAST_DIR",
+    "_KIN_VFS_LAST_DIR",
+    "KIN_NO_VFS",
+    "KIN_SESSION",
+    "KIN_SESSION_ID",
+    "KIN_SESSION_DIR",
+    "KIN_DAEMON_URL",
+    "KIN_DAEMON_WATCH_PID",
+    "KIN_SUPERVISOR_STARTUP_GENERATION",
+    "KIN_REPO_ID",
+    "KIN_REPO_IDS",
+    "KIN_PRIMARY_REPO_ID",
+    "KIN_MCP_REPO",
+    "KIN_SOURCE_ROOT",
+    "KIN_ORIGINAL_PATH",
+    "KIN_DISCOVERY_MODE",
+    "KIN_CONTENT_MODE",
+    "KIN_VFS_DISABLE",
+];
+
+/// Strip ambient repository/session/projection and loader authority from a
+/// daemon command, then bind it to the caller's host toolchain.
+///
+/// This is public for the few daemon processes that are not assembled through
+/// [`DaemonSpawnPlan`] (notably the supervisor and compatibility probes). New
+/// repo-daemon launchers should use the plan so this final scrub cannot be
+/// forgotten.
+pub fn scrub_daemon_process_authority(command: &mut Command) {
+    let explicit_authority = command
+        .get_envs()
+        .map(|(key, _)| key.to_os_string())
+        .filter(|key| is_daemon_ambient_authority(key))
+        .collect::<Vec<_>>();
+    for key in std::env::vars_os()
+        .map(|(key, _)| key)
+        .filter(|key| is_daemon_ambient_authority(key))
+        .chain(explicit_authority)
+    {
+        command.env_remove(key);
+    }
+
+    let host_path = std::env::var_os("KIN_ORIGINAL_PATH")
+        .filter(|value| !value.is_empty())
+        .or_else(|| std::env::var_os("PATH"))
+        .unwrap_or_default();
+    command.env("PATH", host_path).env("KIN_VFS_DISABLE", "1");
+}
+
+fn is_daemon_ambient_authority(key: &std::ffi::OsStr) -> bool {
+    let label = key.to_string_lossy();
+    DAEMON_AMBIENT_AUTHORITY_ENV
+        .iter()
+        .any(|expected| env_name_eq(&label, expected))
+        || env_name_starts_with(&label, "GIT_")
+        || env_name_starts_with(&label, "DYLD_")
+        || env_name_starts_with(&label, "LD_")
+}
+
+#[cfg(windows)]
+fn env_name_eq(actual: &str, expected: &str) -> bool {
+    actual.eq_ignore_ascii_case(expected)
+}
+
+#[cfg(not(windows))]
+fn env_name_eq(actual: &str, expected: &str) -> bool {
+    actual == expected
+}
+
+#[cfg(windows)]
+fn env_name_starts_with(actual: &str, expected: &str) -> bool {
+    actual
+        .get(..expected.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(expected))
+}
+
+#[cfg(not(windows))]
+fn env_name_starts_with(actual: &str, expected: &str) -> bool {
+    actual.starts_with(expected)
+}
+
 // ── Spawn plan ──────────────────────────────────────────────────────────
 
 /// Everything a daemon spawn needs, assembled once so both callers pass the
@@ -89,6 +198,7 @@ impl DaemonSpawnPlan {
     /// here.
     pub fn command(&self) -> std::process::Command {
         let mut cmd = std::process::Command::new(&self.daemon_bin);
+        scrub_daemon_process_authority(&mut cmd);
         cmd.args([
             "--repo",
             &self.working_dir.display().to_string(),
@@ -484,6 +594,106 @@ mod tests {
             "KIN_SUPERVISOR_URL".to_string(),
             Some("http://127.0.0.1:9000".to_string())
         )));
+    }
+
+    #[test]
+    fn daemon_authority_scrub_is_final_and_preserves_declared_configuration() {
+        let mut command = Command::new("/usr/bin/kin-daemon");
+        for (key, value) in [
+            ("GIT_DIR", "/ambient/repository/.git"),
+            ("GIT_WORK_TREE", "/ambient/repository"),
+            ("GIT_CONFIG_COUNT", "1"),
+            ("GIT_CONFIG_KEY_0", "core.hooksPath"),
+            ("GIT_CONFIG_VALUE_0", "/ambient/hooks"),
+            ("GIT_CONFIG_GLOBAL", "/ambient/gitconfig"),
+            ("GIT_DEFAULT_HASH", "sha256"),
+            ("GIT_TRACE", "/ambient/git-trace"),
+            ("KIN_DAEMON_URL", "http://stale.invalid"),
+            ("KIN_MCP_REPO", "/ambient/repo"),
+            ("KIN_SESSION", "ambient-session"),
+            ("KIN_SOURCE_ROOT", "/ambient/projection"),
+            ("KIN_SUPERVISOR_STARTUP_GENERATION", "ambient-generation"),
+            ("DYLD_LIBRARY_PATH", "/ambient/dyld"),
+            ("LD_DEBUG_OUTPUT", "/tmp/ambient-loader-output"),
+        ] {
+            command.env(key, value);
+        }
+        command
+            .env("KIN_TEST_RUNTIME_OWNER_TOKEN", "test-owner")
+            .env("KIN_REGISTRY_PATH", "/declared/registry.toml")
+            .env("KIN_DAEMON_IDLE_TIMEOUT_SECS", "900");
+
+        scrub_daemon_process_authority(&mut command);
+
+        let envs = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        for removed in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_KEY_0",
+            "GIT_CONFIG_VALUE_0",
+            "GIT_CONFIG_GLOBAL",
+            "GIT_DEFAULT_HASH",
+            "GIT_TRACE",
+            "KIN_DAEMON_URL",
+            "KIN_MCP_REPO",
+            "KIN_SESSION",
+            "KIN_SOURCE_ROOT",
+            "KIN_SUPERVISOR_STARTUP_GENERATION",
+            "DYLD_LIBRARY_PATH",
+            "LD_DEBUG_OUTPUT",
+        ] {
+            assert_eq!(
+                envs.get(removed),
+                Some(&None),
+                "{removed} retained daemon authority"
+            );
+        }
+        assert_eq!(
+            envs.get("KIN_TEST_RUNTIME_OWNER_TOKEN"),
+            Some(&Some("test-owner".to_string()))
+        );
+        assert_eq!(
+            envs.get("KIN_REGISTRY_PATH"),
+            Some(&Some("/declared/registry.toml".to_string()))
+        );
+        assert_eq!(
+            envs.get("KIN_DAEMON_IDLE_TIMEOUT_SECS"),
+            Some(&Some("900".to_string()))
+        );
+        assert_eq!(envs.get("KIN_VFS_DISABLE"), Some(&Some("1".to_string())));
+        assert!(
+            envs.get("PATH").is_some_and(Option::is_some),
+            "daemon scrub must bind the child to a host PATH"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn daemon_authority_names_are_case_insensitive_on_windows() {
+        for hostile in [
+            "git_dir",
+            "Git_Work_Tree",
+            "git_config_key_0",
+            "Git_Default_Hash",
+            "kin_daemon_url",
+            "Kin_Mcp_Repo",
+            "dyld_library_path",
+            "Ld_Debug_Output",
+        ] {
+            assert!(
+                is_daemon_ambient_authority(std::ffi::OsStr::new(hostile)),
+                "{hostile} bypassed Windows daemon authority isolation"
+            );
+        }
     }
 
     #[test]

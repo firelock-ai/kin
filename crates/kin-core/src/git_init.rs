@@ -749,7 +749,6 @@ fn bind_historical_semantics(
 
 #[cfg(test)]
 mod tests {
-    use std::process::Command;
 
     use super::*;
 
@@ -1606,7 +1605,7 @@ mod tests {
         assert!(leftovers.is_empty(), "staging leftovers: {leftovers:?}");
     }
 
-    fn fixture_git(repository: &Path) -> Command {
+    fn fixture_git(repository: &Path) -> kin_git::test_support::FixtureGitCommand {
         kin_git::test_support::fixture_git_in(repository)
     }
 

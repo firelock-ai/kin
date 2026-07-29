@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use kin_core::layout::KIN_LAYOUT_VERSION;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use std::ffi::{OsStr, OsString};
 use std::path::Path;
 use std::process::Command;
+use std::time::Duration;
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct BenchMeta {
@@ -479,15 +481,103 @@ fn git_output_optional(repo_path: &Path, args: &[&str]) -> Option<String> {
     git_output_inner(repo_path, args).ok()
 }
 
+const BENCH_GIT_TIMEOUT: Duration = Duration::from_secs(10);
+const BENCH_GIT_CAPTURE_LIMIT: u64 = 256 * 1024;
+
 fn git_output_inner(repo_path: &Path, args: &[&str]) -> Result<String> {
-    let mut command = Command::new("git");
-    command.args(args).current_dir(repo_path);
-    #[cfg(test)]
-    command.env("GIT_CONFIG_NOSYSTEM", "1").env(
-        "GIT_CONFIG_GLOBAL",
-        if cfg!(windows) { "NUL" } else { "/dev/null" },
-    );
-    let output = command.output()?;
+    let host_path = kin_core::shims::unshimmed_path();
+    git_output_inner_with_policy(
+        repo_path,
+        args,
+        &host_path,
+        BENCH_GIT_TIMEOUT,
+        BENCH_GIT_CAPTURE_LIMIT,
+    )
+}
+
+fn git_output_inner_with_policy(
+    repo_path: &Path,
+    args: &[&str],
+    host_path: &str,
+    timeout: Duration,
+    capture_limit: u64,
+) -> Result<String> {
+    let resolution_cwd =
+        std::env::current_dir().context("capture host Git resolution directory for benchmark")?;
+    git_output_inner_with_resolution_policy(
+        repo_path,
+        args,
+        host_path,
+        &resolution_cwd,
+        timeout,
+        capture_limit,
+    )
+}
+
+fn git_output_inner_with_resolution_policy(
+    repo_path: &Path,
+    args: &[&str],
+    host_path: &str,
+    resolution_cwd: &Path,
+    timeout: Duration,
+    capture_limit: u64,
+) -> Result<String> {
+    let repo_root = repo_path
+        .canonicalize()
+        .with_context(|| format!("canonicalize benchmark repository {}", repo_path.display()))?;
+    let host_path = absolute_bench_host_search_path(host_path, resolution_cwd)?;
+    let git = which::which_in("git", Some(&host_path), resolution_cwd)
+        .context("locate host Git executable for benchmark metadata")?;
+    let git = if git.is_absolute() {
+        git
+    } else {
+        resolution_cwd.join(git)
+    };
+    let mut command = Command::new(git);
+    command
+        .arg("--no-replace-objects")
+        .args(args)
+        .current_dir(&repo_root);
+    run_bench_git_command(&mut command, args, &host_path, timeout, capture_limit)
+}
+
+fn absolute_bench_host_search_path(
+    host_path: impl AsRef<OsStr>,
+    resolution_cwd: &Path,
+) -> Result<OsString> {
+    let entries = std::env::split_paths(host_path.as_ref())
+        .map(|entry| {
+            if entry.is_absolute() {
+                entry
+            } else {
+                resolution_cwd.join(entry)
+            }
+        })
+        .collect::<Vec<_>>();
+    std::env::join_paths(entries).with_context(|| {
+        format!(
+            "normalize host Git PATH against {} for benchmark metadata",
+            resolution_cwd.display()
+        )
+    })
+}
+
+fn run_bench_git_command(
+    command: &mut Command,
+    args: &[&str],
+    host_path: &OsStr,
+    timeout: Duration,
+    capture_limit: u64,
+) -> Result<String> {
+    let label = format!("Git benchmark metadata query {args:?}");
+    finalize_bench_git_process(command, host_path);
+    let output = crate::daemon_client::probe_process::output_finalized_with_timeout_and_limit(
+        command,
+        &label,
+        timeout,
+        capture_limit,
+    )
+    .with_context(|| format!("run host Git benchmark metadata query {args:?}"))?;
     if !output.status.success() {
         return Err(anyhow::anyhow!(
             "git {} failed: {}",
@@ -506,6 +596,79 @@ fn git_output_inner(repo_path: &Path, args: &[&str]) -> Result<String> {
     Ok(value.to_string())
 }
 
+/// Apply the complete Git/Kin/VFS/loader authority boundary immediately
+/// before bounded spawn. The bounded helper may only attach stdio afterward.
+fn finalize_bench_git_process(command: &mut Command, host_path: &OsStr) {
+    finalize_bench_git_process_with_ambient(
+        command,
+        host_path,
+        std::env::vars_os().map(|(key, _)| key),
+    );
+}
+
+fn finalize_bench_git_process_with_ambient(
+    command: &mut Command,
+    host_path: &OsStr,
+    ambient_keys: impl IntoIterator<Item = std::ffi::OsString>,
+) {
+    let explicit_authority = command
+        .get_envs()
+        .map(|(key, _)| key.to_os_string())
+        .filter(|key| is_bench_git_authority_env(key))
+        .collect::<Vec<_>>();
+    for key in ambient_keys
+        .into_iter()
+        .filter(|key| is_bench_git_authority_env(key))
+        .chain(explicit_authority)
+    {
+        command.env_remove(key);
+    }
+    command
+        .env("PATH", host_path)
+        .env("KIN_VFS_DISABLE", "1")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_ATTR_NOSYSTEM", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_PAGER", "cat")
+        .env("GIT_ALLOW_PROTOCOL", "file")
+        .env("GIT_PROTOCOL_FROM_USER", "0")
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
+        .env("GIT_OPTIONAL_LOCKS", "0");
+    #[cfg(unix)]
+    command.env("GIT_CONFIG_GLOBAL", "/dev/null");
+    #[cfg(windows)]
+    command.env("GIT_CONFIG_GLOBAL", "NUL");
+    #[cfg(not(any(unix, windows)))]
+    command.env(
+        "GIT_CONFIG_GLOBAL",
+        command
+            .get_current_dir()
+            .unwrap_or_else(|| Path::new("."))
+            .join(".kin-empty-global-gitconfig"),
+    );
+}
+
+fn is_bench_git_authority_env(key: &std::ffi::OsStr) -> bool {
+    let label = key.to_string_lossy();
+    bench_git_env_name_starts_with(&label, "GIT_")
+        || bench_git_env_name_starts_with(&label, "KIN_")
+        || bench_git_env_name_starts_with(&label, "_KIN_")
+        || bench_git_env_name_starts_with(&label, "DYLD_")
+        || bench_git_env_name_starts_with(&label, "LD_")
+}
+
+#[cfg(windows)]
+fn bench_git_env_name_starts_with(actual: &str, expected: &str) -> bool {
+    actual
+        .get(..expected.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(expected))
+}
+
+#[cfg(not(windows))]
+fn bench_git_env_name_starts_with(actual: &str, expected: &str) -> bool {
+    actual.starts_with(expected)
+}
+
 fn hash_json(value: &serde_json::Value) -> String {
     let bytes = serde_json::to_vec(value).expect("json serialization should succeed");
     hex::encode(Sha256::digest(bytes))
@@ -514,14 +677,21 @@ fn hash_json(value: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_meta, build_prepared_manifests, embedding_meta, feature_flags, metal_active,
-        vector_index_metadata_version,
+        build_meta, build_prepared_manifests, embedding_meta, feature_flags,
+        finalize_bench_git_process_with_ambient, git_output_inner, git_output_inner_with_policy,
+        git_output_inner_with_resolution_policy, metal_active, vector_index_metadata_version,
     };
+    use std::ffi::{OsStr, OsString};
     use std::fs;
     use std::path::Path;
+    use std::process::Command;
+    use std::time::Duration;
     use tempfile::tempdir;
 
-    fn git<const N: usize>(repository: &Path, args: [&str; N]) -> std::process::Command {
+    fn git<const N: usize>(
+        repository: &Path,
+        args: [&str; N],
+    ) -> kin_git::test_support::FixtureGitCommand {
         let mut command = crate::commands::test_subprocess::fixture_git(repository);
         command.args(args);
         command
@@ -534,6 +704,237 @@ mod tests {
             "git {args:?} failed: stdout={} stderr={}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn configured_command_env(command: &Command, key: &str) -> Option<Option<std::ffi::OsString>> {
+        command
+            .get_envs()
+            .find(|(candidate, _)| *candidate == OsStr::new(key))
+            .map(|(_, value)| value.map(OsStr::to_os_string))
+    }
+
+    #[test]
+    fn bench_git_finalizer_scrubs_ambient_and_explicit_authority() {
+        let explicit = [
+            "GIT_DIR",
+            "KIN_SESSION",
+            "_KIN_VFS_LAST_DIR",
+            "DYLD_INSERT_LIBRARIES",
+            "LD_PRELOAD",
+        ];
+        let ambient = [
+            "GIT_WORK_TREE",
+            "KIN_SOURCE_ROOT",
+            "_KIN_TEST_AUTHORITY",
+            "DYLD_LIBRARY_PATH",
+            "LD_LIBRARY_PATH",
+        ];
+        let mut command = Command::new("git");
+        for key in explicit {
+            command.env(key, "poison");
+        }
+
+        finalize_bench_git_process_with_ambient(
+            &mut command,
+            OsStr::new("trusted-host-path"),
+            ambient.into_iter().map(OsString::from),
+        );
+
+        for key in explicit.into_iter().chain(ambient) {
+            assert_eq!(
+                configured_command_env(&command, key),
+                Some(None),
+                "{key} retained authority"
+            );
+        }
+        assert_eq!(
+            configured_command_env(&command, "PATH"),
+            Some(Some(OsString::from("trusted-host-path")))
+        );
+        assert_eq!(
+            configured_command_env(&command, "KIN_VFS_DISABLE"),
+            Some(Some(OsString::from("1")))
+        );
+        assert_eq!(
+            configured_command_env(&command, "GIT_CONFIG_NOSYSTEM"),
+            Some(Some(OsString::from("1")))
+        );
+        assert_eq!(
+            configured_command_env(&command, "GIT_NO_REPLACE_OBJECTS"),
+            Some(Some(OsString::from("1")))
+        );
+        assert_eq!(
+            configured_command_env(&command, "GIT_OPTIONAL_LOCKS"),
+            Some(Some(OsString::from("0")))
+        );
+    }
+
+    #[cfg(unix)]
+    fn write_bench_fake_git(bin: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        fs::create_dir_all(bin).unwrap();
+        let git = bin.join("git");
+        fs::write(&git, format!("#!/bin/sh\nset -eu\n{body}\n")).unwrap();
+        let mut permissions = fs::metadata(&git).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&git, permissions).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn fixture_process_is_live(pid: u32) -> bool {
+        let system = sysinfo::System::new_all();
+        system
+            .process(sysinfo::Pid::from_u32(pid))
+            .is_some_and(|process| {
+                !matches!(
+                    process.status(),
+                    sysinfo::ProcessStatus::Dead | sysinfo::ProcessStatus::Zombie
+                )
+            })
+    }
+
+    #[test]
+    fn bench_git_output_reads_from_a_real_repository() {
+        let repo = tempdir().unwrap();
+        require_git(repo.path(), ["init"]);
+
+        assert_eq!(
+            git_output_inner(repo.path(), &["rev-parse", "--is-inside-work-tree"]).unwrap(),
+            "true"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bench_git_output_uses_resolved_host_git_with_closed_stdin() {
+        let fixture = tempdir().unwrap();
+        let bin = fixture.path().join("host-bin");
+        write_bench_fake_git(
+            &bin,
+            r#"
+if IFS= read -r ignored; then
+    echo "stdin remained readable" >&2
+    exit 90
+fi
+printf 'path=%s\n' "$PATH"
+printf 'vfs=%s\n' "$KIN_VFS_DISABLE"
+printf 'nosystem=%s\n' "$GIT_CONFIG_NOSYSTEM"
+printf 'global=%s\n' "$GIT_CONFIG_GLOBAL"
+"#,
+        );
+        let host_path = bin.to_string_lossy();
+
+        let output = git_output_inner_with_policy(
+            fixture.path(),
+            &["rev-parse", "HEAD"],
+            &host_path,
+            Duration::from_secs(2),
+            16 * 1024,
+        )
+        .unwrap();
+
+        assert!(output.contains(&format!("path={host_path}")), "{output}");
+        assert!(output.contains("vfs=1"), "{output}");
+        assert!(output.contains("nosystem=1"), "{output}");
+        assert!(output.contains("global=/dev/null"), "{output}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bench_git_relative_host_path_cannot_rebind_under_repository_cwd() {
+        let fixture = tempdir().unwrap();
+        let resolution_root = fixture.path().join("resolution");
+        let repo_root = fixture.path().join("repository");
+        write_bench_fake_git(&resolution_root.join("bin"), "printf trusted");
+        write_bench_fake_git(&repo_root.join("bin"), "printf hostile");
+
+        let output = git_output_inner_with_resolution_policy(
+            &repo_root,
+            &["rev-parse", "HEAD"],
+            "bin",
+            &resolution_root,
+            Duration::from_secs(2),
+            16 * 1024,
+        )
+        .unwrap();
+
+        assert_eq!(output, "trusted");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bench_git_output_rejects_runaway_output_and_reaps_descendants() {
+        let fixture = tempdir().unwrap();
+        let bin = fixture.path().join("host-bin");
+        write_bench_fake_git(
+            &bin,
+            r#"
+/bin/sleep 30 &
+printf '%s\n' "$!" > "${0%/*}/descendant.pid"
+chunk='xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
+while :; do
+    printf '%s' "$chunk"
+done
+"#,
+        );
+        let error = git_output_inner_with_policy(
+            fixture.path(),
+            &["rev-parse", "HEAD"],
+            &bin.to_string_lossy(),
+            Duration::from_secs(5),
+            4 * 1024,
+        )
+        .expect_err("runaway benchmark Git output must fail closed");
+        let message = format!("{error:#}");
+        assert!(message.contains("exceeded the 4096-byte"), "{message}");
+        assert!(message.contains("cleanup=ok"), "{message}");
+
+        let pid = fs::read_to_string(bin.join("descendant.pid"))
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap();
+        assert!(
+            !fixture_process_is_live(pid),
+            "runaway benchmark Git descendant {pid} survived bounded return"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bench_git_output_times_out_and_reaps_descendants() {
+        let fixture = tempdir().unwrap();
+        let bin = fixture.path().join("host-bin");
+        write_bench_fake_git(
+            &bin,
+            r#"
+/bin/sleep 30 &
+printf '%s\n' "$!" > "${0%/*}/descendant.pid"
+wait
+"#,
+        );
+        let error = git_output_inner_with_policy(
+            fixture.path(),
+            &["rev-parse", "HEAD"],
+            &bin.to_string_lossy(),
+            Duration::from_millis(200),
+            16 * 1024,
+        )
+        .expect_err("hung benchmark Git query must time out");
+        let message = format!("{error:#}");
+        assert!(message.contains("timed out after 200ms"), "{message}");
+        assert!(message.contains("cleanup=ok"), "{message}");
+
+        let pid = fs::read_to_string(bin.join("descendant.pid"))
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap();
+        assert!(
+            !fixture_process_is_live(pid),
+            "timed-out benchmark Git descendant {pid} survived bounded return"
         );
     }
 
@@ -588,8 +989,8 @@ mod tests {
         require_git(repo.path(), ["config", "user.name", "Kin"]);
         require_git(repo.path(), ["add", "README.md"]);
         let commit = git(repo.path(), ["commit", "--signoff", "-m", "init"])
-            .env("GIT_AUTHOR_DATE", "1000000000 +0000")
-            .env("GIT_COMMITTER_DATE", "1000000000 +0000")
+            .author_date("1000000000 +0000")
+            .committer_date("1000000000 +0000")
             .output()
             .unwrap();
         assert!(
@@ -625,8 +1026,8 @@ mod tests {
         require_git(repo.path(), ["config", "user.name", "Kin"]);
         require_git(repo.path(), ["add", "README.md"]);
         let commit = git(repo.path(), ["commit", "--signoff", "-m", "init"])
-            .env("GIT_AUTHOR_DATE", "1000000100 +0000")
-            .env("GIT_COMMITTER_DATE", "1000000100 +0000")
+            .author_date("1000000100 +0000")
+            .committer_date("1000000100 +0000")
             .output()
             .unwrap();
         assert!(

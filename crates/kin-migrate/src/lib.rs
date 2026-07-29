@@ -6,6 +6,7 @@
 //! Detects Git forges and delegates repository admission to Kin's single exact,
 //! atomic repository-v6 bootstrap boundary.
 
+mod bounded_process;
 pub mod error;
 pub mod executor;
 pub mod finalize;

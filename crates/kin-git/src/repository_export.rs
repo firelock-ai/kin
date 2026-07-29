@@ -1080,9 +1080,7 @@ where
 
 #[cfg(all(test, unix))]
 mod tests {
-    use std::io::Write as _;
     use std::os::unix::fs::{symlink, PermissionsExt as _};
-    use std::process::{Command, Stdio};
 
     use kin_blobs::{BlobError, BlobStore};
     use kin_model::{
@@ -1093,7 +1091,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::test_support::fixture_git;
+    use crate::test_support::{fixture_git, FixtureGitCommand};
     use crate::{
         admit_semantic_git_import, build_git_external_authority, plan_semantic_git_import,
     };
@@ -1676,16 +1674,11 @@ mod tests {
     }
 
     fn git_with_input(repository: &Path, args: &[&str], input: &[u8]) -> Vec<u8> {
-        let mut child = fixture_git()
+        let output = fixture_git()
             .args(args)
             .current_dir(repository)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
+            .output_with_input(input)
             .unwrap();
-        child.stdin.take().unwrap().write_all(input).unwrap();
-        let output = child.wait_with_output().unwrap();
         assert!(
             output.status.success(),
             "command failed: {}",
@@ -1704,7 +1697,7 @@ mod tests {
         command(&mut invocation);
     }
 
-    fn command(invocation: &mut Command) -> Vec<u8> {
+    fn command(invocation: &mut FixtureGitCommand) -> Vec<u8> {
         let output = invocation.output().unwrap();
         assert!(
             output.status.success(),

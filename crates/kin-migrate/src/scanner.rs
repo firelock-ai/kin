@@ -1,13 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use crate::error::{MigrateError, Result};
+
+#[cfg(windows)]
+const NULL_GIT_CONFIG: &str = "NUL";
+#[cfg(not(windows))]
+const NULL_GIT_CONFIG: &str = "/dev/null";
+const MIGRATION_GIT_TIMEOUT: Duration = Duration::from_secs(30);
+const MIGRATION_GIT_CAPTURE_LIMIT: u64 = 1024 * 1024;
 
 /// Metadata about a scanned Git repository.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,11 +42,9 @@ pub fn scan_repo(repo_path: &Path) -> Result<RepoScan> {
     let root = repo_path
         .canonicalize()
         .map_err(|error| MigrateError::io(repo_path, error))?;
-    let git_probe = Command::new("git")
-        .arg("-C")
-        .arg(&root)
-        .args(["rev-parse", "--git-dir"])
-        .output()
+    let mut git_probe = git_command(&root)?;
+    git_probe.args(["rev-parse", "--git-dir"]);
+    let git_probe = run_git_metadata(&mut git_probe, "migration repository probe")
         .map_err(|error| MigrateError::io(&root, error))?;
     if !git_probe.status.success() {
         return Err(MigrateError::NotAGitRepo(repo_path.display().to_string()));
@@ -57,16 +64,137 @@ pub fn scan_repo(repo_path: &Path) -> Result<RepoScan> {
 /// Detect the checked-out branch without interpreting `.git` internals. This
 /// also works for linked worktrees where `.git` is a file.
 fn detect_default_branch(repo_path: &Path) -> Option<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo_path)
-        .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
-        .output()
-        .ok()?;
+    let mut command = git_command(repo_path).ok()?;
+    command.args(["symbolic-ref", "--quiet", "--short", "HEAD"]);
+    let output = run_git_metadata(&mut command, "migration branch probe").ok()?;
     output
         .status
         .success()
         .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Construct the product Git boundary for a repository selected explicitly by
+/// `repo_path`.
+///
+/// Migration scanning asks Git only for repository metadata. Ambient Git
+/// selectors, Kin/VFS projection authority, and loader injection must not be
+/// able to redirect that query to a different repository or executable
+/// context. Local repository configuration remains visible; system/global and
+/// command-scope configuration do not.
+struct ProductGitCommand {
+    inner: Command,
+    host_path: OsString,
+}
+
+impl ProductGitCommand {
+    fn args<I, S>(&mut self, args: I) -> &mut Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        self.inner.args(args);
+        self
+    }
+}
+
+fn git_command(repo_path: &Path) -> Result<ProductGitCommand> {
+    let resolution_cwd = std::env::current_dir().map_err(|error| {
+        MigrateError::GitImport(format!("capture host Git resolution directory: {error}"))
+    })?;
+    let host_path = absolute_host_search_path(kin_core::shims::unshimmed_path(), &resolution_cwd)?;
+    let git = which::which_in("git", Some(&host_path), &resolution_cwd).map_err(|error| {
+        MigrateError::GitImport(format!(
+            "locate host Git executable for {}: {error}",
+            repo_path.display()
+        ))
+    })?;
+    let git = if git.is_absolute() {
+        git
+    } else {
+        resolution_cwd.join(git)
+    };
+    let mut command = Command::new(git);
+    command.arg("-C").arg(repo_path);
+    Ok(ProductGitCommand {
+        inner: command,
+        host_path,
+    })
+}
+
+fn absolute_host_search_path(
+    host_path: impl AsRef<OsStr>,
+    resolution_cwd: &Path,
+) -> Result<OsString> {
+    let entries = std::env::split_paths(host_path.as_ref())
+        .map(|entry| {
+            if entry.is_absolute() {
+                entry
+            } else {
+                resolution_cwd.join(entry)
+            }
+        })
+        .collect::<Vec<_>>();
+    std::env::join_paths(entries).map_err(|error| {
+        MigrateError::GitImport(format!(
+            "normalize host Git PATH against {}: {error}",
+            resolution_cwd.display()
+        ))
+    })
+}
+
+fn run_git_metadata(command: &mut ProductGitCommand, label: &str) -> std::io::Result<Output> {
+    // This is the final command mutation before the bounded helper attaches
+    // owned stdio and spawns the process.
+    isolate_git_process(&mut command.inner, &command.host_path);
+    crate::bounded_process::output_finalized_with_timeout_and_limit(
+        &mut command.inner,
+        label,
+        MIGRATION_GIT_TIMEOUT,
+        MIGRATION_GIT_CAPTURE_LIMIT,
+    )
+}
+
+fn isolate_git_process(command: &mut Command, host_path: &OsStr) {
+    let explicit_authority = command
+        .get_envs()
+        .map(|(key, _)| key.to_os_string())
+        .filter(|key| is_git_process_authority(key))
+        .collect::<Vec<_>>();
+    for key in std::env::vars_os()
+        .map(|(key, _)| key)
+        .filter(|key| is_git_process_authority(key))
+        .chain(explicit_authority)
+    {
+        command.env_remove(key);
+    }
+    command
+        .env("PATH", host_path)
+        .env("KIN_VFS_DISABLE", "1")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", NULL_GIT_CONFIG)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_TERMINAL_PROMPT", "0");
+}
+
+fn is_git_process_authority(key: &std::ffi::OsStr) -> bool {
+    let label = key.to_string_lossy();
+    env_name_starts_with(&label, "GIT_")
+        || env_name_starts_with(&label, "KIN_")
+        || env_name_starts_with(&label, "_KIN_")
+        || env_name_starts_with(&label, "DYLD_")
+        || env_name_starts_with(&label, "LD_")
+}
+
+#[cfg(windows)]
+fn env_name_starts_with(actual: &str, expected: &str) -> bool {
+    actual
+        .get(..expected.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(expected))
+}
+
+#[cfg(not(windows))]
+fn env_name_starts_with(actual: &str, expected: &str) -> bool {
+    actual.starts_with(expected)
 }
 
 #[cfg(test)]
@@ -75,12 +203,105 @@ mod tests {
 
     fn make_git_repo() -> Option<tempfile::TempDir> {
         let dir = tempfile::tempdir().unwrap();
-        let output = Command::new("git")
-            .args(["init", "-b", "main"])
-            .current_dir(dir.path())
-            .output()
-            .ok()?;
+        let mut command = git_command(dir.path()).ok()?;
+        command.args(["init", "-b", "main"]);
+        let output = run_git_metadata(&mut command, "migration test repository init").ok()?;
         output.status.success().then_some(dir)
+    }
+
+    #[test]
+    fn product_git_boundary_scrubs_command_local_authority() {
+        let mut command = Command::new("git");
+        for (key, value) in [
+            ("GIT_DIR", "/hostile/repository"),
+            ("GIT_CONFIG_COUNT", "1"),
+            ("KIN_VFS_WORKSPACE", "/hostile/projection"),
+            ("_KIN_VFS_LAST_DIR", "/hostile/projection/src"),
+            ("DYLD_INSERT_LIBRARIES", "/hostile/interpose.dylib"),
+            ("LD_PRELOAD", "/hostile/interpose.so"),
+        ] {
+            command.env(key, value);
+        }
+        let resolution_cwd = std::env::current_dir().unwrap();
+        let host_path =
+            absolute_host_search_path(kin_core::shims::unshimmed_path(), &resolution_cwd).unwrap();
+        isolate_git_process(&mut command, &host_path);
+
+        let envs = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        for removed in [
+            "GIT_DIR",
+            "GIT_CONFIG_COUNT",
+            "KIN_VFS_WORKSPACE",
+            "_KIN_VFS_LAST_DIR",
+            "DYLD_INSERT_LIBRARIES",
+            "LD_PRELOAD",
+        ] {
+            assert_eq!(
+                envs.get(removed),
+                Some(&None),
+                "{removed} retained product Git authority"
+            );
+        }
+        assert_eq!(
+            envs.get("GIT_CONFIG_GLOBAL"),
+            Some(&Some(NULL_GIT_CONFIG.to_string()))
+        );
+        assert_eq!(envs.get("KIN_VFS_DISABLE"), Some(&Some("1".to_string())));
+        assert!(envs.get("PATH").is_some_and(Option::is_some));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relative_host_path_is_bound_absolutely_before_child_cwd_changes() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let resolution_cwd = root.path().join("resolution");
+        let child_cwd = root.path().join("child");
+        let host_bin = resolution_cwd.join("bin");
+        let hostile_bin = child_cwd.join("bin");
+        std::fs::create_dir_all(&host_bin).unwrap();
+        std::fs::create_dir_all(&hostile_bin).unwrap();
+        let trusted = host_bin.join("git");
+        let hostile = hostile_bin.join("git");
+        std::fs::write(&trusted, "#!/bin/sh\nprintf trusted\n").unwrap();
+        std::fs::write(&hostile, "#!/bin/sh\nprintf hostile\n").unwrap();
+        for executable in [&trusted, &hostile] {
+            let mut permissions = std::fs::metadata(executable).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(executable, permissions).unwrap();
+        }
+
+        let host_path = absolute_host_search_path("bin", &resolution_cwd).unwrap();
+        let git = which::which_in("git", Some(&host_path), &resolution_cwd).unwrap();
+        assert!(git.is_absolute(), "host Git binding remained relative");
+        let output = Command::new(git).current_dir(&child_cwd).output().unwrap();
+        assert_eq!(output.stdout, b"trusted");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn product_git_boundary_is_case_insensitive_on_windows() {
+        for hostile in [
+            "git_dir",
+            "Kin_Vfs_Workspace",
+            "_kin_vfs_last_dir",
+            "Dyld_Insert_Libraries",
+            "ld_preload",
+        ] {
+            assert!(
+                is_git_process_authority(std::ffi::OsStr::new(hostile)),
+                "{hostile} bypassed Windows product Git isolation"
+            );
+        }
     }
 
     #[test]

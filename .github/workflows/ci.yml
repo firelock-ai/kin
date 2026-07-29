@@ -126,23 +126,129 @@ jobs:
         run: |
           set -euo pipefail
           export RUST_BACKTRACE=1
-          cargo test --locked --target x86_64-pc-windows-msvc \
+
+          list_tests() {
+            CARGO_TERM_COLOR=never cargo test "$@" -- --list | tr -d '\r'
+          }
+
+          assert_nonempty_listing() {
+            local label="$1"
+            local listing="$2"
+            local count
+            count="$(printf '%s\n' "$listing" \
+              | awk '/: test$/ { count += 1 } END { print count + 0 }')"
+            if [[ "$count" -eq 0 ]]; then
+              echo "::error title=Missing native Windows tests::$label listed zero tests"
+              printf '%s\n' "$listing"
+              exit 1
+            fi
+            echo "$label: listed $count test(s)"
+          }
+
+          run_nonempty_target() {
+            local label="$1"
+            shift
+            local listing
+            listing="$(list_tests "$@")"
+            assert_nonempty_listing "$label" "$listing"
+            cargo test "$@" -- --test-threads=1
+          }
+
+          run_required_filter() {
+            local label="$1"
+            local filter="$2"
+            shift 2
+            local listing
+            local matches
+            listing="$(list_tests "$@")"
+            matches="$(printf '%s\n' "$listing" \
+              | awk -v needle="$filter" \
+                'index($0, needle) > 0 && /: test$/ { count += 1 } END { print count + 0 }')"
+            if [[ "$matches" -eq 0 ]]; then
+              echo "::error title=Missing native Windows tests::$label filter '$filter' matched zero listed tests"
+              printf '%s\n' "$listing"
+              exit 1
+            fi
+            echo "$label: filter '$filter' matched $matches test(s)"
+            cargo test "$@" "$filter" -- --test-threads=1
+          }
+
+          run_required_exact() {
+            local label="$1"
+            local test_name="$2"
+            shift 2
+            local listing
+            local matches
+            listing="$(list_tests "$@")"
+            matches="$(printf '%s\n' "$listing" \
+              | awk -v expected="$test_name: test" \
+                '$0 == expected { count += 1 } END { print count + 0 }')"
+            if [[ "$matches" -ne 1 ]]; then
+              echo "::error title=Missing native Windows test::$label expected exactly one '$test_name', found $matches"
+              printf '%s\n' "$listing"
+              exit 1
+            fi
+            cargo test "$@" "$test_name" -- --exact --test-threads=1
+          }
+
+          run_required_target() {
+            local label="$1"
+            local required_test="$2"
+            shift 2
+            local listing
+            local matches
+            listing="$(list_tests "$@")"
+            assert_nonempty_listing "$label" "$listing"
+            matches="$(printf '%s\n' "$listing" \
+              | awk -v expected="$required_test: test" \
+                '$0 == expected { count += 1 } END { print count + 0 }')"
+            if [[ "$matches" -ne 1 ]]; then
+              echo "::error title=Missing native Windows test::$label expected exactly one '$required_test', found $matches"
+              printf '%s\n' "$listing"
+              exit 1
+            fi
+            cargo test "$@" -- --test-threads=1
+          }
+
+          run_nonempty_target "kin-registry library" \
+            --locked --target x86_64-pc-windows-msvc \
             -p kin-registry --lib
-          cargo test --locked --target x86_64-pc-windows-msvc \
-            -p kin-core --lib registry::tests
-          cargo test --locked --target x86_64-pc-windows-msvc \
+          run_required_filter "kin-core registry authority" "registry::tests" \
+            --locked --target x86_64-pc-windows-msvc \
+            -p kin-core --lib
+          run_nonempty_target "kin-git library" \
+            --locked --target x86_64-pc-windows-msvc \
             -p kin-git --lib
-          cargo test --locked --target x86_64-pc-windows-msvc \
-            -p kin-cli --no-default-features --no-run
-          test_binary=$(find target/x86_64-pc-windows-msvc/debug/deps \
-            -maxdepth 1 -type f -name 'kin_cli-*.exe' -print -quit)
-          test -n "$test_binary"
-          "$test_binary" windows --test-threads=1
-          cargo test --locked --target x86_64-pc-windows-msvc \
-            -p kin-core --lib current_branch_write_replaces_existing_head -- \
-            --test-threads=1
-          cargo test --locked --target x86_64-pc-windows-msvc \
-            -p kin-core --lib branch_transaction -- --test-threads=1
+          run_required_filter "kin-cli Windows modules" "windows" \
+            --locked --target x86_64-pc-windows-msvc \
+            -p kin-cli --no-default-features --lib
+          run_required_filter "bounded CLI test subprocesses" \
+            "commands::test_subprocess::tests" \
+            --locked --target x86_64-pc-windows-msvc \
+            -p kin-cli --no-default-features --lib
+          run_required_filter "bounded daemon probe subprocesses" \
+            "daemon_client::probe_process::tests" \
+            --locked --target x86_64-pc-windows-msvc \
+            -p kin-cli --no-default-features --lib
+          run_required_target "spawned-child Windows authority ordering" \
+            "spawned_child_observes_case_insensitive_authority_order" \
+            --locked --target x86_64-pc-windows-msvc \
+            -p kin-cli --no-default-features --test windows_authority_order
+          run_required_target "isolated runtime process-tree containment" \
+            "dropping_isolated_runtime_terminates_a_late_descendant" \
+            --locked --target x86_64-pc-windows-msvc \
+            -p kin-cli --no-default-features --test daemon_runtime_containment
+          run_required_exact "direct daemon-child containment" \
+            "dropping_a_direct_daemon_child_terminates_its_containment" \
+            --locked --target x86_64-pc-windows-msvc \
+            -p kin-daemon --no-default-features --test port_handshake
+          run_required_exact "late daemon-descendant containment" \
+            "dropping_containment_terminates_a_late_descendant" \
+            --locked --target x86_64-pc-windows-msvc \
+            -p kin-daemon --no-default-features --test port_handshake
+          run_required_filter "daemon isolation support" "common::daemon_isolation" \
+            --locked --target x86_64-pc-windows-msvc \
+            -p kin-daemon --no-default-features --test port_handshake
 
   windows-installer:
     name: Windows installer + vector-free release build

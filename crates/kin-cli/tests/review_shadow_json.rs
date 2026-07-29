@@ -17,7 +17,8 @@ use common::Command;
 
 fn kin_command(runtime: &common::IsolatedDaemonRuntime) -> Command<'_> {
     let mut cmd = runtime.kin_command();
-    cmd.env("KIN_DAEMON_BIN", runtime.daemon_bin());
+    cmd.env("KIN_DAEMON_BIN", runtime.daemon_bin())
+        .env("KIN_DAEMON_DISABLE_LSP", "1");
     cmd
 }
 
@@ -31,8 +32,7 @@ fn run_git(repo: &Path, args: &[&str]) {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COMMIT_EPOCH: AtomicU64 = AtomicU64::new(1_000_000_000);
         let date = format!("{} +0000", COMMIT_EPOCH.fetch_add(100, Ordering::Relaxed));
-        cmd.env("GIT_AUTHOR_DATE", &date)
-            .env("GIT_COMMITTER_DATE", &date);
+        cmd.fixture_git_commit_dates(&date);
     }
     let output = cmd.output().expect("run git");
     assert!(

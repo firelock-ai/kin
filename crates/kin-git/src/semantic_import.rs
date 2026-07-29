@@ -1063,8 +1063,6 @@ fn display_path(path: &[u8]) -> String {
 mod tests {
     use std::ffi::OsStr;
     use std::fs;
-    #[cfg(unix)]
-    use std::io::Write as _;
     use std::path::{Path, PathBuf};
     use std::process::Output;
 
@@ -2009,17 +2007,7 @@ mod tests {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        fixture_git()
-            .args(args)
-            .current_dir(repo)
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env(
-                "GIT_CONFIG_GLOBAL",
-                if cfg!(windows) { "NUL" } else { "/dev/null" },
-            )
-            .env("HOME", repo)
-            .output()
-            .unwrap()
+        fixture_git().args(args).current_dir(repo).output().unwrap()
     }
 
     #[cfg(unix)]
@@ -2028,22 +2016,11 @@ mod tests {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        let mut child = fixture_git()
+        fixture_git()
             .args(args)
             .current_dir(repo)
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env(
-                "GIT_CONFIG_GLOBAL",
-                if cfg!(windows) { "NUL" } else { "/dev/null" },
-            )
-            .env("HOME", repo)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
-        child.stdin.take().unwrap().write_all(stdin).unwrap();
-        child.wait_with_output().unwrap()
+            .output_with_input(stdin)
+            .unwrap()
     }
 
     fn cas_path(root: &Path, hash: &Hash256) -> PathBuf {

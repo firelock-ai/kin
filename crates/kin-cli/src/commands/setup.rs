@@ -6,9 +6,12 @@ use console::style;
 use dialoguer::MultiSelect;
 use fs2::FileExt;
 use std::env;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, BufRead, IsTerminal, Read as _, Seek as _, Write as _};
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::Duration;
 
 // ---------------------------------------------------------------------------
 // Embedded shell hooks (from kin-vfs/shell/)
@@ -2115,29 +2118,104 @@ fn read_single_git_pointer(path: &Path, label: &str) -> Result<String> {
     Ok(value.to_string())
 }
 
+const SETUP_GIT_AUTHORITY_TIMEOUT: Duration = Duration::from_secs(15);
+const SETUP_GIT_AUTHORITY_CAPTURE_LIMIT: u64 = 4 * 1024 * 1024;
+
 fn git_authority_output(repo_root: &Path, args: &[&str]) -> Result<String> {
-    let git = which::which("git").context("git is required to validate workspace MCP authority")?;
-    let mut command = std::process::Command::new(git);
+    let host_path = kin_core::shims::unshimmed_path();
+    git_authority_output_with_policy(
+        repo_root,
+        args,
+        &host_path,
+        SETUP_GIT_AUTHORITY_TIMEOUT,
+        SETUP_GIT_AUTHORITY_CAPTURE_LIMIT,
+    )
+}
+
+fn git_authority_output_with_policy(
+    repo_root: &Path,
+    args: &[&str],
+    host_path: &str,
+    timeout: Duration,
+    capture_limit: u64,
+) -> Result<String> {
+    let resolution_cwd =
+        std::env::current_dir().context("capture host Git resolution directory for setup")?;
+    git_authority_output_with_resolution_policy(
+        repo_root,
+        args,
+        host_path,
+        &resolution_cwd,
+        timeout,
+        capture_limit,
+    )
+}
+
+fn git_authority_output_with_resolution_policy(
+    repo_root: &Path,
+    args: &[&str],
+    host_path: &str,
+    resolution_cwd: &Path,
+    timeout: Duration,
+    capture_limit: u64,
+) -> Result<String> {
+    let repo_root = repo_root
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize repository {}", repo_root.display()))?;
+    let host_path = absolute_setup_host_search_path(host_path, resolution_cwd)?;
+    let git = which::which_in("git", Some(&host_path), resolution_cwd)
+        .context("host Git is required to validate workspace MCP authority")?;
+    let git = if git.is_absolute() {
+        git
+    } else {
+        resolution_cwd.join(git)
+    };
+    let mut command = Command::new(git);
     command
+        .arg("--no-replace-objects")
         .arg("-C")
-        .arg(repo_root)
-        .args(args)
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_COMMON_DIR")
-        .env_remove("GIT_INDEX_FILE")
-        .env_remove("GIT_OBJECT_DIRECTORY")
-        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
-        .env_remove("GIT_CEILING_DIRECTORIES")
-        .env_remove("GIT_DISCOVERY_ACROSS_FILESYSTEM");
-    #[cfg(test)]
-    command.env("GIT_CONFIG_NOSYSTEM", "1").env(
-        "GIT_CONFIG_GLOBAL",
-        if cfg!(windows) { "NUL" } else { "/dev/null" },
-    );
-    let output = command
-        .output()
-        .with_context(|| format!("failed to run git {:?}", args))?;
+        .arg(&repo_root)
+        .args(args);
+    run_git_authority_command(&mut command, args, &host_path, timeout, capture_limit)
+}
+
+fn absolute_setup_host_search_path(
+    host_path: impl AsRef<OsStr>,
+    resolution_cwd: &Path,
+) -> Result<OsString> {
+    let entries = std::env::split_paths(host_path.as_ref())
+        .map(|entry| {
+            if entry.is_absolute() {
+                entry
+            } else {
+                resolution_cwd.join(entry)
+            }
+        })
+        .collect::<Vec<_>>();
+    std::env::join_paths(entries).with_context(|| {
+        format!(
+            "normalize host Git PATH against {} for setup",
+            resolution_cwd.display()
+        )
+    })
+}
+
+fn run_git_authority_command(
+    command: &mut Command,
+    args: &[&str],
+    host_path: &OsStr,
+    timeout: Duration,
+    capture_limit: u64,
+) -> Result<String> {
+    let label = format!("Git workspace authority query {args:?}");
+    finalize_setup_git_authority_process(command, host_path);
+    let output = crate::daemon_client::probe_process::output_finalized_with_timeout_and_limit(
+        command,
+        &label,
+        timeout,
+        capture_limit,
+    )
+    .with_context(|| format!("failed to run host Git authority query {args:?}"))?;
     if !output.status.success() {
         anyhow::bail!(
             "git {:?} rejected workspace authority: {}",
@@ -2146,6 +2224,79 @@ fn git_authority_output(repo_root: &Path, args: &[&str]) -> Result<String> {
         );
     }
     String::from_utf8(output.stdout).context("git authority output is not UTF-8")
+}
+
+/// Apply the complete Git/Kin/VFS/loader authority boundary immediately
+/// before bounded spawn. The bounded helper may only attach stdio afterward.
+fn finalize_setup_git_authority_process(command: &mut Command, host_path: &OsStr) {
+    finalize_setup_git_authority_process_with_ambient(
+        command,
+        host_path,
+        std::env::vars_os().map(|(key, _)| key),
+    );
+}
+
+fn finalize_setup_git_authority_process_with_ambient(
+    command: &mut Command,
+    host_path: &OsStr,
+    ambient_keys: impl IntoIterator<Item = std::ffi::OsString>,
+) {
+    let explicit_authority = command
+        .get_envs()
+        .map(|(key, _)| key.to_os_string())
+        .filter(|key| is_setup_git_authority_env(key))
+        .collect::<Vec<_>>();
+    for key in ambient_keys
+        .into_iter()
+        .filter(|key| is_setup_git_authority_env(key))
+        .chain(explicit_authority)
+    {
+        command.env_remove(key);
+    }
+    command
+        .env("PATH", host_path)
+        .env("KIN_VFS_DISABLE", "1")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_ATTR_NOSYSTEM", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_PAGER", "cat")
+        .env("GIT_ALLOW_PROTOCOL", "file")
+        .env("GIT_PROTOCOL_FROM_USER", "0")
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
+        .env("GIT_OPTIONAL_LOCKS", "0");
+    #[cfg(unix)]
+    command.env("GIT_CONFIG_GLOBAL", "/dev/null");
+    #[cfg(windows)]
+    command.env("GIT_CONFIG_GLOBAL", "NUL");
+    #[cfg(not(any(unix, windows)))]
+    command.env(
+        "GIT_CONFIG_GLOBAL",
+        command
+            .get_current_dir()
+            .unwrap_or_else(|| Path::new("."))
+            .join(".kin-empty-global-gitconfig"),
+    );
+}
+
+fn is_setup_git_authority_env(key: &std::ffi::OsStr) -> bool {
+    let label = key.to_string_lossy();
+    setup_git_env_name_starts_with(&label, "GIT_")
+        || setup_git_env_name_starts_with(&label, "KIN_")
+        || setup_git_env_name_starts_with(&label, "_KIN_")
+        || setup_git_env_name_starts_with(&label, "DYLD_")
+        || setup_git_env_name_starts_with(&label, "LD_")
+}
+
+#[cfg(windows)]
+fn setup_git_env_name_starts_with(actual: &str, expected: &str) -> bool {
+    actual
+        .get(..expected.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(expected))
+}
+
+#[cfg(not(windows))]
+fn setup_git_env_name_starts_with(actual: &str, expected: &str) -> bool {
+    actual.starts_with(expected)
 }
 
 fn canonical_git_output_path(repo_root: &Path, output: &str, label: &str) -> Result<PathBuf> {
@@ -11989,6 +12140,235 @@ mod tests {
             no_interactive: true,
             intent: None,
         }
+    }
+
+    fn configured_command_env(command: &Command, key: &str) -> Option<Option<std::ffi::OsString>> {
+        command
+            .get_envs()
+            .find(|(candidate, _)| *candidate == OsStr::new(key))
+            .map(|(_, value)| value.map(OsStr::to_os_string))
+    }
+
+    #[test]
+    fn setup_git_authority_finalizer_scrubs_ambient_and_explicit_authority() {
+        let explicit = [
+            "GIT_DIR",
+            "KIN_SESSION",
+            "_KIN_VFS_LAST_DIR",
+            "DYLD_INSERT_LIBRARIES",
+            "LD_PRELOAD",
+        ];
+        let ambient = [
+            "GIT_WORK_TREE",
+            "KIN_SOURCE_ROOT",
+            "_KIN_TEST_AUTHORITY",
+            "DYLD_LIBRARY_PATH",
+            "LD_LIBRARY_PATH",
+        ];
+        let mut command = Command::new("git");
+        for key in explicit {
+            command.env(key, "poison");
+        }
+
+        finalize_setup_git_authority_process_with_ambient(
+            &mut command,
+            OsStr::new("trusted-host-path"),
+            ambient.into_iter().map(OsString::from),
+        );
+
+        for key in explicit.into_iter().chain(ambient) {
+            assert_eq!(
+                configured_command_env(&command, key),
+                Some(None),
+                "{key} retained authority"
+            );
+        }
+        assert_eq!(
+            configured_command_env(&command, "PATH"),
+            Some(Some(OsString::from("trusted-host-path")))
+        );
+        assert_eq!(
+            configured_command_env(&command, "KIN_VFS_DISABLE"),
+            Some(Some(OsString::from("1")))
+        );
+        assert_eq!(
+            configured_command_env(&command, "GIT_CONFIG_NOSYSTEM"),
+            Some(Some(OsString::from("1")))
+        );
+        assert_eq!(
+            configured_command_env(&command, "GIT_NO_REPLACE_OBJECTS"),
+            Some(Some(OsString::from("1")))
+        );
+        assert_eq!(
+            configured_command_env(&command, "GIT_OPTIONAL_LOCKS"),
+            Some(Some(OsString::from("0")))
+        );
+    }
+
+    #[cfg(unix)]
+    fn write_setup_fake_git(bin: &Path, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        fs::create_dir_all(bin).unwrap();
+        let git = bin.join("git");
+        fs::write(&git, format!("#!/bin/sh\nset -eu\n{body}\n")).unwrap();
+        let mut permissions = fs::metadata(&git).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&git, permissions).unwrap();
+        git
+    }
+
+    #[cfg(unix)]
+    fn fixture_process_is_live(pid: u32) -> bool {
+        let system = sysinfo::System::new_all();
+        system
+            .process(sysinfo::Pid::from_u32(pid))
+            .is_some_and(|process| {
+                !matches!(
+                    process.status(),
+                    sysinfo::ProcessStatus::Dead | sysinfo::ProcessStatus::Zombie
+                )
+            })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setup_git_authority_uses_resolved_host_git_with_closed_stdin() {
+        let fixture = tempfile::tempdir().unwrap();
+        let bin = fixture.path().join("host-bin");
+        write_setup_fake_git(
+            &bin,
+            r#"
+if IFS= read -r ignored; then
+    echo "stdin remained readable" >&2
+    exit 90
+fi
+printf 'path=%s\n' "$PATH"
+printf 'vfs=%s\n' "$KIN_VFS_DISABLE"
+printf 'nosystem=%s\n' "$GIT_CONFIG_NOSYSTEM"
+printf 'global=%s\n' "$GIT_CONFIG_GLOBAL"
+printf 'args=%s|%s|%s|%s|%s\n' "$1" "$2" "$3" "$4" "$5"
+"#,
+        );
+        let host_path = bin.to_string_lossy();
+
+        let output = git_authority_output_with_policy(
+            fixture.path(),
+            &["rev-parse", "HEAD"],
+            &host_path,
+            Duration::from_secs(2),
+            16 * 1024,
+        )
+        .unwrap();
+
+        assert!(output.contains(&format!("path={host_path}\n")), "{output}");
+        assert!(output.contains("vfs=1\n"), "{output}");
+        assert!(output.contains("nosystem=1\n"), "{output}");
+        assert!(output.contains("global=/dev/null\n"), "{output}");
+        assert!(
+            output.contains(&format!(
+                "args=--no-replace-objects|-C|{}|rev-parse|HEAD",
+                fixture.path().canonicalize().unwrap().display()
+            )),
+            "{output}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setup_git_relative_host_path_cannot_rebind_under_repository_cwd() {
+        let fixture = tempfile::tempdir().unwrap();
+        let resolution_root = fixture.path().join("resolution");
+        let repo_root = fixture.path().join("repository");
+        write_setup_fake_git(&resolution_root.join("bin"), "printf trusted");
+        write_setup_fake_git(&repo_root.join("bin"), "printf hostile");
+
+        let output = git_authority_output_with_resolution_policy(
+            &repo_root,
+            &["rev-parse", "HEAD"],
+            "bin",
+            &resolution_root,
+            Duration::from_secs(2),
+            16 * 1024,
+        )
+        .unwrap();
+
+        assert_eq!(output, "trusted");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setup_git_authority_rejects_runaway_output_and_reaps_descendants() {
+        let fixture = tempfile::tempdir().unwrap();
+        let bin = fixture.path().join("host-bin");
+        write_setup_fake_git(
+            &bin,
+            r#"
+/bin/sleep 30 &
+printf '%s\n' "$!" > "${0%/*}/descendant.pid"
+chunk='xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
+while :; do
+    printf '%s' "$chunk"
+done
+"#,
+        );
+        let error = git_authority_output_with_policy(
+            fixture.path(),
+            &["rev-parse", "HEAD"],
+            &bin.to_string_lossy(),
+            Duration::from_secs(5),
+            4 * 1024,
+        )
+        .expect_err("runaway Git output must fail closed");
+        let message = format!("{error:#}");
+        assert!(message.contains("exceeded the 4096-byte"), "{message}");
+        assert!(message.contains("cleanup=ok"), "{message}");
+
+        let pid = fs::read_to_string(bin.join("descendant.pid"))
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap();
+        assert!(
+            !fixture_process_is_live(pid),
+            "runaway Git descendant {pid} survived bounded return"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setup_git_authority_times_out_and_reaps_descendants() {
+        let fixture = tempfile::tempdir().unwrap();
+        let bin = fixture.path().join("host-bin");
+        write_setup_fake_git(
+            &bin,
+            r#"
+/bin/sleep 30 &
+printf '%s\n' "$!" > "${0%/*}/descendant.pid"
+wait
+"#,
+        );
+        let error = git_authority_output_with_policy(
+            fixture.path(),
+            &["worktree", "list", "--porcelain"],
+            &bin.to_string_lossy(),
+            Duration::from_millis(200),
+            16 * 1024,
+        )
+        .expect_err("hung Git authority query must time out");
+        let message = format!("{error:#}");
+        assert!(message.contains("timed out after 200ms"), "{message}");
+        assert!(message.contains("cleanup=ok"), "{message}");
+
+        let pid = fs::read_to_string(bin.join("descendant.pid"))
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap();
+        assert!(
+            !fixture_process_is_live(pid),
+            "timed-out Git descendant {pid} survived bounded return"
+        );
     }
 
     #[test]

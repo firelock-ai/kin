@@ -860,8 +860,8 @@ mod tests {
         // the tie-break that only applies to equal-timestamp commits.
         fixture_git()
             .args(["commit", "-m", "initial"])
-            .env("GIT_AUTHOR_DATE", "2021-01-01T00:00:00 +0000")
-            .env("GIT_COMMITTER_DATE", "2021-01-01T00:00:00 +0000")
+            .author_date("2021-01-01T00:00:00 +0000")
+            .committer_date("2021-01-01T00:00:00 +0000")
             .current_dir(dir.path())
             .output()
             .unwrap();
@@ -874,8 +874,8 @@ mod tests {
             .unwrap();
         fixture_git()
             .args(["commit", "-m", "middle"])
-            .env("GIT_AUTHOR_DATE", "2021-01-02T00:00:00 +0000")
-            .env("GIT_COMMITTER_DATE", "2021-01-02T00:00:00 +0000")
+            .author_date("2021-01-02T00:00:00 +0000")
+            .committer_date("2021-01-02T00:00:00 +0000")
             .current_dir(dir.path())
             .output()
             .unwrap();
@@ -893,8 +893,8 @@ mod tests {
             .unwrap();
         fixture_git()
             .args(["commit", "-m", "latest"])
-            .env("GIT_AUTHOR_DATE", "2021-01-03T00:00:00 +0000")
-            .env("GIT_COMMITTER_DATE", "2021-01-03T00:00:00 +0000")
+            .author_date("2021-01-03T00:00:00 +0000")
+            .committer_date("2021-01-03T00:00:00 +0000")
             .current_dir(dir.path())
             .output()
             .unwrap();

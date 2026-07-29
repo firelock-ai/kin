@@ -167,6 +167,12 @@
       ]
     },
     {
+      "file": "crates/kin-cli/src/daemon_client/probe_process.rs",
+      "reason": "Daemon process-boundary module end to end: bounded compatibility probes and their process-tree containment, capture, cancellation, and cleanup. It reaches and validates the daemon that owns graph authority and never derives a semantic query answer from filesystem or subprocess output. The file is dedicated to this boundary, so a whole-file exemption is reviewable; any future answer logic belongs elsewhere and requires removing or narrowing this exemption.",
+      "owner": "kin-cli",
+      "expiration": "2026-12-31"
+    },
+    {
       "file": "crates/kin-daemon-spawn/src/lib.rs",
       "reason": "Daemon process lifecycle IO boundary end to end (spawn plan, port record, disposition, registrar); zero answer-authority surface. Every filesystem and subprocess primitive here reaches or supervises the daemon that holds graph authority, never answers in its place, and no query result derives from any of them. Exempt whole-file rather than pinned because the process handle signatures repeat, which an exactly-once allow_match cannot express. lib.rs is the crate's only module, so a later-added module is scanned by default: re-review this exemption when a second .rs file joins the crate",
       "owner": "kin-daemon-spawn",

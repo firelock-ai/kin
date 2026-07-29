@@ -1220,8 +1220,8 @@ mod tests {
             let date = format!("{epoch} +0000");
             let output = crate::commands::test_subprocess::fixture_git(repo)
                 .args(["commit", "-m", message])
-                .env("GIT_AUTHOR_DATE", &date)
-                .env("GIT_COMMITTER_DATE", &date)
+                .author_date(&date)
+                .committer_date(&date)
                 .output()
                 .expect("git commit");
             assert!(
