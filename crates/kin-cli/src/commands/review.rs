@@ -1207,6 +1207,7 @@ mod tests {
         let git = |args: &[&str]| {
             let output = Command::new("git")
                 .args(args)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
                 .env("GIT_CONFIG_GLOBAL", null_git_config)
                 .current_dir(repo)
                 .output()
@@ -1225,6 +1226,7 @@ mod tests {
             let date = format!("{epoch} +0000");
             let output = Command::new("git")
                 .args(["commit", "-m", message])
+                .env("GIT_CONFIG_NOSYSTEM", "1")
                 .env("GIT_CONFIG_GLOBAL", null_git_config)
                 .env("GIT_AUTHOR_DATE", &date)
                 .env("GIT_COMMITTER_DATE", &date)
@@ -1241,6 +1243,7 @@ mod tests {
         let head_sha = || {
             let output = Command::new("git")
                 .args(["rev-parse", "HEAD"])
+                .env("GIT_CONFIG_NOSYSTEM", "1")
                 .env("GIT_CONFIG_GLOBAL", null_git_config)
                 .current_dir(repo)
                 .output()

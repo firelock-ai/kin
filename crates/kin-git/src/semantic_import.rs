@@ -2012,6 +2012,10 @@ mod tests {
             .args(args)
             .current_dir(repo)
             .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env(
+                "GIT_CONFIG_GLOBAL",
+                if cfg!(windows) { "NUL" } else { "/dev/null" },
+            )
             .env("HOME", repo)
             .output()
             .unwrap()
@@ -2027,6 +2031,10 @@ mod tests {
             .args(args)
             .current_dir(repo)
             .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env(
+                "GIT_CONFIG_GLOBAL",
+                if cfg!(windows) { "NUL" } else { "/dev/null" },
+            )
             .env("HOME", repo)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
