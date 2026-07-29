@@ -93,11 +93,13 @@ fn fresh_native_init_json_reports_exact_unborn_authority() {
 
     let payload: Value =
         serde_json::from_slice(&output.stdout).expect("native init stdout should be JSON");
-    assert_eq!(payload["schema"], "kin.init-result.v4");
+    assert_eq!(payload["schema"], "kin.init-result.v5");
     assert_eq!(payload["authority"], "repository-v6");
     assert_eq!(payload["source_boundary"], "native-unborn");
     assert_eq!(payload["history"], "unborn");
-    assert_eq!(payload["semantic_enrichment"], "not-run");
+    assert_eq!(payload["semantic_enrichment"]["presence"], "absent");
+    assert_eq!(payload["semantic_enrichment"]["entity_count"], 0);
+    assert_eq!(payload["semantic_enrichment"]["relation_count"], 0);
     assert_eq!(payload["exact_reachable_git_history"], false);
     assert_eq!(payload["authority_generation"], 1);
     assert_eq!(payload["workspace_generation"], 0);
@@ -122,17 +124,79 @@ fn fresh_git_init_json_reports_exact_reachable_authority() {
 
     let payload: Value =
         serde_json::from_slice(&output.stdout).expect("Git init stdout should be JSON");
-    assert_eq!(payload["schema"], "kin.init-result.v4");
+    assert_eq!(payload["schema"], "kin.init-result.v5");
     assert_eq!(payload["authority"], "repository-v6");
     assert_eq!(payload["source_boundary"], "git-exact-reachable-history");
     assert_eq!(payload["history"], "exact-reachable");
-    assert_eq!(payload["semantic_enrichment"], "not-run");
+    assert_eq!(payload["semantic_enrichment"]["presence"], "absent");
+    assert_eq!(payload["semantic_enrichment"]["entity_count"], 0);
+    assert!(payload["semantic_enrichment"]["semantic_change_count"]
+        .as_u64()
+        .is_some_and(|changes| changes >= 2));
     assert_eq!(payload["exact_reachable_git_history"], true);
     assert_eq!(payload["authority_generation"], 1);
     assert_eq!(payload["workspace_generation"], 0);
     assert!(!payload["initial_change_id"].is_null());
     assert!(repo.join(".kin/manifest.json").is_file());
     assert!(!repo.join("AGENTS.md").exists());
+}
+
+#[test]
+fn init_and_status_report_the_same_admission_enrichment() {
+    let root = tempdir().expect("temp root");
+    let home = root.path().join("home");
+    let repo = root.path().join("enriched");
+    fs::create_dir_all(&home).expect("create home");
+    fs::create_dir_all(repo.join("src")).expect("create source directory");
+    run_git(&repo, &["init", "--initial-branch=main"]);
+    run_git(&repo, &["config", "user.email", "kin@example.invalid"]);
+    run_git(&repo, &["config", "user.name", "Kin"]);
+    fs::write(
+        repo.join("src/lib.rs"),
+        "pub fn helper() -> u32 {\n    7\n}\n\npub fn caller() -> u32 {\n    helper() + 1\n}\n",
+    )
+    .expect("write entity source");
+    run_git(&repo, &["add", "--all"]);
+    run_git(&repo, &["commit", "-m", "entity source"]);
+
+    let init = kin_init(&repo, &home, &["--json"]);
+    assert!(
+        init.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&init.stdout),
+        String::from_utf8_lossy(&init.stderr)
+    );
+    let admitted: Value = serde_json::from_slice(&init.stdout).expect("init stdout should be JSON");
+
+    assert_eq!(admitted["semantic_enrichment"]["presence"], "present");
+    assert!(
+        admitted["semantic_enrichment"]["entity_count"]
+            .as_u64()
+            .is_some_and(|entities| entities >= 2),
+        "admission enriches the supported source it imported: {}",
+        admitted["semantic_enrichment"]
+    );
+
+    let status = Command::new(env!("CARGO_BIN_EXE_kin"))
+        .args(["status", "--json"])
+        .env("HOME", &home)
+        .env_remove("KIN_DAEMON_URL")
+        .current_dir(&repo)
+        .output()
+        .expect("run kin status");
+    assert!(
+        status.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&status.stdout),
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let reported: Value =
+        serde_json::from_slice(&status.stdout).expect("status stdout should be JSON");
+
+    assert_eq!(
+        reported["semantic_enrichment"], admitted["semantic_enrichment"],
+        "init and status report one graph"
+    );
 }
 
 #[test]

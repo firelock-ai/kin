@@ -7,6 +7,12 @@
 //! contents, legacy branch sidecars, Git, or a separately opened graph
 //! snapshot. Opening the authority also revalidates every referenced source
 //! body in the repository-owned CAS.
+//!
+//! Semantic counts are materialized from that same lease rather than read off
+//! the authority's raw tables, because the entities a workspace resolves to are
+//! a replay of the deltas its history carries. That materialization is the
+//! query graph the daemon serves, so status, `kin init`, and `kin graph status`
+//! all answer from one view.
 
 use std::path::PathBuf;
 
@@ -36,6 +42,57 @@ pub struct SemanticEnrichmentStatus {
     /// There is no repository-v6 completion attestation yet. Counts are exact;
     /// completeness is deliberately not inferred from them.
     pub completion_attested: bool,
+}
+
+/// Read the enrichment the workspace query graph actually carries.
+///
+/// The authority snapshot's own entity and relation tables are not this
+/// answer. Exact admission binds entity and relation deltas onto the changes it
+/// admits, and the entities a workspace resolves to are materialized by
+/// replaying those deltas to its base change and applying its semantic overlay.
+/// A surface that counted the raw tables instead would report zero enrichment
+/// on a fully enriched repository.
+///
+/// This is the one accessor every enrichment claim goes through, so `init`,
+/// `status`, and the daemon's query graph cannot drift apart: it materializes
+/// exactly the snapshot `kin-daemon` loads to serve `graph status`.
+pub fn semantic_enrichment_from_authority(
+    authority: &kin_db::RepositoryAuthorityState,
+    workspace_id: &WorkspaceId,
+) -> Result<SemanticEnrichmentStatus> {
+    let snapshot = authority
+        .workspace_graph_snapshot(workspace_id)
+        .with_context(|| {
+            format!("materialize repository-v6 query graph for workspace {workspace_id}")
+        })?
+        .ok_or_else(|| {
+            anyhow::anyhow!("repository-v6 authority has no workspace {workspace_id}")
+        })?;
+    let entity_count = snapshot.entities.len();
+    let relation_count = snapshot.relations.len();
+    Ok(SemanticEnrichmentStatus {
+        presence: if entity_count == 0 && relation_count == 0 {
+            SemanticEnrichmentPresence::Absent
+        } else {
+            SemanticEnrichmentPresence::Present
+        },
+        entity_count,
+        relation_count,
+        semantic_change_count: snapshot.changes.len(),
+        completion_attested: false,
+    })
+}
+
+/// Read enrichment truth through a one-shot binding.
+///
+/// For callers that hold no authority lease yet. A caller that already holds
+/// one uses [`semantic_enrichment_from_authority`] instead of opening a second.
+pub fn semantic_enrichment(
+    binding: &kin_core::LocalRepositoryAuthorityBinding,
+) -> Result<SemanticEnrichmentStatus> {
+    let authority = ActiveRepositoryAuthority::open(binding)?;
+    let lease = authority.manager().read_authority();
+    semantic_enrichment_from_authority(&lease, &authority.workspace_id)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -136,7 +193,6 @@ pub fn inspect(
     let authority = ActiveRepositoryAuthority::open(binding)?;
     let lease = authority.manager().read_authority();
     let metadata = lease.metadata();
-    let snapshot = lease.snapshot();
     let workspace = metadata
         .workspaces
         .iter()
@@ -156,20 +212,8 @@ pub fn inspect(
         anyhow::bail!("repository-v6 lease exposed inconsistent root generations");
     }
 
-    let entity_count = snapshot.entities.len();
-    let relation_count = snapshot.relations.len();
     let artifact_count = workspace.tree.artifacts().len();
-    let semantic_enrichment = SemanticEnrichmentStatus {
-        presence: if entity_count == 0 && relation_count == 0 {
-            SemanticEnrichmentPresence::Absent
-        } else {
-            SemanticEnrichmentPresence::Present
-        },
-        entity_count,
-        relation_count,
-        semantic_change_count: snapshot.changes.len(),
-        completion_attested: false,
-    };
+    let semantic_enrichment = semantic_enrichment_from_authority(&lease, &authority.workspace_id)?;
 
     Ok(StatusReport {
         schema: STATUS_SCHEMA.to_string(),

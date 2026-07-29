@@ -26,13 +26,25 @@ pub struct RepositoryArtifactCoverage {
     /// Symlinks, gitlinks, and non-UTF-8 paths that remain exact tree truth but
     /// do not currently have a `FilePathId` enrichment surface.
     pub exact_only_artifact_count: usize,
+    /// Enrichable artifacts still waiting for a facet.
+    ///
+    /// Absence is not a defect under the current substrate. No admission path
+    /// writes the facet layer: exact Git admission binds entity and relation
+    /// deltas derived from supported sources and nothing else, and the facet
+    /// layer is written one file at a time by reconcile as it enriches them.
+    /// Every coverage level from none to full is therefore a reachable healthy
+    /// state, so this count describes progress rather than divergence.
     pub missing_enrichment_path_count: usize,
     pub conflicting_enrichment_path_count: usize,
     pub stale_enrichment_path_count: usize,
     pub content_mismatch_path_count: usize,
     pub orphan_entity_count: usize,
-    /// Hard repository-coverage gate. Semantic relations are intentionally not
-    /// part of this value: zero evidence-backed relationships is valid.
+    /// Whether every enrichable artifact carries exactly one agreeing facet.
+    ///
+    /// This is a coverage observation, not the health verdict: a repository
+    /// whose enrichment is still pending is incomplete and healthy. The
+    /// verdict lives in `critical_issues`, which keys on facets that exist and
+    /// disagree with exact tree truth.
     pub complete: bool,
     pub issue_paths_sample: Vec<String>,
 }
@@ -197,7 +209,9 @@ fn collect_repository_artifact_coverage_for_tree(
         }
     }
 
-    issue_paths.extend(missing_enrichment_paths.iter().cloned());
+    // Paths still waiting for a facet are deliberately absent from the issue
+    // sample. They are healthy, and naming them beside real divergence is how
+    // an operator learns to skim past the sample.
     issue_paths.extend(conflicting_enrichment_paths.iter().cloned());
     issue_paths.extend(stale_enrichment_paths.iter().cloned());
     issue_paths.extend(content_mismatch_paths.iter().cloned());
@@ -335,11 +349,14 @@ fn build_graph_health_report(
 
     // A supported source file may legitimately contain no entities, and bytes
     // with a parser-looking extension may correctly route to an opaque facet.
-    // Health therefore keys on universal facet coverage, never on entity or
-    // relationship counts.
+    // Health therefore never keys on relationship counts. It does account for
+    // the entity layer, because exact admission builds that layer and no facet
+    // layer at all: a repository with entities derived from its supported
+    // sources is not an empty graph, whatever its facet coverage is.
     let graph_empty_for_supported_inputs = (supported_inputs.entity_source > 0
         || supported_inputs.shallow_source > 0)
-        && artifact_coverage.enriched_artifact_count == 0;
+        && artifact_coverage.enriched_artifact_count == 0
+        && stats.total_entities == 0;
 
     let mut critical_issues = Vec::new();
     let mut warnings = Vec::new();
@@ -352,10 +369,19 @@ fn build_graph_health_report(
         ));
     }
 
+    // Pending enrichment is expected, so it is reported and never promoted to
+    // a failure. Nothing in the current substrate produces a facet at
+    // admission, and reconcile produces them one file at a time, so a health
+    // surface that failed on absence would fail on every healthy repository
+    // until the last file happened to be touched. What remains fail-closed is
+    // every facet that exists and disagrees with exact tree truth, below.
     if artifact_coverage.missing_enrichment_path_count > 0 {
-        critical_issues.push(format!(
-            "{} admitted regular files have no query-facing enrichment facet",
-            artifact_coverage.missing_enrichment_path_count
+        notes.push(format!(
+            "{} of {} admitted regular files have no query-facing enrichment facet yet; \
+             authority admission binds the entity layer only and facets are written per file \
+             as reconcile enriches them",
+            artifact_coverage.missing_enrichment_path_count,
+            artifact_coverage.enrichable_artifact_count
         ));
     }
 
@@ -653,8 +679,24 @@ mod tests {
         assert_eq!(report.semantic_relation_count, 0);
     }
 
+    fn empty_supported_inputs() -> SupportedInputCounts {
+        SupportedInputCounts {
+            entity_source: 0,
+            shallow_source: 0,
+        }
+    }
+
+    fn no_contamination() -> ContaminationSummary {
+        ContaminationSummary {
+            entity_count: 0,
+            non_entity_count: 0,
+            path_count: 0,
+            path_samples: Vec::new(),
+        }
+    }
+
     #[test]
-    fn artifact_coverage_gaps_are_critical_and_sampled() {
+    fn artifact_coverage_divergence_is_critical_and_sampled() {
         let coverage = RepositoryArtifactCoverage {
             authority_artifact_count: 3,
             graph_tree_artifact_count: 2,
@@ -665,23 +707,15 @@ mod tests {
             missing_enrichment_path_count: 1,
             conflicting_enrichment_path_count: 0,
             stale_enrichment_path_count: 0,
-            content_mismatch_path_count: 0,
+            content_mismatch_path_count: 1,
             orphan_entity_count: 0,
             complete: false,
             issue_paths_sample: vec!["unknown.custom".to_string()],
         };
         let report = build_graph_health_report(
             &stats(),
-            &SupportedInputCounts {
-                entity_source: 0,
-                shallow_source: 0,
-            },
-            &ContaminationSummary {
-                entity_count: 0,
-                non_entity_count: 0,
-                path_count: 0,
-                path_samples: Vec::new(),
-            },
+            &empty_supported_inputs(),
+            &no_contamination(),
             coverage,
         );
 
@@ -693,7 +727,90 @@ mod tests {
         assert!(report
             .critical_issues
             .iter()
-            .any(|issue| issue.contains("no query-facing enrichment facet")));
+            .any(|issue| issue.contains("disagree with exact repository content identity")));
+    }
+
+    #[test]
+    fn pending_enrichment_is_a_note_rather_than_a_failure() {
+        let coverage = RepositoryArtifactCoverage {
+            authority_artifact_count: 3,
+            graph_tree_artifact_count: 3,
+            enrichable_artifact_count: 3,
+            enriched_artifact_count: 0,
+            missing_enrichment_path_count: 3,
+            complete: false,
+            ..complete_coverage()
+        };
+
+        let report = build_graph_health_report(
+            &stats(),
+            &SupportedInputCounts {
+                entity_source: 3,
+                shallow_source: 0,
+            },
+            &no_contamination(),
+            coverage,
+        );
+
+        assert!(report.critical_issues.is_empty());
+        assert!(report
+            .notes
+            .iter()
+            .any(|note| note.contains("3 of 3 admitted regular files have no query-facing")));
+    }
+
+    #[test]
+    fn an_entity_layer_without_facets_is_not_an_empty_graph() {
+        let mut entity_stats = stats();
+        entity_stats.total_entities = 9;
+        entity_stats.total_relations = 7;
+        let coverage = RepositoryArtifactCoverage {
+            authority_artifact_count: 7,
+            graph_tree_artifact_count: 7,
+            enrichable_artifact_count: 7,
+            enriched_artifact_count: 0,
+            missing_enrichment_path_count: 7,
+            complete: false,
+            ..complete_coverage()
+        };
+
+        let report = build_graph_health_report(
+            &entity_stats,
+            &SupportedInputCounts {
+                entity_source: 7,
+                shallow_source: 0,
+            },
+            &no_contamination(),
+            coverage,
+        );
+
+        assert!(!report.graph_empty_for_supported_inputs);
+        assert!(report.critical_issues.is_empty());
+    }
+
+    #[test]
+    fn supported_inputs_with_no_entities_and_no_facets_is_an_empty_graph() {
+        let coverage = RepositoryArtifactCoverage {
+            authority_artifact_count: 2,
+            graph_tree_artifact_count: 2,
+            enrichable_artifact_count: 2,
+            enriched_artifact_count: 0,
+            missing_enrichment_path_count: 2,
+            complete: false,
+            ..complete_coverage()
+        };
+
+        let report = build_graph_health_report(
+            &stats(),
+            &SupportedInputCounts {
+                entity_source: 2,
+                shallow_source: 0,
+            },
+            &no_contamination(),
+            coverage,
+        );
+
+        assert!(report.graph_empty_for_supported_inputs);
     }
 
     #[test]
