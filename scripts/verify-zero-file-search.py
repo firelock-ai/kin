@@ -556,9 +556,9 @@ def split_code(line, st):
 def lex_lines(lines):
     """Return [(structure, code), ...]: one lexer pass over a whole file.
 
-    Everything that needs a file's lexical form shares this pass — brace depth
+    Everything that needs a file's lexical form shares this pass: brace depth
     for function bodies, the scan's own structure tracking, and the projection
-    allowlist counts are measured against — so the three cannot disagree about
+    allowlist counts are measured against. The three cannot disagree about
     where a string literal ends.
     """
     lex = LexState()
