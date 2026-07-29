@@ -806,8 +806,14 @@ fn remove_endpoint_components(kin_root: &Path) {
 /// actually installed — an endpoint belonging to a process that is still
 /// running is never in that set.
 pub fn publish_daemon_endpoint(kin_root: &Path, port: u16) -> std::io::Result<()> {
-    let _authority = acquire_singleton_coordination_guard(kin_root)?;
-    publish_daemon_endpoint_under_authority(kin_root, port)
+    // Waiting out the coordination lock is a synchronous sleep reached from
+    // async contexts, and holding a worker hostage here is what once starved
+    // the liveness routes a client was polling before it clobbered the very
+    // endpoint being published.
+    without_blocking_runtime_worker(|| {
+        let _authority = acquire_singleton_coordination_guard(kin_root)?;
+        publish_daemon_endpoint_under_authority(kin_root, port)
+    })
 }
 
 fn publish_daemon_endpoint_under_authority(kin_root: &Path, port: u16) -> std::io::Result<()> {
@@ -937,25 +943,27 @@ pub fn remove_pid_file(kin_root: &Path) {
 /// exited, and one whose number differs may belong to a successor that
 /// republished while this process was draining.
 pub fn remove_daemon_files_if_current_process(kin_root: &Path) {
-    let Ok(_authority) = acquire_singleton_coordination_guard(kin_root) else {
-        tracing::warn!(
-            repo = %kin_root.display(),
-            "preserving daemon endpoint because lifecycle authority is unavailable"
-        );
-        return;
-    };
-    let ownership = endpoint_ownership(kin_root);
-    if !ownership.authorizes_removal() {
-        if !matches!(ownership, EndpointOwnership::Absent) {
+    without_blocking_runtime_worker(|| {
+        let Ok(_authority) = acquire_singleton_coordination_guard(kin_root) else {
             tracing::warn!(
                 repo = %kin_root.display(),
-                ?ownership,
-                "preserving daemon endpoint published by another process"
+                "preserving daemon endpoint because lifecycle authority is unavailable"
             );
+            return;
+        };
+        let ownership = endpoint_ownership(kin_root);
+        if !ownership.authorizes_removal() {
+            if !matches!(ownership, EndpointOwnership::Absent) {
+                tracing::warn!(
+                    repo = %kin_root.display(),
+                    ?ownership,
+                    "preserving daemon endpoint published by another process"
+                );
+            }
+            return;
         }
-        return;
-    }
-    remove_endpoint_components(kin_root);
+        remove_endpoint_components(kin_root);
+    })
 }
 
 /// Is the process with this PID alive?
@@ -977,10 +985,14 @@ pub fn daemon_is_up(kin_root: &Path) -> Option<u16> {
             // Stale — clean up only while publication is excluded and the
             // endpoint still names the same dead owner the verdict was formed
             // about.
-            let _authority = acquire_singleton_coordination_guard(kin_root).ok()?;
-            if endpoint_ownership(kin_root) == stale {
-                remove_endpoint_components(kin_root);
-            }
+            without_blocking_runtime_worker(|| {
+                let Ok(_authority) = acquire_singleton_coordination_guard(kin_root) else {
+                    return;
+                };
+                if endpoint_ownership(kin_root) == stale {
+                    remove_endpoint_components(kin_root);
+                }
+            });
             return None;
         }
     }
