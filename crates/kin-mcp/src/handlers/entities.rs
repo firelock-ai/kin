@@ -811,11 +811,23 @@ fn cross_repo_repo_id() -> std::result::Result<String, String> {
 /// in-process spine. Neither value comes from MCP request arguments or ambient
 /// process configuration, so a caller cannot redirect the authority query.
 #[derive(Clone, Copy)]
+pub enum FindReferencesSpineAuthority<'a> {
+    /// Exact-root cross-repository authority is ready to query.
+    Ready(&'a dyn kin_spine::SpineBackend),
+    /// A daemon-owned single-flight initializer is actively materializing it.
+    Warming,
+    /// Spine is enabled, but no exact authority is currently publishable.
+    Unavailable,
+    /// The operator explicitly disabled the cross-repository spine.
+    NotConfigured,
+}
+
+#[derive(Clone, Copy)]
 pub struct FindReferencesAuthority<'a> {
     pub repo_id: &'a str,
     /// Exact root of the concrete live/session graph serving this request.
     pub graph_root: &'a str,
-    pub spine: Option<&'a dyn kin_spine::SpineBackend>,
+    pub spine: FindReferencesSpineAuthority<'a>,
 }
 
 enum FindReferencesAuthoritySource<'a> {
@@ -895,7 +907,7 @@ fn daemon_spine_xref(
 ) -> std::result::Result<(String, kin_spine::SpineQuery<kin_spine::SpineXrefResponse>), String> {
     let repo_id = normalize_cross_repo_repo_id(Some(authority.repo_id))?;
     let query = match authority.spine {
-        Some(spine) => {
+        FindReferencesSpineAuthority::Ready(spine) => {
             let body = spine.cross_repo_xref_response(&repo_id, target_id);
             if body.authority_root_matches(&repo_id, authority.graph_root) {
                 kin_spine::SpineQuery::Found(body)
@@ -906,7 +918,15 @@ fn daemon_spine_xref(
                 ))
             }
         }
-        None => kin_spine::SpineQuery::NotConfigured,
+        FindReferencesSpineAuthority::Warming => kin_spine::SpineQuery::Unavailable(
+            "cross-repo spine authority is warming; local graph references are available, but cross-repo absence is not yet complete"
+                .to_string(),
+        ),
+        FindReferencesSpineAuthority::Unavailable => kin_spine::SpineQuery::Unavailable(
+            "cross-repo spine authority is enabled but no exact-root snapshot is currently publishable"
+                .to_string(),
+        ),
+        FindReferencesSpineAuthority::NotConfigured => kin_spine::SpineQuery::NotConfigured,
     };
     Ok((repo_id, query))
 }
@@ -3053,7 +3073,7 @@ mod tests {
             FindReferencesAuthority {
                 repo_id: "provider",
                 graph_root: &registered_root,
-                spine: Some(&spine),
+                spine: FindReferencesSpineAuthority::Ready(&spine),
             },
             None,
         )
@@ -3079,7 +3099,7 @@ mod tests {
             FindReferencesAuthority {
                 repo_id: "provider",
                 graph_root: &live_root,
-                spine: Some(&spine),
+                spine: FindReferencesSpineAuthority::Ready(&spine),
             },
             None,
         )
@@ -3097,6 +3117,76 @@ mod tests {
             .is_some_and(|reason| reason.contains("root mismatch")));
         assert_eq!(mismatched["negative"]["safe_to_conclude_absent"], false);
         assert!(mismatched["references"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn daemon_find_references_keeps_local_rows_while_spine_warms() {
+        let graph = InMemoryGraph::new();
+        let caller = make_entity("caller", "src/app.rs");
+        let target = make_entity("target", "src/lib.rs");
+        let orphan = make_entity("orphan", "src/orphan.rs");
+        graph.upsert_entity(&caller).unwrap();
+        graph.upsert_entity(&target).unwrap();
+        graph.upsert_entity(&orphan).unwrap();
+        graph
+            .upsert_relation(&make_relation(caller.id, target.id, RelationKind::Calls))
+            .unwrap();
+        let root = graph_root(&graph);
+        let args = HashMap::from([(
+            "entity_id".to_string(),
+            serde_json::json!(target.id.to_string()),
+        )]);
+
+        let result = handle_find_references_with_authority(
+            &args,
+            &graph,
+            FindReferencesAuthority {
+                repo_id: "provider",
+                graph_root: &root,
+                spine: FindReferencesSpineAuthority::Warming,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        let result =
+            crate::finalize_with_envelope(result, structurally_ready_envelope(), "find_references");
+        let body = parsed_response(&result);
+
+        assert_eq!(body["total_upstream"], 1);
+        assert_eq!(body["references"][0]["name"], "caller");
+        assert_eq!(body["cross_repo"]["status"], "unavailable");
+        assert!(body["cross_repo"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("warming")));
+
+        let orphan_args = HashMap::from([(
+            "entity_id".to_string(),
+            serde_json::json!(orphan.id.to_string()),
+        )]);
+        let orphan_result = handle_find_references_with_authority(
+            &orphan_args,
+            &graph,
+            FindReferencesAuthority {
+                repo_id: "provider",
+                graph_root: &root,
+                spine: FindReferencesSpineAuthority::Warming,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        let orphan_result = crate::finalize_with_envelope(
+            orphan_result,
+            structurally_ready_envelope(),
+            "find_references",
+        );
+        let orphan_body = parsed_response(&orphan_result);
+        assert_eq!(orphan_body["total_upstream"], 0);
+        assert_eq!(
+            orphan_body["negative"]["safe_to_conclude_absent"], false,
+            "warming cross-repo authority cannot certify an otherwise empty result"
+        );
     }
 
     #[tokio::test]
@@ -3143,7 +3233,7 @@ mod tests {
             FindReferencesAuthority {
                 repo_id: "provider",
                 graph_root: &provider_root,
-                spine: Some(&spine),
+                spine: FindReferencesSpineAuthority::Ready(&spine),
             },
             None,
         )
@@ -3172,7 +3262,7 @@ mod tests {
                 FindReferencesAuthority {
                     repo_id: "provider",
                     graph_root: &provider_root,
-                    spine: Some(&spine),
+                    spine: FindReferencesSpineAuthority::Ready(&spine),
                 },
                 None,
             )
@@ -3211,7 +3301,7 @@ mod tests {
             FindReferencesAuthority {
                 repo_id: "provider",
                 graph_root: &provider_root,
-                spine: Some(&spine),
+                spine: FindReferencesSpineAuthority::Ready(&spine),
             },
             None,
         )
@@ -3268,7 +3358,7 @@ mod tests {
         let authority = FindReferencesAuthority {
             repo_id: "provider",
             graph_root: &provider_root,
-            spine: Some(&spine),
+            spine: FindReferencesSpineAuthority::Ready(&spine),
         };
         let any = handle_bulk_check_references_with_authority(&args, &graph, authority).unwrap();
         let any = crate::finalize_with_envelope(

@@ -692,6 +692,28 @@ impl Drop for SpineWarmGuard<'_> {
     }
 }
 
+/// Clears the single-flight background-schedule flag when its worker exits.
+///
+/// Unlike [`SpineWarmGuard`], this guard does not arm the flag: the caller has
+/// already won a `compare_exchange` before it spawns the worker. Keeping the
+/// clear in `Drop` makes a panicking initializer retryable instead of leaving
+/// every later reference query convinced a worker still exists.
+struct SpineWarmScheduleGuard<'a> {
+    flag: &'a AtomicBool,
+}
+
+impl<'a> SpineWarmScheduleGuard<'a> {
+    fn for_armed_flag(flag: &'a AtomicBool) -> Self {
+        Self { flag }
+    }
+}
+
+impl Drop for SpineWarmScheduleGuard<'_> {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::Release);
+    }
+}
+
 /// One local sibling repository capability frozen while the daemon starts.
 ///
 /// Lazy spine initialization may load graph bytes later, but it must never
@@ -972,6 +994,14 @@ pub struct DaemonState {
     /// and its own repo is served, but a cross-repo surface is materializing.
     /// Clients must treat it as alive-and-waiting, never as a dead endpoint.
     spine_warming: AtomicBool,
+    /// One daemon-owned background warm-up has been scheduled or is running.
+    ///
+    /// This closes the gap before the worker acquires `spine_initialization`:
+    /// without it, a burst of first reference queries can each spawn a worker
+    /// before the first worker reaches [`SpineWarmGuard`]. The mutex would keep
+    /// their expensive passes serialized, but would still leave an unbounded
+    /// queue of redundant background threads.
+    spine_warmup_scheduled: AtomicBool,
     /// Deterministic blocking seam for concurrency and runtime-starvation
     /// regression tests. Production initialization has no injected hook.
     #[cfg(test)]
@@ -1762,6 +1792,7 @@ impl DaemonState {
             spine: std::sync::OnceLock::new(),
             spine_initialization: Mutex::new(()),
             spine_warming: AtomicBool::new(false),
+            spine_warmup_scheduled: AtomicBool::new(false),
             #[cfg(test)]
             spine_initialization_test_hook: Mutex::new(None),
             spine_refresh_gate: tokio::sync::Mutex::new(()),
@@ -1930,6 +1961,7 @@ impl DaemonState {
             spine: std::sync::OnceLock::new(),
             spine_initialization: Mutex::new(()),
             spine_warming: AtomicBool::new(false),
+            spine_warmup_scheduled: AtomicBool::new(false),
             #[cfg(test)]
             spine_initialization_test_hook: Mutex::new(None),
             spine_refresh_gate: tokio::sync::Mutex::new(()),
@@ -2020,17 +2052,64 @@ impl DaemonState {
             // blocking handoff, not only the sibling thread join buried within
             // it. The mutex is acquired there too so a contending initializer
             // cannot park another async worker.
-            without_blocking_runtime_worker(|| {
-                let _initialization = self
-                    .spine_initialization
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if self.spine.get().is_none() {
-                    self.initialize_spine_lazy();
-                }
-            });
+            without_blocking_runtime_worker(|| self.initialize_spine_if_needed());
         }
         self.spine.get().map(|s| s.as_ref())
+    }
+
+    /// Start one daemon-owned spine warm-up without waiting for it.
+    ///
+    /// Reference queries need local graph rows immediately even when loading
+    /// every startup-pinned sibling takes a minute. The background worker uses
+    /// the same serialized initializer as [`Self::ensure_spine`], so there is
+    /// still one exact publication path and one `OnceLock` visibility edge.
+    ///
+    /// Returns `true` only when this call scheduled the worker. A ready,
+    /// disabled, or already-warming spine returns `false`.
+    pub fn start_spine_warmup(self: &Arc<Self>) -> bool {
+        if Self::spine_disabled() || self.spine.get().is_some() {
+            return false;
+        }
+        if self
+            .spine_warmup_scheduled
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
+
+        let state = Arc::clone(self);
+        match std::thread::Builder::new()
+            .name("kin-spine-warmup".to_string())
+            .spawn(move || {
+                let _scheduled =
+                    SpineWarmScheduleGuard::for_armed_flag(&state.spine_warmup_scheduled);
+                state.initialize_spine_if_needed();
+            }) {
+            Ok(_) => true,
+            Err(error) => {
+                self.spine_warmup_scheduled.store(false, Ordering::Release);
+                warn!(error = %error, "could not start background spine warm-up");
+                false
+            }
+        }
+    }
+
+    /// Whether this daemon is configured to provide cross-repository spine
+    /// authority. A configured but not-yet-ready spine is an explicit
+    /// unavailable/warming state, never the same as `KIN_DISABLE_SPINE`.
+    pub fn spine_configured(&self) -> bool {
+        !Self::spine_disabled()
+    }
+
+    fn initialize_spine_if_needed(&self) {
+        let _initialization = self
+            .spine_initialization
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.spine.get().is_none() {
+            self.initialize_spine_lazy();
+        }
     }
 
     fn spine_capture_is_current(&self, capture: &SpineGraphCapture) -> bool {
@@ -2140,7 +2219,8 @@ impl DaemonState {
 
     /// Whether a complete lazy spine initialization pass is in progress.
     pub fn spine_warming(&self) -> bool {
-        self.spine_warming.load(Ordering::Relaxed)
+        self.spine_warming.load(Ordering::Acquire)
+            || self.spine_warmup_scheduled.load(Ordering::Acquire)
     }
 
     #[cfg(test)]

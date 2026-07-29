@@ -1559,7 +1559,7 @@ where
 }
 
 async fn mcp_find_references_with_stable_authority<F>(
-    state: &DaemonState,
+    state: &Arc<DaemonState>,
     session_id: Option<&SessionId>,
     selected_graph: Arc<kin_db::InMemoryGraph>,
     authority: RequestGraphAuthority,
@@ -1569,7 +1569,7 @@ async fn mcp_find_references_with_stable_authority<F>(
 where
     F: FnMut(usize),
 {
-    let spine = state.ensure_spine();
+    let spine = nonblocking_mcp_spine_authority(state);
     let repository_authority = mcp_repository_authority_binding(state)?;
     for attempt_number in 0..XREF_STABLE_READ_ATTEMPTS {
         let Some(attempt) = prepare_xref_graph_read(state, &selected_graph, authority) else {
@@ -1631,7 +1631,7 @@ fn require_mcp_local_repository_authority(
 }
 
 async fn mcp_bulk_check_references_with_stable_authority<F>(
-    state: &DaemonState,
+    state: &Arc<DaemonState>,
     session_id: Option<&SessionId>,
     selected_graph: Arc<kin_db::InMemoryGraph>,
     authority: RequestGraphAuthority,
@@ -1641,7 +1641,7 @@ async fn mcp_bulk_check_references_with_stable_authority<F>(
 where
     F: FnMut(usize),
 {
-    let spine = state.ensure_spine();
+    let spine = nonblocking_mcp_spine_authority(state);
     for attempt_number in 0..XREF_STABLE_READ_ATTEMPTS {
         let Some(attempt) = prepare_xref_graph_read(state, &selected_graph, authority) else {
             continue;
@@ -1669,6 +1669,41 @@ where
     Err(kin_mcp::McpError::Other(
         "graph authority changed repeatedly during bulk_check_references; retry".to_string(),
     ))
+}
+
+/// Return immediately with the daemon's current cross-repository authority.
+///
+/// A first MCP reference query starts one background warm-up but never joins
+/// it. Local graph rows remain usable while the response explicitly marks
+/// cross-repo absence as incomplete. Once the exact-root spine publishes, the
+/// same path upgrades to `Ready` without changing request semantics.
+fn nonblocking_mcp_spine_authority(
+    state: &Arc<DaemonState>,
+) -> kin_mcp::handlers::entities::FindReferencesSpineAuthority<'_> {
+    use kin_mcp::handlers::entities::FindReferencesSpineAuthority;
+
+    if let Some(spine) = state.spine() {
+        return FindReferencesSpineAuthority::Ready(spine);
+    }
+    if !state.spine_configured() {
+        return FindReferencesSpineAuthority::NotConfigured;
+    }
+
+    state.start_spine_warmup();
+
+    // A tiny repository can finish between scheduling and this read. Prefer
+    // the exact published authority immediately instead of reporting one
+    // unnecessary warming response.
+    if let Some(spine) = state.spine() {
+        FindReferencesSpineAuthority::Ready(spine)
+    } else if state.spine_warming() {
+        FindReferencesSpineAuthority::Warming
+    } else {
+        // Spawn failure or a stable-capture deferral is materially different
+        // from an operator-disabled spine. Keep negatives inconclusive and let
+        // the next query retry the single-flight initializer.
+        FindReferencesSpineAuthority::Unavailable
+    }
 }
 
 async fn health(
@@ -18937,6 +18972,78 @@ mod tests {
             provider_root
         );
         assert_eq!(body["negative"]["safe_to_conclude_absent"], true);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn first_mcp_find_returns_while_one_background_spine_warmup_blocks() {
+        use std::sync::mpsc;
+
+        let previous_disable = std::env::var_os("KIN_DISABLE_SPINE");
+        std::env::remove_var("KIN_DISABLE_SPINE");
+
+        let state = test_state();
+        let target = test_entity("target", "src/lib.rs");
+        state.graph.upsert_entity(&target).unwrap();
+
+        let (warm_started_tx, warm_started_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
+        let hook_release_rx = Arc::clone(&release_rx);
+        state.set_spine_initialization_test_hook(Some(Arc::new(move || {
+            let _ = warm_started_tx.send(());
+            let _ = hook_release_rx
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .recv_timeout(Duration::from_secs(30));
+        })));
+
+        let arguments = serde_json::from_value::<HashMap<String, serde_json::Value>>(json!({
+            "entity_id": target.id.to_string(),
+        }))
+        .unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            mcp_find_references_with_stable_authority(
+                &state,
+                None,
+                Arc::clone(&state.graph),
+                RequestGraphAuthority::Head,
+                &arguments,
+                |_| {},
+            ),
+        )
+        .await
+        .expect("the first local reference answer must not join spine warm-up")
+        .expect("local reference handling remains available while warming");
+        let body: serde_json::Value = serde_json::from_str(&mcp_result_text(&result)).unwrap();
+
+        assert_eq!(body["cross_repo"]["status"], "unavailable");
+        assert!(body["cross_repo"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("warming")));
+        warm_started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the first query must start the daemon-owned warm-up");
+        assert!(state.spine_warming());
+        assert!(
+            !state.start_spine_warmup(),
+            "a concurrent first-query burst must not schedule a second worker"
+        );
+
+        let _ = release_tx.send(());
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while state.spine().is_none() || state.spine_warming() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("background warm-up must publish after the blocking seam releases");
+
+        match previous_disable {
+            Some(value) => std::env::set_var("KIN_DISABLE_SPINE", value),
+            None => std::env::remove_var("KIN_DISABLE_SPINE"),
+        }
     }
 
     #[tokio::test]
