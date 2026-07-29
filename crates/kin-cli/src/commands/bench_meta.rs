@@ -678,13 +678,16 @@ fn hash_json(value: &serde_json::Value) -> String {
 mod tests {
     use super::{
         build_meta, build_prepared_manifests, embedding_meta, feature_flags,
-        finalize_bench_git_process_with_ambient, git_output_inner, git_output_inner_with_policy,
-        git_output_inner_with_resolution_policy, metal_active, vector_index_metadata_version,
+        finalize_bench_git_process_with_ambient, git_output_inner, metal_active,
+        vector_index_metadata_version,
     };
+    #[cfg(unix)]
+    use super::{git_output_inner_with_policy, git_output_inner_with_resolution_policy};
     use std::ffi::{OsStr, OsString};
     use std::fs;
     use std::path::Path;
     use std::process::Command;
+    #[cfg(unix)]
     use std::time::Duration;
     use tempfile::tempdir;
 
