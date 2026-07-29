@@ -15040,9 +15040,11 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
         let main = dir.path().join("main");
         let linked = dir.path().join("linked");
         fs::create_dir_all(&main).unwrap();
+        let null_git_config = if cfg!(windows) { "NUL" } else { "/dev/null" };
         let git = |args: &[&str], cwd: &Path| {
             let output = Command::new("git")
                 .args(args)
+                .env("GIT_CONFIG_GLOBAL", null_git_config)
                 .current_dir(cwd)
                 .output()
                 .unwrap();
@@ -15078,6 +15080,7 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
         }
         let status = Command::new("git")
             .args(["status", "--porcelain", "--untracked-files=all"])
+            .env("GIT_CONFIG_GLOBAL", null_git_config)
             .current_dir(&linked)
             .output()
             .unwrap();
@@ -15328,9 +15331,11 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
         let main = dir.path().join("main");
         let linked = dir.path().join("linked");
         fs::create_dir_all(&main).unwrap();
+        let null_git_config = if cfg!(windows) { "NUL" } else { "/dev/null" };
         let git = |args: &[&str], cwd: &Path| {
             let output = Command::new("git")
                 .args(args)
+                .env("GIT_CONFIG_GLOBAL", null_git_config)
                 .current_dir(cwd)
                 .output()
                 .unwrap();
