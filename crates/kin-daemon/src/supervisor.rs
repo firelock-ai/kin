@@ -10,6 +10,7 @@
 use std::collections::BTreeMap;
 #[cfg(unix)]
 use std::collections::{HashMap, HashSet};
+use std::io::{Seek, SeekFrom, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -22,6 +23,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -34,6 +36,10 @@ use crate::state::DaemonState;
 const SUPERVISOR_PID_FILE: &str = "supervisor.pid";
 const SUPERVISOR_PORT_FILE: &str = "supervisor.port";
 const SUPERVISOR_TOKEN_FILE: &str = "supervisor.token";
+const SUPERVISOR_LIFECYCLE_FILE: &str = "supervisor.lifecycle";
+const SUPERVISOR_SINGLETON_FILE: &str = "supervisor.lock";
+const SUPERVISOR_LIFECYCLE_BUDGET: Duration = Duration::from_secs(5);
+const SUPERVISOR_LIFECYCLE_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const HEARTBEAT_TTL: Duration = Duration::from_secs(20);
 /// Ceiling for the retry backoff a repo daemon applies while it cannot reach a
@@ -169,48 +175,157 @@ fn supervisor_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".kin"))
 }
 
-fn supervisor_pid_path() -> PathBuf {
-    supervisor_dir().join(SUPERVISOR_PID_FILE)
+#[derive(Debug)]
+struct SupervisorLock {
+    file: std::fs::File,
 }
 
-fn supervisor_port_path() -> PathBuf {
-    supervisor_dir().join(SUPERVISOR_PORT_FILE)
+impl Drop for SupervisorLock {
+    fn drop(&mut self) {
+        let _ = self.file.set_len(0);
+        let _ = self.file.flush();
+    }
 }
 
-fn write_supervisor_endpoint_files(port: u16) {
-    let dir = supervisor_dir();
-    let _ = std::fs::create_dir_all(&dir);
+fn acquire_supervisor_lifecycle_guard(dir: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::create_dir_all(dir)?;
+    let deadline = Instant::now() + SUPERVISOR_LIFECYCLE_BUDGET;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(dir.join(SUPERVISOR_LIFECYCLE_FILE))?;
+    loop {
+        match file.try_lock_exclusive() {
+            Ok(()) => return Ok(file),
+            Err(error) if error.kind() == fs2::lock_contended_error().kind() => {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        "timed out waiting for supervisor lifecycle authority",
+                    ));
+                }
+                std::thread::sleep(
+                    SUPERVISOR_LIFECYCLE_RETRY_INTERVAL
+                        .min(deadline.saturating_duration_since(now)),
+                );
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn stamp_supervisor_lock_owner(file: &mut std::fs::File) {
+    if file.set_len(0).is_err() || file.seek(SeekFrom::Start(0)).is_err() {
+        return;
+    }
+    if write!(file, "{}", std::process::id()).is_ok() {
+        let _ = file.flush();
+    }
+}
+
+fn recorded_supervisor_pid(dir: &Path) -> Option<u32> {
+    std::fs::read_to_string(dir.join(SUPERVISOR_PID_FILE))
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+}
+
+fn acquire_supervisor_lock(dir: &Path) -> std::io::Result<SupervisorLock> {
+    let _lifecycle = acquire_supervisor_lifecycle_guard(dir)?;
+
+    // A compatible older supervisor does not know supervisor.lock, so its live
+    // PID record remains an independent mixed-version exclusion signal.
+    if let Some(pid) = recorded_supervisor_pid(dir) {
+        if pid != std::process::id() && kin_cli::daemon_client::process_liveness(pid).may_be_alive()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AddrInUse,
+                format!("kin supervisor pid {pid} may still be running"),
+            ));
+        }
+    }
+
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(dir.join(SUPERVISOR_SINGLETON_FILE))?;
+    match file.try_lock_exclusive() {
+        Ok(()) => {
+            stamp_supervisor_lock_owner(&mut file);
+            Ok(SupervisorLock { file })
+        }
+        Err(error) if error.kind() == fs2::lock_contended_error().kind() => {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::AddrInUse,
+                "another kin supervisor holds the per-user singleton",
+            ))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn write_supervisor_endpoint_files(
+    dir: &Path,
+    _supervisor_lock: &SupervisorLock,
+    port: u16,
+) -> std::io::Result<()> {
+    let _lifecycle = acquire_supervisor_lifecycle_guard(dir)?;
     let pid_tmp = dir.join(format!("{SUPERVISOR_PID_FILE}.tmp"));
-    if std::fs::write(&pid_tmp, std::process::id().to_string()).is_ok() {
-        let _ = std::fs::rename(pid_tmp, supervisor_pid_path());
-    }
-    // Written atomically (temp + rename) so a CLI polling the port file during
-    // the supervisor→CLI port handshake never parses a torn or partial value.
     let port_tmp = dir.join(format!("{SUPERVISOR_PORT_FILE}.tmp"));
-    if std::fs::write(&port_tmp, port.to_string()).is_ok() {
-        let _ = std::fs::rename(port_tmp, supervisor_port_path());
+    let pid_path = dir.join(SUPERVISOR_PID_FILE);
+    let port_path = dir.join(SUPERVISOR_PORT_FILE);
+    let result = (|| {
+        std::fs::write(&pid_tmp, std::process::id().to_string())?;
+        std::fs::write(&port_tmp, port.to_string())?;
+        std::fs::rename(&pid_tmp, &pid_path)?;
+        std::fs::rename(&port_tmp, &port_path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(pid_tmp);
+        let _ = std::fs::remove_file(port_tmp);
+        if recorded_supervisor_pid(dir) == Some(std::process::id()) {
+            let _ = std::fs::remove_file(pid_path);
+            let _ = std::fs::remove_file(port_path);
+        }
     }
+    result
 }
 
-fn remove_supervisor_endpoint_files_if_current_process() {
-    let pid_path = supervisor_pid_path();
+fn remove_supervisor_endpoint_files_if_current_process(dir: &Path, port: u16) {
+    let Ok(_lifecycle) = acquire_supervisor_lifecycle_guard(dir) else {
+        warn!("preserving supervisor endpoint because lifecycle authority is unavailable");
+        return;
+    };
+    let pid_path = dir.join(SUPERVISOR_PID_FILE);
+    let port_path = dir.join(SUPERVISOR_PORT_FILE);
     let belongs_to_current = std::fs::read_to_string(&pid_path)
         .ok()
         .and_then(|content| content.trim().parse::<u32>().ok())
         == Some(std::process::id());
-    if !belongs_to_current {
+    let same_port = std::fs::read_to_string(&port_path)
+        .ok()
+        .and_then(|content| content.trim().parse::<u16>().ok())
+        == Some(port);
+    if !(belongs_to_current && same_port) {
         return;
     }
     let _ = std::fs::remove_file(pid_path);
-    let _ = std::fs::remove_file(supervisor_port_path());
+    let _ = std::fs::remove_file(port_path);
 }
 
 pub fn supervisor_url_from_files() -> Option<String> {
     supervisor_url_from_dir(&supervisor_dir())
 }
 
-/// Endpoint recorded by a live supervisor under `dir`. Returns `None` — and
-/// clears the stale files — when the recorded process is gone.
+/// Endpoint recorded by a live supervisor under `dir`.
+///
+/// This read-only discovery path never retires endpoint files. The CLI owns
+/// conditional retirement under supervisor.lifecycle plus supervisor.lock.
 fn supervisor_url_from_dir(dir: &Path) -> Option<String> {
     let pid_path = dir.join(SUPERVISOR_PID_FILE);
     let port_path = dir.join(SUPERVISOR_PORT_FILE);
@@ -220,8 +335,6 @@ fn supervisor_url_from_dir(dir: &Path) -> Option<String> {
         .parse::<u32>()
         .ok()?;
     if !is_process_alive(pid) {
-        let _ = std::fs::remove_file(&pid_path);
-        let _ = std::fs::remove_file(&port_path);
         return None;
     }
     let port = std::fs::read_to_string(&port_path)
@@ -269,15 +382,7 @@ fn discover_supervisor_url(failing: Option<&str>) -> Option<String> {
 }
 
 fn is_process_alive(pid: u32) -> bool {
-    #[cfg(unix)]
-    {
-        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = pid;
-        true
-    }
+    kin_cli::daemon_client::is_process_alive(pid)
 }
 
 fn canonical_path_string(path: impl Into<PathBuf>) -> String {
@@ -1101,6 +1206,9 @@ async fn deregister_daemon(
 }
 
 pub async fn run_supervisor(port: u16, idle_timeout: Option<Duration>) -> std::io::Result<()> {
+    let state_dir = supervisor_dir();
+    let startup = kin_cli::daemon_client::validate_supervisor_runtime_startup(&state_dir)?;
+    let supervisor_lock = Arc::new(acquire_supervisor_lock(&state_dir)?);
     let state = Arc::new(SupervisorState::new());
 
     let bind_host = std::env::var("KIN_SUPERVISOR_BIND_HOST")
@@ -1128,7 +1236,11 @@ pub async fn run_supervisor(port: u16, idle_timeout: Option<Duration>) -> std::i
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let bound_port = listener.local_addr()?.port();
-    write_supervisor_endpoint_files(bound_port);
+    write_supervisor_endpoint_files(&state_dir, &supervisor_lock, bound_port)?;
+    if let Err(error) = startup.acknowledge() {
+        remove_supervisor_endpoint_files_if_current_process(&state_dir, bound_port);
+        return Err(error);
+    }
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
 
     if let Some(idle_timeout) = idle_timeout {
@@ -1189,7 +1301,7 @@ pub async fn run_supervisor(port: u16, idle_timeout: Option<Duration>) -> std::i
             }
         })
         .await;
-    remove_supervisor_endpoint_files_if_current_process();
+    remove_supervisor_endpoint_files_if_current_process(&state_dir, bound_port);
     result
 }
 
@@ -2105,6 +2217,85 @@ fn reexec_self(self_exe_mtime: u64) -> std::io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn supervisor_singleton_is_process_lifetime_and_never_unlinked() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = acquire_supervisor_lock(dir.path()).unwrap();
+
+        let error = acquire_supervisor_lock(dir.path()).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+        assert!(
+            dir.path().join(SUPERVISOR_SINGLETON_FILE).exists(),
+            "a contended acquire must preserve the singleton pathname"
+        );
+        assert!(
+            dir.path().join(SUPERVISOR_LIFECYCLE_FILE).exists(),
+            "the lifecycle authority is never unlinked"
+        );
+
+        drop(first);
+        let reacquired = acquire_supervisor_lock(dir.path()).unwrap();
+        drop(reacquired);
+        assert!(
+            dir.path().join(SUPERVISOR_SINGLETON_FILE).exists(),
+            "clean release drops the flock but never replaces its inode"
+        );
+    }
+
+    #[test]
+    fn supervisor_publication_and_cleanup_are_generation_conditional() {
+        let dir = tempfile::tempdir().unwrap();
+        let authority = acquire_supervisor_lock(dir.path()).unwrap();
+        write_supervisor_endpoint_files(dir.path(), &authority, 50595).unwrap();
+
+        // A same-process successor generation must survive cleanup formed
+        // against the prior port.
+        write_supervisor_endpoint_files(dir.path(), &authority, 50596).unwrap();
+        remove_supervisor_endpoint_files_if_current_process(dir.path(), 50595);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(SUPERVISOR_PORT_FILE))
+                .unwrap()
+                .trim(),
+            "50596"
+        );
+
+        remove_supervisor_endpoint_files_if_current_process(dir.path(), 50596);
+        assert!(!dir.path().join(SUPERVISOR_PID_FILE).exists());
+        assert!(!dir.path().join(SUPERVISOR_PORT_FILE).exists());
+        assert!(dir.path().join(SUPERVISOR_SINGLETON_FILE).exists());
+    }
+
+    #[test]
+    fn current_protocol_directory_sentinel_blocks_legacy_respawn_without_heartbeat() {
+        let dir = tempfile::tempdir().unwrap();
+        let _startup_lock =
+            kin_cli::daemon_client::try_acquire_supervisor_startup_lock_in_dir(dir.path()).unwrap();
+        let supervisor_lock = Arc::new(acquire_supervisor_lock(dir.path()).unwrap());
+        let port = 50597;
+        write_supervisor_endpoint_files(dir.path(), &supervisor_lock, port).unwrap();
+
+        // Exact destructive ordering in the immutable PR-base CLI: health
+        // fails, both discovery files are deleted, and only then does it try
+        // create-new on supervisor.start.lock. The current protocol keeps that
+        // pathname as a non-empty directory, which remove_file cannot delete
+        // and create_new cannot replace. No timer or runtime task participates.
+        let _ = std::fs::remove_file(dir.path().join(SUPERVISOR_PID_FILE));
+        let _ = std::fs::remove_file(dir.path().join(SUPERVISOR_PORT_FILE));
+        let legacy_acquired = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(dir.path().join("supervisor.start.lock"))
+            .is_ok();
+        assert!(
+            !legacy_acquired,
+            "the old client must not obtain spawn authority after deleting discovery"
+        );
+        assert!(
+            dir.path().join("supervisor.start.lock").is_dir(),
+            "the compatibility sentinel must remain a directory for the supervisor lifetime"
+        );
+    }
 
     fn repo_payload(instance_id: &str, port: u16) -> RepoDaemonRegistration {
         RepoDaemonRegistration {
@@ -3377,8 +3568,9 @@ mod tests {
             Some("http://127.0.0.1:50596")
         );
 
-        // A recorded supervisor that is no longer alive is not adopted, and its
-        // stale endpoint files are cleared.
+        // A recorded supervisor that is no longer alive is not adopted. This
+        // read-only discovery path preserves its files; conditional retirement
+        // belongs to the CLI's lifecycle + singleton authority.
         #[cfg(unix)]
         {
             std::fs::write(dir.join(SUPERVISOR_PID_FILE), "999999999").unwrap();
@@ -3388,8 +3580,8 @@ mod tests {
                     .as_deref(),
                 Some(inherited.as_str())
             );
-            assert!(!dir.join(SUPERVISOR_PID_FILE).exists());
-            assert!(!dir.join(SUPERVISOR_PORT_FILE).exists());
+            assert!(dir.join(SUPERVISOR_PID_FILE).exists());
+            assert!(dir.join(SUPERVISOR_PORT_FILE).exists());
         }
 
         let _ = std::fs::remove_dir_all(&dir);

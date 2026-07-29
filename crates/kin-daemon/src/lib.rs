@@ -136,7 +136,10 @@ pub mod supervisor;
 pub mod traffic_adapter;
 pub mod write_veto;
 
-pub use daemon::{run, DaemonConfig};
+pub use daemon::{
+    acquire_daemon_authority, acquire_daemon_authority_within, run, run_with_authority,
+    DaemonConfig,
+};
 pub use error::{DaemonError, Result};
 pub use lifecycle::{
     daemon_is_up, ensure_daemon_running, ensure_daemon_running_with_idle_timeout, AutoStartError,

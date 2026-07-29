@@ -583,13 +583,19 @@ mod tests {
             .current_dir(repo.path())
             .output()
             .unwrap();
-        Command::new("git")
-            .args(["commit", "-m", "init"])
+        let commit = Command::new("git")
+            .args(["commit", "--signoff", "-m", "init"])
             .env("GIT_AUTHOR_DATE", "1000000000 +0000")
             .env("GIT_COMMITTER_DATE", "1000000000 +0000")
             .current_dir(repo.path())
             .output()
             .unwrap();
+        assert!(
+            commit.status.success(),
+            "git commit failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&commit.stdout),
+            String::from_utf8_lossy(&commit.stderr)
+        );
 
         let meta = build_meta().unwrap();
         let (prepared, repo_base) = build_prepared_manifests(&meta, repo.path()).unwrap();
@@ -632,13 +638,19 @@ mod tests {
             .current_dir(repo.path())
             .output()
             .unwrap();
-        Command::new("git")
-            .args(["commit", "-m", "init"])
+        let commit = Command::new("git")
+            .args(["commit", "--signoff", "-m", "init"])
             .env("GIT_AUTHOR_DATE", "1000000100 +0000")
             .env("GIT_COMMITTER_DATE", "1000000100 +0000")
             .current_dir(repo.path())
             .output()
             .unwrap();
+        assert!(
+            commit.status.success(),
+            "git commit failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&commit.stdout),
+            String::from_utf8_lossy(&commit.stderr)
+        );
 
         let meta = build_meta().unwrap();
         let (prepared_a, repo_base_a) = build_prepared_manifests(&meta, repo.path()).unwrap();

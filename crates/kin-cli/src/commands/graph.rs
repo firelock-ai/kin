@@ -1496,7 +1496,7 @@ mod tests {
             fs::write(repo.join("README.md"), b"authority without source\n").unwrap();
         }
         git(&["add", "--all"]);
-        git(&["commit", "-m", "seed exact source authority"]);
+        git(&["commit", "--signoff", "-m", "seed exact source authority"]);
         let init = kin_core::init_from_git(&repo).unwrap();
         let layout = init.layout;
         let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&layout).unwrap();
