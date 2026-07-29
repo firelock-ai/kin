@@ -152,41 +152,39 @@ fn read_local_publication_identity(
     backend: &LocalFileBackend,
     repository_id: &RepositoryId,
 ) -> Result<LocalPublicationIdentity, (StatusCode, String)> {
+    use std::io::Read as _;
+
     let record = backend
         .base_path()
         .join(repository_id.as_str())
         .join(AUTHORITY_PUBLICATION_RECORD);
-    let metadata = match std::fs::metadata(&record) {
-        Ok(metadata) => metadata,
+    let record_error = |error: std::io::Error| {
+        repository_authority_error(format!(
+            "cannot read local publication record {}: {error}",
+            record.display()
+        ))
+    };
+    // One handle answers both the bound and the contents, so a commit landing
+    // mid-check cannot have the size of one record and the bytes of another.
+    let mut file = match std::fs::File::open(&record) {
+        Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(LocalPublicationIdentity::Unpublished);
         }
-        Err(error) => {
-            return Err(repository_authority_error(format!(
-                "cannot read local publication record {}: {error}",
-                record.display()
-            )));
-        }
+        Err(error) => return Err(record_error(error)),
     };
-    if metadata.len() > MAX_AUTHORITY_PUBLICATION_RECORD_BYTES {
+    let len = file.metadata().map_err(record_error)?.len();
+    if len > MAX_AUTHORITY_PUBLICATION_RECORD_BYTES {
         return Err(repository_authority_error(format!(
-            "local publication record {} is {} bytes, past the {MAX_AUTHORITY_PUBLICATION_RECORD_BYTES}-byte bound",
-            record.display(),
-            metadata.len()
+            "local publication record {} is {len} bytes, past the {MAX_AUTHORITY_PUBLICATION_RECORD_BYTES}-byte bound",
+            record.display()
         )));
     }
-    match std::fs::read(&record) {
-        Ok(bytes) => Ok(LocalPublicationIdentity::Published(
-            Sha256::digest(&bytes).into(),
-        )),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            Ok(LocalPublicationIdentity::Unpublished)
-        }
-        Err(error) => Err(repository_authority_error(format!(
-            "cannot read local publication record {}: {error}",
-            record.display()
-        ))),
-    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(record_error)?;
+    Ok(LocalPublicationIdentity::Published(
+        Sha256::digest(&bytes).into(),
+    ))
 }
 
 /// One repository-v6 authority shared across the daemon's projection routes.
