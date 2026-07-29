@@ -563,6 +563,11 @@ impl SpineIndex {
 
     /// Resolve an entity by name and kind across all repos.
     /// Returns matches sorted by fingerprint similarity if a reference fingerprint is provided.
+    ///
+    /// Entries a repository holds with [`EntityRole::External`] are never
+    /// returned. Those stand for symbols the repository references but does not
+    /// own, so binding one as a resolution target would answer "where is this
+    /// defined" with another repository's unresolved import.
     pub fn resolve(
         &self,
         name: &str,
@@ -573,17 +578,19 @@ impl SpineIndex {
 
         let mut results = Vec::new();
 
+        let owns_definition =
+            |entry: &&EntityEntry| entry.role != Some(kin_model::EntityRole::External);
         if let Some(kind) = kind {
             let key = (name.to_lowercase(), kind);
             if let Some(entries) = inner.by_name.get(&key) {
-                results.extend(entries.iter().cloned());
+                results.extend(entries.iter().filter(owns_definition).cloned());
             }
         } else {
             // Search across all kinds
             let name_lower = name.to_lowercase();
             for ((n, _), entries) in &inner.by_name {
                 if *n == name_lower {
-                    results.extend(entries.iter().cloned());
+                    results.extend(entries.iter().filter(owns_definition).cloned());
                 }
             }
         }

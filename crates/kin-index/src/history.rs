@@ -13,8 +13,10 @@ use std::path::Path;
 
 use kin_blobs::BlobStore;
 use kin_model::{
-    ArtifactId, ChangeOrigin, Entity, EntityDelta, EntityId, FilePathId, ParseCompleteness,
-    Relation, RelationDelta, RelationId, ResolvedTree, SemanticChange, SemanticChangeId, TreeEntry,
+    ArtifactId, ChangeOrigin, Entity, EntityDelta, EntityId, EntityKind, EntityMetadata,
+    EntityRole, FilePathId, FingerprintAlgorithm, Hash256, LanguageId, ParseCompleteness, Relation,
+    RelationDelta, RelationId, ResolvedTree, SemanticChange, SemanticChangeId, SemanticFingerprint,
+    TreeEntry, Visibility,
 };
 use sha2::{Digest, Sha256};
 
@@ -36,7 +38,7 @@ use crate::pipeline::IndexPipeline;
 /// establish whether replay semantics actually changed, and if they did, bump
 /// this constant and the manifest's recorded version together. Never
 /// regenerate a digest silently.
-pub const HYDRATION_SEMANTICS_VERSION: u32 = 6;
+pub const HYDRATION_SEMANTICS_VERSION: u32 = 7;
 
 /// Semantic graph delta derived for one pre-enrichment change identity.
 ///
@@ -308,18 +310,14 @@ fn semantic_state_for_tree(
     parse_data.sort_by(|left, right| left.file_path.cmp(&right.file_path));
 
     let linked = link_cross_file_with_completeness(&parse_data, &artifact_ids, &completeness)?;
+    entities.extend(external_reference_targets(&linked, &entities));
     let mut relations = BTreeMap::new();
     for relation in linked {
         if let Some(absent) = absent_local_endpoint(&relation, &entities) {
             // A change carries the entity set of its own tree, so replaying it
-            // can only bind an edge whose endpoints that tree defines. The
-            // linker's cross-repo placeholder destination is absent by
-            // contract and stays a view-time inference rather than change-owned
-            // history; every other absent endpoint is inconsistent state and
-            // fails closed here instead of being admitted.
-            if absent.is_destination && is_external_import_placeholder(&relation) {
-                continue;
-            }
+            // can only bind an edge whose endpoints that tree defines. Every
+            // cross-repo destination now has one, so an absent endpoint here is
+            // inconsistent state and fails closed instead of being admitted.
             return Err(invalid(format!(
                 "linked relation {} names {} entity {} that the tree does not define",
                 relation.id,
@@ -349,6 +347,115 @@ fn semantic_state_for_tree(
 struct AbsentEndpoint {
     entity_id: EntityId,
     is_destination: bool,
+}
+
+/// Bind a graph-owned destination for every cross-repo reference the linker
+/// produced against `entities`.
+///
+/// The linker answers an import it cannot resolve locally with a deterministic
+/// placeholder destination naming the symbol another repository owns. That is
+/// the one endpoint this tree cannot supply from its own files, and a change
+/// whose relation names an entity nothing defines does not replay, so the
+/// reference used to be discarded: a freshly imported repository held no
+/// cross-repo references at all and answered every cross-repo query empty.
+///
+/// Binding an external target instead makes the reference complete,
+/// change-owned truth at the admission boundary. The target keeps the linker's
+/// deterministic identity, so every commit that observes the same import binds
+/// the same node and the fold emits no churn. It carries no file origin,
+/// because this tree does not contain the definition, and no signature,
+/// because none was observed. Its uniform [`EntityKind::Module`] says only what
+/// this repository can prove, that the symbol is reached through a module it
+/// does not own, and keeps external targets from ever matching a local
+/// definition by kind.
+fn external_reference_targets(
+    linked: &[Relation],
+    entities: &BTreeMap<EntityId, Entity>,
+) -> BTreeMap<EntityId, Entity> {
+    let mut targets = BTreeMap::new();
+    for relation in linked {
+        if !is_external_import_placeholder(relation) {
+            continue;
+        }
+        let Some(destination) = relation.dst.as_entity() else {
+            continue;
+        };
+        if entities.contains_key(&destination) || targets.contains_key(&destination) {
+            continue;
+        }
+        // The placeholder contract guarantees a local source, a non-empty
+        // import source, and exactly one evidence entry carrying the symbol.
+        let (Some(source), Some(import_source), Some(symbol)) = (
+            relation.src.as_entity().and_then(|id| entities.get(&id)),
+            relation.import_source.as_deref(),
+            relation
+                .evidence
+                .first()
+                .and_then(|evidence| evidence.token.as_deref()),
+        ) else {
+            continue;
+        };
+        targets.insert(
+            destination,
+            external_reference_entity(destination, import_source, symbol, source.language),
+        );
+    }
+    targets
+}
+
+/// Build the external target a cross-repo reference resolves against.
+fn external_reference_entity(
+    id: EntityId,
+    import_source: &str,
+    symbol: &str,
+    language: LanguageId,
+) -> Entity {
+    Entity {
+        id,
+        kind: EntityKind::Module,
+        name: symbol.to_string(),
+        language,
+        fingerprint: external_reference_fingerprint(import_source, symbol),
+        file_origin: None,
+        span: None,
+        signature: String::new(),
+        visibility: Visibility::Public,
+        role: EntityRole::External,
+        doc_summary: None,
+        metadata: EntityMetadata::default(),
+        lineage_parent: None,
+        created_in: None,
+        superseded_by: None,
+    }
+}
+
+/// Derive the fingerprint of an external target from the only two facts this
+/// repository observed about it.
+///
+/// The bodies that would produce a real fingerprint live in another repository,
+/// so every hash is domain-separated over the import source and symbol instead.
+/// That keeps one external target's identity stable across commits while
+/// keeping two different targets distinct, and it never coincides with a
+/// fingerprint computed over actual source. The stability score is zero because
+/// nothing here was measured.
+fn external_reference_fingerprint(import_source: &str, symbol: &str) -> SemanticFingerprint {
+    let digest = |domain: &str| {
+        let mut hasher = Sha256::new();
+        hasher.update(domain.as_bytes());
+        hasher.update((import_source.len() as u64).to_le_bytes());
+        hasher.update(import_source.as_bytes());
+        hasher.update((symbol.len() as u64).to_le_bytes());
+        hasher.update(symbol.as_bytes());
+        Hash256::from_bytes(hasher.finalize().into())
+    };
+    SemanticFingerprint {
+        algorithm: FingerprintAlgorithm::V1TreeSitter,
+        ast_hash: digest("kin.external-reference.ast.v1"),
+        signature_hash: digest("kin.external-reference.signature.v1"),
+        behavior_hash: digest("kin.external-reference.behavior.v1"),
+        equivalence_hash: digest("kin.external-reference.equivalence.v1"),
+        stability_score: 0.0,
+    }
 }
 
 /// Report the first entity endpoint of `relation` that `entities` does not
@@ -761,10 +868,10 @@ mod tests {
 
     /// The shape that blocked every real repository: a commit that starts
     /// calling a symbol imported from another crate. The linker answers with a
-    /// cross-repo placeholder destination that is absent from this repository's
-    /// entity set by contract, so a change carrying that edge cannot be
-    /// replayed. Admission must still bind the commit and the local call graph
-    /// around it.
+    /// cross-repo placeholder destination no local file defines, so enrichment
+    /// must bind an external target for it before the change can replay. The
+    /// commit, the local call graph around it, and the cross-repo reference
+    /// itself must all survive admission.
     ///
     /// Upstream trigger: fd b4a252a3916ab342b289331fbf49aa2db73df579, its 26th
     /// commit, which adds `extern crate isatty` and calls `stdout_isatty` from
@@ -848,6 +955,25 @@ mod tests {
                 .iter()
                 .any(|relation| relation.kind == kin_model::RelationKind::Calls),
             "the local call graph must survive"
+        );
+        let external = bound_relations
+            .iter()
+            .find(|relation| is_external_import_placeholder(relation))
+            .expect("the cross-repo reference must survive admission as change-owned truth");
+        let target = external.dst.as_entity().and_then(|id| {
+            admitted
+                .changes
+                .iter()
+                .flat_map(|change| &change.entity_deltas)
+                .filter_map(EntityDelta::new_state)
+                .find(|entity| entity.id == id)
+        });
+        let target = target.expect("the external reference must bind a destination entity");
+        assert_eq!(target.role, EntityRole::External);
+        assert_eq!(target.name, "stdout_isatty");
+        assert!(
+            target.file_origin.is_none(),
+            "an external target has no file in this repository"
         );
         for relation in &bound_relations {
             for node in [relation.src, relation.dst] {
