@@ -1342,28 +1342,30 @@ fn resolve_entity_source_authority<G: GraphStore>(
                         entity.id, source_change_id
                     ))
                 })?;
-            let current_artifact = committed
-                .tree
-                .artifact_at_path(&path)
-                .cloned()
-                .ok_or_else(|| {
-                    graph_source_gap(format!(
-                        "entity {} points at '{}' but that path is absent at {}",
-                        entity.id, recorded_origin.0, source_change_id
-                    ))
-                })?;
+            let current_artifact =
+                committed
+                    .tree
+                    .artifact_at_path(&path)
+                    .cloned()
+                    .ok_or_else(|| {
+                        graph_source_gap(format!(
+                            "entity {} points at '{}' but that path is absent at {}",
+                            entity.id, recorded_origin.0, source_change_id
+                        ))
+                    })?;
 
             // Bind the entity revision to the artifact identity that occupied its
             // path when that revision was introduced. A later path reuse must not
             // make an old entity read bytes from a different artifact.
-            let introduced_tree = store
-                .resolve_tree_at(&revision.introduced_by)
-                .map_err(|error| {
-                    graph_source_gap(format!(
-                        "cannot resolve entity {} introduction tree at {}: {error}",
-                        entity.id, revision.introduced_by
-                    ))
-                })?;
+            let introduced_tree =
+                store
+                    .resolve_tree_at(&revision.introduced_by)
+                    .map_err(|error| {
+                        graph_source_gap(format!(
+                            "cannot resolve entity {} introduction tree at {}: {error}",
+                            entity.id, revision.introduced_by
+                        ))
+                    })?;
             let introduced_artifact = introduced_tree.artifact_at_path(&path).ok_or_else(|| {
                 graph_source_gap(format!(
                     "entity {} revision {} was introduced without an artifact at '{}'",

@@ -5747,8 +5747,7 @@ fn build_semantic_locate_result(
             "match_evidence": match_evidence,
         });
         if let Some(span) = span {
-            let (start_line, end_line) =
-                kin_mcp::handlers::common::presentation_span_lines(span);
+            let (start_line, end_line) = kin_mcp::handlers::common::presentation_span_lines(span);
             hit["start_line"] = json!(start_line);
             hit["end_line"] = json!(end_line);
         }
