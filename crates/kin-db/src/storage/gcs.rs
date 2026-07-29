@@ -1273,8 +1273,9 @@ pub(crate) mod tests {
             "current.rs".to_string(),
             crate::types::regular_tree_entry(2),
         );
+        let current_bytes = current.to_bytes().unwrap();
         let gen2 = backend
-            .save_snapshot(repo_id, &current.to_bytes().unwrap(), gen1)
+            .save_snapshot(repo_id, &current_bytes, gen1)
             .unwrap();
         let stale_error = stale
             .save_snapshot(repo_id, &base.to_bytes().unwrap(), stale_gen)
@@ -1282,11 +1283,20 @@ pub(crate) mod tests {
         assert!(stale_error.to_string().contains("generation mismatch"));
 
         let reopened = GcsBackend::from_store(Box::new(Arc::clone(&store)), "fixture");
-        let recovered = crate::storage::backend::load_recovered_snapshot(&reopened, repo_id)
-            .unwrap()
-            .unwrap();
+        let recovered_authority =
+            crate::storage::backend::load_recovered_repository_authority(&reopened, repo_id, 0)
+                .unwrap()
+                .unwrap();
+        let stats = recovered_authority.payload_stats;
+        let recovered = recovered_authority.recovered;
         assert_eq!(recovered.generation, gen2);
         assert_eq!(recovered.snapshot.resolved_tree, current.resolved_tree);
+        assert_eq!(stats.snapshot_generation(), gen2);
+        assert_eq!(stats.head_generation(), gen2);
+        assert_eq!(stats.snapshot_bytes(), current_bytes.len() as u64);
+        assert_eq!(stats.acknowledged_delta_count(), 0);
+        assert_eq!(stats.acknowledged_delta_bytes(), 0);
+        assert_eq!(stats.total_payload_bytes(), current_bytes.len() as u64);
 
         let mut after_reopen = recovered.snapshot;
         after_reopen.admit_artifact_for_test(

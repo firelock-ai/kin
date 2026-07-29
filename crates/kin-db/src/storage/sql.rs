@@ -960,11 +960,12 @@ mod tests {
         let repo_id = "restart-repo";
         let mut base = GraphSnapshot::empty();
         base.admit_artifact_for_test("base.rs".to_string(), crate::types::regular_tree_entry(1));
+        let base_bytes = base.to_bytes().unwrap();
 
-        {
+        let (first_bytes, second_bytes) = {
             let backend = SqliteBackend::new(&db_path).unwrap();
             let gen1 = backend
-                .save_snapshot(repo_id, &base.to_bytes().unwrap(), GENERATION_INIT)
+                .save_snapshot(repo_id, &base_bytes, GENERATION_INIT)
                 .unwrap();
 
             let mut after_first = base.clone();
@@ -973,9 +974,8 @@ mod tests {
                 crate::types::regular_tree_entry(2),
             );
             let first = crate::storage::delta::compute_graph_delta(&base, &after_first, gen1);
-            let gen2 = backend
-                .save_delta(repo_id, &first.to_bytes().unwrap(), gen1)
-                .unwrap();
+            let first_bytes = first.to_bytes().unwrap();
+            let gen2 = backend.save_delta(repo_id, &first_bytes, gen1).unwrap();
 
             let mut after_second = after_first.clone();
             after_second.admit_artifact_for_test(
@@ -984,10 +984,10 @@ mod tests {
             );
             let second =
                 crate::storage::delta::compute_graph_delta(&after_first, &after_second, gen2);
-            backend
-                .save_delta(repo_id, &second.to_bytes().unwrap(), gen2)
-                .unwrap();
-        }
+            let second_bytes = second.to_bytes().unwrap();
+            backend.save_delta(repo_id, &second_bytes, gen2).unwrap();
+            (first_bytes, second_bytes)
+        };
 
         let reopened = SqliteBackend::new(&db_path).unwrap();
         let (base_bytes, base_generation) = reopened.load_snapshot(repo_id).unwrap().unwrap();
@@ -998,15 +998,28 @@ mod tests {
                 .resolved_tree,
             base.resolved_tree
         );
-        let recovered = crate::storage::backend::load_recovered_snapshot(&reopened, repo_id)
-            .unwrap()
-            .expect("snapshot exists");
+        let recovered_authority =
+            crate::storage::backend::load_recovered_repository_authority(&reopened, repo_id, 0)
+                .unwrap()
+                .expect("snapshot exists");
+        let stats = recovered_authority.payload_stats;
+        let recovered = recovered_authority.recovered;
         assert_eq!(recovered.generation, 3);
         assert_eq!(recovered.deltas_applied, 2);
         assert_eq!(recovered.snapshot.resolved_tree.len(), 3);
         assert!(recovered.snapshot.has_artifact_path_for_test("base.rs"));
         assert!(recovered.snapshot.has_artifact_path_for_test("first.rs"));
         assert!(recovered.snapshot.has_artifact_path_for_test("second.rs"));
+        let delta_bytes = (first_bytes.len() + second_bytes.len()) as u64;
+        assert_eq!(stats.snapshot_generation(), 1);
+        assert_eq!(stats.head_generation(), 3);
+        assert_eq!(stats.snapshot_bytes(), base_bytes.len() as u64);
+        assert_eq!(stats.acknowledged_delta_count(), 2);
+        assert_eq!(stats.acknowledged_delta_bytes(), delta_bytes);
+        assert_eq!(
+            stats.total_payload_bytes(),
+            base_bytes.len() as u64 + delta_bytes
+        );
     }
 
     #[test]

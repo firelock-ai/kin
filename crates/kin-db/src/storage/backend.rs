@@ -1375,6 +1375,117 @@ impl SnapshotAuthority {
 pub type PersistedDelta = (Vec<u8>, Generation);
 pub type SnapshotRecoveryState = (Option<SnapshotAuthority>, Vec<PersistedDelta>);
 
+/// Immutable receipt for the serialized graph payload selected by one
+/// coherent authority open.
+///
+/// The receipt counts the exact snapshot bytes admitted by recovery plus only
+/// the acknowledged delta bytes successfully replayed on top of that
+/// snapshot. It deliberately excludes backend metadata, retired or staged
+/// journal entries, source bodies, indexes, overlays, and filesystem
+/// allocation overhead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthorityPayloadStats {
+    snapshot_generation: Generation,
+    head_generation: Generation,
+    snapshot_bytes: u64,
+    acknowledged_delta_count: u64,
+    acknowledged_delta_bytes: u64,
+    total_payload_bytes: u64,
+}
+
+impl AuthorityPayloadStats {
+    fn from_recovery(
+        snapshot_generation: Generation,
+        head_generation: Generation,
+        snapshot_bytes: usize,
+        acknowledged_delta_count: usize,
+        acknowledged_delta_bytes: u64,
+    ) -> Result<Self, KinDbError> {
+        let snapshot_bytes = u64::try_from(snapshot_bytes).map_err(|_| {
+            KinDbError::StorageError("authority snapshot byte length does not fit u64".to_string())
+        })?;
+        let acknowledged_delta_count = u64::try_from(acknowledged_delta_count).map_err(|_| {
+            KinDbError::StorageError(
+                "authority acknowledged delta count does not fit u64".to_string(),
+            )
+        })?;
+        Self::from_components(
+            snapshot_generation,
+            head_generation,
+            snapshot_bytes,
+            acknowledged_delta_count,
+            acknowledged_delta_bytes,
+        )
+    }
+
+    fn from_components(
+        snapshot_generation: Generation,
+        head_generation: Generation,
+        snapshot_bytes: u64,
+        acknowledged_delta_count: u64,
+        acknowledged_delta_bytes: u64,
+    ) -> Result<Self, KinDbError> {
+        let expected_delta_count =
+            head_generation
+                .checked_sub(snapshot_generation)
+                .ok_or_else(|| {
+                    KinDbError::StorageError(format!(
+                        "authority snapshot generation {snapshot_generation} exceeds head generation {head_generation}"
+                    ))
+                })?;
+        if acknowledged_delta_count != expected_delta_count {
+            return Err(KinDbError::StorageError(format!(
+                "authority payload receipt counted {acknowledged_delta_count} acknowledged deltas, expected {expected_delta_count} between generations {snapshot_generation} and {head_generation}"
+            )));
+        }
+        let total_payload_bytes = snapshot_bytes
+            .checked_add(acknowledged_delta_bytes)
+            .ok_or_else(|| {
+                KinDbError::StorageError(format!(
+                    "authority payload byte count overflows u64: snapshot {snapshot_bytes} plus acknowledged deltas {acknowledged_delta_bytes}"
+                ))
+            })?;
+        Ok(Self {
+            snapshot_generation,
+            head_generation,
+            snapshot_bytes,
+            acknowledged_delta_count,
+            acknowledged_delta_bytes,
+            total_payload_bytes,
+        })
+    }
+
+    /// Generation represented by the selected immutable snapshot bytes.
+    pub const fn snapshot_generation(self) -> Generation {
+        self.snapshot_generation
+    }
+
+    /// Last generation acknowledged by the coherent authority view.
+    pub const fn head_generation(self) -> Generation {
+        self.head_generation
+    }
+
+    /// Exact serialized length of the selected snapshot bytes.
+    pub const fn snapshot_bytes(self) -> u64 {
+        self.snapshot_bytes
+    }
+
+    /// Number of acknowledged deltas successfully replayed during recovery.
+    pub const fn acknowledged_delta_count(self) -> u64 {
+        self.acknowledged_delta_count
+    }
+
+    /// Exact serialized length of acknowledged deltas successfully replayed.
+    pub const fn acknowledged_delta_bytes(self) -> u64 {
+        self.acknowledged_delta_bytes
+    }
+
+    /// Checked sum of selected snapshot and acknowledged delta bytes.
+    pub const fn total_payload_bytes(self) -> u64 {
+        self.total_payload_bytes
+    }
+}
+
 /// A snapshot reconstructed from durable base bytes plus its acknowledged
 /// incremental-delta chain.
 #[derive(Debug)]
@@ -1395,6 +1506,7 @@ pub struct RecoveredSnapshot {
 pub(crate) struct RecoveredRepositoryAuthority {
     pub recovered: RecoveredSnapshot,
     pub reused_complete_validation: bool,
+    pub payload_stats: AuthorityPayloadStats,
 }
 
 /// Load a backend snapshot and replay its complete authoritative delta chain.
@@ -1451,6 +1563,7 @@ fn load_recovered_snapshot_inner<B: StorageBackend + ?Sized>(
         )));
     }
 
+    let snapshot_payload_bytes = authority.snapshot_bytes.len();
     let snapshot_sha256 = hex::encode(Sha256::digest(&authority.snapshot_bytes));
     let deltas_seen = raw_deltas.len();
     let reused_complete_validation = expected_validator_version.is_some_and(|expected| {
@@ -1470,6 +1583,13 @@ fn load_recovered_snapshot_inner<B: StorageBackend + ?Sized>(
         GraphSnapshot::from_bytes(&authority.snapshot_bytes)?
     };
     if authority.snapshot_generation == authority.head_generation {
+        let payload_stats = AuthorityPayloadStats::from_recovery(
+            authority.snapshot_generation,
+            authority.head_generation,
+            snapshot_payload_bytes,
+            0,
+            0,
+        )?;
         return Ok(Some(RecoveredRepositoryAuthority {
             recovered: RecoveredSnapshot {
                 snapshot,
@@ -1480,6 +1600,7 @@ fn load_recovered_snapshot_inner<B: StorageBackend + ?Sized>(
                 history_validation: authority.history_validation,
             },
             reused_complete_validation,
+            payload_stats,
         }));
     }
     let mut expected_generation = checked_next_generation(
@@ -1488,6 +1609,7 @@ fn load_recovered_snapshot_inner<B: StorageBackend + ?Sized>(
     )?;
     let mut recovered_generation = authority.snapshot_generation;
     let mut applied = 0usize;
+    let mut acknowledged_delta_bytes = 0u64;
     let mut previous_generation = None;
     for (bytes, generation) in raw_deltas {
         if generation == GENERATION_INIT {
@@ -1523,7 +1645,23 @@ fn load_recovered_snapshot_inner<B: StorageBackend + ?Sized>(
             )));
         }
         crate::storage::delta::apply_graph_delta(&mut snapshot, &delta)?;
-        applied += 1;
+        let delta_bytes = u64::try_from(bytes.len()).map_err(|_| {
+            KinDbError::StorageError(format!(
+                "repo {repo_id} acknowledged delta generation {generation} byte length does not fit u64"
+            ))
+        })?;
+        acknowledged_delta_bytes = acknowledged_delta_bytes
+            .checked_add(delta_bytes)
+            .ok_or_else(|| {
+                KinDbError::StorageError(format!(
+                    "repo {repo_id} acknowledged delta payload byte count overflows u64"
+                ))
+            })?;
+        applied = applied.checked_add(1).ok_or_else(|| {
+            KinDbError::StorageError(format!(
+                "repo {repo_id} acknowledged delta count overflows usize"
+            ))
+        })?;
         recovered_generation = generation;
         if generation < authority.head_generation {
             expected_generation =
@@ -1538,6 +1676,13 @@ fn load_recovered_snapshot_inner<B: StorageBackend + ?Sized>(
         )));
     }
 
+    let payload_stats = AuthorityPayloadStats::from_recovery(
+        authority.snapshot_generation,
+        authority.head_generation,
+        snapshot_payload_bytes,
+        applied,
+        acknowledged_delta_bytes,
+    )?;
     Ok(Some(RecoveredRepositoryAuthority {
         recovered: RecoveredSnapshot {
             snapshot,
@@ -1550,6 +1695,7 @@ fn load_recovered_snapshot_inner<B: StorageBackend + ?Sized>(
             history_validation: None,
         },
         reused_complete_validation: false,
+        payload_stats,
     }))
 }
 
@@ -6386,6 +6532,176 @@ mod tests {
         );
     }
 
+    struct RecoveryFixtureBackend {
+        snapshot_bytes: Vec<u8>,
+        snapshot_generation: Generation,
+        head_generation: Generation,
+        deltas: Vec<PersistedDelta>,
+    }
+
+    impl StorageBackend for RecoveryFixtureBackend {
+        fn load_recovery_state(&self, _repo_id: &str) -> Result<SnapshotRecoveryState, KinDbError> {
+            Ok((
+                Some(SnapshotAuthority {
+                    snapshot_bytes: self.snapshot_bytes.clone(),
+                    snapshot_generation: self.snapshot_generation,
+                    head_generation: self.head_generation,
+                    history_validation: None,
+                }),
+                self.deltas.clone(),
+            ))
+        }
+
+        fn load_snapshot(
+            &self,
+            _repo_id: &str,
+        ) -> Result<Option<(Vec<u8>, Generation)>, KinDbError> {
+            unreachable!("the coherent recovery fixture overrides load_recovery_state")
+        }
+
+        fn save_snapshot(
+            &self,
+            _repo_id: &str,
+            _data: &[u8],
+            _expected_gen: Generation,
+        ) -> Result<Generation, KinDbError> {
+            unreachable!("the coherent recovery fixture is read-only")
+        }
+
+        fn save_delta(
+            &self,
+            _repo_id: &str,
+            _delta_data: &[u8],
+            _base_gen: Generation,
+        ) -> Result<Generation, KinDbError> {
+            unreachable!("the coherent recovery fixture is read-only")
+        }
+
+        fn load_deltas_since(
+            &self,
+            _repo_id: &str,
+            _since_gen: Generation,
+        ) -> Result<Vec<(Vec<u8>, Generation)>, KinDbError> {
+            unreachable!("the coherent recovery fixture overrides load_recovery_state")
+        }
+
+        fn clear_deltas(&self, _repo_id: &str) -> Result<(), KinDbError> {
+            unreachable!("the coherent recovery fixture is read-only")
+        }
+
+        fn save_overlay(
+            &self,
+            _repo_id: &str,
+            _session_id: &str,
+            _data: &[u8],
+        ) -> Result<(), KinDbError> {
+            unreachable!("the coherent recovery fixture is read-only")
+        }
+
+        fn load_overlay(
+            &self,
+            _repo_id: &str,
+            _session_id: &str,
+        ) -> Result<Option<Vec<u8>>, KinDbError> {
+            unreachable!("the coherent recovery fixture is read-only")
+        }
+
+        fn delete_overlay(&self, _repo_id: &str, _session_id: &str) -> Result<(), KinDbError> {
+            unreachable!("the coherent recovery fixture is read-only")
+        }
+
+        fn list_repos(&self) -> Result<Vec<String>, KinDbError> {
+            unreachable!("the coherent recovery fixture is read-only")
+        }
+    }
+
+    fn recovered_payload_stats<B: StorageBackend + ?Sized>(
+        backend: &B,
+        repo_id: &str,
+    ) -> Result<AuthorityPayloadStats, KinDbError> {
+        load_recovered_repository_authority(backend, repo_id, 0)?
+            .map(|recovered| recovered.payload_stats)
+            .ok_or_else(|| {
+                KinDbError::StorageError(format!(
+                    "repo {repo_id} has no persisted authority payload"
+                ))
+            })
+    }
+
+    #[test]
+    fn authority_payload_stats_constructor_checks_generation_count_and_overflow() {
+        let inverted = AuthorityPayloadStats::from_components(3, 2, 1, 0, 0)
+            .expect_err("an inverted authority range must not produce a receipt");
+        assert!(inverted
+            .to_string()
+            .contains("snapshot generation 3 exceeds head generation 2"));
+
+        let wrong_count = AuthorityPayloadStats::from_components(1, 3, 1, 1, 1)
+            .expect_err("the receipt count must name every contiguous generation");
+        assert!(wrong_count
+            .to_string()
+            .contains("counted 1 acknowledged deltas, expected 2"));
+
+        let overflow = AuthorityPayloadStats::from_components(1, 1, u64::MAX, 0, 1)
+            .expect_err("the checked total must refuse u64 overflow");
+        assert!(overflow
+            .to_string()
+            .contains("authority payload byte count overflows u64"));
+    }
+
+    #[test]
+    fn malformed_acknowledged_chains_return_no_payload_receipt() {
+        let snapshot_bytes = GraphSnapshot::empty().to_bytes().unwrap();
+        let valid = crate::storage::delta::GraphSnapshotDelta::empty(1)
+            .to_bytes()
+            .unwrap();
+        let wrong_base = crate::storage::delta::GraphSnapshotDelta::empty(0)
+            .to_bytes()
+            .unwrap();
+
+        let fixtures = [
+            (
+                "wrong-base",
+                RecoveryFixtureBackend {
+                    snapshot_bytes: snapshot_bytes.clone(),
+                    snapshot_generation: 1,
+                    head_generation: 2,
+                    deltas: vec![(wrong_base, 2)],
+                },
+                "declares base 0, expected 1",
+            ),
+            (
+                "duplicate",
+                RecoveryFixtureBackend {
+                    snapshot_bytes: snapshot_bytes.clone(),
+                    snapshot_generation: 1,
+                    head_generation: 3,
+                    deltas: vec![(valid.clone(), 2), (valid.clone(), 2)],
+                },
+                "delta journal is not strictly ordered",
+            ),
+            (
+                "corrupt",
+                RecoveryFixtureBackend {
+                    snapshot_bytes,
+                    snapshot_generation: 1,
+                    head_generation: 2,
+                    deltas: vec![(vec![0xff, 0x00, 0xff], 2)],
+                },
+                "delta",
+            ),
+        ];
+
+        for (name, backend, expected) in fixtures {
+            let error = recovered_payload_stats(&backend, name)
+                .expect_err("malformed acknowledged bytes must not produce any receipt");
+            assert!(
+                error.to_string().to_lowercase().contains(expected),
+                "unexpected {name} recovery error: {error}"
+            );
+        }
+    }
+
     struct UnboundedOnlyBackend;
 
     impl StorageBackend for UnboundedOnlyBackend {
@@ -8582,16 +8898,39 @@ mod tests {
     }
 
     #[test]
+    fn local_base_authority_reports_only_exact_selected_snapshot_bytes() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+        let repo_id = "base-payload-receipt";
+        let mut snapshot = GraphSnapshot::empty();
+        snapshot
+            .admit_artifact_for_test("base.rs".to_string(), crate::types::regular_tree_entry(1));
+        let snapshot_bytes = snapshot.to_bytes().unwrap();
+        let generation = backend
+            .save_snapshot(repo_id, &snapshot_bytes, GENERATION_INIT)
+            .unwrap();
+
+        let stats = recovered_payload_stats(&backend, repo_id).unwrap();
+        assert_eq!(stats.snapshot_generation(), generation);
+        assert_eq!(stats.head_generation(), generation);
+        assert_eq!(stats.snapshot_bytes(), snapshot_bytes.len() as u64);
+        assert_eq!(stats.acknowledged_delta_count(), 0);
+        assert_eq!(stats.acknowledged_delta_bytes(), 0);
+        assert_eq!(stats.total_payload_bytes(), snapshot_bytes.len() as u64);
+    }
+
+    #[test]
     fn local_backend_recovery_replays_sequential_deltas_after_reopen() {
         let dir = TempDir::new().unwrap();
         let repo_id = "restart-repo";
         let mut base = GraphSnapshot::empty();
         base.admit_artifact_for_test("base.rs".to_string(), crate::types::regular_tree_entry(1));
+        let base_bytes = base.to_bytes().unwrap();
 
-        {
+        let (first_delta_bytes, second_delta_bytes) = {
             let backend = LocalFileBackend::new(dir.path());
             let gen1 = backend
-                .save_snapshot(repo_id, &base.to_bytes().unwrap(), GENERATION_INIT)
+                .save_snapshot(repo_id, &base_bytes, GENERATION_INIT)
                 .unwrap();
 
             let mut after_first = base.clone();
@@ -8600,8 +8939,9 @@ mod tests {
                 crate::types::regular_tree_entry(2),
             );
             let first_delta = crate::storage::delta::compute_graph_delta(&base, &after_first, gen1);
+            let first_delta_bytes = first_delta.to_bytes().unwrap();
             let gen2 = backend
-                .save_delta(repo_id, &first_delta.to_bytes().unwrap(), gen1)
+                .save_delta(repo_id, &first_delta_bytes, gen1)
                 .unwrap();
 
             let mut after_second = after_first.clone();
@@ -8611,16 +8951,20 @@ mod tests {
             );
             let second_delta =
                 crate::storage::delta::compute_graph_delta(&after_first, &after_second, gen2);
+            let second_delta_bytes = second_delta.to_bytes().unwrap();
             let gen3 = backend
-                .save_delta(repo_id, &second_delta.to_bytes().unwrap(), gen2)
+                .save_delta(repo_id, &second_delta_bytes, gen2)
                 .unwrap();
             assert_eq!(gen3, 3);
-        }
+            (first_delta_bytes, second_delta_bytes)
+        };
 
         let reopened = LocalFileBackend::new(dir.path());
-        let recovered = load_recovered_snapshot(&reopened, repo_id)
+        let recovered_authority = load_recovered_repository_authority(&reopened, repo_id, 0)
             .unwrap()
             .expect("base snapshot exists");
+        let stats = recovered_authority.payload_stats;
+        let recovered = recovered_authority.recovered;
         assert_eq!(recovered.generation, 3);
         assert_eq!(recovered.deltas_seen, 2);
         assert_eq!(recovered.deltas_applied, 2);
@@ -8628,6 +8972,44 @@ mod tests {
         assert!(recovered.snapshot.has_artifact_path_for_test("base.rs"));
         assert!(recovered.snapshot.has_artifact_path_for_test("first.rs"));
         assert!(recovered.snapshot.has_artifact_path_for_test("second.rs"));
+        let acknowledged_delta_bytes = (first_delta_bytes.len() + second_delta_bytes.len()) as u64;
+        assert_eq!(stats.snapshot_generation(), 1);
+        assert_eq!(stats.head_generation(), 3);
+        assert_eq!(stats.snapshot_bytes(), base_bytes.len() as u64);
+        assert_eq!(stats.acknowledged_delta_count(), 2);
+        assert_eq!(stats.acknowledged_delta_bytes(), acknowledged_delta_bytes);
+        assert_eq!(
+            stats.total_payload_bytes(),
+            base_bytes.len() as u64 + acknowledged_delta_bytes
+        );
+    }
+
+    #[test]
+    fn staged_delta_above_head_is_seen_but_not_counted() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+        let repo_id = "staged-payload-receipt";
+        let snapshot_bytes = GraphSnapshot::empty().to_bytes().unwrap();
+        let head = backend
+            .save_snapshot(repo_id, &snapshot_bytes, GENERATION_INIT)
+            .unwrap();
+        let staged = crate::storage::delta::GraphSnapshotDelta::empty(head)
+            .to_bytes()
+            .unwrap();
+        LocalFileBackend::atomic_write(&backend.delta_path(repo_id, head + 1), &staged).unwrap();
+
+        let recovered = load_recovered_repository_authority(&backend, repo_id, 0)
+            .unwrap()
+            .expect("the base authority remains recoverable");
+        assert_eq!(recovered.recovered.deltas_seen, 1);
+        assert_eq!(recovered.recovered.deltas_applied, 0);
+        let stats = recovered.payload_stats;
+        assert_eq!(stats.snapshot_generation(), head);
+        assert_eq!(stats.head_generation(), head);
+        assert_eq!(stats.snapshot_bytes(), snapshot_bytes.len() as u64);
+        assert_eq!(stats.acknowledged_delta_count(), 0);
+        assert_eq!(stats.acknowledged_delta_bytes(), 0);
+        assert_eq!(stats.total_payload_bytes(), snapshot_bytes.len() as u64);
     }
 
     #[test]
@@ -8764,8 +9146,8 @@ mod tests {
             &replacement.to_bytes().unwrap(),
         )
         .unwrap();
-        let error = load_recovered_snapshot(&backend, repo_id)
-            .expect_err("authority must bind the exact acknowledged delta bytes");
+        let error = recovered_payload_stats(&backend, repo_id)
+            .expect_err("replaced acknowledged bytes must return no payload receipt");
         assert!(error
             .to_string()
             .contains("acknowledged delta digest mismatch"));
@@ -8860,24 +9242,51 @@ mod tests {
             crate::types::regular_tree_entry(7),
         );
         let delta = crate::storage::delta::compute_graph_delta(&base, &current, gen1);
-        let gen2 = backend
-            .save_delta(repo_id, &delta.to_bytes().unwrap(), gen1)
-            .unwrap();
+        let delta_bytes = delta.to_bytes().unwrap();
+        let gen2 = backend.save_delta(repo_id, &delta_bytes, gen1).unwrap();
 
         // Model a crash after full snapshot promotion but before clear_deltas.
+        let current_bytes = current.to_bytes().unwrap();
         let gen3 = backend
-            .save_snapshot(repo_id, &current.to_bytes().unwrap(), gen2)
+            .save_snapshot(repo_id, &current_bytes, gen2)
             .unwrap();
         assert_eq!(gen3, 3);
+        assert!(
+            backend.delta_path(repo_id, gen2).exists(),
+            "the retired acknowledged delta remains visible until cleanup"
+        );
+        let selected_snapshot = backend.versioned_snapshot_path(repo_id, gen3);
+        std::fs::copy(
+            &selected_snapshot,
+            backend.versioned_snapshot_path(repo_id, gen1),
+        )
+        .unwrap();
+        std::fs::copy(
+            &selected_snapshot,
+            backend.versioned_snapshot_path(repo_id, gen3 + 1),
+        )
+        .unwrap();
 
-        let recovered = load_recovered_snapshot(&backend, repo_id)
+        let recovered_authority = load_recovered_repository_authority(&backend, repo_id, 0)
             .unwrap()
             .expect("promoted snapshot exists");
+        let stats = recovered_authority.payload_stats;
+        let recovered = recovered_authority.recovered;
         assert_eq!(recovered.generation, gen3);
         assert_eq!(recovered.deltas_seen, 0);
         assert_eq!(recovered.deltas_applied, 0);
         assert_eq!(recovered.snapshot.resolved_tree.len(), 1);
         assert!(recovered.snapshot.has_artifact_path_for_test("current.rs"));
+        assert_eq!(stats.snapshot_generation(), gen3);
+        assert_eq!(stats.head_generation(), gen3);
+        assert_eq!(stats.snapshot_bytes(), current_bytes.len() as u64);
+        assert_eq!(stats.acknowledged_delta_count(), 0);
+        assert_eq!(stats.acknowledged_delta_bytes(), 0);
+        assert_eq!(stats.total_payload_bytes(), current_bytes.len() as u64);
+        assert!(
+            backend.versioned_snapshot_path(repo_id, gen3 + 1).exists(),
+            "a newer staged snapshot may remain visible but is not selected or counted"
+        );
     }
 
     #[test]
@@ -9227,8 +9636,8 @@ mod tests {
     fn local_recovery_rejects_missing_delta_prefix() {
         let (_dir, backend, repo_id) = local_backend_with_two_deltas();
         std::fs::remove_file(backend.delta_path(repo_id, 2)).unwrap();
-        let error = load_recovered_snapshot(&backend, repo_id)
-            .expect_err("missing first delta must fail closed");
+        let error = recovered_payload_stats(&backend, repo_id)
+            .expect_err("a missing first delta must return no payload receipt");
         assert!(error.to_string().contains("expected generation 2, found 3"));
     }
 
@@ -9236,8 +9645,8 @@ mod tests {
     fn local_recovery_rejects_missing_delta_head() {
         let (_dir, backend, repo_id) = local_backend_with_two_deltas();
         std::fs::remove_file(backend.delta_path(repo_id, 3)).unwrap();
-        let error = load_recovered_snapshot(&backend, repo_id)
-            .expect_err("missing acknowledged head must fail closed");
+        let error = recovered_payload_stats(&backend, repo_id)
+            .expect_err("a missing acknowledged head must return no payload receipt");
         assert!(error
             .to_string()
             .contains("delta chain ended at generation 2, acknowledged head is 3"));

@@ -36,10 +36,11 @@ pub use storage::{
     VerificationReport, REPO_TRUTH_HASH_VERSION, ZERO_HASH,
 };
 pub use storage::{
-    load_recovered_snapshot, Generation, LocalFileBackend, LocalNamespaceIdentityFault,
-    LocalNamespaceProbe, PersistedDelta, RecoveredSnapshot, SnapshotAuthority, SnapshotCursor,
-    SnapshotRecoveryState, SnapshotSaveOutcome, SourceBlobValidationRequest, StorageBackend,
-    VerifiedSourceBlob, VerifiedSourceBlobBatch, GENERATION_INIT, MAX_SOURCE_BLOB_BYTES,
+    load_recovered_snapshot, AuthorityPayloadStats, Generation, LocalFileBackend,
+    LocalNamespaceIdentityFault, LocalNamespaceProbe, PersistedDelta, RecoveredSnapshot,
+    SnapshotAuthority, SnapshotCursor, SnapshotRecoveryState, SnapshotSaveOutcome,
+    SourceBlobValidationRequest, StorageBackend, VerifiedSourceBlob, VerifiedSourceBlobBatch,
+    GENERATION_INIT, MAX_SOURCE_BLOB_BYTES,
 };
 pub use storage::{
     AuthorityCommitDecision, AuthorityPublication, AuthorityReadLease, DurableAuthorityPersistence,

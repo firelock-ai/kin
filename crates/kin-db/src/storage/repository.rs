@@ -44,9 +44,9 @@ use crate::storage::authority::{
 };
 use crate::storage::backend::{
     load_recovered_repository_authority, validate_source_blob_size, verify_source_blob_digest,
-    Generation, LocalAuthorityFreezeLock, LocalFileBackend, RecoveredSnapshot, SnapshotCursor,
-    SnapshotSaveOutcome, SourceBlobValidationRequest, StorageBackend, VerifiedSourceBlobBatch,
-    MAX_SOURCE_BLOB_BYTES,
+    AuthorityPayloadStats, Generation, LocalAuthorityFreezeLock, LocalFileBackend,
+    RecoveredSnapshot, SnapshotCursor, SnapshotSaveOutcome, SourceBlobValidationRequest,
+    StorageBackend, VerifiedSourceBlobBatch, MAX_SOURCE_BLOB_BYTES,
 };
 use crate::storage::format::GraphSnapshot;
 
@@ -786,12 +786,26 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
     /// only for a reopen that carries a durable validation record naming the
     /// exact bytes being opened; see [`verified_history_validation`].
     pub fn open(repository_id: RepositoryId, backend: Arc<B>) -> Result<Self, KinDbError> {
+        Self::open_with_payload_stats(repository_id, backend).map(|(manager, _receipt)| manager)
+    }
+
+    /// Open authority and return the immutable payload receipt from that open.
+    ///
+    /// `Some` describes the exact persisted snapshot and acknowledged deltas
+    /// selected by the same coherent recovery that built the manager. `None`
+    /// means no persisted snapshot existed and generation zero was constructed
+    /// only in memory. The receipt does not update after later commits.
+    pub fn open_with_payload_stats(
+        repository_id: RepositoryId,
+        backend: Arc<B>,
+    ) -> Result<(Self, Option<AuthorityPayloadStats>), KinDbError> {
         let started = std::time::Instant::now();
         let recovered = load_recovered_repository_authority(
             backend.as_ref(),
             repository_id.as_str(),
             HISTORY_VALIDATION_VERSION,
         )?;
+        let payload_stats = recovered.as_ref().map(|recovered| recovered.payload_stats);
         let recovered_authority = recovered.is_some();
         let recovered_at = started.elapsed();
         let reopen_proof = recovered
@@ -908,7 +922,7 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
         } else if let Some(digest) = loaded_digest {
             manager.bind_history_validation(backend_cursor, &digest);
         }
-        Ok(manager)
+        Ok((manager, payload_stats))
     }
 
     /// Whether this open trusted a durable history validation instead of
@@ -5082,6 +5096,47 @@ mod tests {
 
     fn initial_manager(backend: Arc<MemoryBackend>) -> RepositoryAuthorityManager<MemoryBackend> {
         RepositoryAuthorityManager::open(repository_id(), backend).unwrap()
+    }
+
+    #[test]
+    fn open_payload_receipt_is_none_for_memory_only_state_and_exact_after_persistence() {
+        let backend = Arc::new(MemoryBackend::default());
+        let (manager, initial_receipt) = RepositoryAuthorityManager::open_with_payload_stats(
+            repository_id(),
+            Arc::clone(&backend),
+        )
+        .unwrap();
+        assert!(
+            initial_receipt.is_none(),
+            "generation zero constructed only in memory has no serialized authority payload"
+        );
+
+        manager
+            .commit_repository_transaction(arbitrary_repository_transaction(&manager))
+            .unwrap();
+        drop(manager);
+        let (persisted_bytes, generation) = backend
+            .snapshot
+            .lock()
+            .clone()
+            .expect("the transaction persisted one exact snapshot");
+
+        let (reopened, receipt) = RepositoryAuthorityManager::open_with_payload_stats(
+            repository_id(),
+            Arc::clone(&backend),
+        )
+        .unwrap();
+        let receipt = receipt.expect("persisted recovery returns an immutable open receipt");
+        assert_eq!(receipt.snapshot_generation(), generation);
+        assert_eq!(receipt.head_generation(), generation);
+        assert_eq!(receipt.snapshot_bytes(), persisted_bytes.len() as u64);
+        assert_eq!(receipt.acknowledged_delta_count(), 0);
+        assert_eq!(receipt.acknowledged_delta_bytes(), 0);
+        assert_eq!(receipt.total_payload_bytes(), persisted_bytes.len() as u64);
+        assert_eq!(reopened.read_authority().generation(), 1);
+
+        let _source_compatible =
+            RepositoryAuthorityManager::open(repository_id(), backend).unwrap();
     }
 
     fn transaction_shell<B: StorageBackend + ?Sized + 'static>(
