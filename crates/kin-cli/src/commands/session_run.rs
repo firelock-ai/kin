@@ -285,7 +285,7 @@ pub(crate) fn discard(session_dir: &Path) -> Result<()> {
 /// Discover the repository layout for a session surface.
 pub fn discover_layout() -> Result<kin_core::KinLayout> {
     let cwd = std::env::current_dir().context("resolve current directory")?;
-    kin_core::KinLayout::discover(&cwd).ok_or_else(|| anyhow!("not inside a Kin repository"))
+    crate::commands::require_repository_layout_at(&cwd)
 }
 
 /// How `kin exec` interprets its trailing arguments.

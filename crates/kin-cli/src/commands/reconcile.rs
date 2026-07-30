@@ -204,8 +204,7 @@ impl SessionReconcileObservation {
 
 pub async fn run(session_id: Option<String>, confirm_mass_deletion: bool) -> Result<()> {
     let cwd = std::env::current_dir().context("resolve current directory")?;
-    let layout = kin_core::KinLayout::discover(&cwd)
-        .ok_or_else(|| anyhow!("not inside a Kin repository"))?;
+    let layout = crate::commands::require_repository_layout_at(&cwd)?;
     run_for_layout(&layout, session_id.as_deref(), confirm_mass_deletion).await
 }
 

@@ -285,9 +285,8 @@ async fn bind_daemon_for_repo_dir(dir: &Path) -> std::result::Result<String, Str
             return Ok(url);
         }
     }
-    let layout = kin_core::KinLayout::discover(dir).ok_or_else(|| {
-        "not inside a kin repository (no .kin/ found); run `kin init .` first".to_string()
-    })?;
+    let layout = crate::commands::require_repository_layout_at(dir)
+        .map_err(|refusal| format!("{refusal:#}"))?;
     let url = crate::daemon_client::resolve_daemon_url_for_mcp(&layout)
         .await
         .map_err(|e| format!("{e:#}"))?
@@ -405,8 +404,12 @@ mod tests {
             .await
             .expect_err("a directory with no .kin/ must not resolve a daemon");
         assert!(
-            reason.contains("not inside a kin repository"),
+            reason.contains("not a Kin repository"),
             "unexpected reason: {reason}"
+        );
+        assert!(
+            reason.contains("kin init"),
+            "the reason must name the remedy: {reason}"
         );
     }
 
