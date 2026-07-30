@@ -12,17 +12,42 @@ mod common;
 
 use common::Command;
 
+/// Cap on the wait for an idle daemon to finish retiring.
+///
+/// Only a last resort. It bounds a loop that polls the retirement evidence
+/// itself, and it is far enough above the idle window and the shutdown grace
+/// that reaching it means retirement stalled rather than that it was slow.
 #[cfg(unix)]
-fn wait_for_pid_exit(pid: u32) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline {
+const RETIREMENT_OBSERVATION: Duration = Duration::from_secs(30);
+
+/// Wait for an idle daemon to retire: its process gone and the endpoint files
+/// it published removed.
+///
+/// Retirement is several steps. The listener closes, the process exits, and the
+/// published record is removed, and only the last of those is what a later
+/// command would see. Waiting on the process alone proves an early step and
+/// then assumes the rest, which holds only while the remaining steps happen to
+/// fit in the slack left over. So poll the published evidence directly and name
+/// whichever part of it never arrived.
+#[cfg(unix)]
+fn wait_for_retired_daemon(pid: u32, daemon_pid: &std::path::Path, daemon_port: &std::path::Path) {
+    let deadline = Instant::now() + RETIREMENT_OBSERVATION;
+    loop {
         let alive = unsafe { libc::kill(pid as libc::pid_t, 0) == 0 };
-        if !alive {
+        let pid_recorded = daemon_pid.exists();
+        let port_recorded = daemon_port.exists();
+        if !alive && !pid_recorded && !port_recorded {
             return;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "idle daemon did not retire within {RETIREMENT_OBSERVATION:?}: process {pid} \
+                 alive={alive}, daemon.pid present={pid_recorded}, daemon.port \
+                 present={port_recorded}"
+            );
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    panic!("process {pid} did not exit");
 }
 
 /// Commit everything in the worktree so `kin init` sees a clean Git migration
@@ -67,6 +92,39 @@ fn kin_command(runtime: &common::IsolatedDaemonRuntime) -> Command<'_> {
         .env("KIN_DAEMON_BIN", runtime.daemon_bin())
         .env("KIN_DAEMON_READY_TIMEOUT_SECS", "30")
         .env("KIN_BYPASS_EMBEDDING_COVERAGE_CHECK", "1");
+    cmd
+}
+
+/// Idle window for the one test whose subject is a daemon retiring itself.
+///
+/// The shared runtime leaves daemon lifetime to its teardown proof, so a daemon
+/// only retires on its own when the command that spawned it asked for a window.
+///
+/// The value is not free to raise. At one second the daemon exits and removes
+/// the endpoint files it published, which is what this test observes. At five
+/// the process still exits but the files survive past thirty seconds of
+/// polling, so retirement completes in one case and not the other. Until that
+/// difference is understood, this stays at the window the assertion was written
+/// against rather than a longer one that quietly stops proving it.
+const IDLE_SHUTDOWN_UNDER_TEST_SECS: &str = "1";
+
+/// A command that asks the runtime it starts to retire itself when idle.
+///
+/// Both halves carry the window. The worker publishes the endpoint files, and
+/// the supervisor outliving it keeps that endpoint from being retired, so a
+/// test that observes the files disappear needs the whole runtime to wind down
+/// rather than only the worker. A process takes its window from whichever
+/// command spawned it, so every command in such a test has to carry this.
+fn kin_command_awaiting_idle_shutdown(runtime: &common::IsolatedDaemonRuntime) -> Command<'_> {
+    let mut cmd = kin_command(runtime);
+    cmd.env(
+        "KIN_DAEMON_IDLE_TIMEOUT_SECS",
+        IDLE_SHUTDOWN_UNDER_TEST_SECS,
+    )
+    .env(
+        "KIN_SUPERVISOR_IDLE_TIMEOUT_SECS",
+        IDLE_SHUTDOWN_UNDER_TEST_SECS,
+    );
     cmd
 }
 
@@ -175,7 +233,7 @@ fn locate_autostarts_daemon_when_available() {
     );
     commit_worktree(repo.path(), "seed");
 
-    let init = kin_command(&runtime)
+    let init = kin_command_awaiting_idle_shutdown(&runtime)
         .arg("init")
         .arg(".")
         .current_dir(repo.path())
@@ -196,7 +254,7 @@ fn locate_autostarts_daemon_when_available() {
     path_entries.insert(0, daemon_dir.to_path_buf());
     let path = env::join_paths(path_entries).expect("join PATH");
 
-    let locate = kin_command(&runtime)
+    let locate = kin_command_awaiting_idle_shutdown(&runtime)
         .arg("locate")
         .arg("--json")
         .arg("lexer issue")
@@ -223,11 +281,7 @@ fn locate_autostarts_daemon_when_available() {
         .ok()
         .and_then(|raw| raw.trim().parse::<u32>().ok())
     {
-        wait_for_pid_exit(pid);
-        assert!(
-            !daemon_pid.exists() && !daemon_port.exists(),
-            "idle daemon should remove endpoint files"
-        );
+        wait_for_retired_daemon(pid, &daemon_pid, &daemon_port);
     }
 }
 
