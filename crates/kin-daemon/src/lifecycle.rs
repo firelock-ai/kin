@@ -1338,15 +1338,39 @@ struct LaunchctlContainment {
     guardian: Option<kin_daemon_spawn::ProcessGroupGuardian>,
 }
 
+/// Resolve the guardian entrypoint for a real Kin product process.
+///
+/// Product binaries dispatch the private guardian mode before normal argument
+/// parsing. Keeping this branch on `product` is load-bearing: `exact_test`
+/// appends libtest-only arguments and is reserved for the unit-test binary
+/// below.
+#[cfg(all(target_os = "macos", not(test)))]
+fn launchctl_guardian_launcher() -> std::io::Result<kin_daemon_spawn::ProcessGroupGuardianLauncher>
+{
+    let executable = std::env::current_exe()
+        .map_err(|error| lifecycle_io(error, "resolve launchctl guardian executable"))?;
+    Ok(kin_daemon_spawn::ProcessGroupGuardianLauncher::product(
+        executable,
+    ))
+}
+
+/// Route a re-executed Rust unit-test binary to one exact guardian worker.
+#[cfg(all(target_os = "macos", test))]
+fn launchctl_guardian_launcher() -> std::io::Result<kin_daemon_spawn::ProcessGroupGuardianLauncher>
+{
+    let executable = std::env::current_exe()
+        .map_err(|error| lifecycle_io(error, "resolve launchctl guardian test executable"))?;
+    Ok(kin_daemon_spawn::ProcessGroupGuardianLauncher::exact_test(
+        executable,
+        "kin_process_group_guardian_worker",
+    ))
+}
+
 #[cfg(target_os = "macos")]
 impl LaunchctlContainment {
     fn spawn(command: Command, deadline: Instant) -> std::io::Result<(Child, Self)> {
         let readiness = LaunchctlCapture::create("guardian-ready")?;
-        let launcher = kin_daemon_spawn::ProcessGroupGuardianLauncher::exact_test(
-            std::env::current_exe()
-                .map_err(|error| lifecycle_io(error, "resolve launchctl guardian executable"))?,
-            "kin_process_group_guardian_worker",
-        );
+        let launcher = launchctl_guardian_launcher()?;
         let mut guardian = launcher
             .spawn_with(&readiness.path, deadline, |guardian_environment| {
                 // Preserve the launchctl caller's authority boundary. The
@@ -2434,10 +2458,11 @@ fn install_replacement_after_legacy_preflight<Replacement>(
     }
 }
 
-/// Register a launchd Launch Agent so the daemon starts on login.
+/// Opt in to a launchd Launch Agent so the daemon starts on login.
 ///
-/// Called by `kin init` after initializing a repo. Creates a per-repo
-/// plist in ~/Library/LaunchAgents/ and loads it immediately.
+/// The current CLI does not call this during `kin init`; a caller must choose
+/// this persistent host integration explicitly. The function creates a
+/// per-repo plist in ~/Library/LaunchAgents/ and loads it immediately.
 ///
 /// Each repo gets its own agent with a canonical-root digest label:
 ///   ai.firelock.kin-daemon.<digest>.<readable-suffix>
@@ -2562,9 +2587,10 @@ pub fn register_launch_agent(kin_root: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Unregister the Launch Agent for a repo.
+/// Unregister an explicitly installed Launch Agent for a repo.
 ///
-/// Called by `kin eject` before removing `.kin/`.
+/// The current CLI does not call this during `kin eject`; the caller that opted
+/// into registration also owns invoking this cleanup before removing `.kin/`.
 #[cfg(target_os = "macos")]
 pub fn unregister_launch_agent(kin_root: &Path) {
     let working_dir = match kin_root.parent() {

@@ -4,16 +4,15 @@
 <!--
   launchd plist template for kin-daemon (per-repo).
 
-  This is a TEMPLATE. `kin init` generates a repo-specific plist with
-  the correct --repo path and --port. See lifecycle.rs for the code.
+  This is a TEMPLATE for explicit, per-repository host integration. The Kin
+  CLI does not install or remove it during `kin init` or `kin eject`.
+
+  Before installing, replace REPO_ID, DAEMON_BIN, REPO_PATH, and PORT with
+  repository-specific values. DAEMON_BIN and REPO_PATH must be absolute.
 
   Manual install (single repo):
     cp ai.firelock.kin-daemon.plist ~/Library/LaunchAgents/
     launchctl load ~/Library/LaunchAgents/ai.firelock.kin-daemon.plist
-
-  Automatic install:
-    `kin init .` registers the daemon with launchd automatically.
-    `kin eject` removes it.
 -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
