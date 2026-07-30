@@ -3940,8 +3940,17 @@ async fn locate(
     // Resolve the bounded-snippet projection for this request. Off by default
     // (CLI human path, legacy clients); the agent JSON surface sets it so each
     // located definition symbol carries inline code from graph-owned content.
+    //
+    // The middle case is the one that was missing: a structured caller that
+    // declined bodies still wants the graph-native `entities[]` ranking. Falling
+    // through to the default options switched the whole projection off, so
+    // `kin locate --json --no-snippets` answered a request to spend fewer tokens
+    // by returning no results -- the same defect `include_snippet: false` had on
+    // the `semantic_locate` arm.
     let snippet_opts = if req.snippets {
         kin_cli::commands::locate::SnippetOptions::enabled(req.snippet_lines)
+    } else if req.entity_surface {
+        kin_cli::commands::locate::SnippetOptions::enabled(req.snippet_lines).without_bodies()
     } else {
         kin_cli::commands::locate::SnippetOptions::default()
     };
@@ -3955,7 +3964,10 @@ async fn locate(
         .unwrap_or_else(kin_cli::commands::locate::entity_page_size);
 
     // Paging fast path: a valid cursor whose ranking is still cached at the
-    // current graph version is windowed straight from cache — NO retrieval.
+    // current graph version AND in this request's body mode is windowed straight
+    // from cache, with NO retrieval. The mode is checked and not merely keyed:
+    // the cursor token carries the key, so a caller can present the other mode's
+    // key and would otherwise be served that mode's ranking.
     if let Some(cursor_token) = req.cursor.as_deref() {
         if let Some(parsed) = kin_cli::commands::locate::LocateCursor::decode(cursor_token) {
             let cached = {
@@ -3963,6 +3975,7 @@ async fn locate(
                 cache
                     .get(&parsed.key)
                     .filter(|entry| entry.graph_version == graph_version)
+                    .filter(|entry| entry.mode == snippet_opts.projection_mode())
                     .map(|entry| entry.entities.clone())
             };
             if let Some(entities) = cached {
@@ -4084,9 +4097,10 @@ async fn locate(
 
     // Cache the full entity ranking and window page 0 so a follow-up `--next`
     // pages it from cache without re-running retrieval. Keyed by
-    // (query, ref/scope, graph-version) so any edit invalidates the page. A
-    // multi-query ranking keys off the joined variants so it cannot collide with
-    // any single-variant cursor.
+    // (query, ref/scope, graph-version, body-mode) so any edit invalidates the
+    // page and a caller paging in one body mode never receives a ranking built in
+    // the other. A multi-query ranking keys off the joined variants so it cannot
+    // collide with any single-variant cursor.
     let key_text = if multi_query {
         multiquery_cursor_text(&variants)
     } else {
@@ -4096,8 +4110,21 @@ async fn locate(
         &key_text,
         scope_token.as_deref(),
         graph_version,
+        snippet_opts.projection_mode(),
     );
-    cache_locate_ranking(&state, &key, &result.entities, graph_version);
+    // Only a request that actually projected `entities[]` has a ranking worth
+    // holding. The no-projection path leaves it empty, issues no cursor, and never
+    // reads this cache, so writing to it can only do harm: it would publish an
+    // empty ranking under a key another mode's live cursor might present.
+    if snippet_opts.enabled {
+        cache_locate_ranking(
+            &state,
+            &key,
+            &result.entities,
+            graph_version,
+            snippet_opts.projection_mode(),
+        );
+    }
     kin_cli::commands::locate::apply_entity_page(&mut result, &key, 0, page_size);
     Ok(Json(result))
 }
@@ -4382,6 +4409,7 @@ fn cache_locate_ranking(
     key: &str,
     entities: &[kin_cli::commands::locate::LocateEntity],
     graph_version: u64,
+    mode: &'static str,
 ) {
     let mut cache = state.locate_rankings.lock().unwrap();
     if cache.len() >= LOCATE_RANKING_CACHE_CAP && !cache.contains_key(key) {
@@ -4398,6 +4426,7 @@ fn cache_locate_ranking(
         CachedLocateRanking {
             entities: entities.to_vec(),
             graph_version,
+            mode,
             created: std::time::Instant::now(),
         },
     );
@@ -5570,6 +5599,13 @@ fn build_semantic_locate_result(
                 cache
                     .get(&parsed.key)
                     .filter(|entry| entry.graph_version == graph_version)
+                    // Cached rows already carry (or omit) `snippet`, and the
+                    // cursor supplies the key, so a mode mismatch has to miss the
+                    // cache and re-search rather than replay the other mode.
+                    .filter(|entry| {
+                        entry.mode
+                            == kin_cli::commands::locate::projection_mode(true, include_snippet)
+                    })
                     .map(|entry| entry.rows.clone())
             };
             if let Some(rows) = cached {
@@ -5747,8 +5783,9 @@ fn build_semantic_locate_result(
             "match_evidence": match_evidence,
         });
         if let Some(span) = span {
-            hit["start_line"] = json!(span.start_line);
-            hit["end_line"] = json!(span.end_line);
+            let (start_line, end_line) = kin_mcp::handlers::common::presentation_span_lines(span);
+            hit["start_line"] = json!(start_line);
+            hit["end_line"] = json!(end_line);
         }
         if let Some(snippet) = snippet {
             hit["snippet"] = json!(snippet);
@@ -5761,6 +5798,7 @@ fn build_semantic_locate_result(
         &query,
         Some(granularity_token.as_str()),
         graph_version,
+        kin_cli::commands::locate::projection_mode(true, include_snippet),
     );
     {
         let mut cache = state.semantic_locate_pages.lock().unwrap();
@@ -5778,6 +5816,7 @@ fn build_semantic_locate_result(
             CachedSemanticPage {
                 rows: rows.clone(),
                 graph_version,
+                mode: kin_cli::commands::locate::projection_mode(true, include_snippet),
                 created: std::time::Instant::now(),
             },
         );
@@ -5829,6 +5868,12 @@ fn fused_semantic_locate_payload(
         json!(if file_granularity { "file" } else { "entity" }),
     );
     payload.insert("routing".to_string(), json!("fused-v1"));
+    // State the page explicitly. `LocateResult::page` is skipped when zero, so a
+    // caller that asked for page 3 and got page 0 (a cache miss re-ran the ranking
+    // and restarted) saw the key vanish rather than change, and had to infer the
+    // restart from an absent field. The cosine arm always states its page; now both
+    // arms answer the question the same way.
+    payload.insert("page".to_string(), json!(result.page));
     if let Some(coverage) = coverage_detail {
         payload.insert("semantic_coverage_detail".to_string(), json!(coverage));
     }
@@ -5844,6 +5889,17 @@ fn fused_semantic_locate_payload(
                     "match_evidence".to_string(),
                     fused_match_evidence(query, entity),
                 );
+                // The two `semantic_locate` arms carried the same graph-owned
+                // excerpt under different names: the cosine arm called it
+                // `snippet`, the fused arm `body`. An agent that set
+                // `include_snippet` and looked for `snippet` therefore found no
+                // snippet key at all on whichever arm its profile happened to
+                // serve. Mirror the field so `include_snippet` means one thing on
+                // both arms, and keep `body` for the locate-schema parity that
+                // consumers of `kin locate --json` already parse.
+                if let Some(body) = entity.body.as_ref() {
+                    map.insert("snippet".to_string(), json!(body));
+                }
             }
         }
     }
@@ -5921,6 +5977,21 @@ async fn build_fused_semantic_locate_result(
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
 
+    // `entities[]` is the graph-native surface this tool answers with, so it is
+    // projected either way. Only the body text follows `include_snippet`. The
+    // default options would switch the whole projection off, which turned "omit
+    // snippets" into "omit the results".
+    //
+    // Resolved BEFORE the paging fast path below rather than after it: the fast
+    // path answers straight from a cached ranking, and a body mode decided after
+    // that point leaves the cursor path unable to tell which mode the caller
+    // actually asked for.
+    let snippet_opts = if include_snippet {
+        kin_cli::commands::locate::SnippetOptions::enabled(None)
+    } else {
+        kin_cli::commands::locate::SnippetOptions::enabled(None).without_bodies()
+    };
+
     // Graph version stamps the paging cursor: any mutation bumps `vfs_version`,
     // so a stale cursor can never page a ranking built against different truth.
     let graph_version = state.vfs_version.load(std::sync::atomic::Ordering::SeqCst);
@@ -5946,6 +6017,10 @@ async fn build_fused_semantic_locate_result(
                 cache
                     .get(&parsed.key)
                     .filter(|entry| entry.graph_version == graph_version)
+                    // The cursor carries the cache key, so a caller can present a
+                    // key minted in the other body mode. Keying is not enough;
+                    // the held ranking's mode has to match this request's.
+                    .filter(|entry| entry.mode == snippet_opts.projection_mode())
                     .map(|entry| entry.entities.clone())
             };
             if let Some(entities) = cached {
@@ -5972,12 +6047,6 @@ async fn build_fused_semantic_locate_result(
         // Cache miss / stale / undecodable cursor: fall through to a fresh run
         // (returns page 0) rather than silently failing the page.
     }
-
-    let snippet_opts = if include_snippet {
-        kin_cli::commands::locate::SnippetOptions::enabled(None)
-    } else {
-        kin_cli::commands::locate::SnippetOptions::default()
-    };
 
     // Multi-query fan-out: `query` plus any additional `queries` variants,
     // deduped. Two-or-more distinct variants trigger RRF fusion; otherwise the
@@ -6039,8 +6108,15 @@ async fn build_fused_semantic_locate_result(
         &key_text,
         scope_token.as_deref(),
         graph_version,
+        snippet_opts.projection_mode(),
     );
-    cache_locate_ranking(state, &key, &locate_result.entities, graph_version);
+    cache_locate_ranking(
+        state,
+        &key,
+        &locate_result.entities,
+        graph_version,
+        snippet_opts.projection_mode(),
+    );
     kin_cli::commands::locate::apply_entity_page(&mut locate_result, &key, 0, page_size);
 
     fused_semantic_locate_payload(locate_result, &query, file_granularity)
@@ -6098,6 +6174,14 @@ fn resolved_entity_source_from_outcome<E: std::fmt::Display>(
             start_line: record.start_line,
             end_line: record.end_line,
             signature: record.signature,
+            // This arm resolves source through kin-cli's own authority read, so it
+            // has no `ExactEntitySource` to render. It reports the coherence label
+            // that read did establish rather than emitting nothing, so the batch
+            // surface is never silent about an unverified span.
+            provenance: serde_json::Map::from_iter([(
+                "span_coherence".to_string(),
+                json!(record.span_coherence),
+            )]),
             body: record.body,
         }),
         Ok(EntitySourceOutcome::NotFound(message)) => ResolvedEntitySource::NotFound {
@@ -10342,6 +10426,7 @@ mod tests {
             end_byte: 14,
             signature: "fn target()".into(),
             body: "fn target() {}".into(),
+            span_coherence: "digest_verified".to_string(),
         };
         let result = entity_source_tool_result(Ok::<_, String>(EntitySourceOutcome::Found(record)));
 
@@ -10384,6 +10469,7 @@ mod tests {
             end_byte: 14,
             signature: "fn target()".into(),
             body: "fn target() {}".into(),
+            span_coherence: "digest_verified".to_string(),
         };
         let resolved = vec![
             resolved_entity_source_from_outcome(
@@ -21678,6 +21764,7 @@ mod tests {
                             reference: None,
                             snippets: false,
                             snippet_lines: None,
+                            entity_surface: false,
                             cursor: None,
                             page_size: None,
                         })
@@ -21777,6 +21864,229 @@ mod tests {
         assert!(hit["kind"].as_str().is_some());
     }
 
+    /// The fused arm must fill `snippet`, the field the schema names, and must
+    /// keep its entity ranking when snippets are declined.
+    ///
+    /// The two arms disagreed on the field: the cosine arm wrote `snippet`, the
+    /// fused arm wrote only `body`. An agent that asked for a snippet and read
+    /// `snippet` therefore found no snippet key at all under the fused profile,
+    /// which closed the one in-profile path to source text it had.
+    ///
+    /// Scope of this test: the FUSED arm. The cosine arm's `snippet` emission is
+    /// unchanged and cannot be exercised here, because the cosine ranking needs a
+    /// populated vector index and this fixture has none (see
+    /// `mcp_semantic_locate_reports_coverage_without_hard_gate`, which asserts the
+    /// no-index behavior). Field-name agreement between the arms therefore rests
+    /// on the cosine arm's existing emission plus this assertion on the fused one.
+    #[tokio::test]
+    async fn mcp_semantic_locate_fused_serves_snippets_and_keeps_hits_when_declined() {
+        let state = test_state();
+        let source = "def parse_config(path):\n    return {\"path\": path}\n";
+        install_repository_file(&state, "src/config.py", source.as_bytes());
+        install_working_copy_file(&state, "src/config.py", source.as_bytes(), false);
+
+        // An entity whose span actually covers its body, so a snippet is
+        // projectable from graph-owned bytes.
+        let mut entity = test_entity("parse_config", "src/config.py");
+        entity.span = Some(SourceSpan {
+            file: kin_model::FilePathId::new("src/config.py"),
+            start_byte: 0,
+            end_byte: source.len(),
+            start_line: 0,
+            start_col: 0,
+            end_line: 1,
+            end_col: 24,
+        });
+        // Parse time sets this preview from the node's source bytes, and the fused
+        // ranker reads it to decide an entity is a definition rather than a bare
+        // reference. Only definitions get bodies, so a fixture without it would be
+        // testing the reference path.
+        entity.metadata.extra.insert(
+            "embedding_body_preview".to_string(),
+            json!(source.lines().next().unwrap()),
+        );
+        state.graph.upsert_entity(&entity).unwrap();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let app = router(state);
+
+        let fused = call_semantic_locate(
+            app.clone(),
+            json!({
+                "query": "parse config",
+                "limit": 5,
+                "pipeline": "fused",
+                "include_snippet": true
+            }),
+        )
+        .await;
+        let hits = fused["entities"].as_array().unwrap();
+        assert!(!hits.is_empty(), "expected a fused hit: {fused}");
+        let snippet = hits[0]["snippet"]
+            .as_str()
+            .unwrap_or_else(|| panic!("fused hit must carry a `snippet` key: {}", hits[0]));
+        assert!(
+            snippet.contains("return {\"path\": path}"),
+            "the snippet must be the entity's graph-owned source: {snippet}"
+        );
+        // `body` stays for the locate-schema parity consumers already parse.
+        assert_eq!(hits[0]["body"].as_str(), Some(snippet));
+
+        // Suppression is honored, not ignored: no snippet key when opted out.
+        let suppressed = call_semantic_locate(
+            app,
+            json!({
+                "query": "parse config",
+                "limit": 5,
+                "pipeline": "fused",
+                "include_snippet": false
+            }),
+        )
+        .await;
+        let suppressed_hits = suppressed["entities"].as_array().unwrap();
+        assert!(!suppressed_hits.is_empty());
+        assert!(
+            suppressed_hits[0].get("snippet").is_none(),
+            "include_snippet:false must suppress the snippet: {}",
+            suppressed_hits[0]
+        );
+    }
+
+    /// A legacy locate must not be able to empty an agent's live cursor.
+    ///
+    /// `POST /locate` maps `{snippets, entity_surface}` onto THREE projections, and
+    /// the first version of the paging fix keyed and filtered the ranking cache on
+    /// `bodies` alone, which separates only two of them. `bodies` is false both for
+    /// the agent surface that wants a full ranking without source and for the
+    /// legacy path that projects no `entities[]` at all, so they collided on one
+    /// cache slot: a plain `kin locate` overwrote the agent's cached ranking with an
+    /// empty one, and the agent's own cursor then passed the filter and was served
+    /// `entities: []` from cache, with no fall-through re-run precisely because the
+    /// filter passed rather than rejected.
+    ///
+    /// Either outcome is acceptable on the last leg; a silent empty page is not.
+    #[tokio::test]
+    async fn locate_paging_survives_a_legacy_request_on_the_same_query() {
+        let state = test_state();
+        // TWO ranked definitions, so `page_size: 1` leaves a live cursor to page.
+        // With one hit the first page is also the last and no cursor is issued,
+        // which would make the test vacuous rather than failing.
+        let first = "def parse_config(path):\n    return {\"path\": path}\n";
+        let second =
+            "\ndef parse_config_list(paths):\n    return [parse_config(p) for p in paths]\n";
+        let source = format!("{first}{second}");
+        install_repository_file(&state, "src/config.py", source.as_bytes());
+        install_working_copy_file(&state, "src/config.py", source.as_bytes(), false);
+
+        for (name, start_byte, end_byte, preview) in [
+            ("parse_config", 0, first.len(), "def parse_config(path):"),
+            (
+                "parse_config_list",
+                first.len(),
+                source.len(),
+                "def parse_config_list(paths):",
+            ),
+        ] {
+            let mut entity = test_entity(name, "src/config.py");
+            entity.span = Some(SourceSpan {
+                file: kin_model::FilePathId::new("src/config.py"),
+                start_byte,
+                end_byte,
+                start_line: 0,
+                start_col: 0,
+                end_line: 1,
+                end_col: 24,
+            });
+            // The fused ranker reads this to call an entity a definition rather
+            // than a bare reference, and only definitions are ranked.
+            entity
+                .metadata
+                .extra
+                .insert("embedding_body_preview".to_string(), json!(preview));
+            state.graph.upsert_entity(&entity).unwrap();
+        }
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let app = router(state);
+
+        // A `LocateRequest` in one of the three projections. `page_size: 1` keeps a
+        // cursor live across the interleaving below.
+        let post_locate = |app: Router, snippets: bool, entity_surface: bool, cursor| async move {
+            let response = app
+                .oneshot(
+                    Request::post("/locate")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::to_string(&kin_cli::daemon_client::LocateRequest {
+                                text: "parse config".to_string(),
+                                queries: Vec::new(),
+                                explain: false,
+                                max_files: 10,
+                                max_files_explicit: true,
+                                reference: None,
+                                snippets,
+                                snippet_lines: None,
+                                entity_surface,
+                                cursor,
+                                page_size: Some(1),
+                            })
+                            .unwrap(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), 256 * 1024)
+                .await
+                .unwrap();
+            serde_json::from_slice::<kin_cli::commands::locate::LocateResult>(&body).unwrap()
+        };
+
+        // 1. The agent surface, bodies declined: a real ranking plus a cursor.
+        let page0 = post_locate(app.clone(), false, true, None).await;
+        assert!(
+            !page0.entities.is_empty(),
+            "the agent JSON surface must return the ranking even with bodies declined"
+        );
+        let Some(cursor) = page0.next_cursor.clone() else {
+            panic!(
+                "fixture must issue a cursor: {} entities, total_ranked {}",
+                page0.entities.len(),
+                page0.total_ranked
+            );
+        };
+
+        // 2. A legacy/human locate for the SAME query at the SAME graph version.
+        //    It projects no entities, and must not publish that emptiness anywhere
+        //    the agent's cursor can reach.
+        let legacy = post_locate(app.clone(), false, false, None).await;
+        assert!(
+            legacy.entities.is_empty(),
+            "the legacy projection is coordinates-only by design, got {} entities",
+            legacy.entities.len()
+        );
+
+        // 3. Page the ORIGINAL cursor. Either the correct next page from cache, or
+        //    an honest miss that re-ran and restarted at page 0 with a real ranking.
+        //    Never an empty page.
+        let page1 = post_locate(app, false, true, Some(cursor)).await;
+        assert!(
+            !page1.entities.is_empty(),
+            "a legacy request must not empty an agent's cursor: got {} entities, total_ranked {}, page {}",
+            page1.entities.len(),
+            page1.total_ranked,
+            page1.page
+        );
+        assert!(
+            page1.total_ranked > 0,
+            "an emptied cached ranking reports total_ranked 0, got {}",
+            page1.total_ranked
+        );
+    }
+
     // The legacy cosine ranking stays reachable per-call, independent of the
     // daemon's profile — the A/B lever for benchmarks and the compat escape.
     #[tokio::test]
@@ -21868,6 +22178,7 @@ mod tests {
                             reference: None,
                             snippets: true,
                             snippet_lines: None,
+                            entity_surface: true,
                             cursor: None,
                             page_size: None,
                         })

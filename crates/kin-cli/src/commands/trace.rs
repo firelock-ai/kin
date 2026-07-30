@@ -186,11 +186,7 @@ pub fn build_trace_json_response(
                 .as_ref()
                 .map(|f| display_read_path(layout, &f.0))
                 .unwrap_or_default(),
-            line: candidate
-                .span
-                .as_ref()
-                .map(|span| span.start_line)
-                .unwrap_or(1),
+            line: kin_mcp::handlers::common::entity_presentation_start_line(candidate).unwrap_or(1),
             signature: (!candidate.signature.is_empty()).then(|| candidate.signature.clone()),
         })
         .collect::<Vec<_>>();
@@ -404,7 +400,8 @@ fn build_trace_lines_with_graph(
                         .as_ref()
                         .map(|f| display_read_path(layout, &f.0))
                         .unwrap_or_else(|| "unknown".to_string());
-                    let line = dep.span.as_ref().map(|s| s.start_line).unwrap_or(0);
+                    let line = kin_mcp::handlers::common::entity_presentation_start_line(&dep)
+                        .unwrap_or(0);
                     lines.push(format!("  {} @ {}:{}", dep.name, file_loc, line));
                     printed += 1;
                 }
@@ -528,11 +525,7 @@ fn render_file_path_trace_lines(
 
     let mut lines = vec![format!("--- entities declared in {} ---", read_path)];
     for entity in entities.iter().take(40) {
-        let line = entity
-            .span
-            .as_ref()
-            .map(|span| span.start_line)
-            .unwrap_or(0);
+        let line = kin_mcp::handlers::common::entity_presentation_start_line(entity).unwrap_or(0);
         lines.push(format!(
             "  {} ({:?}) @ {}:{}",
             entity.name, entity.kind, read_path, line

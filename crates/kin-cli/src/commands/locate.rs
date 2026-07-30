@@ -305,8 +305,17 @@ pub fn entity_page_size() -> usize {
 /// `semantic_locate` hits alike) and are env-overridable.
 #[derive(Clone, Copy, Debug)]
 pub struct SnippetOptions {
-    /// Whether to project snippets at all.
+    /// Whether this is the agent/JSON surface. Gates BOTH the inline snippet
+    /// projection and the graph-native `entities[]` re-projection, so the
+    /// human/in-process path stays coordinates-only.
     pub enabled: bool,
+    /// Whether the projected surfaces carry body text.
+    ///
+    /// Separate from `enabled` because they answer different questions: whether
+    /// the graph-native entity surface exists at all, and whether its hits carry
+    /// source. Collapsing them meant an agent asking to omit snippets lost the
+    /// entire `entities[]` array with them, which is the surface it was reading.
+    pub bodies: bool,
     /// Max snippet lines per symbol (signature + first body lines).
     pub max_lines: usize,
     /// Hard char cap per snippet.
@@ -323,6 +332,7 @@ impl Default for SnippetOptions {
     fn default() -> Self {
         Self {
             enabled: false,
+            bodies: false,
             max_lines: kin_mcp::handlers::common::RETRIEVAL_SNIPPET_MAX_LINES,
             max_chars: kin_mcp::handlers::common::RETRIEVAL_SNIPPET_MAX_CHARS,
             max_symbols_per_file: DEFAULT_SNIPPET_SYMBOLS,
@@ -342,6 +352,7 @@ impl SnippetOptions {
             .clamp(1, 200);
         Self {
             enabled: true,
+            bodies: true,
             max_lines: lines,
             max_chars: locate_env_usize("KIN_LOCATE_SNIPPET_CHARS", base.max_chars).clamp(1, 8000),
             max_symbols_per_file: locate_env_usize(
@@ -350,6 +361,47 @@ impl SnippetOptions {
             )
             .clamp(1, 50),
         }
+    }
+
+    /// The agent/JSON surface with body text omitted.
+    ///
+    /// What `include_snippet: false` means: still project the graph-native
+    /// `entities[]` ranking, just without source bodies. Dropping the ranking
+    /// too would answer a request to save tokens by removing the results.
+    pub fn without_bodies(mut self) -> Self {
+        self.bodies = false;
+        self
+    }
+
+    /// Which entity projection this options value produces.
+    ///
+    /// See [`projection_mode`]. Two requests may share one cached ranking only
+    /// when these agree, so this is what belongs in a cache key, not `bodies`
+    /// alone.
+    pub fn projection_mode(&self) -> &'static str {
+        projection_mode(self.enabled, self.bodies)
+    }
+}
+
+/// Stable discriminator for the entity projection a request asks for.
+///
+/// There are THREE projections, not two, and collapsing them to `bodies` alone is
+/// a correctness bug rather than a naming one. `bodies` is false both for the
+/// agent surface that wants a full ranking without source and for the
+/// human/legacy surface that wants no `entities[]` at all
+/// (`build_entity_view` returns early on `!enabled`, leaving the ranking empty).
+/// Those two produce completely different results, so keying or filtering a
+/// cached ranking on `bodies` lets a legacy request overwrite an agent's cached
+/// ranking with an empty one and lets the agent's own cursor then be served that
+/// empty ranking, from cache, with no re-run.
+pub fn projection_mode(enabled: bool, bodies: bool) -> &'static str {
+    match (enabled, bodies) {
+        // No graph-native entity projection at all.
+        (false, _) => "none",
+        // The full ranking, coordinates only.
+        (true, false) => "ranking",
+        // The full ranking with graph-owned source on each hit.
+        (true, true) => "ranking+bodies",
     }
 }
 
@@ -1266,6 +1318,9 @@ pub async fn run(
         max_files_explicit,
         reference,
         snippets,
+        // `--json` IS the structured/agent surface, so it gets the graph-native
+        // entity ranking whether or not it asked for bodies.
+        json,
         paging,
     )
     .await?;
@@ -1276,6 +1331,13 @@ pub async fn run(
     Ok(())
 }
 
+/// Run a locate and return the structured result.
+///
+/// `snippets` requests source bodies on hits; `entity_surface` requests the
+/// graph-native `entities[]` ranking. They are separate because a caller can
+/// legitimately want the ranking without the source, and collapsing them made
+/// `--json --no-snippets` return no results at all. A caller emitting JSON should
+/// pass `entity_surface: true` whether or not it wants bodies.
 #[allow(clippy::too_many_arguments)]
 pub async fn capture(
     text: &str,
@@ -1285,6 +1347,7 @@ pub async fn capture(
     max_files_explicit: bool,
     reference: Option<String>,
     snippets: bool,
+    entity_surface: bool,
     paging: LocatePaging,
 ) -> Result<LocateResult> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
@@ -1304,6 +1367,7 @@ pub async fn capture(
         max_files_explicit,
         reference,
         snippets,
+        entity_surface,
         paging,
     )
     .await?;
@@ -1390,6 +1454,7 @@ async fn try_locate_via_daemon(
     max_files_explicit: bool,
     reference: Option<String>,
     snippets: bool,
+    entity_surface: bool,
     paging: LocatePaging,
 ) -> Result<LocateResult> {
     let daemon_url = std::env::var("KIN_DAEMON_URL")
@@ -1410,6 +1475,7 @@ async fn try_locate_via_daemon(
         reference,
         snippets,
         snippet_lines: None,
+        entity_surface,
         cursor: paging.cursor,
         page_size: paging.page_size,
     };
@@ -15194,7 +15260,7 @@ pub fn attach_snippets(
     repository_authority: Option<&kin_core::LocalRepositoryAuthorityBinding>,
     source_scope: kin_mcp::handlers::common::EntitySourceScope,
 ) -> Result<()> {
-    if !opts.enabled {
+    if !opts.enabled || !opts.bodies {
         return Ok(());
     }
     for file in result.files.iter_mut() {
@@ -15348,7 +15414,9 @@ pub fn build_entity_view(
             }
             // Bodies belong to definitions; references/re-exports stay
             // coordinates-only (the symbol already reused its snippet, if any).
-            let body = if sym.definition {
+            // With bodies off, the hit keeps its coordinates and the ranking is
+            // still projected.
+            let body = if opts.bodies && sym.definition {
                 bounded_entity_body_with_note(
                     graph,
                     entity,
@@ -15409,10 +15477,39 @@ pub fn build_entity_view(
 }
 
 /// Stable, opaque key for a locate ranking, scoped to the query, the ref/scope it
-/// ran against, and the graph version. Embedding the graph version means any
-/// edit (a `vfs_version` bump) yields a different key, so a stale cursor can
-/// never page a ranking built against different graph truth.
-pub fn locate_cursor_key(text: &str, reference: Option<&str>, graph_version: u64) -> String {
+/// ran against, the graph version, and the entity projection it was built in.
+/// Embedding the graph version means any edit (a `vfs_version` bump) yields a
+/// different key, so a stale cursor can never page a ranking built against
+/// different graph truth.
+///
+/// `mode` is part of the key because a cached ranking IS the paged answer, so the
+/// projection it was built in decides what every later page returns. Three ways
+/// that bites when the mode is left out, all reachable on one query at one graph
+/// version:
+///
+/// - a ranking cached WITH bodies, paged by a caller that declined them, returns
+///   the source that caller asked not to receive, silently ignoring the flag it
+///   set to bound its token spend;
+/// - a ranking cached WITHOUT bodies, paged by a caller that asked for them,
+///   returns hits carrying no snippet at all -- the "set `include_snippet` and
+///   found no snippet key" defect, relocated from page 0 to page 1;
+/// - a ranking cached by a caller that wanted NO entity projection is empty, and
+///   sharing a key with the coordinates-only agent projection lets it overwrite a
+///   real ranking, so an agent's own cursor is then served an empty page from
+///   cache with no re-run.
+///
+/// The third is why this takes a [`projection_mode`] token rather than a `bodies`
+/// bool: there are three projections and a bool can only separate two of them.
+/// It is a required parameter rather than something callers fold into `reference`
+/// themselves because every paging surface has to make the same decision, and a
+/// convention that lives in three call sites and is enforced in none is how these
+/// defects arrived.
+pub fn locate_cursor_key(
+    text: &str,
+    reference: Option<&str>,
+    graph_version: u64,
+    mode: &str,
+) -> String {
     use std::hash::{Hash, Hasher};
     let mut hasher = FxHasher::default();
     text.hash(&mut hasher);
@@ -15420,6 +15517,8 @@ pub fn locate_cursor_key(text: &str, reference: Option<&str>, graph_version: u64
     reference.unwrap_or("").hash(&mut hasher);
     0xff_u8.hash(&mut hasher);
     graph_version.hash(&mut hasher);
+    0xff_u8.hash(&mut hasher);
+    mode.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
 }
 
@@ -16288,16 +16387,82 @@ mod tests {
 
     #[test]
     fn locate_cursor_key_is_deterministic_and_version_scoped() {
-        let a = locate_cursor_key("find the parser", Some("HEAD"), 42);
-        let b = locate_cursor_key("find the parser", Some("HEAD"), 42);
+        let a = locate_cursor_key("find the parser", Some("HEAD"), 42, "ranking+bodies");
+        let b = locate_cursor_key("find the parser", Some("HEAD"), 42, "ranking+bodies");
         assert_eq!(a, b, "same inputs must yield the same key");
         // A graph edit bumps the version → a different key, so a stale cursor can
         // never page a ranking built against different graph truth.
-        let c = locate_cursor_key("find the parser", Some("HEAD"), 43);
+        let c = locate_cursor_key("find the parser", Some("HEAD"), 43, "ranking+bodies");
         assert_ne!(a, c);
         // Query and ref are part of the identity.
-        assert_ne!(a, locate_cursor_key("other query", Some("HEAD"), 42));
-        assert_ne!(a, locate_cursor_key("find the parser", Some("main"), 42));
+        assert_ne!(
+            a,
+            locate_cursor_key("other query", Some("HEAD"), 42, "ranking+bodies")
+        );
+        assert_ne!(
+            a,
+            locate_cursor_key("find the parser", Some("main"), 42, "ranking+bodies")
+        );
+    }
+
+    /// The projection mode joins the cursor key, so one query at one graph version
+    /// cannot serve two different projections from a single cached ranking.
+    ///
+    /// There are THREE projections, and the first version of this fix keyed on a
+    /// `bodies` bool, which can only separate two. `bodies` is false both for the
+    /// coordinates-only agent ranking and for the legacy path that projects no
+    /// `entities[]` at all, so those two collided: a legacy request overwrote the
+    /// agent's cached ranking with an empty one, and the agent's own cursor was
+    /// then served that empty page from cache with no re-run. All three must be
+    /// mutually distinct, which is what this asserts.
+    #[test]
+    fn locate_cursor_key_separates_every_projection_mode() {
+        let key = |mode| locate_cursor_key("find the parser", Some("HEAD"), 42, mode);
+        let none = key(projection_mode(false, false));
+        let ranking = key(projection_mode(true, false));
+        let with_bodies = key(projection_mode(true, true));
+
+        assert_ne!(
+            ranking, with_bodies,
+            "include_snippet true/false must not collide on one cache entry"
+        );
+        // The pair the `bodies` bool could not tell apart. A real ranking and an
+        // empty one sharing a key is how a legacy caller emptied an agent's cursor.
+        assert_ne!(
+            none, ranking,
+            "the no-projection mode must not share a key with the agent ranking"
+        );
+        assert_ne!(none, with_bodies);
+
+        // Deterministic within a mode; the mode is the ONLY difference above.
+        assert_eq!(
+            ranking,
+            key(projection_mode(true, false)),
+            "the key must still be deterministic within a mode"
+        );
+    }
+
+    /// `bodies` alone cannot distinguish the three projections, which is the whole
+    /// reason the key takes a mode token.
+    #[test]
+    fn projection_mode_distinguishes_the_no_projection_case_from_a_bodiless_ranking() {
+        assert_eq!(projection_mode(true, true), "ranking+bodies");
+        assert_eq!(projection_mode(true, false), "ranking");
+        assert_eq!(projection_mode(false, false), "none");
+        // The trap: both have bodies == false.
+        assert_ne!(projection_mode(true, false), projection_mode(false, false));
+        // `SnippetOptions` agrees with the free function for each constructor.
+        assert_eq!(SnippetOptions::default().projection_mode(), "none");
+        assert_eq!(
+            SnippetOptions::enabled(None).projection_mode(),
+            "ranking+bodies"
+        );
+        assert_eq!(
+            SnippetOptions::enabled(None)
+                .without_bodies()
+                .projection_mode(),
+            "ranking"
+        );
     }
 
     fn fusion_entity(id: &str, path: &str, score: f32) -> LocateEntity {
@@ -16683,6 +16848,33 @@ mod tests {
             result.entities.is_empty(),
             "disabled snippet opts must leave the entity surface untouched"
         );
+    }
+
+    /// Omitting bodies must not omit the ranking.
+    ///
+    /// `enabled` selects the agent/JSON surface and `bodies` selects whether its
+    /// hits carry source. One flag used to do both, so `include_snippet: false`
+    /// silently returned zero entities: an agent economizing on tokens lost the
+    /// results instead of the snippets.
+    #[test]
+    fn without_bodies_keeps_the_entity_surface_and_drops_only_source_text() {
+        let opts = SnippetOptions::enabled(None);
+        assert!(opts.enabled && opts.bodies);
+
+        let lean = SnippetOptions::enabled(None).without_bodies();
+        assert!(
+            lean.enabled,
+            "the agent/JSON surface stays selected, so entities are still projected"
+        );
+        assert!(!lean.bodies, "only body text is dropped");
+        // The bounds are untouched: nothing about paging or caps changes.
+        assert_eq!(lean.max_lines, opts.max_lines);
+        assert_eq!(lean.max_chars, opts.max_chars);
+        assert_eq!(lean.max_symbols_per_file, opts.max_symbols_per_file);
+
+        // The human/in-process default is unchanged: no surface, no bodies.
+        let human = SnippetOptions::default();
+        assert!(!human.enabled && !human.bodies);
     }
 
     #[test]

@@ -206,27 +206,23 @@ pub fn handle_get_entity_source<G: GraphStore>(
                 EntitySourceScope::WorkspaceHead,
             )?
             .ok_or_else(|| McpError::Context("entity source body unavailable".into()))?;
-            let is_stale = LAST_READ_STALE.with(|f| f.get());
             let source = LAST_READ_SOURCE.with(|f| f.get());
-            let span = entity.span.as_ref();
-            let value = serde_json::json!({
+            let mut value = serde_json::json!({
                 "id": entity.id,
                 "name": entity.name,
                 "kind": entity.kind,
                 "language": entity.language,
                 "file_path": entity.file_origin.as_ref().map(|p| p.to_string()),
                 "read_path": entity_read_path(&entity),
-                "start_line": span.map(|s| s.start_line),
-                "end_line": span.map(|s| s.end_line),
+                "start_line": entity_presentation_start_line(&entity),
+                "end_line": entity_presentation_end_line(&entity),
                 "signature": entity.signature,
                 "body": exact_source.body,
-                "source_change_id": exact_source.source_change_id,
-                "artifact_id": exact_source.artifact_id,
-                "artifact_path": exact_source.path,
-                "artifact_entry": exact_source.entry,
-                "stale": is_stale,
                 "source": source,
             });
+            if let Some(map) = value.as_object_mut() {
+                map.extend(source_provenance_fields(&exact_source));
+            }
             let json = serde_json::to_string_pretty(&value).map_err(McpError::Json)?;
             Ok(ToolCallResult::text(json))
         }
@@ -262,6 +258,14 @@ pub const MAX_BULK_SOURCE_ENTITIES: usize = 50;
 /// One resolved entity's source facts, projected into a path-independent shape:
 /// the generic graph store and the daemon graph both build this before the batch
 /// envelope is assembled, so the response row is identical across serving paths.
+///
+/// Each row is individually coherent; the BATCH is not one instant. Authority is
+/// sampled per entity, so a 50-row response can straddle workspace generations and
+/// two rows may describe different ones. No row is wrong, but nothing here
+/// promises they share a moment, which is why each row carries its own provenance
+/// rather than the envelope carrying one stamp for all of them. A caller that
+/// needs a single consistent snapshot across many entities must compare the
+/// per-row `workspace_generation` values rather than assume they agree.
 #[derive(Debug, Clone)]
 pub struct EntitySourceRow {
     pub id: String,
@@ -273,6 +277,16 @@ pub struct EntitySourceRow {
     pub end_line: u32,
     pub signature: String,
     pub body: String,
+    /// This row's source provenance and span coherence, rendered by the shared
+    /// [`source_provenance_fields`] seam, or empty when the serving path had none
+    /// to offer.
+    ///
+    /// A batch row needs this more than a single read does, not less. This tool
+    /// returns up to 50 full bodies and exists so an agent can restate source it
+    /// is about to overwrite, so "these bytes are uncommitted" and "this span was
+    /// never proven to describe them" are exactly the facts it must not have to
+    /// guess.
+    pub provenance: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Per-ID outcome for the batched source tool. Mirrors the single tool's
@@ -366,8 +380,14 @@ fn source_row_json(
         "signature": row.signature,
         "omitted": omitted,
     });
+    // Provenance rides with the body, and only with the body: a signature-only or
+    // budget-omitted row served no bytes, so it has no byte provenance to describe
+    // and stamping one would invite reading it as though it did.
     if let Some(body) = body {
         value["body"] = serde_json::json!(body);
+        if let Some(object) = value.as_object_mut() {
+            object.extend(row.provenance.clone());
+        }
     }
     if let Some(reason) = reason {
         value["reason"] = serde_json::json!(reason);
@@ -499,13 +519,10 @@ fn resolve_entity_source_generic<G: GraphStore>(
                         .as_ref()
                         .map(|path| path.0.clone())
                         .unwrap_or_default(),
-                    start_line: entity
-                        .span
-                        .as_ref()
-                        .map(|span| span.start_line)
-                        .unwrap_or(0),
-                    end_line: entity.span.as_ref().map(|span| span.end_line).unwrap_or(0),
+                    start_line: entity_presentation_start_line(&entity).unwrap_or(0),
+                    end_line: entity_presentation_end_line(&entity).unwrap_or(0),
                     signature: entity.signature.clone(),
+                    provenance: source_provenance_fields(&source),
                     body: source.body,
                 }),
                 Ok(None) => ResolvedEntitySource::NoSource {
@@ -603,12 +620,14 @@ pub fn handle_get_context_pack<G: GraphStore>(
     let pack = build_context_pack_with_traffic(store, &entity_id, &opts, &nearby_intents)
         .map_err(|e| McpError::Context(e.to_string()))?;
 
-    // Build structured response JSON.
+    // Build structured response JSON. The pack still has to have projected a
+    // focal entry for the focal entity to be worth serializing, but the body
+    // comes from graph truth rather than from that entry.
     let focal_entry = pack.focal_entities.first();
     let focal_entity = store.get_entity(&entity_id).map_err(McpError::graph)?;
 
-    let focal_json = if let (Some(entry), Some(entity)) = (focal_entry, &focal_entity) {
-        focal_context_json(store, entry, entity, compact, repository_authority)?
+    let focal_json = if let (Some(_), Some(entity)) = (focal_entry, &focal_entity) {
+        focal_context_json(store, entity, compact, repository_authority)?
     } else {
         serde_json::json!(null)
     };
@@ -626,8 +645,8 @@ pub fn handle_get_context_pack<G: GraphStore>(
                 "signature": e.signature,
                 "file_path": e.file_origin.as_ref().map(|p| p.to_string()),
                 "read_path": entity_read_path(&e),
-                "start_line": e.span.as_ref().map(|span| span.start_line),
-                "end_line": e.span.as_ref().map(|span| span.end_line),
+                "start_line": entity_presentation_start_line(&e),
+                "end_line": entity_presentation_end_line(&e),
             });
             if !compact {
                 obj["projection"] = serde_json::json!(format!("{:?}", entry.projection_level));
@@ -639,13 +658,24 @@ pub fn handle_get_context_pack<G: GraphStore>(
                     repository_authority,
                     EntitySourceScope::WorkspaceHead,
                 )?;
-                let is_stale = LAST_READ_STALE.with(|f| f.get());
                 let source = LAST_READ_SOURCE.with(|f| f.get());
-                obj["stale"] = serde_json::json!(is_stale);
                 obj["source"] = serde_json::json!(source);
-                obj["body"] = serde_json::json!(body
-                    .map(|source| source.body)
-                    .unwrap_or_else(|| entry.content.clone()));
+                // Same rule as the focal body: a dependency's `body` is the
+                // graph-owned projection or null. The pack's own `entry.content`
+                // is a token-accounting stub, and serving it here would hand an
+                // agent signature text shaped like an implementation.
+                match body {
+                    Some(source) => {
+                        obj["body"] = serde_json::json!(source.body);
+                        if let Some(map) = obj.as_object_mut() {
+                            map.extend(source_provenance_fields(&source));
+                        }
+                    }
+                    None => {
+                        obj["body"] = serde_json::Value::Null;
+                        obj["body_unavailable"] = serde_json::json!(entity_body_gap_reason(&e));
+                    }
+                }
             }
             Ok(obj)
         } else {
@@ -856,6 +886,8 @@ fn spine_reference_rows(
             kind: source.map(|entity| format!("{:?}", entity.kind)),
             file_path: Some(file_path),
             start_line: None,
+            // A federated xref carries no site span from the other repo's graph.
+            reference_lines: Vec::new(),
             signature: source.map(|entity| entity.signature.clone()),
             snippet: None,
             // CrossRepoEdge proves a dependency but does not retain whether
@@ -879,7 +911,11 @@ fn reference_row_json(row: ReferenceRow) -> serde_json::Value {
         "name": row.name,
         "kind": row.kind,
         "file_path": row.file_path,
+        // `start_line` locates the CALLER's definition; `reference_lines` locates
+        // the usages inside it. Both are graph facts and both are 1-based, so an
+        // agent never has to count forward from a definition to find a call site.
         "start_line": row.start_line,
+        "reference_lines": row.reference_lines,
         "signature": row.signature,
         "snippet": row.snippet,
         "relation_kinds": row
@@ -1636,7 +1672,8 @@ pub fn handle_explore_codebase<G: GraphStore>(
                     output.push_str(&format!("  File: {}\n", fp));
                 }
                 if let Some(ref span) = focal.span {
-                    output.push_str(&format!("  Lines: {}–{}\n", span.start_line, span.end_line));
+                    let (start_line, end_line) = presentation_span_lines(span);
+                    output.push_str(&format!("  Lines: {start_line}–{end_line}\n"));
                 }
 
                 let chain = collect_primary_trace_chain(store, &focal, 12)?;
@@ -1668,11 +1705,12 @@ pub fn handle_explore_codebase<G: GraphStore>(
                             }
                         }
                         if let Some(span) = step.span.as_ref() {
+                            let (start_line, end_line) = presentation_span_lines(span);
                             if !push_with_budget(
                                 &mut output,
                                 &mut tokens_used,
                                 token_budget,
-                                &format!("   Lines: {}–{}\n", span.start_line, span.end_line),
+                                &format!("   Lines: {start_line}–{end_line}\n"),
                             ) {
                                 output.push_str("  ... (truncated)\n");
                                 break;
@@ -1892,8 +1930,8 @@ pub fn handle_explore_codebase<G: GraphStore>(
                         output.push_str(&format!("  File: {}\n", fp));
                     }
                     if let Some(ref span) = entity.span {
-                        output
-                            .push_str(&format!("  Lines: {}–{}\n", span.start_line, span.end_line));
+                        let (start_line, end_line) = presentation_span_lines(span);
+                        output.push_str(&format!("  Lines: {start_line}–{end_line}\n"));
                     }
 
                     match build_context_pack(store, &entity.id, &opts) {
@@ -2914,6 +2952,7 @@ mod tests {
             start_line: 1,
             end_line: 3,
             signature: format!("fn {name}()"),
+            provenance: serde_json::Map::new(),
             body: body.to_string(),
         })
     }

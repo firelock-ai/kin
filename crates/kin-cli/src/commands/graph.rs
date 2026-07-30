@@ -4,6 +4,7 @@
 use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result};
+use kin_mcp::handlers::common::presentation_span_lines;
 use kin_model::{
     Entity, EntityId, EntityKind, EntityRole, EntityStore, GraphStore, Hash256, RelationKind,
 };
@@ -37,12 +38,23 @@ pub struct GraphSourceRecord {
     pub kind: String,
     pub language: String,
     pub file_path: String,
+    /// 1-based inclusive presentation lines, converted from the graph's 0-based
+    /// span rows at construction. This record is only ever printed or serialized
+    /// to an agent, so it carries the editor convention; `start_byte`/`end_byte`
+    /// stay in the graph's own domain because they are offsets, not positions.
     pub start_line: u32,
     pub end_line: u32,
     pub start_byte: usize,
     pub end_byte: usize,
     pub signature: String,
     pub body: String,
+    /// Whether the span that cut `body` was proven to describe these exact bytes
+    /// (`kin_mcp::handlers::common::SpanCoherence::label`).
+    ///
+    /// A provable mismatch never reaches here, because it fails the read. What this
+    /// distinguishes is a verified pair from one the graph recorded no digest for,
+    /// so a caller about to restate this body as an edit can tell which it has.
+    pub span_coherence: String,
 }
 
 /// The three distinguishable results of resolving an entity's source for
@@ -592,10 +604,8 @@ fn build_graph_inspect_response(
             lines.push(format!("  File: {}", fo.0));
         }
         if let Some(ref span) = entity.span {
-            lines.push(format!(
-                "  Span: lines {}-{}",
-                span.start_line, span.end_line
-            ));
+            let (start_line, end_line) = presentation_span_lines(span);
+            lines.push(format!("  Span: lines {start_line}-{end_line}"));
         }
         lines.push(format!("  Signature: {}", entity.signature));
         if let Some(ref doc) = entity.doc_summary {
@@ -867,7 +877,18 @@ fn graph_source_record(
         .span
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("entity '{}' has no source span", entity.name))?;
-    let bytes = read_entity_file_bytes_from_graph(binding, graph, entity)?;
+    let (bytes, blob) = read_entity_file_bytes_with_digest(binding, graph, entity)?;
+    // Bind the span to the bytes it is about to cut, through the SAME rule the MCP
+    // resolver uses.
+    //
+    // This arm resolves its own bytes rather than routing through
+    // `read_entity_source_excerpt_detailed`, and it is the arm the daemon serves
+    // `get_entity_source` and `get_entity_sources` from, so in product mode it is
+    // the arm agents actually read through. Leaving the check on the offline
+    // resolver only would have protected the path used least. The bounds checks
+    // below cannot substitute: a stale span normally still lands inside the file.
+    let span_coherence =
+        kin_mcp::handlers::common::span_source_coherence(entity, &blob, &file_origin.0)?;
     if span.start_byte >= span.end_byte {
         anyhow::bail!(
             "entity '{}' has an empty or invalid source span ({}..{})",
@@ -895,26 +916,43 @@ fn graph_source_record(
             )
         })?
         .to_string();
+    let (start_line, end_line) = presentation_span_lines(span);
     Ok(GraphSourceRecord {
         id: entity.id.to_string(),
         name: entity.name.clone(),
         kind: format!("{:?}", entity.kind),
         language: entity.language.to_string(),
         file_path: file_origin.0.clone(),
-        start_line: span.start_line,
-        end_line: span.end_line,
+        start_line,
+        end_line,
         start_byte: span.start_byte,
         end_byte: span.end_byte,
         signature: entity.signature.clone(),
         body,
+        span_coherence: span_coherence.label().to_string(),
     })
 }
 
 pub(crate) fn read_entity_file_bytes_from_graph(
     binding: &kin_core::LocalRepositoryAuthorityBinding,
-    _graph: &impl GraphStore,
+    graph: &impl GraphStore,
     entity: &Entity,
 ) -> Result<Vec<u8>> {
+    read_entity_file_bytes_with_digest(binding, graph, entity).map(|(bytes, _)| bytes)
+}
+
+/// The bytes at an entity's path in the exact workspace tree, plus the digest
+/// they were loaded by.
+///
+/// Callers that go on to SLICE these bytes with the live entity's span need the
+/// digest, because the span and the bytes come from two independently updated
+/// stores and the digest is what binds them. Returning it here rather than
+/// re-resolving the artifact keeps the pair from being sampled twice.
+pub(crate) fn read_entity_file_bytes_with_digest(
+    binding: &kin_core::LocalRepositoryAuthorityBinding,
+    _graph: &impl GraphStore,
+    entity: &Entity,
+) -> Result<(Vec<u8>, kin_model::Hash256)> {
     let file_id = entity
         .file_origin
         .as_ref()
@@ -944,12 +982,13 @@ pub(crate) fn read_entity_file_bytes_from_graph(
             workspace.workspace_id
         );
     };
-    authority.load_source_blob(hash).with_context(|| {
+    let bytes = authority.load_source_blob(hash).with_context(|| {
         format!(
             "repository-v6 source body for artifact {:?} at '{}' is unavailable",
             artifact.artifact_id, file_id.0
         )
-    })
+    })?;
+    Ok((bytes, hash))
 }
 
 #[cfg(test)]
@@ -1610,6 +1649,68 @@ mod tests {
         assert_eq!(source.file_path, "src/lib.rs");
         assert_eq!(source.start_byte, start);
         assert_eq!(source.end_byte, end);
+    }
+
+    /// This arm enforces the span/bytes coherence rule too.
+    ///
+    /// It is not reached through `resolve_entity_source_authority`: it resolves its
+    /// own bytes, and it is what the daemon serves `get_entity_source` and
+    /// `get_entity_sources` from, so in product mode it is the arm agents actually
+    /// read through. A rule enforced only on the offline resolver would have
+    /// protected the least-used path and left the most-used one open.
+    ///
+    /// The two bounds checks below it cannot substitute: this fixture's stale span
+    /// (0..14 of a 14-byte original) is comfortably inside the longer replacement,
+    /// so a length test passes and the read would return a truncated fragment of a
+    /// different function as this entity's body.
+    #[test]
+    fn graph_source_refuses_a_span_derived_from_different_bytes() {
+        let original = b"fn target() {}\n";
+        let fixture = graph_source_fixture(Some(original));
+        let mut entity = source_entity("target", fixture.file_id.clone(), 0, original.len() - 1);
+        // Stamp the digest of a DIFFERENT source: the reconciler records the digest
+        // each span was derived from, and here it does not describe the tree's bytes.
+        entity.metadata.extra.insert(
+            "blob_hash".to_string(),
+            serde_json::Value::String(Hash256::from_bytes([0x5a; 32]).to_string()),
+        );
+        let id = entity.id;
+        commit_source_entity(&fixture, &entity);
+
+        let error = build_graph_source_response(&fixture.binding, &fixture.graph, &id.to_string())
+            .expect_err("a span derived from other bytes must not serve a mis-sliced body");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("does not describe these bytes"),
+            "the refusal must name the incoherence, got: {message}"
+        );
+    }
+
+    /// An entity whose recorded digest matches the tree is served AND says so, so
+    /// a caller preparing an overwrite can tell a verified body from an unverified
+    /// one on this arm as well.
+    #[test]
+    fn graph_source_reports_span_coherence_for_a_verified_read() {
+        let original = b"fn target() {}\n";
+        let fixture = graph_source_fixture(Some(original));
+        let mut entity = source_entity("target", fixture.file_id.clone(), 0, original.len() - 1);
+
+        // The digest the tree actually holds for this path.
+        let blob = read_entity_file_bytes_with_digest(&fixture.binding, &fixture.graph, &entity)
+            .unwrap()
+            .1;
+        entity.metadata.extra.insert(
+            "blob_hash".to_string(),
+            serde_json::Value::String(blob.to_string()),
+        );
+        let id = entity.id;
+        commit_source_entity(&fixture, &entity);
+
+        let response =
+            build_graph_source_response(&fixture.binding, &fixture.graph, &id.to_string()).unwrap();
+        let record = response.source.unwrap();
+        assert_eq!(record.body, "fn target() {}");
+        assert_eq!(record.span_coherence, "digest_verified");
     }
 
     #[test]

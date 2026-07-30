@@ -165,7 +165,7 @@ pub fn tool_definitions() -> ToolsListResult {
                         },
                         "include_snippet": {
                             "type": "boolean",
-                            "description": "Attach a bounded inline source snippet to each entity hit",
+                            "description": "Attach a bounded inline source snippet to each entity hit, projected from graph-owned content. Read it from the hit's `snippet` field (the fused pipeline also carries the same text as `body` for locate-schema parity). Entity granularity only: a file hit has no single entity body. A hit with no graph-owned body carries no snippet rather than a placeholder.",
                             "default": true
                         },
                         "pipeline": {
@@ -1075,6 +1075,13 @@ pub fn agent_default_tool_names() -> &'static [&'static str] {
         "semantic_locate",
         "semantic_search",
         "get_context_pack",
+        // A profile carrying the transaction write surface must carry a direct
+        // entity-body read. Staging a body update means restating the entity's
+        // current source, so an agent without a body read can only guess it --
+        // and a guessed body silently overwrites the real one on commit. The
+        // discovery tools hand back ids and bounded snippets; this is the tool
+        // that turns an id into the exact graph-owned body.
+        "get_entity_source",
         "trace_data_flow",
         "find_references",
         "graph_neighborhood",
@@ -1270,7 +1277,7 @@ mod tests {
         let profile = agent_default_tool_names();
 
         assert!(
-            profile.len() >= 10 && profile.len() <= 17,
+            profile.len() >= 10 && profile.len() <= 18,
             "agent-default should be small but cover the wedge; got {}",
             profile.len()
         );
@@ -1289,6 +1296,8 @@ mod tests {
         for required in [
             "semantic_locate",
             "get_context_pack",
+            // The write surface is only safe with a body read beside it.
+            "get_entity_source",
             "kin_transaction_commit",
             "kin_provenance_query",
             // kin_session_start tells the agent to keep the session alive with
@@ -1304,9 +1313,8 @@ mod tests {
             );
         }
 
-        // An agent restricted to this profile cannot call get_entity_source, so
-        // the read tool it does have must say where the source text arrives.
-        // Without that it hunts for a tool it cannot see.
+        // The body-shaped read tool must say where the source text arrives, so an
+        // agent reaching for source knows which field carries it.
         let context_pack = list
             .tools
             .iter()
@@ -1316,6 +1324,23 @@ mod tests {
             context_pack.description.contains("focal_entity.body"),
             "get_context_pack must name the field carrying the source text"
         );
+
+        // Structural guard on the write half of this profile: any profile that can
+        // stage and commit graph writes must also be able to read an entity's
+        // exact body. Staging a body update without one means guessing the
+        // current source, and a guessed body overwrites the real one on commit.
+        let can_write = profile
+            .iter()
+            .any(|name| name.starts_with("kin_transaction_"));
+        if can_write {
+            assert!(
+                profile
+                    .iter()
+                    .any(|name| matches!(*name, "get_entity_source" | "get_entity_body")),
+                "a profile with the transaction write surface must carry a direct \
+                 entity-body read; got {profile:?}"
+            );
+        }
 
         let allowed: std::collections::HashSet<&str> = profile.iter().copied().collect();
         let visible = list

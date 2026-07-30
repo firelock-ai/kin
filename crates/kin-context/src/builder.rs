@@ -1046,6 +1046,18 @@ fn format_traffic_entry(intent: &IntentSummary, proximity: TrafficProximity) -> 
     )
 }
 
+/// Project the focal entity's HEADER, not its body, despite the name and despite
+/// the `ProjectionLevel::FullBody` the caller records beside it.
+///
+/// This crate has no source-reading capability: bodies live in content-addressed
+/// blobs reached through repository authority, which is a layer above. What this
+/// produces is a header plus signature, used for the pack's token accounting.
+///
+/// Consumers must NOT surface this text as an entity's `body`. It is source-shaped
+/// but is not source, so an agent that restates it as a body update deletes the
+/// implementation. The MCP context-pack handlers therefore read the real body
+/// through the graph-owned projection and report a gap when it is unavailable,
+/// rather than falling back to this string.
 fn project_full_body(entity: &Entity) -> String {
     let mut content = String::new();
     content.push_str(&format!(

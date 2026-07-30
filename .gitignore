@@ -20,6 +20,9 @@
 
 # Logs / local artifacts
 firebase-debug.log
+# Gate/check output redirected to the repo root by local multi-lane tooling.
+# Tracking these lands one lane's transient run output on every other lane.
+.kin-coord-*.log
 node_modules/
 **/node_modules/
 __pycache__/

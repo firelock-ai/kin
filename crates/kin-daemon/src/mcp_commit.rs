@@ -2397,11 +2397,12 @@ mod tests {
     ///
     /// This is the shape the product uses: call `get_entity`, take the returned
     /// object whole, add a `body`, commit. It is not the same as echoing the
-    /// in-memory struct, because `entity_response_json` injects ten
-    /// response-only keys at top level (read_path, start_line, end_line,
-    /// source_excerpt, source_change_id, artifact_id, artifact_path,
-    /// artifact_entry, stale, source) and `Entity` does not deny unknown
-    /// fields.
+    /// in-memory struct, because `entity_response_json` injects response-only keys
+    /// at top level (read_path, start_line, end_line, source_excerpt, source_state,
+    /// span_coherence, artifact_id, artifact_path, artifact_entry, source, plus
+    /// either source_change_id for committed bytes or workspace_tree_hash /
+    /// workspace_generation / base_change_id for uncommitted ones) and `Entity`
+    /// does not deny unknown fields.
     ///
     /// What this pins is that the round trip is faithful: those keys are
     /// discarded on the way back in and land nowhere, so an echoed payload
@@ -2430,7 +2431,16 @@ mod tests {
             Some(&binding),
         )
         .expect("the read surface must render the entity");
-        for injected in ["read_path", "start_line", "source_excerpt", "stale"] {
+        // `span_coherence` stands where `stale` used to: same role in this test, a
+        // response-only key that must round-trip harmlessly. `stale` was removed
+        // because nothing ever set it true, so it asserted a freshness the read had
+        // not established; `span_coherence` reports what was actually checked.
+        for injected in [
+            "read_path",
+            "start_line",
+            "source_excerpt",
+            "span_coherence",
+        ] {
             assert!(
                 response.get(injected).is_some(),
                 "fixture must exercise a response carrying the injected key {injected}: {response}"
