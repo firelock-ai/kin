@@ -8038,6 +8038,219 @@ mod tests {
         }
     }
 
+    // ── Endpoint owner liveness ───────────────────────────────────────────
+    //
+    // The failure these close: the start path decided from `daemon.pid` alone.
+    // A SIGKILLed daemon leaves its endpoint behind, the kernel hands that PID
+    // to an unrelated process, `kill(pid, 0)` reports it alive, and autostart
+    // concluded forever that a live daemon it could not reach owned the repo.
+    // The endpoint was never proven invalid, so nothing retired it and nothing
+    // respawned.
+
+    /// Publish an endpoint attributed to a given incarnation, the way the daemon
+    /// does: the owner record first, then the endpoint it attributes.
+    fn write_attributed_endpoint_files(
+        kin_root: &Path,
+        identity: ProcessIdentity,
+        port: u16,
+    ) -> u32 {
+        let pid = identity.pid();
+        std::fs::write(
+            repo_daemon_owner_path(kin_root),
+            serde_json::to_string(&EndpointOwnerRecord::for_identity(identity)).unwrap(),
+        )
+        .unwrap();
+        write_endpoint_files(kin_root, pid, port);
+        pid
+    }
+
+    /// The same live PID, a different incarnation of it: exactly the shape PID
+    /// reuse produces once the daemon that published the endpoint is gone.
+    fn recycled_identity_for_this_process() -> ProcessIdentity {
+        let current = current_process_identity().expect("read this process's identity");
+        let forged = ProcessIdentity {
+            pid: current.pid,
+            boot_id: current.boot_id.clone(),
+            birth_token: format!("{}9", current.birth_token),
+        };
+        assert_ne!(
+            forged, current,
+            "the forged identity must name a different incarnation"
+        );
+        forged
+    }
+
+    #[test]
+    fn a_recycled_pid_does_not_keep_a_dead_daemons_endpoint_alive() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let pid = write_attributed_endpoint_files(root, recycled_identity_for_this_process(), 51000);
+
+        // The bare-PID probe every earlier version used: this PID is running,
+        // so the endpoint looked live and wedged autostart permanently.
+        assert_eq!(process_liveness(pid), ProcessLiveness::Alive);
+
+        let owner = endpoint_owner_liveness(root, pid);
+        assert!(
+            owner.identity_verified(),
+            "an attributed endpoint must be judged against its recorded incarnation"
+        );
+        assert!(
+            owner.authorizes_cleanup(),
+            "the daemon that published this endpoint is gone, so it must be retirable"
+        );
+        assert_eq!(
+            live_daemon_endpoint(root), None,
+            "a recycled PID is not the daemon that published the endpoint"
+        );
+        assert!(
+            !root.join("daemon.pid").exists()
+                && !root.join("daemon.port").exists()
+                && !repo_daemon_owner_path(root).exists(),
+            "the proven-stale endpoint must be retired so a replacement can start"
+        );
+    }
+
+    #[tokio::test]
+    async fn probing_a_recycled_pid_endpoint_proves_it_invalid() {
+        // The other half: `probe_daemon_endpoint` re-checked liveness from the
+        // bare PID, so a recycled PID returned LiveNotReady until the deadline
+        // on every attempt, forever, and the caller is forbidden from clearing
+        // an endpoint that was never proven wrong.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".kin");
+        std::fs::create_dir_all(&root).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let pid = write_attributed_endpoint_files(&root, recycled_identity_for_this_process(), port);
+
+        let verdict = probe_daemon_endpoint(
+            &root,
+            LiveDaemonEndpoint { pid, port },
+            Duration::from_millis(50),
+        )
+        .await;
+
+        match verdict {
+            EndpointVerdict::Invalid(detail) => assert!(
+                detail.contains("different process"),
+                "the diagnostic must say the publisher is gone, not that a number is: {detail}"
+            ),
+            other => panic!("a recycled PID must prove the record wrong, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_endpoint_owned_by_a_live_incarnation_survives() {
+        // The inverse, so the fix cannot be "always delete": this process really
+        // did publish this endpoint, and it must keep it.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let identity = current_process_identity().expect("read this process's identity");
+        let pid = write_attributed_endpoint_files(root, identity, 51000);
+
+        let owner = endpoint_owner_liveness(root, pid);
+        assert!(owner.identity_verified());
+        assert!(
+            !owner.authorizes_cleanup(),
+            "a verified live owner's endpoint must never be retirable"
+        );
+        assert_eq!(
+            live_daemon_endpoint(root),
+            Some(LiveDaemonEndpoint { pid, port: 51000 })
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_uninspectable_owner_is_preserved_rather_than_retired() {
+        // The indeterminate arm, driven through a real foreign process so the
+        // record names an incarnation that really exists. An owner this process
+        // cannot inspect is not a dead one, and the removal decision fails
+        // closed.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut foreign = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn a stand-in foreign owner");
+        let identity = process_identity(foreign.id())
+            .expect("read the foreign owner's identity")
+            .expect("the foreign owner is running");
+        let pid = write_attributed_endpoint_files(root, identity, 51000);
+
+        let unreadable = |_: &ProcessIdentity| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "cannot read birth identity for a foreign process",
+            ))
+        };
+        assert!(
+            !endpoint_owner_liveness_with_probes(root, pid, unreadable, process_liveness)
+                .authorizes_cleanup(),
+            "an owner that cannot be inspected must not authorize retirement"
+        );
+        assert_eq!(
+            live_daemon_endpoint(root),
+            Some(LiveDaemonEndpoint { pid, port: 51000 }),
+            "a foreign live owner keeps its endpoint"
+        );
+        assert!(root.join("daemon.pid").exists() && root.join("daemon.port").exists());
+
+        let _ = foreign.kill();
+        let _ = foreign.wait();
+    }
+
+    #[test]
+    fn attribution_that_names_another_pid_falls_back_to_the_endpoint_it_describes() {
+        // A torn or mixed-version write: the record and the PID file disagree,
+        // so the record describes a different process than the endpoint being
+        // judged. Judging the PID the endpoint actually names is the only
+        // reading that cannot act on a statement about somebody else.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            repo_daemon_owner_path(root),
+            serde_json::to_string(&EndpointOwnerRecord::for_identity(
+                recycled_identity_for_this_process(),
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        write_endpoint_files(root, 4242, 51000);
+
+        let owner = endpoint_owner_liveness_with_probes(root, 4242, |_| Ok(false), |_| {
+            ProcessLiveness::Unknown
+        });
+        assert!(
+            !owner.identity_verified(),
+            "a record for a different PID does not attribute this endpoint"
+        );
+        assert!(!owner.authorizes_cleanup());
+    }
+
+    #[test]
+    fn a_legacy_endpoint_is_still_judged_by_its_pid() {
+        // No owner record, so a bare PID is all there is. The legacy arm must
+        // keep working: an endpoint published by a compatible older daemon is
+        // retired when its PID is provably gone.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_endpoint_files(root, 4242, 51000);
+
+        let owner = endpoint_owner_liveness(root, 4242);
+        assert!(
+            !owner.identity_verified(),
+            "an unattributed endpoint cannot be identity verified"
+        );
+        assert_eq!(
+            live_daemon_endpoint_with_probe(root, |_| ProcessLiveness::Dead),
+            None
+        );
+        assert!(!root.join("daemon.pid").exists() && !root.join("daemon.port").exists());
+    }
+
     #[test]
     fn live_daemon_endpoint_returns_alive_pid_even_before_port_binds() {
         let dir = tempfile::tempdir().unwrap();
