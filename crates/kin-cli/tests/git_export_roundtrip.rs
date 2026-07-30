@@ -106,7 +106,6 @@ fn kin(runtime: &common::IsolatedDaemonRuntime) -> Command<'_> {
     let mut cmd = runtime.kin_command();
     cmd.env("KIN_DAEMON_DISABLE_LSP", "1")
         .env("KIN_DAEMON_BIN", runtime.daemon_bin())
-        .env("KIN_DAEMON_IDLE_TIMEOUT_SECS", "1")
         .env("KIN_DAEMON_READY_TIMEOUT_SECS", "30")
         .env("KIN_BYPASS_EMBEDDING_COVERAGE_CHECK", "1");
     cmd
