@@ -1850,14 +1850,8 @@ fn process_group_members(process_group: libc::pid_t) -> std::io::Result<Vec<libc
     let mut buffer = vec![0u32; slots];
     let byte_len = i32::try_from(buffer.len() * std::mem::size_of::<u32>())
         .map_err(|_| std::io::Error::other("process group member buffer exceeds a c_int"))?;
-    let written = unsafe {
-        libc::proc_listpids(
-            PROC_PGRP_ONLY,
-            group,
-            buffer.as_mut_ptr().cast(),
-            byte_len,
-        )
-    };
+    let written =
+        unsafe { libc::proc_listpids(PROC_PGRP_ONLY, group, buffer.as_mut_ptr().cast(), byte_len) };
     if written < 0 {
         return Err(std::io::Error::last_os_error());
     }
@@ -1981,10 +1975,7 @@ fn proc_stat_fields_after_name(stat: &str) -> Option<Vec<&str>> {
 /// The single-character run state: field 3 overall, first after the name.
 #[cfg(target_os = "linux")]
 fn parse_proc_stat_state(stat: &str) -> Option<char> {
-    proc_stat_fields_after_name(stat)?
-        .first()?
-        .chars()
-        .next()
+    proc_stat_fields_after_name(stat)?.first()?.chars().next()
 }
 
 /// The process group id: field 5 overall, third after the name.
@@ -2782,7 +2773,10 @@ mod tests {
             !legacy_group_probe_reports_occupied(pgid),
             "a collected member leaves no group behind"
         );
-        assert_eq!(process_group_containment(pgid), ProcessGroupContainment::Empty);
+        assert_eq!(
+            process_group_containment(pgid),
+            ProcessGroupContainment::Empty
+        );
     }
 
     #[cfg(target_os = "linux")]
