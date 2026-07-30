@@ -264,6 +264,50 @@ impl fmt::Display for IndeterminateDaemonCommandError {
 
 impl std::error::Error for IndeterminateDaemonCommandError {}
 
+/// Proof carried by a successful acknowledgement of a non-idempotent command.
+///
+/// Requiring this trait at the one-dispatch transport boundary makes it
+/// impossible for a new mutation response to treat merely-decodable JSON as
+/// authority. The request identity must be echoed exactly, and the response
+/// must carry the report that describes the committed outcome.
+trait NonIdempotentAcknowledgement {
+    fn acknowledged_operation_id(&self) -> Option<OperationId>;
+    fn has_authoritative_report(&self) -> bool;
+}
+
+impl NonIdempotentAcknowledgement for crate::commands::merge::MergeResponse {
+    fn acknowledged_operation_id(&self) -> Option<OperationId> {
+        self.operation_id
+    }
+
+    fn has_authoritative_report(&self) -> bool {
+        self.report.is_some()
+    }
+}
+
+impl NonIdempotentAcknowledgement for crate::commands::resolve::ResolveResponse {
+    fn acknowledged_operation_id(&self) -> Option<OperationId> {
+        self.operation_id
+    }
+
+    fn has_authoritative_report(&self) -> bool {
+        self.report.is_some()
+    }
+}
+
+#[cfg(test)]
+impl NonIdempotentAcknowledgement for serde_json::Value {
+    fn acknowledged_operation_id(&self) -> Option<OperationId> {
+        self.get("operation_id")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
+    }
+
+    fn has_authoritative_report(&self) -> bool {
+        self.get("report").is_some_and(|report| !report.is_null())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocateRequest {
     pub text: String,
@@ -643,9 +687,10 @@ impl DaemonClient {
     /// committed the operation. Merge and resolve can durably publish authority
     /// before daemon-side finalization reports a 4xx or 5xx error, so every
     /// non-success response, transport failure, response-body failure, and
-    /// successful-but-undecodable response returns a typed indeterminate error
-    /// carrying the caller-stable operation identity. A future protocol may
-    /// recover precise rejection semantics through explicit pre-commit proof.
+    /// successful-but-undecodable or uncorroborated response returns a typed
+    /// indeterminate error carrying the caller-stable operation identity. A
+    /// future protocol may recover precise rejection semantics through
+    /// explicit pre-commit proof.
     async fn post_non_idempotent_json<Req, Resp>(
         &self,
         path: &str,
@@ -655,7 +700,7 @@ impl DaemonClient {
     ) -> Result<Resp>
     where
         Req: serde::Serialize + ?Sized,
-        Resp: serde::de::DeserializeOwned,
+        Resp: serde::de::DeserializeOwned + NonIdempotentAcknowledgement,
     {
         let url = format!(
             "{}/{}",
@@ -701,13 +746,41 @@ impl DaemonClient {
                 format!("read daemon response body failed: {error}"),
             ))
         })?;
-        serde_json::from_slice(&body).map_err(|error| {
+        let acknowledgement: Resp = serde_json::from_slice(&body).map_err(|error| {
             anyhow::Error::new(IndeterminateDaemonCommandError::new(
                 operation_id,
                 path,
                 format!("decode daemon response failed: {error}"),
             ))
-        })
+        })?;
+        match acknowledgement.acknowledged_operation_id() {
+            Some(acknowledged) if acknowledged == operation_id => {}
+            Some(acknowledged) => {
+                return Err(anyhow::Error::new(IndeterminateDaemonCommandError::new(
+                    operation_id,
+                    path,
+                    format!(
+                        "daemon success acknowledgement named operation {acknowledged}, \
+                         expected {operation_id}"
+                    ),
+                )));
+            }
+            None => {
+                return Err(anyhow::Error::new(IndeterminateDaemonCommandError::new(
+                    operation_id,
+                    path,
+                    "daemon success acknowledgement omitted operation_id",
+                )));
+            }
+        }
+        if !acknowledgement.has_authoritative_report() {
+            return Err(anyhow::Error::new(IndeterminateDaemonCommandError::new(
+                operation_id,
+                path,
+                "daemon success acknowledgement omitted its authoritative report",
+            )));
+        }
+        Ok(acknowledgement)
     }
 
     pub async fn locate(
@@ -5446,9 +5519,10 @@ mod urlencoding {
 mod tests {
     use super::*;
 
-    async fn spawn_fixed_response_server(
+    async fn spawn_fixed_response_server_at(
+        route: &'static str,
         status: axum::http::StatusCode,
-        body: &'static str,
+        body: impl Into<String>,
     ) -> (
         String,
         std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -5456,12 +5530,14 @@ mod tests {
     ) {
         use axum::{routing::post, Router};
 
+        let body = body.into();
         let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let handler_requests = requests.clone();
         let app = Router::new().route(
-            "/commands/test",
+            route,
             post(move || {
                 let requests = handler_requests.clone();
+                let body = body.clone();
                 async move {
                     requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     (status, body)
@@ -5474,6 +5550,17 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         (format!("http://{address}"), requests, server)
+    }
+
+    async fn spawn_fixed_response_server(
+        status: axum::http::StatusCode,
+        body: &'static str,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        spawn_fixed_response_server_at("/commands/test", status, body).await
     }
 
     async fn read_complete_http_request(stream: &mut tokio::net::TcpStream) -> std::io::Result<()> {
@@ -5635,6 +5722,118 @@ mod tests {
         assert!(rendered.contains("outcome is indeterminate"));
         assert!(rendered.contains(&operation_id.to_string()));
         assert!(rendered.contains("do not retry automatically"));
+    }
+
+    #[tokio::test]
+    async fn merge_requires_a_corroborated_acknowledgement_and_dispatches_once() {
+        let operation_id = stable_test_operation_id();
+        let other_operation_id =
+            OperationId::from_uuid(Uuid::from_u128(0xfedcba09_8765_4321_fedc_ba0987654321));
+        let cases = [
+            (
+                "empty acknowledgement",
+                "{}".to_string(),
+                "omitted operation_id",
+            ),
+            (
+                "mismatched operation identity",
+                serde_json::json!({"operation_id": other_operation_id}).to_string(),
+                "expected",
+            ),
+            (
+                "missing report",
+                serde_json::json!({"operation_id": operation_id}).to_string(),
+                "omitted its authoritative report",
+            ),
+        ];
+
+        for (case, body, detail) in cases {
+            let (base_url, requests, server) =
+                spawn_fixed_response_server_at("/commands/merge", axum::http::StatusCode::OK, body)
+                    .await;
+            let client =
+                DaemonClient::from_base_url_with_explicit_authority(base_url, None, None).unwrap();
+            let request = crate::commands::merge::MergeRequest {
+                source: kin_model::RefName::branch(b"source").unwrap(),
+                operation_id,
+                actor: kin_model::AuthorId::new("ack-test"),
+            };
+
+            let error = client
+                .merge(&request)
+                .await
+                .expect_err("an uncorroborated merge acknowledgement must be indeterminate");
+            server.abort();
+
+            assert_indeterminate(&error, operation_id);
+            assert_eq!(
+                requests.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "{case} must not be redispatched"
+            );
+            assert!(
+                format!("{error:#}").contains(detail),
+                "{case} should report {detail}: {error:#}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_requires_a_corroborated_acknowledgement_and_dispatches_once() {
+        let operation_id = stable_test_operation_id();
+        let other_operation_id =
+            OperationId::from_uuid(Uuid::from_u128(0xfedcba09_8765_4321_fedc_ba0987654321));
+        let cases = [
+            (
+                "empty acknowledgement",
+                "{}".to_string(),
+                "omitted operation_id",
+            ),
+            (
+                "mismatched operation identity",
+                serde_json::json!({"operation_id": other_operation_id}).to_string(),
+                "expected",
+            ),
+            (
+                "missing report",
+                serde_json::json!({"operation_id": operation_id}).to_string(),
+                "omitted its authoritative report",
+            ),
+        ];
+
+        for (case, body, detail) in cases {
+            let (base_url, requests, server) = spawn_fixed_response_server_at(
+                "/commands/resolve",
+                axum::http::StatusCode::OK,
+                body,
+            )
+            .await;
+            let client =
+                DaemonClient::from_base_url_with_explicit_authority(base_url, None, None).unwrap();
+            let request = crate::commands::resolve::ResolveRequest {
+                operation_id,
+                actor: kin_model::AuthorId::new("ack-test"),
+                action: crate::commands::resolve::ResolveAction::Abort,
+                expected_record: None,
+            };
+
+            let error = client
+                .resolve(&request)
+                .await
+                .expect_err("an uncorroborated resolve acknowledgement must be indeterminate");
+            server.abort();
+
+            assert_indeterminate(&error, operation_id);
+            assert_eq!(
+                requests.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "{case} must not be redispatched"
+            );
+            assert!(
+                format!("{error:#}").contains(detail),
+                "{case} should report {detail}: {error:#}"
+            );
+        }
     }
 
     #[tokio::test]
