@@ -47,6 +47,13 @@ jobs:
     name: Mint release tag
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # The kin-release-bot App credentials are scoped to this environment, which
+    # a job only resolves when it declares the environment. Without the binding
+    # the job silently falls back to repository-scoped copies of the same secret
+    # names, so a key rotation applied to the environment never reaches the mint.
+    # The environment's deployment branch policy admits main only, which matches
+    # the ref guard below.
+    environment: release-tag
     steps:
       - name: Guard — authorized actor and ref
         # Only the release captain or the bot may dispatch, and only against the
