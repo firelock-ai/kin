@@ -3760,6 +3760,7 @@ impl DaemonState {
             relation_deltas: semantics.relation_deltas().to_vec(),
             tree_deltas,
             admission_policy_delta: planned_delta.admission_policy_delta.clone(),
+            external_reference_deltas: Vec::new(),
         };
         let graph_changed = finalization_delta != TransactionDelta::default();
         if graph_changed {
@@ -4832,6 +4833,7 @@ mod tests {
             spec_link: None,
             evidence: vec![],
             risk_summary: None,
+            external_reference_deltas: Vec::new(),
         };
         change.id = kin_core::compute_semantic_change_id(&change).unwrap();
         change
@@ -5596,6 +5598,7 @@ mod tests {
                     ),
                 }],
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             })
             .unwrap();
         sibling_graph

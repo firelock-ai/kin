@@ -284,6 +284,7 @@ fn add_exact_refs(layout: &kin_core::KinLayout) {
         workspace_mutation: None,
         local_overlay_delta: None,
         merge_transaction_delta: None,
+        sealed_observation: None,
     };
     let receipt = manager
         .commit_repository_transaction(transaction)
@@ -320,6 +321,7 @@ fn exact_ref_create_transaction(
         workspace_mutation: None,
         local_overlay_delta: None,
         merge_transaction_delta: None,
+        sealed_observation: None,
     }
 }
 
@@ -996,6 +998,7 @@ fn admit_uncommitted_workspace_edit(
             }),
             local_overlay_delta: None,
             merge_transaction_delta: None,
+            sealed_observation: None,
         })
         .expect("commit admitted workspace edit");
 }

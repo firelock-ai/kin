@@ -623,6 +623,7 @@ fn switch(
         relation_deltas: daemon_semantic_delta.relation_deltas().to_vec(),
         tree_deltas: tree_deltas.clone(),
         admission_policy_delta: None,
+        external_reference_deltas: Vec::new(),
     };
     preflight_switch_delta(state, &workspace.tree, &target_state, &daemon_delta)?;
     let already_active = matches!(
@@ -701,6 +702,7 @@ fn switch(
         }),
         local_overlay_delta: None,
         merge_transaction_delta: None,
+        sealed_observation: None,
     };
     // Validate the derived view before materializing anything over it. This
     // reads the working copy only at paths the workspace tree already tracks
@@ -812,6 +814,7 @@ fn replay_switch(
         workspace_mutation: Some(mutation.clone()),
         local_overlay_delta: None,
         merge_transaction_delta: None,
+        sealed_observation: None,
     };
     if transaction.transaction_hash()? != receipt.transaction_hash {
         return Err(branch_conflict(format!(
@@ -864,6 +867,7 @@ fn replay_switch(
         relation_deltas: daemon_semantic_delta.relation_deltas().to_vec(),
         tree_deltas: mutation.tree_deltas.clone(),
         admission_policy_delta: None,
+        external_reference_deltas: Vec::new(),
     };
     drop(lease);
     let (replayed, authority_freeze) =
@@ -950,6 +954,7 @@ fn ref_transaction(
         workspace_mutation: None,
         local_overlay_delta: None,
         merge_transaction_delta: None,
+        sealed_observation: None,
     }
 }
 

@@ -190,6 +190,7 @@ mod tests {
             spec_link: None,
             evidence: vec![],
             risk_summary: None,
+            external_reference_deltas: Vec::new(),
         };
         change.id =
             compute_semantic_change_id(&change).expect("test change must be identity-exact");

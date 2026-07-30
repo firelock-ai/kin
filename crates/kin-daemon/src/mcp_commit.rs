@@ -1310,6 +1310,7 @@ fn transaction_delta_between(
         relation_deltas,
         tree_deltas,
         admission_policy_delta: None,
+        external_reference_deltas: Vec::new(),
     })
 }
 

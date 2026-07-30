@@ -441,6 +441,7 @@ fn record_transaction(
         workspace_mutation: None,
         local_overlay_delta: None,
         merge_transaction_delta: Some(delta),
+        sealed_observation: None,
     }
 }
 

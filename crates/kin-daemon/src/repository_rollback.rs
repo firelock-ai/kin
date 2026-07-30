@@ -316,6 +316,7 @@ fn plan_and_commit(
         spec_link: None,
         evidence: Vec::new(),
         risk_summary: None,
+        external_reference_deltas: Vec::new(),
     };
     change.id =
         compute_semantic_change_id(&change).context("compute the rollback change identity")?;
@@ -343,6 +344,7 @@ fn plan_and_commit(
         relation_deltas: daemon_semantic_delta.relation_deltas().to_vec(),
         tree_deltas: workspace_tree_deltas.clone(),
         admission_policy_delta: None,
+        external_reference_deltas: Vec::new(),
     };
     preflight_rollback_delta(state, &workspace.tree, &target_state, &daemon_delta)?;
 
@@ -397,6 +399,7 @@ fn plan_and_commit(
         }),
         local_overlay_delta: None,
         merge_transaction_delta: None,
+        sealed_observation: None,
     };
     transaction
         .validate()

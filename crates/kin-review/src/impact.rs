@@ -742,6 +742,7 @@ mod tests {
                     ),
                 }],
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             })
             .expect("test artifact admission");
         artifact_id

@@ -1589,6 +1589,7 @@ fn transfer_transaction(
         workspace_mutation: None,
         local_overlay_delta: None,
         merge_transaction_delta: None,
+        sealed_observation: None,
     };
     transaction.validate().map_err(model)?;
     Ok(transaction)
@@ -1828,6 +1829,7 @@ mod tests {
             spec_link: None,
             evidence: Vec::new(),
             risk_summary: None,
+            external_reference_deltas: Vec::new(),
         };
         change.id = compute_semantic_change_id(&change).unwrap();
         change
@@ -1943,6 +1945,7 @@ mod tests {
             workspace_mutation: None,
             local_overlay_delta: None,
             merge_transaction_delta: None,
+            sealed_observation: None,
         };
         drop(lease);
         manager.commit_repository_transaction(transaction).unwrap();
@@ -2121,6 +2124,7 @@ mod tests {
             spec_link: None,
             evidence: Vec::new(),
             risk_summary: None,
+            external_reference_deltas: Vec::new(),
         };
         parent.id = compute_semantic_change_id(&parent).unwrap();
         let mut imported_head = SemanticChange {
@@ -2140,6 +2144,7 @@ mod tests {
             spec_link: None,
             evidence: Vec::new(),
             risk_summary: None,
+            external_reference_deltas: Vec::new(),
         };
         imported_head.id = compute_semantic_change_id(&imported_head).unwrap();
         let aliases = vec![
@@ -2206,6 +2211,7 @@ mod tests {
             workspace_mutation: None,
             local_overlay_delta: None,
             merge_transaction_delta: None,
+            sealed_observation: None,
         };
         drop(source_lease);
         source
@@ -2456,6 +2462,7 @@ mod tests {
             workspace_mutation: None,
             local_overlay_delta: None,
             merge_transaction_delta: None,
+            sealed_observation: None,
         };
         drop(lease);
         fixture
@@ -2516,6 +2523,7 @@ mod tests {
             workspace_mutation: None,
             local_overlay_delta: None,
             merge_transaction_delta: None,
+            sealed_observation: None,
         };
         drop(lease);
         authority
@@ -2728,6 +2736,7 @@ mod tests {
             workspace_mutation: None,
             local_overlay_delta: None,
             merge_transaction_delta: None,
+            sealed_observation: None,
         };
         drop(lease);
         fixture
