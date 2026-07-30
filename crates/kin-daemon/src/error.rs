@@ -44,6 +44,27 @@ pub enum DaemonError {
     #[error("repository '{0}' has no graph in storage")]
     RepoAbsentFromStorage(String),
 
+    /// The requested repository lies outside the key space this daemon serves.
+    ///
+    /// This is the third answer alongside a repository that is there and one
+    /// that is absent, and it is the only one decidable without touching
+    /// storage: the configured key space already excludes the id, so no load is
+    /// attempted and no backend state is consulted. Answering it as a storage
+    /// outcome would describe a daemon that failed where nothing was ever
+    /// asked of storage.
+    ///
+    /// Both identities travel with the refusal because either alone is
+    /// unactionable. The requested id alone leaves the caller unable to tell a
+    /// typo from a request sent to the wrong pod, and the served id alone does
+    /// not say which request was refused. Carrying them here rather than
+    /// rebuilding the sentence at each route also keeps every surface phrasing
+    /// the same refusal identically.
+    #[error(
+        "this daemon serves repository {served} and does not serve {requested}; \
+         GET /health advertises the repo_id this daemon accepts"
+    )]
+    RepoNotServed { served: String, requested: String },
+
     #[error("{0}")]
     IncompatibleRepo(String),
 
