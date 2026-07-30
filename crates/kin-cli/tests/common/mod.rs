@@ -1365,6 +1365,7 @@ fn process_has_owner_token(
 struct CapturedCommandStream {
     bytes: Vec<u8>,
     observed_bytes: u64,
+    post_exit_empty_read_attempts: u64,
     truncated: bool,
     error: Option<String>,
     done: bool,
@@ -1375,6 +1376,7 @@ struct CommandCaptureReader {
     state: Arc<Mutex<CapturedCommandStream>>,
     thread: Option<std::thread::JoinHandle<()>>,
     cancel: Arc<AtomicBool>,
+    post_exit: Arc<AtomicBool>,
 }
 
 struct BoundedCommandCapture {
@@ -1416,39 +1418,84 @@ impl BoundedCommandCapture {
         self.overflowed.load(Ordering::Acquire)
     }
 
-    fn finish(mut self, descendants_were_closed: bool) -> std::io::Result<CapturedCommandOutput> {
-        let join_deadline = Instant::now() + PROCESS_REAP_TIMEOUT;
+    fn finish(self, descendants_were_closed: bool) -> std::io::Result<CapturedCommandOutput> {
+        self.finish_with_timeout(descendants_were_closed, PROCESS_REAP_TIMEOUT)
+    }
+
+    fn finish_with_timeout(
+        mut self,
+        descendants_were_closed: bool,
+        reap_timeout: Duration,
+    ) -> std::io::Result<CapturedCommandOutput> {
+        let join_deadline = Instant::now() + reap_timeout;
+        let mut quiescence_error = None;
         if descendants_were_closed {
             while !self.both_done()? && Instant::now() < join_deadline {
                 std::thread::sleep(POLL_INTERVAL);
             }
         } else {
-            // Observe a stable prefix before cancellation so diagnostics
-            // include output already in flight, but never wait for a
-            // descendant-owned EOF.
-            let deadline = Instant::now() + Duration::from_secs(1);
-            let mut prior = self.observed_lengths()?;
-            let mut quiet_since = Instant::now();
+            // The direct child has exited, so every byte it wrote is already
+            // visible to the pipe. Require each live reader to perform a
+            // post-exit empty/EOF probe before a quiet prefix can authorize
+            // cancellation. A data read is not enough: more bytes may remain
+            // in the pipe if the reader is descheduled between chunks. Under
+            // runner saturation a reader thread may not have been scheduled
+            // at all during the old fixed quiet window; cancelling it then
+            // returned a successful command with incomplete stdout and
+            // converted a harness race into a product assertion.
+            let initial_stdout = self.stdout.snapshot()?;
+            let initial_stderr = self.stderr.snapshot()?;
+            self.stdout.post_exit.store(true, Ordering::Release);
+            self.stderr.post_exit.store(true, Ordering::Release);
+            let deadline = Instant::now() + reap_timeout;
+            let mut prior = (initial_stdout.observed_bytes, initial_stderr.observed_bytes);
+            let mut quiet_since = None;
             loop {
-                let current = self.observed_lengths()?;
-                if self.both_done()? {
+                let stdout = self.stdout.snapshot()?;
+                let stderr = self.stderr.snapshot()?;
+                if stdout.done && stderr.done {
                     break;
                 }
+                if Instant::now() >= deadline {
+                    quiescence_error = Some(std::io::Error::other(
+                        "bounded command capture readers did not observe post-exit pipe quiescence",
+                    ));
+                    break;
+                }
+                let both_probed_after_exit = (initial_stdout.done
+                    || stdout.done
+                    || stdout.post_exit_empty_read_attempts
+                        > initial_stdout.post_exit_empty_read_attempts)
+                    && (initial_stderr.done
+                        || stderr.done
+                        || stderr.post_exit_empty_read_attempts
+                            > initial_stderr.post_exit_empty_read_attempts);
+                if !both_probed_after_exit {
+                    std::thread::sleep(POLL_INTERVAL);
+                    continue;
+                }
+
+                let current = (stdout.observed_bytes, stderr.observed_bytes);
                 if current != prior {
                     prior = current;
-                    quiet_since = Instant::now();
-                } else if Instant::now() >= quiet_since + PROCESS_QUIESCENCE
-                    || Instant::now() >= deadline
-                {
-                    break;
+                    quiet_since = Some(Instant::now());
+                } else {
+                    let quiet_since = quiet_since.get_or_insert_with(Instant::now);
+                    if Instant::now() >= *quiet_since + PROCESS_QUIESCENCE {
+                        break;
+                    }
                 }
                 std::thread::sleep(POLL_INTERVAL);
             }
         }
         self.stdout
-            .cancel_and_join_until(Instant::now() + PROCESS_REAP_TIMEOUT)?;
+            .cancel_and_join_until(Instant::now() + reap_timeout)?;
         self.stderr
-            .cancel_and_join_until(Instant::now() + PROCESS_REAP_TIMEOUT)?;
+            .cancel_and_join_until(Instant::now() + reap_timeout)?;
+
+        if let Some(error) = quiescence_error {
+            return Err(error);
+        }
 
         let output = CapturedCommandOutput {
             stdout: self.stdout.snapshot()?,
@@ -1467,13 +1514,6 @@ impl BoundedCommandCapture {
         Ok(output)
     }
 
-    fn observed_lengths(&self) -> std::io::Result<(u64, u64)> {
-        Ok((
-            self.stdout.snapshot()?.observed_bytes,
-            self.stderr.snapshot()?.observed_bytes,
-        ))
-    }
-
     fn both_done(&self) -> std::io::Result<bool> {
         Ok(self.stdout.snapshot()?.done && self.stderr.snapshot()?.done)
     }
@@ -1490,16 +1530,25 @@ impl CommandCaptureReader {
         let reader_state = state.clone();
         let cancel = Arc::new(AtomicBool::new(false));
         let reader_cancel = cancel.clone();
+        let post_exit = Arc::new(AtomicBool::new(false));
+        let reader_post_exit = post_exit.clone();
         let thread = std::thread::Builder::new()
             .name(format!("kin-integration-{name}-capture"))
             .spawn(move || {
-                drain_command_stream(stream, &reader_state, &overflowed, &reader_cancel);
+                drain_command_stream(
+                    stream,
+                    &reader_state,
+                    &overflowed,
+                    &reader_cancel,
+                    &reader_post_exit,
+                );
             })?;
         Ok(Self {
             name,
             state,
             thread: Some(thread),
             cancel,
+            post_exit,
         })
     }
 
@@ -1701,15 +1750,34 @@ fn drain_command_stream(
     state: &Arc<Mutex<CapturedCommandStream>>,
     overflowed: &Arc<AtomicBool>,
     cancel: &Arc<AtomicBool>,
+    post_exit: &Arc<AtomicBool>,
 ) {
     let mut buffer = [0_u8; 16 * 1024];
     loop {
         if cancel.load(Ordering::Acquire) {
             break;
         }
+        let read_started_after_exit = post_exit.load(Ordering::Acquire);
         match stream.read_available(&mut buffer) {
-            Ok(CommandCaptureRead::Eof) => break,
+            Ok(CommandCaptureRead::Eof) => {
+                let Ok(mut state) = state.lock() else {
+                    return;
+                };
+                if read_started_after_exit {
+                    state.post_exit_empty_read_attempts =
+                        state.post_exit_empty_read_attempts.saturating_add(1);
+                }
+                break;
+            }
             Ok(CommandCaptureRead::Pending) => {
+                let Ok(mut state) = state.lock() else {
+                    return;
+                };
+                if read_started_after_exit {
+                    state.post_exit_empty_read_attempts =
+                        state.post_exit_empty_read_attempts.saturating_add(1);
+                }
+                drop(state);
                 std::thread::park_timeout(POLL_INTERVAL);
             }
             Ok(CommandCaptureRead::Data(read)) => {
@@ -1726,7 +1794,7 @@ fn drain_command_stream(
                     overflowed.store(true, Ordering::Release);
                 }
             }
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
             Err(error) => {
                 if let Ok(mut state) = state.lock() {
                     state.error = Some(error.to_string());
@@ -1758,13 +1826,112 @@ impl CommandCapturePipe for NeverEofCommandCapturePipe {
     }
 }
 
+struct GatedTwoChunkCommandCapturePipe {
+    stage: u8,
+    first_attempt_entered: std::sync::mpsc::SyncSender<()>,
+    release_pre_exit_pending: std::sync::mpsc::Receiver<()>,
+    release_first_chunk: std::sync::mpsc::Receiver<()>,
+    release_second_chunk: std::sync::mpsc::Receiver<()>,
+    cancel: Arc<AtomicBool>,
+}
+
+impl Read for GatedTwoChunkCommandCapturePipe {
+    fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::other(
+            "gated command capture must use read_available",
+        ))
+    }
+}
+
+impl CommandCapturePipe for GatedTwoChunkCommandCapturePipe {
+    fn prepare_nonblocking(&self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn read_available(&mut self, buffer: &mut [u8]) -> std::io::Result<CommandCaptureRead> {
+        let chunk = match self.stage {
+            0 => {
+                self.first_attempt_entered
+                    .send(())
+                    .map_err(|error| std::io::Error::other(error.to_string()))?;
+                self.release_pre_exit_pending
+                    .recv()
+                    .map_err(|error| std::io::Error::other(error.to_string()))?;
+                self.stage = 1;
+                return Ok(CommandCaptureRead::Pending);
+            }
+            1 => {
+                self.release_first_chunk
+                    .recv()
+                    .map_err(|error| std::io::Error::other(error.to_string()))?;
+                if self.cancel.load(Ordering::Acquire) {
+                    return Ok(CommandCaptureRead::Pending);
+                }
+                b"first chunk ".as_slice()
+            }
+            2 => {
+                self.release_second_chunk
+                    .recv()
+                    .map_err(|error| std::io::Error::other(error.to_string()))?;
+                if self.cancel.load(Ordering::Acquire) {
+                    return Ok(CommandCaptureRead::Pending);
+                }
+                b"second chunk".as_slice()
+            }
+            _ => return Ok(CommandCaptureRead::Pending),
+        };
+        self.stage = self.stage.saturating_add(1);
+        buffer[..chunk.len()].copy_from_slice(chunk);
+        Ok(CommandCaptureRead::Data(chunk.len()))
+    }
+}
+
+struct ContinuousAfterPostExitQuiescencePipe {
+    post_exit_pending_observations: u8,
+    post_exit: Arc<AtomicBool>,
+}
+
+impl Read for ContinuousAfterPostExitQuiescencePipe {
+    fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::other(
+            "continuous command capture must use read_available",
+        ))
+    }
+}
+
+impl CommandCapturePipe for ContinuousAfterPostExitQuiescencePipe {
+    fn prepare_nonblocking(&self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn read_available(&mut self, buffer: &mut [u8]) -> std::io::Result<CommandCaptureRead> {
+        if self.post_exit_pending_observations < 2 {
+            if self.post_exit.load(Ordering::Acquire) {
+                self.post_exit_pending_observations =
+                    self.post_exit_pending_observations.saturating_add(1);
+            }
+            return Ok(CommandCaptureRead::Pending);
+        }
+        std::thread::sleep(Duration::from_millis(1));
+        buffer[0] = b'x';
+        Ok(CommandCaptureRead::Data(1))
+    }
+}
+
 #[test]
 fn bounded_command_capture_sink_never_retains_past_the_ceiling() {
     let state = Arc::new(Mutex::new(CapturedCommandStream::default()));
     let overflowed = Arc::new(AtomicBool::new(false));
     let cancel = Arc::new(AtomicBool::new(false));
+    let post_exit = Arc::new(AtomicBool::new(false));
     let input = vec![b'x'; COMMAND_CAPTURE_LIMIT + 16 * 1024];
-    drain_command_stream(std::io::Cursor::new(input), &state, &overflowed, &cancel);
+    drain_command_stream(
+        std::io::Cursor::new(input),
+        &state,
+        &overflowed,
+        &cancel,
+        &post_exit,
+    );
     let captured = state.lock().expect("capture state").clone();
 
     assert_eq!(captured.bytes.len(), COMMAND_CAPTURE_LIMIT);
@@ -1828,6 +1995,226 @@ fn never_eof_command_capture_is_cancelled_and_joined() {
         "never-EOF capture exceeded its cancellation deadline"
     );
     assert!(reader.snapshot().expect("capture snapshot").done);
+}
+
+#[test]
+fn bounded_capture_waits_for_a_post_exit_reader_probe() {
+    let stdout_state = Arc::new(Mutex::new(CapturedCommandStream::default()));
+    let stdout_reader_state = stdout_state.clone();
+    let stdout_cancel = Arc::new(AtomicBool::new(false));
+    let stdout_reader_cancel = stdout_cancel.clone();
+    let stdout_post_exit = Arc::new(AtomicBool::new(false));
+    let stdout_reader_post_exit = stdout_post_exit.clone();
+    let overflowed = Arc::new(AtomicBool::new(false));
+    let stdout_overflowed = overflowed.clone();
+    let (release, wait_for_release) = std::sync::mpsc::sync_channel(0);
+    let stdout_thread = std::thread::Builder::new()
+        .name("kin-integration-delayed-stdout-capture".to_string())
+        .spawn(move || {
+            wait_for_release.recv().expect("release delayed reader");
+            drain_command_stream(
+                std::io::Cursor::new(b"late direct-child output".to_vec()),
+                &stdout_reader_state,
+                &stdout_overflowed,
+                &stdout_reader_cancel,
+                &stdout_reader_post_exit,
+            );
+        })
+        .expect("spawn delayed stdout reader");
+    let stdout = CommandCaptureReader {
+        name: "stdout",
+        state: stdout_state,
+        thread: Some(stdout_thread),
+        cancel: stdout_cancel,
+        post_exit: stdout_post_exit,
+    };
+    let stderr =
+        CommandCaptureReader::spawn(NeverEofCommandCapturePipe, "stderr", overflowed.clone())
+            .expect("start never-EOF stderr reader");
+    let release_thread = std::thread::spawn(move || {
+        std::thread::sleep(PROCESS_QUIESCENCE.saturating_mul(2));
+        release.send(()).expect("release delayed stdout reader");
+    });
+
+    let captured = BoundedCommandCapture {
+        stdout,
+        stderr,
+        overflowed,
+    }
+    .finish(false)
+    .expect("finish delayed post-exit capture");
+    release_thread.join().expect("join delayed-reader release");
+
+    assert_eq!(captured.stdout.bytes, b"late direct-child output");
+}
+
+#[test]
+fn bounded_capture_requires_post_exit_pipe_quiescence_after_data() {
+    let stdout_state = Arc::new(Mutex::new(CapturedCommandStream::default()));
+    let stdout_reader_state = stdout_state.clone();
+    let stdout_cancel = Arc::new(AtomicBool::new(false));
+    let stdout_reader_cancel = stdout_cancel.clone();
+    let stdout_post_exit = Arc::new(AtomicBool::new(false));
+    let stdout_reader_post_exit = stdout_post_exit.clone();
+    let overflowed = Arc::new(AtomicBool::new(false));
+    let stdout_overflowed = overflowed.clone();
+    let (entered_first_attempt, wait_for_first_attempt) = std::sync::mpsc::sync_channel(0);
+    let (release_pre_exit_pending, wait_for_pre_exit_pending) = std::sync::mpsc::sync_channel(0);
+    let (release_first_chunk, wait_for_first_chunk) = std::sync::mpsc::sync_channel(0);
+    let (release_second_chunk, wait_for_second_chunk) = std::sync::mpsc::sync_channel(0);
+    let stdout_thread = std::thread::Builder::new()
+        .name("kin-integration-gated-stdout-capture".to_string())
+        .spawn(move || {
+            drain_command_stream(
+                GatedTwoChunkCommandCapturePipe {
+                    stage: 0,
+                    first_attempt_entered: entered_first_attempt,
+                    release_pre_exit_pending: wait_for_pre_exit_pending,
+                    release_first_chunk: wait_for_first_chunk,
+                    release_second_chunk: wait_for_second_chunk,
+                    cancel: stdout_reader_cancel.clone(),
+                },
+                &stdout_reader_state,
+                &stdout_overflowed,
+                &stdout_reader_cancel,
+                &stdout_reader_post_exit,
+            );
+        })
+        .expect("spawn gated stdout reader");
+    let stdout = CommandCaptureReader {
+        name: "stdout",
+        state: stdout_state,
+        thread: Some(stdout_thread),
+        cancel: stdout_cancel,
+        post_exit: stdout_post_exit,
+    };
+    wait_for_first_attempt
+        .recv()
+        .expect("stdout reader entered its pre-exit probe");
+    let stderr =
+        CommandCaptureReader::spawn(NeverEofCommandCapturePipe, "stderr", overflowed.clone())
+            .expect("start never-EOF stderr reader");
+    let release_thread = std::thread::spawn(move || {
+        std::thread::sleep(PROCESS_QUIESCENCE.saturating_mul(2));
+        release_pre_exit_pending
+            .send(())
+            .expect("release pre-exit pending probe");
+        std::thread::sleep(PROCESS_QUIESCENCE.saturating_mul(2));
+        release_first_chunk
+            .send(())
+            .expect("release first stdout chunk");
+        std::thread::sleep(PROCESS_QUIESCENCE.saturating_mul(2));
+        release_second_chunk
+            .send(())
+            .expect("release second stdout chunk");
+    });
+
+    let captured = BoundedCommandCapture {
+        stdout,
+        stderr,
+        overflowed,
+    }
+    .finish(false)
+    .expect("finish gated post-exit capture");
+    release_thread.join().expect("join gated-reader release");
+
+    assert_eq!(captured.stdout.bytes, b"first chunk second chunk");
+}
+
+#[test]
+fn bounded_capture_deadline_cannot_be_bypassed_by_continuous_output() {
+    let stdout_state = Arc::new(Mutex::new(CapturedCommandStream::default()));
+    let stdout_reader_state = stdout_state.clone();
+    let stdout_cancel = Arc::new(AtomicBool::new(false));
+    let stdout_reader_cancel = stdout_cancel.clone();
+    let stdout_post_exit = Arc::new(AtomicBool::new(false));
+    let stdout_reader_post_exit = stdout_post_exit.clone();
+    let stdout_pipe_post_exit = stdout_post_exit.clone();
+    let overflowed = Arc::new(AtomicBool::new(false));
+    let stdout_overflowed = overflowed.clone();
+    let stdout_thread = std::thread::Builder::new()
+        .name("kin-integration-continuous-stdout-capture".to_string())
+        .spawn(move || {
+            drain_command_stream(
+                ContinuousAfterPostExitQuiescencePipe {
+                    post_exit_pending_observations: 0,
+                    post_exit: stdout_pipe_post_exit,
+                },
+                &stdout_reader_state,
+                &stdout_overflowed,
+                &stdout_reader_cancel,
+                &stdout_reader_post_exit,
+            );
+        })
+        .expect("spawn continuous stdout reader");
+    let stdout = CommandCaptureReader {
+        name: "stdout",
+        state: stdout_state,
+        thread: Some(stdout_thread),
+        cancel: stdout_cancel,
+        post_exit: stdout_post_exit,
+    };
+    let stderr =
+        CommandCaptureReader::spawn(NeverEofCommandCapturePipe, "stderr", overflowed.clone())
+            .expect("start never-EOF stderr reader");
+    let watchdog_stdout_cancel = stdout.cancel.clone();
+    let watchdog_stderr_cancel = stderr.cancel.clone();
+    let watchdog_stdout_thread = stdout
+        .thread
+        .as_ref()
+        .expect("live stdout capture thread")
+        .thread()
+        .clone();
+    let watchdog_stderr_thread = stderr
+        .thread
+        .as_ref()
+        .expect("live stderr capture thread")
+        .thread()
+        .clone();
+    let started = Instant::now();
+    let capture = BoundedCommandCapture {
+        stdout,
+        stderr,
+        overflowed,
+    };
+    let (finish_result_tx, finish_result_rx) = std::sync::mpsc::sync_channel(1);
+    let finish_thread = std::thread::spawn(move || {
+        let result = capture.finish_with_timeout(false, Duration::from_millis(250));
+        let _ = finish_result_tx.send(result);
+    });
+    let finish_result = match finish_result_rx.recv_timeout(Duration::from_secs(1)) {
+        Ok(result) => {
+            finish_thread.join().expect("join bounded capture finish");
+            result
+        }
+        Err(timeout) => {
+            watchdog_stdout_cancel.store(true, Ordering::Release);
+            watchdog_stderr_cancel.store(true, Ordering::Release);
+            watchdog_stdout_thread.unpark();
+            watchdog_stderr_thread.unpark();
+            let cleanup = finish_result_rx.recv_timeout(Duration::from_secs(1));
+            if cleanup.is_ok() {
+                finish_thread
+                    .join()
+                    .expect("join watchdog-released capture finish");
+            }
+            panic!(
+                "continuous output hung the bounded capture finish; \
+                 watchdog_result={timeout}; cleanup_result={cleanup:?}"
+            );
+        }
+    };
+    let error = finish_result
+        .expect_err("continuous descendant output must not bypass the capture deadline");
+
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "continuous output bypassed the bounded capture deadline"
+    );
+    assert!(
+        error.to_string().contains("post-exit pipe quiescence"),
+        "{error}"
+    );
 }
 
 fn compact_command_capture(stream: &CapturedCommandStream) -> String {

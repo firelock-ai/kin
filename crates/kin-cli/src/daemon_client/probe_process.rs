@@ -23,6 +23,15 @@ const REAP_GRACE: Duration = Duration::from_secs(5);
 const MAX_CAPTURE_BYTES_PER_STREAM: u64 = 1024 * 1024;
 const TRUNCATION_MARKER: &[u8] = b"\n[output truncated at capture limit]\n";
 
+enum DeadlineStart {
+    Immediate,
+    #[cfg(test)]
+    AfterParseablePid {
+        marker: std::path::PathBuf,
+        readiness_timeout: Duration,
+    },
+}
+
 pub(super) fn output_with_timeout(
     command: &mut Command,
     label: &str,
@@ -46,6 +55,45 @@ pub(crate) fn output_finalized_with_timeout_and_limit(
     timeout: Duration,
     max_capture_bytes_per_stream: u64,
 ) -> std::io::Result<Output> {
+    output_finalized_with_timeout_and_limit_from(
+        command,
+        label,
+        timeout,
+        max_capture_bytes_per_stream,
+        DeadlineStart::Immediate,
+    )
+}
+
+/// Test-only bounded execution whose runtime timeout starts after a descendant
+/// has atomically published a parseable PID marker.
+#[cfg(test)]
+pub(crate) fn output_finalized_with_timeout_and_limit_after_parseable_pid_ready(
+    command: &mut Command,
+    label: &str,
+    readiness_marker: &std::path::Path,
+    readiness_timeout: Duration,
+    timeout: Duration,
+    max_capture_bytes_per_stream: u64,
+) -> std::io::Result<Output> {
+    output_finalized_with_timeout_and_limit_from(
+        command,
+        label,
+        timeout,
+        max_capture_bytes_per_stream,
+        DeadlineStart::AfterParseablePid {
+            marker: readiness_marker.to_path_buf(),
+            readiness_timeout,
+        },
+    )
+}
+
+fn output_finalized_with_timeout_and_limit_from(
+    command: &mut Command,
+    label: &str,
+    timeout: Duration,
+    max_capture_bytes_per_stream: u64,
+    deadline_start: DeadlineStart,
+) -> std::io::Result<Output> {
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -65,7 +113,36 @@ pub(crate) fn output_finalized_with_timeout_and_limit(
             ));
         }
     };
-    let deadline = Instant::now() + timeout;
+    let deadline = match deadline_start {
+        DeadlineStart::Immediate => Instant::now() + timeout,
+        #[cfg(test)]
+        DeadlineStart::AfterParseablePid {
+            marker,
+            readiness_timeout,
+        } => {
+            let readiness_deadline = Instant::now() + readiness_timeout;
+            while !pid_marker_is_parseable(&marker) && Instant::now() < readiness_deadline {
+                std::thread::sleep(POLL_INTERVAL);
+            }
+            if !pid_marker_is_parseable(&marker) {
+                let cleanup = terminate_tree_and_reap(&mut child, &mut tree, label);
+                let captured = capture.finish_until(Instant::now() + REAP_GRACE);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "{label} did not publish a parseable PID to {} within \
+                         {readiness_timeout:?}; cleanup={}; capture={}; stdout={} stderr={}",
+                        marker.display(),
+                        render_result(&cleanup),
+                        captured.render_errors(),
+                        compact_capture(&captured.stdout),
+                        compact_capture(&captured.stderr),
+                    ),
+                ));
+            }
+            Instant::now() + timeout
+        }
+    };
     loop {
         if let Some(event) = capture.try_event() {
             match event {
@@ -145,6 +222,14 @@ pub(crate) fn output_finalized_with_timeout_and_limit(
             }
         }
     }
+}
+
+#[cfg(test)]
+fn pid_marker_is_parseable(marker: &std::path::Path) -> bool {
+    std::fs::read_to_string(marker)
+        .ok()
+        .and_then(|contents| contents.trim().parse::<u32>().ok())
+        .is_some_and(|pid| pid != 0)
 }
 
 #[derive(Debug)]
@@ -1229,6 +1314,31 @@ mod tests {
     const PROBE_WORKER_ENV: &str = "KINTEST_DAEMON_PROBE_WORKER";
     const PROBE_DESCENDANT_MARKER_ENV: &str = "KINTEST_DAEMON_PROBE_DESCENDANT_MARKER";
 
+    fn publish_pid_marker(marker: &std::path::Path) -> std::io::Result<()> {
+        let pid = std::process::id();
+        let mut staged_name = marker
+            .file_name()
+            .unwrap_or_else(|| std::ffi::OsStr::new("probe-descendant.pid"))
+            .to_os_string();
+        staged_name.push(format!(".{pid}.tmp"));
+        let staged_marker = marker.with_file_name(staged_name);
+        std::fs::write(&staged_marker, pid.to_string())?;
+        if let Err(error) = std::fs::rename(&staged_marker, marker) {
+            let _ = std::fs::remove_file(staged_marker);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn read_pid_marker(marker: &std::path::Path) -> Option<u32> {
+        std::fs::read_to_string(marker)
+            .ok()?
+            .trim()
+            .parse::<u32>()
+            .ok()
+            .filter(|pid| *pid != 0)
+    }
+
     struct NeverEofCapturePipe;
 
     impl std::io::Read for NeverEofCapturePipe {
@@ -1294,6 +1404,12 @@ mod tests {
                 std::io::stdout().write_all(&chunk).unwrap();
                 std::io::stdout().flush().unwrap();
             }
+        } else if mode == "delayed-ready" {
+            let marker =
+                std::path::PathBuf::from(std::env::var_os(PROBE_DESCENDANT_MARKER_ENV).unwrap());
+            std::thread::sleep(Duration::from_millis(500));
+            publish_pid_marker(&marker).unwrap();
+            std::thread::sleep(Duration::from_millis(250));
         } else if mode == "parent-owner" {
             let marker = std::env::var_os(PROBE_DESCENDANT_MARKER_ENV).unwrap();
             let mut nested_probe = Command::new(std::env::current_exe().unwrap());
@@ -1312,8 +1428,9 @@ mod tests {
             );
             panic!("parent-owner fixture unexpectedly returned: {result:?}");
         } else if mode == "descendant" {
-            let marker = std::env::var_os(PROBE_DESCENDANT_MARKER_ENV).unwrap();
-            std::fs::write(marker, std::process::id().to_string()).unwrap();
+            let marker =
+                std::path::PathBuf::from(std::env::var_os(PROBE_DESCENDANT_MARKER_ENV).unwrap());
+            publish_pid_marker(&marker).unwrap();
             std::thread::sleep(Duration::from_secs(30));
         } else if mode == "spawn-descendant" {
             let marker =
@@ -1329,11 +1446,13 @@ mod tests {
                 .spawn()
                 .unwrap();
             let deadline = Instant::now() + Duration::from_secs(5);
-            while !marker.is_file() && Instant::now() < deadline {
+            let mut descendant_pid = read_pid_marker(&marker);
+            while descendant_pid.is_none() && Instant::now() < deadline {
                 assert!(descendant.try_wait().unwrap().is_none());
                 std::thread::sleep(POLL_INTERVAL);
+                descendant_pid = read_pid_marker(&marker);
             }
-            assert!(marker.is_file(), "probe descendant did not become ready");
+            descendant_pid.expect("probe descendant did not publish a parseable PID");
             drop(descendant);
         }
     }
@@ -1354,6 +1473,34 @@ mod tests {
         assert!(output.status.success());
         assert!(String::from_utf8_lossy(&output.stdout).contains("probe stdout"));
         assert!(String::from_utf8_lossy(&output.stderr).contains("probe stderr"));
+    }
+
+    #[test]
+    fn bounded_probe_runtime_timeout_starts_after_parseable_pid_readiness() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("delayed-ready.pid");
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "daemon_client::probe_process::tests::probe_worker",
+                "--nocapture",
+            ])
+            .env(PROBE_WORKER_ENV, "delayed-ready")
+            .env(PROBE_DESCENDANT_MARKER_ENV, &marker);
+
+        let output = output_finalized_with_timeout_and_limit_after_parseable_pid_ready(
+            &mut command,
+            "delayed-ready daemon probe fixture",
+            &marker,
+            Duration::from_secs(2),
+            Duration::from_millis(400),
+            MAX_CAPTURE_BYTES_PER_STREAM,
+        )
+        .unwrap();
+
+        assert!(output.status.success());
+        read_pid_marker(&marker).expect("delayed-ready probe did not publish a parseable PID");
     }
 
     #[test]
@@ -1424,11 +1571,8 @@ mod tests {
         .unwrap();
         assert!(output.status.success());
 
-        let pid = std::fs::read_to_string(&marker)
-            .unwrap()
-            .trim()
-            .parse::<u32>()
-            .unwrap();
+        let pid =
+            read_pid_marker(&marker).expect("probe descendant did not publish a parseable PID");
         assert!(
             !process_is_live(pid),
             "probe descendant {pid} survived bounded return"
@@ -1490,22 +1634,17 @@ mod tests {
             .stderr(Stdio::null());
         let mut owner = KillAndReapOnDrop(Some(owner_command.spawn().unwrap()));
         let ready_deadline = Instant::now() + Duration::from_secs(5);
-        while !marker.is_file() && Instant::now() < ready_deadline {
+        let mut guarded_pid = read_pid_marker(&marker);
+        while guarded_pid.is_none() && Instant::now() < ready_deadline {
             assert!(
                 owner.child_mut().try_wait().unwrap().is_none(),
                 "parent fixture exited before its guarded probe became ready"
             );
             std::thread::sleep(POLL_INTERVAL);
+            guarded_pid = read_pid_marker(&marker);
         }
-        assert!(
-            marker.is_file(),
-            "guarded probe did not become ready for parent-death test"
-        );
-        let guarded_pid = std::fs::read_to_string(&marker)
-            .unwrap()
-            .trim()
-            .parse::<u32>()
-            .unwrap();
+        let guarded_pid = guarded_pid
+            .expect("guarded probe did not publish a parseable PID for parent-death test");
 
         // This bypasses Rust Drop inside the owner process. Only the
         // guardian's parent-death ownership pipe can clean the nested probe.

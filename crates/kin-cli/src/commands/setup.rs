@@ -2121,6 +2121,15 @@ fn read_single_git_pointer(path: &Path, label: &str) -> Result<String> {
 const SETUP_GIT_AUTHORITY_TIMEOUT: Duration = Duration::from_secs(15);
 const SETUP_GIT_AUTHORITY_CAPTURE_LIMIT: u64 = 4 * 1024 * 1024;
 
+enum SetupGitDeadlineStart {
+    Immediate,
+    #[cfg(all(test, unix))]
+    AfterParseablePid {
+        marker: PathBuf,
+        readiness_timeout: Duration,
+    },
+}
+
 fn git_authority_output(repo_root: &Path, args: &[&str]) -> Result<String> {
     let host_path = kin_core::shims::unshimmed_path();
     git_authority_output_with_policy(
@@ -2159,6 +2168,51 @@ fn git_authority_output_with_resolution_policy(
     timeout: Duration,
     capture_limit: u64,
 ) -> Result<String> {
+    git_authority_output_with_resolution_policy_from(
+        repo_root,
+        args,
+        host_path,
+        resolution_cwd,
+        timeout,
+        capture_limit,
+        SetupGitDeadlineStart::Immediate,
+    )
+}
+
+#[cfg(all(test, unix))]
+fn git_authority_output_with_policy_after_parseable_pid_ready(
+    repo_root: &Path,
+    args: &[&str],
+    host_path: &str,
+    readiness_marker: &Path,
+    timeout: Duration,
+    capture_limit: u64,
+) -> Result<String> {
+    let resolution_cwd =
+        std::env::current_dir().context("capture host Git resolution directory for setup")?;
+    git_authority_output_with_resolution_policy_from(
+        repo_root,
+        args,
+        host_path,
+        &resolution_cwd,
+        timeout,
+        capture_limit,
+        SetupGitDeadlineStart::AfterParseablePid {
+            marker: readiness_marker.to_path_buf(),
+            readiness_timeout: Duration::from_secs(5),
+        },
+    )
+}
+
+fn git_authority_output_with_resolution_policy_from(
+    repo_root: &Path,
+    args: &[&str],
+    host_path: &str,
+    resolution_cwd: &Path,
+    timeout: Duration,
+    capture_limit: u64,
+    deadline_start: SetupGitDeadlineStart,
+) -> Result<String> {
     let repo_root = repo_root
         .canonicalize()
         .with_context(|| format!("failed to canonicalize repository {}", repo_root.display()))?;
@@ -2176,7 +2230,14 @@ fn git_authority_output_with_resolution_policy(
         .arg("-C")
         .arg(&repo_root)
         .args(args);
-    run_git_authority_command(&mut command, args, &host_path, timeout, capture_limit)
+    run_git_authority_command(
+        &mut command,
+        args,
+        &host_path,
+        timeout,
+        capture_limit,
+        deadline_start,
+    )
 }
 
 fn absolute_setup_host_search_path(
@@ -2206,15 +2267,33 @@ fn run_git_authority_command(
     host_path: &OsStr,
     timeout: Duration,
     capture_limit: u64,
+    deadline_start: SetupGitDeadlineStart,
 ) -> Result<String> {
     let label = format!("Git workspace authority query {args:?}");
     finalize_setup_git_authority_process(command, host_path);
-    let output = crate::daemon_client::probe_process::output_finalized_with_timeout_and_limit(
-        command,
-        &label,
-        timeout,
-        capture_limit,
-    )
+    let output = match deadline_start {
+        SetupGitDeadlineStart::Immediate => {
+            crate::daemon_client::probe_process::output_finalized_with_timeout_and_limit(
+                command,
+                &label,
+                timeout,
+                capture_limit,
+            )
+        }
+        #[cfg(all(test, unix))]
+        SetupGitDeadlineStart::AfterParseablePid {
+            marker,
+            readiness_timeout,
+        } => crate::daemon_client::probe_process::
+            output_finalized_with_timeout_and_limit_after_parseable_pid_ready(
+                command,
+                &label,
+                &marker,
+                readiness_timeout,
+                timeout,
+                capture_limit,
+            ),
+    }
     .with_context(|| format!("failed to run host Git authority query {args:?}"))?;
     if !output.status.success() {
         anyhow::bail!(
@@ -12318,17 +12397,21 @@ printf 'args=%s|%s|%s|%s|%s\n' "$1" "$2" "$3" "$4" "$5"
             &bin,
             r#"
 /bin/sleep 30 &
-printf '%s\n' "$!" > "${0%/*}/descendant.pid"
+descendant_pid="$!"
+printf '%s\n' "$descendant_pid" > "${0%/*}/descendant.pid.staged"
+/bin/mv "${0%/*}/descendant.pid.staged" "${0%/*}/descendant.pid"
 chunk='xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
 while :; do
     printf '%s' "$chunk"
 done
 "#,
         );
-        let error = git_authority_output_with_policy(
+        let marker = bin.join("descendant.pid");
+        let error = git_authority_output_with_policy_after_parseable_pid_ready(
             fixture.path(),
             &["rev-parse", "HEAD"],
             &bin.to_string_lossy(),
+            &marker,
             Duration::from_secs(5),
             4 * 1024,
         )
@@ -12337,7 +12420,7 @@ done
         assert!(message.contains("exceeded the 4096-byte"), "{message}");
         assert!(message.contains("cleanup=ok"), "{message}");
 
-        let pid = fs::read_to_string(bin.join("descendant.pid"))
+        let pid = fs::read_to_string(marker)
             .unwrap()
             .trim()
             .parse::<u32>()
@@ -12357,14 +12440,18 @@ done
             &bin,
             r#"
 /bin/sleep 30 &
-printf '%s\n' "$!" > "${0%/*}/descendant.pid"
+descendant_pid="$!"
+printf '%s\n' "$descendant_pid" > "${0%/*}/descendant.pid.staged"
+/bin/mv "${0%/*}/descendant.pid.staged" "${0%/*}/descendant.pid"
 wait
 "#,
         );
-        let error = git_authority_output_with_policy(
+        let marker = bin.join("descendant.pid");
+        let error = git_authority_output_with_policy_after_parseable_pid_ready(
             fixture.path(),
             &["worktree", "list", "--porcelain"],
             &bin.to_string_lossy(),
+            &marker,
             Duration::from_millis(200),
             16 * 1024,
         )
@@ -12373,7 +12460,7 @@ wait
         assert!(message.contains("timed out after 200ms"), "{message}");
         assert!(message.contains("cleanup=ok"), "{message}");
 
-        let pid = fs::read_to_string(bin.join("descendant.pid"))
+        let pid = fs::read_to_string(marker)
             .unwrap()
             .trim()
             .parse::<u32>()

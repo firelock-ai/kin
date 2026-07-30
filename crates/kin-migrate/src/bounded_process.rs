@@ -1227,6 +1227,31 @@ mod tests {
     const PROBE_WORKER_ENV: &str = "KINTEST_MIGRATION_PROBE_WORKER";
     const PROBE_DESCENDANT_MARKER_ENV: &str = "KINTEST_MIGRATION_PROBE_DESCENDANT_MARKER";
 
+    fn publish_pid_marker(marker: &std::path::Path) -> std::io::Result<()> {
+        let pid = std::process::id();
+        let mut staged_name = marker
+            .file_name()
+            .unwrap_or_else(|| std::ffi::OsStr::new("probe-descendant.pid"))
+            .to_os_string();
+        staged_name.push(format!(".{pid}.tmp"));
+        let staged_marker = marker.with_file_name(staged_name);
+        std::fs::write(&staged_marker, pid.to_string())?;
+        if let Err(error) = std::fs::rename(&staged_marker, marker) {
+            let _ = std::fs::remove_file(staged_marker);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn read_pid_marker(marker: &std::path::Path) -> Option<u32> {
+        std::fs::read_to_string(marker)
+            .ok()?
+            .trim()
+            .parse::<u32>()
+            .ok()
+            .filter(|pid| *pid != 0)
+    }
+
     struct NeverEofCapturePipe;
 
     impl std::io::Read for NeverEofCapturePipe {
@@ -1311,8 +1336,9 @@ mod tests {
             );
             panic!("parent-owner fixture unexpectedly returned: {result:?}");
         } else if mode == "descendant" {
-            let marker = std::env::var_os(PROBE_DESCENDANT_MARKER_ENV).unwrap();
-            std::fs::write(marker, std::process::id().to_string()).unwrap();
+            let marker =
+                std::path::PathBuf::from(std::env::var_os(PROBE_DESCENDANT_MARKER_ENV).unwrap());
+            publish_pid_marker(&marker).unwrap();
             std::thread::sleep(Duration::from_secs(30));
         } else if mode == "spawn-descendant" {
             let marker =
@@ -1328,11 +1354,13 @@ mod tests {
                 .spawn()
                 .unwrap();
             let deadline = Instant::now() + Duration::from_secs(5);
-            while !marker.is_file() && Instant::now() < deadline {
+            let mut descendant_pid = read_pid_marker(&marker);
+            while descendant_pid.is_none() && Instant::now() < deadline {
                 assert!(descendant.try_wait().unwrap().is_none());
                 std::thread::sleep(POLL_INTERVAL);
+                descendant_pid = read_pid_marker(&marker);
             }
-            assert!(marker.is_file(), "probe descendant did not become ready");
+            descendant_pid.expect("probe descendant did not publish a parseable PID");
             drop(descendant);
         }
     }
@@ -1428,11 +1456,8 @@ mod tests {
         .unwrap();
         assert!(output.status.success());
 
-        let pid = std::fs::read_to_string(&marker)
-            .unwrap()
-            .trim()
-            .parse::<u32>()
-            .unwrap();
+        let pid =
+            read_pid_marker(&marker).expect("probe descendant did not publish a parseable PID");
         assert!(
             !process_is_live(pid),
             "probe descendant {pid} survived bounded return"
@@ -1494,22 +1519,17 @@ mod tests {
             .stderr(Stdio::null());
         let mut owner = KillAndReapOnDrop(Some(owner_command.spawn().unwrap()));
         let ready_deadline = Instant::now() + Duration::from_secs(5);
-        while !marker.is_file() && Instant::now() < ready_deadline {
+        let mut guarded_pid = read_pid_marker(&marker);
+        while guarded_pid.is_none() && Instant::now() < ready_deadline {
             assert!(
                 owner.child_mut().try_wait().unwrap().is_none(),
                 "parent fixture exited before its guarded probe became ready"
             );
             std::thread::sleep(POLL_INTERVAL);
+            guarded_pid = read_pid_marker(&marker);
         }
-        assert!(
-            marker.is_file(),
-            "guarded probe did not become ready for parent-death test"
-        );
-        let guarded_pid = std::fs::read_to_string(&marker)
-            .unwrap()
-            .trim()
-            .parse::<u32>()
-            .unwrap();
+        let guarded_pid = guarded_pid
+            .expect("guarded probe did not publish a parseable PID for parent-death test");
 
         // This bypasses Rust Drop inside the owner process. Only the
         // guardian's parent-death ownership pipe can clean the nested probe.

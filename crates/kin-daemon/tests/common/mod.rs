@@ -821,6 +821,7 @@ fn spawn_contained_test_command(
     Ok(DaemonChild { child, containment })
 }
 
+#[cfg(unix)]
 fn confirm_containment_empty_blocking(
     containment: &DaemonContainment,
     label: &str,

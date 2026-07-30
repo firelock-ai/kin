@@ -1542,6 +1542,21 @@ mod tests {
     #[cfg(unix)]
     const HOSTILE_GIT_MARKER: &str = "TEST_FIXTURE_GIT_HOSTILE_EXECUTABLE_MARKER";
 
+    fn publish_marker_atomically(marker: &Path, contents: impl AsRef<[u8]>) {
+        let mut staged_name = marker.as_os_str().to_os_string();
+        staged_name.push(".staged");
+        let staged = PathBuf::from(staged_name);
+        std::fs::write(&staged, contents).unwrap();
+        std::fs::rename(staged, marker).unwrap();
+    }
+
+    fn read_pid_marker(marker: &Path) -> Option<u32> {
+        std::fs::read_to_string(marker)
+            .ok()
+            .and_then(|contents| contents.trim().parse::<u32>().ok())
+            .filter(|pid| *pid != 0)
+    }
+
     struct NeverEofCapturePipe;
 
     impl io::Read for NeverEofCapturePipe {
@@ -2022,11 +2037,10 @@ mod tests {
     #[test]
     fn parent_death_guardian_worker() {
         if let Some(marker) = std::env::var_os(PARENT_DEATH_DESCENDANT) {
-            std::fs::write(
-                PathBuf::from(&marker).with_extension("pid"),
+            publish_marker_atomically(
+                &PathBuf::from(&marker).with_extension("pid"),
                 std::process::id().to_string(),
-            )
-            .unwrap();
+            );
             std::thread::sleep(Duration::from_secs(30));
             std::fs::write(
                 PathBuf::from(marker).with_extension("finished"),
@@ -2054,12 +2068,22 @@ mod tests {
         let (mut descendant, tree) =
             FixtureProcessTree::spawn(&mut descendant, "parent-death descendant").unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
-        while !marker.with_extension("pid").is_file() && Instant::now() < deadline {
+        let pid_marker = marker.with_extension("pid");
+        let descendant_pid = loop {
+            if let Some(pid) = read_pid_marker(&pid_marker) {
+                break pid;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "parent-death descendant did not publish a parseable pid"
+            );
             assert!(descendant.try_wait().unwrap().is_none());
             std::thread::sleep(FIXTURE_GIT_POLL_INTERVAL);
-        }
-        assert!(marker.with_extension("pid").is_file());
-        std::fs::write(marker.with_extension("owner-ready"), b"ready").unwrap();
+        };
+        publish_marker_atomically(
+            &marker.with_extension("owner-ready"),
+            descendant_pid.to_string(),
+        );
         let _descendant = descendant;
         let _tree = tree;
         std::thread::sleep(Duration::from_secs(30));
@@ -2084,18 +2108,21 @@ mod tests {
             .stderr(Stdio::null());
         let mut owner = owner.spawn().unwrap();
         let ready_deadline = Instant::now() + Duration::from_secs(5);
-        while !marker.with_extension("owner-ready").is_file() && Instant::now() < ready_deadline {
+        let ready_marker = marker.with_extension("owner-ready");
+        let descendant = loop {
+            if let Some(pid) = read_pid_marker(&ready_marker) {
+                break pid;
+            }
+            assert!(
+                Instant::now() < ready_deadline,
+                "parent-death owner never published a parseable descendant pid"
+            );
             assert!(
                 owner.try_wait().unwrap().is_none(),
                 "parent-death owner exited before its descendant became ready"
             );
             std::thread::sleep(FIXTURE_GIT_POLL_INTERVAL);
-        }
-        assert!(marker.with_extension("owner-ready").is_file());
-        let descendant = std::fs::read_to_string(marker.with_extension("pid"))
-            .unwrap()
-            .parse::<u32>()
-            .unwrap();
+        };
 
         let owner_pid = libc::pid_t::try_from(owner.id()).unwrap();
         assert_eq!(unsafe { libc::kill(owner_pid, libc::SIGKILL) }, 0);
@@ -2188,11 +2215,10 @@ mod tests {
     #[test]
     fn descendant_worker() {
         if let Some(marker) = std::env::var_os(DESCENDANT_MARKER) {
-            std::fs::write(
-                PathBuf::from(&marker).with_extension("pid"),
+            publish_marker_atomically(
+                &PathBuf::from(&marker).with_extension("pid"),
                 std::process::id().to_string(),
-            )
-            .unwrap();
+            );
             println!("descendant inherited capture");
             std::io::stdout().flush().unwrap();
             std::thread::sleep(Duration::from_secs(30));
@@ -2217,11 +2243,18 @@ mod tests {
             .spawn()
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
-        while !marker.with_extension("pid").is_file() && Instant::now() < deadline {
+        let pid_marker = marker.with_extension("pid");
+        loop {
+            if read_pid_marker(&pid_marker).is_some() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "descendant did not publish a parseable pid"
+            );
             assert!(descendant.try_wait().unwrap().is_none());
             std::thread::sleep(FIXTURE_GIT_POLL_INTERVAL);
         }
-        assert!(marker.with_extension("pid").is_file());
         drop(descendant);
     }
 
@@ -2243,10 +2276,8 @@ mod tests {
             .unwrap();
         assert!(output.status.success(), "{output:?}");
         assert!(String::from_utf8_lossy(&output.stdout).contains("descendant inherited capture"));
-        let pid = std::fs::read_to_string(marker.with_extension("pid"))
-            .unwrap()
-            .parse::<u32>()
-            .unwrap();
+        let pid = read_pid_marker(&marker.with_extension("pid"))
+            .expect("descendant parent returned before publishing a parseable pid");
         assert!(
             !process_is_live(pid),
             "descendant process {pid} survived fixture return"

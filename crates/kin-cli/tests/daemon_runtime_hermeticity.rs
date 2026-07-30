@@ -110,12 +110,34 @@ fn git(repository: &Path, args: &[&str]) {
     );
 }
 
-fn recorded_pid(path: &Path) -> u32 {
+fn publish_marker_atomically(marker: &Path, contents: impl AsRef<[u8]>) {
+    let mut staged_name = marker.as_os_str().to_os_string();
+    staged_name.push(".staged");
+    let staged = PathBuf::from(staged_name);
+    std::fs::write(&staged, contents).expect("write staged runtime marker");
+    std::fs::rename(staged, marker).expect("publish runtime marker");
+}
+
+fn try_recorded_pid(path: &Path) -> Option<u32> {
     std::fs::read_to_string(path)
-        .unwrap_or_else(|error| panic!("read recorded pid at {}: {error}", path.display()))
-        .trim()
-        .parse()
-        .unwrap_or_else(|error| panic!("parse recorded pid at {}: {error}", path.display()))
+        .ok()
+        .and_then(|contents| contents.trim().parse::<u32>().ok())
+        .filter(|pid| *pid != 0)
+}
+
+fn recorded_pid(path: &Path) -> u32 {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(pid) = try_recorded_pid(path) {
+            return pid;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "parseable pid was not published at {}",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 fn process_alive(pid: u32) -> bool {
@@ -783,10 +805,7 @@ fn cleanup_sleeper_worker() {
     }
     if let Some(marker) = std::env::var_os(CLEANUP_WAIT_FOR_MARKER) {
         let marker = PathBuf::from(marker);
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !marker.is_file() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        let _ = recorded_pid(&marker);
     }
     std::thread::sleep(Duration::from_secs(30));
 }
@@ -795,8 +814,7 @@ fn cleanup_sleeper_worker() {
 #[serial]
 fn containment_process_tree_worker() {
     if let Some(marker) = std::env::var_os(TREE_DESCENDANT) {
-        std::fs::write(PathBuf::from(marker), std::process::id().to_string())
-            .expect("write descendant pid");
+        publish_marker_atomically(&PathBuf::from(marker), std::process::id().to_string());
         std::thread::sleep(Duration::from_secs(30));
         return;
     }
@@ -856,15 +874,8 @@ fn parent_death_runtime_worker() {
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn parent-death descendant");
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !descendant_marker.is_file() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    assert!(
-        descendant_marker.is_file(),
-        "parent-death descendant did not become ready"
-    );
-    std::fs::write(ready, b"parent ready").expect("write parent-death readiness");
+    let descendant = recorded_pid(&descendant_marker);
+    publish_marker_atomically(&ready, descendant.to_string());
     let _runtime = runtime;
     loop {
         std::thread::sleep(Duration::from_secs(60));
@@ -876,7 +887,6 @@ fn parent_death_runtime_worker() {
 fn hard_parent_death_terminates_the_guarded_process_group() {
     let root = tempdir().expect("temp root");
     let ready = root.path().join("parent-death.ready");
-    let descendant_marker = root.path().join("parent-death-descendant.pid");
     let mut parent = KillAndReapChild::new(
         std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "parent_death_runtime_worker", "--nocapture"])
@@ -889,7 +899,14 @@ fn hard_parent_death_terminates_the_guarded_process_group() {
             .expect("spawn parent-death runtime worker"),
     );
     let deadline = Instant::now() + Duration::from_secs(5);
-    while !ready.is_file() && Instant::now() < deadline {
+    let descendant = loop {
+        if let Some(pid) = try_recorded_pid(&ready) {
+            break pid;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "parent-death worker never published a parseable descendant pid"
+        );
         assert!(
             parent
                 .try_wait()
@@ -898,9 +915,7 @@ fn hard_parent_death_terminates_the_guarded_process_group() {
             "parent-death worker exited before readiness"
         );
         std::thread::sleep(Duration::from_millis(20));
-    }
-    assert!(ready.is_file(), "parent-death worker never became ready");
-    let descendant = recorded_pid(&descendant_marker);
+    };
 
     parent
         .terminate_and_reap()
@@ -924,10 +939,6 @@ fn spawn_contained_process_tree(
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn contained process tree");
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !marker.is_file() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(20));
-    }
     let descendant = recorded_pid(&marker);
     (child, descendant)
 }

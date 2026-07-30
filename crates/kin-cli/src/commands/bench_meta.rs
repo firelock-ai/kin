@@ -484,6 +484,15 @@ fn git_output_optional(repo_path: &Path, args: &[&str]) -> Option<String> {
 const BENCH_GIT_TIMEOUT: Duration = Duration::from_secs(10);
 const BENCH_GIT_CAPTURE_LIMIT: u64 = 256 * 1024;
 
+enum BenchGitDeadlineStart {
+    Immediate,
+    #[cfg(all(test, unix))]
+    AfterParseablePid {
+        marker: std::path::PathBuf,
+        readiness_timeout: Duration,
+    },
+}
+
 fn git_output_inner(repo_path: &Path, args: &[&str]) -> Result<String> {
     let host_path = kin_core::shims::unshimmed_path();
     git_output_inner_with_policy(
@@ -522,6 +531,51 @@ fn git_output_inner_with_resolution_policy(
     timeout: Duration,
     capture_limit: u64,
 ) -> Result<String> {
+    git_output_inner_with_resolution_policy_from(
+        repo_path,
+        args,
+        host_path,
+        resolution_cwd,
+        timeout,
+        capture_limit,
+        BenchGitDeadlineStart::Immediate,
+    )
+}
+
+#[cfg(all(test, unix))]
+fn git_output_inner_with_policy_after_parseable_pid_ready(
+    repo_path: &Path,
+    args: &[&str],
+    host_path: &str,
+    readiness_marker: &Path,
+    timeout: Duration,
+    capture_limit: u64,
+) -> Result<String> {
+    let resolution_cwd =
+        std::env::current_dir().context("capture host Git resolution directory for benchmark")?;
+    git_output_inner_with_resolution_policy_from(
+        repo_path,
+        args,
+        host_path,
+        &resolution_cwd,
+        timeout,
+        capture_limit,
+        BenchGitDeadlineStart::AfterParseablePid {
+            marker: readiness_marker.to_path_buf(),
+            readiness_timeout: Duration::from_secs(5),
+        },
+    )
+}
+
+fn git_output_inner_with_resolution_policy_from(
+    repo_path: &Path,
+    args: &[&str],
+    host_path: &str,
+    resolution_cwd: &Path,
+    timeout: Duration,
+    capture_limit: u64,
+    deadline_start: BenchGitDeadlineStart,
+) -> Result<String> {
     let repo_root = repo_path
         .canonicalize()
         .with_context(|| format!("canonicalize benchmark repository {}", repo_path.display()))?;
@@ -538,7 +592,14 @@ fn git_output_inner_with_resolution_policy(
         .arg("--no-replace-objects")
         .args(args)
         .current_dir(&repo_root);
-    run_bench_git_command(&mut command, args, &host_path, timeout, capture_limit)
+    run_bench_git_command(
+        &mut command,
+        args,
+        &host_path,
+        timeout,
+        capture_limit,
+        deadline_start,
+    )
 }
 
 fn absolute_bench_host_search_path(
@@ -568,15 +629,33 @@ fn run_bench_git_command(
     host_path: &OsStr,
     timeout: Duration,
     capture_limit: u64,
+    deadline_start: BenchGitDeadlineStart,
 ) -> Result<String> {
     let label = format!("Git benchmark metadata query {args:?}");
     finalize_bench_git_process(command, host_path);
-    let output = crate::daemon_client::probe_process::output_finalized_with_timeout_and_limit(
-        command,
-        &label,
-        timeout,
-        capture_limit,
-    )
+    let output = match deadline_start {
+        BenchGitDeadlineStart::Immediate => {
+            crate::daemon_client::probe_process::output_finalized_with_timeout_and_limit(
+                command,
+                &label,
+                timeout,
+                capture_limit,
+            )
+        }
+        #[cfg(all(test, unix))]
+        BenchGitDeadlineStart::AfterParseablePid {
+            marker,
+            readiness_timeout,
+        } => crate::daemon_client::probe_process::
+            output_finalized_with_timeout_and_limit_after_parseable_pid_ready(
+                command,
+                &label,
+                &marker,
+                readiness_timeout,
+                timeout,
+                capture_limit,
+            ),
+    }
     .with_context(|| format!("run host Git benchmark metadata query {args:?}"))?;
     if !output.status.success() {
         return Err(anyhow::anyhow!(
@@ -682,7 +761,10 @@ mod tests {
         vector_index_metadata_version,
     };
     #[cfg(unix)]
-    use super::{git_output_inner_with_policy, git_output_inner_with_resolution_policy};
+    use super::{
+        git_output_inner_with_policy, git_output_inner_with_policy_after_parseable_pid_ready,
+        git_output_inner_with_resolution_policy,
+    };
     use std::ffi::{OsStr, OsString};
     use std::fs;
     use std::path::Path;
@@ -875,17 +957,21 @@ printf 'global=%s\n' "$GIT_CONFIG_GLOBAL"
             &bin,
             r#"
 /bin/sleep 30 &
-printf '%s\n' "$!" > "${0%/*}/descendant.pid"
+descendant_pid="$!"
+printf '%s\n' "$descendant_pid" > "${0%/*}/descendant.pid.staged"
+/bin/mv "${0%/*}/descendant.pid.staged" "${0%/*}/descendant.pid"
 chunk='xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
 while :; do
     printf '%s' "$chunk"
 done
 "#,
         );
-        let error = git_output_inner_with_policy(
+        let marker = bin.join("descendant.pid");
+        let error = git_output_inner_with_policy_after_parseable_pid_ready(
             fixture.path(),
             &["rev-parse", "HEAD"],
             &bin.to_string_lossy(),
+            &marker,
             Duration::from_secs(5),
             4 * 1024,
         )
@@ -894,7 +980,7 @@ done
         assert!(message.contains("exceeded the 4096-byte"), "{message}");
         assert!(message.contains("cleanup=ok"), "{message}");
 
-        let pid = fs::read_to_string(bin.join("descendant.pid"))
+        let pid = fs::read_to_string(marker)
             .unwrap()
             .trim()
             .parse::<u32>()
@@ -914,14 +1000,18 @@ done
             &bin,
             r#"
 /bin/sleep 30 &
-printf '%s\n' "$!" > "${0%/*}/descendant.pid"
+descendant_pid="$!"
+printf '%s\n' "$descendant_pid" > "${0%/*}/descendant.pid.staged"
+/bin/mv "${0%/*}/descendant.pid.staged" "${0%/*}/descendant.pid"
 wait
 "#,
         );
-        let error = git_output_inner_with_policy(
+        let marker = bin.join("descendant.pid");
+        let error = git_output_inner_with_policy_after_parseable_pid_ready(
             fixture.path(),
             &["rev-parse", "HEAD"],
             &bin.to_string_lossy(),
+            &marker,
             Duration::from_millis(200),
             16 * 1024,
         )
@@ -930,7 +1020,7 @@ wait
         assert!(message.contains("timed out after 200ms"), "{message}");
         assert!(message.contains("cleanup=ok"), "{message}");
 
-        let pid = fs::read_to_string(bin.join("descendant.pid"))
+        let pid = fs::read_to_string(marker)
             .unwrap()
             .trim()
             .parse::<u32>()

@@ -2369,12 +2369,31 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
-    fn wait_for_worker_marker(path: &Path) {
+    fn publish_worker_pid_atomically(path: &Path) {
+        let mut staged_name = path.as_os_str().to_os_string();
+        staged_name.push(".staged");
+        let staged = PathBuf::from(staged_name);
+        std::fs::write(&staged, std::process::id().to_string()).expect("write staged worker pid");
+        std::fs::rename(staged, path).expect("publish worker pid");
+    }
+
+    #[cfg(target_os = "macos")]
+    fn wait_for_worker_pid(path: &Path) -> u32 {
         let deadline = Instant::now() + Duration::from_secs(5);
-        while !path.is_file() && Instant::now() < deadline {
+        loop {
+            if let Some(pid) = std::fs::read_to_string(path)
+                .ok()
+                .and_then(|contents| contents.trim().parse::<u32>().ok())
+                .filter(|pid| *pid != 0)
+            {
+                return pid;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "worker never published a parseable pid"
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert!(path.is_file(), "worker marker was never published");
     }
 
     #[cfg(target_os = "macos")]
@@ -2434,8 +2453,7 @@ mod tests {
                 let marker = PathBuf::from(
                     std::env::var_os(LIFECYCLE_DESCENDANT_MARKER).expect("descendant marker path"),
                 );
-                std::fs::write(marker, std::process::id().to_string())
-                    .expect("publish descendant pid");
+                publish_worker_pid_atomically(&marker);
                 std::thread::sleep(Duration::from_secs(60));
             }
             "spawn-descendant" | "spawn-descendant-and-wait" => {
@@ -2447,7 +2465,7 @@ mod tests {
                     .env(LIFECYCLE_DESCENDANT_MARKER, &marker)
                     .stdin(Stdio::null());
                 let descendant = descendant.spawn().expect("spawn contained descendant");
-                wait_for_worker_marker(&marker);
+                let _descendant_pid = wait_for_worker_pid(&marker);
                 drop(descendant);
                 if mode == "spawn-descendant-and-wait" {
                     std::thread::sleep(Duration::from_secs(60));
@@ -2517,12 +2535,7 @@ mod tests {
             "deadline helper exceeded its bounded cleanup window"
         );
 
-        wait_for_worker_marker(&marker);
-        let descendant = std::fs::read_to_string(&marker)
-            .expect("read descendant pid")
-            .trim()
-            .parse::<u32>()
-            .expect("parse descendant pid");
+        let descendant = wait_for_worker_pid(&marker);
         wait_for_process_exit(descendant);
     }
 
@@ -2543,12 +2556,7 @@ mod tests {
         .expect("direct process should finish without inherited-output hang");
         assert!(output.status.success());
 
-        wait_for_worker_marker(&marker);
-        let descendant = std::fs::read_to_string(&marker)
-            .expect("read descendant pid")
-            .trim()
-            .parse::<u32>()
-            .expect("parse descendant pid");
+        let descendant = wait_for_worker_pid(&marker);
         wait_for_process_exit(descendant);
     }
 
@@ -2573,16 +2581,12 @@ mod tests {
                     .expect("spawn unwind-guard fixture");
             direct_pid = child.id();
             let _running = RunningLaunchctlCommand { child, containment };
-            wait_for_worker_marker(&marker);
+            let _descendant_pid = wait_for_worker_pid(&marker);
             panic!("exercise bounded-command unwind guard");
         }));
         assert!(unwind.is_err(), "fixture must unwind through the guard");
 
-        let descendant = std::fs::read_to_string(&marker)
-            .expect("read descendant pid")
-            .trim()
-            .parse::<u32>()
-            .expect("parse descendant pid");
+        let descendant = wait_for_worker_pid(&marker);
         wait_for_process_exit(direct_pid);
         wait_for_process_exit(descendant);
     }

@@ -15,6 +15,21 @@ const TREE_PARENT: &str = "KIN_TEST_RUNTIME_TREE_PARENT";
 const TREE_DESCENDANT: &str = "KIN_TEST_RUNTIME_TREE_DESCENDANT";
 const TREE_STOP: &str = "KIN_TEST_RUNTIME_TREE_STOP";
 
+fn publish_marker_atomically(marker: &std::path::Path, contents: impl AsRef<[u8]>) {
+    let mut staged_name = marker.as_os_str().to_os_string();
+    staged_name.push(".staged");
+    let staged = PathBuf::from(staged_name);
+    std::fs::write(&staged, contents).expect("write staged runtime marker");
+    std::fs::rename(staged, marker).expect("publish runtime marker");
+}
+
+fn read_pid_marker(marker: &std::path::Path) -> Option<u32> {
+    std::fs::read_to_string(marker)
+        .ok()
+        .and_then(|contents| contents.trim().parse::<u32>().ok())
+        .filter(|pid| *pid != 0)
+}
+
 struct KillAndReapChild {
     child: Child,
 }
@@ -76,8 +91,7 @@ impl Drop for KillAndReapChild {
 #[test]
 fn isolated_runtime_tree_worker() {
     if let Some(marker) = std::env::var_os(TREE_DESCENDANT) {
-        std::fs::write(PathBuf::from(marker), std::process::id().to_string())
-            .expect("write isolated-runtime descendant pid");
+        publish_marker_atomically(&PathBuf::from(marker), std::process::id().to_string());
         let stop = PathBuf::from(std::env::var_os(TREE_STOP).expect("tree stop marker"));
         let deadline = Instant::now() + Duration::from_secs(60);
         while !stop.is_file() && Instant::now() < deadline {
@@ -145,7 +159,14 @@ fn dropping_isolated_runtime_terminates_a_late_descendant() {
     );
     let parent_pid = parent.id();
     let deadline = Instant::now() + Duration::from_secs(10);
-    while !descendant_marker.is_file() && Instant::now() < deadline {
+    let descendant_pid = loop {
+        if let Some(pid) = read_pid_marker(&descendant_marker) {
+            break pid;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "runtime-owned descendant did not publish a parseable pid"
+        );
         assert!(
             parent
                 .try_wait()
@@ -154,12 +175,7 @@ fn dropping_isolated_runtime_terminates_a_late_descendant() {
             "runtime-owned parent exited before descendant readiness"
         );
         std::thread::sleep(Duration::from_millis(20));
-    }
-    let descendant_pid = std::fs::read_to_string(&descendant_marker)
-        .expect("read isolated-runtime descendant pid")
-        .trim()
-        .parse::<u32>()
-        .expect("parse isolated-runtime descendant pid");
+    };
     let parent_start = live_process_start_time(parent_pid).expect("live runtime-owned parent");
     let descendant_start =
         live_process_start_time(descendant_pid).expect("live runtime-owned descendant");

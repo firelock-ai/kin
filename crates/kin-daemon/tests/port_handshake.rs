@@ -37,11 +37,24 @@ const CONTAINMENT_TREE_DESCENDANT: &str = "KIN_TEST_DAEMON_CONTAINMENT_TREE_DESC
 #[cfg(unix)]
 const CONTAINMENT_HARD_PARENT: &str = "KIN_TEST_DAEMON_CONTAINMENT_HARD_PARENT";
 
+fn publish_marker_atomically(marker: &Path, contents: &[u8], context: &str) {
+    let mut staged_name = marker.as_os_str().to_os_string();
+    staged_name.push(".staged");
+    let staged = PathBuf::from(staged_name);
+    std::fs::write(&staged, contents)
+        .unwrap_or_else(|error| panic!("{context}: write staged marker: {error}"));
+    std::fs::rename(&staged, marker)
+        .unwrap_or_else(|error| panic!("{context}: publish staged marker: {error}"));
+}
+
 #[test]
 fn direct_containment_tree_worker() {
     if let Some(marker) = std::env::var_os(CONTAINMENT_TREE_DESCENDANT) {
-        std::fs::write(PathBuf::from(marker), std::process::id().to_string())
-            .expect("write direct-containment descendant pid");
+        publish_marker_atomically(
+            &PathBuf::from(marker),
+            std::process::id().to_string().as_bytes(),
+            "publish direct-containment descendant pid",
+        );
         std::thread::sleep(Duration::from_secs(30));
         return;
     }
@@ -90,8 +103,11 @@ async fn direct_containment_hard_parent_worker() {
     }
     let descendant_pid =
         std::fs::read_to_string(&descendant_marker).expect("read hard-parent descendant pid");
-    std::fs::write(&ready, format!("{direct_pid}\n{descendant_pid}"))
-        .expect("publish hard-parent containment readiness");
+    publish_marker_atomically(
+        &ready,
+        format!("{direct_pid}\n{descendant_pid}").as_bytes(),
+        "publish hard-parent containment readiness",
+    );
     loop {
         std::thread::sleep(Duration::from_secs(30));
     }
