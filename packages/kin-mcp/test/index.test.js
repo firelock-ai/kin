@@ -6,6 +6,7 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { fileURLToPath } from 'node:url';
 
 import {
   childEnv,
@@ -514,6 +515,59 @@ test('runKinMcp auto-inits when explicitly allowed', async () => {
     assert.ok(initPos >= 0, 'expected kin init . call');
     assert.ok(mcpPos >= 0, 'expected kin mcp start call');
     assert.ok(initPos < mcpPos, 'init should run before mcp start');
+  } finally {
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('auto-init keeps MCP stdout protocol-only from process start', async () => {
+  const tmpDir = await fs.mkdtemp(
+    path.join(os.tmpdir(), 'kin-mcp-autoinit-protocol-')
+  );
+  const binaryPath = path.join(tmpDir, 'kin');
+  const protocolPayload = JSON.stringify({
+    jsonrpc: '2.0',
+    id: 1,
+    result: { protocolVersion: '2024-11-05' }
+  });
+  const protocolFrame =
+    `Content-Length: ${Buffer.byteLength(protocolPayload)}\r\n\r\n${protocolPayload}`;
+  await fs.writeFile(
+    binaryPath,
+    [
+      '#!/bin/sh',
+      'if [ "$1" = "init" ]; then',
+      "  printf '%s\\n' 'init stdout must leave the protocol channel'",
+      "  printf '%s\\n' 'init stderr remains diagnostic' >&2",
+      `  mkdir -p "${tmpDir}/.kin"`,
+      '  exit 0',
+      'fi',
+      `printf '%s' '${protocolFrame}'`,
+      ''
+    ].join('\n'),
+    { mode: 0o755 }
+  );
+
+  try {
+    const result = cp.spawnSync(
+      process.execPath,
+      [fileURLToPath(new URL('../bin/kin-mcp.js', import.meta.url))],
+      {
+        cwd: tmpDir,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          KIN_MCP_KIN_BINARY: binaryPath,
+          KIN_MCP_AUTO_INIT: '1'
+        }
+      }
+    );
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout, protocolFrame);
+    assert.doesNotMatch(result.stdout, /init stdout/);
+    assert.match(result.stderr, /init stdout must leave the protocol channel/);
+    assert.match(result.stderr, /init stderr remains diagnostic/);
   } finally {
     await fs.rm(tmpDir, { recursive: true, force: true });
   }

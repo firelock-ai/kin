@@ -195,7 +195,16 @@ export async function runKinMcp(argv = [], options = {}) {
       return 2;
     }
     stderr.write('No .kin/ found; KIN_MCP_AUTO_INIT=1, running kin init...\n');
-    const initCode = await spawnKin(binaryPath, ['init', '.'], { ...spawnOptions, cwd });
+    const initCode = await spawnKin(
+      binaryPath,
+      ['init', '.'],
+      {
+        ...spawnOptions,
+        cwd,
+        stdio: ['ignore', 'pipe', 'pipe']
+      },
+      { forwardOutputTo: stderr }
+    );
     if (initCode !== 0) {
       stderr.write('kin init failed. Cannot start MCP server.\n');
       return initCode;
@@ -474,7 +483,7 @@ async function isRunnable(filePath, platform) {
   }
 }
 
-function spawnKin(binaryPath, args, options) {
+function spawnKin(binaryPath, args, options, { forwardOutputTo } = {}) {
   const env = options.env || process.env;
 
   return new Promise((resolve, reject) => {
@@ -483,6 +492,11 @@ function spawnKin(binaryPath, args, options) {
       env,
       stdio: options.stdio || 'inherit'
     });
+
+    if (forwardOutputTo) {
+      forwardStream(child.stdout, forwardOutputTo);
+      forwardStream(child.stderr, forwardOutputTo);
+    }
 
     const handlers = new Map();
     for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
@@ -514,5 +528,19 @@ function spawnKin(binaryPath, args, options) {
       }
       resolve(code ?? 1);
     });
+  });
+}
+
+function forwardStream(source, destination) {
+  if (!source) {
+    return;
+  }
+
+  source.on('data', chunk => {
+    const ready = destination.write(chunk);
+    if (ready === false && typeof destination.once === 'function') {
+      source.pause();
+      destination.once('drain', () => source.resume());
+    }
   });
 }
