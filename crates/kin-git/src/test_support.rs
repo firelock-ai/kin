@@ -388,7 +388,7 @@ impl FixtureGitCommand {
             .expect("fixture Git command was already consumed")
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn inner_ref(&self) -> &Command {
         self.inner
             .as_ref()
