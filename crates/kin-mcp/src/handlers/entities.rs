@@ -258,6 +258,14 @@ pub const MAX_BULK_SOURCE_ENTITIES: usize = 50;
 /// One resolved entity's source facts, projected into a path-independent shape:
 /// the generic graph store and the daemon graph both build this before the batch
 /// envelope is assembled, so the response row is identical across serving paths.
+///
+/// Each row is individually coherent; the BATCH is not one instant. Authority is
+/// sampled per entity, so a 50-row response can straddle workspace generations and
+/// two rows may describe different ones. No row is wrong, but nothing here
+/// promises they share a moment, which is why each row carries its own provenance
+/// rather than the envelope carrying one stamp for all of them. A caller that
+/// needs a single consistent snapshot across many entities must compare the
+/// per-row `workspace_generation` values rather than assume they agree.
 #[derive(Debug, Clone)]
 pub struct EntitySourceRow {
     pub id: String,
@@ -269,6 +277,16 @@ pub struct EntitySourceRow {
     pub end_line: u32,
     pub signature: String,
     pub body: String,
+    /// This row's source provenance and span coherence, rendered by the shared
+    /// [`source_provenance_fields`] seam, or empty when the serving path had none
+    /// to offer.
+    ///
+    /// A batch row needs this more than a single read does, not less. This tool
+    /// returns up to 50 full bodies and exists so an agent can restate source it
+    /// is about to overwrite, so "these bytes are uncommitted" and "this span was
+    /// never proven to describe them" are exactly the facts it must not have to
+    /// guess.
+    pub provenance: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Per-ID outcome for the batched source tool. Mirrors the single tool's
@@ -362,8 +380,14 @@ fn source_row_json(
         "signature": row.signature,
         "omitted": omitted,
     });
+    // Provenance rides with the body, and only with the body: a signature-only or
+    // budget-omitted row served no bytes, so it has no byte provenance to describe
+    // and stamping one would invite reading it as though it did.
     if let Some(body) = body {
         value["body"] = serde_json::json!(body);
+        if let Some(object) = value.as_object_mut() {
+            object.extend(row.provenance.clone());
+        }
     }
     if let Some(reason) = reason {
         value["reason"] = serde_json::json!(reason);
@@ -498,6 +522,7 @@ fn resolve_entity_source_generic<G: GraphStore>(
                     start_line: entity_presentation_start_line(&entity).unwrap_or(0),
                     end_line: entity_presentation_end_line(&entity).unwrap_or(0),
                     signature: entity.signature.clone(),
+                    provenance: source_provenance_fields(&source),
                     body: source.body,
                 }),
                 Ok(None) => ResolvedEntitySource::NoSource {
@@ -2927,6 +2952,7 @@ mod tests {
             start_line: 1,
             end_line: 3,
             signature: format!("fn {name}()"),
+            provenance: serde_json::Map::new(),
             body: body.to_string(),
         })
     }

@@ -5051,6 +5051,58 @@ mod tests {
         let _ = after_hash;
     }
 
+    /// The batch arm must disclose provenance on every row that carries a body.
+    ///
+    /// `get_entity_sources` returns up to 50 full bodies and exists so an agent can
+    /// restate source it is about to overwrite, which makes it the arm where "these
+    /// bytes are uncommitted" and "this span was never proven to describe them"
+    /// matter most. It was the one body-serving arm that rendered neither: the
+    /// refusal for provable incoherence reached it through the shared resolver, but
+    /// the served-unverified half of the same rule emitted no signal at all.
+    #[test]
+    fn batch_source_rows_carry_provenance_beside_each_body() {
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempdir().unwrap();
+        let _guard = EnvVarGuard::set("KIN_SOURCE_ROOT", dir.path());
+
+        let before = "export function alpha() { return 1; }\n";
+        let after = "export function alpha() { return 2; }\n";
+        let (entity, store, authority, _) =
+            divergent_tree_fixture(dir.path(), before, after, SpanStamp::Current);
+
+        let args = HashMap::from([(
+            "entity_ids".to_string(),
+            serde_json::json!([entity.id.to_string()]),
+        )]);
+        let value = tool_result_json(
+            entities::handle_get_entity_sources(&args, &store, Some(&authority)).unwrap(),
+        );
+        let row = &value["results"]
+            .as_array()
+            .unwrap_or_else(|| panic!("batch envelope must carry rows: {value}"))[0];
+
+        assert!(
+            row["body"].as_str().is_some_and(|b| b.contains("return 2")),
+            "the row must carry the live body: {row}"
+        );
+        // The bytes are in no committed change, and the row says so rather than
+        // naming one.
+        assert_eq!(
+            row["source_state"].as_str(),
+            Some("workspace"),
+            "a batch row over an uncommitted tree must disclose that: {row}"
+        );
+        assert!(
+            row.get("source_change_id").is_none(),
+            "no change contains these bytes, so none may be offered: {row}"
+        );
+        assert_eq!(row["span_coherence"].as_str(), Some("digest_verified"));
+        assert!(row.get("workspace_tree_hash").is_some());
+    }
+
     /// A span derived from one source must never be used to cut a different one.
     ///
     /// The graph and repository authority are separate stores updated by separate

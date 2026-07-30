@@ -1345,6 +1345,42 @@ fn recorded_span_source_digest(entity: &Entity) -> Option<kin_blobs::Hash256> {
     kin_blobs::Hash256::from_hex(hex).ok()
 }
 
+/// Bind a live entity's span to the artifact bytes about to be sliced with it.
+///
+/// THE one implementation of the coherence rule, public because not every serving
+/// arm resolves its bytes through [`read_entity_source_excerpt_detailed`]. The
+/// daemon's `get_entity_source` and `get_entity_sources` reach source through
+/// `kin_cli`'s own authority read, so a rule that lived only inside this module's
+/// resolver would hold on the offline arm and not on the arm agents actually use
+/// in product mode. One function, called from both, cannot drift that way.
+///
+/// `Err` means provable incoherence: the span was derived from different bytes
+/// than the ones at this path now, so slicing would return text that is not the
+/// entity's source. That is transient and retryable, and it is named as such,
+/// because the reconciler re-derives the span against the admitted tree.
+///
+/// `Ok(Unverified)` means the entity records no digest, which is an ordinary state
+/// and must never become a read failure.
+pub fn span_source_coherence(
+    entity: &Entity,
+    artifact_blob: &Hash256,
+    artifact_path: &str,
+) -> Result<SpanCoherence> {
+    match recorded_span_source_digest(entity) {
+        Some(recorded) if recorded.as_bytes() == artifact_blob.as_bytes() => {
+            Ok(SpanCoherence::DigestVerified)
+        }
+        Some(recorded) => Err(graph_source_gap(format!(
+            "entity {} span was derived from source {recorded} but path '{artifact_path}' now \
+             holds {artifact_blob} in the workspace tree, so the recorded span does not describe \
+             these bytes; the graph has admitted the new source and not yet re-derived this \
+             entity's span",
+            entity.id
+        ))),
+        None => Ok(SpanCoherence::Unverified),
+    }
+}
+
 fn resolve_entity_source_authority<G: GraphStore>(
     store: &G,
     entity: &Entity,
@@ -1596,26 +1632,9 @@ fn resolve_entity_source_authority<G: GraphStore>(
     // resolved committed state.
     let span_coherence = match scope {
         EntitySourceScope::At(_) => SpanCoherence::CoherentByConstruction,
-        EntitySourceScope::WorkspaceHead => match recorded_span_source_digest(entity) {
-            Some(recorded) if recorded.as_bytes() == hash.as_bytes() => {
-                SpanCoherence::DigestVerified
-            }
-            Some(recorded) => {
-                // Refuse rather than serve a body cut at the wrong offsets. This
-                // is a transient, retryable state: the reconciler re-derives the
-                // span against the admitted tree and the read then succeeds.
-                // Serving the mis-slice instead is the failure mode that makes an
-                // agent restate someone else's code as this entity's body.
-                return Err(graph_source_gap(format!(
-                    "entity {} span was derived from source {recorded} but path '{}' now holds \
-                     {hash} in the workspace tree, so the recorded span does not describe these \
-                     bytes; the graph has admitted the new source and not yet re-derived this \
-                     entity's span",
-                    entity.id, recorded_origin.0
-                )));
-            }
-            None => SpanCoherence::Unverified,
-        },
+        EntitySourceScope::WorkspaceHead => {
+            span_source_coherence(entity, &hash, &recorded_origin.0)?
+        }
     };
     let bytes = authority.load_source_blob(hash).map_err(|error| {
         graph_source_gap(format!(

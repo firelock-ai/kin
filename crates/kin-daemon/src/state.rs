@@ -1101,16 +1101,22 @@ pub struct DaemonState {
 pub struct CachedLocateRanking {
     pub entities: Vec<kin_cli::commands::locate::LocateEntity>,
     pub graph_version: u64,
-    /// Whether the cached hits carry source bodies.
+    /// Which entity projection this ranking was built in
+    /// ([`kin_cli::commands::locate::projection_mode`]).
     ///
     /// Checked on lookup, because a cursor token carries the cache KEY and the
-    /// client hands it back verbatim: folding the body mode into the key stops
-    /// the two modes from overwriting each other's slot, but it cannot stop a
-    /// caller from presenting the other mode's key. Without this check, paging a
+    /// client hands it back verbatim: folding the mode into the key stops two
+    /// modes from overwriting each other's slot, but it cannot stop a caller from
+    /// presenting another mode's key. Without this check, paging a
     /// bodies-carrying ranking with bodies declined returns source the caller
-    /// asked not to receive, and paging a bodies-less ranking with bodies
-    /// requested returns hits with no snippet at all.
-    pub bodies: bool,
+    /// asked not to receive, paging a bodies-less ranking with bodies requested
+    /// returns hits with no snippet at all, and paging any ranking with the
+    /// no-projection mode returns an empty page.
+    ///
+    /// A full mode token rather than a bool: `bodies` is false for BOTH the
+    /// coordinates-only agent projection and the no-projection legacy path, so a
+    /// bool cannot tell a real ranking from an empty one.
+    pub mode: &'static str,
     pub created: Instant,
 }
 
@@ -1120,10 +1126,12 @@ pub struct CachedLocateRanking {
 pub struct CachedSemanticPage {
     pub rows: Vec<serde_json::Value>,
     pub graph_version: u64,
-    /// Whether the cached rows carry `snippet`. Same reason as
-    /// [`CachedLocateRanking::bodies`]: the cursor supplies the key, so the mode
-    /// has to be verified on lookup rather than only keyed.
-    pub bodies: bool,
+    /// Which projection these rows were built in. Same reason as
+    /// [`CachedLocateRanking::mode`]: the cursor supplies the key, so the mode has
+    /// to be verified on lookup rather than only keyed. This arm always projects
+    /// rows, so only the two body modes occur here, but it carries the same token
+    /// so both caches answer the question the same way.
+    pub mode: &'static str,
     pub created: Instant,
 }
 

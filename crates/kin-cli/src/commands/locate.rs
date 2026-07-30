@@ -372,6 +372,37 @@ impl SnippetOptions {
         self.bodies = false;
         self
     }
+
+    /// Which entity projection this options value produces.
+    ///
+    /// See [`projection_mode`]. Two requests may share one cached ranking only
+    /// when these agree, so this is what belongs in a cache key, not `bodies`
+    /// alone.
+    pub fn projection_mode(&self) -> &'static str {
+        projection_mode(self.enabled, self.bodies)
+    }
+}
+
+/// Stable discriminator for the entity projection a request asks for.
+///
+/// There are THREE projections, not two, and collapsing them to `bodies` alone is
+/// a correctness bug rather than a naming one. `bodies` is false both for the
+/// agent surface that wants a full ranking without source and for the
+/// human/legacy surface that wants no `entities[]` at all
+/// (`build_entity_view` returns early on `!enabled`, leaving the ranking empty).
+/// Those two produce completely different results, so keying or filtering a
+/// cached ranking on `bodies` lets a legacy request overwrite an agent's cached
+/// ranking with an empty one and lets the agent's own cursor then be served that
+/// empty ranking, from cache, with no re-run.
+pub fn projection_mode(enabled: bool, bodies: bool) -> &'static str {
+    match (enabled, bodies) {
+        // No graph-native entity projection at all.
+        (false, _) => "none",
+        // The full ranking, coordinates only.
+        (true, false) => "ranking",
+        // The full ranking with graph-owned source on each hit.
+        (true, true) => "ranking+bodies",
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Default)]
@@ -15446,14 +15477,14 @@ pub fn build_entity_view(
 }
 
 /// Stable, opaque key for a locate ranking, scoped to the query, the ref/scope it
-/// ran against, the graph version, and whether the cached hits carry source
-/// bodies. Embedding the graph version means any edit (a `vfs_version` bump)
-/// yields a different key, so a stale cursor can never page a ranking built
-/// against different graph truth.
+/// ran against, the graph version, and the entity projection it was built in.
+/// Embedding the graph version means any edit (a `vfs_version` bump) yields a
+/// different key, so a stale cursor can never page a ranking built against
+/// different graph truth.
 ///
-/// `bodies` is part of the key because a cached ranking IS the paged answer, so
-/// the mode it was built in decides what every later page returns. Two ways that
-/// bites when the mode is left out, both reachable on one query at one graph
+/// `mode` is part of the key because a cached ranking IS the paged answer, so the
+/// projection it was built in decides what every later page returns. Three ways
+/// that bites when the mode is left out, all reachable on one query at one graph
 /// version:
 ///
 /// - a ranking cached WITH bodies, paged by a caller that declined them, returns
@@ -15461,18 +15492,23 @@ pub fn build_entity_view(
 ///   set to bound its token spend;
 /// - a ranking cached WITHOUT bodies, paged by a caller that asked for them,
 ///   returns hits carrying no snippet at all -- the "set `include_snippet` and
-///   found no snippet key" defect, relocated from page 0 to page 1.
+///   found no snippet key" defect, relocated from page 0 to page 1;
+/// - a ranking cached by a caller that wanted NO entity projection is empty, and
+///   sharing a key with the coordinates-only agent projection lets it overwrite a
+///   real ranking, so an agent's own cursor is then served an empty page from
+///   cache with no re-run.
 ///
-/// A mode mismatch must therefore miss the cache and re-run the ranking, which is
-/// what a distinct key produces. It is a required parameter rather than
-/// something callers fold into `reference` themselves because every paging
-/// surface has to make the same decision, and a convention that lives in three
-/// call sites and is enforced in none is how the two defects above arrived.
+/// The third is why this takes a [`projection_mode`] token rather than a `bodies`
+/// bool: there are three projections and a bool can only separate two of them.
+/// It is a required parameter rather than something callers fold into `reference`
+/// themselves because every paging surface has to make the same decision, and a
+/// convention that lives in three call sites and is enforced in none is how these
+/// defects arrived.
 pub fn locate_cursor_key(
     text: &str,
     reference: Option<&str>,
     graph_version: u64,
-    bodies: bool,
+    mode: &str,
 ) -> String {
     use std::hash::{Hash, Hasher};
     let mut hasher = FxHasher::default();
@@ -15482,7 +15518,7 @@ pub fn locate_cursor_key(
     0xff_u8.hash(&mut hasher);
     graph_version.hash(&mut hasher);
     0xff_u8.hash(&mut hasher);
-    bodies.hash(&mut hasher);
+    mode.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
 }
 
@@ -16353,44 +16389,81 @@ mod tests {
 
     #[test]
     fn locate_cursor_key_is_deterministic_and_version_scoped() {
-        let a = locate_cursor_key("find the parser", Some("HEAD"), 42, true);
-        let b = locate_cursor_key("find the parser", Some("HEAD"), 42, true);
+        let a = locate_cursor_key("find the parser", Some("HEAD"), 42, "ranking+bodies");
+        let b = locate_cursor_key("find the parser", Some("HEAD"), 42, "ranking+bodies");
         assert_eq!(a, b, "same inputs must yield the same key");
         // A graph edit bumps the version → a different key, so a stale cursor can
         // never page a ranking built against different graph truth.
-        let c = locate_cursor_key("find the parser", Some("HEAD"), 43, true);
+        let c = locate_cursor_key("find the parser", Some("HEAD"), 43, "ranking+bodies");
         assert_ne!(a, c);
         // Query and ref are part of the identity.
-        assert_ne!(a, locate_cursor_key("other query", Some("HEAD"), 42, true));
         assert_ne!(
             a,
-            locate_cursor_key("find the parser", Some("main"), 42, true)
+            locate_cursor_key("other query", Some("HEAD"), 42, "ranking+bodies")
+        );
+        assert_ne!(
+            a,
+            locate_cursor_key("find the parser", Some("main"), 42, "ranking+bodies")
         );
     }
 
-    /// The body mode joins the cursor key, so one query at one graph version
-    /// cannot serve both modes from a single cached ranking.
+    /// The projection mode joins the cursor key, so one query at one graph version
+    /// cannot serve two different projections from a single cached ranking.
     ///
-    /// Without this, the cached ranking's mode silently overrides the flag the
-    /// paging caller set: a bodies-carrying ranking returns source to a caller
-    /// that declined it, and a bodies-less ranking returns hits with no snippet
-    /// to a caller that asked for one. The second is the `include_snippet`
-    /// field-absence defect moved from page 0 to page 1, which is why the key,
-    /// not the payload, is where this has to be fixed: a mismatch must miss the
-    /// cache and re-rank rather than be papered over on emit.
+    /// There are THREE projections, and the first version of this fix keyed on a
+    /// `bodies` bool, which can only separate two. `bodies` is false both for the
+    /// coordinates-only agent ranking and for the legacy path that projects no
+    /// `entities[]` at all, so those two collided: a legacy request overwrote the
+    /// agent's cached ranking with an empty one, and the agent's own cursor was
+    /// then served that empty page from cache with no re-run. All three must be
+    /// mutually distinct, which is what this asserts.
     #[test]
-    fn locate_cursor_key_separates_the_body_mode() {
-        let with_bodies = locate_cursor_key("find the parser", Some("HEAD"), 42, true);
-        let without_bodies = locate_cursor_key("find the parser", Some("HEAD"), 42, false);
+    fn locate_cursor_key_separates_every_projection_mode() {
+        let key = |mode| locate_cursor_key("find the parser", Some("HEAD"), 42, mode);
+        let none = key(projection_mode(false, false));
+        let ranking = key(projection_mode(true, false));
+        let with_bodies = key(projection_mode(true, true));
+
         assert_ne!(
-            with_bodies, without_bodies,
+            ranking, with_bodies,
             "include_snippet true/false must not collide on one cache entry"
         );
-        // The mode is the ONLY difference; everything else held equal.
+        // The pair the `bodies` bool could not tell apart. A real ranking and an
+        // empty one sharing a key is how a legacy caller emptied an agent's cursor.
+        assert_ne!(
+            none, ranking,
+            "the no-projection mode must not share a key with the agent ranking"
+        );
+        assert_ne!(none, with_bodies);
+
+        // Deterministic within a mode; the mode is the ONLY difference above.
         assert_eq!(
-            without_bodies,
-            locate_cursor_key("find the parser", Some("HEAD"), 42, false),
+            ranking,
+            key(projection_mode(true, false)),
             "the key must still be deterministic within a mode"
+        );
+    }
+
+    /// `bodies` alone cannot distinguish the three projections, which is the whole
+    /// reason the key takes a mode token.
+    #[test]
+    fn projection_mode_distinguishes_the_no_projection_case_from_a_bodiless_ranking() {
+        assert_eq!(projection_mode(true, true), "ranking+bodies");
+        assert_eq!(projection_mode(true, false), "ranking");
+        assert_eq!(projection_mode(false, false), "none");
+        // The trap: both have bodies == false.
+        assert_ne!(projection_mode(true, false), projection_mode(false, false));
+        // `SnippetOptions` agrees with the free function for each constructor.
+        assert_eq!(SnippetOptions::default().projection_mode(), "none");
+        assert_eq!(
+            SnippetOptions::enabled(None).projection_mode(),
+            "ranking+bodies"
+        );
+        assert_eq!(
+            SnippetOptions::enabled(None)
+                .without_bodies()
+                .projection_mode(),
+            "ranking"
         );
     }
 

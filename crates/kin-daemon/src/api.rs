@@ -3975,7 +3975,7 @@ async fn locate(
                 cache
                     .get(&parsed.key)
                     .filter(|entry| entry.graph_version == graph_version)
-                    .filter(|entry| entry.bodies == snippet_opts.bodies)
+                    .filter(|entry| entry.mode == snippet_opts.projection_mode())
                     .map(|entry| entry.entities.clone())
             };
             if let Some(entities) = cached {
@@ -4110,15 +4110,21 @@ async fn locate(
         &key_text,
         scope_token.as_deref(),
         graph_version,
-        snippet_opts.bodies,
+        snippet_opts.projection_mode(),
     );
-    cache_locate_ranking(
-        &state,
-        &key,
-        &result.entities,
-        graph_version,
-        snippet_opts.bodies,
-    );
+    // Only a request that actually projected `entities[]` has a ranking worth
+    // holding. The no-projection path leaves it empty, issues no cursor, and never
+    // reads this cache, so writing to it can only do harm: it would publish an
+    // empty ranking under a key another mode's live cursor might present.
+    if snippet_opts.enabled {
+        cache_locate_ranking(
+            &state,
+            &key,
+            &result.entities,
+            graph_version,
+            snippet_opts.projection_mode(),
+        );
+    }
     kin_cli::commands::locate::apply_entity_page(&mut result, &key, 0, page_size);
     Ok(Json(result))
 }
@@ -4403,7 +4409,7 @@ fn cache_locate_ranking(
     key: &str,
     entities: &[kin_cli::commands::locate::LocateEntity],
     graph_version: u64,
-    bodies: bool,
+    mode: &'static str,
 ) {
     let mut cache = state.locate_rankings.lock().unwrap();
     if cache.len() >= LOCATE_RANKING_CACHE_CAP && !cache.contains_key(key) {
@@ -4420,7 +4426,7 @@ fn cache_locate_ranking(
         CachedLocateRanking {
             entities: entities.to_vec(),
             graph_version,
-            bodies,
+            mode,
             created: std::time::Instant::now(),
         },
     );
@@ -5596,7 +5602,10 @@ fn build_semantic_locate_result(
                     // Cached rows already carry (or omit) `snippet`, and the
                     // cursor supplies the key, so a mode mismatch has to miss the
                     // cache and re-search rather than replay the other mode.
-                    .filter(|entry| entry.bodies == include_snippet)
+                    .filter(|entry| {
+                        entry.mode
+                            == kin_cli::commands::locate::projection_mode(true, include_snippet)
+                    })
                     .map(|entry| entry.rows.clone())
             };
             if let Some(rows) = cached {
@@ -5789,7 +5798,7 @@ fn build_semantic_locate_result(
         &query,
         Some(granularity_token.as_str()),
         graph_version,
-        include_snippet,
+        kin_cli::commands::locate::projection_mode(true, include_snippet),
     );
     {
         let mut cache = state.semantic_locate_pages.lock().unwrap();
@@ -5807,7 +5816,7 @@ fn build_semantic_locate_result(
             CachedSemanticPage {
                 rows: rows.clone(),
                 graph_version,
-                bodies: include_snippet,
+                mode: kin_cli::commands::locate::projection_mode(true, include_snippet),
                 created: std::time::Instant::now(),
             },
         );
@@ -5859,6 +5868,12 @@ fn fused_semantic_locate_payload(
         json!(if file_granularity { "file" } else { "entity" }),
     );
     payload.insert("routing".to_string(), json!("fused-v1"));
+    // State the page explicitly. `LocateResult::page` is skipped when zero, so a
+    // caller that asked for page 3 and got page 0 (a cache miss re-ran the ranking
+    // and restarted) saw the key vanish rather than change, and had to infer the
+    // restart from an absent field. The cosine arm always states its page; now both
+    // arms answer the question the same way.
+    payload.insert("page".to_string(), json!(result.page));
     if let Some(coverage) = coverage_detail {
         payload.insert("semantic_coverage_detail".to_string(), json!(coverage));
     }
@@ -6005,7 +6020,7 @@ async fn build_fused_semantic_locate_result(
                     // The cursor carries the cache key, so a caller can present a
                     // key minted in the other body mode. Keying is not enough;
                     // the held ranking's mode has to match this request's.
-                    .filter(|entry| entry.bodies == snippet_opts.bodies)
+                    .filter(|entry| entry.mode == snippet_opts.projection_mode())
                     .map(|entry| entry.entities.clone())
             };
             if let Some(entities) = cached {
@@ -6093,14 +6108,14 @@ async fn build_fused_semantic_locate_result(
         &key_text,
         scope_token.as_deref(),
         graph_version,
-        snippet_opts.bodies,
+        snippet_opts.projection_mode(),
     );
     cache_locate_ranking(
         state,
         &key,
         &locate_result.entities,
         graph_version,
-        snippet_opts.bodies,
+        snippet_opts.projection_mode(),
     );
     kin_cli::commands::locate::apply_entity_page(&mut locate_result, &key, 0, page_size);
 
@@ -6159,6 +6174,14 @@ fn resolved_entity_source_from_outcome<E: std::fmt::Display>(
             start_line: record.start_line,
             end_line: record.end_line,
             signature: record.signature,
+            // This arm resolves source through kin-cli's own authority read, so it
+            // has no `ExactEntitySource` to render. It reports the coherence label
+            // that read did establish rather than emitting nothing, so the batch
+            // surface is never silent about an unverified span.
+            provenance: serde_json::Map::from_iter([(
+                "span_coherence".to_string(),
+                json!(record.span_coherence),
+            )]),
             body: record.body,
         }),
         Ok(EntitySourceOutcome::NotFound(message)) => ResolvedEntitySource::NotFound {
@@ -10403,6 +10426,7 @@ mod tests {
             end_byte: 14,
             signature: "fn target()".into(),
             body: "fn target() {}".into(),
+            span_coherence: "digest_verified".to_string(),
         };
         let result = entity_source_tool_result(Ok::<_, String>(EntitySourceOutcome::Found(record)));
 
@@ -10445,6 +10469,7 @@ mod tests {
             end_byte: 14,
             signature: "fn target()".into(),
             body: "fn target() {}".into(),
+            span_coherence: "digest_verified".to_string(),
         };
         let resolved = vec![
             resolved_entity_source_from_outcome(
@@ -21945,6 +21970,140 @@ mod tests {
             suppressed_hits[0].get("snippet").is_none(),
             "include_snippet:false must suppress the snippet: {}",
             suppressed_hits[0]
+        );
+    }
+
+    /// A legacy locate must not be able to empty an agent's live cursor.
+    ///
+    /// `POST /locate` maps `{snippets, entity_surface}` onto THREE projections, and
+    /// the first version of the paging fix keyed and filtered the ranking cache on
+    /// `bodies` alone, which separates only two of them. `bodies` is false both for
+    /// the agent surface that wants a full ranking without source and for the
+    /// legacy path that projects no `entities[]` at all, so they collided on one
+    /// cache slot: a plain `kin locate` overwrote the agent's cached ranking with an
+    /// empty one, and the agent's own cursor then passed the filter and was served
+    /// `entities: []` from cache, with no fall-through re-run precisely because the
+    /// filter passed rather than rejected.
+    ///
+    /// Either outcome is acceptable on the last leg; a silent empty page is not.
+    #[tokio::test]
+    async fn locate_paging_survives_a_legacy_request_on_the_same_query() {
+        let state = test_state();
+        // TWO ranked definitions, so `page_size: 1` leaves a live cursor to page.
+        // With one hit the first page is also the last and no cursor is issued,
+        // which would make the test vacuous rather than failing.
+        let first = "def parse_config(path):\n    return {\"path\": path}\n";
+        let second =
+            "\ndef parse_config_list(paths):\n    return [parse_config(p) for p in paths]\n";
+        let source = format!("{first}{second}");
+        install_repository_file(&state, "src/config.py", source.as_bytes());
+        install_working_copy_file(&state, "src/config.py", source.as_bytes(), false);
+
+        for (name, start_byte, end_byte, preview) in [
+            ("parse_config", 0, first.len(), "def parse_config(path):"),
+            (
+                "parse_config_list",
+                first.len(),
+                source.len(),
+                "def parse_config_list(paths):",
+            ),
+        ] {
+            let mut entity = test_entity(name, "src/config.py");
+            entity.span = Some(SourceSpan {
+                file: kin_model::FilePathId::new("src/config.py"),
+                start_byte,
+                end_byte,
+                start_line: 0,
+                start_col: 0,
+                end_line: 1,
+                end_col: 24,
+            });
+            // The fused ranker reads this to call an entity a definition rather
+            // than a bare reference, and only definitions are ranked.
+            entity
+                .metadata
+                .extra
+                .insert("embedding_body_preview".to_string(), json!(preview));
+            state.graph.upsert_entity(&entity).unwrap();
+        }
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let app = router(state);
+
+        // A `LocateRequest` in one of the three projections. `page_size: 1` keeps a
+        // cursor live across the interleaving below.
+        let post_locate = |app: Router, snippets: bool, entity_surface: bool, cursor| async move {
+            let response = app
+                .oneshot(
+                    Request::post("/locate")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::to_string(&kin_cli::daemon_client::LocateRequest {
+                                text: "parse config".to_string(),
+                                queries: Vec::new(),
+                                explain: false,
+                                max_files: 10,
+                                max_files_explicit: true,
+                                reference: None,
+                                snippets,
+                                snippet_lines: None,
+                                entity_surface,
+                                cursor,
+                                page_size: Some(1),
+                            })
+                            .unwrap(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), 256 * 1024)
+                .await
+                .unwrap();
+            serde_json::from_slice::<kin_cli::commands::locate::LocateResult>(&body).unwrap()
+        };
+
+        // 1. The agent surface, bodies declined: a real ranking plus a cursor.
+        let page0 = post_locate(app.clone(), false, true, None).await;
+        assert!(
+            !page0.entities.is_empty(),
+            "the agent JSON surface must return the ranking even with bodies declined"
+        );
+        let Some(cursor) = page0.next_cursor.clone() else {
+            panic!(
+                "fixture must issue a cursor: {} entities, total_ranked {}",
+                page0.entities.len(),
+                page0.total_ranked
+            );
+        };
+
+        // 2. A legacy/human locate for the SAME query at the SAME graph version.
+        //    It projects no entities, and must not publish that emptiness anywhere
+        //    the agent's cursor can reach.
+        let legacy = post_locate(app.clone(), false, false, None).await;
+        assert!(
+            legacy.entities.is_empty(),
+            "the legacy projection is coordinates-only by design, got {} entities",
+            legacy.entities.len()
+        );
+
+        // 3. Page the ORIGINAL cursor. Either the correct next page from cache, or
+        //    an honest miss that re-ran and restarted at page 0 with a real ranking.
+        //    Never an empty page.
+        let page1 = post_locate(app, false, true, Some(cursor)).await;
+        assert!(
+            !page1.entities.is_empty(),
+            "a legacy request must not empty an agent's cursor: got {} entities, total_ranked {}, page {}",
+            page1.entities.len(),
+            page1.total_ranked,
+            page1.page
+        );
+        assert!(
+            page1.total_ranked > 0,
+            "an emptied cached ranking reports total_ranked 0, got {}",
+            page1.total_ranked
         );
     }
 
