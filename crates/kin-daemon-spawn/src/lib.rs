@@ -818,8 +818,9 @@ fn validate_process_group_guardian_readiness(
 /// explicit cleanup the launcher stops the whole group as a kernel-enforced
 /// fork barrier, kills it repeatedly, then hands completion to the watcher. The
 /// watcher performs that barrier only for owner death or failed parent cleanup.
-/// The launcher reaps its sentinel and performs the final exact empty-group
-/// check after callers wait their owned direct children.
+/// The launcher reaps its sentinel and then establishes that nothing left in
+/// the group can still execute, which an already-exited member satisfies whether
+/// or not its process-table slot has been collected yet.
 ///
 /// This is intentionally a same-credential, group-preserving cooperative
 /// contract, not a security sandbox. A child that changes credentials or
@@ -965,8 +966,9 @@ impl ProcessGroupGuardian {
     /// Poll and reap a completed watcher.
     ///
     /// A successful result combines the completed launcher-or-watcher
-    /// STOP/repeated-KILL barrier with launcher-side sentinel reap and one
-    /// exact final `kill(-pgid, 0) == ESRCH` emptiness check.
+    /// STOP/repeated-KILL barrier with launcher-side sentinel reap and one final
+    /// containment check, which requires every process still in the group to
+    /// have exited and is satisfied trivially when the group is empty.
     pub fn try_reap(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
         self.observe_watcher_exit()?;
         if self.watcher.is_some() {
@@ -1473,9 +1475,11 @@ fn log_reaper_group_finalization(
     let sentinel_was_killed = sentinel_exit_was_sigkill(sentinel_status);
     // The sentinel handle was just reaped and consumed. This is the one final
     // group probe; no reaper path may signal the numeric PGID after this call.
-    let empty_probe = unsafe { libc::kill(-process_group, 0) };
-    let group_empty =
-        empty_probe == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+    // It asks the same containment question the launcher path asks, because an
+    // observable group holding nothing but uncollected corpses is contained, and
+    // logging that benign state as an error trained operators to ignore the log
+    // line that reports a real escape.
+    let containment = process_group_containment(process_group);
     if !sentinel_was_killed {
         tracing::error!(
             %sentinel_status,
@@ -1483,11 +1487,18 @@ fn log_reaper_group_finalization(
             "durable reaper observed unexpected sentinel exit"
         );
     }
-    if !group_empty {
-        tracing::error!(
+    match containment {
+        ProcessGroupContainment::Empty | ProcessGroupContainment::OnlyExited => {}
+        ProcessGroupContainment::LiveMember { pid } => tracing::error!(
             process_group,
-            "durable reaper final probe found the process group still observable"
-        );
+            live_pid = pid,
+            "durable reaper final probe found a live process in the process group"
+        ),
+        ProcessGroupContainment::Indeterminate { detail } => tracing::warn!(
+            process_group,
+            %detail,
+            "durable reaper could not establish process-group containment"
+        ),
     }
 }
 
@@ -1730,23 +1741,307 @@ fn finalize_owned_process_group(
     sentinel.take();
 
     // This is deliberately the one and only post-reap numeric group probe.
-    // ESRCH is exact empty-group success. A direct child that has exited but
-    // has not yet been waited remains visible here and fails closed.
-    let empty_probe = unsafe { libc::kill(-process_group, 0) };
-    let group_empty =
-        empty_probe == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+    let containment = process_group_containment(process_group);
     if !sentinel_was_killed {
         return Err(std::io::Error::other(format!(
             "process-group sentinel exited unexpectedly: {status}"
         )));
     }
-    if !group_empty {
-        return Err(std::io::Error::other(format!(
-            "process group {process_group} remained observable after sentinel reap; \
+    match containment {
+        ProcessGroupContainment::Empty | ProcessGroupContainment::OnlyExited => Ok(()),
+        ProcessGroupContainment::LiveMember { pid } => Err(std::io::Error::other(format!(
+            "process group {process_group} still holds live process {pid} after sentinel reap; \
              callers must kill and wait owned direct children before guardian finalization"
-        )));
+        ))),
+        ProcessGroupContainment::Indeterminate { detail } => Err(std::io::Error::other(format!(
+            "process group {process_group} containment could not be established after sentinel \
+             reap: {detail}"
+        ))),
     }
-    Ok(())
+}
+
+/// What the process group holds once the sentinel has been reaped.
+///
+/// The distinction that matters is between a process that can still run and one
+/// that only still has a slot in the process table.
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProcessGroupContainment {
+    /// No member remains: `kill(-pgid, 0)` reported ESRCH.
+    Empty,
+    /// Members remain, and every one of them has already exited.
+    OnlyExited,
+    /// A member remains that has not exited.
+    LiveMember { pid: libc::pid_t },
+    /// The group is non-empty and its members could not be classified.
+    Indeterminate { detail: String },
+}
+
+/// Classify a process group after its members have been killed.
+///
+/// `kill(-pgid, 0)` answers "does this group have members", which is not the
+/// question. A process that has exited but has not been waited keeps its slot in
+/// the process table and stays a member of its group, so an ESRCH-only test
+/// cannot tell a group that still runs code from a group that holds nothing but
+/// corpses.
+///
+/// The caller waits the children it owns, but that does not close the gap. A
+/// grandchild that outlives its parent is reparented to init, and its exited
+/// slot is cleared when init gets around to it, which is a window no caller
+/// participates in. Failing closed on that window is what turned a correct
+/// cleanup into an intermittent error whenever the machine was busy enough to
+/// widen it.
+///
+/// An exited process holds no address space, executes no instructions, and
+/// cannot fork, so it cannot leave the group or outlive this call in any sense
+/// the containment guarantee is about. Reporting it as contained is what the
+/// guarantee already means, stated precisely.
+///
+/// Indeterminate is kept separate from both answers on purpose. A group that is
+/// non-empty and unreadable is not proof of containment, and quietly treating it
+/// as empty would be the silent-pass failure this whole path exists to prevent.
+#[cfg(unix)]
+fn process_group_containment(process_group: libc::pid_t) -> ProcessGroupContainment {
+    if unsafe { libc::kill(-process_group, 0) } == -1
+        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    {
+        return ProcessGroupContainment::Empty;
+    }
+    match process_group_members(process_group) {
+        Ok(members) if members.is_empty() => {
+            // The group emptied between the two calls. Nothing remains to run.
+            ProcessGroupContainment::Empty
+        }
+        Ok(members) => {
+            for pid in members {
+                match process_has_exited(pid) {
+                    Ok(true) => {}
+                    Ok(false) => return ProcessGroupContainment::LiveMember { pid },
+                    Err(error) => {
+                        return ProcessGroupContainment::Indeterminate {
+                            detail: format!("classify member {pid}: {error}"),
+                        };
+                    }
+                }
+            }
+            ProcessGroupContainment::OnlyExited
+        }
+        Err(error) => ProcessGroupContainment::Indeterminate {
+            detail: format!("enumerate group members: {error}"),
+        },
+    }
+}
+
+/// `proc_listpids` selector for "processes in this process group".
+///
+/// Declared here because `libc` exposes `proc_listpids` and the other selectors
+/// but not this one. The value is `PROC_PGRP_ONLY` from
+/// `<sys/proc_info.h>`; it is part of the same stable numbering as
+/// [`libc::PROC_PIDTBSDINFO`], which this crate's sibling identity probe
+/// already depends on.
+#[cfg(target_os = "macos")]
+const PROC_PGRP_ONLY: u32 = 2;
+
+/// Bytes reported by one `proc_listpids` call, with failure kept distinct from
+/// an empty answer.
+///
+/// `proc_listpids` does not use the -1/errno convention the rest of this module
+/// reads. libproc turns a failed `__proc_info` into a return of 0, and rejects
+/// an unknown selector the same way, leaving the reason in errno. So the return
+/// value alone cannot separate "this group has no members" from "this query
+/// failed", and a `< 0` test never fires. Clearing errno first is what makes the
+/// two distinguishable.
+///
+/// That distinction is the point of the call. An unreadable group reported as an
+/// empty one classifies as [`ProcessGroupContainment::Empty`], which
+/// finalization accepts, so anything that denies `proc_info` would silently
+/// disable the containment check for the lifetime of the process while
+/// reporting success.
+#[cfg(target_os = "macos")]
+fn list_process_group_bytes(
+    group: u32,
+    buffer: *mut libc::c_void,
+    byte_len: i32,
+) -> std::io::Result<usize> {
+    unsafe { *libc::__error() = 0 };
+    let written = unsafe { libc::proc_listpids(PROC_PGRP_ONLY, group, buffer, byte_len) };
+    if written > 0 {
+        return Ok(written as usize);
+    }
+    let failure = std::io::Error::last_os_error();
+    // Only a failing call writes errno here, so an untouched errno is the one
+    // reading under which zero means the group is genuinely empty.
+    if written == 0 && failure.raw_os_error() == Some(0) {
+        return Ok(0);
+    }
+    Err(failure)
+}
+
+/// PIDs currently reported as members of a process group.
+#[cfg(target_os = "macos")]
+fn process_group_members(process_group: libc::pid_t) -> std::io::Result<Vec<libc::pid_t>> {
+    let group = u32::try_from(process_group)
+        .map_err(|_| std::io::Error::other("process group id does not fit a selector argument"))?;
+    // Ask for the size first, then read with headroom: the group can only be
+    // shrinking here, so a buffer sized for the earlier answer cannot truncate a
+    // later one, and the headroom absorbs the case where it somehow grew.
+    let needed = list_process_group_bytes(group, std::ptr::null_mut(), 0)?;
+    if needed == 0 {
+        return Ok(Vec::new());
+    }
+    let slots = needed / std::mem::size_of::<u32>() + 8;
+    let mut buffer = vec![0u32; slots];
+    let byte_len = i32::try_from(buffer.len() * std::mem::size_of::<u32>())
+        .map_err(|_| std::io::Error::other("process group member buffer exceeds a c_int"))?;
+    let written = list_process_group_bytes(group, buffer.as_mut_ptr().cast(), byte_len)?;
+    let count = written / std::mem::size_of::<u32>();
+    Ok(buffer
+        .into_iter()
+        .take(count)
+        // A zero slot is padding, not a process.
+        .filter(|pid| *pid != 0)
+        .map(|pid| pid as libc::pid_t)
+        .collect())
+}
+
+/// Whether a process has exited but still occupies a process-table slot.
+///
+/// Two probes decide this, because each one alone is ambiguous and together
+/// they are not.
+///
+/// [`libc::PROC_PIDTBSDINFO`] is assembled from the process's task. An exited
+/// process has released its task while keeping its proc entry, so this query
+/// fails with ESRCH for exactly the processes this function exists to
+/// recognize. `kill(pid, 0)` reads the proc entry instead, and still succeeds
+/// for them. So info-unavailable *and* signallable is a positive identification
+/// of a process that has exited, not an absence of evidence.
+///
+/// The remaining combinations are unambiguous. Info available means a task
+/// exists, so the process has not exited. Neither available means the entry is
+/// gone, which is more than exited. Any other error is neither, and is reported
+/// as an error rather than guessed, because these members are this program's
+/// own descendants and a failure to inspect one is not something to paper over.
+///
+/// The state field would say this directly, but the struct that carries it for
+/// exited processes is not in the `libc` version this workspace pins, and
+/// hand-declaring a kernel struct layout to save two syscalls is a worse trade
+/// than deriving it from two calls whose meanings are documented.
+#[cfg(target_os = "macos")]
+fn process_has_exited(pid: libc::pid_t) -> std::io::Result<bool> {
+    let mut info = unsafe { std::mem::zeroed::<libc::proc_bsdinfo>() };
+    let expected = std::mem::size_of::<libc::proc_bsdinfo>();
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            std::ptr::addr_of_mut!(info).cast(),
+            expected as i32,
+        )
+    };
+    if written == expected as i32 {
+        return Ok(false);
+    }
+    let info_error = std::io::Error::last_os_error();
+    if info_error.raw_os_error() != Some(libc::ESRCH) {
+        return Err(info_error);
+    }
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        // A proc entry with no task behind it.
+        return Ok(true);
+    }
+    let signal_error = std::io::Error::last_os_error();
+    match signal_error.raw_os_error() {
+        // Gone from the table entirely.
+        Some(libc::ESRCH) => Ok(true),
+        _ => Err(signal_error),
+    }
+}
+
+/// PIDs currently reported as members of a process group.
+///
+/// Linux has no group-scoped process query, so this reads the one place the
+/// kernel publishes a process's group. This is process-table IO, not repository
+/// content: it answers a question about this program's own children.
+#[cfg(target_os = "linux")]
+fn process_group_members(process_group: libc::pid_t) -> std::io::Result<Vec<libc::pid_t>> {
+    let mut members = Vec::new();
+    for entry in std::fs::read_dir("/proc")? {
+        let entry = entry?;
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<libc::pid_t>().ok())
+        else {
+            continue;
+        };
+        // A process that exits mid-scan is simply not a member any more.
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        if parse_proc_stat_process_group(&stat) == Some(process_group) {
+            members.push(pid);
+        }
+    }
+    Ok(members)
+}
+
+/// Whether a process has exited but still occupies a process-table slot.
+#[cfg(target_os = "linux")]
+fn process_has_exited(pid: libc::pid_t) -> std::io::Result<bool> {
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => parse_proc_stat_state(&stat)
+            .map(|state| state == 'Z')
+            .ok_or_else(|| std::io::Error::other(format!("unparseable /proc/{pid}/stat"))),
+        // Gone entirely, which is more than exited.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error),
+    }
+}
+
+/// Fields after the executable name in `/proc/<pid>/stat`.
+///
+/// The name is parenthesized and may itself contain spaces and parentheses, so
+/// splitting the whole line on whitespace mis-parses any process whose name
+/// contains one. Everything after the final `)` is fixed-width and safe to
+/// split, which is what `proc(5)` documents and what every correct reader does.
+#[cfg(target_os = "linux")]
+fn proc_stat_fields_after_name(stat: &str) -> Option<Vec<&str>> {
+    let tail = &stat[stat.rfind(')')? + 1..];
+    Some(tail.split_whitespace().collect())
+}
+
+/// The single-character run state: field 3 overall, first after the name.
+#[cfg(target_os = "linux")]
+fn parse_proc_stat_state(stat: &str) -> Option<char> {
+    proc_stat_fields_after_name(stat)?.first()?.chars().next()
+}
+
+/// The process group id: field 5 overall, third after the name.
+#[cfg(target_os = "linux")]
+fn parse_proc_stat_process_group(stat: &str) -> Option<libc::pid_t> {
+    proc_stat_fields_after_name(stat)?
+        .get(2)?
+        .parse::<libc::pid_t>()
+        .ok()
+}
+
+/// Targets with neither a group query nor a published process table cannot
+/// classify members, so containment stays indeterminate rather than assumed.
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+fn process_group_members(_process_group: libc::pid_t) -> std::io::Result<Vec<libc::pid_t>> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "process-group member enumeration is unsupported on this platform",
+    ))
+}
+
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+fn process_has_exited(_pid: libc::pid_t) -> std::io::Result<bool> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "process exit-state inspection is unsupported on this platform",
+    ))
 }
 
 #[cfg(unix)]
@@ -2423,6 +2718,114 @@ pub async fn register_started_daemon(kin_root: &Path, daemon_url: &str) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Process-group containment ─────────────────────────────────────────
+    //
+    // The failure these close: containment was decided by kill(-pgid, 0), which
+    // reports a group non-empty while it holds a process that has exited and
+    // not yet been waited. A grandchild that outlives its parent is reparented
+    // to init, and init clears that slot on its own schedule, so a cleanup that
+    // had genuinely killed everything reported failure whenever the machine was
+    // busy enough to widen that window.
+    //
+    // These drive the states directly rather than racing for them, and each one
+    // asserts the old probe's answer alongside the new one, so the arrangement
+    // that used to fail is pinned rather than described.
+
+    /// Spawn a command in a process group of its own, so the test owns a group
+    /// whose identity is the child's PID.
+    #[cfg(all(unix, any(target_os = "macos", target_os = "linux")))]
+    fn spawn_in_own_group(program: &str, args: &[&str]) -> std::process::Child {
+        use std::os::unix::process::CommandExt as _;
+        let mut command = std::process::Command::new(program);
+        command.args(args);
+        command.process_group(0);
+        command.spawn().expect("spawn a group leader")
+    }
+
+    /// Whether the pre-fix probe would call this group occupied.
+    #[cfg(all(unix, any(target_os = "macos", target_os = "linux")))]
+    fn legacy_group_probe_reports_occupied(process_group: libc::pid_t) -> bool {
+        let probe = unsafe { libc::kill(-process_group, 0) };
+        !(probe == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH))
+    }
+
+    #[cfg(all(unix, any(target_os = "macos", target_os = "linux")))]
+    #[test]
+    fn a_member_that_exited_without_being_waited_is_contained() {
+        // Exactly the arrangement that failed: the group's only member has run
+        // to completion, and nobody has collected it yet.
+        let mut child = spawn_in_own_group("true", &[]);
+        let pgid = libc::pid_t::try_from(child.id()).expect("child pid fits pid_t");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            if process_has_exited(pgid).expect("classify the member") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            process_has_exited(pgid).expect("classify the member"),
+            "the member must have exited before the containment claim is meaningful"
+        );
+        assert!(
+            legacy_group_probe_reports_occupied(pgid),
+            "this test is only meaningful while the group still looks occupied to kill(-pgid, 0)"
+        );
+
+        assert_eq!(
+            process_group_containment(pgid),
+            ProcessGroupContainment::OnlyExited,
+            "a group holding nothing but an uncollected corpse is contained"
+        );
+
+        child.wait().expect("collect the member");
+    }
+
+    #[cfg(all(unix, any(target_os = "macos", target_os = "linux")))]
+    #[test]
+    fn a_member_that_is_still_running_is_not_contained() {
+        // The inverse, so the fix cannot degenerate into always reporting
+        // containment.
+        let mut child = spawn_in_own_group("sleep", &["30"]);
+        let pgid = libc::pid_t::try_from(child.id()).expect("child pid fits pid_t");
+
+        assert_eq!(
+            process_group_containment(pgid),
+            ProcessGroupContainment::LiveMember { pid: pgid },
+            "a running member must be reported, and named"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[cfg(all(unix, any(target_os = "macos", target_os = "linux")))]
+    #[test]
+    fn a_group_whose_members_are_all_collected_is_empty() {
+        let mut child = spawn_in_own_group("true", &[]);
+        let pgid = libc::pid_t::try_from(child.id()).expect("child pid fits pid_t");
+        child.wait().expect("collect the member");
+
+        assert!(
+            !legacy_group_probe_reports_occupied(pgid),
+            "a collected member leaves no group behind"
+        );
+        assert_eq!(
+            process_group_containment(pgid),
+            ProcessGroupContainment::Empty
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_stat_parsing_survives_a_process_name_containing_spaces_and_parens() {
+        // Splitting the whole line would mis-count every field after the name.
+        let stat = "42 (weird ) name) Z 7 99 0 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 100";
+        assert_eq!(parse_proc_stat_state(stat), Some('Z'));
+        assert_eq!(parse_proc_stat_process_group(stat), Some(99));
+    }
 
     #[cfg(unix)]
     const INERT_GROUP_MEMBER_ENV: &str = "KIN_INTERNAL_TEST_INERT_GROUP_MEMBER";
@@ -3161,13 +3564,16 @@ mod tests {
         let mut member = guardian.spawn(member_command).unwrap();
 
         guardian.request_cleanup();
-        let error = guardian
+        // This used to require an error. Blocking success on an uncollected
+        // corpse could not survive contact with the grandchild case: a process
+        // that outlives its parent is reparented to init, and init clears its
+        // slot on a schedule no caller takes part in, so the same state arrived
+        // with nobody at fault and cleanup reported failure under load. The
+        // barrier is still what has to hold, and it is asserted below: the
+        // member was killed, not merely observed.
+        guardian
             .reap_until(std::time::Instant::now() + Duration::from_secs(5))
-            .expect_err("an unreaped direct zombie must block exact empty success");
-        assert!(
-            error.to_string().contains("remained observable"),
-            "unexpected direct-zombie error: {error}"
-        );
+            .expect("a group holding only an uncollected corpse is contained");
         let member_status = member.wait().unwrap();
         assert_eq!(member_status.signal(), Some(libc::SIGKILL));
         wait_for_test_process_group_gone(process_group, Duration::from_secs(5));
