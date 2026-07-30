@@ -14043,6 +14043,7 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
     }
 
     #[test]
+    #[serial]
     fn codex_relative_repo_binding_uses_entry_cwd_not_process_cwd() {
         let dir = tempfile::tempdir().unwrap();
         let repo_a = dir.path().join("repo-a");
@@ -14836,6 +14837,7 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
     }
 
     #[test]
+    #[serial]
     fn config_transaction_test_authority_normalizes_relative_nonexistent_paths() {
         let current = env::current_dir().unwrap();
         let fixture = tempfile::Builder::new()

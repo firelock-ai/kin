@@ -22,6 +22,21 @@ lexical awareness reads as an unclosed body before excusing the rest of the
 file. The other pays for a real filesystem probe with a rename in test code the
 guard never reads, which is what a pin counted over the raw file will accept.
 
+The widest exemption of all is a whole file, and it has no falsification history
+by construction: nothing is scanned there, so no probe can fail. A module
+narrowed out of that state is probed across its production region here, and a
+body exemption reground onto a pin is probed inside the body it used to excuse.
+
+Which lines count as production is itself a policy decision, and the tracker
+that made it keyed on the literal string `mod tests`. The cfg probes exercise
+each spelling separately, including the ones that mention `test` and still
+compile in production, and each carries a control the scan must always report so
+a silent guard cannot pass for a correctly excluded item.
+
+Every probe asks whether the SCAN reported the file, not whether the tool exited
+nonzero. An allowlist error also exits nonzero and also prints the path it
+complains about, and that failure mode is exactly the one that masks the scan.
+
 The enforced-module list is read from the guard itself rather than restated
 here. A module added to the guard's coverage is falsified automatically, and
 this harness cannot quietly fall behind what the guard claims to cover.
@@ -146,6 +161,134 @@ SLACK_PROBE = (
 # A rename inside a test module: routine, invisible to the guard, and the offset
 # that used to pay for the probe above.
 SLACK_TEST_REPLACEMENT = ".authority_metadata()"
+
+# Modules that were exempt as whole files and are now scanned around pinned
+# expressions. A whole-file exemption is the widest gap the policy can have and
+# the quietest: the guard's summary line and exit status are identical whether
+# the file is a boundary end to end or has grown a raw source read since anyone
+# looked. Narrowing one is only worth as much as the proof that the file is
+# actually scanned now, so each is probed across its production region.
+NARROWED_MODULES = ["crates/kin-daemon-spawn/src/lib.rs"]
+
+# (module, function, pinned expression) for bodies that were exempt by name and
+# are now covered by a pin on the primitive instead. The pin masks two `.exists()`
+# calls; the twenty-four lines around them must be scanned again, which is the
+# whole difference between the two grains. Poison goes just inside the body, on a
+# line that is not the pinned one.
+REGROUND_PINS = [
+    ("crates/kin-daemon/src/daemon.rs", "repository_root_missing", ".exists()"),
+    ("crates/kin-daemon/src/daemon.rs", "classify_control_plane", ".exists()"),
+]
+
+# The cfg tracker decides which items are production code, and it decided it by
+# naming convention: the attribute line armed and disarmed in the same iteration,
+# so only a following literal `mod tests` kept the exclusion alive. Every entry
+# here is a spelling that decision got wrong or could get wrong, and the marker
+# is placed in the violating line's own text so the guard's report distinguishes
+# them. `expect` is the set of markers the scan must report; every probe also
+# carries a control the scan must always report, so "the guard stayed silent
+# because it is broken" cannot pass as "the item was correctly excluded".
+TRACKER_CONTROL = "__tracker_control_path"
+
+
+def tracker_read(marker):
+    return f"    let _ = std::fs::read_to_string({marker}).unwrap();"
+
+
+TRACKER_PROBES = [
+    (
+        "cfg(test) fn",
+        "#[cfg(test)]\nfn __tracker_gated_fn() {\n"
+        + tracker_read("__tracker_cfg_test_fn")
+        + "\n}",
+        [("__tracker_cfg_test_fn", False)],
+    ),
+    (
+        "cfg(test) mod, unconventional name",
+        "#[cfg(test)]\nmod __tracker_ingest_cas_tests {\n    fn probe() {\n"
+        + tracker_read("__tracker_cfg_test_mod")
+        + "\n    }\n}",
+        [("__tracker_cfg_test_mod", False)],
+    ),
+    (
+        "cfg(all(test, unix))",
+        "#[cfg(all(test, unix))]\nfn __tracker_all_gated() {\n"
+        + tracker_read("__tracker_cfg_all_test")
+        + "\n}",
+        [("__tracker_cfg_all_test", False)],
+    ),
+    (
+        "cfg(any(unix, test)) stays scanned",
+        "#[cfg(any(unix, test))]\nfn __tracker_any_gated() {\n"
+        + tracker_read("__tracker_cfg_any_test")
+        + "\n}",
+        [("__tracker_cfg_any_test", True)],
+    ),
+    (
+        "cfg(not(test)) stays scanned",
+        "#[cfg(not(test))]\nfn __tracker_not_gated() {\n"
+        + tracker_read("__tracker_cfg_not_test")
+        + "\n}",
+        [("__tracker_cfg_not_test", True)],
+    ),
+    (
+        "cfg_attr(not(test), ..) gates nothing",
+        "#[cfg_attr(not(test), allow(dead_code))]\nfn __tracker_cfg_attr() {\n"
+        + tracker_read("__tracker_cfg_attr_test")
+        + "\n}",
+        [("__tracker_cfg_attr_test", True)],
+    ),
+    (
+        "#[test] fn",
+        "#[test]\nfn __tracker_test_attr() {\n"
+        + tracker_read("__tracker_test_attribute")
+        + "\n}",
+        [("__tracker_test_attribute", False)],
+    ),
+    (
+        "#[tokio::test] fn",
+        '#[tokio::test(flavor = "multi_thread")]\nasync fn __tracker_tokio_test() {\n'
+        + tracker_read("__tracker_tokio_attribute")
+        + "\n}",
+        [("__tracker_tokio_attribute", False)],
+    ),
+    (
+        "exclusion ends at the gated item",
+        "#[cfg(test)]\nmod __tracker_bounded {\n    fn probe() {\n"
+        + tracker_read("__tracker_inside_bound")
+        + "\n    }\n}\nfn __tracker_next_item() {\n"
+        + tracker_read("__tracker_after_bound")
+        + "\n}",
+        [("__tracker_inside_bound", False), ("__tracker_after_bound", True)],
+    ),
+    (
+        "a literal brace cannot widen the exclusion",
+        "#[cfg(test)]\nfn __tracker_brace_gated() {\n"
+        + '    let _template = "{";\n'
+        + tracker_read("__tracker_inside_brace")
+        + "\n}\nfn __tracker_after_brace() {\n"
+        + tracker_read("__tracker_after_brace_probe")
+        + "\n}",
+        [("__tracker_inside_brace", False), ("__tracker_after_brace_probe", True)],
+    ),
+    (
+        "a gated struct field excludes nothing",
+        "struct __TrackerFields {\n    #[cfg(test)]\n    probe: bool,\n}\n"
+        + "fn __tracker_after_field() {\n"
+        + tracker_read("__tracker_after_field_probe")
+        + "\n}",
+        [("__tracker_after_field_probe", True)],
+    ),
+    (
+        "cfg(test) macro_rules",
+        "#[cfg(test)]\nmacro_rules! __tracker_gated_macro {\n    () => {\n"
+        + tracker_read("__tracker_inside_macro")
+        + "\n    };\n}\nfn __tracker_after_macro() {\n"
+        + tracker_read("__tracker_after_macro_probe")
+        + "\n}",
+        [("__tracker_inside_macro", False), ("__tracker_after_macro_probe", True)],
+    ),
+]
 
 
 def load_guard(root):
@@ -344,6 +487,21 @@ def run(cmd):
     return result.returncode, result.stdout + result.stderr
 
 
+def scan_reported(out, rel):
+    """Whether the Python guard's SCAN reported this file.
+
+    A nonzero exit is not evidence the scan ran, and neither is the file's name
+    appearing in the output: an allowlist error also exits nonzero and also
+    prints the path it is complaining about. Only the scan prints the
+    `[VIOLATION] <path>` header, so that is what a probe has to look for. This
+    matters because the two failure modes read identically from outside and one
+    of them masks the other: a stale pin once reported itself while ten real
+    violations in a newly covered crate went unmentioned, and a probe satisfied
+    by "exit code was 1 and the basename appeared" would have called that a pass.
+    """
+    return f"[VIOLATION] {rel}" in out
+
+
 def main():
     if len(sys.argv) != 2:
         print(__doc__)
@@ -403,11 +561,19 @@ def main():
                         cell.append("-")
                         continue
                     code, out = run(cmd)
+                    named = (
+                        scan_reported(out, rel)
+                        if tag == "py"
+                        else os.path.basename(rel) in out
+                    )
                     if code == 0:
                         failures.append(f"{rel} @ {label}: {tag} guard PASSED on a poisoned tree")
                         cell.append("BLIND")
-                    elif os.path.basename(rel) not in out:
-                        failures.append(f"{rel} @ {label}: {tag} guard failed but never named the file")
+                    elif not named:
+                        failures.append(
+                            f"{rel} @ {label}: {tag} guard failed but its scan never "
+                            "reported the file"
+                        )
                         cell.append("UNNAMED")
                     else:
                         cell.append("ok")
@@ -416,6 +582,143 @@ def main():
             with open(path, "w", encoding="utf-8") as f:
                 f.write(original)
         print(f"  {os.path.basename(rel):24} {'  '.join(marks)}")
+
+    # A module that was whole-file exempt has no falsification history at all:
+    # nothing was ever scanned there, so no probe could fail. Prove the narrowed
+    # policy across the production region, at the same four sites the answer
+    # modules get, and require the SCAN to report it rather than settling for a
+    # nonzero exit.
+    for rel in NARROWED_MODULES:
+        path = os.path.join(root, rel)
+        if not os.path.isfile(path):
+            failures.append(f"{rel}: narrowed-module falsification target is missing")
+            continue
+        with open(path, "r", encoding="utf-8") as f:
+            original = f.read()
+        lines = original.split("\n")
+        marks = []
+        try:
+            for label, idx in probe_sites(lines):
+                poisoned = lines[:idx] + [POISON] + lines[idx:]
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write("\n".join(poisoned))
+                code, out = run([sys.executable, py_guard, root])
+                if code == 0:
+                    failures.append(
+                        f"{rel} @ {label}: guard PASSED on a poisoned tree that was "
+                        "whole-file exempt before this policy was narrowed"
+                    )
+                    marks.append(f"{label}=BLIND")
+                elif not scan_reported(out, rel):
+                    failures.append(
+                        f"{rel} @ {label}: guard failed but the scan never reported "
+                        "the file"
+                    )
+                    marks.append(f"{label}=UNNAMED")
+                else:
+                    marks.append(f"{label}=ok")
+        finally:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(original)
+        print(f"  narrowed {os.path.basename(rel):15} {'  '.join(marks)}")
+
+    # A pin on a primitive replaced two function-body exemptions. The bodies are
+    # scanned again, which is the only reason the trade is worth making, so
+    # poison each one on a line that is not the pinned one and require the report.
+    # An exemption that had regressed to whole-body would swallow this silently.
+    for rel, fn_name, pin in REGROUND_PINS:
+        path = os.path.join(root, rel)
+        with open(path, "r", encoding="utf-8") as f:
+            original = f.read()
+        lines = original.split("\n")
+        span = fn_body_span(lines, fn_name)
+        if span is None:
+            failures.append(f"{rel}: could not locate {fn_name} to falsify")
+            continue
+        if pin not in "\n".join(lines[span[0] : span[1] + 1]):
+            failures.append(
+                f"{rel}: {fn_name} no longer contains the pinned {pin!r}, so the "
+                "reground pin no longer covers it"
+            )
+            continue
+        try:
+            poisoned = lines[: span[0] + 1] + [POISON] + lines[span[0] + 1 :]
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("\n".join(poisoned))
+            code, out = run([sys.executable, py_guard, root])
+            mark = "ok"
+            if code == 0 or not scan_reported(out, rel):
+                failures.append(
+                    f"{rel}: poison inside {fn_name} was not reported, so that body "
+                    "is still exempt in whole rather than covered by a pin"
+                )
+                mark = "BLIND"
+            print(f"  reground pin {fn_name:26} {mark}")
+        finally:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(original)
+
+    # Which items are production code is a policy decision, and the tracker used
+    # to make it by naming convention. Each probe below is one cfg spelling, with
+    # a control the scan must always report so silence cannot pass for exclusion.
+    #
+    # Every probe's markers are unique, so the whole table is planted in one run
+    # and each expectation read out of the same output. That is one guard run
+    # instead of eleven, which matters because the guard walks every crate and
+    # this harness already runs it well over a hundred times. The cost of batching
+    # is attribution: an over-wide exclusion in one snippet would surface as a
+    # missing marker in a later one. So a batch that fails is replayed one probe
+    # at a time, which localises it exactly, and only a failing run pays for that.
+    tracker_rel = f"{CMD_DIR}/search.rs"
+    tracker_path = os.path.join(root, tracker_rel)
+    with open(tracker_path, "r", encoding="utf-8") as f:
+        tracker_original = f.read()
+    control = (
+        "fn __tracker_control() {\n"
+        f"    let _ = std::fs::read_to_string({TRACKER_CONTROL}).unwrap();\n"
+        "}"
+    )
+
+    def tracker_verdicts(probes):
+        """Plant `probes` together and return {label: mark} for the one run."""
+        body = "".join(f"\n{snippet}\n" for _, snippet, _ in probes)
+        with open(tracker_path, "w", encoding="utf-8") as handle:
+            handle.write(tracker_original + body + "\n" + control + "\n")
+        code, out = run([sys.executable, py_guard, root])
+        if code == 0 or TRACKER_CONTROL not in out:
+            return {label: "NOCONTROL" for label, _, _ in probes}
+        verdicts = {}
+        for label, _, expectations in probes:
+            mark = "ok"
+            for marker, want_reported in expectations:
+                if want_reported and marker not in out:
+                    mark = "MISSED"
+                elif not want_reported and marker in out:
+                    mark = "SPURIOUS"
+            verdicts[label] = mark
+        return verdicts
+
+    EXPLAIN = {
+        "NOCONTROL": "the control probe was not reported, so the run proves "
+        "nothing about the gated items",
+        "MISSED": "an item that is production code was not reported",
+        "SPURIOUS": "an item that exists only in a test build was reported as "
+        "production",
+    }
+    try:
+        verdicts = tracker_verdicts(TRACKER_PROBES)
+        if any(mark != "ok" for mark in verdicts.values()):
+            verdicts = {}
+            for probe in TRACKER_PROBES:
+                verdicts.update(tracker_verdicts([probe]))
+        for label, _, _ in TRACKER_PROBES:
+            mark = verdicts[label]
+            if mark != "ok":
+                failures.append(f"tracker probe {label!r}: {EXPLAIN[mark]}")
+            print(f"  cfg tracker {label:38} {mark}")
+    finally:
+        with open(tracker_path, "w", encoding="utf-8") as f:
+            f.write(tracker_original)
 
     # An expression pin must exempt only its own bytes, not the entire source
     # line. Poison every pinned line while retaining the allowed expression on
@@ -465,10 +768,10 @@ def main():
                 )
             else:
                 for rel in pinned:
-                    if os.path.basename(rel) not in out:
+                    if not scan_reported(out, rel):
                         failures.append(
                             f"{rel}: Python same-line falsification failed but "
-                            "the guard never named the file"
+                            "the scan never reported the file"
                         )
             print(
                 "  pinned same-line poison   "
@@ -559,7 +862,7 @@ def main():
                 with open(path, "w", encoding="utf-8") as f:
                     f.write("\n".join(poisoned))
                 code, out = run([sys.executable, py_guard, root])
-                named = base in out
+                named = scan_reported(out, rel)
                 if want_named and not named:
                     failures.append(
                         f"{rel} @ {label}: guard did not name the file on a "
@@ -746,10 +1049,14 @@ def main():
                             "on bare Path::metadata"
                         )
                         cell.append("BLIND")
-                    elif os.path.basename(metadata_rel) not in out:
+                    elif not (
+                        scan_reported(out, metadata_rel)
+                        if tag == "py"
+                        else os.path.basename(metadata_rel) in out
+                    ):
                         failures.append(
                             f"{metadata_rel} @ {label}: {tag} guard failed but "
-                            "never named the file"
+                            "never reported the file"
                         )
                         cell.append("UNNAMED")
                     else:
@@ -799,10 +1106,14 @@ def main():
                                 f"{deny_rel} @ {label}: {tag} guard PASSED on {probe_name}"
                             )
                             cell.append("BLIND")
-                        elif os.path.basename(deny_rel) not in out:
+                        elif not (
+                            scan_reported(out, deny_rel)
+                            if tag == "py"
+                            else os.path.basename(deny_rel) in out
+                        ):
                             failures.append(
                                 f"{deny_rel} @ {label}: {tag} guard failed on "
-                                f"{probe_name} but never named the file"
+                                f"{probe_name} but never reported the file"
                             )
                             cell.append("UNNAMED")
                         else:
