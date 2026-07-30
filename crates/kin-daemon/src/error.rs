@@ -27,6 +27,23 @@ pub enum DaemonError {
     #[error("Not initialized: no .kin/ directory found")]
     NotInitialized,
 
+    /// The storage backend answered completely and holds no such repository.
+    ///
+    /// Absence is a trustworthy answer, not a failure to answer: the backend
+    /// was reachable, its authority read succeeded, and it reported nothing
+    /// stored under this id. Every other storage arm is the opposite, whether
+    /// an unreachable object store, expired credentials, or a corrupt delta
+    /// chain, and callers must be able to route the two differently: a
+    /// repository that is not there versus a daemon that cannot answer.
+    ///
+    /// This is typed rather than flattened into
+    /// [`Graph`](Self::Graph)`(StorageError(..))` because recovering the
+    /// distinction afterwards would mean matching on message text, and a
+    /// classification inferred from a failure string is exactly what stops
+    /// holding the first time the wording moves.
+    #[error("repository '{0}' has no graph in storage")]
+    RepoAbsentFromStorage(String),
+
     #[error("{0}")]
     IncompatibleRepo(String),
 

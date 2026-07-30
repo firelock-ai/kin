@@ -6719,6 +6719,14 @@ async fn mcp_tools_call(
 /// identity compare answers "is this the advertised repository" while the
 /// question is "is this one we serve". Those diverge for every sibling a hosted
 /// daemon carries, and a load error holds no evidence either way.
+///
+/// A served repository splits once more, and this half the load itself decides:
+/// a backend that answers completely and holds nothing under the id is a
+/// missing repository (404), while a backend that fails to answer is a fault
+/// (500). The loader types that difference as
+/// [`DaemonError::RepoAbsentFromStorage`] so it survives the trip here. Reading
+/// it back out of a flattened storage error's wording would be the same
+/// infer-from-the-failure mistake the served key space exists to avoid.
 async fn repo_scoped_graph(
     state: &DaemonState,
     repo_id: &str,
@@ -6733,7 +6741,19 @@ async fn repo_scoped_graph(
             ),
         ));
     }
-    state.get_repo_graph(repo_id).await.map_err(internal_error)
+    match state.get_repo_graph(repo_id).await {
+        Ok(graph) => Ok(graph),
+        Err(crate::error::DaemonError::RepoAbsentFromStorage(absent)) => Err((
+            StatusCode::NOT_FOUND,
+            format!(
+                "this daemon serves repository {} and is configured for {absent}, \
+                 but storage holds no graph for {absent}; \
+                 GET /repos lists the repositories storage actually holds",
+                state.cached_repo_id
+            ),
+        )),
+        Err(error) => Err(internal_error(error)),
+    }
 }
 
 async fn repository_authority_snapshot(
@@ -14083,7 +14103,22 @@ mod tests {
     /// expired credentials, a snapshot authority that disagrees with the
     /// acknowledged head, or a corrupt delta chain. All of them arrive as an
     /// `Err` out of the recovery read, which is the single path
-    /// `load_recovered_snapshot` takes.
+    /// `load_recovered_snapshot` takes, so fault injection is scoped to exactly
+    /// the three reads that path makes.
+    ///
+    /// Every other trait method forwards to the inner backend, including the
+    /// ones whose trait defaults would answer instead of delegating. That is
+    /// not tidiness: `supports_incremental_deltas` defaults to `false` and the
+    /// whole source-blob family defaults to "not supported by this backend",
+    /// so a partially-forwarding fixture silently downgrades the very
+    /// capabilities a hosted backend has. A test reusing it would then be
+    /// measuring the fixture's degraded shape and reporting it as hosted
+    /// behavior.
+    ///
+    /// The single method deliberately left on its trait default is
+    /// `compact_deltas`, which `LocalFileBackend` also leaves defaulted. That
+    /// default composes through this type's own reads, so compaction stays
+    /// fault-aware instead of routing around the switch.
     struct RepoFaultBackend {
         inner: kin_db::LocalFileBackend,
         faulting: FaultSwitch,
@@ -14130,6 +14165,10 @@ mod tests {
     const BACKEND_FAULT_TEXT: &str = "object store unreachable";
 
     impl kin_db::StorageBackend for RepoFaultBackend {
+        fn supports_incremental_deltas(&self) -> bool {
+            self.inner.supports_incremental_deltas()
+        }
+
         fn load_recovery_state(
             &self,
             repo_id: &str,
@@ -14161,6 +14200,52 @@ mod tests {
             }
         }
 
+        fn save_source_blob(
+            &self,
+            repo_id: &str,
+            digest: [u8; 32],
+            data: &[u8],
+        ) -> std::result::Result<(), kin_db::KinDbError> {
+            self.inner.save_source_blob(repo_id, digest, data)
+        }
+
+        fn load_source_blob(
+            &self,
+            repo_id: &str,
+            digest: [u8; 32],
+        ) -> std::result::Result<Option<Vec<u8>>, kin_db::KinDbError> {
+            self.inner.load_source_blob(repo_id, digest)
+        }
+
+        fn load_source_blob_bounded(
+            &self,
+            repo_id: &str,
+            digest: [u8; 32],
+            max_bytes: u64,
+        ) -> std::result::Result<Option<Vec<u8>>, kin_db::KinDbError> {
+            self.inner
+                .load_source_blob_bounded(repo_id, digest, max_bytes)
+        }
+
+        fn with_verified_source_blob_batch(
+            &self,
+            repo_id: &str,
+            operation: &mut dyn FnMut(
+                &dyn kin_db::VerifiedSourceBlobBatch,
+            ) -> std::result::Result<(), kin_db::KinDbError>,
+        ) -> std::result::Result<(), kin_db::KinDbError> {
+            self.inner
+                .with_verified_source_blob_batch(repo_id, operation)
+        }
+
+        fn source_blob_len(
+            &self,
+            repo_id: &str,
+            digest: [u8; 32],
+        ) -> std::result::Result<Option<u64>, kin_db::KinDbError> {
+            self.inner.source_blob_len(repo_id, digest)
+        }
+
         fn save_snapshot(
             &self,
             repo_id: &str,
@@ -14168,6 +14253,42 @@ mod tests {
             expected_gen: kin_db::Generation,
         ) -> std::result::Result<kin_db::Generation, kin_db::KinDbError> {
             self.inner.save_snapshot(repo_id, data, expected_gen)
+        }
+
+        fn save_snapshot_classified(
+            &self,
+            repo_id: &str,
+            data: &[u8],
+            expected_cursor: kin_db::SnapshotCursor,
+        ) -> kin_db::SnapshotSaveOutcome {
+            self.inner
+                .save_snapshot_classified(repo_id, data, expected_cursor)
+        }
+
+        fn save_snapshot_validated(
+            &self,
+            repo_id: &str,
+            data: &[u8],
+            expected: kin_db::SnapshotCursor,
+            history_validator_version: Option<u32>,
+        ) -> kin_db::SnapshotSaveOutcome {
+            self.inner
+                .save_snapshot_validated(repo_id, data, expected, history_validator_version)
+        }
+
+        fn record_history_validation(
+            &self,
+            repo_id: &str,
+            generation: kin_db::Generation,
+            snapshot_sha256: &str,
+            validator_version: u32,
+        ) -> std::result::Result<bool, kin_db::KinDbError> {
+            self.inner.record_history_validation(
+                repo_id,
+                generation,
+                snapshot_sha256,
+                validator_version,
+            )
         }
 
         fn save_delta(
@@ -14221,6 +14342,107 @@ mod tests {
         }
     }
 
+    /// The shipped hosted shape: one advertised repo, several allowlisted
+    /// siblings, none of them pre-warmed into the repo graph map, over a
+    /// backend that can be made to fault per repository.
+    fn hosted_state_with_allowlist(
+        label: &str,
+        advertised: &str,
+        siblings: &[&str],
+    ) -> (Arc<DaemonState>, FaultSwitch) {
+        let dir = std::env::temp_dir().join(format!("kin-daemon-{label}-{}", Uuid::new_v4()));
+        let kin_dir = dir.join(".kin");
+        std::fs::create_dir_all(kin_dir.join("objects")).unwrap();
+        std::fs::create_dir_all(kin_dir.join("working")).unwrap();
+        let layout = kin_core::KinLayout::new(kin_dir);
+        kin_core::manifest::KinManifest::new()
+            .save(&layout.manifest_path())
+            .unwrap();
+        let backend_dir = dir.join("backend");
+        std::fs::create_dir_all(&backend_dir).unwrap();
+
+        let (backend, faults) = RepoFaultBackend::new(&backend_dir);
+        let allowed: std::collections::HashSet<String> = std::iter::once(advertised)
+            .chain(siblings.iter().copied())
+            .map(ToOwned::to_owned)
+            .collect();
+        let state = Arc::new(
+            DaemonState::open_with_backend(layout, Box::new(backend), advertised, Some(allowed))
+                .unwrap(),
+        );
+        (state, faults)
+    }
+
+    /// The fault fixture must be indistinguishable from the backend it wraps
+    /// except when a fault is armed. A trait default answering in place of a
+    /// forward is not a smaller lie than a wrong value: it reports "this
+    /// backend cannot do that" about a backend that can, so a test reusing the
+    /// fixture measures a degraded shape and reports it as hosted behavior.
+    #[test]
+    fn the_fault_fixture_forwards_the_capabilities_of_the_backend_it_wraps() {
+        use kin_db::StorageBackend;
+
+        let dir =
+            std::env::temp_dir().join(format!("kin-daemon-fault-fidelity-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let real = kin_db::LocalFileBackend::new(&dir);
+        let (fixture, _faults) = RepoFaultBackend::new(&dir);
+
+        assert!(
+            real.supports_incremental_deltas(),
+            "the wrapped backend is expected to have a delta write path"
+        );
+        assert_eq!(
+            fixture.supports_incremental_deltas(),
+            real.supports_incremental_deltas(),
+            "a fixture that under-reports delta support sends writes down the wrong path"
+        );
+
+        let repo_id = "fidelity-repo";
+        let body: &[u8] = b"fn main() {}";
+        let digest: [u8; 32] = Sha256::digest(body).into();
+        fixture
+            .save_source_blob(repo_id, digest, body)
+            .expect("the fixture must forward immutable source-blob writes");
+        assert_eq!(
+            real.load_source_blob(repo_id, digest).unwrap().as_deref(),
+            Some(body),
+            "the forwarded write must land in the wrapped backend"
+        );
+        assert_eq!(
+            fixture
+                .load_source_blob(repo_id, digest)
+                .unwrap()
+                .as_deref(),
+            Some(body)
+        );
+        assert_eq!(
+            fixture
+                .load_source_blob_bounded(repo_id, digest, kin_db::MAX_SOURCE_BLOB_BYTES)
+                .unwrap()
+                .as_deref(),
+            Some(body)
+        );
+        assert_eq!(
+            fixture.source_blob_len(repo_id, digest).unwrap(),
+            Some(body.len() as u64)
+        );
+
+        let mut batched: Option<Vec<u8>> = None;
+        fixture
+            .with_verified_source_blob_batch(repo_id, &mut |batch| {
+                batched = batch
+                    .load_verified(kin_db::SourceBlobValidationRequest {
+                        digest,
+                        max_bytes: kin_db::MAX_SOURCE_BLOB_BYTES,
+                    })?
+                    .map(|verified| verified.into_bytes());
+                Ok(())
+            })
+            .expect("the fixture must forward verified batch reads");
+        assert_eq!(batched.as_deref(), Some(body));
+    }
+
     /// A hosted daemon serves every allowlisted repository, not only the one it
     /// advertises. So a backend fault on an allowlisted sibling is a fault, and
     /// answering 404 there would report a GCS outage or a corrupt delta chain as
@@ -14233,30 +14455,9 @@ mod tests {
     /// than inferred from the failure afterwards.
     #[tokio::test]
     async fn a_backend_fault_on_a_served_sibling_stays_a_fault_rather_than_a_404() {
-        let dir = std::env::temp_dir().join(format!("kin-daemon-repo-fault-{}", Uuid::new_v4()));
-        let kin_dir = dir.join(".kin");
-        std::fs::create_dir_all(kin_dir.join("objects")).unwrap();
-        std::fs::create_dir_all(kin_dir.join("working")).unwrap();
-        let layout = kin_core::KinLayout::new(kin_dir);
-        kin_core::manifest::KinManifest::new()
-            .save(&layout.manifest_path())
-            .unwrap();
-        let backend_dir = dir.join("backend");
-        std::fs::create_dir_all(&backend_dir).unwrap();
-
-        // The shipped hosted shape: one advertised repo, several allowlisted
-        // siblings, none of them pre-warmed into the repo graph map.
         let advertised = "primary-repo";
         let sibling = "sibling-repo";
-        let (backend, faults) = RepoFaultBackend::new(&backend_dir);
-        let allowed: std::collections::HashSet<String> =
-            [advertised.to_string(), sibling.to_string()]
-                .into_iter()
-                .collect();
-        let state = Arc::new(
-            DaemonState::open_with_backend(layout, Box::new(backend), advertised, Some(allowed))
-                .unwrap(),
-        );
+        let (state, faults) = hosted_state_with_allowlist("repo-fault", advertised, &[sibling]);
         assert_eq!(
             advertised_repo_id(Arc::clone(&state)).await,
             advertised,
@@ -14305,6 +14506,80 @@ mod tests {
         assert!(
             message.contains(advertised) && message.contains(unserved),
             "the refusal must name both the served and requested ids: {message}"
+        );
+    }
+
+    /// An allowlisted repository with nothing stored under it is a repository
+    /// that is not there, not a daemon that is broken. The backend read
+    /// succeeded and reported neither snapshot authority nor deltas, which is a
+    /// complete answer. Reporting it as a fault told every client, retry loop,
+    /// and 5xx alert that this daemon had failed, when no amount of retrying
+    /// makes an absent repository appear.
+    ///
+    /// It is equally not an identity mismatch: the id IS in this daemon's
+    /// served key space, so the refusal must not claim otherwise.
+    #[tokio::test]
+    async fn an_allowlisted_repo_absent_from_storage_is_missing_rather_than_a_fault() {
+        let advertised = "primary-repo";
+        let absent = "never-stored-repo";
+        let (state, faults) = hosted_state_with_allowlist("repo-absent", advertised, &[absent]);
+        assert_eq!(
+            advertised_repo_id(Arc::clone(&state)).await,
+            advertised,
+            "the fixture must advertise the primary id"
+        );
+        assert!(
+            state.serves_repo_id(absent),
+            "the allowlist is the served key space, so the absent id is served"
+        );
+
+        for path in [
+            format!("/repos/{absent}/health"),
+            format!("/repos/{absent}/entities"),
+            format!("/repos/{absent}/provenance/verify"),
+        ] {
+            let (status, body) = repo_route(Arc::clone(&state), &path).await;
+            let message = String::from_utf8_lossy(&body);
+            assert_eq!(
+                status,
+                StatusCode::NOT_FOUND,
+                "a served repository absent from storage must be missing at {path}: {message}"
+            );
+            assert!(
+                message.contains(advertised) && message.contains(absent),
+                "the refusal must name both the served and requested ids: {message}"
+            );
+            assert!(
+                !message.contains("does not serve"),
+                "an allowlisted repository must not be reported as unserved: {message}"
+            );
+        }
+
+        // The advertised repository still answers on the same daemon, so the
+        // 404s above are about that repository rather than a daemon-wide state.
+        let (status, body) =
+            repo_route(Arc::clone(&state), &format!("/repos/{advertised}/entities")).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the advertised repo must stay routable: {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        // Absence is decided by what the load reported, not by the id: the very
+        // same id over a backend that cannot answer is still a fault.
+        faults.start_faulting(absent);
+        let (status, body) =
+            repo_route(Arc::clone(&state), &format!("/repos/{absent}/entities")).await;
+        let message = String::from_utf8_lossy(&body);
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a backend that cannot answer is still a fault: {message}"
+        );
+        assert!(
+            message.contains(BACKEND_FAULT_TEXT),
+            "the fault must carry the backend error rather than discard it: {message}"
         );
     }
 
