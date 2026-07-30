@@ -7272,12 +7272,6 @@ mod tests {
         std::fs::write(mcp_transactions_disk_path(&layout), b"{not valid json").unwrap();
         assert!(load_persisted_mcp_transactions(&layout).is_empty());
     }
-}
-
-#[cfg(test)]
-mod ingest_cas_tests {
-    use super::*;
-    use kin_model::{ArtifactId, RepoPath, ResolvedArtifact, ResolvedTree, TreeEntry};
 
     /// Publish one blob as the repository's exact workspace tree and return its
     /// content address. The published body lives in repository authority, which
