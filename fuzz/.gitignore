@@ -2,4 +2,10 @@ target
 corpus
 artifacts
 coverage
-Cargo.lock
+
+# Cargo.lock is deliberately NOT ignored. cargo-fuzz's template ignores it,
+# which is the right default for a library but wrong here: this package is a
+# detached workspace whose transitive kin-* dependencies resolve from the Kin
+# registry, so an ignored lock left every run to re-resolve against whatever
+# was newest and let a fuzz build turn red with no change to this repository.
+# The lock is tracked, and the workflow proves the build resolved through it.
