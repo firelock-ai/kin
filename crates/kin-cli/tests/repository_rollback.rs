@@ -33,21 +33,23 @@ fn require_git(path: &Path, args: &[&str]) {
     );
 }
 
-fn run_kin(repo: &Path, home: &Path, args: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_kin"))
+fn run_kin(
+    runtime: &common::IsolatedDaemonRuntime,
+    repo: &Path,
+    args: &[&str],
+) -> std::process::Output {
+    runtime
+        .kin_command()
         .args(args)
-        .env("HOME", home)
         .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("KIN_DAEMON_BIN", common::fresh_daemon_bin())
-        .env_remove("KIN_DAEMON_URL")
-        .env_remove("KIN_VFS_WORKSPACE")
+        .env("KIN_DAEMON_BIN", runtime.daemon_bin())
         .current_dir(repo)
         .output()
         .expect("run kin")
 }
 
-fn require_kin_json(repo: &Path, home: &Path, args: &[&str]) -> Value {
-    let output = run_kin(repo, home, args);
+fn require_kin_json(runtime: &common::IsolatedDaemonRuntime, repo: &Path, args: &[&str]) -> Value {
+    let output = run_kin(runtime, repo, args);
     assert!(
         output.status.success(),
         "kin {args:?} failed: stdout={} stderr={}",
@@ -59,7 +61,7 @@ fn require_kin_json(repo: &Path, home: &Path, args: &[&str]) -> Value {
 
 /// A two-commit Git history admitted into Kin, returning the change ids of the
 /// base and head in branch order.
-fn initialize(repo: &Path, home: &Path) -> (String, String) {
+fn initialize(runtime: &common::IsolatedDaemonRuntime, repo: &Path) -> (String, String) {
     fs::create_dir_all(repo).expect("create repo");
     require_git(repo, &["init", "--initial-branch=main"]);
     require_git(repo, &["config", "user.email", "kin@example.invalid"]);
@@ -77,7 +79,7 @@ fn initialize(repo: &Path, home: &Path) -> (String, String) {
     require_git(repo, &["add", "--all"]);
     require_git(repo, &["commit", "-m", "regression"]);
 
-    let init = run_kin(repo, home, &["init", ".", "--json"]);
+    let init = run_kin(runtime, repo, &["init", ".", "--json"]);
     assert!(
         init.status.success(),
         "stdout={} stderr={}",
@@ -85,7 +87,7 @@ fn initialize(repo: &Path, home: &Path) -> (String, String) {
         String::from_utf8_lossy(&init.stderr)
     );
 
-    let entries = log_entries(repo, home);
+    let entries = log_entries(runtime, repo);
     assert!(
         entries.len() >= 2,
         "admission did not produce the two-change history rollback needs"
@@ -94,8 +96,8 @@ fn initialize(repo: &Path, home: &Path) -> (String, String) {
 }
 
 /// Change ids in branch order, newest first, as canonical hexadecimal.
-fn log_entries(repo: &Path, home: &Path) -> Vec<String> {
-    let log = require_kin_json(repo, home, &["log", "--json"]);
+fn log_entries(runtime: &common::IsolatedDaemonRuntime, repo: &Path) -> Vec<String> {
+    let log = require_kin_json(runtime, repo, &["log", "--json"]);
     log["entries"]
         .as_array()
         .expect("log entries")
@@ -115,19 +117,18 @@ fn change_id_hex(value: &Value) -> String {
         .collect()
 }
 
-fn head_change(repo: &Path, home: &Path) -> String {
-    log_entries(repo, home)[0].clone()
+fn head_change(runtime: &common::IsolatedDaemonRuntime, repo: &Path) -> String {
+    log_entries(runtime, repo)[0].clone()
 }
 
 #[test]
 fn rollback_publishes_a_restoring_change_and_moves_the_workspace_with_it() {
     let root = tempdir().expect("temp root");
-    let home = root.path().join("home");
     let repo = root.path().join("repo");
-    fs::create_dir_all(&home).expect("create home");
-    let (base, head) = initialize(&repo, &home);
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    let (base, head) = initialize(&runtime, &repo);
 
-    let output = run_kin(&repo, &home, &["rollback", &base]);
+    let output = run_kin(&runtime, &repo, &["rollback", &base]);
     assert!(
         output.status.success(),
         "stdout={} stderr={}",
@@ -142,13 +143,13 @@ fn rollback_publishes_a_restoring_change_and_moves_the_workspace_with_it() {
 
     // History moves forward: the rolled-back change is a new change, and the
     // change that was rolled back is still in history.
-    let restored_head = head_change(&repo, &home);
+    let restored_head = head_change(&runtime, &repo);
     assert_ne!(restored_head, head, "rollback did not publish a new change");
     assert_ne!(
         restored_head, base,
         "rollback reset the branch instead of publishing a restoring change"
     );
-    let ids = log_entries(&repo, &home);
+    let ids = log_entries(&runtime, &repo);
     assert!(
         ids.contains(&head),
         "rollback discarded the change it rolled back: {ids:?}"
@@ -176,7 +177,7 @@ fn rollback_publishes_a_restoring_change_and_moves_the_workspace_with_it() {
     );
 
     // Ref and workspace agree: nothing drifted from the transition.
-    let drift = require_kin_json(&repo, &home, &["doctor", "--drift", "--json"]);
+    let drift = require_kin_json(&runtime, &repo, &["doctor", "--drift", "--json"]);
     assert_eq!(
         drift["clean"], true,
         "rollback left the projection diverged from graph truth: {drift}"
@@ -184,7 +185,7 @@ fn rollback_publishes_a_restoring_change_and_moves_the_workspace_with_it() {
 
     // Rolling back to the change the branch already names is refused rather
     // than published as an empty change.
-    let repeated = run_kin(&repo, &home, &["rollback", &restored_head]);
+    let repeated = run_kin(&runtime, &repo, &["rollback", &restored_head]);
     assert!(
         !repeated.status.success(),
         "rollback published a change with nothing to restore"
@@ -194,13 +195,12 @@ fn rollback_publishes_a_restoring_change_and_moves_the_workspace_with_it() {
 #[test]
 fn rollback_refuses_a_change_outside_this_branch_history() {
     let root = tempdir().expect("temp root");
-    let home = root.path().join("home");
     let repo = root.path().join("repo");
-    fs::create_dir_all(&home).expect("create home");
-    initialize(&repo, &home);
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    initialize(&runtime, &repo);
 
     let unknown = "0".repeat(64);
-    let output = run_kin(&repo, &home, &["rollback", &unknown]);
+    let output = run_kin(&runtime, &repo, &["rollback", &unknown]);
     assert!(
         !output.status.success(),
         "rollback accepted a change repository authority does not have"
@@ -211,7 +211,7 @@ fn rollback_refuses_a_change_outside_this_branch_history() {
         "the refusal must say the change is not in this repository's history: {stderr}"
     );
 
-    let malformed = run_kin(&repo, &home, &["rollback", "not-a-change"]);
+    let malformed = run_kin(&runtime, &repo, &["rollback", "not-a-change"]);
     assert!(
         !malformed.status.success(),
         "rollback accepted a malformed change id"
@@ -221,21 +221,20 @@ fn rollback_refuses_a_change_outside_this_branch_history() {
 #[test]
 fn rollback_refuses_over_a_diverged_projection() {
     let root = tempdir().expect("temp root");
-    let home = root.path().join("home");
     let repo = root.path().join("repo");
-    fs::create_dir_all(&home).expect("create home");
-    let (base, _) = initialize(&repo, &home);
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    let (base, _) = initialize(&runtime, &repo);
 
     // A tracked path edited outside Kin is graph-owned content that the
     // transition would overwrite. It must be reported, not destroyed.
     fs::write(repo.join("keep.txt"), b"edited outside kin\n").expect("edit tracked file");
-    let output = run_kin(&repo, &home, &["rollback", &base]);
+    let output = run_kin(&runtime, &repo, &["rollback", &base]);
     if output.status.success() {
         // The daemon may have admitted the edit into workspace authority before
         // the rollback ran. In that case the workspace was dirty and the
         // refusal must have come from there instead; either way the edit must
         // never be silently discarded by an unreported overwrite.
-        let drift = require_kin_json(&repo, &home, &["doctor", "--drift", "--json"]);
+        let drift = require_kin_json(&runtime, &repo, &["doctor", "--drift", "--json"]);
         assert_eq!(
             drift["clean"], true,
             "rollback reported success while leaving the projection diverged: {drift}"

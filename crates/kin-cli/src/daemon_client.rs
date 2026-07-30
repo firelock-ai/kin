@@ -22,48 +22,37 @@ use std::time::{Duration, Instant};
 use tracing::{info, warn};
 use uuid::Uuid;
 
-static BUILD_MISMATCH_REPORTED: AtomicBool = AtomicBool::new(false);
+pub(crate) mod probe_process;
 
-/// Repository/session authority inherited by the CLI must not leak into a
-/// daemon process. Daemons receive their repository explicitly through
-/// `--repo`; retaining any of these variables can bind the worker to a prior
-/// projection or repository identity before argument processing. Daemon
-/// configuration such as bind host and bearer token is intentionally retained.
-const DAEMON_AMBIENT_AUTHORITY_ENV: &[&str] = &[
-    "DYLD_INSERT_LIBRARIES",
-    "LD_PRELOAD",
-    "KIN_VFS_WORKSPACE",
-    "KIN_VFS_WORKSPACE_ALIASES",
-    "KIN_VFS_SOCK",
-    "KIN_VFS_PIPE",
-    "KIN_VFS_CANARY",
-    "KIN_VFS_INTERPOSE_ACTIVE",
-    "KIN_VFS_LAST_DIR",
-    "_KIN_VFS_LAST_DIR",
-    "KIN_NO_VFS",
-    "KIN_SESSION",
-    "KIN_SESSION_ID",
-    "KIN_SESSION_DIR",
-    "KIN_DAEMON_URL",
-    "KIN_DAEMON_WATCH_PID",
-    SUPERVISOR_STARTUP_GENERATION_ENV,
-    "KIN_REPO_ID",
-    "KIN_REPO_IDS",
-    "KIN_PRIMARY_REPO_ID",
-    "KIN_MCP_REPO",
-    "KIN_SOURCE_ROOT",
-    "KIN_ORIGINAL_PATH",
-    "KIN_DISCOVERY_MODE",
-    "KIN_CONTENT_MODE",
-    "KIN_VFS_DISABLE",
-];
+static BUILD_MISMATCH_REPORTED: AtomicBool = AtomicBool::new(false);
+const DAEMON_BINARY_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Stable failure contract for callers that delegate repository-daemon
+/// autostart to this crate.
+///
+/// The daemon crate re-exports this type. Keeping the classification at the
+/// source prevents rendered error text from becoming a second, accidental
+/// protocol between the two crates.
+#[derive(Debug, thiserror::Error)]
+pub enum AutoStartError {
+    #[error("kin-daemon binary not found (not in PATH or next to kin binary)")]
+    BinaryNotFound,
+    #[error("daemon startup failed: {0}")]
+    SpawnFailed(String),
+    #[error("daemon failed to become ready before the startup deadline: {0}")]
+    StartupTimeout(String),
+    #[error("invalid .kin layout: {0}")]
+    InvalidLayout(String),
+}
+
+impl AutoStartError {
+    fn spawn(error: impl std::fmt::Display) -> Self {
+        Self::SpawnFailed(error.to_string())
+    }
+}
 
 fn scrub_daemon_process_authority(command: &mut Command) {
-    let host_path = kin_core::shims::unshimmed_path();
-    for key in DAEMON_AMBIENT_AUTHORITY_ENV {
-        command.env_remove(key);
-    }
-    command.env("PATH", host_path).env("KIN_VFS_DISABLE", "1");
+    kin_daemon_spawn::scrub_daemon_process_authority(command);
 }
 
 /// Response from `GET /health`.
@@ -2746,18 +2735,20 @@ pub fn daemon_is_up(kin_root: &Path) -> Option<u16> {
 
 fn daemon_binary_supports_supervisor(path: &Path) -> bool {
     let mut command = Command::new(path);
-    scrub_daemon_process_authority(&mut command);
-    let output = match command.arg("--help").output() {
-        Ok(output) => output,
-        Err(error) => {
-            warn!(
-                binary = %path.display(),
-                error = %error,
-                "failed to probe kin-daemon binary"
-            );
-            return false;
-        }
-    };
+    command.arg("--help");
+    let label = format!("{} --help", path.display());
+    let output =
+        match probe_process::output_with_timeout(command, &label, DAEMON_BINARY_PROBE_TIMEOUT) {
+            Ok(output) => output,
+            Err(error) => {
+                warn!(
+                    binary = %path.display(),
+                    error = %error,
+                    "failed to probe kin-daemon binary"
+                );
+                return false;
+            }
+        };
     let mut help = String::new();
     help.push_str(&String::from_utf8_lossy(&output.stdout));
     help.push_str(&String::from_utf8_lossy(&output.stderr));
@@ -2783,19 +2774,24 @@ fn compact_probe_output(output: &std::process::Output) -> String {
         rendered.push_str("<empty output>");
     }
     const MAX_LEN: usize = 400;
+    const TRUNCATION_SUFFIX: &str = "...";
     if rendered.len() > MAX_LEN {
-        rendered.truncate(MAX_LEN);
-        rendered.push_str("...");
+        let mut content_end = MAX_LEN.saturating_sub(TRUNCATION_SUFFIX.len());
+        while !rendered.is_char_boundary(content_end) {
+            content_end -= 1;
+        }
+        rendered.truncate(content_end);
+        rendered.push_str(TRUNCATION_SUFFIX);
     }
+    debug_assert!(rendered.len() <= MAX_LEN);
     rendered
 }
 
 fn daemon_binary_matches_cli_graph(path: &Path) -> Result<(), String> {
     let mut command = Command::new(path);
-    scrub_daemon_process_authority(&mut command);
-    let output = command
-        .arg("--compat-json")
-        .output()
+    command.arg("--compat-json");
+    let label = format!("{} --compat-json", path.display());
+    let output = probe_process::output_with_timeout(command, &label, DAEMON_BINARY_PROBE_TIMEOUT)
         .map_err(|error| format!("compat probe failed to execute: {error}"))?;
     if !output.status.success() {
         return Err(format!(
@@ -2804,7 +2800,17 @@ fn daemon_binary_matches_cli_graph(path: &Path) -> Result<(), String> {
             compact_probe_output(&output)
         ));
     }
-    let compat: DaemonCompatResponse = serde_json::from_slice(&output.stdout)
+    validate_daemon_compat_json(&output.stdout)
+}
+
+/// Validate the bounded `kin-daemon --compat-json` payload against this CLI's
+/// graph and startup contracts.
+///
+/// Kept public so non-CLI activation surfaces (for example a macOS
+/// LaunchAgent installer) can prove the exact selected daemon before making it
+/// persistent.
+pub fn validate_daemon_compat_json(payload: &[u8]) -> Result<(), String> {
+    let compat: DaemonCompatResponse = serde_json::from_slice(payload)
         .map_err(|error| format!("compat probe returned invalid JSON: {error}"))?;
     validate_daemon_compat_response(&compat)
 }
@@ -2850,18 +2856,29 @@ fn validate_daemon_binary(path: &Path) -> Result<(), String> {
     daemon_binary_matches_cli_graph(path)
 }
 
-fn find_daemon_binary() -> Result<PathBuf> {
+#[derive(Debug, thiserror::Error)]
+enum DaemonBinaryDiscoveryError {
+    #[error("kin-daemon binary not found")]
+    NotFound,
+    #[error("{0}")]
+    Invalid(String),
+}
+
+fn find_daemon_binary() -> std::result::Result<PathBuf, DaemonBinaryDiscoveryError> {
     if let Ok(explicit) = std::env::var("KIN_DAEMON_BIN") {
         let path = PathBuf::from(explicit);
         if !path.exists() {
-            bail!("explicit KIN_DAEMON_BIN does not exist: {}", path.display());
+            return Err(DaemonBinaryDiscoveryError::Invalid(format!(
+                "explicit KIN_DAEMON_BIN does not exist: {}",
+                path.display()
+            )));
         }
         return match validate_daemon_binary(&path) {
             Ok(()) => Ok(path),
-            Err(reason) => bail!(
+            Err(reason) => Err(DaemonBinaryDiscoveryError::Invalid(format!(
                 "explicit KIN_DAEMON_BIN {} is incompatible with this kin CLI: {reason}",
                 path.display()
-            ),
+            ))),
         };
     }
 
@@ -2904,16 +2921,16 @@ fn find_daemon_binary() -> Result<PathBuf> {
     }
 
     if rejected.is_empty() {
-        bail!("kin-daemon binary not found");
+        return Err(DaemonBinaryDiscoveryError::NotFound);
     }
     let checked = rejected
         .into_iter()
         .map(|(path, reason)| format!("{} ({reason})", path.display()))
         .collect::<Vec<_>>()
         .join(", ");
-    bail!(
+    Err(DaemonBinaryDiscoveryError::Invalid(format!(
         "kin-daemon binary is stale or incompatible with this kin CLI; rebuild kin-daemon. Checked: {checked}"
-    )
+    )))
 }
 
 /// Readiness wait for a freshly spawned per-repo daemon. Large repositories take
@@ -4164,22 +4181,34 @@ async fn probe_health_for_repo(
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+enum DaemonReadinessError {
+    #[error("{0:#}")]
+    Failed(#[source] anyhow::Error),
+    #[error("{0}")]
+    Timeout(String),
+}
+
 async fn wait_for_daemon_ready(
     kin_root: &Path,
     child: &mut Child,
     deadline: Instant,
     log_offset: u64,
-) -> Result<String> {
+) -> std::result::Result<String, DaemonReadinessError> {
     let timeout = deadline.saturating_duration_since(Instant::now());
     let client = daemon_health_client();
     let mut last_error = String::from("daemon did not report its port");
 
     while Instant::now() < deadline {
-        if let Some(status) = child.try_wait().context("check daemon child status")? {
-            bail!(
+        if let Some(status) = child
+            .try_wait()
+            .context("check daemon child status")
+            .map_err(DaemonReadinessError::Failed)?
+        {
+            return Err(DaemonReadinessError::Failed(anyhow!(
                 "daemon exited during startup with status {status}; recent log:\n{}",
                 daemon_log_tail_since(kin_root, log_offset)
-            );
+            )));
         }
 
         // The daemon binds :0 and writes its actual bound port to the port file
@@ -4245,13 +4274,13 @@ async fn wait_for_daemon_ready(
         "it is still running and was left alone rather than killed for being slow; \
          wait for it, or stop it with `kin daemon stop`"
     };
-    bail!(
-        "daemon failed to become ready within {:.1}s: {}; {}; recent log:\n{}",
+    Err(DaemonReadinessError::Timeout(format!(
+        "waited {:.1}s: {}; {}; recent log:\n{}",
         timeout.as_secs_f64(),
         last_error,
         fate,
         daemon_log_tail_since(kin_root, log_offset)
-    )
+    )))
 }
 
 /// What the caller should do about the endpoint currently recorded for a repo.
@@ -4859,16 +4888,7 @@ pub async fn ensure_supervisor_running() -> Result<String> {
         );
     }
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        unsafe {
-            cmd.pre_exec(|| {
-                libc::setsid();
-                Ok(())
-            });
-        }
-    }
+    kin_daemon_spawn::detach_from_caller(&mut cmd);
 
     let mut child = cmd.spawn().context("spawn kin supervisor")?;
     let deadline = Instant::now() + Duration::from_secs(daemon_ready_timeout_secs());
@@ -5151,7 +5171,7 @@ pub fn install_spawn_registrar() {
     kin_daemon_spawn::install_registrar(std::sync::Arc::new(CliSpawnRegistrar));
 }
 
-pub async fn ensure_daemon_running(kin_root: &Path) -> Result<String> {
+pub async fn ensure_daemon_running(kin_root: &Path) -> std::result::Result<String, AutoStartError> {
     ensure_daemon_running_with_idle_timeout(kin_root, None).await
 }
 
@@ -5165,45 +5185,54 @@ pub async fn ensure_daemon_running(kin_root: &Path) -> Result<String> {
 pub async fn ensure_daemon_running_with_idle_timeout(
     kin_root: &Path,
     idle_timeout_override: Option<&'static str>,
-) -> Result<String> {
+) -> std::result::Result<String, AutoStartError> {
     install_spawn_registrar();
     let supervisor_url = ensure_supervisor_running()
         .await
-        .context("kin supervisor is required")?;
+        .map_err(map_supervisor_auto_start_error)?;
     if let Some(base_url) = supervisor_route_for_repo(kin_root, &supervisor_url).await {
         return Ok(base_url);
     }
 
     match wait_for_existing_daemon(kin_root).await {
         ExistingDaemon::Connected(base_url) => {
-            register_repo_daemon_with_supervisor(kin_root, &base_url, &supervisor_url).await?;
+            register_repo_daemon_with_supervisor(kin_root, &base_url, &supervisor_url)
+                .await
+                .map_err(AutoStartError::spawn)?;
             return Ok(base_url);
         }
         ExistingDaemon::Starting(message) | ExistingDaemon::LiveNotReady(message) => {
-            bail!(message)
+            return Err(AutoStartError::SpawnFailed(message));
         }
         ExistingDaemon::None => {}
     }
 
-    let _startup_lock = acquire_startup_lock(kin_root).await?;
+    let _startup_lock = acquire_startup_lock(kin_root)
+        .await
+        .map_err(AutoStartError::spawn)?;
     if let Some(base_url) = supervisor_route_for_repo(kin_root, &supervisor_url).await {
         return Ok(base_url);
     }
     match wait_for_existing_daemon(kin_root).await {
         ExistingDaemon::Connected(base_url) => {
-            register_repo_daemon_with_supervisor(kin_root, &base_url, &supervisor_url).await?;
+            register_repo_daemon_with_supervisor(kin_root, &base_url, &supervisor_url)
+                .await
+                .map_err(AutoStartError::spawn)?;
             return Ok(base_url);
         }
         ExistingDaemon::Starting(message) | ExistingDaemon::LiveNotReady(message) => {
-            bail!(message)
+            return Err(AutoStartError::SpawnFailed(message));
         }
         ExistingDaemon::None => {}
     }
 
-    let daemon_bin = find_daemon_binary()?;
+    let daemon_bin = find_daemon_binary().map_err(|error| match error {
+        DaemonBinaryDiscoveryError::NotFound => AutoStartError::BinaryNotFound,
+        DaemonBinaryDiscoveryError::Invalid(detail) => AutoStartError::SpawnFailed(detail),
+    })?;
     let working_dir = kin_root
         .parent()
-        .ok_or_else(|| anyhow!("invalid .kin layout: no parent"))?;
+        .ok_or_else(|| AutoStartError::InvalidLayout("no parent".to_string()))?;
 
     // The daemon owns port selection: it binds :0 and reports the real bound
     // port via the port file. Passing 0 (rather than a port we reserve here)
@@ -5224,23 +5253,43 @@ pub async fn ensure_daemon_running_with_idle_timeout(
     let mut cmd = plan.command();
     scrub_daemon_process_authority(&mut cmd);
     let log_offset = daemon_log_len(kin_root);
-    let log = open_daemon_log(kin_root)?;
+    let log = open_daemon_log(kin_root).map_err(AutoStartError::spawn)?;
     let stderr = log
         .try_clone()
-        .context("clone daemon log handle for stderr")?;
+        .context("clone daemon log handle for stderr")
+        .map_err(AutoStartError::spawn)?;
     cmd.stdout(Stdio::from(log));
     cmd.stderr(Stdio::from(stderr));
 
     let mut child = cmd
         .spawn()
-        .with_context(|| format!("spawn kin-daemon for {}", working_dir.display()))?;
+        .with_context(|| format!("spawn kin-daemon for {}", working_dir.display()))
+        .map_err(AutoStartError::spawn)?;
 
     let timeout_secs = daemon_ready_timeout_secs();
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
-    let base_url = wait_for_daemon_ready(kin_root, &mut child, deadline, log_offset).await?;
-    register_repo_daemon_with_supervisor(kin_root, &base_url, &supervisor_url).await?;
+    let base_url = wait_for_daemon_ready(kin_root, &mut child, deadline, log_offset)
+        .await
+        .map_err(|error| match error {
+            DaemonReadinessError::Failed(error) => AutoStartError::spawn(format!("{error:#}")),
+            DaemonReadinessError::Timeout(detail) => AutoStartError::StartupTimeout(detail),
+        })?;
+    register_repo_daemon_with_supervisor(kin_root, &base_url, &supervisor_url)
+        .await
+        .map_err(AutoStartError::spawn)?;
     info!(daemon = %base_url, "daemon is up and ready");
     Ok(base_url)
+}
+
+fn map_supervisor_auto_start_error(error: anyhow::Error) -> AutoStartError {
+    if matches!(
+        error.downcast_ref::<DaemonBinaryDiscoveryError>(),
+        Some(DaemonBinaryDiscoveryError::NotFound)
+    ) {
+        AutoStartError::BinaryNotFound
+    } else {
+        AutoStartError::spawn(format!("kin supervisor is required: {error:#}"))
+    }
 }
 
 /// Like resolve_daemon_url, but never auto-starts a daemon.
@@ -5299,7 +5348,7 @@ async fn resolve_daemon_url_inner(
 
     match ensure_daemon_running_with_idle_timeout(layout.root(), idle_timeout_override).await {
         Ok(url) => Ok(Some(url)),
-        Err(err) => Err(err.context("kin daemon is required")),
+        Err(err) => Err(anyhow::Error::new(err).context("kin daemon is required")),
     }
 }
 
@@ -5325,6 +5374,24 @@ mod urlencoding {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn supervisor_autostart_mapping_preserves_typed_binary_discovery() {
+        let missing =
+            anyhow::Error::new(DaemonBinaryDiscoveryError::NotFound).context("start supervisor");
+        assert!(matches!(
+            map_supervisor_auto_start_error(missing),
+            AutoStartError::BinaryNotFound
+        ));
+
+        let misleading =
+            anyhow!("readiness probe detail happened to say kin-daemon binary not found");
+        assert!(matches!(
+            map_supervisor_auto_start_error(misleading),
+            AutoStartError::SpawnFailed(detail)
+                if detail.contains("readiness probe detail")
+        ));
+    }
 
     #[tokio::test]
     async fn idempotent_post_retries_exact_body_with_same_session_authority() {
@@ -5443,20 +5510,30 @@ mod tests {
 
     #[test]
     fn daemon_children_drop_inherited_repo_and_projection_authority() {
+        // kin-daemon-spawn owns the exhaustive authority list and tests it there.
+        // Keep this wrapper test focused on representative delegated scrubbing plus
+        // the CLI-owned promise that explicit daemon configuration survives.
+        const POISONED_AUTHORITY: &[&str] = &[
+            "KIN_DAEMON_URL",
+            "KIN_MCP_REPO",
+            "KIN_SESSION",
+            "KIN_SOURCE_ROOT",
+            "KIN_SUPERVISOR_STARTUP_GENERATION",
+            "DYLD_LIBRARY_PATH",
+            "LD_DEBUG_OUTPUT",
+        ];
         let mut command = Command::new("true");
-        for key in DAEMON_AMBIENT_AUTHORITY_ENV {
+        for key in POISONED_AUTHORITY {
             command.env(key, "poison");
         }
+        command.env("KIN_VFS_DISABLE", "poison");
         command.env("KIN_DAEMON_AUTH_TOKEN", "configured-token");
         command.env("KIN_DAEMON_BIND_HOST", "0.0.0.0");
         command.env("PATH", "poison-path");
 
         scrub_daemon_process_authority(&mut command);
 
-        for key in DAEMON_AMBIENT_AUTHORITY_ENV {
-            if *key == "KIN_VFS_DISABLE" {
-                continue;
-            }
+        for key in POISONED_AUTHORITY {
             let value = command
                 .get_envs()
                 .find(|(name, _)| *name == std::ffi::OsStr::new(key))
@@ -6133,6 +6210,33 @@ mod tests {
         }))
         .unwrap();
         validate_daemon_compat_response(&current).unwrap();
+    }
+
+    #[test]
+    #[cfg(any(unix, windows))]
+    fn compat_probe_diagnostic_truncates_on_a_unicode_boundary() {
+        #[cfg(unix)]
+        let status = {
+            use std::os::unix::process::ExitStatusExt as _;
+            std::process::ExitStatus::from_raw(1 << 8)
+        };
+        #[cfg(windows)]
+        let status = {
+            use std::os::windows::process::ExitStatusExt as _;
+            std::process::ExitStatus::from_raw(1)
+        };
+        let output = std::process::Output {
+            status,
+            // "stdout=x" shifts the two-byte characters so the nominal
+            // content cutoff lands inside one of them.
+            stdout: format!("x{}", "é".repeat(300)).into_bytes(),
+            stderr: Vec::new(),
+        };
+
+        let diagnostic = compact_probe_output(&output);
+        assert!(diagnostic.is_char_boundary(diagnostic.len()));
+        assert!(diagnostic.ends_with("..."));
+        assert!(diagnostic.len() <= 400);
     }
 
     #[test]

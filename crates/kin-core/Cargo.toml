@@ -51,4 +51,8 @@ windows-sys = { version = "0.61", features = [
 winapi-util = "0.1"
 
 [dev-dependencies]
+kin-git = { workspace = true, features = ["test-support"] }
 pretty_assertions = { workspace = true }
+
+[target.'cfg(unix)'.dev-dependencies]
+kin-daemon-spawn = { workspace = true }

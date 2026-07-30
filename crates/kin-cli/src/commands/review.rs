@@ -1198,18 +1198,12 @@ mod tests {
     /// graph authority without reading or mutating the adjacent Git checkout.
     #[test]
     fn shadow_rejects_unimported_git_refs_without_mutating_graph() {
-        use std::process::Command;
-
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path();
-        let null_git_config = if cfg!(windows) { "NUL" } else { "/dev/null" };
 
         let git = |args: &[&str]| {
-            let output = Command::new("git")
+            let output = crate::commands::test_subprocess::fixture_git(repo)
                 .args(args)
-                .env("GIT_CONFIG_NOSYSTEM", "1")
-                .env("GIT_CONFIG_GLOBAL", null_git_config)
-                .current_dir(repo)
                 .output()
                 .expect("run git");
             assert!(
@@ -1224,13 +1218,10 @@ mod tests {
             std::fs::write(repo.join(file), content).unwrap();
             git(&["add", "."]);
             let date = format!("{epoch} +0000");
-            let output = Command::new("git")
+            let output = crate::commands::test_subprocess::fixture_git(repo)
                 .args(["commit", "-m", message])
-                .env("GIT_CONFIG_NOSYSTEM", "1")
-                .env("GIT_CONFIG_GLOBAL", null_git_config)
-                .env("GIT_AUTHOR_DATE", &date)
-                .env("GIT_COMMITTER_DATE", &date)
-                .current_dir(repo)
+                .author_date(&date)
+                .committer_date(&date)
                 .output()
                 .expect("git commit");
             assert!(
@@ -1241,11 +1232,8 @@ mod tests {
             );
         };
         let head_sha = || {
-            let output = Command::new("git")
+            let output = crate::commands::test_subprocess::fixture_git(repo)
                 .args(["rev-parse", "HEAD"])
-                .env("GIT_CONFIG_NOSYSTEM", "1")
-                .env("GIT_CONFIG_GLOBAL", null_git_config)
-                .current_dir(repo)
                 .output()
                 .expect("git rev-parse HEAD");
             String::from_utf8(output.stdout)

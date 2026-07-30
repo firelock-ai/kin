@@ -47,21 +47,23 @@ fn git_stdout(path: &Path, args: &[&str]) -> String {
         .to_string()
 }
 
-fn run_kin(repo: &Path, home: &Path, args: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_kin"))
+fn run_kin(
+    runtime: &common::IsolatedDaemonRuntime,
+    repo: &Path,
+    args: &[&str],
+) -> std::process::Output {
+    runtime
+        .kin_command()
         .args(args)
-        .env("HOME", home)
         .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("KIN_DAEMON_BIN", common::fresh_daemon_bin())
-        .env_remove("KIN_DAEMON_URL")
-        .env_remove("KIN_VFS_WORKSPACE")
+        .env("KIN_DAEMON_BIN", runtime.daemon_bin())
         .current_dir(repo)
         .output()
         .expect("run kin")
 }
 
-fn require_kin_json(repo: &Path, home: &Path, args: &[&str]) -> Value {
-    let output = run_kin(repo, home, args);
+fn require_kin_json(runtime: &common::IsolatedDaemonRuntime, repo: &Path, args: &[&str]) -> Value {
+    let output = run_kin(runtime, repo, args);
     assert!(
         output.status.success(),
         "kin {args:?} failed: stdout={} stderr={}",
@@ -125,12 +127,11 @@ fn build_repository(repo: &Path) -> (String, String) {
 #[test]
 fn semver_impact_is_derived_from_published_entity_change_classes() {
     let root = tempdir().expect("temp root");
-    let home = root.path().join("home");
     let repo = root.path().join("repo");
-    fs::create_dir_all(&home).expect("create home");
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
     let (base, head) = build_repository(&repo);
 
-    let init = run_kin(&repo, &home, &["init", ".", "--json"]);
+    let init = run_kin(&runtime, &repo, &["init", ".", "--json"]);
     assert!(
         init.status.success(),
         "stdout={} stderr={}",
@@ -139,8 +140,8 @@ fn semver_impact_is_derived_from_published_entity_change_classes() {
     );
 
     let report = require_kin_json(
+        &runtime,
         &repo,
-        &home,
         &["semver", "--base", &base, "--head", &head, "--json"],
     );
     assert_eq!(report["schema"], "kin.semver-impact.v1");
@@ -219,8 +220,8 @@ fn semver_impact_is_derived_from_published_entity_change_classes() {
     // The same endpoints in the same order always derive the same answer: the
     // impact is a function of graph state, not of when it was asked.
     let repeated = require_kin_json(
+        &runtime,
         &repo,
-        &home,
         &["semver", "--base", &base, "--head", &head, "--json"],
     );
     assert_eq!(repeated, report, "semver impact is not deterministic");
@@ -229,17 +230,16 @@ fn semver_impact_is_derived_from_published_entity_change_classes() {
 #[test]
 fn semver_reports_no_impact_between_identical_endpoints() {
     let root = tempdir().expect("temp root");
-    let home = root.path().join("home");
     let repo = root.path().join("repo");
-    fs::create_dir_all(&home).expect("create home");
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
     let (_, head) = build_repository(&repo);
 
-    let init = run_kin(&repo, &home, &["init", ".", "--json"]);
+    let init = run_kin(&runtime, &repo, &["init", ".", "--json"]);
     assert!(init.status.success());
 
     let report = require_kin_json(
+        &runtime,
         &repo,
-        &home,
         &["semver", "--base", &head, "--head", &head, "--json"],
     );
     assert_eq!(report["impact"], "none");
@@ -252,14 +252,13 @@ fn semver_reports_no_impact_between_identical_endpoints() {
 #[test]
 fn semver_requires_an_explicit_base_endpoint() {
     let root = tempdir().expect("temp root");
-    let home = root.path().join("home");
     let repo = root.path().join("repo");
-    fs::create_dir_all(&home).expect("create home");
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
     build_repository(&repo);
-    let init = run_kin(&repo, &home, &["init", ".", "--json"]);
+    let init = run_kin(&runtime, &repo, &["init", ".", "--json"]);
     assert!(init.status.success());
 
-    let output = run_kin(&repo, &home, &["semver"]);
+    let output = run_kin(&runtime, &repo, &["semver"]);
     assert!(
         !output.status.success(),
         "semver derived an impact without an explicit base endpoint"
@@ -271,8 +270,8 @@ fn semver_requires_an_explicit_base_endpoint() {
     );
 
     let unknown = run_kin(
+        &runtime,
         &repo,
-        &home,
         &["semver", "--base", "refs/heads/nonexistent"],
     );
     assert!(

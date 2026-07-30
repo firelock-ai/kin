@@ -10,6 +10,15 @@
 //! `WorkspaceState`. It does not create `SemanticChange` history on its own;
 //! repository authority commits workspace and history transitions atomically.
 
+#[cfg(all(test, unix))]
+#[test]
+fn kin_process_group_guardian_worker() {
+    let requested = std::env::var_os(kin_daemon_spawn::PROCESS_GROUP_GUARDIAN_MODE_ENV).is_some();
+    let dispatched = kin_daemon_spawn::run_process_group_guardian_if_requested()
+        .expect("run Kin index fixture process-group guardian");
+    assert_eq!(dispatched, requested);
+}
+
 pub mod admission;
 pub mod artifacts;
 pub mod classifier;

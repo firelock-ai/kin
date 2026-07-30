@@ -1420,7 +1420,6 @@ fn stabilize_layout_ids(
 mod tests {
     use super::*;
     use std::path::Path;
-    use std::process::Command;
     use std::sync::OnceLock;
 
     use kin_model::{AuthorId, EntityFilter, LocatedEntry, SemanticChangeId, Timestamp, TreeDelta};
@@ -1482,8 +1481,7 @@ mod tests {
     }
 
     fn git(repo: &Path, args: &[&str]) -> String {
-        let output = Command::new("git")
-            .current_dir(repo)
+        let output = kin_git::test_support::fixture_git_in(repo)
             .args(args)
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env(

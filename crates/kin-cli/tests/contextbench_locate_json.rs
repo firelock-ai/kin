@@ -39,6 +39,7 @@ fn parse_json_output(output: &std::process::Output, context: &str) -> Value {
 #[test]
 fn contextbench_locate_keeps_query_selection_and_normalization_inside_kin() {
     let repo = tempdir().expect("temp repo");
+    let runtime = common::IsolatedDaemonRuntime::new(repo.path());
     fs::create_dir_all(repo.path().join("src")).expect("create src dir");
     fs::write(
         repo.path().join("src/lib.rs"),
@@ -52,7 +53,8 @@ fn contextbench_locate_keeps_query_selection_and_normalization_inside_kin() {
     git(repo.path(), &["add", "src/lib.rs"]);
     git(repo.path(), &["commit", "-m", "seed"]);
 
-    let init = Command::new(env!("CARGO_BIN_EXE_kin"))
+    let init = runtime
+        .kin_command()
         .args(["init", "."])
         .current_dir(repo.path())
         .output()
@@ -81,10 +83,11 @@ fn contextbench_locate_keeps_query_selection_and_normalization_inside_kin() {
     // can claim the port in the gap and the daemon exits during startup. Each
     // attempt rebinds a fresh port, so a bounded retry clears that transient
     // startup race without masking a genuine failure.
-    let daemon_bin = common::fresh_daemon_bin();
+    let daemon_bin = runtime.daemon_bin();
     let mut locate = None;
     for attempt in 1..=8u64 {
-        let out = Command::new(env!("CARGO_BIN_EXE_kin"))
+        let out = runtime
+            .kin_command()
             .args([
                 "contextbench-locate",
                 "--json",

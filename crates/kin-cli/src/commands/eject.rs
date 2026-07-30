@@ -10,11 +10,12 @@
 //! Git repository off to the side, stops graph projection, reopens the same
 //! authority roots, proves the workspace again, and only then detaches `.kin/`.
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{BufRead as _, Read as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use kin_model::{ResolvedTree, TreeEntry};
@@ -24,6 +25,10 @@ use super::git::{
     RepositorySource,
 };
 use super::repository_authority::ActiveRepositoryAuthority;
+
+const EJECT_GIT_METADATA_TIMEOUT: Duration = Duration::from_secs(60);
+const EJECT_GIT_FSCK_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+const EJECT_GIT_CAPTURE_LIMIT: u64 = 8 * 1024 * 1024;
 
 /// Verify graph truth, install its exact Git projection, and detach Kin.
 pub async fn run(yes: bool) -> Result<()> {
@@ -591,23 +596,20 @@ fn run_git(root: &Path, git_dir: Option<&Path>, args: &[&str]) -> Result<()> {
 }
 
 fn run_git_output(root: &Path, git_dir: Option<&Path>, args: &[&str]) -> Result<Output> {
-    let git = which::which("git").context("locate Git executable for interoperability proof")?;
+    let resolution_cwd =
+        std::env::current_dir().context("capture host Git resolution directory for eject")?;
+    let host_path =
+        absolute_eject_host_search_path(kin_core::shims::unshimmed_path(), &resolution_cwd)?;
+    let git = which::which_in("git", Some(&host_path), &resolution_cwd)
+        .context("locate host Git executable for interoperability proof")?;
+    let git = if git.is_absolute() {
+        git
+    } else {
+        resolution_cwd.join(git)
+    };
     let mut command = Command::new(git);
     command.current_dir(root);
-    for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with("GIT_") {
-            command.env_remove(key);
-        }
-    }
-    command
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_NO_REPLACE_OBJECTS", "1")
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .arg("--no-replace-objects");
-    #[cfg(unix)]
-    command.env("GIT_CONFIG_GLOBAL", "/dev/null");
-    #[cfg(windows)]
-    command.env("GIT_CONFIG_GLOBAL", "NUL");
+    command.arg("--no-replace-objects");
     if let Some(git_dir) = git_dir {
         command
             .arg("--git-dir")
@@ -616,9 +618,96 @@ fn run_git_output(root: &Path, git_dir: Option<&Path>, args: &[&str]) -> Result<
             .arg(root);
     }
     command.args(args.iter().map(OsStr::new));
+    finalize_eject_git_process(&mut command, &host_path);
+    crate::daemon_client::probe_process::output_finalized_with_timeout_and_limit(
+        command,
+        &format!("Git interoperability proof {args:?}"),
+        eject_git_timeout(args),
+        EJECT_GIT_CAPTURE_LIMIT,
+    )
+    .with_context(|| format!("run Git interoperability proof {:?}", args))
+}
+
+fn eject_git_timeout(args: &[&str]) -> Duration {
+    if args.first() == Some(&"fsck") {
+        EJECT_GIT_FSCK_TIMEOUT
+    } else {
+        EJECT_GIT_METADATA_TIMEOUT
+    }
+}
+
+fn absolute_eject_host_search_path(
+    host_path: impl AsRef<OsStr>,
+    resolution_cwd: &Path,
+) -> Result<OsString> {
+    let entries = std::env::split_paths(host_path.as_ref())
+        .map(|entry| {
+            if entry.is_absolute() {
+                entry
+            } else {
+                resolution_cwd.join(entry)
+            }
+        })
+        .collect::<Vec<_>>();
+    std::env::join_paths(entries).with_context(|| {
+        format!(
+            "normalize host Git PATH against {} for eject",
+            resolution_cwd.display()
+        )
+    })
+}
+
+/// Eject verifies a graph-derived Git projection against an explicit root.
+/// Ambient repository selectors, Kin/VFS projection state, or loader injection
+/// must not be able to redirect that proof to a shim or another repository.
+fn isolate_eject_git_process(command: &mut Command, host_path: &OsStr) {
+    let explicit_authority = command
+        .get_envs()
+        .map(|(key, _)| key.to_os_string())
+        .filter(|key| is_eject_git_process_authority(key))
+        .collect::<Vec<_>>();
+    for key in std::env::vars_os()
+        .map(|(key, _)| key)
+        .filter(|key| is_eject_git_process_authority(key))
+        .chain(explicit_authority)
+    {
+        command.env_remove(key);
+    }
+    command.env("PATH", host_path).env("KIN_VFS_DISABLE", "1");
+}
+
+/// Apply the complete authority boundary immediately before bounded spawn.
+fn finalize_eject_git_process(command: &mut Command, host_path: &OsStr) {
+    isolate_eject_git_process(command, host_path);
     command
-        .output()
-        .with_context(|| format!("run Git interoperability proof {:?}", args))
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
+        .env("GIT_OPTIONAL_LOCKS", "0");
+    #[cfg(unix)]
+    command.env("GIT_CONFIG_GLOBAL", "/dev/null");
+    #[cfg(windows)]
+    command.env("GIT_CONFIG_GLOBAL", "NUL");
+}
+
+fn is_eject_git_process_authority(key: &std::ffi::OsStr) -> bool {
+    let label = key.to_string_lossy();
+    eject_env_name_starts_with(&label, "GIT_")
+        || eject_env_name_starts_with(&label, "KIN_")
+        || eject_env_name_starts_with(&label, "_KIN_")
+        || eject_env_name_starts_with(&label, "DYLD_")
+        || eject_env_name_starts_with(&label, "LD_")
+}
+
+#[cfg(windows)]
+fn eject_env_name_starts_with(actual: &str, expected: &str) -> bool {
+    actual
+        .get(..expected.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(expected))
+}
+
+#[cfg(not(windows))]
+fn eject_env_name_starts_with(actual: &str, expected: &str) -> bool {
+    actual.starts_with(expected)
 }
 
 #[cfg(unix)]
@@ -641,4 +730,115 @@ fn sync_directory(path: &Path) -> Result<()> {
 #[cfg(not(unix))]
 fn sync_directory(_path: &Path) -> Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod git_process_boundary_tests {
+    use super::*;
+
+    #[test]
+    fn eject_git_boundary_scrubs_repository_vfs_and_loader_authority() {
+        let mut command = Command::new("git");
+        for (key, value) in [
+            ("GIT_DIR", "/hostile/repository"),
+            ("GIT_CONFIG_COUNT", "1"),
+            ("KIN_VFS_WORKSPACE", "/hostile/projection"),
+            ("_KIN_VFS_LAST_DIR", "/hostile/projection/src"),
+            ("DYLD_INSERT_LIBRARIES", "/hostile/interpose.dylib"),
+            ("LD_PRELOAD", "/hostile/interpose.so"),
+        ] {
+            command.env(key, value);
+        }
+        finalize_eject_git_process(&mut command, OsStr::new("/host/bin"));
+
+        let envs = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        for removed in [
+            "GIT_DIR",
+            "GIT_CONFIG_COUNT",
+            "KIN_VFS_WORKSPACE",
+            "_KIN_VFS_LAST_DIR",
+            "DYLD_INSERT_LIBRARIES",
+            "LD_PRELOAD",
+        ] {
+            assert_eq!(
+                envs.get(removed),
+                Some(&None),
+                "{removed} retained eject Git authority"
+            );
+        }
+        assert_eq!(envs.get("KIN_VFS_DISABLE"), Some(&Some("1".to_string())));
+        assert_eq!(envs.get("PATH"), Some(&Some("/host/bin".to_string())));
+        assert_eq!(
+            envs.get("GIT_CONFIG_NOSYSTEM"),
+            Some(&Some("1".to_string()))
+        );
+        assert_eq!(envs.get("GIT_OPTIONAL_LOCKS"), Some(&Some("0".to_string())));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relative_host_path_is_bound_absolutely_before_eject_changes_child_cwd() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let resolution_cwd = root.path().join("resolution");
+        let child_cwd = root.path().join("child");
+        let host_bin = resolution_cwd.join("bin");
+        let hostile_bin = child_cwd.join("bin");
+        std::fs::create_dir_all(&host_bin).unwrap();
+        std::fs::create_dir_all(&hostile_bin).unwrap();
+        let trusted = host_bin.join("git");
+        let hostile = hostile_bin.join("git");
+        std::fs::write(&trusted, "#!/bin/sh\nprintf trusted\n").unwrap();
+        std::fs::write(&hostile, "#!/bin/sh\nprintf hostile\n").unwrap();
+        for executable in [&trusted, &hostile] {
+            let mut permissions = std::fs::metadata(executable).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(executable, permissions).unwrap();
+        }
+
+        let host_path = absolute_eject_host_search_path("bin", &resolution_cwd).unwrap();
+        let git = which::which_in("git", Some(&host_path), &resolution_cwd).unwrap();
+        assert!(git.is_absolute(), "host Git binding remained relative");
+        let output = Command::new(git).current_dir(&child_cwd).output().unwrap();
+        assert_eq!(output.stdout, b"trusted");
+    }
+
+    #[test]
+    fn repository_wide_fsck_has_a_separate_finite_budget() {
+        assert!(EJECT_GIT_FSCK_TIMEOUT > EJECT_GIT_METADATA_TIMEOUT);
+        assert_eq!(
+            eject_git_timeout(&["fsck", "--strict"]),
+            EJECT_GIT_FSCK_TIMEOUT
+        );
+        assert_eq!(
+            eject_git_timeout(&["rev-parse", "--verify", "HEAD"]),
+            EJECT_GIT_METADATA_TIMEOUT
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn eject_git_boundary_is_case_insensitive_on_windows() {
+        for hostile in [
+            "git_dir",
+            "Kin_Vfs_Workspace",
+            "_kin_vfs_last_dir",
+            "Dyld_Insert_Libraries",
+            "ld_preload",
+        ] {
+            assert!(
+                is_eject_git_process_authority(std::ffi::OsStr::new(hostile)),
+                "{hostile} bypassed Windows eject Git isolation"
+            );
+        }
+    }
 }

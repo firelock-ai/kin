@@ -61,10 +61,10 @@ fn commit_worktree(repo: &std::path::Path, message: &str) {
     );
 }
 
-fn kin_command() -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_kin"));
+fn kin_command(runtime: &common::IsolatedDaemonRuntime) -> Command<'_> {
+    let mut cmd = runtime.kin_command();
     cmd.env("KIN_DAEMON_DISABLE_LSP", "1")
-        .env("KIN_DAEMON_BIN", common::fresh_daemon_bin())
+        .env("KIN_DAEMON_BIN", runtime.daemon_bin())
         .env("KIN_DAEMON_IDLE_TIMEOUT_SECS", "1")
         .env("KIN_DAEMON_READY_TIMEOUT_SECS", "30")
         .env("KIN_BYPASS_EMBEDDING_COVERAGE_CHECK", "1");
@@ -75,6 +75,7 @@ fn kin_command() -> Command {
 #[serial]
 fn locate_json_keeps_tracing_warnings_off_stdout() {
     let repo = tempdir().expect("temp repo");
+    let runtime = common::IsolatedDaemonRuntime::new(repo.path());
     fs::create_dir_all(repo.path().join("src")).expect("create src dir");
     fs::write(
         repo.path().join("src/lib.rs"),
@@ -95,7 +96,7 @@ fn locate_json_keeps_tracing_warnings_off_stdout() {
     );
     commit_worktree(repo.path(), "seed");
 
-    let init = kin_command()
+    let init = kin_command(&runtime)
         .arg("init")
         .arg(".")
         .current_dir(repo.path())
@@ -122,7 +123,7 @@ fn locate_json_keeps_tracing_warnings_off_stdout() {
     )
     .expect("write stale vector metadata");
 
-    let locate = kin_command()
+    let locate = kin_command(&runtime)
         .arg("locate")
         .arg("--json")
         .arg("lexer issue")
@@ -154,6 +155,7 @@ fn locate_json_keeps_tracing_warnings_off_stdout() {
 #[serial]
 fn locate_autostarts_daemon_when_available() {
     let repo = tempdir().expect("temp repo");
+    let runtime = common::IsolatedDaemonRuntime::new(repo.path());
     fs::create_dir_all(repo.path().join("src")).expect("create src dir");
     fs::write(
         repo.path().join("src/lib.rs"),
@@ -174,7 +176,7 @@ fn locate_autostarts_daemon_when_available() {
     );
     commit_worktree(repo.path(), "seed");
 
-    let init = kin_command()
+    let init = kin_command(&runtime)
         .arg("init")
         .arg(".")
         .current_dir(repo.path())
@@ -187,7 +189,7 @@ fn locate_autostarts_daemon_when_available() {
         String::from_utf8_lossy(&init.stderr)
     );
 
-    let daemon_bin = common::fresh_daemon_bin();
+    let daemon_bin = runtime.daemon_bin();
     assert!(daemon_bin.exists(), "kin-daemon test binary path");
     let daemon_dir = daemon_bin.parent().expect("daemon bin dir");
     let mut path_entries =
@@ -195,7 +197,7 @@ fn locate_autostarts_daemon_when_available() {
     path_entries.insert(0, daemon_dir.to_path_buf());
     let path = env::join_paths(path_entries).expect("join PATH");
 
-    let locate = kin_command()
+    let locate = kin_command(&runtime)
         .arg("locate")
         .arg("--json")
         .arg("lexer issue")
@@ -235,6 +237,7 @@ fn locate_autostarts_daemon_when_available() {
 #[serial]
 fn locate_requires_daemon_by_default() {
     let repo = tempdir().expect("temp repo");
+    let runtime = common::IsolatedDaemonRuntime::new(repo.path());
     fs::create_dir_all(repo.path().join("src")).expect("create src dir");
     fs::write(
         repo.path().join("src/lib.rs"),
@@ -255,7 +258,7 @@ fn locate_requires_daemon_by_default() {
     );
     commit_worktree(repo.path(), "seed");
 
-    let init = kin_command()
+    let init = kin_command(&runtime)
         .arg("init")
         .arg(".")
         .current_dir(repo.path())
@@ -268,11 +271,11 @@ fn locate_requires_daemon_by_default() {
         String::from_utf8_lossy(&init.stderr)
     );
 
-    let locate = kin_command()
+    let locate = kin_command(&runtime)
         .arg("locate")
         .arg("--json")
         .arg("lexer issue")
-        .env("KIN_DAEMON_URL", "http://127.0.0.1:9")
+        .fixture_daemon_url("http://127.0.0.1:9")
         .current_dir(repo.path())
         .output()
         .expect("run kin locate");
@@ -306,6 +309,7 @@ fn logged_change_ids(stdout: &[u8]) -> Vec<String> {
 #[serial]
 fn locate_ref_can_resolve_historical_files_from_the_public_cli() {
     let repo = tempdir().expect("temp repo");
+    let runtime = common::IsolatedDaemonRuntime::new(repo.path());
     fs::create_dir_all(repo.path().join("src")).expect("create src dir");
     fs::write(
         repo.path().join("src/lib.py"),
@@ -337,7 +341,7 @@ fn locate_ref_can_resolve_historical_files_from_the_public_cli() {
     .expect("write renamed source");
     commit_worktree(repo.path(), "rename handler");
 
-    let init = kin_command()
+    let init = kin_command(&runtime)
         .arg("init")
         .arg(".")
         .current_dir(repo.path())
@@ -350,7 +354,7 @@ fn locate_ref_can_resolve_historical_files_from_the_public_cli() {
         String::from_utf8_lossy(&init.stderr)
     );
 
-    let log = kin_command()
+    let log = kin_command(&runtime)
         .arg("log")
         .current_dir(repo.path())
         .output()
@@ -374,7 +378,7 @@ fn locate_ref_can_resolve_historical_files_from_the_public_cli() {
 
     let query = "Investigate legacy_handler in src/lib.py";
 
-    let historical = kin_command()
+    let historical = kin_command(&runtime)
         .arg("locate")
         .arg("--json")
         .arg("--ref")
@@ -390,7 +394,7 @@ fn locate_ref_can_resolve_historical_files_from_the_public_cli() {
         String::from_utf8_lossy(&historical.stderr)
     );
 
-    let current = kin_command()
+    let current = kin_command(&runtime)
         .arg("locate")
         .arg("--json")
         .arg(query)
@@ -442,6 +446,7 @@ fn locate_ref_can_resolve_historical_files_from_the_public_cli() {
 #[serial]
 fn locate_ref_resolves_admitted_history_without_hydrating_from_git() {
     let repo = tempdir().expect("temp repo");
+    let runtime = common::IsolatedDaemonRuntime::new(repo.path());
     fs::create_dir_all(repo.path().join("src")).expect("create src dir");
 
     let git_init = Command::new("git")
@@ -519,7 +524,7 @@ fn locate_ref_resolves_admitted_history_without_hydrating_from_git() {
         .expect("git commit current");
     assert!(commit_current.status.success());
 
-    let init = kin_command()
+    let init = kin_command(&runtime)
         .arg("init")
         .arg(".")
         .current_dir(repo.path())
@@ -538,7 +543,7 @@ fn locate_ref_resolves_admitted_history_without_hydrating_from_git() {
     fs::rename(repo.path().join(".git"), repo.path().join(".git-detached"))
         .expect("detach migration source");
 
-    let historical = kin_command()
+    let historical = kin_command(&runtime)
         .arg("locate")
         .arg("--json")
         .arg("--ref")
@@ -570,7 +575,7 @@ fn locate_ref_resolves_admitted_history_without_hydrating_from_git() {
 
     // A ref that init never admitted is a graph gap, reported as one. It is
     // never repaired by reaching back into a filesystem checkout.
-    let absent = kin_command()
+    let absent = kin_command(&runtime)
         .arg("locate")
         .arg("--json")
         .arg("--ref")
@@ -598,6 +603,7 @@ fn locate_ref_resolves_admitted_history_without_hydrating_from_git() {
 #[serial]
 fn locate_ref_resolves_tip_and_root_after_full_history_init() {
     let repo = tempdir().expect("temp repo");
+    let runtime = common::IsolatedDaemonRuntime::new(repo.path());
 
     let git_init = Command::new("git")
         .arg("init")
@@ -628,8 +634,7 @@ fn locate_ref_resolves_tip_and_root_after_full_history_init() {
                 "-m",
                 message,
             ])
-            .env("GIT_AUTHOR_DATE", &date)
-            .env("GIT_COMMITTER_DATE", &date)
+            .fixture_git_commit_dates(&date)
             .current_dir(repo.path())
             .output()
             .expect("git commit");
@@ -673,7 +678,7 @@ fn locate_ref_resolves_tip_and_root_after_full_history_init() {
     }
     let head_sha = rev_parse("HEAD");
 
-    let init = kin_command()
+    let init = kin_command(&runtime)
         .arg("init")
         .arg(".")
         .current_dir(repo.path())
@@ -687,7 +692,7 @@ fn locate_ref_resolves_tip_and_root_after_full_history_init() {
     );
 
     // The tip resolves strictly from imported graph history.
-    let head_locate = kin_command()
+    let head_locate = kin_command(&runtime)
         .arg("locate")
         .arg("--json")
         .arg("--ref")
@@ -706,7 +711,7 @@ fn locate_ref_resolves_tip_and_root_after_full_history_init() {
         .expect("HEAD-ref locate stdout should be valid JSON");
 
     // The root resolves from the same complete imported DAG.
-    let root_locate = kin_command()
+    let root_locate = kin_command(&runtime)
         .arg("locate")
         .arg("--json")
         .arg("--ref")

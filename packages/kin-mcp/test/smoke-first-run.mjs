@@ -16,6 +16,7 @@
 // binaries and spawns a real daemon, so it runs on demand / in release CI.
 
 import cp from 'node:child_process';
+import { constants as fsConstants } from 'node:fs';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -31,6 +32,206 @@ function log(message) {
   process.stderr.write(`[smoke] ${message}\n`);
 }
 
+function envNameEquals(actual, expected, platform = process.platform) {
+  return platform === 'win32'
+    ? actual.toLowerCase() === expected.toLowerCase()
+    : actual === expected;
+}
+
+function envNameStartsWith(actual, expected, platform = process.platform) {
+  if (platform === 'win32') {
+    return actual.slice(0, expected.length).toLowerCase() === expected.toLowerCase();
+  }
+  return actual.startsWith(expected);
+}
+
+function readEnv(env, name, platform = process.platform) {
+  if (Object.hasOwn(env, name)) {
+    return env[name];
+  }
+  const match = Object.keys(env).find(key => envNameEquals(key, name, platform));
+  return match === undefined ? undefined : env[match];
+}
+
+function isInheritedAuthority(name, platform = process.platform) {
+  return (
+    envNameStartsWith(name, 'GIT_', platform) ||
+    envNameStartsWith(name, 'KIN_', platform) ||
+    envNameStartsWith(name, '_KIN_', platform) ||
+    envNameStartsWith(name, 'DYLD_', platform) ||
+    envNameStartsWith(name, 'LD_', platform) ||
+    envNameEquals(name, 'EMAIL', platform) ||
+    envNameEquals(name, 'SSH_ASKPASS', platform) ||
+    envNameEquals(name, 'SSH_ASKPASS_REQUIRE', platform) ||
+    envNameEquals(name, 'SSH_AUTH_SOCK', platform) ||
+    envNameEquals(name, 'PATH', platform) ||
+    envNameEquals(name, 'HOME', platform) ||
+    envNameEquals(name, 'USERPROFILE', platform) ||
+    envNameEquals(name, 'XDG_CONFIG_HOME', platform)
+  );
+}
+
+export function absoluteHostPath({
+  env = process.env,
+  cwd = process.cwd(),
+  platform = process.platform
+} = {}) {
+  const pathApi = platform === 'win32' ? path.win32 : path.posix;
+  const delimiter = platform === 'win32' ? ';' : ':';
+  const raw =
+    readEnv(env, 'KIN_ORIGINAL_PATH', platform) ||
+    readEnv(env, 'PATH', platform) ||
+    '';
+  return raw
+    .split(delimiter)
+    .map(entry => {
+      const candidate = entry || '.';
+      return pathApi.isAbsolute(candidate)
+        ? pathApi.normalize(candidate)
+        : pathApi.resolve(cwd, candidate);
+    })
+    .join(delimiter);
+}
+
+export function hermeticSmokeEnv({
+  sourceEnv = process.env,
+  hostPath,
+  homeDir,
+  xdgDir,
+  platform = process.platform
+}) {
+  const env = {};
+  for (const [name, value] of Object.entries(sourceEnv)) {
+    if (!isInheritedAuthority(name, platform)) {
+      env[name] = value;
+    }
+  }
+
+  Object.assign(env, {
+    GIT_CONFIG_GLOBAL: platform === 'win32' ? 'NUL' : os.devNull,
+    GIT_CONFIG_NOSYSTEM: '1',
+    GIT_ATTR_NOSYSTEM: '1',
+    GIT_TERMINAL_PROMPT: '0',
+    GIT_PAGER: 'cat',
+    GIT_ALLOW_PROTOCOL: 'file',
+    GIT_PROTOCOL_FROM_USER: '0',
+    PATH: hostPath,
+    KIN_VFS_DISABLE: '1',
+    HOME: homeDir,
+    USERPROFILE: homeDir,
+    XDG_CONFIG_HOME: xdgDir
+  });
+  return env;
+}
+
+async function isExecutableFile(candidate, platform) {
+  try {
+    const stat = await fs.stat(candidate);
+    if (!stat.isFile()) {
+      return false;
+    }
+    if (platform !== 'win32') {
+      await fs.access(candidate, fsConstants.X_OK);
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function resolveHostGit({
+  hostPath,
+  cwd = process.cwd(),
+  platform = process.platform
+}) {
+  const pathApi = platform === 'win32' ? path.win32 : path.posix;
+  const delimiter = platform === 'win32' ? ';' : ':';
+  const executableNames = platform === 'win32' ? ['git.exe', 'git'] : ['git'];
+  for (const entry of hostPath.split(delimiter)) {
+    if (!entry) {
+      continue;
+    }
+    for (const executableName of executableNames) {
+      const candidate = pathApi.resolve(cwd, entry, executableName);
+      if (await isExecutableFile(candidate, platform)) {
+        return fs.realpath(candidate);
+      }
+    }
+  }
+  throw new Error(`could not locate an executable host Git in PATH=${hostPath}`);
+}
+
+export async function createSmokeFixtureContext({
+  workRoot,
+  sourceEnv = process.env,
+  cwd = process.cwd(),
+  platform = process.platform
+}) {
+  const homeDir = path.join(workRoot, 'home');
+  const xdgDir = path.join(workRoot, 'xdg');
+  const hooksDir = path.join(workRoot, 'hooks');
+  const templateDir = path.join(workRoot, 'template');
+  await Promise.all(
+    [homeDir, xdgDir, hooksDir, templateDir].map(directory =>
+      fs.mkdir(directory, { recursive: true })
+    )
+  );
+
+  const hostPath = absoluteHostPath({ env: sourceEnv, cwd, platform });
+  const gitBinary = await resolveHostGit({ hostPath, cwd, platform });
+  const env = hermeticSmokeEnv({
+    sourceEnv,
+    hostPath,
+    homeDir,
+    xdgDir,
+    platform
+  });
+  Object.assign(env, {
+    GIT_AUTHOR_NAME: 'Kin MCP Smoke',
+    GIT_AUTHOR_EMAIL: 'kin-mcp-smoke@localhost',
+    GIT_AUTHOR_DATE: '2000-01-01T00:00:00Z',
+    GIT_COMMITTER_NAME: 'Kin MCP Smoke',
+    GIT_COMMITTER_EMAIL: 'kin-mcp-smoke@localhost',
+    GIT_COMMITTER_DATE: '2000-01-01T00:00:00Z'
+  });
+  return { env, gitBinary, hooksDir, templateDir };
+}
+
+function gitArgs(context, args) {
+  return [
+    '-c',
+    `core.hooksPath=${context.hooksDir}`,
+    '-c',
+    'maintenance.auto=false',
+    '-c',
+    'gc.auto=0',
+    '-c',
+    'protocol.file.allow=always',
+    ...args
+  ];
+}
+
+export function runGit(context, repoDir, args, { stdio = 'inherit' } = {}) {
+  return cp.execFileSync(context.gitBinary, gitArgs(context, args), {
+    cwd: repoDir,
+    env: context.env,
+    stdio
+  });
+}
+
+export function initializeGitFixture(context, repoDir) {
+  runGit(context, repoDir, [
+    'init',
+    '--initial-branch=main',
+    `--template=${context.templateDir}`,
+    '.'
+  ]);
+  runGit(context, repoDir, ['config', '--local', 'commit.gpgSign', 'false']);
+  runGit(context, repoDir, ['config', '--local', 'core.autocrlf', 'false']);
+  runGit(context, repoDir, ['add', '--', 'main.rs']);
+  runGit(context, repoDir, ['commit', '-m', 'Seed Kin MCP smoke fixture']);
+}
+
 async function isFile(candidate) {
   try {
     const stat = await fs.stat(candidate);
@@ -41,12 +242,13 @@ async function isFile(candidate) {
 }
 
 async function locateBinary(envKey, name) {
-  const explicit = process.env[envKey];
+  const explicit = readEnv(process.env, envKey);
   if (explicit) {
-    if (!(await isFile(explicit))) {
+    const explicitPath = path.resolve(explicit);
+    if (!(await isFile(explicitPath))) {
       throw new Error(`${envKey}=${explicit} is not a file`);
     }
-    return explicit;
+    return explicitPath;
   }
   for (const profile of ['release', 'debug']) {
     const candidate = path.join(repoRoot, 'target', profile, name);
@@ -146,7 +348,7 @@ async function killTree(child, kinRoot, cacheRoot) {
   // Tear down the supervisor (and any other daemon) this run spawned from the
   // throwaway cache so the smoke leaves no background processes behind.
   try {
-    const listing = cp.execFileSync('ps', ['-Ao', 'pid=,command='], {
+    const listing = cp.execFileSync('/bin/ps', ['-Ao', 'pid=,command='], {
       encoding: 'utf8'
     });
     for (const line of listing.split('\n')) {
@@ -174,10 +376,12 @@ async function main() {
   const cacheRoot = path.join(workRoot, 'cache');
   const repoDir = path.join(workRoot, 'repo');
   await fs.mkdir(repoDir, { recursive: true });
+  const fixtureContext = await createSmokeFixtureContext({ workRoot });
   await fs.writeFile(
     path.join(repoDir, 'main.rs'),
     'fn greet() -> &\'static str {\n    "hello kin"\n}\n'
   );
+  initializeGitFixture(fixtureContext, repoDir);
 
   await stageCache(cacheRoot, kinBin, daemonBin);
 
@@ -186,22 +390,19 @@ async function main() {
     env: { KIN_MCP_CACHE_DIR: cacheRoot }
   });
   log('kin init . (explicit first-run)');
-  cp.execFileSync(cachedKin, ['init', '.'], { cwd: repoDir, stdio: 'inherit' });
+  cp.execFileSync(cachedKin, ['init', '.'], {
+    cwd: repoDir,
+    env: fixtureContext.env,
+    stdio: 'inherit'
+  });
 
   const wrapperBin = path.join(packageDir, 'bin', 'kin-mcp.js');
   const env = {
-    ...process.env,
+    ...fixtureContext.env,
     KIN_MCP_CACHE_DIR: cacheRoot,
     KIN_DAEMON_IDLE_TIMEOUT_SECS: '30',
     KIN_SUPERVISOR_IDLE_TIMEOUT_SECS: '30'
   };
-  // Prove no reliance on a stale PATH binary or pre-existing daemon: scrub
-  // any daemon discovery hints the wrapper would otherwise inherit.
-  delete env.KIN_DAEMON_BIN;
-  delete env.KIN_DAEMON_URL;
-  delete env.KIN_SUPERVISOR_URL;
-  delete env.KIN_MCP_KIN_BINARY;
-  delete env.KIN_BINARY_PATH;
 
   log('starting wrapper (kin-mcp -> kin mcp start), auto-spawning daemon...');
   const child = cp.spawn(process.execPath, [wrapperBin], {
@@ -274,7 +475,10 @@ async function main() {
   }
 }
 
-main().catch(error => {
-  process.stderr.write(`SMOKE FAIL: ${error.message}\n`);
-  process.exit(1);
-});
+const invokedPath = process.argv[1] ? path.resolve(process.argv[1]) : null;
+if (invokedPath === fileURLToPath(import.meta.url)) {
+  main().catch(error => {
+    process.stderr.write(`SMOKE FAIL: ${error.message}\n`);
+    process.exit(1);
+  });
+}

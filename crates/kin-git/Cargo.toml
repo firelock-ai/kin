@@ -9,6 +9,13 @@ license.workspace = true
 description = "Exact Git migration and projection boundary for Kin"
 repository.workspace = true
 
+[features]
+test-support = [
+    "dep:kin-daemon-spawn",
+    "dep:libc",
+    "dep:which",
+]
+
 [dependencies]
 kin-model = { workspace = true }
 kin-blobs = { workspace = true }
@@ -22,13 +29,29 @@ rayon = { workspace = true }
 uuid = { workspace = true, features = ["v5"] }
 rustix = { workspace = true }
 tempfile = { workspace = true }
+which = { version = "8", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 cap-std = "=4.0.2"
+kin-daemon-spawn = { workspace = true, optional = true }
+libc = { version = "0.2", optional = true }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_JobObjects",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
 
 [dev-dependencies]
+libc = "0.2"
 pretty_assertions = { workspace = true }
 serde_json = { workspace = true }
+which = "8"
+
+[target.'cfg(unix)'.dev-dependencies]
+kin-daemon-spawn = { workspace = true }

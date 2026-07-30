@@ -31,20 +31,22 @@ fn require_git(path: &Path, args: &[&str]) {
     );
 }
 
-fn run_kin(repo: &Path, home: &Path, args: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_kin"))
+fn run_kin(
+    runtime: &common::IsolatedDaemonRuntime,
+    repo: &Path,
+    args: &[&str],
+) -> std::process::Output {
+    runtime
+        .kin_command()
         .args(args)
-        .env("HOME", home)
         .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("KIN_DAEMON_BIN", common::fresh_daemon_bin())
-        .env_remove("KIN_DAEMON_URL")
-        .env_remove("KIN_VFS_WORKSPACE")
+        .env("KIN_DAEMON_BIN", runtime.daemon_bin())
         .current_dir(repo)
         .output()
         .expect("run kin")
 }
 
-fn initialize(repo: &Path, home: &Path) {
+fn initialize(runtime: &common::IsolatedDaemonRuntime, repo: &Path) {
     fs::create_dir_all(repo).expect("create repo");
     require_git(repo, &["init", "--initial-branch=main"]);
     require_git(repo, &["config", "user.email", "kin@example.invalid"]);
@@ -56,7 +58,7 @@ fn initialize(repo: &Path, home: &Path) {
     require_git(repo, &["add", "--all"]);
     require_git(repo, &["commit", "-m", "release surface"]);
 
-    let init = run_kin(repo, home, &["init", ".", "--json"]);
+    let init = run_kin(runtime, repo, &["init", ".", "--json"]);
     assert!(
         init.status.success(),
         "stdout={} stderr={}",
@@ -68,12 +70,15 @@ fn initialize(repo: &Path, home: &Path) {
 #[test]
 fn a_release_snapshot_is_bound_to_exact_roots_source_and_artifacts() {
     let root = tempdir().expect("temp root");
-    let home = root.path().join("home");
     let repo = root.path().join("repo");
-    fs::create_dir_all(&home).expect("create home");
-    initialize(&repo, &home);
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    initialize(&runtime, &repo);
 
-    let output = run_kin(&repo, &home, &["release", "snapshot", "v1.0.0", "--force"]);
+    let output = run_kin(
+        &runtime,
+        &repo,
+        &["release", "snapshot", "v1.0.0", "--force"],
+    );
     assert!(
         output.status.success(),
         "stdout={} stderr={}",
@@ -144,7 +149,11 @@ fn a_release_snapshot_is_bound_to_exact_roots_source_and_artifacts() {
 
     // A second release of a different tag over the same source is a different
     // snapshot: the digest covers the tag and the roots transition too.
-    let second = run_kin(&repo, &home, &["release", "snapshot", "v1.0.1", "--force"]);
+    let second = run_kin(
+        &runtime,
+        &repo,
+        &["release", "snapshot", "v1.0.1", "--force"],
+    );
     assert!(
         second.status.success(),
         "stdout={} stderr={}",
@@ -165,14 +174,13 @@ fn a_release_snapshot_is_bound_to_exact_roots_source_and_artifacts() {
 #[test]
 fn a_refused_release_publishes_no_snapshot_and_no_tag() {
     let root = tempdir().expect("temp root");
-    let home = root.path().join("home");
     let repo = root.path().join("repo");
-    fs::create_dir_all(&home).expect("create home");
-    initialize(&repo, &home);
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    initialize(&runtime, &repo);
 
     let refused = run_kin(
+        &runtime,
         &repo,
-        &home,
         &[
             "release",
             "snapshot",
@@ -192,7 +200,11 @@ fn a_refused_release_publishes_no_snapshot_and_no_tag() {
     );
 
     // The refused tag must not exist, so the same name can still be released.
-    let allowed = run_kin(&repo, &home, &["release", "snapshot", "v2.0.0", "--force"]);
+    let allowed = run_kin(
+        &runtime,
+        &repo,
+        &["release", "snapshot", "v2.0.0", "--force"],
+    );
     assert!(
         allowed.status.success(),
         "the refused release left its tag ref behind: stdout={} stderr={}",

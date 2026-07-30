@@ -7,7 +7,13 @@ use std::time::{Duration, Instant};
 
 use kin_daemon::api::HealthResponse;
 use tokio::net::TcpStream;
-use tokio::process::{Child, Command};
+use tokio::process::Command;
+
+mod common;
+
+use common::{
+    isolate_daemon_test_command, spawn_daemon_test_command, terminate_daemon, DaemonChild,
+};
 
 /// Readiness budget for a daemon to come up. Generous enough that two CI runs
 /// sharing a runner (a push build and a pull_request build on the same commit)
@@ -26,7 +32,7 @@ fn backoff_after(current: Duration) -> Duration {
 /// polling a dead process until the readiness deadline. This turns a bind
 /// collision or a startup crash into an immediate, legible failure rather than
 /// a multi-minute "never became healthy" hang.
-fn assert_child_alive(child: &mut Child, port: u16, what: &str) {
+fn assert_child_alive(child: &mut DaemonChild, port: u16, what: &str) {
     if let Ok(Some(status)) = child.try_wait() {
         panic!("daemon on port {port} exited before it became {what}: {status}");
     }
@@ -36,7 +42,7 @@ fn assert_child_alive(child: &mut Child, port: u16, what: &str) {
 /// and return it. Spawning with `--port 0` lets the daemon own port selection
 /// and advertise the real bound port here — the same handshake the CLI uses —
 /// so a kill/restart never depends on reusing one port's teardown timing.
-async fn read_published_port(child: &mut Child, repo_root: &Path) -> u16 {
+async fn read_published_port(child: &mut DaemonChild, repo_root: &Path) -> u16 {
     let port_file = repo_root.join(".kin/daemon.port");
     // Share the readiness budget rather than keeping a tighter one of its own.
     // Publishing the port is part of the same startup this file already grants
@@ -91,26 +97,38 @@ fn init_repo(root: &Path) {
     kin_core::init(root).unwrap();
 }
 
-fn spawn_daemon(repo_root: &Path, port: u16) -> Child {
+fn spawn_daemon(repo_root: &Path, port: u16) -> DaemonChild {
     spawn_daemon_with_env(repo_root, port, &[])
 }
 
-fn spawn_daemon_with_env(repo_root: &Path, port: u16, envs: &[(&str, &str)]) -> Child {
+fn spawn_daemon_with_env(repo_root: &Path, port: u16, envs: &[(&str, &str)]) -> DaemonChild {
     let bin = env!("CARGO_BIN_EXE_kin-daemon");
     let mut cmd = Command::new(bin);
+    isolate_daemon_test_command(&mut cmd);
     cmd.arg("--repo")
         .arg(repo_root)
         .arg("--port")
         .arg(port.to_string())
+        // Daemon startup inspects the registry to pin sibling repository
+        // authority. A scratch daemon must never enumerate the developer's
+        // real registry while doing so.
+        .env(
+            "KIN_REGISTRY_PATH",
+            repo_root.join(".kin/test-runtime/registry.toml"),
+        )
+        // These recovery tests exercise daemon lifecycle and graph durability,
+        // not host language-server discovery.
+        .env("KIN_DAEMON_DISABLE_LSP", "1")
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
     for (key, value) in envs {
         cmd.env(key, value);
     }
-    cmd.spawn().expect("failed to spawn kin-daemon")
+    spawn_daemon_test_command(cmd, "chaos-recovery daemon")
+        .expect("failed to spawn contained kin-daemon")
 }
 
-async fn wait_for_health(child: &mut Child, port: u16) -> HealthResponse {
+async fn wait_for_health(child: &mut DaemonChild, port: u16) -> HealthResponse {
     let client = reqwest::Client::new();
     let url = format!("http://127.0.0.1:{port}/health");
     let deadline = Instant::now() + READINESS_TIMEOUT;
@@ -136,7 +154,7 @@ async fn wait_for_health(child: &mut Child, port: u16) -> HealthResponse {
     }
 }
 
-async fn wait_for_serving(child: &mut Child, port: u16) {
+async fn wait_for_serving(child: &mut DaemonChild, port: u16) {
     let addr = format!("127.0.0.1:{port}");
     let deadline = Instant::now() + READINESS_TIMEOUT;
     let mut backoff = Duration::from_millis(50);
@@ -250,11 +268,9 @@ async fn daemon_recovers_after_process_kill_and_restart() {
     assert_eq!(first.status, "ok");
     assert!(first.uptime_seconds < 20);
 
-    child.start_kill().expect("failed to kill kin-daemon");
-    let exit = tokio::time::timeout(Duration::from_secs(10), child.wait())
+    let exit = terminate_daemon(&mut child, "initial recovery daemon")
         .await
-        .expect("kin-daemon did not exit after kill")
-        .expect("kin-daemon wait failed");
+        .expect("terminate and reap initial recovery daemon");
     assert!(
         !exit.success(),
         "killed kin-daemon should not report success"
@@ -270,10 +286,9 @@ async fn daemon_recovers_after_process_kill_and_restart() {
     assert_eq!(second.status, "ok");
     assert!(second.uptime_seconds < 20);
 
-    restarted
-        .start_kill()
-        .expect("failed to stop restarted kin-daemon");
-    let _ = restarted.wait().await;
+    terminate_daemon(&mut restarted, "restarted recovery daemon")
+        .await
+        .expect("terminate and reap restarted recovery daemon");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -324,8 +339,8 @@ async fn daemon_exits_after_idle_timeout_and_removes_endpoint_files() {
     let exit = match tokio::time::timeout(Duration::from_secs(90), child.wait()).await {
         Ok(result) => result.expect("kin-daemon wait failed"),
         Err(_) => {
-            let _ = child.start_kill();
-            panic!("kin-daemon did not exit after idle timeout");
+            let cleanup = terminate_daemon(&mut child, "idle-timeout daemon").await;
+            panic!("kin-daemon did not exit after idle timeout; cleanup={cleanup:?}");
         }
     };
     assert!(exit.success(), "idle shutdown should be graceful: {exit}");
@@ -372,8 +387,8 @@ async fn daemon_exits_after_dirty_repo_control_dir_is_removed() {
     let exit = match tokio::time::timeout(Duration::from_secs(15), child.wait()).await {
         Ok(result) => result.expect("kin-daemon wait failed"),
         Err(_) => {
-            let _ = child.start_kill();
-            panic!("kin-daemon did not exit after deleted control directory");
+            let cleanup = terminate_daemon(&mut child, "deleted-control-dir daemon").await;
+            panic!("kin-daemon did not exit after deleted control directory; cleanup={cleanup:?}");
         }
     };
     assert!(

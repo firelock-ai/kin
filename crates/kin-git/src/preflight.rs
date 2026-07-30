@@ -2002,11 +2002,12 @@ mod tests {
     use std::io::Write as _;
     use std::os::unix::ffi::OsStringExt;
     use std::os::unix::fs::{symlink, PermissionsExt};
-    use std::process::{Command, Output, Stdio};
+    use std::process::Output;
 
     use tempfile::TempDir;
 
     use super::*;
+    use crate::test_support::{fixture_git, FixtureGitCommand};
     use crate::{plan_semantic_git_import, GitError};
 
     struct Fixture {
@@ -2991,47 +2992,22 @@ mod tests {
     }
 
     fn git_stdin(repo: &Path, args: &[&str], input: &str) -> Output {
-        let mut child = git_command(repo)
+        let output = git_command(repo)
             .args(args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
+            .output_with_input(input.as_bytes())
             .expect("spawn git");
-        child
-            .stdin
-            .as_mut()
-            .expect("git stdin")
-            .write_all(input.as_bytes())
-            .expect("write git stdin");
-        let output = child.wait_with_output().expect("wait for git");
         assert_git_success(args, &output);
         output
     }
 
-    fn git_command(repo: &Path) -> Command {
+    fn git_command(repo: &Path) -> FixtureGitCommand {
         let mut command = clean_git_command();
         command.current_dir(repo);
         command
     }
 
-    fn clean_git_command() -> Command {
-        let mut command = Command::new("git");
-        command.env("GIT_CONFIG_NOSYSTEM", "1").env(
-            "GIT_CONFIG_GLOBAL",
-            if cfg!(windows) { "NUL" } else { "/dev/null" },
-        );
-        for variable in [
-            "GIT_DIR",
-            "GIT_WORK_TREE",
-            "GIT_INDEX_FILE",
-            "GIT_OBJECT_DIRECTORY",
-            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-            "GIT_COMMON_DIR",
-        ] {
-            command.env_remove(variable);
-        }
-        command
+    fn clean_git_command() -> FixtureGitCommand {
+        fixture_git()
     }
 
     fn assert_git_success(args: &[&str], output: &Output) {

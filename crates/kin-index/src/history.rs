@@ -722,7 +722,6 @@ fn invalid(message: impl Into<String>) -> IndexError {
 mod tests {
     use std::fs;
     use std::path::Path;
-    use std::process::Command;
 
     use kin_git::{
         admit_semantic_git_import, capture_lossless_git_repository, plan_semantic_git_import,
@@ -1263,21 +1262,16 @@ mod tests {
     }
 
     fn git(repository: &Path, args: &[&str]) {
-        let output = Command::new("git")
-            .args(args)
-            .current_dir(repository)
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env(
-                "GIT_CONFIG_GLOBAL",
-                if cfg!(windows) { "NUL" } else { "/dev/null" },
-            )
-            .output()
-            .unwrap();
+        let output = fixture_git(repository).args(args).output().unwrap();
         assert!(
             output.status.success(),
             "git {args:?} failed\nstdout: {}\nstderr: {}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    fn fixture_git(repository: &Path) -> kin_git::test_support::FixtureGitCommand {
+        kin_git::test_support::fixture_git_in(repository)
     }
 }

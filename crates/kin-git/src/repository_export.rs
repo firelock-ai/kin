@@ -1080,9 +1080,7 @@ where
 
 #[cfg(all(test, unix))]
 mod tests {
-    use std::io::Write as _;
     use std::os::unix::fs::{symlink, PermissionsExt as _};
-    use std::process::{Command, Stdio};
 
     use kin_blobs::{BlobError, BlobStore};
     use kin_model::{
@@ -1093,6 +1091,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+    use crate::test_support::{fixture_git, FixtureGitCommand};
     use crate::{
         admit_semantic_git_import, build_git_external_authority, plan_semantic_git_import,
     };
@@ -1466,7 +1465,7 @@ mod tests {
                 .trim(),
             "refs/heads/main"
         );
-        let show_ref = git_test_command()
+        let show_ref = fixture_git()
             .arg("--git-dir")
             .arg(&exported)
             .arg("show-ref")
@@ -1665,26 +1664,21 @@ mod tests {
     }
 
     fn git(repository: &Path, args: &[&str]) -> Vec<u8> {
-        command(git_test_command().args(args).current_dir(repository))
+        command(fixture_git().args(args).current_dir(repository))
     }
 
     fn git_bare(repository: &Path, args: &[&str]) -> Vec<u8> {
-        let mut invocation = git_test_command();
+        let mut invocation = fixture_git();
         invocation.arg("--git-dir").arg(repository).args(args);
         command(&mut invocation)
     }
 
     fn git_with_input(repository: &Path, args: &[&str], input: &[u8]) -> Vec<u8> {
-        let mut child = git_test_command()
+        let output = fixture_git()
             .args(args)
             .current_dir(repository)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
+            .output_with_input(input)
             .unwrap();
-        child.stdin.take().unwrap().write_all(input).unwrap();
-        let output = child.wait_with_output().unwrap();
         assert!(
             output.status.success(),
             "command failed: {}",
@@ -1694,7 +1688,7 @@ mod tests {
     }
 
     fn git_clone_without_checkout(source: &Path, destination: &Path) {
-        let mut invocation = git_test_command();
+        let mut invocation = fixture_git();
         invocation
             .arg("clone")
             .arg("--no-checkout")
@@ -1703,16 +1697,7 @@ mod tests {
         command(&mut invocation);
     }
 
-    fn git_test_command() -> Command {
-        let mut command = Command::new("git");
-        command.env("GIT_CONFIG_NOSYSTEM", "1").env(
-            "GIT_CONFIG_GLOBAL",
-            if cfg!(windows) { "NUL" } else { "/dev/null" },
-        );
-        command
-    }
-
-    fn command(invocation: &mut Command) -> Vec<u8> {
+    fn command(invocation: &mut FixtureGitCommand) -> Vec<u8> {
         let output = invocation.output().unwrap();
         assert!(
             output.status.success(),
