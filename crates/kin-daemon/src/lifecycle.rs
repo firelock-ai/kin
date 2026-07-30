@@ -2458,16 +2458,19 @@ fn install_replacement_after_legacy_preflight<Replacement>(
     }
 }
 
-/// Opt in to a launchd Launch Agent so the daemon starts on login.
+/// Internal implementation for a future Kin-owned launchd opt-in surface.
 ///
-/// The current CLI does not call this during `kin init`; a caller must choose
-/// this persistent host integration explicitly. The function creates a
-/// per-repo plist in ~/Library/LaunchAgents/ and loads it immediately.
+/// This stays crate-private because its containment re-executes the current
+/// Kin product binary, which must dispatch the private guardian mode before
+/// argument parsing. Exposing it to arbitrary downstream executables would
+/// create an invalid implicit host contract. The current CLI does not call it
+/// during `kin init`.
 ///
 /// Each repo gets its own agent with a canonical-root digest label:
 ///   ai.firelock.kin-daemon.<digest>.<readable-suffix>
 #[cfg(target_os = "macos")]
-pub fn register_launch_agent(kin_root: &Path) -> Result<(), String> {
+#[allow(dead_code)]
+pub(crate) fn register_launch_agent(kin_root: &Path) -> Result<(), String> {
     let working_dir = kin_root.parent().ok_or("no parent")?;
     let canonical_working_dir = working_dir.canonicalize().map_err(|error| {
         format!(
@@ -2587,12 +2590,14 @@ pub fn register_launch_agent(kin_root: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Unregister an explicitly installed Launch Agent for a repo.
+/// Internal cleanup for the Kin-owned LaunchAgent implementation.
 ///
-/// The current CLI does not call this during `kin eject`; the caller that opted
-/// into registration also owns invoking this cleanup before removing `.kin/`.
+/// It remains crate-private for the same guardian-host reason as
+/// [`register_launch_agent`]. The current CLI does not call it during
+/// `kin eject`.
 #[cfg(target_os = "macos")]
-pub fn unregister_launch_agent(kin_root: &Path) {
+#[allow(dead_code)]
+pub(crate) fn unregister_launch_agent(kin_root: &Path) {
     let working_dir = match kin_root.parent() {
         Some(p) => p,
         None => return,
@@ -2661,13 +2666,15 @@ pub fn unregister_launch_agent(kin_root: &Path) {
 
 /// No-op on non-macOS platforms.
 #[cfg(not(target_os = "macos"))]
-pub fn register_launch_agent(_kin_root: &Path) -> Result<(), String> {
+#[allow(dead_code)]
+pub(crate) fn register_launch_agent(_kin_root: &Path) -> Result<(), String> {
     Ok(()) // Linux: TODO systemd user unit
 }
 
 /// No-op on non-macOS platforms.
 #[cfg(not(target_os = "macos"))]
-pub fn unregister_launch_agent(_kin_root: &Path) {}
+#[allow(dead_code)]
+pub(crate) fn unregister_launch_agent(_kin_root: &Path) {}
 
 // ── Tests ───────────────────────────────────────────────────────────────
 
