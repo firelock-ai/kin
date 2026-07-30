@@ -142,11 +142,7 @@ pub async fn run(source: String, json: bool) -> Result<()> {
 
 /// Discover the repository every merge-transaction command is bound to.
 pub(crate) fn require_repository_layout() -> Result<kin_core::KinLayout> {
-    kin_core::KinLayout::discover(&std::env::current_dir()?).ok_or_else(|| {
-        anyhow::anyhow!(
-            "not a Kin repository (no .kin/ found)\nhint: run `kin init .` to initialize a Kin repository here"
-        )
-    })
+    crate::commands::require_repository_layout()
 }
 
 async fn execute(request: MergeRequest) -> Result<MergeResponse> {

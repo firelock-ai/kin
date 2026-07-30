@@ -86,8 +86,7 @@ pub async fn run(
     nearby_limit: usize,
     transitive_limit: usize,
 ) -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let layout = crate::commands::require_repository_layout()?;
     let _scope = announce_active_scope(&layout, "trace").await?;
     let response = run_daemon_trace(
         &layout,
@@ -239,8 +238,7 @@ pub async fn run_json(
     _nearby_limit: usize,
     _transitive_limit: usize,
 ) -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let layout = crate::commands::require_repository_layout()?;
     let _scope = announce_active_scope(&layout, "trace --json").await?;
     let response = run_daemon_trace(
         &layout,

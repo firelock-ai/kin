@@ -136,8 +136,7 @@ async fn serve_graph_json(State(json): State<Arc<String>>) -> Response {
 
 /// `kin graph viz` — serve an interactive force-directed graph over HTTP.
 pub async fn run(port: u16, open_browser: bool) -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let layout = crate::commands::require_repository_layout()?;
     let snap =
         crate::backend::open_snapshot_explicit_admin_read_only(&layout, "kin graph viz").await?;
     let payload = build_payload_from_snapshot(&snap)?;

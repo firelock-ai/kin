@@ -102,8 +102,7 @@ pub(crate) fn capture_export_snapshot_from_state(
 /// Project repository-v6 authority into a new bare Git repository.
 pub fn export(output: PathBuf) -> Result<()> {
     let cwd = std::env::current_dir()?;
-    let layout = kin_core::KinLayout::discover(&cwd)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let layout = crate::commands::require_repository_layout_at(&cwd)?;
     let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&layout)?;
     let output = validate_export_destination(&layout, &cwd, &output)?;
     let authority = ActiveRepositoryAuthority::open(&binding)?;

@@ -38,8 +38,7 @@ pub struct NoteExecution {
 }
 
 async fn run_daemon_note(request: &NoteRequest) -> Result<NoteResponse> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let layout = crate::commands::require_repository_layout()?;
     let daemon_url = std::env::var("KIN_DAEMON_URL")
         .ok()
         .filter(|value| !value.trim().is_empty())
@@ -78,8 +77,7 @@ pub async fn stale() -> Result<()> {
 
 /// `kin todo import` — Import inline TODOs from source files.
 pub async fn todo_import(path: Option<String>) -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let layout = crate::commands::require_repository_layout()?;
     let scan_root = path
         .clone()
         .map(std::path::PathBuf::from)

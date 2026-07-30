@@ -54,11 +54,7 @@ pub struct DriftResponse {
 }
 
 pub async fn run(json: bool) -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?).ok_or_else(|| {
-        anyhow::anyhow!(
-            "not a Kin repository (no .kin/ found)\nhint: run `kin init .` to initialize a Kin repository here"
-        )
-    })?;
+    let layout = crate::commands::require_repository_layout()?;
     let daemon_url = crate::daemon_client::resolve_daemon_url(&layout)
         .await?
         .ok_or_else(|| {

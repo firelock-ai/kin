@@ -59,8 +59,7 @@ pub async fn run(
     signature: Option<String>,
     json: bool,
 ) -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let layout = crate::commands::require_repository_layout()?;
     let response = run_daemon_impact(
         &layout,
         &ImpactRequest {

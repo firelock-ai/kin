@@ -22,8 +22,7 @@ fn resolve_org_id() -> Result<String> {
 }
 
 fn resolve_repo_id() -> Result<String> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let layout = crate::commands::require_repository_layout()?;
     remote::resolve_repo_id(&layout)
 }
 

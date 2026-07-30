@@ -60,8 +60,7 @@ pub struct ContextResponse {
 }
 
 pub async fn run(entity: String, budget: String, assistant: Option<String>) -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let layout = crate::commands::require_repository_layout()?;
     let _scope = announce_active_scope(&layout, "context").await?;
     let response = run_daemon_context(
         &layout,

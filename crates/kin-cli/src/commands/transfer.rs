@@ -177,11 +177,7 @@ fn parse_ref(value: Option<&str>) -> Result<Option<RefName>> {
 }
 
 fn layout() -> Result<KinLayout> {
-    KinLayout::discover(&std::env::current_dir()?).ok_or_else(|| {
-        anyhow::anyhow!(
-            "not a Kin repository (no .kin/ found)\nhint: run `kin init .` to initialize one"
-        )
-    })
+    crate::commands::require_repository_layout()
 }
 
 async fn daemon() -> Result<crate::daemon_client::DaemonClient> {

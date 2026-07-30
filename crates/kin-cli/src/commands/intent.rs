@@ -4,8 +4,7 @@
 use anyhow::{Context, Result};
 
 async fn daemon_base_url() -> Result<String> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let layout = crate::commands::require_repository_layout()?;
     crate::daemon_client::resolve_daemon_url(&layout)
         .await?
         .ok_or_else(|| {

@@ -9,8 +9,7 @@ use kin_core::{ManagedDocConfig, RepoSummary, SyncMode};
 
 /// `kin assistant install <assistant>` — Install an assistant adapter.
 pub async fn install(assistant: String) -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let layout = crate::commands::require_repository_layout()?;
 
     let kind = AssistantKind::from_str(&assistant).ok_or_else(|| {
         anyhow::anyhow!(
@@ -81,8 +80,7 @@ pub async fn install(assistant: String) -> Result<()> {
 
 /// `kin assistant doctor` — Run connectivity checks for all installed adapters.
 pub async fn run_doctor(assistant: Option<String>) -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let layout = crate::commands::require_repository_layout()?;
 
     if let Some(name) = assistant {
         // Doctor a specific assistant.
@@ -116,8 +114,7 @@ pub async fn run_doctor(assistant: Option<String>) -> Result<()> {
 
 /// `kin assistant list` — List installed assistant adapters.
 pub async fn list() -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let layout = crate::commands::require_repository_layout()?;
 
     let adapters = list_adapters(&layout)?;
 
@@ -152,8 +149,7 @@ pub async fn list() -> Result<()> {
 
 /// `kin assistant sync` — Regenerate managed blocks in all enabled target files.
 pub async fn sync() -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let layout = crate::commands::require_repository_layout()?;
 
     let config = ManagedDocConfig::load(&layout)?;
 
@@ -195,8 +191,7 @@ pub async fn configure(
     enable: Option<String>,
     disable: Option<String>,
 ) -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let layout = crate::commands::require_repository_layout()?;
 
     let mut config = ManagedDocConfig::load(&layout)?;
     let mut changed = false;
@@ -306,8 +301,7 @@ pub async fn hooks(assistant: Option<String>) -> Result<()> {
 
 /// `kin assistant snippets [assistant]` — Generate config snippets.
 pub async fn snippets(assistant: Option<String>) -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let layout = crate::commands::require_repository_layout()?;
 
     let kinds: Vec<AssistantKind> = if let Some(name) = assistant {
         let kind = AssistantKind::from_str(&name).ok_or_else(|| {
@@ -355,8 +349,7 @@ pub async fn snippets(assistant: Option<String>) -> Result<()> {
 
 /// `kin assistant prompt --assistant <name> [--mode benchmark|normal]`
 pub async fn prompt(assistant: String, mode: String) -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let layout = crate::commands::require_repository_layout()?;
 
     let kind = AssistantKind::from_str(&assistant).ok_or_else(|| {
         anyhow::anyhow!(

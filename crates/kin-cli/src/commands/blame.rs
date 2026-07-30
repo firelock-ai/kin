@@ -19,8 +19,7 @@ pub struct BlameResponse {
 
 /// `kin blame <entity>` — Show who/when each version of an entity was committed.
 pub async fn run(entity: String, reference: Option<String>) -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let layout = crate::commands::require_repository_layout()?;
     let response = run_daemon_blame(&layout, &BlameRequest { entity, reference }).await?;
     for line in response.lines {
         println!("{line}");

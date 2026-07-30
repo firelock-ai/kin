@@ -102,8 +102,7 @@ struct ReviewResultJson {
 }
 
 async fn run_daemon_review(request: &ReviewRequest) -> Result<ReviewResponse> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let layout = crate::commands::require_repository_layout()?;
     let daemon_url = std::env::var("KIN_DAEMON_URL")
         .ok()
         .filter(|value| !value.trim().is_empty())

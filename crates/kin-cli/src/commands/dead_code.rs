@@ -60,8 +60,7 @@ pub struct DeadCodeSeededResponse {
 }
 
 pub async fn run() -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let layout = crate::commands::require_repository_layout()?;
     let response = run_daemon_dead_code(&layout).await?;
     for line in response.lines {
         println!("{line}");
@@ -74,8 +73,7 @@ pub async fn run_seeded(
     limit: Option<usize>,
     name_pattern: Option<String>,
 ) -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let layout = crate::commands::require_repository_layout()?;
     let response = run_daemon_dead_code_seeded(
         &layout,
         &DeadCodeSeededRequest {

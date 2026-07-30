@@ -304,11 +304,7 @@ pub async fn run(json: bool, profile: Option<String>) -> Result<()> {
 async fn run_daemon_resources(
     request: &CommandResourcesRequest,
 ) -> Result<CommandResourcesResponse> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?).ok_or_else(|| {
-        anyhow::anyhow!(
-            "not a Kin repository (no .kin/ found)\nhint: run `kin init .` to initialize a Kin repository here"
-        )
-    })?;
+    let layout = crate::commands::require_repository_layout()?;
     let daemon_url = std::env::var("KIN_DAEMON_URL")
         .ok()
         .filter(|value| !value.trim().is_empty())

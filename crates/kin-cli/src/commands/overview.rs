@@ -21,8 +21,7 @@ pub struct OverviewResponse {
 }
 
 pub async fn run_json() -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let layout = crate::commands::require_repository_layout()?;
     print_overview_response(
         run_daemon_overview(
             &layout,
@@ -36,8 +35,7 @@ pub async fn run_json() -> Result<()> {
 }
 
 pub async fn run(compact: bool) -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let layout = crate::commands::require_repository_layout()?;
     print_overview_response(
         run_daemon_overview(
             &layout,

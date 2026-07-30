@@ -6,8 +6,7 @@ use anyhow::{Context, Result};
 use super::locate_telemetry::{consent_marker_path, telemetry_dir};
 
 pub async fn run_status() -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let layout = crate::commands::require_repository_layout()?;
 
     let kin_root = layout.root();
     let consent_path = consent_marker_path(kin_root);
@@ -56,8 +55,7 @@ pub async fn run_status() -> Result<()> {
 }
 
 pub async fn run_consent() -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let layout = crate::commands::require_repository_layout()?;
 
     let kin_root = layout.root();
     let consent_path = consent_marker_path(kin_root);
@@ -80,8 +78,7 @@ pub async fn run_consent() -> Result<()> {
 }
 
 pub async fn run_revoke() -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let layout = crate::commands::require_repository_layout()?;
 
     let kin_root = layout.root();
     let consent_path = consent_marker_path(kin_root);
@@ -104,8 +101,7 @@ pub async fn run_revoke() -> Result<()> {
 }
 
 pub async fn run_purge() -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let layout = crate::commands::require_repository_layout()?;
 
     let kin_root = layout.root();
     let spool_dir = telemetry_dir(kin_root);

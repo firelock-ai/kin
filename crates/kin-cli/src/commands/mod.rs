@@ -89,3 +89,46 @@ pub mod update;
 pub mod verify;
 pub mod work;
 pub mod xref;
+
+/// Discover the Kin repository a command is bound to, or refuse by naming the
+/// command that creates one.
+///
+/// Every command that needs a repository refuses through here so the refusal
+/// cannot drift per command. Running a repository command from the wrong
+/// directory is an ordinary first mistake, and a refusal that only states the
+/// absence leaves the caller to guess the remedy.
+pub(crate) fn require_repository_layout() -> anyhow::Result<kin_core::KinLayout> {
+    require_repository_layout_at(&std::env::current_dir()?)
+}
+
+/// Discover the Kin repository containing `start`, refusing the same way.
+pub(crate) fn require_repository_layout_at(
+    start: &std::path::Path,
+) -> anyhow::Result<kin_core::KinLayout> {
+    kin_core::KinLayout::discover(start).ok_or_else(|| {
+        anyhow::anyhow!(
+            "not a Kin repository (no .kin/ found)\nhint: run `kin init .` to initialize a Kin repository here"
+        )
+    })
+}
+
+#[cfg(test)]
+mod repository_refusal_tests {
+    use super::require_repository_layout_at;
+
+    #[test]
+    fn refusing_outside_a_repository_names_the_command_that_creates_one() {
+        let empty = tempfile::tempdir().expect("temp dir");
+        let err = require_repository_layout_at(empty.path())
+            .expect_err("a directory with no .kin/ is not a repository");
+        let message = err.to_string();
+        assert!(
+            message.contains("not a Kin repository"),
+            "refusal must state the condition: {message}"
+        );
+        assert!(
+            message.contains("kin init"),
+            "refusal must name the remedy: {message}"
+        );
+    }
+}

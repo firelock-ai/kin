@@ -1350,8 +1350,7 @@ pub async fn capture(
     entity_surface: bool,
     paging: LocatePaging,
 ) -> Result<LocateResult> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let layout = crate::commands::require_repository_layout()?;
     if locate_env_bool("KIN_LOCATE_FORCE_LOCAL", false) {
         anyhow::bail!(
             "KIN_LOCATE_FORCE_LOCAL is no longer supported; locate requires the Kin daemon"
