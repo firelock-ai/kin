@@ -169,23 +169,27 @@ fn read_local_publication_identity(
         ))
     };
     // One handle answers both the bound and the contents, so a commit landing
-    // mid-check cannot have the size of one record and the bytes of another.
-    let mut file = match std::fs::File::open(&record) {
+    // mid-check cannot bound one record and return the bytes of another. The
+    // bound is enforced by reading a single byte past it rather than by a
+    // separate size probe, so nothing measures a record it did not then read,
+    // and rejecting an oversized file costs one byte beyond the limit.
+    let file = match std::fs::File::open(&record) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(LocalPublicationIdentity::Unpublished);
         }
         Err(error) => return Err(record_error(error)),
     };
-    let len = file.metadata().map_err(record_error)?.len();
-    if len > MAX_AUTHORITY_PUBLICATION_RECORD_BYTES {
+    let mut bytes = Vec::new();
+    file.take(MAX_AUTHORITY_PUBLICATION_RECORD_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(record_error)?;
+    if bytes.len() as u64 > MAX_AUTHORITY_PUBLICATION_RECORD_BYTES {
         return Err(repository_authority_error(format!(
-            "local publication record {} is {len} bytes, past the {MAX_AUTHORITY_PUBLICATION_RECORD_BYTES}-byte bound",
+            "local publication record {} is past the {MAX_AUTHORITY_PUBLICATION_RECORD_BYTES}-byte bound",
             record.display()
         )));
     }
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).map_err(record_error)?;
     Ok(LocalPublicationIdentity::Published(
         Sha256::digest(&bytes).into(),
     ))
