@@ -556,6 +556,7 @@ fn three_way(
         &merged_relations,
         &merged_entities,
         &merged_artifacts,
+        &base_state,
         &ours_state,
         &theirs_state,
         &mut conflicts,
@@ -852,6 +853,7 @@ pub(crate) fn publish_resolved_merge(
         &merged_relations,
         &merged_entities,
         &merged_artifacts,
+        &base_state,
         &ours_state,
         &theirs_state,
         &mut recomposed,
@@ -891,6 +893,7 @@ pub(crate) fn publish_resolved_merge(
         &merged_relations,
         &merged_entities,
         &merged_artifacts,
+        &base_state,
         &ours_state,
         &theirs_state,
         &mut dangling,
@@ -1368,6 +1371,7 @@ fn collect_dangling_endpoints(
     relations: &std::collections::HashMap<kin_model::RelationId, kin_model::Relation>,
     entities: &std::collections::HashMap<kin_model::EntityId, kin_model::Entity>,
     artifacts: &std::collections::HashMap<kin_model::ArtifactId, ResolvedArtifact>,
+    base: &kin_model::graph::ResolvedGraphState,
     ours: &kin_model::graph::ResolvedGraphState,
     theirs: &kin_model::graph::ResolvedGraphState,
     conflicts: &mut Vec<MergeConflictEntry>,
@@ -1423,7 +1427,7 @@ fn collect_dangling_endpoints(
             divergence: MergeDivergence::DanglingEndpoint { endpoint },
             // The relation itself composed; what broke is the node it points
             // at, so its sides are recorded as history holds them.
-            base: MergeSideValue::Absent,
+            base: MergeSideValue::relation(base.relations.get(&relation))?,
             ours: MergeSideValue::relation(ours.relations.get(&relation))?,
             theirs: MergeSideValue::relation(theirs.relations.get(&relation))?,
             label: Some(detail),
@@ -1952,5 +1956,145 @@ pub(crate) fn merge_bind_refusal(refusal: RepositoryAuthorityBindRefusal) -> (St
         (StatusCode::CONFLICT, format!("{error:#}"))
     } else {
         (StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use kin_model::{
+        graph::ResolvedGraphState, ArtifactId, AuthorId, GraphNodeId, MergeEntryResolution,
+        MergeResolutionProvenance, OperationId, Relation, RelationId, RelationKind, RelationOrigin,
+        RepoPath, ResolvedArtifact, ResolvedTree, TreeEntry,
+    };
+
+    use super::*;
+
+    fn artifact(id: ArtifactId, path: &str, content: u8) -> ResolvedArtifact {
+        ResolvedArtifact::new(
+            id,
+            RepoPath::from_utf8(path).unwrap(),
+            TreeEntry::blob(Hash256::from_bytes([content; 32]), false),
+        )
+    }
+
+    fn graph_state(
+        target: ResolvedArtifact,
+        anchor: ResolvedArtifact,
+        relation: Relation,
+    ) -> ResolvedGraphState {
+        ResolvedGraphState {
+            relations: [(relation.id, relation)].into(),
+            tree: ResolvedTree::from_artifacts([target, anchor]).unwrap(),
+            ..ResolvedGraphState::default()
+        }
+    }
+
+    #[test]
+    fn dangling_relation_records_and_accepts_its_present_base_side() {
+        let target_id = ArtifactId::new();
+        let anchor_id = ArtifactId::new();
+        let relation = Relation {
+            id: RelationId::new(),
+            kind: RelationKind::References,
+            src: GraphNodeId::Artifact(anchor_id),
+            dst: GraphNodeId::Artifact(target_id),
+            confidence: 1.0,
+            origin: RelationOrigin::Manual,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
+        };
+        let base_state = graph_state(
+            artifact(target_id, "src/target.rs", 0x10),
+            artifact(anchor_id, "src/anchor.rs", 0x20),
+            relation.clone(),
+        );
+        let ours_state = graph_state(
+            artifact(target_id, "src/target.rs", 0x11),
+            artifact(anchor_id, "src/anchor.rs", 0x20),
+            relation.clone(),
+        );
+        let theirs_state = graph_state(
+            artifact(target_id, "src/target.rs", 0x12),
+            artifact(anchor_id, "src/anchor.rs", 0x20),
+            relation.clone(),
+        );
+
+        let base_artifacts = artifacts_by_id(&base_state.tree);
+        let ours_artifacts = artifacts_by_id(&ours_state.tree);
+        let theirs_artifacts = artifacts_by_id(&theirs_state.tree);
+        let mut conflicts = Vec::new();
+        let mut merged_artifacts = compose(
+            &base_artifacts,
+            &ours_artifacts,
+            &theirs_artifacts,
+            |artifact| MergeConflictSubject::Artifact {
+                artifact: *artifact,
+            },
+            MergeSideValue::artifact,
+            |_| None,
+            &mut conflicts,
+        )
+        .unwrap();
+        let mut merged_relations = compose(
+            &base_state.relations,
+            &ours_state.relations,
+            &theirs_state.relations,
+            |relation| MergeConflictSubject::Relation {
+                relation: *relation,
+            },
+            MergeSideValue::relation,
+            |_| None,
+            &mut conflicts,
+        )
+        .unwrap();
+        let mut merged_entities = HashMap::new();
+
+        collect_dangling_endpoints(
+            &merged_relations,
+            &merged_entities,
+            &merged_artifacts,
+            &base_state,
+            &ours_state,
+            &theirs_state,
+            &mut conflicts,
+        )
+        .unwrap();
+
+        let mut dangling = conflicts
+            .iter()
+            .find(|entry| matches!(entry.divergence, MergeDivergence::DanglingEndpoint { .. }))
+            .expect("the unchanged relation must dangle from the conflicted artifact")
+            .clone();
+        let expected = MergeSideValue::relation(Some(&relation)).unwrap();
+        assert_eq!(dangling.base, expected);
+        assert_eq!(dangling.ours, expected);
+        assert_eq!(dangling.theirs, expected);
+
+        dangling.resolution = MergeEntryResolution::Side {
+            side: MergeSide::Base,
+            provenance: MergeResolutionProvenance {
+                actor: AuthorId::new("test"),
+                operation_id: OperationId::new(),
+                resolved_at: Timestamp::now(),
+            },
+        };
+        dangling.validate().unwrap();
+        apply_resolution(
+            &dangling,
+            &base_state,
+            &ours_state,
+            &theirs_state,
+            &base_artifacts,
+            &ours_artifacts,
+            &theirs_artifacts,
+            &mut merged_entities,
+            &mut merged_relations,
+            &mut merged_artifacts,
+        )
+        .unwrap();
+        assert_eq!(merged_relations.get(&relation.id), Some(&relation));
     }
 }
