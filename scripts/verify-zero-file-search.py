@@ -183,18 +183,40 @@ def load_allowlist():
             else:
                 lexed = lex_lines(lines)
 
+        if policy.whole_file and not scan_reaches(item["file"]):
+            errors.append(
+                f"  entry {item['file']} exempts the whole file, but the scan "
+                f"never reaches that path (owner: {item['owner']}), so the "
+                "exemption grants nothing and only records a claim nothing "
+                "enforces. Remove it, or pin the boundary, which forces the "
+                "file to be scanned around the pins"
+            )
+
         # `allow_fn` is validated first because the bodies it excuses decide
         # which lines the scan reads, and those lines are what `allow_match`
         # counts have to be measured against.
         if raw_fns is not None and lexed is not None:
             try:
                 bodies = find_fn_body_ranges(lines, None, lexed)
+                scanned = {index for index, _ in scannable_lines(lexed)}
                 for name, want in parse_pin_list(raw_fns, "fn").items():
                     found = len(bodies.get(name, ()))
                     if found != want:
                         errors.append(
                             f"  entry {item['file']} allow_fn {name!r} resolves to "
                             f"{found} function bodies (want {want})"
+                        )
+                        continue
+                    if not any(
+                        index in scanned
+                        for lo, hi in bodies[name]
+                        for index in range(lo, hi + 1)
+                    ):
+                        errors.append(
+                            f"  entry {item['file']} allow_fn {name!r} names a body "
+                            "the scan never reads, so the exemption excuses "
+                            "nothing. A test-gated or otherwise unscanned "
+                            "function needs no entry. Remove it"
                         )
                         continue
                     policy.fns.add(name)
@@ -382,6 +404,22 @@ def is_test_file(rel_path):
             return True
 
     return False
+
+
+def scan_reaches(rel_path):
+    """Whether the walk would scan this path absent any allowlist policy.
+
+    A pinned entry answers yes by construction: naming spans in a file forces it
+    to be scanned even inside a boundary directory. A whole-file entry for a path
+    the walk skips anyway answers no, and such an entry is inert. Eight of them
+    had accumulated on command modules outside the query set and on a file
+    already enumerated as a boundary, each reading like an enforced boundary
+    declaration while granting exactly nothing. Deciding this from the same walk
+    predicate the scan uses is what keeps the two from drifting: add a module to
+    QUERY_COMMANDS and its dormant whole-file exemption would begin to matter,
+    which is when it has to be re-justified rather than silently inherited.
+    """
+    return rel_path.startswith("crates/") and not is_test_file(rel_path)
 
 
 # Patterns to scan.
@@ -668,42 +706,254 @@ def find_fn_body_ranges(lines, fn_names=None, lexed=None):
     return found
 
 
+# The leading path of an attribute, with the whitespace Rust permits around the
+# `::` separators. `#[test]`, `#[tokio::test]` and `#[cfg(...)]` are all read
+# from this one shape.
+ATTR_PATH = re.compile(r"^#\s*\[\s*([A-Za-z0-9_]+(?:\s*::\s*[A-Za-z0-9_]+)*)")
+
+# An item head an attribute can gate, whose extent the tracker can bound by
+# brace matching or a terminating `;`. Modifiers may repeat and appear in any
+# order, so they are matched as a run rather than as a fixed sequence.
+# Deliberately a closed set: a construct this does not recognise -- a gated
+# struct field, enum variant, match arm, or statement -- has no bound this
+# tracker can trust, and the safe answer there is to keep scanning.
+#
+# `macro_rules!` sits outside the word-boundary group on purpose. A trailing
+# `\b` asserts a word character follows, and `!` is not one, so listing it
+# among the keywords produced an alternative that could never match while
+# reading as though it did. The failure was the safe direction, and no
+# cfg-gated macro exists in the tree today, but a closed set that silently
+# omits one of its own members is the same defect this tracker was rewritten
+# to remove: a policy decision made by an accident of spelling.
+ITEM_HEAD = re.compile(
+    r"^(?:(?:pub(?:\s*\([^)]*\))?|default|unsafe|async|const|extern(?:\s+\"[^\"]*\")?)\s+)*"
+    r"(?:(?:mod|fn|impl|struct|enum|union|trait|type|use|const|static)\b"
+    r"|macro_rules\s*!)"
+)
+
+
+def split_predicates(inner):
+    """Split a cfg predicate list on its top-level commas."""
+    parts, depth, current = [], 0, []
+    for ch in inner:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        if ch == "," and depth == 0:
+            parts.append("".join(current))
+            current = []
+            continue
+        current.append(ch)
+    if "".join(current).strip():
+        parts.append("".join(current))
+    return [p.strip() for p in parts if p.strip()]
+
+
+CFG_CALL = re.compile(r"^([A-Za-z0-9_]+)\s*\((.*)\)$", re.S)
+
+
+def predicate_is_test_only(predicate):
+    """Whether a cfg predicate can only hold in a test build.
+
+    Evaluated rather than pattern-matched, because the tree carries predicates
+    that mention `test` and still compile in production. `all(...)` is test-only
+    when any member is, since every member must hold. `any(...)` only when every
+    member is, since one suffices: `cfg(any(unix, test))` is live on unix in a
+    release build, and excluding it would stop scanning production code. `not(..)`
+    is never treated as test-only, and neither is any other predicate, so an
+    unrecognised spelling keeps its item scanned.
+    """
+    predicate = predicate.strip()
+    call = CFG_CALL.match(predicate)
+    if call:
+        operator, inner = call.group(1).strip(), call.group(2)
+        members = split_predicates(inner)
+        if operator == "all":
+            return any(predicate_is_test_only(m) for m in members)
+        if operator == "any":
+            return bool(members) and all(predicate_is_test_only(m) for m in members)
+        return False
+    return predicate == "test"
+
+
+def attribute_extent(lexed, start):
+    """(last_line, text, trailing) for the attribute opening on line `start`.
+
+    Bracket-matched over the lexically stripped text, so an attribute spanning
+    lines is read whole and a `]` inside a string literal cannot close it early.
+    `trailing` is whatever follows the closing bracket on its line, which is how
+    a one-line `#[cfg(test)] use std::fs;` is recognised.
+    """
+    depth = 0
+    parts = []
+    for j in range(start, len(lexed)):
+        structure = lexed[j][0]
+        begin = structure.index("#") if j == start else 0
+        for k in range(begin, len(structure)):
+            ch = structure[k]
+            if ch == "[":
+                depth += 1
+            elif ch == "]":
+                depth -= 1
+                if depth == 0:
+                    parts.append(structure[begin : k + 1])
+                    return j, "".join(parts), structure[k + 1 :]
+        parts.append(structure[begin:])
+    return None, "".join(parts), ""
+
+
+def is_test_gate(text):
+    """Whether an attribute removes its item from every non-test build.
+
+    Two shapes qualify. A `test` attribute path -- `#[test]`, `#[tokio::test]`
+    -- marks an item rustc only emits under `--test`. A `cfg` whose predicate is
+    test-only gates the item's existence outright. `cfg_attr` never qualifies: it
+    applies an attribute conditionally and leaves the item itself compiled.
+    """
+    m = ATTR_PATH.match(text)
+    if not m:
+        return False
+    path = re.sub(r"\s+", "", m.group(1))
+    if path == "test" or path.endswith("::test"):
+        return True
+    if path != "cfg":
+        return False
+    open_paren = text.find("(", m.end())
+    if open_paren < 0:
+        return False
+    depth = 0
+    for k in range(open_paren, len(text)):
+        if text[k] == "(":
+            depth += 1
+        elif text[k] == ")":
+            depth -= 1
+            if depth == 0:
+                return predicate_is_test_only(text[open_paren + 1 : k])
+    return False
+
+
+def item_span(lexed, start):
+    """(start, last_line) for the item beginning on line `start`, or None.
+
+    Bounded the same way a function body is: brace depth from the item's opening
+    brace to its matching close, or a terminating `;` outside parentheses and
+    brackets for a declaration that has no block. Counted on the lexically
+    stripped text so a brace inside a literal or a comment cannot move the bound.
+    An item whose close is never found returns None, which drops the exclusion
+    and keeps the lines scanned rather than excusing everything below it.
+    """
+    depth = 0
+    started = False
+    nesting = 0
+    for j in range(start, len(lexed)):
+        structure = lexed[j][0]
+        if not started:
+            for ch in structure:
+                if ch in "([":
+                    nesting += 1
+                elif ch in ")]":
+                    nesting -= 1
+                elif ch == "{" and nesting <= 0:
+                    break
+                elif ch == ";" and nesting <= 0:
+                    return start, j
+        opens = structure.count("{")
+        closes = structure.count("}")
+        if opens:
+            started = True
+        if started:
+            depth += opens - closes
+            if depth <= 0:
+                return start, j
+    return None
+
+
+def test_gated_ranges(lexed):
+    """Inclusive line ranges holding items that exist only in a test build.
+
+    The tracker this replaces armed on the attribute line and disarmed on the
+    same iteration, because an attribute carries no brace and the guard's
+    disarm condition is `brace_depth <= armed_depth`. What kept it working at
+    all was the literal string `mod tests` on the following line re-arming it,
+    so exclusion was decided by a naming convention: `#[cfg(test)] mod
+    ingest_cas_tests` and every `#[cfg(test)] fn` were scanned as production.
+    The failure direction was safe, but over-reporting manufactures allowlist
+    entries, and an exemption that exists to silence a false positive is
+    indistinguishable later from one that licenses real boundary IO.
+
+    Attribute runs are read whole and the item they gate is bounded explicitly,
+    so exclusion follows from the cfg predicate rather than from a name. A gated
+    construct whose extent cannot be bounded, and an attribute run that gates
+    nothing recognisable, both stay scanned.
+    """
+    ranges = []
+    n = len(lexed)
+    i = 0
+    while i < n:
+        if not lexed[i][0].strip().startswith("#["):
+            i += 1
+            continue
+
+        block_start = i
+        gated = False
+        item_start = None
+        j = i
+        while j < n:
+            structure = lexed[j][0]
+            stripped = structure.strip()
+            if not stripped:
+                j += 1
+                continue
+            if not stripped.startswith("#["):
+                item_start = j
+                break
+            last_line, text, trailing = attribute_extent(lexed, j)
+            if last_line is None:
+                break
+            if is_test_gate(text):
+                gated = True
+            if trailing.strip():
+                item_start = last_line
+                break
+            j = last_line + 1
+
+        span = None
+        if gated and item_start is not None:
+            head = lexed[item_start][0].strip()
+            if item_start != block_start:
+                candidate = head
+            else:
+                # The item shares the attribute's line, so only what follows the
+                # closing bracket is the item.
+                candidate = attribute_extent(lexed, item_start)[2].strip()
+            if ITEM_HEAD.match(candidate):
+                span = item_span(lexed, item_start)
+
+        if span is None:
+            i = block_start + 1
+            continue
+        ranges.append((block_start, span[1]))
+        i = span[1] + 1
+    return ranges
+
+
 def scannable_lines(lexed):
     """Yield (index, code) for every line the scan reads, index 0-based.
 
-    Test modules and `#[test]` attributes are skipped here rather than in the
-    caller so that allowlist pin counts and the scan itself are measured over
-    exactly the same text. A count taken over the raw file measured a superset:
-    test-module and commented-out occurrences counted toward a pin's budget
-    without ever being sites the pin could license, and removing one from a test
-    then silently released budget for a real filesystem probe in a scanned path.
+    Test-only items are skipped here rather than in the caller so that allowlist
+    pin counts and the scan itself are measured over exactly the same text. A
+    count taken over the raw file measured a superset: test and commented-out
+    occurrences counted toward a pin's budget without ever being sites the pin
+    could license, and removing one from a test then silently released budget for
+    a real filesystem probe in a scanned path.
     """
-    in_test_module = False
-    brace_depth = 0
-    test_module_brace_depth = -1
-
-    for idx, (structure, code) in enumerate(lexed):
-        stripped = structure.strip()
-
-        # Track test module to ignore test code inside source files
-        if "mod tests" in stripped or "#[cfg(test)]" in stripped:
-            in_test_module = True
-            test_module_brace_depth = brace_depth
-
-        # Track brace depth
-        brace_depth += stripped.count("{") - stripped.count("}")
-
-        if in_test_module and brace_depth <= test_module_brace_depth:
-            in_test_module = False
-            test_module_brace_depth = -1
-
-        if in_test_module:
+    excluded = set()
+    for lo, hi in test_gated_ranges(lexed):
+        excluded.update(range(lo, hi + 1))
+    for idx, (_structure, code) in enumerate(lexed):
+        if idx in excluded:
             continue
-
-        # Skip attributes like #[test]
-        if stripped.startswith("#[test]"):
-            continue
-
         yield idx, code
 
 

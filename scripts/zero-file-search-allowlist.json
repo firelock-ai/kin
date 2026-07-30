@@ -1,54 +1,6 @@
 {
   "allowlist": [
     {
-      "file": "crates/kin-cli/src/commands/checkout.rs",
-      "reason": "IO Boundary: materializes file state during checkout and reads files for status/reconcile bounds",
-      "owner": "kin-cli",
-      "expiration": "2026-12-31"
-    },
-    {
-      "file": "crates/kin-cli/src/commands/commit.rs",
-      "reason": "IO Boundary: reads local workspace files to build gitignore, hashes, and commit metadata",
-      "owner": "kin-cli",
-      "expiration": "2026-12-31"
-    },
-    {
-      "file": "crates/kin-cli/src/commands/init.rs",
-      "reason": "IO Ingestion: imports files from disk to build the initial semantic graph",
-      "owner": "kin-cli",
-      "expiration": "2026-12-31"
-    },
-    {
-      "file": "crates/kin-cli/src/commands/reconcile.rs",
-      "reason": "IO Boundary: writes/projects graph modifications back to filesystem",
-      "owner": "kin-cli",
-      "expiration": "2026-12-31"
-    },
-    {
-      "file": "crates/kin-cli/src/commands/session_workspace.rs",
-      "reason": "IO Boundary: syncs workspace by reading and writing files",
-      "owner": "kin-cli",
-      "expiration": "2026-12-31"
-    },
-    {
-      "file": "crates/kin-cli/src/commands/secret.rs",
-      "reason": "IO Boundary: reads authentication/tokens from stdin or config file",
-      "owner": "kin-cli",
-      "expiration": "2026-12-31"
-    },
-    {
-      "file": "crates/kin-cli/src/commands/locate_debug.rs",
-      "reason": "Debug Command: reads benchmark/test inputs from disk",
-      "owner": "kin-cli",
-      "expiration": "2026-12-31"
-    },
-    {
-      "file": "crates/kin-cli/src/backend.rs",
-      "reason": "Direct Snapshot direct-reads (offline bootstrap fallback)",
-      "owner": "kin-cli",
-      "expiration": "2026-12-31"
-    },
-    {
       "file": "crates/kin-cli/src/capability.rs",
       "reason": "Hardware check: reads /proc/meminfo for system stats",
       "owner": "kin-cli",
@@ -174,9 +126,43 @@
     },
     {
       "file": "crates/kin-daemon-spawn/src/lib.rs",
-      "reason": "Daemon process lifecycle IO boundary end to end (spawn plan, port record, disposition, registrar); zero answer-authority surface. Every filesystem and subprocess primitive here reaches or supervises the daemon that holds graph authority, never answers in its place, and no query result derives from any of them. Exempt whole-file rather than pinned because the process handle signatures repeat, which an exactly-once allow_match cannot express. lib.rs is the crate's only module, so a later-added module is scanned by default: re-review this exemption when a second .rs file joins the crate",
+      "reason": "Daemon process lifecycle boundary (spawn plan, process-group guardian, readiness handshake, port record, disposition, registrar) with zero answer-authority surface. Every primitive here reaches or supervises the daemon that holds graph authority, never answers in its place, and no query result derives from any of them. This was a whole-file exemption, which left 4041 lines unscanned and let any newly added filesystem read ride in unexamined; the crate's single module made that the entire crate. It is now pinned by primitive, so every line is scanned and only these expressions are masked. Four classes. (1) Type paths: the first three pins are the std, tokio, and unix-extension `process::` module paths, which appear in struct fields, parameter and return types, and imports. A type path is not execution, and pinning the path rather than the surrounding bodies is what keeps execution visible: masking `std::process::` leaves `Command::new(` intact, so every construction site still has to be pinned on its own and a new one fails the guard. (2) Process construction: the two `Command::new` pins are the guardian sentinel and watcher spawns and the daemon command builder, which are the whole point of a spawn boundary. (3) The readiness handshake: the guardian publishes its process group through a temp-and-rename file the parent reads once and removes on every exit path, which is why the remove pin carries seven occurrences. (4) The port record: reading the port the daemon reported, recognizing an orphaned record from a port file without its pid file, and clearing that record. Counts are exact over scanned code, so an added occurrence of any pin drops the pin and reports every line it claimed",
       "owner": "kin-daemon-spawn",
-      "expiration": "2026-12-31"
+      "expiration": "2026-12-31",
+      "allow_match": [
+        {
+          "expr": "std::process::",
+          "count": 53
+        },
+        {
+          "expr": "tokio::process::",
+          "count": 2
+        },
+        {
+          "expr": "std::os::unix::process::",
+          "count": 4
+        },
+        {
+          "expr": "Command::new(&self.executable)",
+          "count": 2
+        },
+        "Command::new(&self.daemon_bin)",
+        {
+          "expr": "std::fs::remove_file(readiness_path)",
+          "count": 7
+        },
+        "std::fs::read_to_string(readiness_path)",
+        "std::fs::write(&temporary_path, readiness)",
+        "std::fs::rename(&temporary_path, readiness_path)",
+        "std::fs::remove_file(&temporary_path)",
+        "std::fs::remove_file(kin_root.join(OWNER_FILE_NAME))",
+        "std::fs::remove_file(kin_root.join(PORT_FILE_NAME))",
+        "std::fs::read_to_string(kin_root.join(PORT_FILE_NAME))",
+        {
+          "expr": ".exists()",
+          "count": 2
+        }
+      ]
     },
     {
       "file": "crates/kin-daemon/src/api.rs",
@@ -271,7 +257,6 @@
         },
         "endpoint_ownership_with_probe",
         "proven_live_other_endpoint_owner_with_probe",
-        "publish_foreign_endpoint_for_test",
         "remove_endpoint_components",
         "publish_daemon_endpoint_under_authority_with_probe"
       ],
@@ -332,7 +317,7 @@
     },
     {
       "file": "crates/kin-daemon/src/daemon.rs",
-      "reason": "Daemon run loop boundary. Two pins are the liveness checks that ask whether this daemon's own endpoint records and control plane are still present, which is a question about the process rather than about the repository. The rest are the run loop reporting its process id, exiting, and canonicalizing the bound repository root twice while wiring authority into the server. No repository content is read and no query answer derives from any of it. Pinned by expression rather than by function, because the run loop is half this module and exempting its body would leave more unscanned than the primitives justify. Those two liveness pins named expressions that no longer exist: endpoint_files_missing and control_plane_missing were replaced by a classifier that verifies who owns an endpoint before treating its absence as an eviction notice. The successors are exempted per function rather than by snippet, because a pinned expression is exactly what went stale here.",
+      "reason": "Daemon run loop boundary. Two pins are the liveness checks that ask whether this daemon's own repository root and control plane are still present, which is a question about the process rather than about the repository. The rest are the run loop reporting its process id, exiting, and canonicalizing the bound repository root twice while wiring authority into the server. No repository content is read and no query answer derives from any of it. Pinned by expression rather than by function, because the run loop is half this module and exempting its body would leave more unscanned than the primitives justify. The liveness pins first named endpoint_files_missing and control_plane_missing, expressions that stopped existing when a classifier replaced them to verify who owns an endpoint before treating its absence as an eviction notice. Their successors, repository_root_missing and classify_control_plane, were then exempted per function, which excused twenty-four lines to license two expressions. They are pinned again, but on the primitive rather than on a snippet: the two `.exists()` calls are the only filesystem primitive in either body, and a count on the primitive survives the rewording that made the first pins stale while still failing the guard the moment a third appears.",
       "owner": "kin-daemon",
       "expiration": "2026-12-31",
       "allow_match": [
@@ -340,12 +325,12 @@
           "expr": ".canonicalize()",
           "count": 2
         },
+        {
+          "expr": ".exists()",
+          "count": 2
+        },
         "std::process::id(),",
         "std::process::exit(0);"
-      ],
-      "allow_fn": [
-        "repository_root_missing",
-        "classify_control_plane"
       ]
     },
     {
