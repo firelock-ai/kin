@@ -1593,10 +1593,13 @@ mod tests {
     #[test]
     fn parent_death_guardian_descendant_worker() {
         if let Some(marker) = std::env::var_os(PARENT_DEATH_DESCENDANT) {
+            let pid_marker = PathBuf::from(&marker).with_extension("pid");
+            let staged_pid_marker = PathBuf::from(&marker).with_extension("pid.staged");
             fs_write(
-                PathBuf::from(&marker).with_extension("pid"),
+                staged_pid_marker.clone(),
                 std::process::id().to_string().as_bytes(),
             );
+            std::fs::rename(staged_pid_marker, pid_marker).unwrap();
             std::thread::sleep(Duration::from_secs(30));
             fs_write(
                 PathBuf::from(marker).with_extension("finished"),
@@ -1685,21 +1688,23 @@ mod tests {
         let mut owner = KillAndReapChild(Some(owner.spawn().unwrap()));
         let pid_marker = marker.with_extension("pid");
         let ready_deadline = Instant::now() + TEST_SUBPROCESS_REAP_GRACE;
-        while !pid_marker.is_file() && Instant::now() < ready_deadline {
+        let descendant = loop {
+            if let Ok(contents) = std::fs::read_to_string(&pid_marker) {
+                if let Ok(pid) = contents.trim().parse::<u32>() {
+                    break pid;
+                }
+            }
             assert!(
                 owner.child_mut().try_wait().unwrap().is_none(),
                 "parent-death owner exited before its descendant became ready"
             );
+            assert!(
+                Instant::now() < ready_deadline,
+                "guarded descendant never published a parseable PID marker: {:?}",
+                std::fs::read_to_string(&pid_marker)
+            );
             std::thread::sleep(TEST_SUBPROCESS_POLL_INTERVAL);
-        }
-        assert!(
-            pid_marker.is_file(),
-            "guarded descendant never became ready"
-        );
-        let descendant = std::fs::read_to_string(&pid_marker)
-            .unwrap()
-            .parse::<u32>()
-            .unwrap();
+        };
 
         owner.kill_and_reap();
         let death_deadline = Instant::now() + TEST_SUBPROCESS_REAP_GRACE;
