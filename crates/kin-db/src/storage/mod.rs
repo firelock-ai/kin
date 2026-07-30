@@ -8,6 +8,7 @@ pub mod delta;
 pub mod format;
 #[cfg(feature = "gcs")]
 pub mod gcs;
+pub(crate) mod history_replay;
 pub mod index;
 mod local_journal;
 pub mod merkle;
