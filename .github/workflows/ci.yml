@@ -827,6 +827,18 @@ jobs:
         # nextest does not run doctests; keep them covered explicitly.
         run: cargo test --doc --locked
 
+      # `gcs` is a non-default feature, so the passes above never execute the
+      # hosted-storage code it gates, and Clippy's `--all-features` pass only
+      # type-checks it. Without this step a behavioral regression in the
+      # GCS-mode startup admission path compiles clean and reaches main with a
+      # green required context. The whole package runs rather than just the
+      # binary target: the feature gates only `bin/kin-daemon.rs` today, and
+      # scoping to that target would silently stop covering a gate added to the
+      # library later. No companion doctest pass belongs here because
+      # kin-daemon declares `doctest = false`.
+      - name: Test gcs feature
+        run: cargo nextest run -p kin-daemon --features gcs --locked
+
   # Security audit moved to sast.yml (cargo-deny: advisories + licenses + bans + sources)
 
   coverage:
