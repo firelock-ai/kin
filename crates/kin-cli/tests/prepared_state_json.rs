@@ -269,7 +269,6 @@ fn prepared_state_publish_and_materialize_preserve_indexed_state() {
         .args(["support", "--json"])
         .env("KIN_DAEMON_BIN", runtime.daemon_bin())
         .env("KIN_DAEMON_DISABLE_LSP", "1")
-        .env("KIN_DAEMON_IDLE_TIMEOUT_SECS", "1")
         .env("KIN_DAEMON_READY_TIMEOUT_SECS", "30")
         .output()
         .expect("run kin support --json");

@@ -50,6 +50,21 @@ const COMMAND_DIAGNOSTIC_LIMIT: usize = 4 * 1024;
 const COMMAND_DIAGNOSTIC_MARKER: &str = "\n[bounded capture truncated]";
 const RUNTIME_OWNER_ENV: &str = "KIN_TEST_RUNTIME_OWNER_TOKEN";
 const RUNTIME_CONTAINMENT_GROUP_ENV: &str = "KIN_TEST_RUNTIME_CONTAINMENT_PROCESS_GROUP";
+pub const IDLE_SHUTDOWN_DISABLED_ENV: &str = "KIN_DAEMON_IDLE_TIMEOUT_SECS";
+pub const SUPERVISOR_IDLE_SHUTDOWN_DISABLED_ENV: &str = "KIN_SUPERVISOR_IDLE_TIMEOUT_SECS";
+/// The value both idle-shutdown controls read as "never idle out".
+///
+/// `kin-daemon` treats an empty value or `0` as no idle window at all; every
+/// other value is a number of seconds after which it retires itself.
+pub const IDLE_SHUTDOWN_DISABLED: &str = "0";
+
+/// Whether a configured idle-shutdown value leaves the daemon's idle clock off,
+/// applying the daemon's own parsing rule rather than matching one literal.
+pub fn disables_idle_shutdown(value: Option<&OsStr>) -> bool {
+    value
+        .and_then(OsStr::to_str)
+        .is_some_and(|value| matches!(value.trim(), "" | "0"))
+}
 
 #[cfg(unix)]
 struct RuntimeContainment {
@@ -1023,8 +1038,25 @@ impl IsolatedDaemonRuntime {
             .env("XDG_CONFIG_HOME", self.home_path.join(".config"))
             .env(RUNTIME_OWNER_ENV, &self.owner_token)
             .env("KIN_VFS_DISABLE", "1")
-            .env("KIN_DAEMON_IDLE_TIMEOUT_SECS", "1")
-            .env("KIN_SUPERVISOR_IDLE_TIMEOUT_SECS", "1")
+            // Idle shutdown is disabled because this runtime already bounds
+            // daemon lifetime with evidence rather than a clock. `Drop` stops
+            // every process through the product CLI, terminates the
+            // guardian-owned process group, reaps each direct child, and only
+            // then accepts the final empty-group proof; a killed test binary
+            // reaches the same end through the guardian's own parent-death
+            // watch, and a daemon whose temporary repository disappears exits
+            // on its control-plane check. An idle window adds nothing to that
+            // and races the test holding the daemon: the window is measured
+            // from daemon readiness, so a loaded machine can retire a daemon
+            // between the moment a command proves the endpoint healthy and the
+            // moment it dispatches, and the command then fails against an
+            // endpoint that was live when it was read. Any value short enough
+            // to retire daemons promptly is short enough to lose that race.
+            .env(IDLE_SHUTDOWN_DISABLED_ENV, IDLE_SHUTDOWN_DISABLED)
+            .env(
+                SUPERVISOR_IDLE_SHUTDOWN_DISABLED_ENV,
+                IDLE_SHUTDOWN_DISABLED,
+            )
             // Production deliberately allows ~18s for graceful daemon
             // shutdown and force-exits after ~25s. Integration cleanup has a
             // tighter independent bound, so use the daemon's supported grace
@@ -1196,6 +1228,54 @@ impl IsolatedDaemonRuntime {
                 let _ = std::fs::remove_file(parent.join(name));
             }
         }
+    }
+}
+
+/// What a repository's recorded daemon endpoint can be proven to be.
+///
+/// The published record and the listener it names are separate pieces of state,
+/// so a probe has to separate "no daemon is advertised" from "a daemon is
+/// advertised and does not answer". Only the second breaks a caller: a command
+/// reads the record, proves the endpoint healthy, and dispatches against a
+/// listener that is already gone.
+#[derive(Debug)]
+pub enum RecordedDaemonEndpoint {
+    Unrecorded,
+    Listening { port: u16 },
+    NotListening { port: u16, error: String },
+    Unreadable { detail: String },
+}
+
+const ENDPOINT_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Probe the endpoint `kin_root`'s daemon record names, without spawning one.
+///
+/// `kin_root` is the `.kin/` directory, the same one the daemon publishes into.
+pub fn probe_recorded_daemon_endpoint(kin_root: &Path) -> RecordedDaemonEndpoint {
+    let port_path = kin_root.join(kin_daemon_spawn::PORT_FILE_NAME);
+    let recorded = match std::fs::read_to_string(&port_path) {
+        Ok(recorded) => recorded,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return RecordedDaemonEndpoint::Unrecorded;
+        }
+        Err(error) => {
+            return RecordedDaemonEndpoint::Unreadable {
+                detail: format!("read {}: {error}", port_path.display()),
+            };
+        }
+    };
+    let Ok(port) = recorded.trim().parse::<u16>() else {
+        return RecordedDaemonEndpoint::Unreadable {
+            detail: format!("{} does not name a port: {recorded:?}", port_path.display()),
+        };
+    };
+    let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    match std::net::TcpStream::connect_timeout(&address, ENDPOINT_PROBE_TIMEOUT) {
+        Ok(_) => RecordedDaemonEndpoint::Listening { port },
+        Err(error) => RecordedDaemonEndpoint::NotListening {
+            port,
+            error: error.to_string(),
+        },
     }
 }
 

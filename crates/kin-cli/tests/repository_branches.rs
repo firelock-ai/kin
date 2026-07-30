@@ -12,6 +12,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tempfile::tempdir;
 
 mod common;
@@ -479,6 +480,69 @@ fn branch_create_and_delete_commit_exact_ref_cas() {
     assert_eq!(
         delete_record.ref_mutations[0].new_target, None,
         "delete receipt must retain exact deletion"
+    );
+}
+
+/// How long a served daemon is watched for self-retirement.
+///
+/// Long enough to cover a short idle window plus the daemon's own idle check
+/// interval, so a runtime that reintroduces one is caught rather than merely
+/// made less likely to bite.
+const SERVED_DAEMON_OBSERVATION: Duration = Duration::from_secs(3);
+const SERVED_DAEMON_POLL: Duration = Duration::from_millis(50);
+
+#[test]
+fn a_daemon_that_served_a_branch_command_keeps_answering_its_recorded_endpoint() {
+    let root = tempdir().expect("temp root");
+    let repo = root.path().join("repo");
+    initialize_git_repo(&repo);
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    let layout = initialize_kin_repo(&runtime, &repo);
+
+    let command = runtime.kin_command();
+    for key in [
+        common::IDLE_SHUTDOWN_DISABLED_ENV,
+        common::SUPERVISOR_IDLE_SHUTDOWN_DISABLED_ENV,
+    ] {
+        let configured = command
+            .configured_env_for_test(std::ffi::OsStr::new(key))
+            .unwrap_or_else(|| panic!("{key} is not configured by the isolated runtime"));
+        assert!(
+            common::disables_idle_shutdown(configured.as_deref()),
+            "{key}={configured:?} leaves an idle clock running. Daemon lifetime in this runtime \
+             is bounded by its teardown proof, and an idle window instead retires daemons that a \
+             command has already proven healthy."
+        );
+    }
+    drop(command);
+
+    let create = run_kin(&runtime, &repo, &["branch", "create", "retained"]);
+    assert!(
+        create.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&create.stdout),
+        String::from_utf8_lossy(&create.stderr)
+    );
+
+    let started = Instant::now();
+    let mut proofs = 0_u32;
+    while started.elapsed() < SERVED_DAEMON_OBSERVATION {
+        match common::probe_recorded_daemon_endpoint(layout.root()) {
+            common::RecordedDaemonEndpoint::Listening { .. } => proofs += 1,
+            observed => panic!(
+                "the daemon that served this repository stopped answering its recorded \
+                 endpoint {:.2}s after a command used it, leaving {observed:?}. A command \
+                 that reads this record, proves the endpoint healthy, and then dispatches \
+                 against it fails with a refused connection, and the test harness bounds \
+                 daemon lifetime by its teardown proof rather than by an idle clock.",
+                started.elapsed().as_secs_f64()
+            ),
+        }
+        std::thread::sleep(SERVED_DAEMON_POLL);
+    }
+    assert!(
+        proofs > 0,
+        "observation window never probed the recorded daemon endpoint"
     );
 }
 
