@@ -2949,6 +2949,13 @@ impl DaemonState {
 
     /// Load a repo's graph from the storage backend (synchronous).
     /// Used internally for pre-loading and by `get_repo_graph`.
+    ///
+    /// The absent case is typed as
+    /// [`DaemonError::RepoAbsentFromStorage`] rather than folded into the
+    /// fault arms. `load_recovered_snapshot` returns `Ok(None)` only when the
+    /// backend read succeeded and found neither snapshot authority nor
+    /// deltas, so absence here is a complete answer and callers may route it
+    /// as a missing repository instead of a broken daemon.
     fn load_repo_graph(&self, repo_id: &str) -> Result<Arc<kin_db::InMemoryGraph>> {
         let Some(backend) = &self.storage_backend else {
             return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
@@ -2975,9 +2982,7 @@ impl DaemonState {
                 );
                 Ok(graph)
             }
-            None => Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
-                format!("repo '{}' not found in storage", repo_id),
-            ))),
+            None => Err(DaemonError::RepoAbsentFromStorage(repo_id.to_string())),
         }
     }
 
