@@ -467,6 +467,7 @@ impl DaemonClient {
         let one_dispatch_client = reqwest::Client::builder()
             .timeout(Duration::from_secs(request_timeout))
             .connect_timeout(Duration::from_secs(2))
+            .retry(reqwest::retry::never())
             .redirect(reqwest::redirect::Policy::none())
             .default_headers(headers)
             .build()
