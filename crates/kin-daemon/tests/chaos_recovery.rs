@@ -38,7 +38,13 @@ fn assert_child_alive(child: &mut Child, port: u16, what: &str) {
 /// so a kill/restart never depends on reusing one port's teardown timing.
 async fn read_published_port(child: &mut Child, repo_root: &Path) -> u16 {
     let port_file = repo_root.join(".kin/daemon.port");
-    let deadline = Instant::now() + Duration::from_secs(30);
+    // Share the readiness budget rather than keeping a tighter one of its own.
+    // Publishing the port is part of the same startup this file already grants
+    // READINESS_TIMEOUT for, and a 30s cap here made a healthy daemon on a
+    // loaded machine indistinguishable from a broken one. A daemon that dies is
+    // still caught eagerly through its child handle, so a generous budget only
+    // ever bounds a slow-but-live startup.
+    let deadline = Instant::now() + READINESS_TIMEOUT;
     let mut backoff = Duration::from_millis(20);
 
     loop {
@@ -54,7 +60,26 @@ async fn read_published_port(child: &mut Child, repo_root: &Path) -> u16 {
             panic!("daemon exited before publishing its port: {status}");
         }
         if Instant::now() >= deadline {
-            panic!("daemon never published its port to {}", port_file.display());
+            // Say which of the two it is. A deadline measures this test's
+            // patience, not the daemon's health, and reporting "never
+            // published" for a process that is still running sends the reader
+            // hunting a startup bug that is not there. This is the same
+            // distinction the production spawn contract draws between
+            // `ChildExited` and `StillStarting`.
+            let fate = match child.try_wait() {
+                Ok(Some(status)) => format!("it exited with {status}"),
+                Ok(None) => {
+                    "it is still running, so this is a slow start rather than a failed one \
+                     (the machine is likely loaded)"
+                        .to_string()
+                }
+                Err(error) => format!("its state could not be read: {error}"),
+            };
+            panic!(
+                "daemon did not publish a port to {} within {:.0}s; {fate}",
+                port_file.display(),
+                READINESS_TIMEOUT.as_secs_f64()
+            );
         }
 
         tokio::time::sleep(backoff).await;
@@ -355,4 +380,134 @@ async fn daemon_exits_after_dirty_repo_control_dir_is_removed() {
         exit.success(),
         "deleted-control-dir idle shutdown should be graceful: {exit}"
     );
+}
+
+/// Every component of a repo's published endpoint, read as raw bytes.
+///
+/// Compared whole so a test can assert that a file was not merely present
+/// afterwards but untouched: a refusing starter that rewrote the incumbent's
+/// port with its own would leave both paths existing.
+fn endpoint_snapshot(repo_root: &Path) -> Vec<(String, Option<Vec<u8>>)> {
+    ["daemon.pid", "daemon.port", "daemon.owner"]
+        .into_iter()
+        .map(|name| {
+            (
+                name.to_string(),
+                std::fs::read(repo_root.join(".kin").join(name)).ok(),
+            )
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_second_daemon_leaves_the_incumbent_serving() {
+    // The reported sequence: an MCP retry revived a daemon, the revived daemon
+    // lost the repo singleton and refused, and the incumbent it lost to died
+    // moments later with its endpoint files gone. A refusal must be inert.
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+
+    let mut incumbent = spawn_daemon_with_env(
+        repo.path(),
+        0,
+        &[
+            ("KIN_DAEMON_DISABLE_LSP", "1"),
+            ("KIN_DAEMON_IDLE_TIMEOUT_SECS", "600"),
+        ],
+    );
+    let port = read_published_port(&mut incumbent, repo.path()).await;
+    assert_eq!(wait_for_health(&mut incumbent, port).await.status, "ok");
+
+    let before = endpoint_snapshot(repo.path());
+    assert!(
+        before.iter().all(|(_, bytes)| bytes.is_some()),
+        "the incumbent must have published an attributed endpoint: {before:?}"
+    );
+
+    let mut refused = spawn_daemon_with_env(repo.path(), 0, &[("KIN_DAEMON_DISABLE_LSP", "1")]);
+    let exit = match tokio::time::timeout(Duration::from_secs(120), refused.wait()).await {
+        Ok(result) => result.expect("second kin-daemon wait failed"),
+        Err(_) => {
+            let _ = refused.start_kill();
+            panic!("the second kin-daemon neither started nor refused");
+        }
+    };
+    assert!(
+        !exit.success(),
+        "losing the repo singleton must be reported as a failure: {exit}"
+    );
+
+    assert_eq!(
+        endpoint_snapshot(repo.path()),
+        before,
+        "a refused start must leave the incumbent's endpoint byte-identical"
+    );
+    assert_child_alive(&mut incumbent, port, "alive after a refused second start");
+    assert_eq!(
+        wait_for_health(&mut incumbent, port).await.status,
+        "ok",
+        "the incumbent must still be serving the repo it owns"
+    );
+
+    incumbent.start_kill().expect("failed to stop kin-daemon");
+    let _ = incumbent.wait().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_deleted_endpoint_is_republished_instead_of_ending_the_daemon() {
+    // The other half of the same failure: the incumbent keyed its own liveness
+    // on endpoint files it did not verify it owned. Deleting them must be
+    // repaired by the daemon that still holds the repo, not obeyed.
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+
+    let mut child = spawn_daemon_with_env(
+        repo.path(),
+        0,
+        &[
+            ("KIN_DAEMON_DISABLE_LSP", "1"),
+            ("KIN_DAEMON_IDLE_TIMEOUT_SECS", "600"),
+        ],
+    );
+    let port = read_published_port(&mut child, repo.path()).await;
+    wait_for_serving(&mut child, port).await;
+
+    let daemon_pid = repo.path().join(".kin/daemon.pid");
+    let daemon_port = repo.path().join(".kin/daemon.port");
+    wait_for_path(
+        &daemon_pid,
+        "daemon did not write pid file",
+        Duration::from_secs(10),
+    )
+    .await;
+    std::fs::remove_file(&daemon_pid).unwrap();
+    std::fs::remove_file(&daemon_port).unwrap();
+
+    wait_for_path(
+        &daemon_pid,
+        "daemon never republished its pid file",
+        Duration::from_secs(60),
+    )
+    .await;
+    wait_for_path(
+        &daemon_port,
+        "daemon never republished its port file",
+        Duration::from_secs(60),
+    )
+    .await;
+
+    assert_child_alive(&mut child, port, "alive after its endpoint was deleted");
+    assert_eq!(
+        std::fs::read_to_string(&daemon_port)
+            .unwrap()
+            .trim()
+            .parse::<u16>()
+            .unwrap(),
+        port,
+        "republication must restore the port the daemon actually bound"
+    );
+    assert_eq!(wait_for_health(&mut child, port).await.status, "ok");
+
+    child.start_kill().expect("failed to stop kin-daemon");
+    let _ = child.wait().await;
 }
