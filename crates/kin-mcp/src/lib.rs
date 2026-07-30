@@ -23,9 +23,9 @@ pub use server::{
     McpServerConfig, RepoBinder, SessionAuthorityMode,
 };
 pub use session::{
-    AssistantSession, CoordinationEnforcementMode, CoordinationSurfaceCoverage,
-    CoordinationWritePreflight, IntentRegistrationAttempt, McpMutationOperation,
-    McpMutationPayload, McpTransaction, SessionRegistry,
+    AssistantSession, CommitRefusal, CommitRefusalCode, CoordinationEnforcementMode,
+    CoordinationSurfaceCoverage, CoordinationWritePreflight, IntentRegistrationAttempt,
+    McpMutationOperation, McpMutationPayload, McpTransaction, SessionRegistry,
 };
 pub use tools::{
     agent_default_tool_names, benchmark_tool_names, context_bench_tool_names, tool_definitions,
