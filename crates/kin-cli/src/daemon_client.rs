@@ -8084,7 +8084,8 @@ mod tests {
     fn a_recycled_pid_does_not_keep_a_dead_daemons_endpoint_alive() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let pid = write_attributed_endpoint_files(root, recycled_identity_for_this_process(), 51000);
+        let pid =
+            write_attributed_endpoint_files(root, recycled_identity_for_this_process(), 51000);
 
         // The bare-PID probe every earlier version used: this PID is running,
         // so the endpoint looked live and wedged autostart permanently.
@@ -8100,7 +8101,8 @@ mod tests {
             "the daemon that published this endpoint is gone, so it must be retirable"
         );
         assert_eq!(
-            live_daemon_endpoint(root), None,
+            live_daemon_endpoint(root),
+            None,
             "a recycled PID is not the daemon that published the endpoint"
         );
         assert!(
@@ -8123,7 +8125,8 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         drop(listener);
-        let pid = write_attributed_endpoint_files(&root, recycled_identity_for_this_process(), port);
+        let pid =
+            write_attributed_endpoint_files(&root, recycled_identity_for_this_process(), port);
 
         let verdict = probe_daemon_endpoint(
             &root,
@@ -8220,9 +8223,12 @@ mod tests {
         .unwrap();
         write_endpoint_files(root, 4242, 51000);
 
-        let owner = endpoint_owner_liveness_with_probes(root, 4242, |_| Ok(false), |_| {
-            ProcessLiveness::Unknown
-        });
+        let owner = endpoint_owner_liveness_with_probes(
+            root,
+            4242,
+            |_| Ok(false),
+            |_| ProcessLiveness::Unknown,
+        );
         assert!(
             !owner.identity_verified(),
             "a record for a different PID does not attribute this endpoint"
