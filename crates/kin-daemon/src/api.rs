@@ -14117,6 +14117,29 @@ mod tests {
         (status, body.to_vec())
     }
 
+    /// Drive the real spine ingest route, body and all, exactly as the hosted
+    /// import orchestrator does. Going through `router` rather than calling the
+    /// state method keeps the status code under test the one a client actually
+    /// receives.
+    async fn spine_ingest(state: Arc<DaemonState>, repo_id: &str) -> (StatusCode, Vec<u8>) {
+        let response = router(state)
+            .oneshot(
+                Request::post(format!("/spine/repos/{repo_id}/ingest"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({ "repo": repo_id })).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        (status, body.to_vec())
+    }
+
     /// The identity contract a client depends on: read `repo_id` off `/health`
     /// and every `/repos/{repo_id}/…` route resolves it. Two key spaces here
     /// meant a caller that trusted the advertised id got a storage-mode 500 on
@@ -14685,6 +14708,106 @@ mod tests {
         faults.start_faulting(absent);
         let (status, body) =
             repo_route(Arc::clone(&state), &format!("/repos/{absent}/entities")).await;
+        let message = String::from_utf8_lossy(&body);
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a backend that cannot answer is still a fault: {message}"
+        );
+        assert!(
+            message.contains(BACKEND_FAULT_TEXT),
+            "the fault must carry the backend error rather than discard it: {message}"
+        );
+    }
+
+    /// The spine ingest route resolves a repository by id just as the
+    /// `/repos/{repo_id}` routes do, so it owes a caller the same three
+    /// answers. It gave one: every outcome, a mis-addressed request included,
+    /// arrived as a 500.
+    ///
+    /// This is the shape the control plane actually meets. The import
+    /// orchestrator POSTs one ingest per cataloged repo, so a pod whose
+    /// `KIN_REPO_IDS` omits one of them answered "this daemon failed" to a
+    /// question about which pod owns that repository. The orchestrator then
+    /// retried, and no number of retries moves a repository into a key space
+    /// that excludes it, while the 5xx alerting fired on a daemon that was
+    /// working exactly as configured.
+    #[tokio::test]
+    async fn spine_ingest_refuses_an_unserved_repo_id_rather_than_reporting_a_fault() {
+        let advertised = "primary-repo";
+        let sibling = "sibling-repo";
+        let unserved = "unconfigured-repo";
+        let (state, _faults) =
+            hosted_state_with_allowlist("ingest-unserved", advertised, &[sibling]);
+        assert!(
+            !state.serves_repo_id(unserved),
+            "the fixture must exclude the id under test from the served key space"
+        );
+
+        let (status, body) = spine_ingest(Arc::clone(&state), unserved).await;
+        let message = String::from_utf8_lossy(&body);
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "an id outside the served key space is a mis-addressed request, \
+             not a daemon that failed: {message}"
+        );
+        assert!(
+            message.contains(advertised) && message.contains(unserved),
+            "the refusal must name the served and the requested id so the caller \
+             can tell a typo from the wrong pod: {message}"
+        );
+
+        // An allowlisted sibling storage has never held is the other 404, and
+        // the two must stay tellable apart in the body. Both are "not here",
+        // but one says this pod does not own the repository and the other says
+        // this pod owns it and has not ingested it, and those route to
+        // different fixes: re-address the request, or run the ingest.
+        assert!(
+            message.contains("does not serve"),
+            "the unserved refusal must say so plainly: {message}"
+        );
+        let (sibling_status, sibling_body) = spine_ingest(Arc::clone(&state), sibling).await;
+        let sibling_message = String::from_utf8_lossy(&sibling_body);
+        assert_eq!(
+            sibling_status,
+            StatusCode::NOT_FOUND,
+            "a served sibling absent from storage is also missing: {sibling_message}"
+        );
+        assert!(
+            !sibling_message.contains("does not serve"),
+            "a served sibling must not inherit the unserved refusal: {sibling_message}"
+        );
+    }
+
+    /// Absence and fault stay distinguishable on the ingest route too. A
+    /// repository the allowlist admits but storage has never held is missing,
+    /// and a backend that cannot answer for that same id is still a fault: the
+    /// answer is decided by what the load reported, never by the id.
+    #[tokio::test]
+    async fn spine_ingest_reports_a_served_repo_absent_from_storage_as_missing() {
+        let advertised = "primary-repo";
+        let absent = "never-stored-repo";
+        let (state, faults) = hosted_state_with_allowlist("ingest-absent", advertised, &[absent]);
+        assert!(
+            state.serves_repo_id(absent),
+            "the allowlist is the served key space, so the absent id is served"
+        );
+
+        let (status, body) = spine_ingest(Arc::clone(&state), absent).await;
+        let message = String::from_utf8_lossy(&body);
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "a served repository storage does not hold is missing, not a fault: {message}"
+        );
+        assert!(
+            !message.contains("does not serve"),
+            "an allowlisted repository must not be reported as unserved: {message}"
+        );
+
+        faults.start_faulting(absent);
+        let (status, body) = spine_ingest(Arc::clone(&state), absent).await;
         let message = String::from_utf8_lossy(&body);
         assert_eq!(
             status,
