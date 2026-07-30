@@ -2540,6 +2540,28 @@ where
     remove_endpoint_files_with(&pid_path, &port_path, remove_file)
 }
 
+/// How long a retirement waits out a contended lifecycle lock before reporting
+/// it as held.
+///
+/// One non-blocking `flock` is not evidence that anybody holds this lock. It was
+/// observed failing with `EWOULDBLOCK` on a freshly created file that nothing
+/// else had ever opened, with `lsof` naming only the caller's own descriptor and
+/// an immediate retry on that same descriptor succeeding. A single syscall that
+/// can say "contended" about an uncontended lock cannot be the whole test.
+///
+/// This matters beyond a flaky read, because of what the caller does with the
+/// answer: `LifecycleContended` is a preserve-the-endpoint outcome rather than an
+/// error, so a spurious refusal silently abandons a legitimate retirement and
+/// leaves a stale endpoint behind with nothing reported. The daemon side already
+/// reached this conclusion for its own singleton lock and retries within a
+/// budget; this is the same rule for the client-side lifecycle lock.
+///
+/// The window is short because these are brief authority sections, not a daemon
+/// handoff. Genuine contention outlives it and is still reported.
+const LIFECYCLE_AUTHORITY_RETRY_BUDGET: Duration = Duration::from_millis(250);
+
+const LIFECYCLE_AUTHORITY_RETRY_INTERVAL: Duration = Duration::from_millis(5);
+
 fn try_acquire_daemon_endpoint_authority(kin_root: &Path) -> std::io::Result<File> {
     let authority = OpenOptions::new()
         .create(true)
@@ -2547,8 +2569,22 @@ fn try_acquire_daemon_endpoint_authority(kin_root: &Path) -> std::io::Result<Fil
         .write(true)
         .truncate(false)
         .open(kin_root.join("daemon.lifecycle"))?;
-    authority.try_lock_exclusive()?;
-    Ok(authority)
+    let deadline = Instant::now() + LIFECYCLE_AUTHORITY_RETRY_BUDGET;
+    loop {
+        match authority.try_lock_exclusive() {
+            Ok(()) => return Ok(authority),
+            Err(error) if error.kind() == fs2::lock_contended_error().kind() => {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(error);
+                }
+                std::thread::sleep(
+                    LIFECYCLE_AUTHORITY_RETRY_INTERVAL.min(deadline.saturating_duration_since(now)),
+                );
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6923,6 +6959,33 @@ mod tests {
         }
     }
 
+    /// Take supervisor startup authority immediately after a previous holder
+    /// released it, waiting out a contended acquire.
+    ///
+    /// `try_acquire_supervisor_startup_lock_in_dir` is the non-waiting
+    /// primitive, and one non-blocking `flock` can report contention on a lock
+    /// whose holder has already dropped. Production never sees this because it
+    /// reaches the primitive through
+    /// `acquire_supervisor_startup_lock_in_dir_with_timeout`, which already
+    /// retries within a deadline. A test that takes the authority as a setup
+    /// step needs the same rule, or it fails on the release window while
+    /// asserting something else entirely.
+    fn take_supervisor_startup_authority_after_release(dir: &Path) -> SupervisorStartupLock {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match try_acquire_supervisor_startup_lock_in_dir(dir) {
+                Ok(authority) => return authority,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::AlreadyExists
+                        && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("supervisor startup authority at {dir:?}: {error}"),
+            }
+        }
+    }
+
     #[tokio::test]
     async fn supervisor_startup_authority_serializes_a_b_c_and_drop_never_unlinks() {
         let dir = tempfile::tempdir().unwrap();
@@ -6948,7 +7011,7 @@ mod tests {
         let generation_a = launcher_a.generation().to_string();
         drop(launcher_a);
 
-        let launcher_b = try_acquire_supervisor_startup_lock_in_dir(dir.path()).unwrap();
+        let launcher_b = take_supervisor_startup_authority_after_release(dir.path());
         assert_ne!(generation_a, launcher_b.generation());
         assert!(
             launcher_b.authorizes(dir.path()),
@@ -6969,7 +7032,7 @@ mod tests {
         assert!(launcher_b.authorizes(dir.path()));
 
         drop(launcher_b);
-        let launcher_c = try_acquire_supervisor_startup_lock_in_dir(dir.path()).unwrap();
+        let launcher_c = take_supervisor_startup_authority_after_release(dir.path());
         assert!(launcher_c.authorizes(dir.path()));
         drop(launcher_c);
         assert!(
@@ -7402,8 +7465,7 @@ mod tests {
         );
 
         drop(legacy_startup_authority);
-        let current_startup_authority =
-            try_acquire_supervisor_startup_lock_in_dir(dir.path()).unwrap();
+        let current_startup_authority = take_supervisor_startup_authority_after_release(dir.path());
         let final_decision =
             wait_for_existing_supervisor_in_dir(dir.path(), Some(&current_startup_authority)).await;
 
