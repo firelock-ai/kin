@@ -261,7 +261,6 @@
         "rollback_with_actions",
         "read_bounded_launch_agent_plist",
         "write_launch_agent_stage",
-        "ensure_daemon_running_with_idle_timeout",
         {
           "fn": "register_launch_agent",
           "count": 2
@@ -270,7 +269,6 @@
           "fn": "unregister_launch_agent",
           "count": 2
         },
-        "read_endpoint_owner_record",
         "endpoint_ownership_with_probe",
         "proven_live_other_endpoint_owner_with_probe",
         "publish_foreign_endpoint_for_test",

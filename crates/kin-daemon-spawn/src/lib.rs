@@ -4,14 +4,22 @@
 //! The one definition of how a repo daemon is started and how its port is
 //! learned.
 //!
-//! Two callers start daemons: the CLI autostart path and the MCP revival path.
-//! They cannot share code through either of their own crates — `kin-cli`
-//! depends on `kin-mcp`, and `kin-mcp` cannot depend on `kin-daemon` because
-//! `kin-daemon` already depends on `kin-mcp`. So each grew its own copy of the
-//! contract, and the MCP copy has now twice regressed to a weaker version of a
+//! Two callers start a daemon and wait for it: the CLI autostart path and the
+//! MCP revival path. They cannot share code through either of their own crates
+//! — `kin-cli` depends on `kin-mcp`, and `kin-mcp` cannot depend on `kin-daemon`
+//! because `kin-daemon` already depends on `kin-mcp`. So each grew its own copy
+//! of the contract, and the MCP copy twice regressed to a weaker version of a
 //! rule the CLI copy already enforced.
 //!
-//! This crate is the shared floor beneath both. It deliberately holds the
+//! A third surface starts a daemon without waiting for it: the macOS LaunchAgent
+//! plist, which hands its argument vector to launchd rather than to a child this
+//! process supervises. It is not a caller of the startup helpers here, but it
+//! does have to agree about port selection, so it passes
+//! [`DAEMON_PORT_ARGUMENT`] like everything else. `kin-daemon` also once
+//! re-exported a fourth entry point of its own; it is gone, so counting the
+//! spawn contracts in the tree now yields the one below.
+//!
+//! This crate is the shared floor beneath them. It deliberately holds the
 //! decisions that diverged rather than everything a spawn touches:
 //!
 //! - the daemon owns port selection ([`DAEMON_PORT_ARGUMENT`]), and the port is

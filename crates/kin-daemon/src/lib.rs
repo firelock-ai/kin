@@ -142,10 +142,7 @@ pub use daemon::{
     DaemonConfig,
 };
 pub use error::{DaemonError, Result};
-pub use lifecycle::{
-    daemon_is_up, ensure_daemon_running, ensure_daemon_running_with_idle_timeout, AutoStartError,
-    MCP_IDLE_TIMEOUT_SECS,
-};
+pub use lifecycle::{daemon_is_up, AutoStartError, MCP_IDLE_TIMEOUT_SECS};
 pub use loop_runner::LoopConfig;
 pub use session_registry::SessionCoordinator;
 pub use state::{ChangeType, DaemonEvent, DaemonState, LspEnrichmentMessage, LspEnrichmentRequest};
