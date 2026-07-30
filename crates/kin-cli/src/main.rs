@@ -3151,10 +3151,35 @@ const PROGRESS_REPORTING_COMMANDS: [&str; 2] = ["init", "clone"];
 ///   is pre-wired and inert.
 ///
 /// So a long admission does **not** report mid-flight progress at this version.
-/// It begins to the moment this workspace consumes a KinDB shipping
+/// It begins the moment this workspace consumes a KinDB shipping
 /// `storage::history_replay`, with no change here. Anyone diagnosing an
 /// apparently stalled `kin init` before then should not read silence as
 /// evidence that the instrumentation ran.
+///
+/// `kin_db::storage::snapshot` is deliberately not here, despite carrying three
+/// live conditional `info!` sites. All three sit on `SnapshotManager` reopen and
+/// reload paths, one after loading a vector sidecar, one on delta replay at
+/// open, and one where pending deltas bypass the locate cache, so each of them
+/// needs a snapshot that already exists. An admission never has one, because
+/// `kin init` refuses outright when `.kin` is already present
+/// (`reject_existing_repository`, run before any admission work in
+/// `commands/init.rs`) rather than rebuilding authority over it. There is
+/// nothing for an admission to reopen, replay, or load a sidecar from, so
+/// naming the module would add a fourth directive that matches nothing on
+/// either of these two commands.
+///
+/// That reason is structural and survives a refactor of who imports what. The
+/// supporting type-name fact points the same way but is weaker: admission
+/// builds authority through `RepositoryAuthorityManager`, which `kin-core`'s
+/// `init.rs` and `git_init.rs` open, and the kin-db module defining that
+/// manager holds no reference to `SnapshotManager` to reach those callsites
+/// through. A future kin-db could invalidate that observation without failing
+/// anything here, which is why it is the secondary note rather than the reason.
+///
+/// Where those events do fire, the daemon already runs at `info` and records
+/// them, and on ordinary graph-reading commands they report finished counts
+/// rather than progress, so raising them there would restate the mistake this
+/// allowlist exists to avoid.
 const ADMISSION_PROGRESS_TARGETS: [&str; 3] = [
     "kin_core::init",
     "kin_core::git_init",
@@ -3270,6 +3295,207 @@ mod tests {
                 );
             }
         }
+    }
+
+    // Behavioral probes for the default log filter.
+    //
+    // The assertions above check the shape of the directive string, and a string
+    // can be correct while admitting nothing. `EnvFilter` resolves directives
+    // against a callsite at runtime, so a reordered list, an added global
+    // directive, or a target shadowed by a broader one all leave the string
+    // intact and every assertion above green while the event is dropped. These
+    // probes install what production installs and assert on what actually
+    // reaches a writer.
+    //
+    // They build the filter from `default_filter_directives` rather than calling
+    // `default_env_filter`, deliberately: that function consults `RUST_LOG`, and
+    // a probe inheriting the developer's or the runner's environment would fail
+    // or pass vacuously depending on it. `EnvFilter::new` over the pure
+    // directive string is exactly what production installs when `RUST_LOG` is
+    // unset.
+
+    /// Collects everything a subscriber writes, standing in for the terminal.
+    #[derive(Clone)]
+    struct CapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("log buffer poisoned")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+        type Writer = CapturedLog;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// The filter a plain run of `command` installs, absent `RUST_LOG`.
+    fn installed_filter(command: &str) -> EnvFilter {
+        EnvFilter::new(default_filter_directives(command))
+    }
+
+    /// Run `emit` under `filter` and report whether anything reached the writer.
+    ///
+    /// The caller emits rather than naming a target, because `tracing`'s macros
+    /// build a static callsite and so require a literal target. A helper taking
+    /// `&'static str` does not compile, which is why the probes below spell out
+    /// one emission per target instead of looping over
+    /// `ADMISSION_PROGRESS_TARGETS`. Looping over commands stays available,
+    /// since a command reaches the filter as an ordinary argument.
+    fn survives(filter: EnvFilter, emit: impl FnOnce()) -> bool {
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry()
+            .with(filter)
+            .with(tracing_subscriber::fmt::layer().with_writer(CapturedLog(buffer.clone())));
+        tracing::subscriber::with_default(subscriber, emit);
+        let captured = buffer.lock().expect("log buffer poisoned").len();
+        captured > 0
+    }
+
+    /// Forces an edit in this file whenever the target list changes length.
+    ///
+    /// That is the whole of what it guarantees, and it is less than it looks.
+    /// `ADMISSION_PROGRESS_TARGETS` is declared `[&str; 3]`, so `.len()` is a
+    /// compile-time constant and this assertion cannot fail on its own. What
+    /// trips it is the edit that adding a target requires: changing the array's
+    /// length parameter forces changing this literal, which puts the author in
+    /// the module where the probes live, next to the reason a new entry needs
+    /// one. It is a reminder, not a coupling, and it says nothing about
+    /// identity. Swapping one target for another holds the length at 3 and
+    /// leaves this test green.
+    ///
+    /// A swapped target is caught by
+    /// `an_admission_command_admits_every_progress_target` instead, whose probes
+    /// name their targets as literals. `EnvFilter` matches a directive against
+    /// an event's target by prefix, so a renamed entry stops prefix-matching the
+    /// probe that names the old one, the event falls back to the `warn` floor,
+    /// and the probe stops surviving.
+    #[test]
+    fn every_admission_target_has_a_probe() {
+        assert_eq!(
+            ADMISSION_PROGRESS_TARGETS.len(),
+            3,
+            "add a probe below when adding an admission target"
+        );
+    }
+
+    /// Every progress-reporting command must admit the whole target set on its
+    /// own, which is stronger than the set being admitted somewhere.
+    ///
+    /// `default_filter_directives` emits one identical string for every member
+    /// of `PROGRESS_REPORTING_COMMANDS` today, so probing `init` for one target
+    /// and `clone` for another would pass. It would also keep passing the moment
+    /// that function grew a per-command branch, which is a natural extension the
+    /// first time `clone` wants a transport target `init` has no use for. The
+    /// set would then be satisfied across two commands with neither carrying it,
+    /// and the name of this test would be a claim its body no longer made.
+    #[test]
+    fn an_admission_command_admits_every_progress_target() {
+        for command in PROGRESS_REPORTING_COMMANDS {
+            assert!(
+                survives(installed_filter(command), || tracing::info!(
+                    target: "kin_core::init",
+                    "probe"
+                )),
+                "kin {command} must admit the admission receipt"
+            );
+            assert!(
+                survives(installed_filter(command), || tracing::info!(
+                    target: "kin_core::git_init",
+                    "probe"
+                )),
+                "kin {command} must admit Git admission output"
+            );
+            // Pre-wired rather than live: no module of this name exists in the
+            // KinDB this workspace pins, so nothing emits on it yet. Probing it
+            // proves the directive carries such events the moment one does,
+            // which is the only thing pre-wiring can be held to.
+            assert!(
+                survives(installed_filter(command), || tracing::info!(
+                    target: "kin_db::storage::history_replay",
+                    "probe"
+                )),
+                "kin {command} must already admit the pre-wired replay target"
+            );
+        }
+    }
+
+    #[test]
+    fn an_ordinary_command_denies_the_progress_targets() {
+        assert!(
+            !survives(installed_filter("locate"), || tracing::info!(
+                target: "kin_core::git_init",
+                "probe"
+            )),
+            "a short command must not gain admission output"
+        );
+        assert!(
+            !survives(installed_filter("locate"), || tracing::info!(
+                target: "kin_core::init",
+                "probe"
+            )),
+            "a short command must not gain the admission receipt"
+        );
+    }
+
+    #[test]
+    fn the_quiet_floor_holds_for_every_target_not_named() {
+        // Why the raised set is an allowlist rather than a crate-wide or global
+        // level: unnamed info stays exactly as silent as it was, the embedding
+        // hot path most of all, and warnings still reach the user from anywhere.
+        assert!(
+            !survives(installed_filter("init"), || tracing::info!(
+                target: "kin_db::embed",
+                "probe"
+            )),
+            "the embedding hot path must not become visible by default"
+        );
+        assert!(
+            !survives(installed_filter("init"), || tracing::info!(
+                target: "reqwest::connect",
+                "probe"
+            )),
+            "dependency info must not become visible by default"
+        );
+        assert!(
+            survives(installed_filter("init"), || tracing::warn!(
+                target: "kin_db::embed",
+                "probe"
+            )),
+            "warnings must still reach the user from every target"
+        );
+    }
+
+    #[test]
+    fn a_bare_warn_default_drops_the_admission_targets() {
+        // Root cause, and the guard against vacuity. Without it the probes above
+        // would pass just as well against a directive that admitted everything,
+        // and would say nothing about the behavior they exist to pin.
+        assert!(
+            !survives(EnvFilter::new("warn"), || tracing::info!(
+                target: "kin_core::git_init",
+                "probe"
+            )),
+            "the bare warn default this replaced must be shown to drop admission output"
+        );
+        assert!(
+            !survives(EnvFilter::new("warn"), || tracing::info!(
+                target: "kin_core::init",
+                "probe"
+            )),
+            "the bare warn default this replaced must be shown to drop the receipt"
+        );
     }
 
     fn on_cli_test_stack(test: impl FnOnce() + Send + 'static) {
