@@ -193,6 +193,7 @@ DOCS_ONLY_WORKFLOW_HEADER = textwrap.dedent(
         branches: [main]
       pull_request:
         branches: [main]
+      merge_group:
       repository_dispatch:
         types: [dependency-updated]
     permissions:
