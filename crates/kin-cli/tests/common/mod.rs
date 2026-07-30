@@ -1450,6 +1450,7 @@ impl BoundedCommandCapture {
             let deadline = Instant::now() + reap_timeout;
             let mut prior = (initial_stdout.observed_bytes, initial_stderr.observed_bytes);
             let mut quiet_since = None;
+            let mut quiet_probe_baseline: Option<(u64, u64)> = None;
             loop {
                 let stdout = self.stdout.snapshot()?;
                 let stderr = self.stderr.snapshot()?;
@@ -1479,10 +1480,35 @@ impl BoundedCommandCapture {
                 if current != prior {
                     prior = current;
                     quiet_since = Some(Instant::now());
+                    quiet_probe_baseline = None;
                 } else {
-                    let quiet_since = quiet_since.get_or_insert_with(Instant::now);
-                    if Instant::now() >= *quiet_since + PROCESS_QUIESCENCE {
-                        break;
+                    let now = Instant::now();
+                    if quiet_since.is_none() {
+                        quiet_since = Some(now);
+                        quiet_probe_baseline = None;
+                    }
+                    let quiet_since = quiet_since.expect("quiet interval was initialized");
+                    if now >= quiet_since + PROCESS_QUIESCENCE {
+                        if let Some(probe_baseline) = quiet_probe_baseline {
+                            // A reader can be descheduled for the whole quiet
+                            // interval after its first empty probe. Require a
+                            // fresh empty/EOF observation after the far side
+                            // of the interval so queued pipe bytes cannot be
+                            // mistaken for quiescence merely because the
+                            // reader did not run.
+                            let stdout_reprobed = stdout.done
+                                || stdout.post_exit_empty_read_attempts > probe_baseline.0;
+                            let stderr_reprobed = stderr.done
+                                || stderr.post_exit_empty_read_attempts > probe_baseline.1;
+                            if stdout_reprobed && stderr_reprobed {
+                                break;
+                            }
+                        } else {
+                            quiet_probe_baseline = Some((
+                                stdout.post_exit_empty_read_attempts,
+                                stderr.post_exit_empty_read_attempts,
+                            ));
+                        }
                     }
                 }
                 std::thread::sleep(POLL_INTERVAL);
@@ -1889,6 +1915,10 @@ impl CommandCapturePipe for GatedTwoChunkCommandCapturePipe {
 struct ContinuousAfterPostExitQuiescencePipe {
     post_exit_pending_observations: u8,
     post_exit: Arc<AtomicBool>,
+    before_continuous_data: Option<(
+        std::sync::mpsc::SyncSender<()>,
+        std::sync::mpsc::Receiver<()>,
+    )>,
 }
 
 impl Read for ContinuousAfterPostExitQuiescencePipe {
@@ -1911,6 +1941,14 @@ impl CommandCapturePipe for ContinuousAfterPostExitQuiescencePipe {
                     self.post_exit_pending_observations.saturating_add(1);
             }
             return Ok(CommandCaptureRead::Pending);
+        }
+        if let Some((entered, release)) = self.before_continuous_data.take() {
+            entered.send(()).map_err(|_| {
+                std::io::Error::other("continuous capture gate observer was dropped")
+            })?;
+            release.recv().map_err(|_| {
+                std::io::Error::other("continuous capture gate release was dropped")
+            })?;
         }
         std::thread::sleep(Duration::from_millis(1));
         buffer[0] = b'x';
@@ -2132,6 +2170,9 @@ fn bounded_capture_deadline_cannot_be_bypassed_by_continuous_output() {
     let stdout_pipe_post_exit = stdout_post_exit.clone();
     let overflowed = Arc::new(AtomicBool::new(false));
     let stdout_overflowed = overflowed.clone();
+    let (entered_continuous_data, wait_for_continuous_data) = std::sync::mpsc::sync_channel(0);
+    let (release_continuous_data, wait_for_continuous_data_release) =
+        std::sync::mpsc::sync_channel(0);
     let stdout_thread = std::thread::Builder::new()
         .name("kin-integration-continuous-stdout-capture".to_string())
         .spawn(move || {
@@ -2139,6 +2180,10 @@ fn bounded_capture_deadline_cannot_be_bypassed_by_continuous_output() {
                 ContinuousAfterPostExitQuiescencePipe {
                     post_exit_pending_observations: 0,
                     post_exit: stdout_pipe_post_exit,
+                    before_continuous_data: Some((
+                        entered_continuous_data,
+                        wait_for_continuous_data_release,
+                    )),
                 },
                 &stdout_reader_state,
                 &stdout_overflowed,
@@ -2172,6 +2217,15 @@ fn bounded_capture_deadline_cannot_be_bypassed_by_continuous_output() {
         .thread()
         .clone();
     let started = Instant::now();
+    let release_thread = std::thread::spawn(move || {
+        wait_for_continuous_data
+            .recv_timeout(Duration::from_secs(1))
+            .expect("reader reached the continuous-data gate within its deadline");
+        std::thread::sleep(PROCESS_QUIESCENCE.saturating_mul(2));
+        release_continuous_data
+            .send(())
+            .expect("release continuous capture data");
+    });
     let capture = BoundedCommandCapture {
         stdout,
         stderr,
@@ -2179,10 +2233,10 @@ fn bounded_capture_deadline_cannot_be_bypassed_by_continuous_output() {
     };
     let (finish_result_tx, finish_result_rx) = std::sync::mpsc::sync_channel(1);
     let finish_thread = std::thread::spawn(move || {
-        let result = capture.finish_with_timeout(false, Duration::from_millis(250));
+        let result = capture.finish_with_timeout(false, Duration::from_millis(500));
         let _ = finish_result_tx.send(result);
     });
-    let finish_result = match finish_result_rx.recv_timeout(Duration::from_secs(1)) {
+    let finish_result = match finish_result_rx.recv_timeout(Duration::from_secs(2)) {
         Ok(result) => {
             finish_thread.join().expect("join bounded capture finish");
             result
@@ -2204,11 +2258,14 @@ fn bounded_capture_deadline_cannot_be_bypassed_by_continuous_output() {
             );
         }
     };
+    release_thread
+        .join()
+        .expect("join continuous-data gate release");
     let error = finish_result
         .expect_err("continuous descendant output must not bypass the capture deadline");
 
     assert!(
-        started.elapsed() < Duration::from_secs(1),
+        started.elapsed() < Duration::from_secs(2),
         "continuous output bypassed the bounded capture deadline"
     );
     assert!(
