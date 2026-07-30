@@ -642,35 +642,13 @@ where
 /// incarnation.
 const ENDPOINT_OWNER_FILE: &str = "daemon.owner";
 
-/// Schema tag carried by [`ENDPOINT_OWNER_FILE`].
-const ENDPOINT_OWNER_SCHEMA: &str = "kin.daemon.endpoint-owner.v1";
-
-/// Who published the endpoint currently on disk.
+/// The record written into [`ENDPOINT_OWNER_FILE`].
 ///
-/// `daemon.pid` holds a bare PID because every version of every Kin surface
-/// reads it that way, and a PID alone cannot survive reuse: after the recorded
-/// daemon exits, that number starts naming whatever the kernel handed it to
-/// next, and a reader comparing PIDs either preserves a dead endpoint forever
-/// or deletes a live one. This sidecar records the same process incarnation the
-/// singleton lock stamps, so ownership can be *proved* rather than inferred
-/// from a number.
-/// The record carries identity and nothing else. A port field was tempting and
-/// is deliberately absent: `daemon.port` is the port, nothing would read a
-/// second copy, and two records of the same fact can only ever disagree.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-struct EndpointOwnerRecord {
-    schema: String,
-    identity: kin_cli::daemon_client::ProcessIdentity,
-}
-
-impl EndpointOwnerRecord {
-    fn current() -> Option<Self> {
-        Some(Self {
-            schema: ENDPOINT_OWNER_SCHEMA.to_string(),
-            identity: kin_cli::daemon_client::current_process_identity().ok()?,
-        })
-    }
-}
+/// Declared once, beside the process identity it carries, and shared with the
+/// CLI start path that reads it: the daemon publishes attribution and the CLI
+/// decides from it whether an endpoint may be replaced, and two declarations of
+/// one schema are two things to keep in step.
+use kin_cli::daemon_client::EndpointOwnerRecord;
 
 /// What the on-disk endpoint says about its owner.
 ///
@@ -701,11 +679,7 @@ impl EndpointOwnership {
     }
 }
 
-fn read_endpoint_owner_record(kin_root: &Path) -> Option<EndpointOwnerRecord> {
-    let raw = std::fs::read_to_string(kin_root.join(ENDPOINT_OWNER_FILE)).ok()?;
-    let record: EndpointOwnerRecord = serde_json::from_str(&raw).ok()?;
-    (record.schema == ENDPOINT_OWNER_SCHEMA).then_some(record)
-}
+use kin_cli::daemon_client::read_endpoint_owner_record;
 
 /// Classify the published endpoint's owner.
 ///
@@ -735,24 +709,24 @@ fn endpoint_ownership_with_probe(
         // `read(daemon.pid) == process::id()`, which cannot fail; routing the
         // self case through a fallible probe would let a transient error
         // refuse a daemon permission to retire its own endpoint and strand it.
-        if record.identity.pid() == std::process::id() {
+        if record.identity().pid() == std::process::id() {
             return match kin_cli::daemon_client::current_process_identity() {
-                Ok(current) if current == record.identity => EndpointOwnership::CurrentProcess,
+                Ok(current) if current == *record.identity() => EndpointOwnership::CurrentProcess,
                 // Our PID, a different incarnation: the publisher is gone and
                 // the kernel handed us its number.
                 Ok(_) => EndpointOwnership::OtherProcess {
-                    pid: record.identity.pid(),
+                    pid: record.identity().pid(),
                     live: false,
                 },
                 Err(_) => EndpointOwnership::OtherProcess {
-                    pid: record.identity.pid(),
+                    pid: record.identity().pid(),
                     live: true,
                 },
             };
         }
-        return match probe(&record.identity) {
+        return match probe(record.identity()) {
             Ok(is_current) => EndpointOwnership::OtherProcess {
-                pid: record.identity.pid(),
+                pid: record.identity().pid(),
                 live: is_current,
             },
             // An identity that cannot be read at all (another user's process)
@@ -761,7 +735,7 @@ fn endpoint_ownership_with_probe(
             // live here. Publication asks a different question and must not
             // reuse this answer: see [`proven_live_other_endpoint_owner`].
             Err(_) => EndpointOwnership::OtherProcess {
-                pid: record.identity.pid(),
+                pid: record.identity().pid(),
                 live: true,
             },
         };
@@ -810,12 +784,12 @@ fn proven_live_other_endpoint_owner_with_probe(
         return None;
     }
     let record = read_endpoint_owner_record(kin_root)?;
-    if record.identity.pid() == std::process::id() {
+    if record.identity().pid() == std::process::id() {
         return None;
     }
-    probe(&record.identity)
+    probe(record.identity())
         .unwrap_or(false)
-        .then(|| record.identity.pid())
+        .then(|| record.identity().pid())
 }
 
 /// Publish an endpoint attributed to a process other than this one, so tests
@@ -828,10 +802,7 @@ pub(crate) fn publish_foreign_endpoint_for_test(
     port: u16,
 ) {
     let pid = identity.pid();
-    let record = EndpointOwnerRecord {
-        schema: ENDPOINT_OWNER_SCHEMA.to_string(),
-        identity,
-    };
+    let record = EndpointOwnerRecord::for_identity(identity);
     std::fs::write(kin_root.join("daemon.pid"), pid.to_string()).unwrap();
     std::fs::write(kin_root.join("daemon.port"), port.to_string()).unwrap();
     std::fs::write(
@@ -1104,14 +1075,6 @@ fn is_port_open(port: u16) -> bool {
     std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok()
 }
 
-#[cfg(target_os = "macos")]
-fn find_free_port() -> Option<u16> {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .ok()
-        .and_then(|l| l.local_addr().ok())
-        .map(|a| a.port())
-}
-
 // ── Daemon Binary Discovery ─────────────────────────────────────────────
 
 #[cfg(target_os = "macos")]
@@ -1215,36 +1178,12 @@ fn validate_launch_agent_daemon_binary(path: &Path) -> Result<(), String> {
 /// their command through, rather than repeated per crate.
 pub const MCP_IDLE_TIMEOUT_SECS: &str = kin_daemon_spawn::MCP_IDLE_TIMEOUT_SECS;
 
-// ── The One Function ────────────────────────────────────────────────────
-
-/// Ensure the daemon is running for this repo. Returns its base URL.
-///
-/// 1. If a compatible repo daemon is already ready, return its URL.
-/// 2. Otherwise use the shared supervisor/startup contract and wait for
-///    repository-identity-checked readiness.
-/// 3. If start fails → return Err.
-///
-/// This compatibility entry point delegates to the CLI-owned lifecycle
-/// implementation so there is only one startup, readiness, supervisor, and
-/// failure-cleanup contract.
-pub async fn ensure_daemon_running(kin_root: &Path) -> Result<String, AutoStartError> {
-    ensure_daemon_running_with_idle_timeout(kin_root, None).await
-}
-
-/// Like [`ensure_daemon_running`] but lets the caller inject a specific idle
-/// timeout into the spawned daemon process.
-///
-/// Pass `Some(MCP_IDLE_TIMEOUT_SECS)` on the MCP-initiated path (30 min) so
-/// interactive agent sessions don't expire the daemon mid-session.  Pass
-/// `None` to use the compiled default (60 s).  An explicit
-/// `KIN_DAEMON_IDLE_TIMEOUT_SECS` env var always takes precedence over both.
-pub async fn ensure_daemon_running_with_idle_timeout(
-    kin_root: &Path,
-    idle_timeout_override: Option<&'static str>,
-) -> Result<String, AutoStartError> {
-    kin_cli::daemon_client::ensure_daemon_running_with_idle_timeout(kin_root, idle_timeout_override)
-        .await
-}
+// Starting a repo daemon is not this crate's surface. `kin-cli` owns the one
+// startup, readiness, supervisor, and failure-cleanup contract, and
+// `kin-daemon-spawn` owns the decisions both start paths share. This module
+// used to re-export a third entry point on top of them, which for a published
+// crate is an invitation to start a daemon through a path nothing in tree
+// exercises. Call `kin_cli::daemon_client::ensure_daemon_running` instead.
 
 // ── macOS Launch Agent (start on boot) ───────────────────────────────────
 
@@ -2458,45 +2397,23 @@ fn install_replacement_after_legacy_preflight<Replacement>(
     }
 }
 
-/// Internal implementation for a future Kin-owned launchd opt-in surface.
+/// Render the LaunchAgent plist for one repository.
 ///
-/// This stays crate-private because its containment re-executes the current
-/// Kin product binary, which must dispatch the private guardian mode before
-/// argument parsing. Exposing it to arbitrary downstream executables would
-/// create an invalid implicit host contract. The current CLI does not call it
-/// during `kin init`.
-///
-/// Each repo gets its own agent with a canonical-root digest label:
-///   ai.firelock.kin-daemon.<digest>.<readable-suffix>
+/// Pure in its inputs so the argument vector launchd will run is assertable
+/// without installing anything, which is the only way the port rule above stays
+/// pinned: it is a property of the plist, not of a code path a test can reach.
 #[cfg(target_os = "macos")]
-#[allow(dead_code)]
-pub(crate) fn register_launch_agent(kin_root: &Path) -> Result<(), String> {
-    let working_dir = kin_root.parent().ok_or("no parent")?;
-    let canonical_working_dir = working_dir.canonicalize().map_err(|error| {
-        format!(
-            "canonicalize repository root {} for LaunchAgent registration: {error}",
-            working_dir.display()
-        )
-    })?;
-    let repo_path = launch_agent_path_text(&canonical_working_dir, "repository root")?;
-
-    let binary_resolution_cwd = std::env::current_dir()
-        .map_err(|error| format!("resolve current directory for kin-daemon selection: {error}"))?;
-    let selected_daemon =
-        find_daemon_binary().ok_or_else(|| "kin-daemon binary not found".to_string())?;
-    let daemon_bin = resolve_launch_agent_daemon_binary(&selected_daemon, &binary_resolution_cwd)?;
-    validate_launch_agent_daemon_binary(&daemon_bin)?;
-    let daemon_path = launch_agent_path_text(&daemon_bin, "kin-daemon path")?;
-
-    let port = read_port_file(kin_root).unwrap_or_else(|| find_free_port().unwrap_or(4219));
-
-    let label = launch_agent_label(&canonical_working_dir)?;
-    let escaped_label = plist_xml_text(&label)?;
+fn render_launch_agent_plist(
+    label: &str,
+    daemon_path: &str,
+    repo_path: &str,
+) -> Result<String, String> {
+    let escaped_label = plist_xml_text(label)?;
     let escaped_bin = plist_xml_text(daemon_path)?;
     let escaped_repo = plist_xml_text(repo_path)?;
     let escaped_stdout = plist_xml_text(&format!("/tmp/{label}.stdout.log"))?;
     let escaped_stderr = plist_xml_text(&format!("/tmp/{label}.stderr.log"))?;
-    let plist = format!(
+    Ok(format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -2527,10 +2444,52 @@ pub(crate) fn register_launch_agent(kin_root: &Path) -> Result<(), String> {
         label = escaped_label,
         bin = escaped_bin,
         repo = escaped_repo,
-        port = port,
+        port = kin_daemon_spawn::DAEMON_PORT_ARGUMENT,
         stdout = escaped_stdout,
         stderr = escaped_stderr,
-    );
+    ))
+}
+
+/// Internal implementation for a future Kin-owned launchd opt-in surface.
+///
+/// This stays crate-private because its containment re-executes the current
+/// Kin product binary, which must dispatch the private guardian mode before
+/// argument parsing. Exposing it to arbitrary downstream executables would
+/// create an invalid implicit host contract. The current CLI does not call it
+/// during `kin init`.
+///
+/// Each repo gets its own agent with a canonical-root digest label:
+///   ai.firelock.kin-daemon.<digest>.<readable-suffix>
+#[cfg(target_os = "macos")]
+#[allow(dead_code)]
+pub(crate) fn register_launch_agent(kin_root: &Path) -> Result<(), String> {
+    let working_dir = kin_root.parent().ok_or("no parent")?;
+    let canonical_working_dir = working_dir.canonicalize().map_err(|error| {
+        format!(
+            "canonicalize repository root {} for LaunchAgent registration: {error}",
+            working_dir.display()
+        )
+    })?;
+    let repo_path = launch_agent_path_text(&canonical_working_dir, "repository root")?;
+
+    let binary_resolution_cwd = std::env::current_dir()
+        .map_err(|error| format!("resolve current directory for kin-daemon selection: {error}"))?;
+    let selected_daemon =
+        find_daemon_binary().ok_or_else(|| "kin-daemon binary not found".to_string())?;
+    let daemon_bin = resolve_launch_agent_daemon_binary(&selected_daemon, &binary_resolution_cwd)?;
+    validate_launch_agent_daemon_binary(&daemon_bin)?;
+    let daemon_path = launch_agent_path_text(&daemon_bin, "kin-daemon path")?;
+
+    // The daemon owns port selection, here as on every other start path. This
+    // used to bake a number into the plist: the port a daemon happened to be
+    // serving, or one probed with a listener and released, or 4219 when neither
+    // was available. Every one of those is a port some other process may hold
+    // by the time launchd runs the agent, and `KeepAlive` then restarts a
+    // daemon that keeps dying on the same bind conflict. Passing zero makes the
+    // daemon bind an ephemeral port and publish it, which is what the port file
+    // exists for and what every reader already consults.
+    let label = launch_agent_label(&canonical_working_dir)?;
+    let plist = render_launch_agent_plist(&label, daemon_path, repo_path)?;
 
     let home = std::env::var("HOME").map_err(|_| "HOME not set")?;
     let launch_agents = PathBuf::from(&home).join("Library/LaunchAgents");
@@ -3665,6 +3624,44 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn a_launch_agent_lets_the_daemon_choose_its_own_port() {
+        // The plist used to carry a number: the port a daemon happened to be
+        // serving, one probed with a listener and immediately released, or 4219.
+        // launchd runs this argument vector at boot, long after any of those
+        // facts was true, and `KeepAlive` turns a bind conflict into a restart
+        // loop. Zero is the same request every other start path makes.
+        let plist = render_launch_agent_plist(
+            "ai.firelock.kin-daemon.digest.repo",
+            "/usr/local/bin/kin-daemon",
+            "/repos/app",
+        )
+        .expect("render the launch agent plist");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let plist_path = dir.path().join("agent.plist");
+        std::fs::write(&plist_path, &plist).expect("write plist");
+        let arguments =
+            read_plist_program_arguments(&plist_path).expect("extract ProgramArguments");
+
+        assert_eq!(
+            arguments,
+            vec![
+                "/usr/local/bin/kin-daemon",
+                "--repo",
+                "/repos/app",
+                "--port",
+                kin_daemon_spawn::DAEMON_PORT_ARGUMENT,
+            ],
+            "launchd must ask the daemon to bind and report a port, not name one"
+        );
+        assert!(
+            !plist.contains("4219"),
+            "no hardcoded fallback port may survive in the plist: {plist}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn plutil_reads_legacy_program_arguments_for_guarded_migration() {
         let root = tempfile::tempdir().expect("tempdir");
         let repository = root.path().join("app\ttab\nline\rreturn");
@@ -4388,7 +4385,7 @@ mod tests {
             "publication must record who published"
         );
         let record = read_endpoint_owner_record(root).expect("owner record parses");
-        assert_eq!(record.identity.pid(), std::process::id());
+        assert_eq!(record.identity().pid(), std::process::id());
     }
 
     #[test]
@@ -4516,11 +4513,7 @@ mod tests {
         std::fs::write(root.join("daemon.port"), "51234").unwrap();
         std::fs::write(
             root.join(ENDPOINT_OWNER_FILE),
-            serde_json::to_string(&EndpointOwnerRecord {
-                schema: ENDPOINT_OWNER_SCHEMA.to_string(),
-                identity,
-            })
-            .unwrap(),
+            serde_json::to_string(&EndpointOwnerRecord::for_identity(identity)).unwrap(),
         )
         .unwrap();
 
