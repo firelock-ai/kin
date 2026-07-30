@@ -19,8 +19,32 @@ kin_buildinfo::embed_update_build_identity!(
     kin_db::GraphSnapshot::CURRENT_VERSION
 );
 
+/// Orientation for the flat subcommand list. The command surface is wide
+/// because it spans version control, semantic query, sessions, and operations,
+/// and clap renders subcommands as one undifferentiated block with no grouping
+/// primitive. Naming the everyday path here is what separates it from the
+/// benchmarking, hosted-release, and diagnostic commands beside it.
+const AFTER_HELP: &str = "\
+Start here:
+  kin init            admit an existing or new repository
+  kin clone <source>  admit a repository from elsewhere
+  kin status          workspace, refs, and semantic enrichment state
+  kin commit          publish an exact semantic and artifact change
+  kin log / kin diff  read the immutable change log and exact changes
+
+Ask the graph:
+  kin locate / search / trace / impact / refs / context
+
+Commands marked [OPEN GATE] are fail-closed on repository-v6 and say why when
+run. `kin capabilities` prints the full readiness matrix, `--json` for machines.";
+
 #[derive(Parser)]
-#[command(name = "kin", version = kin_buildinfo::version(), about = "Kin semantic VCS")]
+#[command(
+    name = "kin",
+    version = kin_buildinfo::version(),
+    about = "Kin semantic VCS",
+    after_help = AFTER_HELP,
+)]
 struct Cli {
     /// Write a machine-readable execution profile to this JSON file
     #[arg(long, global = true, value_name = "FILE")]
@@ -1946,12 +1970,94 @@ enum HostedReleaseAction {
     },
 }
 
+/// Command paths that Kin used to accept, mapped to the surface that replaced
+/// them.
+///
+/// These names stay unparseable: the table exists only to replace clap's
+/// "similar subcommand" tip, which ranks by edit distance and so answers
+/// `import` with `support` and `impact`. A caller arriving from Git types the
+/// retired name first, and a suggestion pointing at an unrelated command costs
+/// more than no suggestion at all.
+const RETIRED_COMMANDS: &[(&[&str], &str)] = &[
+    (
+        &["import"],
+        "`kin clone <source>` admits a repository from elsewhere, and `kin init` admits one in place.",
+    ),
+    (
+        &["git", "import"],
+        "`kin clone <source>` admits a repository from elsewhere, and `kin init` admits one in place. \
+         `kin git export` remains the only Git interoperability direction.",
+    ),
+    (
+        &["git", "sync"],
+        "`kin reconcile` republishes workspace changes into graph truth, and `kin git export` \
+         publishes an exact Git repository to a new destination.",
+    ),
+    (
+        &["workspace"],
+        "Session workspaces are graph-derived and command-scoped: `kin with`, `kin open`, \
+         `kin shell`, and `kin exec` each run against one.",
+    ),
+    (
+        &["run"],
+        "`kin exec` runs a command in an exact graph-derived session workspace.",
+    ),
+    (&["gc"], "`kin cache gc` reclaims embedding cache space."),
+];
+
+/// Longest retired path matching the leading non-flag tokens of `args`.
+///
+/// Matching is longest-first so `git import` resolves to the Git interoperability
+/// guidance rather than the bare `import` entry. A caller whose tokens do not
+/// match any entry falls through to clap's own reporting.
+fn retired_command_signpost(args: &[String]) -> Option<(String, &'static str)> {
+    let typed: Vec<&str> = args
+        .iter()
+        .map(String::as_str)
+        .filter(|arg| !arg.starts_with('-'))
+        .take(2)
+        .collect();
+    RETIRED_COMMANDS
+        .iter()
+        .filter(|(path, _)| path.len() <= typed.len() && typed[..path.len()] == **path)
+        .max_by_key(|(path, _)| path.len())
+        .map(|(path, guidance)| (path.join(" "), *guidance))
+}
+
+/// Parse the command line, answering a retired command path by name.
+///
+/// Anything clap reports that is not a retired path, including `--help` and
+/// `--version`, is handed back to clap so its exit codes and rendering stay
+/// exactly as they were.
+fn parse_cli_or_report_retired_command() -> Cli {
+    match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(err) => {
+            if err.kind() == clap::error::ErrorKind::InvalidSubcommand {
+                let args: Vec<String> = std::env::args().skip(1).collect();
+                if let Some((path, guidance)) = retired_command_signpost(&args) {
+                    eprintln!("error: `kin {path}` was retired.");
+                    eprintln!();
+                    eprintln!("  {guidance}");
+                    eprintln!();
+                    eprintln!(
+                        "Run `kin --help` for the current commands, or `kin capabilities` for \
+                         repository-v6 readiness."
+                    );
+                    std::process::exit(2);
+                }
+            }
+            err.exit()
+        }
+    }
+}
+
 fn main() -> Result<()> {
     if kin_migrate::run_migration_process_host_if_requested()? {
         return Ok(());
     }
     kin_buildinfo::retain_update_build_identity(&KIN_UPDATE_BUILD_IDENTITY);
-    let cli = Cli::parse();
+    let cli = parse_cli_or_report_retired_command();
     let command_name = current_command_name();
     let cwd = std::env::current_dir()?.display().to_string();
     let profile_out = cli
@@ -3577,6 +3683,93 @@ mod tests {
                 } if output.as_path() == std::path::Path::new("../export.git")
             ));
             assert!(Cli::try_parse_from(["kin", "git", "export", "--in-place"]).is_err());
+        });
+    }
+
+    #[test]
+    fn every_retired_command_path_names_its_replacement() {
+        on_cli_test_stack(|| {
+            for (path, _) in RETIRED_COMMANDS {
+                let mut argv = vec!["kin"];
+                argv.extend_from_slice(path);
+                assert!(
+                    Cli::try_parse_from(&argv).is_err(),
+                    "a retired command path must stay unparseable: {path:?}"
+                );
+
+                let typed: Vec<String> = path.iter().map(|token| token.to_string()).collect();
+                let (matched, guidance) = retired_command_signpost(&typed)
+                    .unwrap_or_else(|| panic!("retired path {path:?} must be signposted"));
+                assert_eq!(matched, path.join(" "));
+                assert!(
+                    guidance.contains("kin "),
+                    "guidance for {path:?} must name a replacement command: {guidance}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn retired_signposting_prefers_the_longest_path_and_ignores_live_commands() {
+        on_cli_test_stack(|| {
+            let git_import = ["git".to_string(), "import".to_string()];
+            let (matched, guidance) =
+                retired_command_signpost(&git_import).expect("`kin git import` is retired");
+            assert_eq!(matched, "git import");
+            assert!(
+                guidance.contains("git export"),
+                "the Git path must name export as the remaining direction: {guidance}"
+            );
+
+            let bare_import = [
+                "import".to_string(),
+                "https://example.com/r.git".to_string(),
+            ];
+            let (matched, _) =
+                retired_command_signpost(&bare_import).expect("`kin import` is retired");
+            assert_eq!(matched, "import");
+
+            // Leading global flags precede the command path a caller typed.
+            let flagged = ["--profile-summary".to_string(), "gc".to_string()];
+            assert_eq!(
+                retired_command_signpost(&flagged).map(|(matched, _)| matched),
+                Some("gc".to_string())
+            );
+
+            // A live command, and an unknown name with no replacement to name,
+            // both fall through to clap's own reporting.
+            for live in [
+                vec!["status".to_string()],
+                vec!["git".to_string(), "export".to_string()],
+                vec!["cache".to_string(), "gc".to_string()],
+                vec!["frobnicate".to_string()],
+            ] {
+                assert!(
+                    retired_command_signpost(&live).is_none(),
+                    "must not signpost {live:?}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn help_orients_a_caller_to_the_everyday_path() {
+        on_cli_test_stack(|| {
+            let mut command = Cli::command();
+            let help = command.render_long_help().to_string();
+            for anchor in [
+                "Start here:",
+                "kin init",
+                "kin status",
+                "kin commit",
+                "kin capabilities",
+                "[OPEN GATE]",
+            ] {
+                assert!(
+                    help.contains(anchor),
+                    "help must orient a caller with {anchor:?}"
+                );
+            }
         });
     }
 
